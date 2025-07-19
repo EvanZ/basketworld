@@ -1,0 +1,26 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basketworld"
+version = "0.1.0"
+description = "A grid-based basketball simulation for reinforcement learning"
+authors = [
+    { name="Your Name", email="your@email.com" }
+]
+requires-python = ">=3.8"
+dependencies = [
+    "gymnasium==0.29.1",
+    "numpy>=1.24",
+    "matplotlib",
+    "pillow",
+    "tqdm",
+    "torch>=2.0",
+    "torchvision",
+    "stable-baselines3==2.2.1",
+    "pytest",
+    "black",
+    "isort"
+]

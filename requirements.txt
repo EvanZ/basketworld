@@ -1,0 +1,16 @@
+# Core environment
+gymnasium==0.29.1
+numpy>=1.24
+matplotlib
+tqdm
+
+# RL Training
+torch>=2.0
+torchvision
+stable-baselines3==2.2.1
+
+
+# Development / Testing
+pytest
+black
+isort

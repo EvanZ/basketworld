@@ -1,0 +1,60 @@
+# images
+images/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
+*.eps
+*.pdf
+*.ico
+*.heic
+*.heif
+*.heif-srgb
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+
+# videos
+videos/
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+
+# logs
+logs/
+
+# models
+models/
+
+# data
+data/
+
+# temp
+temp/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+
+
+# prompts
+prompts/
+
+# utils
+
+# installs
+*.egg-info/
+*.egg
