@@ -498,33 +498,38 @@ class HexagonBasketballEnv(gym.Env):
                 q, r_ax = self._offset_to_axial(c, r)
                 x, y = axial_to_cartesian(q, r_ax)
                 
-                is_basket_tile = (q, r_ax) == self.basket_position
-                face_color = 'orange' if is_basket_tile else 'lightgray'
-                edge_color = 'darkorange' if is_basket_tile else 'white'
-                alpha = 0.9 if is_basket_tile else 0.5
-
+                # Draw the base grid hexagon
                 hexagon = RegularPolygon(
                     (x, y), numVertices=6, radius=hex_radius, 
                     orientation=0, # for pointy-topped
-                    facecolor=face_color, edgecolor=edge_color, alpha=alpha,
-                    linewidth=2 if is_basket_tile else 1
+                    facecolor='lightgray', edgecolor='white', alpha=0.5,
+                    linewidth=1
                 )
                 ax.add_patch(hexagon)
 
-                if is_basket_tile:
-                    ax.text(x, y, 'B', ha='center', va='center', 
-                           fontsize=9, fontweight='bold', color='white', zorder=6)
+                # For the basket, add a thick red ring around it
+                if (q, r_ax) == self.basket_position:
+                    basket_ring = plt.Circle((x, y), hex_radius * 1.05, fill=False, edgecolor='red', linewidth=4, zorder=6)
+                    ax.add_patch(basket_ring)
 
-        # Draw players
+        # Draw players by filling their hexagon
         for i, (q, r) in enumerate(self.positions):
             x, y = axial_to_cartesian(q, r)
             color = 'blue' if i in self.offense_ids else 'red'
-            player_circle = plt.Circle((x, y), 0.5, color=color, alpha=0.9, zorder=10)
-            ax.add_patch(player_circle)
-            ax.text(x, y, str(i), ha='center', va='center', fontsize=8, color='white', zorder=11)
+            
+            player_hexagon = RegularPolygon(
+                (x, y), numVertices=6, radius=hex_radius,
+                orientation=0, # for pointy-topped
+                facecolor=color,
+                edgecolor='white',
+                alpha=0.9,
+                zorder=10
+            )
+            ax.add_patch(player_hexagon)
+            ax.text(x, y, str(i), ha='center', va='center', fontsize=24, fontweight='bold', color='white', zorder=11)
             
             if i == self.ball_holder:
-                ball_ring = plt.Circle((x, y), 0.7, fill=False, color='yellow', linewidth=3, zorder=9)
+                ball_ring = plt.Circle((x, y), hex_radius * 0.9, fill=False, color='orange', linewidth=4, zorder=12)
                 ax.add_patch(ball_ring)
         
         # Calculate court boundaries to set axis limits
