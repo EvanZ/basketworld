@@ -59,7 +59,7 @@ class HexagonBasketballEnv(gym.Env):
         super().__init__()
         
         self.grid_size = grid_size
-        self.court_width = int(grid_size * 0.85)
+        self.court_width = int(grid_size * 1.0)
         self.court_height = grid_size
         self.players_per_side = players_per_side
         self.shot_clock_steps = shot_clock_steps
