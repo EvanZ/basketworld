@@ -33,14 +33,19 @@ class Team(Enum):
 
 class ActionType(Enum):
     NOOP = 0
-    MOVE_NE = 1  # Northeast 
-    MOVE_E = 2   # East
-    MOVE_SE = 3  # Southeast
-    MOVE_SW = 4  # Southwest
-    MOVE_W = 5   # West
-    MOVE_NW = 6  # Northwest
-    PASS = 7
-    SHOOT = 8
+    MOVE_E = 1
+    MOVE_NE = 2
+    MOVE_NW = 3
+    MOVE_W = 4
+    MOVE_SW = 5
+    MOVE_S = 6
+    SHOOT = 7
+    PASS_E = 8
+    PASS_NE = 9
+    PASS_NW = 10
+    PASS_W = 11
+    PASS_SW = 12
+    PASS_S = 13
 
 
 class HexagonBasketballEnv(gym.Env):
@@ -97,14 +102,14 @@ class HexagonBasketballEnv(gym.Env):
         
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
         
-        # Hexagon direction vectors (axial coordinates)
+        # Hexagon direction vectors for POINTY-TOPPED hexagons
         self.hex_directions = [
-            (1, 0),   # E
-            (0, -1),  # NE
+            (+1,  0), # E
+            ( 0, -1), # NE
             (-1, -1), # NW
-            (-1, 0),  # W
-            (-1, 1),  # SW
-            (0, 1),   # SE
+            (-1,  0), # W
+            ( 0, +1), # SW
+            (+1, +1), # S
         ]
         
         self._rng = np.random.default_rng(seed)
@@ -233,26 +238,26 @@ class HexagonBasketballEnv(gym.Env):
             "collisions": []
         }
         
-        # First, collect all intended moves
+        # First, collect all intended moves and non-movement actions
         intended_moves = {}
         for player_id, action in enumerate(actions):
             action_type = ActionType(action)
             
             if action_type == ActionType.NOOP:
                 continue
-            elif action_type in [ActionType.MOVE_NE, ActionType.MOVE_E, ActionType.MOVE_SE,
-                               ActionType.MOVE_SW, ActionType.MOVE_W, ActionType.MOVE_NW]:
-                direction_idx = action - 1  # Subtract 1 because NOOP is 0
+            elif 1 <= action_type.value <= 6: # Movement actions
+                direction_idx = action_type.value - 1
                 new_pos = self._get_adjacent_position(self.positions[player_id], direction_idx)
                 if self._is_valid_position(*new_pos):
                     intended_moves[player_id] = new_pos
-            elif action_type == ActionType.PASS:
-                if player_id == self.ball_holder:
-                    results["passes"][player_id] = self._attempt_pass(player_id)
             elif action_type == ActionType.SHOOT:
                 if player_id == self.ball_holder:
                     results["shots"][player_id] = self._attempt_shot(player_id)
-        
+            elif 8 <= action_type.value <= 13: # Pass actions
+                if player_id == self.ball_holder:
+                    direction_idx = action_type.value - 8
+                    results["passes"][player_id] = self._attempt_pass(player_id, direction_idx)
+
         # Resolve movement collisions
         final_positions = self.positions.copy()
         position_conflicts = {}
@@ -304,47 +309,49 @@ class HexagonBasketballEnv(gym.Env):
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
     
-    def _attempt_pass(self, passer_id: int) -> Dict:
-        """Attempt a pass from the ball holder."""
-        # Find potential teammates in range (simple: adjacent hexagons for now)
+    def _attempt_pass(self, passer_id: int, direction_idx: int) -> Dict:
+        """Attempt a pass from the ball holder in a specific direction."""
         passer_pos = self.positions[passer_id]
-        teammates = self.offense_ids if passer_id in self.offense_ids else self.defense_ids
         
-        # Find adjacent teammates
-        adjacent_teammates = []
-        for teammate_id in teammates:
-            if teammate_id == passer_id:
-                continue
-            teammate_pos = self.positions[teammate_id]
-            if self._hex_distance(passer_pos, teammate_pos) <= 2:  # Within 2 hexagons
-                adjacent_teammates.append(teammate_id)
-        
-        if not adjacent_teammates:
-            # No valid targets - turnover
-            self._turnover_to_defense(passer_id)
-            return {"success": False, "reason": "no_target", "turnover": True}
-        
-        # Calculate pass success probability
-        target_id = self._rng.choice(adjacent_teammates)
-        pass_success_prob = self._calculate_pass_probability(passer_id, target_id)
-        
-        if self._rng.random() < pass_success_prob:
-            # Successful pass
-            self.ball_holder = target_id
-            return {"success": True, "target": target_id, "turnover": False}
-        else:
-            # Failed pass - turnover
-            self._turnover_to_defense(passer_id)
-            return {"success": False, "reason": "intercepted", "turnover": True}
+        # Project a line of sight from the passer
+        # We check up to a max pass distance of 5 hexes
+        for i in range(1, 6): 
+            vec = self.hex_directions[direction_idx]
+            target_pos = (passer_pos[0] + vec[0] * i, passer_pos[1] + vec[1] * i)
+
+            # If pass goes out of bounds, it's a turnover
+            if not self._is_valid_position(*target_pos):
+                self._turnover_to_defense(passer_id)
+                return {"success": False, "reason": "out_of_bounds", "turnover": True}
+            
+            # Check if any player is at the target position
+            for player_id, pos in enumerate(self.positions):
+                if pos == target_pos:
+                    is_teammate = (player_id in self.offense_ids and passer_id in self.offense_ids) or \
+                                  (player_id in self.defense_ids and passer_id in self.defense_ids)
+                    
+                    if is_teammate:
+                        # Successful pass
+                        self.ball_holder = player_id
+                        return {"success": True, "target": player_id, "turnover": False}
+                    else:
+                        # Intercepted by opponent
+                        self._turnover_to_defense(passer_id)
+                        return {"success": False, "reason": "intercepted", "turnover": True}
+
+        # If the pass finds no one in range, it's a turnover
+        self._turnover_to_defense(passer_id)
+        return {"success": False, "reason": "no_target", "turnover": True}
     
     def _attempt_shot(self, shooter_id: int) -> Dict:
         """Attempt a shot from the ball holder."""
         shooter_pos = self.positions[shooter_id]
-        basket_pos = self.basket_position  # Basket at left baseline
+        basket_pos = self.basket_position
         
         distance = self._hex_distance(shooter_pos, basket_pos)
-        shot_success_prob = self._calculate_shot_probability(shooter_id, distance)
         
+        # Simple fixed probability for now
+        shot_success_prob = 0.4 
         shot_made = self._rng.random() < shot_success_prob
         
         if not shot_made:
@@ -377,25 +384,16 @@ class HexagonBasketballEnv(gym.Env):
         q1, r1 = pos1
         q2, r2 = pos2
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
-    
-    def _calculate_pass_probability(self, passer_id: int, target_id: int) -> float:
-        """Calculate probability of successful pass (placeholder implementation)."""
-        # Simple implementation - can be made more sophisticated
-        distance = self._hex_distance(self.positions[passer_id], self.positions[target_id])
-        base_prob = 0.8
-        distance_penalty = 0.1 * (distance - 1)
-        return max(0.1, base_prob - distance_penalty)
-    
+
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
-        """Calculate probability of successful shot (placeholder implementation)."""
-        # Simple implementation - can be made more sophisticated
+        """Calculate probability of successful shot based on distance."""
         if distance <= 2:
             return 0.7  # Close shot
         elif distance <= 4:
             return 0.5  # Mid-range
         else:
             return 0.3  # Long shot
-    
+
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
