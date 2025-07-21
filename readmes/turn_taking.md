@@ -1,4 +1,4 @@
-# it looks like currently we simulate all actions simultaneously, but given our strategy of alternating sides of play, would it make more sense to alternate between offensive actions and defensive actions? I think this would mean the action_space (line 79) would have half of the actions as it does currently. Be honest with your analysis.
+> it looks like currently we simulate all actions simultaneously, but given our strategy of alternating sides of play, would it make more sense to alternate between offensive actions and defensive actions? I think this would mean the action_space (line 79) would have half of the actions as it does currently. Be honest with your analysis.
 ---
 That is an incredibly sharp and insightful question. It gets to the very heart of the design of a multi-agent environment and the trade-offs between realism and learnability. You are also exactly right that if we were to alternate, the action space for any given `step` would be halved.
 

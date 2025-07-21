@@ -1,4 +1,4 @@
-# can you explain the logic behind how you defined the observation space?
+> can you explain the logic behind how you defined the observation space?
 ---
 Of course. That's an excellent question. The design of the observation space is one of the most critical parts of any reinforcement learning environment. It's the "eyes" of the AI agent, and what you choose to include (and how you format it) directly impacts how well the agent can learn.
 

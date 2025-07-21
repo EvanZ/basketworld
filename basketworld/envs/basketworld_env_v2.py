@@ -78,11 +78,24 @@ class HexagonBasketballEnv(gym.Env):
         # Action space: each player can take one of 9 actions
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)
         
-        # Observation space: positions of all players + ball holder + shot clock
-        # Using axial coordinates for hexagons (q, r)
-        obs_low = np.array([-grid_size] * (self.n_players * 2) + [-1] + [0])
-        obs_high = np.array([grid_size] * (self.n_players * 2) + [self.n_players] + [shot_clock_steps])
-        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.int32)
+        # Observation space:
+        # - Player positions: (q, r) for each of n_players -> n_players * 2
+        # - Ball holder: one-hot encoded vector of size n_players
+        # - Shot clock: 1 value
+        obs_space_size = (self.n_players * 2) + self.n_players + 1
+        obs_low = np.full(obs_space_size, -np.inf)
+        obs_high = np.full(obs_space_size, np.inf)
+        
+        # Set specific bounds for known values
+        # Player positions (can be anything, so keep as inf)
+        # Ball holder one-hot (0 to 1)
+        obs_low[self.n_players * 2:-1] = 0
+        obs_high[self.n_players * 2:-1] = 1
+        # Shot clock (0 to max)
+        obs_low[-1] = 0
+        obs_high[-1] = self.shot_clock_steps
+        
+        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
         
         # Hexagon direction vectors (axial coordinates)
         self.hex_directions = [
@@ -423,13 +436,16 @@ class HexagonBasketballEnv(gym.Env):
         for q, r in self.positions:
             obs.extend([q, r])
         
-        # Ball holder
-        obs.append(self.ball_holder)
+        # One-hot encode the ball holder
+        ball_holder_one_hot = np.zeros(self.n_players)
+        if self.ball_holder is not None:
+            ball_holder_one_hot[self.ball_holder] = 1.0
+        obs.extend(ball_holder_one_hot)
         
         # Shot clock
         obs.append(self.shot_clock)
         
-        return np.array(obs, dtype=np.int32)
+        return np.array(obs, dtype=np.float32)
     
     def render(self, mode: str = "human"):
         """Render the current state of the environment."""

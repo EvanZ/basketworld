@@ -1,4 +1,4 @@
-# Can you explain the difference between axial and offset coordinates for the hexagonal positions and how the math works?
+> Can you explain the difference between axial and offset coordinates for the hexagonal positions and how the math works?
 ---
 Of course. This is a fantastic and fundamental question about working with hexagonal grids. It's a common point of confusion because the best way for a *human* to think about a grid isn't the best way for a *computer* to do math on it.
 

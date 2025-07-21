@@ -1,4 +1,4 @@
-# one issue i've realized with hexagonal tesselation is that it appears one direction is shorter than the other. The hexagons are taller than they are wide. Is there any way to account for this? It seems movement steps will be slightly unequal, unless I'm not understanding.
+> one issue i've realized with hexagonal tesselation is that it appears one direction is shorter than the other. The hexagons are taller than they are wide. Is there any way to account for this? It seems movement steps will be slightly unequal, unless I'm not understanding.
 
 ---
 You have hit on a fascinating and extremely subtle point about hexagonal grids. Your observation is 100% correct, and your intuition about unequal steps is understandable.
