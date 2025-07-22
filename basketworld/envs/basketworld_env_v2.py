@@ -235,7 +235,8 @@ class HexagonBasketballEnv(gym.Env):
             "moves": {},
             "passes": {},
             "shots": {},
-            "collisions": []
+            "collisions": [],
+            "out_of_bounds_turnover": False
         }
         
         # First, collect all intended moves and non-movement actions
@@ -250,6 +251,12 @@ class HexagonBasketballEnv(gym.Env):
                 new_pos = self._get_adjacent_position(self.positions[player_id], direction_idx)
                 if self._is_valid_position(*new_pos):
                     intended_moves[player_id] = new_pos
+                else:
+                    # Player tried to move out of bounds
+                    results["moves"][player_id] = {"success": False, "reason": "out_of_bounds"}
+                    if player_id == self.ball_holder:
+                        self._turnover_to_defense(player_id)
+                        results["out_of_bounds_turnover"] = True
             elif action_type == ActionType.SHOOT:
                 if player_id == self.ball_holder:
                     results["shots"][player_id] = self._attempt_shot(player_id)
@@ -418,11 +425,13 @@ class HexagonBasketballEnv(gym.Env):
                     else:
                         rewards[self.offense_ids] = -1.0
         
-        # Check for turnovers
+        # Check for turnovers from passes or moving out of bounds
+        if action_results.get("out_of_bounds_turnover", False):
+            done = True
+        
         for player_id, pass_result in action_results["passes"].items():
             if pass_result.get("turnover", False):
                 done = True  # Episode ends on turnover
-                # No immediate reward for turnovers (handled by team role)
         
         return done, rewards
     
