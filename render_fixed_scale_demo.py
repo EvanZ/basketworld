@@ -8,6 +8,16 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
+def sample_legal_actions(env, obs):
+    """Samples a legal action for each player based on the action mask."""
+    action_masks = obs['action_mask']
+    actions = []
+    for mask in action_masks:
+        legal_actions = np.where(mask == 1)[0]
+        action = env._rng.choice(legal_actions)
+        actions.append(action)
+    return np.array(actions)
+
 def main():
     print("Creating Fixed-Scale Rectangular Hexagon Basketball Environment...")
     
@@ -15,8 +25,7 @@ def main():
     env = basketworld.HexagonBasketballEnv(
         grid_size=16,
         players_per_side=3,
-        shot_clock_steps=24,
-        seed=42
+        shot_clock_steps=24
     )
     
     # Reset to get initial state
@@ -30,14 +39,13 @@ def main():
         rgb_array = env.render(mode="rgb_array")
         frames.append(rgb_array)
         
-        # Take a random step
-        actions = env.action_space.sample()
+        # Sample a legal action using the action mask
+        actions = sample_legal_actions(env, obs)
         obs, rewards, done, truncated, info = env.step(actions)
         
         # Print info for the first step
-        if i == 0:
-            print("Action taken in first step:", actions)
-            print("Rewards:", rewards)
+        print(f"Action taken in step {i}:", actions)
+        print(f"Rewards for step {i}:", rewards)
         
         if done:
             # Render one last frame after episode ends

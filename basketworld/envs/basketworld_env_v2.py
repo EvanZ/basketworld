@@ -83,24 +83,25 @@ class HexagonBasketballEnv(gym.Env):
         # Action space: each player can take one of 9 actions
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)
         
-        # Observation space:
-        # - Player positions: (q, r) for each of n_players -> n_players * 2
-        # - Ball holder: one-hot encoded vector of size n_players
-        # - Shot clock: 1 value
-        obs_space_size = (self.n_players * 2) + self.n_players + 1
-        obs_low = np.full(obs_space_size, -np.inf)
-        obs_high = np.full(obs_space_size, np.inf)
+        # Define the two parts of our observation space
+        state_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=((self.n_players * 2) + self.n_players + 1,), 
+            dtype=np.float32
+        )
+        action_mask_space = spaces.Box(
+            low=0, 
+            high=1, 
+            shape=(self.n_players, len(ActionType)), 
+            dtype=np.int8
+        )
         
-        # Set specific bounds for known values
-        # Player positions (can be anything, so keep as inf)
-        # Ball holder one-hot (0 to 1)
-        obs_low[self.n_players * 2:-1] = 0
-        obs_high[self.n_players * 2:-1] = 1
-        # Shot clock (0 to max)
-        obs_low[-1] = 0
-        obs_high[-1] = self.shot_clock_steps
-        
-        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+        # The full observation space is a dictionary containing the state and the mask
+        self.observation_space = spaces.Dict({
+            "obs": state_space,
+            "action_mask": action_mask_space
+        })
         
         # Hexagon direction vectors for POINTY-TOPPED hexagons
         self.hex_directions = [
@@ -148,7 +149,10 @@ class HexagonBasketballEnv(gym.Env):
         # Random offensive player starts with ball
         self.ball_holder = self._rng.choice(self.offense_ids)
         
-        obs = self._get_observation()
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks()
+        }
         info = {"training_team": self.training_team.name}
         
         return obs, info
@@ -180,7 +184,10 @@ class HexagonBasketballEnv(gym.Env):
             
         self.episode_ended = done
         
-        obs = self._get_observation()
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks()
+        }
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
@@ -188,38 +195,45 @@ class HexagonBasketballEnv(gym.Env):
         }
         
         return obs, rewards, done, False, info
-    
+
+    def _get_action_masks(self) -> np.ndarray:
+        """Generate a mask of legal actions for each player."""
+        masks = np.ones((self.n_players, len(ActionType)), dtype=np.int8)
+        
+        # Only the ball holder can shoot or pass
+        shoot_pass_actions = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
+        
+        for i in range(self.n_players):
+            if i != self.ball_holder:
+                masks[i, shoot_pass_actions] = 0
+                
+        return masks
+        
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
         """Generate initial non-overlapping positions for all players."""
         positions = []
-        
-        # Offense starts on right side (higher q values)
-        offense_start_q = self.grid_size // 2
-        defense_start_q = -self.grid_size // 2
-        
-        # Generate positions ensuring no overlaps
         taken_positions = set()
-        
-        # Place offense players
-        for i in range(self.players_per_side):
+
+        # Defense spawns near the basket (top of the court)
+        for _ in self.defense_ids:
             while True:
-                col = self._rng.integers(self.court_width // 2, self.court_width)
-                row = self._rng.integers(0, self.court_height)
-                q, r = self._offset_to_axial(col, row)
-                if (q, r) not in taken_positions:
-                    positions.append((q, r))
-                    taken_positions.add((q, r))
+                col = self._rng.integers(0, self.court_width)
+                row = self._rng.integers(0, self.court_height // 2)
+                axial_pos = self._offset_to_axial(col, row)
+                if axial_pos not in taken_positions and axial_pos != self.basket_position:
+                    positions.append(axial_pos)
+                    taken_positions.add(axial_pos)
                     break
-        
-        # Place defense players  
-        for i in range(self.players_per_side):
+
+        # Offense spawns down-court (bottom half of the court)
+        for _ in self.offense_ids:
             while True:
-                col = self._rng.integers(0, self.court_width // 2)
-                row = self._rng.integers(0, self.court_height)
-                q, r = self._offset_to_axial(col, row)
-                if (q, r) not in taken_positions:
-                    positions.append((q, r))
-                    taken_positions.add((q, r))
+                col = self._rng.integers(0, self.court_width)
+                row = self._rng.integers(self.court_height // 2, self.court_height)
+                axial_pos = self._offset_to_axial(col, row)
+                if axial_pos not in taken_positions and axial_pos != self.basket_position:
+                    positions.append(axial_pos)
+                    taken_positions.add(axial_pos)
                     break
                     
         return positions
@@ -249,11 +263,14 @@ class HexagonBasketballEnv(gym.Env):
             elif 1 <= action_type.value <= 6: # Movement actions
                 direction_idx = action_type.value - 1
                 new_pos = self._get_adjacent_position(self.positions[player_id], direction_idx)
-                if self._is_valid_position(*new_pos):
+                
+                # Check if the move is valid (within bounds and not onto the basket)
+                if self._is_valid_position(*new_pos) and new_pos != self.basket_position:
                     intended_moves[player_id] = new_pos
                 else:
-                    # Player tried to move out of bounds
-                    results["moves"][player_id] = {"success": False, "reason": "out_of_bounds"}
+                    # Player tried to move out of bounds or onto the basket
+                    reason = "out_of_bounds" if new_pos != self.basket_position else "basket_collision"
+                    results["moves"][player_id] = {"success": False, "reason": reason}
                     if player_id == self.ball_holder:
                         self._turnover_to_defense(player_id)
                         results["out_of_bounds_turnover"] = True
@@ -321,10 +338,10 @@ class HexagonBasketballEnv(gym.Env):
         passer_pos = self.positions[passer_id]
         
         # Project a line of sight from the passer
-        # We check up to a max pass distance of 5 hexes
-        for i in range(1, 6): 
+        distance = 1
+        while True:
             vec = self.hex_directions[direction_idx]
-            target_pos = (passer_pos[0] + vec[0] * i, passer_pos[1] + vec[1] * i)
+            target_pos = (passer_pos[0] + vec[0] * distance, passer_pos[1] + vec[1] * distance)
 
             # If pass goes out of bounds, it's a turnover
             if not self._is_valid_position(*target_pos):
@@ -346,9 +363,8 @@ class HexagonBasketballEnv(gym.Env):
                         self._turnover_to_defense(passer_id)
                         return {"success": False, "reason": "intercepted", "turnover": True}
 
-        # If the pass finds no one in range, it's a turnover
-        self._turnover_to_defense(passer_id)
-        return {"success": False, "reason": "no_target", "turnover": True}
+            # If no player was found, continue the pass to the next hex
+            distance += 1
     
     def _attempt_shot(self, shooter_id: int) -> Dict:
         """Attempt a shot from the ball holder."""
@@ -601,7 +617,7 @@ if __name__ == "__main__":
     
     print("=== Hexagon Basketball Environment Demo ===")
     obs, info = env.reset()
-    print(f"Initial observation shape: {obs.shape}")
+    print(f"Initial observation shape: {obs['obs'].shape}")
     print(f"Action space: {env.action_space}")
     
     env.render()
