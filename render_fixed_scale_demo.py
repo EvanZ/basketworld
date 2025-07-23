@@ -65,10 +65,20 @@ def main():
             end_reason = "Unknown"
             if info['action_results']['shots']:
                 end_reason = "Shot Attempt"
-            elif any(p.get("turnover", False) for p in info['action_results']['passes'].values()):
-                end_reason = "Turnover on Pass"
+            # Check for pass turnovers and their specific reasons
+            elif info['action_results']['passes']:
+                for passer_id, pass_result in info['action_results']['passes'].items():
+                    if pass_result.get("turnover"):
+                        reason = pass_result.get("reason", "unknown")
+                        if reason == "intercepted":
+                            end_reason = "Turnover (Pass Intercepted by Defense)"
+                        elif reason == "out_of_bounds":
+                            end_reason = "Turnover (Pass Sailed Out of Bounds)"
+                        else:
+                            end_reason = f"Turnover on Pass ({reason})"
+                        break # Found the turnover, stop looking
             elif info['action_results'].get('out_of_bounds_turnover'):
-                end_reason = "Turnover (Ball Out of Bounds)"
+                end_reason = "Turnover (Player Stepped Out of Bounds)"
             elif env.shot_clock <= 0:
                 end_reason = "Shot Clock Violation"
             

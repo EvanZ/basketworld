@@ -345,7 +345,7 @@ class HexagonBasketballEnv(gym.Env):
 
             # If pass goes out of bounds, it's a turnover
             if not self._is_valid_position(*target_pos):
-                self._turnover_to_defense(passer_id)
+                self.ball_holder = None # No one has the ball
                 return {"success": False, "reason": "out_of_bounds", "turnover": True}
             
             # Check if any player is at the target position
@@ -378,8 +378,8 @@ class HexagonBasketballEnv(gym.Env):
         shot_made = self._rng.random() < shot_success_prob
         
         if not shot_made:
-            # Missed shot - rebound to defense
-            self._turnover_to_defense(shooter_id)
+            # Missed shot - possession ends
+            self.ball_holder = None
         
         return {
             "success": shot_made,
@@ -585,8 +585,17 @@ class HexagonBasketballEnv(gym.Env):
         ax.grid(False)
         ax.set_xticks([])
         ax.set_yticks([])
+
+        # Add shot clock text to the bottom right corner
+        ax.text(0.95, 0.05, f"{self.shot_clock}",
+                fontsize=48,
+                fontweight='bold',
+                color='black',
+                ha='right',
+                va='bottom',
+                alpha=0.5,
+                transform=ax.transAxes)
         
-        # Convert to RGB array
         fig.canvas.draw()
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
