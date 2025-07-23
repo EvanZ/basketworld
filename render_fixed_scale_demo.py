@@ -34,7 +34,10 @@ def main():
     frames = []
     
     # Run a few random steps to show some action
-    for i in range(15):
+    for i in range(25): # Increased step limit to see more action
+        # Log who has the ball at the start of the step
+        print(f"Step {i+1}: Ball is with Player {env.ball_holder}")
+
         # Render frame
         rgb_array = env.render(mode="rgb_array")
         frames.append(rgb_array)
@@ -43,15 +46,33 @@ def main():
         actions = sample_legal_actions(env, obs)
         obs, rewards, done, truncated, info = env.step(actions)
         
-        # Print info for the first step
-        print(f"Action taken in step {i}:", actions)
-        print(f"Rewards for step {i}:", rewards)
+        # Log the actions and rewards for the current step
+        print(f"  Actions: {actions}")
+        print(f"  Rewards: {rewards}")
+        
+        # Log shot attempts and their results
+        if info['action_results']['shots']:
+            for shooter_id, shot_result in info['action_results']['shots'].items():
+                result_text = "MADE" if shot_result['success'] else "MISSED"
+                print(f"--- Shot by Player {shooter_id}: {result_text}! ---")
         
         if done:
             # Render one last frame after episode ends
             rgb_array = env.render(mode="rgb_array")
             frames.append(rgb_array)
-            print(f"Episode ended after {i+1} steps.")
+            
+            # --- Log the reason for the episode ending ---
+            end_reason = "Unknown"
+            if info['action_results']['shots']:
+                end_reason = "Shot Attempt"
+            elif any(p.get("turnover", False) for p in info['action_results']['passes'].values()):
+                end_reason = "Turnover on Pass"
+            elif info['action_results'].get('out_of_bounds_turnover'):
+                end_reason = "Turnover (Ball Out of Bounds)"
+            elif env.shot_clock <= 0:
+                end_reason = "Shot Clock Violation"
+            
+            print(f"\nEpisode ended after {i+1} steps. Reason: {end_reason}")
             break
             
     # Save the last frame as a static image
