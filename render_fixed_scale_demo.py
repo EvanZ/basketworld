@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import argparse
 
 def sample_legal_actions(env, obs):
     """Samples a legal action for each player based on the action mask."""
@@ -19,13 +20,19 @@ def sample_legal_actions(env, obs):
     return np.array(actions)
 
 def main():
-    print("Creating Fixed-Scale Rectangular Hexagon Basketball Environment...")
+    parser = argparse.ArgumentParser(description="Render a demo of the BasketWorld environment.")
+    parser.add_argument("--grid-size", type=int, default=16, help="The size of the grid, affecting court dimensions.")
+    parser.add_argument("--players", type=int, default=3, help="Number of players per side.")
+    parser.add_argument("--shot-clock", type=int, default=24, help="Number of steps in the shot clock.")
+    args = parser.parse_args()
+
+    print(f"Creating Environment: {args.players}v{args.players} on a size {args.grid_size} grid with a {args.shot_clock}s shot clock...")
     
-    # Create a 3v3 environment with a 16x13 court
+    # Create the environment with parameters from CLI args
     env = basketworld.HexagonBasketballEnv(
-        grid_size=16,
-        players_per_side=3,
-        shot_clock_steps=24
+        grid_size=args.grid_size,
+        players_per_side=args.players,
+        shot_clock_steps=args.shot_clock
     )
     
     # Reset to get initial state
