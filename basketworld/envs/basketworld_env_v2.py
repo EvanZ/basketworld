@@ -59,7 +59,8 @@ class HexagonBasketballEnv(gym.Env):
         players_per_side: int = 3,
         shot_clock_steps: int = 24,
         training_team: Team = Team.OFFENSE,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        render_mode: Optional[str] = None
     ):
         super().__init__()
         
@@ -69,6 +70,7 @@ class HexagonBasketballEnv(gym.Env):
         self.players_per_side = players_per_side
         self.shot_clock_steps = shot_clock_steps
         self.training_team = training_team  # Which team is currently training
+        self.render_mode = render_mode
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -119,6 +121,7 @@ class HexagonBasketballEnv(gym.Env):
         self.positions: List[Tuple[int, int]] = []  # (q, r) axial coordinates
         self.ball_holder: int = 0
         self.shot_clock: int = 0
+        self.step_count: int = 0
         self.episode_ended: bool = False
         self.last_action_results: Dict = {}
         
@@ -140,6 +143,7 @@ class HexagonBasketballEnv(gym.Env):
             self._rng = np.random.default_rng(seed)
             
         self.shot_clock = self.shot_clock_steps
+        self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
         
@@ -162,6 +166,7 @@ class HexagonBasketballEnv(gym.Env):
         if self.episode_ended:
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
             
+        self.step_count += 1
         actions = np.array(actions)
         
         # Decrement shot clock
@@ -373,8 +378,8 @@ class HexagonBasketballEnv(gym.Env):
         
         distance = self._hex_distance(shooter_pos, basket_pos)
         
-        # Simple fixed probability for now
-        shot_success_prob = 0.4 
+        # Use the distance-based probability calculation
+        shot_success_prob = self._calculate_shot_probability(shooter_id, distance)
         shot_made = self._rng.random() < shot_success_prob
         
         if not shot_made:
@@ -410,21 +415,41 @@ class HexagonBasketballEnv(gym.Env):
 
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot based on distance."""
-        if distance <= 2:
-            return 0.7  # Close shot
-        elif distance <= 4:
-            return 0.5  # Mid-range
+        if distance <= 1:
+            return 0.9  # Dunk/Layup
+        elif distance <= 3:
+            return 0.5  # Close shot
+        elif distance <= 5:
+            return 0.2  # Mid-range
         else:
-            return 0.3  # Long shot
+            return 0.05 # Long-range heave
 
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
         done = False
         
+        # --- Reward successful passes and penalize turnovers ---
+        for player_id, pass_result in action_results.get("passes", {}).items():
+            if pass_result.get("success"):
+                # Small reward for a successful pass
+                rewards[self.offense_ids] += 0.1
+            elif pass_result.get("turnover"):
+                done = True  # Episode ends on turnover
+                # Penalize offense, reward defense for the turnover
+                rewards[self.offense_ids] -= 0.2
+                rewards[self.defense_ids] += 0.2
+        
         # Check for shots
         for player_id, shot_result in action_results["shots"].items():
             done = True  # Episode ends after any shot attempt
+            
+            # --- Time-based penalty for shooting too early ---
+            if self.step_count <= 3:
+                # Penalty is high at step 1 and decrements
+                # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
+                time_penalty = - (0.7 - self.step_count * 0.2)
+                rewards[self.offense_ids] += time_penalty
             
             if shot_result["success"]:
                 # Basket made
@@ -441,13 +466,11 @@ class HexagonBasketballEnv(gym.Env):
                     else:
                         rewards[self.offense_ids] = -1.0
         
-        # Check for turnovers from passes or moving out of bounds
+        # Check for turnovers from moving out of bounds
         if action_results.get("out_of_bounds_turnover", False):
             done = True
-        
-        for player_id, pass_result in action_results["passes"].items():
-            if pass_result.get("turnover", False):
-                done = True  # Episode ends on turnover
+            rewards[self.offense_ids] -= 0.2
+            rewards[self.defense_ids] += 0.2
         
         return done, rewards
     
@@ -470,14 +493,12 @@ class HexagonBasketballEnv(gym.Env):
         
         return np.array(obs, dtype=np.float32)
     
-    def render(self, mode: str = "human"):
+    def render(self):
         """Render the current state of the environment."""
-        if mode == "human":
+        if self.render_mode == "human":
             return self._render_ascii()
-        elif mode == "rgb_array":
+        elif self.render_mode == "rgb_array":
             return self._render_visual()
-        else:
-            raise ValueError(f"Unsupported render mode: {mode}")
     
     def _render_ascii(self):
         """Simple ASCII rendering for training."""
