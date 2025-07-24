@@ -20,6 +20,7 @@ import random
 import math
 from typing import Dict, List, Tuple, Optional, Union
 from enum import Enum
+from collections import defaultdict
 
 import gymnasium as gym
 import numpy as np
@@ -251,83 +252,80 @@ class HexagonBasketballEnv(gym.Env):
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
         """Process all player actions simultaneously with collision resolution."""
         results = {
-            "moves": {},
-            "passes": {},
-            "shots": {},
-            "collisions": [],
+            "moves": {}, "passes": {}, "shots": {}, "collisions": [],
             "out_of_bounds_turnover": False
         }
         
-        # First, collect all intended moves and non-movement actions
+        current_positions = self.positions
+        final_positions = current_positions.copy()
+        
+        # 1. Handle non-movement actions first (shots, passes)
+        for player_id, action_val in enumerate(actions):
+            action = ActionType(action_val)
+            if action == ActionType.SHOOT and player_id == self.ball_holder:
+                results["shots"][player_id] = self._attempt_shot(player_id)
+            elif "PASS" in action.name and player_id == self.ball_holder:
+                direction_idx = action.value - ActionType.PASS_E.value
+                results["passes"][player_id] = self._attempt_pass(player_id, direction_idx)
+
+        # 2. Determine intended moves for all players
         intended_moves = {}
-        for player_id, action in enumerate(actions):
-            action_type = ActionType(action)
-            
-            if action_type == ActionType.NOOP:
-                continue
-            elif 1 <= action_type.value <= 6: # Movement actions
-                direction_idx = action_type.value - 1
-                new_pos = self._get_adjacent_position(self.positions[player_id], direction_idx)
+        for player_id, action_val in enumerate(actions):
+            action = ActionType(action_val)
+            if ActionType.MOVE_E.value <= action.value <= ActionType.MOVE_S.value:
+                direction_idx = action.value - ActionType.MOVE_E.value
+                new_pos = self._get_adjacent_position(current_positions[player_id], direction_idx)
                 
-                # Check if the move is valid (within bounds and not onto the basket)
                 if self._is_valid_position(*new_pos) and new_pos != self.basket_position:
                     intended_moves[player_id] = new_pos
                 else:
-                    # Player tried to move out of bounds or onto the basket
                     reason = "out_of_bounds" if new_pos != self.basket_position else "basket_collision"
                     results["moves"][player_id] = {"success": False, "reason": reason}
                     if player_id == self.ball_holder:
                         self._turnover_to_defense(player_id)
                         results["out_of_bounds_turnover"] = True
-            elif action_type == ActionType.SHOOT:
-                if player_id == self.ball_holder:
-                    results["shots"][player_id] = self._attempt_shot(player_id)
-            elif 8 <= action_type.value <= 13: # Pass actions
-                if player_id == self.ball_holder:
-                    direction_idx = action_type.value - 8
-                    results["passes"][player_id] = self._attempt_pass(player_id, direction_idx)
 
-        # Resolve movement collisions
-        final_positions = self.positions.copy()
-        position_conflicts = {}
+        # 3. Resolve movement based on conflicts
         
-        # Group players by intended destination
-        for player_id, new_pos in intended_moves.items():
-            if new_pos not in position_conflicts:
-                position_conflicts[new_pos] = []
-            position_conflicts[new_pos].append(player_id)
+        # Players who are not moving this turn
+        static_players = set(range(self.n_players)) - set(intended_moves.keys())
         
-        # Resolve conflicts
-        for new_pos, conflicting_players in position_conflicts.items():
-            if len(conflicting_players) == 1:
-                # No conflict, move normally
-                player_id = conflicting_players[0]
-                final_positions[player_id] = new_pos
-                results["moves"][player_id] = {"success": True, "new_position": new_pos}
-            else:
-                # Collision! Pick random winner
-                winner = self._rng.choice(conflicting_players)
-                final_positions[winner] = new_pos
+        # Positions that will be occupied by players who are not moving
+        occupied_by_static = {current_positions[pid] for pid in static_players}
+        
+        # Group moving players by their intended destination
+        move_destinations = defaultdict(list)
+        for player_id, dest in intended_moves.items():
+            move_destinations[dest].append(player_id)
+
+        # Iterate through destinations and resolve conflicts
+        for dest, players_intending_to_move in move_destinations.items():
+            # a. Check for collisions with players who aren't moving
+            if dest in occupied_by_static:
+                for player_id in players_intending_to_move:
+                    results["moves"][player_id] = {"success": False, "reason": "collision_static"}
+                continue # No one can move here
+
+            # b. Check for collisions between multiple moving players
+            if len(players_intending_to_move) > 1:
+                # Collision occurs, pick one winner
+                winner = self._rng.choice(players_intending_to_move)
+                final_positions[winner] = dest
+                results["moves"][winner] = {"success": True, "new_position": dest}
                 
-                for player_id in conflicting_players:
-                    if player_id == winner:
-                        results["moves"][player_id] = {"success": True, "new_position": new_pos}
-                    else:
-                        results["moves"][player_id] = {"success": False, "reason": "collision"}
+                # Others fail
+                for player_id in players_intending_to_move:
+                    if player_id != winner:
+                        results["moves"][player_id] = {"success": False, "reason": "collision_dynamic"}
                 
                 results["collisions"].append({
-                    "position": new_pos,
-                    "players": conflicting_players,
-                    "winner": winner
+                    "position": dest, "players": players_intending_to_move, "winner": winner
                 })
-        
-        # Check for players trying to move into occupied spaces
-        occupied_positions = set(final_positions)
-        for player_id, action in enumerate(actions):
-            if player_id in intended_moves:
-                intended_pos = intended_moves[player_id]
-                if intended_pos in occupied_positions and player_id not in results["moves"]:
-                    results["moves"][player_id] = {"success": False, "reason": "occupied"}
+            else:
+                # No collision, single player moves
+                player_id = players_intending_to_move[0]
+                final_positions[player_id] = dest
+                results["moves"][player_id] = {"success": True, "new_position": dest}
         
         self.positions = final_positions
         return results

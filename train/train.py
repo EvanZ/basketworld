@@ -130,8 +130,22 @@ def main(args):
     temp_env = DummyVecEnv([lambda: setup_environment(args, Team.OFFENSE)])
     
     print("Initializing policies...")
-    offense_policy = PPO("MultiInputPolicy", temp_env, verbose=1, n_steps=args.n_steps, batch_size=args.batch_size)
-    defense_policy = PPO("MultiInputPolicy", temp_env, verbose=1, n_steps=args.n_steps, batch_size=args.batch_size)
+    offense_policy = PPO(
+        "MultiInputPolicy", 
+        temp_env, 
+        verbose=1, 
+        n_steps=args.n_steps, 
+        batch_size=args.batch_size,
+        tensorboard_log=args.tensorboard_path
+    )
+    defense_policy = PPO(
+        "MultiInputPolicy", 
+        temp_env, 
+        verbose=1, 
+        n_steps=args.n_steps, 
+        batch_size=args.batch_size,
+        tensorboard_log=args.tensorboard_path
+    )
     temp_env.close()
 
     # --- Alternating Training Loop ---
@@ -149,7 +163,11 @@ def main(args):
             )
         ])
         offense_policy.set_env(offense_env)
-        offense_policy.learn(total_timesteps=args.steps_per_alternation, reset_num_timesteps=False)
+        offense_policy.learn(
+            total_timesteps=args.steps_per_alternation, 
+            reset_num_timesteps=False,
+            tb_log_name="Offense"
+        )
         offense_env.close()
         
         offense_model_path = os.path.join(save_path, f"offense_policy_alt_{i+1}.zip")
@@ -165,7 +183,11 @@ def main(args):
             )
         ])
         defense_policy.set_env(defense_env)
-        defense_policy.learn(total_timesteps=args.steps_per_alternation, reset_num_timesteps=False)
+        defense_policy.learn(
+            total_timesteps=args.steps_per_alternation, 
+            reset_num_timesteps=False,
+            tb_log_name="Defense"
+        )
         defense_env.close()
 
         defense_model_path = os.path.join(save_path, f"defense_policy_alt_{i+1}.zip")
@@ -184,6 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO hyperparameter: Number of steps to run for each environment per update.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
     parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
+    parser.add_argument("--tensorboard-path", type=str, default="tensorboard_logs/", help="Path to save TensorBoard logs.")
     
     args = parser.parse_args()
     main(args) 
