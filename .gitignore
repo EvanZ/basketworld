@@ -33,6 +33,7 @@ videos/
 # logs
 logs/
 tensorboard_logs/
+mlruns/
 
 # models
 models/
@@ -59,3 +60,5 @@ prompts/
 # installs
 *.egg-info/
 *.egg
+
+.vscode/

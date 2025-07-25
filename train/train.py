@@ -15,9 +15,45 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+
+import mlflow
+import sys
+import tempfile
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
+
+# --- Custom MLflow Callback ---
+
+class MLflowCallback(BaseCallback):
+    """
+    A custom callback for logging metrics to MLflow.
+    This callback logs the mean reward and episode length periodically.
+    """
+    def __init__(self, team_name: str, offense_policy, defense_policy, log_freq: int = 2048, verbose=0):
+        super(MLflowCallback, self).__init__(verbose)
+        self.team_name = team_name
+        self.log_freq = log_freq
+        self.offense_policy = offense_policy
+        self.defense_policy = defense_policy
+
+    def _on_step(self) -> bool:
+        # Log metrics periodically to avoid performance overhead
+        if self.n_calls % self.log_freq == 0:
+            # The ep_info_buffer contains info from the last 100 episodes
+            if self.model.ep_info_buffer:
+                # Calculate the global step by summing timesteps from both policies
+                global_step = self.offense_policy.num_timesteps + self.defense_policy.num_timesteps
+                
+                # Calculate the mean reward and length
+                ep_rew_mean = np.mean([ep_info["r"] for ep_info in self.model.ep_info_buffer])
+                ep_len_mean = np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer])
+                
+                # Log to MLflow
+                mlflow.log_metric(f"{self.team_name} Mean Episode Reward", ep_rew_mean, step=global_step)
+                mlflow.log_metric(f"{self.team_name} Mean Episode Length", ep_len_mean, step=global_step)
+        return True
 
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
 
@@ -120,79 +156,121 @@ def setup_environment(args, training_team):
 
 def main(args):
     """Main training function."""
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_path = os.path.join(args.save_path, f"basketworld_selfplay_{timestamp}")
-    os.makedirs(save_path, exist_ok=True)
-    
-    # --- Initialize Base Environment (just for policy creation) ---
-    # SB3 requires an environment to initialize a policy. We'll create a temporary one.
-    temp_env = DummyVecEnv([lambda: setup_environment(args, Team.OFFENSE)])
-    
-    print("Initializing policies...")
-    offense_policy = PPO(
-        "MultiInputPolicy", 
-        temp_env, 
-        verbose=1, 
-        n_steps=args.n_steps, 
-        batch_size=args.batch_size,
-        tensorboard_log=args.tensorboard_path
-    )
-    defense_policy = PPO(
-        "MultiInputPolicy", 
-        temp_env, 
-        verbose=1, 
-        n_steps=args.n_steps, 
-        batch_size=args.batch_size,
-        tensorboard_log=args.tensorboard_path
-    )
-    temp_env.close()
 
-    # --- Alternating Training Loop ---
-    for i in range(args.alternations):
-        print("-" * 50)
-        print(f"Alternation {i + 1} / {args.alternations}")
-        print("-" * 50)
+    # --- Set up MLflow Tracking ---
+    # MLflow requires a running server to log artifacts correctly.
+    tracking_uri = "http://localhost:5000"
+    mlflow.set_tracking_uri(tracking_uri)
+    
+    # Set the experiment name. This will create it if it doesn't exist.
+    mlflow.set_experiment(args.mlflow_experiment_name)
+    
+    try:
+        # Check if the server is reachable by trying to get the current experiment
+        mlflow.get_experiment_by_name(args.mlflow_experiment_name)
+    except mlflow.exceptions.MlflowException as e:
+        print(f"Could not connect to MLflow tracking server at {tracking_uri}.", file=sys.stderr)
+        print("Please ensure the MLflow UI server is running in a separate terminal with `mlflow ui`.", file=sys.stderr)
+        sys.exit(1)
+    
+    with mlflow.start_run(run_name=args.mlflow_run_name) as run:
+        # Log hyperparameters
+        mlflow.log_params(vars(args))
+        print(f"MLflow Run ID: {run.info.run_id}")
 
-        # --- 1. Train Offense against frozen Defense ---
-        print(f"\nTraining Offense...")
-        offense_env = DummyVecEnv([
-            lambda: SelfPlayEnvWrapper(
-                setup_environment(args, Team.OFFENSE),
-                opponent_policy=defense_policy
-            )
-        ])
-        offense_policy.set_env(offense_env)
-        offense_policy.learn(
-            total_timesteps=args.steps_per_alternation, 
-            reset_num_timesteps=False,
-            tb_log_name="Offense"
-        )
-        offense_env.close()
+        # The save_path is no longer needed as models are saved to a temp dir
+        # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # save_path = os.path.join(args.save_path, f"basketworld_selfplay_{timestamp}")
+        # os.makedirs(save_path, exist_ok=True)
         
-        offense_model_path = os.path.join(save_path, f"offense_policy_alt_{i+1}.zip")
-        offense_policy.save(offense_model_path)
-        print(f"Saved offense model to {offense_model_path}")
-
-        # --- 2. Train Defense against frozen Offense ---
-        print(f"\nTraining Defense...")
-        defense_env = DummyVecEnv([
-            lambda: SelfPlayEnvWrapper(
-                setup_environment(args, Team.DEFENSE),
-                opponent_policy=offense_policy
-            )
-        ])
-        defense_policy.set_env(defense_env)
-        defense_policy.learn(
-            total_timesteps=args.steps_per_alternation, 
-            reset_num_timesteps=False,
-            tb_log_name="Defense"
+        # --- Initialize Base Environment (just for policy creation) ---
+        # SB3 requires an environment to initialize a policy. We'll create a temporary one.
+        temp_env = DummyVecEnv([lambda: setup_environment(args, Team.OFFENSE)])
+        
+        print("Initializing policies...")
+        offense_policy = PPO(
+            "MultiInputPolicy", 
+            temp_env, 
+            verbose=1, 
+            n_steps=args.n_steps, 
+            batch_size=args.batch_size,
+            tensorboard_log=None # Disable TensorBoard if using MLflow
         )
-        defense_env.close()
+        defense_policy = PPO(
+            "MultiInputPolicy", 
+            temp_env, 
+            verbose=1, 
+            n_steps=args.n_steps, 
+            batch_size=args.batch_size,
+            tensorboard_log=None # Disable TensorBoard if using MLflow
+        )
+        temp_env.close()
 
-        defense_model_path = os.path.join(save_path, f"defense_policy_alt_{i+1}.zip")
-        defense_policy.save(defense_model_path)
-        print(f"Saved defense model to {defense_model_path}")
+        # --- Alternating Training Loop ---
+        for i in range(args.alternations):
+            print("-" * 50)
+            print(f"Alternation {i + 1} / {args.alternations}")
+            print("-" * 50)
+
+            # --- 1. Train Offense against frozen Defense ---
+            print(f"\nTraining Offense...")
+            offense_env = DummyVecEnv([
+                lambda: SelfPlayEnvWrapper(
+                    setup_environment(args, Team.OFFENSE),
+                    opponent_policy=defense_policy
+                )
+            ])
+            offense_policy.set_env(offense_env)
+            
+            offense_callback = MLflowCallback(
+                team_name="Offense", 
+                offense_policy=offense_policy, 
+                defense_policy=defense_policy, 
+                log_freq=args.n_steps
+            )
+            
+            offense_policy.learn(
+                total_timesteps=args.steps_per_alternation, 
+                reset_num_timesteps=False,
+                callback=offense_callback
+            )
+            offense_env.close()
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                offense_model_path = os.path.join(tmpdir, f"offense_policy_alt_{i+1}.zip")
+                offense_policy.save(offense_model_path)
+                mlflow.log_artifact(offense_model_path, artifact_path="models")
+            print(f"Logged offense model for alternation {i+1} to MLflow")
+
+            # --- 2. Train Defense against frozen Offense ---
+            print(f"\nTraining Defense...")
+            defense_env = DummyVecEnv([
+                lambda: SelfPlayEnvWrapper(
+                    setup_environment(args, Team.DEFENSE),
+                    opponent_policy=offense_policy
+                )
+            ])
+            defense_policy.set_env(defense_env)
+
+            defense_callback = MLflowCallback(
+                team_name="Defense", 
+                offense_policy=offense_policy, 
+                defense_policy=defense_policy, 
+                log_freq=args.n_steps
+            )
+
+            defense_policy.learn(
+                total_timesteps=args.steps_per_alternation, 
+                reset_num_timesteps=False,
+                callback=defense_callback
+            )
+            defense_env.close()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                defense_model_path = os.path.join(tmpdir, f"defense_policy_alt_{i+1}.zip")
+                defense_policy.save(defense_model_path)
+                mlflow.log_artifact(defense_model_path, artifact_path="models")
+            print(f"Logged defense model for alternation {i+1} to MLflow")
 
     print("\n--- Training Complete ---")
 
@@ -205,8 +283,11 @@ if __name__ == "__main__":
     parser.add_argument("--steps-per-alternation", type=int, default=20_000, help="Timesteps to train each policy per alternation.")
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO hyperparameter: Number of steps to run for each environment per update.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
-    parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
-    parser.add_argument("--tensorboard-path", type=str, default="tensorboard_logs/", help="Path to save TensorBoard logs.")
+    # The --save-path argument is no longer needed
+    # parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
+    parser.add_argument("--tensorboard-path", type=str, default=None, help="Path to save TensorBoard logs (set to None if using MLflow).")
+    parser.add_argument("--mlflow-experiment-name", type=str, default="BasketWorld_Training", help="Name of the MLflow experiment.")
+    parser.add_argument("--mlflow-run-name", type=str, default=None, help="Name of the MLflow run.")
     
     args = parser.parse_args()
     main(args) 
