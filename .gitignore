@@ -62,3 +62,4 @@ prompts/
 *.egg
 
 .vscode/
+.DS_Store
