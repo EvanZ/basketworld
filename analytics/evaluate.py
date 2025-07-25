@@ -2,21 +2,22 @@
 """
 Evaluation script to analyze the performance of trained self-play agents.
 
-This script loads a trained offense and defense policy and runs them against
-each other for a specified number of episodes. It computes and prints key
-performance metrics, such as scoring rate and turnover types, and can
-optionally generate a GIF of a sample game.
+This script connects to an MLflow run, downloads the latest trained policies,
+runs them against each other, computes performance metrics, and logs the
+resulting analysis and visualization GIFs back to the original MLflow run.
 """
 import argparse
 import os
 import numpy as np
+import tempfile
+import re
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 import imageio
 from collections import defaultdict
 from tqdm import tqdm
+import mlflow
 
 def get_outcome_category(outcome_str: str) -> str:
     """Categorizes a detailed outcome string into a simple category for filenames."""
@@ -28,16 +29,15 @@ def get_outcome_category(outcome_str: str) -> str:
         return "turnover"
     return "unknown"
 
-def setup_environment(args):
+def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool):
     """Create and wrap the environment for evaluation."""
     
-    # Set render mode only if we need to generate the GIF
-    render_mode = "rgb_array" if not args.no_render else None
+    render_mode = "rgb_array" if not no_render else None
 
     env = basketworld.HexagonBasketballEnv(
-        grid_size=args.grid_size,
-        players_per_side=args.players,
-        shot_clock_steps=args.shot_clock,
+        grid_size=grid_size,
+        players_per_side=players,
+        shot_clock_steps=shot_clock,
         render_mode=render_mode
     )
     return env
@@ -77,130 +77,148 @@ def analyze_results(results: list, num_episodes: int):
 def main(args):
     """Main evaluation function."""
     
-    if not os.path.exists(args.offense_policy) or not os.path.exists(args.defense_policy):
-        print("Error: Policy files not found. Please check the paths.")
+    # --- Set up MLflow Tracking ---
+    tracking_uri = "http://localhost:5000"
+    mlflow.set_tracking_uri(tracking_uri)
+    client = mlflow.tracking.MlflowClient()
+
+    try:
+        run = client.get_run(args.run_id)
+    except Exception as e:
+        print(f"Error: Could not find MLflow run with ID '{args.run_id}'. Please ensure the Run ID is correct and the MLflow server is running.")
+        print(e)
         return
 
-    # --- Setup ---
-    print("Setting up environment for evaluation...")
-    env = setup_environment(args)
+    # --- Get Hyperparameters from MLflow Run ---
+    print("Fetching hyperparameters from MLflow run...")
+    run_params = run.data.params
+    # Parameters are logged as strings, so we must cast them to integers
+    try:
+        grid_size = int(run_params["grid_size"])
+        players = int(run_params["players"])
+        shot_clock = int(run_params["shot_clock"])
+        print(f"  - Grid Size: {grid_size}")
+        print(f"  - Players: {players}")
+        print(f"  - Shot Clock: {shot_clock}")
+    except KeyError as e:
+        print(f"Error: Run {args.run_id} is missing a required parameter: {e}")
+        return
 
-    print("Loading policies...")
-    offense_policy = PPO.load(args.offense_policy)
-    defense_policy = PPO.load(args.defense_policy)
-
-    # --- Evaluation Loop ---
-    print(f"\nRunning {args.episodes} evaluation episodes...")
-    
-    num_episodes = args.episodes
-    episode_results = []
-    
-    # This dictionary will store the frames of the longest episode for each outcome type
-    longest_episodes = {}
-
-    for i in tqdm(range(num_episodes), desc="Running Evaluation"):
-        obs, info = env.reset()
-        done = False
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # --- Download Model Artifacts ---
+        print(f"Fetching latest models from MLflow Run ID: {args.run_id}")
         
-        offense_ids = env.offense_ids
+        artifacts = client.list_artifacts(args.run_id, "models")
         
-        # We now render frames for every episode, if rendering is enabled
-        episode_frames = []
-        if not args.no_render:
-            frame = env.render()
-            episode_frames.append(frame)
+        # Find the latest offense and defense policies by alternation number
+        latest_offense = max([f.path for f in artifacts if "offense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+        latest_defense = max([f.path for f in artifacts if "defense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+        
+        offense_policy_path = client.download_artifacts(args.run_id, latest_offense, tmpdir)
+        defense_policy_path = client.download_artifacts(args.run_id, latest_defense, tmpdir)
 
-        while not done:
-            offense_action, _ = offense_policy.predict(obs, deterministic=True)
-            defense_action, _ = defense_policy.predict(obs, deterministic=True)
+        print(f"  - Downloaded Offense Policy: {os.path.basename(latest_offense)}")
+        print(f"  - Downloaded Defense Policy: {os.path.basename(latest_defense)}")
+        
+        # --- Setup ---
+        print("\nSetting up environment for evaluation...")
+        env = setup_environment(grid_size, players, shot_clock, args.no_render)
 
-            full_action = np.zeros(env.n_players, dtype=int)
-            for player_id in range(env.n_players):
-                if player_id in offense_ids:
-                    full_action[player_id] = offense_action[player_id]
-                else:
-                    full_action[player_id] = defense_action[player_id]
+        print("Loading policies...")
+        offense_policy = PPO.load(offense_policy_path)
+        defense_policy = PPO.load(defense_policy_path)
+
+        # --- Evaluation Loop ---
+        print(f"\nRunning {args.episodes} evaluation episodes...")
+        
+        num_episodes = args.episodes
+        episode_results = []
+        
+        longest_episodes = {}
+
+        for i in tqdm(range(num_episodes), desc="Running Evaluation"):
+            obs, info = env.reset()
+            done = False
             
-            obs, reward, done, _, info = env.step(full_action)
+            offense_ids = env.offense_ids
             
+            episode_frames = []
             if not args.no_render:
                 frame = env.render()
                 episode_frames.append(frame)
 
-        # --- Post-episode analysis ---
-        final_info = info
-        action_results = final_info.get('action_results', {})
-        outcome = "Unknown"
+            while not done:
+                offense_action, _ = offense_policy.predict(obs, deterministic=True)
+                defense_action, _ = defense_policy.predict(obs, deterministic=True)
 
-        if action_results.get('shots'):
-            shot_result = list(action_results['shots'].values())[0]
-            outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
-        elif action_results.get('passes'):
-            pass_result = list(action_results['passes'].values())[0]
-            if pass_result.get('turnover'):
-                outcome = "Turnover (Intercepted)"
-        elif action_results.get('out_of_bounds_turnover'):
-            outcome = "Turnover (Move Out of Bounds)"
-        elif final_info.get('shot_clock', 1) <= 0:
-            outcome = "Turnover (Shot Clock Violation)"
+                full_action = np.zeros(env.n_players, dtype=int)
+                for player_id in range(env.n_players):
+                    if player_id in offense_ids:
+                        full_action[player_id] = offense_action[player_id]
+                    else:
+                        full_action[player_id] = defense_action[player_id]
+                
+                obs, reward, done, _, info = env.step(full_action)
+                
+                if not args.no_render:
+                    frame = env.render()
+                    episode_frames.append(frame)
 
-        episode_results.append({
-            "outcome": outcome,
-            "length": env.step_count
-        })
+            # --- Post-episode analysis ---
+            final_info = info
+            action_results = final_info.get('action_results', {})
+            outcome = "Unknown"
 
-        # --- Check if this is the new longest episode for its category ---
+            if action_results.get('shots'):
+                shot_result = list(action_results['shots'].values())[0]
+                outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
+            elif action_results.get('passes'):
+                pass_result = list(action_results['passes'].values())[0]
+                if pass_result.get('turnover'):
+                    outcome = "Turnover (Intercepted)"
+            elif action_results.get('out_of_bounds_turnover'):
+                outcome = "Turnover (Move Out of Bounds)"
+            elif final_info.get('shot_clock', 1) <= 0:
+                outcome = "Turnover (Shot Clock Violation)"
+
+            episode_results.append({
+                "outcome": outcome,
+                "length": env.step_count
+            })
+
+            if not args.no_render:
+                category = get_outcome_category(outcome)
+                current_length = env.step_count
+                
+                if category not in longest_episodes or current_length > longest_episodes[category]['length']:
+                    longest_episodes[category] = {
+                        'length': current_length,
+                        'frames': episode_frames
+                    }
+
+        # --- Final Report ---
+        analyze_results(episode_results, num_episodes)
+
+        # --- Save GIFs of the longest episodes ---
         if not args.no_render:
-            category = get_outcome_category(outcome)
-            current_length = env.step_count
-            
-            if category not in longest_episodes or current_length > longest_episodes[category]['length']:
-                longest_episodes[category] = {
-                    'length': current_length,
-                    'frames': episode_frames
-                }
-
-    # --- Final Report ---
-    analyze_results(episode_results, num_episodes)
-
-    # --- Save GIFs of the longest episodes ---
-    if not args.no_render:
-        print("\nSaving longest episode GIFs...")
-        for category, data in longest_episodes.items():
-            if data['frames']:
-                gif_path = f"{category}_viz.gif"
-                print(f"  - Saving {gif_path} (length: {data['length']} steps)")
-                imageio.mimsave(gif_path, data['frames'], fps=5)
-        print("Done.")
+            print("\nSaving and logging longest episode GIFs to MLflow...")
+            with mlflow.start_run(run_id=args.run_id): # Re-opens the run to log artifacts
+                for category, data in longest_episodes.items():
+                    if data['frames']:
+                        gif_path = os.path.join(tmpdir, f"{category}_viz.gif")
+                        print(f"  - Saving {os.path.basename(gif_path)} (length: {data['length']} steps)")
+                        imageio.mimsave(gif_path, data['frames'], fps=5, loop=0)
+                        mlflow.log_artifact(gif_path, artifact_path="gifs")
+            print("Done.")
 
     env.close()
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evaluate trained BasketWorld agents.",
+        description="Evaluate trained BasketWorld agents from an MLflow run.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--offense-policy", type=str, required=True, help="Path to the trained offense policy (.zip).")
-    parser.add_argument("--defense-policy", type=str, required=True, help="Path to the trained defense policy (.zip).")
-    parser.add_argument(
-        "--grid-size", 
-        type=int, 
-        default=12, 
-        help="The size of the grid. MUST match the training configuration."
-    )
-    parser.add_argument(
-        "--players", 
-        type=int, 
-        default=2, 
-        help="Number of players per side. MUST match the training configuration."
-    )
-    parser.add_argument(
-        "--shot-clock", 
-        type=int, 
-        default=20, 
-        help="Steps in the shot clock. MUST match the training configuration."
-    )
+    parser.add_argument("--run-id", type=str, required=True, help="The MLflow Run ID to evaluate.")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to run for evaluation.")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering a sample GIF.")
     
