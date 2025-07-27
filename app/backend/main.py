@@ -10,6 +10,7 @@ import basketworld
 from basketworld.envs.basketworld_env_v2 import Team, ActionType
 from stable_baselines3 import PPO
 import mlflow
+import torch
 
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
@@ -132,6 +133,40 @@ def take_step(request: ActionRequest):
     game_state.obs, _, done, _, _ = game_state.env.step(full_action)
     
     return {"status": "success", "state": get_full_game_state()}
+
+@app.get("/api/policy_probabilities")
+def get_policy_probabilities():
+    """
+    Gets the action probabilities from the policy for the user's team,
+    given the current observation.
+    """
+    if not game_state.env or not game_state.user_team:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    try:
+        policy = game_state.offense_policy if game_state.user_team == Team.OFFENSE else game_state.defense_policy
+        
+        # Convert observation to the format the policy expects
+        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
+        
+        # Get the distribution over actions from the policy object
+        distributions = policy.policy.get_distribution(obs_tensor)
+        
+        # The .distribution attribute is a list of individual Categorical distributions.
+        # We need to iterate through it to get the probs for each player.
+        probs_list = [dist.probs.detach().numpy().squeeze().tolist() for dist in distributions.distribution]
+
+        # Return as a dictionary mapping player_id to their list of probabilities
+        response = {
+            player_id: probs 
+            for player_id, probs in enumerate(probs_list) 
+            if player_id in game_state.env.offense_ids or player_id in game_state.env.defense_ids
+        }
+        return jsonable_encoder(response)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get policy probabilities: {e}")
+
 
 def get_full_game_state():
     """Helper function to construct the full game state dictionary."""

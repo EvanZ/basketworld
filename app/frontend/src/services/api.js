@@ -29,9 +29,19 @@ export async function stepGame(actions) {
         body: JSON.stringify({ actions }),
     });
     if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ detail: 'Failed to parse error from stepGame' }));
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to take step' }));
         console.error('[API] stepGame failed:', response.status, errorData);
         throw new Error(errorData.detail || 'Failed to take step');
+    }
+    return response.json();
+}
+
+export async function getPolicyProbs() {
+    const response = await fetch(`${API_BASE_URL}/api/policy_probabilities`);
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to fetch policy probabilities' }));
+        console.error('[API] getPolicyProbs failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to fetch policy probabilities');
     }
     return response.json();
 } 

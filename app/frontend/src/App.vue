@@ -1,17 +1,32 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import GameOver from './components/GameOver.vue';
-import { initGame, stepGame } from './services/api';
+import { initGame, stepGame, getPolicyProbs } from './services/api';
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
+const policyProbs = ref(null);   // For AI suggestions
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
+
+watch(gameState, async (newState) => {
+    if (newState && !newState.done) {
+        try {
+            console.log('[App] Game state changed, fetching policy probabilities...');
+            const probs = await getPolicyProbs();
+            console.log('[App] Received policy probabilities:', probs);
+            policyProbs.value = probs;
+        } catch (e) {
+            console.error("[App] Failed to fetch policy probabilities:", e);
+            policyProbs.value = null;
+        }
+    }
+});
 
 async function handleGameStarted(setupData) {
   isLoading.value = true;
@@ -55,6 +70,7 @@ async function handleActionsSubmitted(actions) {
 function handlePlayAgain() {
   gameState.value = null;
   gameHistory.value = [];
+  policyProbs.value = null;
   activePlayerId.value = null;
   if (initialSetup.value) {
     handleGameStarted(initialSetup.value);
@@ -74,7 +90,11 @@ function handlePlayAgain() {
     <div v-if="error" class="error-message">{{ error }}</div>
 
     <div v-if="gameState" class="game-container">
-      <GameBoard :game-history="gameHistory" :active-player-id="activePlayerId" />
+      <GameBoard 
+        :game-history="gameHistory" 
+        :active-player-id="activePlayerId"
+        :policy-probabilities="policyProbs"
+      />
       <div class="controls-area">
         <PlayerControls 
           v-if="!gameState.done" 

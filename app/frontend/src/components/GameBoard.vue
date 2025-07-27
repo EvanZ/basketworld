@@ -10,6 +10,10 @@ const props = defineProps({
     type: Number,
     default: null,
   },
+  policyProbabilities: {
+    type: Object,
+    default: null,
+  },
 });
 
 // ------------------------------------------------------------
@@ -83,6 +87,43 @@ const viewBox = computed(() => {
     return `${minX} ${minY} ${width} ${height}`;
 });
 
+// This is a direct mapping from our ActionType enum for moves
+const moveActionIndices = {
+    MOVE_E: 1, MOVE_NE: 2, MOVE_NW: 3, MOVE_W: 4, MOVE_SW: 5, MOVE_SE: 6
+};
+const hexDirections = [
+    {q: +1, r:  0}, {q: +1, r: -1}, {q:  0, r: -1}, 
+    {q: -1, r:  0}, {q: -1, r: +1}, {q:  0, r: +1}
+];
+
+const policySuggestions = computed(() => {
+    // Corrected the guard clause to explicitly check for null, fixing the "Player 0" bug.
+    if (props.activePlayerId === null || !props.policyProbabilities || !props.policyProbabilities[props.activePlayerId]) {
+        console.log('[GameBoard] No suggestions to render.');
+        return [];
+    }
+    console.log(`[GameBoard] Calculating suggestions for Player ${props.activePlayerId}`);
+    const currentPlayerPos = currentGameState.value.positions[props.activePlayerId];
+    const probs = props.policyProbabilities[props.activePlayerId];
+
+    const suggestions = [];
+    for (let i = 0; i < hexDirections.length; i++) {
+        const dir = hexDirections[i];
+        const moveActionIndex = i + 1; // Corresponds to MOVE_E ... MOVE_SE
+        const targetPos = { q: currentPlayerPos[0] + dir.q, r: currentPlayerPos[1] + dir.r };
+        const cartesianPos = axialToCartesian(targetPos.q, targetPos.r);
+
+        suggestions.push({
+            x: cartesianPos.x,
+            y: cartesianPos.y,
+            prob: Math.round(probs[moveActionIndex] * 100),
+            key: `sugg-${i}`
+        });
+    }
+    console.log('[GameBoard] Generated suggestions:', suggestions);
+    return suggestions;
+});
+
 </script>
 
 <template>
@@ -150,6 +191,21 @@ const viewBox = computed(() => {
             <!-- Ball handler indicator -->
             <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
           </g>
+        </g>
+        
+        <!-- Draw Policy Suggestions -->
+        <g v-if="policySuggestions.length > 0">
+          <text 
+            v-for="sugg in policySuggestions"
+            :key="sugg.key"
+            :x="sugg.x"
+            :y="sugg.y"
+            dy=".3em"
+            text-anchor="middle"
+            class="policy-suggestion-text"
+          >
+            {{ sugg.prob }}%
+          </text>
         </g>
       </g>
     </svg>
@@ -231,5 +287,14 @@ svg {
 }
 .ghost {
   stroke: none;
+}
+.policy-suggestion-text {
+  font-size: 10px;
+  font-weight: bold;
+  fill: #333;
+  paint-order: stroke;
+  stroke: white;
+  stroke-width: 0.5;
+  pointer-events: none;
 }
 </style> 
