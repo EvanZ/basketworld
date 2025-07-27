@@ -39,14 +39,14 @@ class ActionType(Enum):
     MOVE_NW = 3
     MOVE_W = 4
     MOVE_SW = 5
-    MOVE_S = 6
+    MOVE_SE = 6
     SHOOT = 7
     PASS_E = 8
     PASS_NE = 9
     PASS_NW = 10
     PASS_W = 11
     PASS_SW = 12
-    PASS_S = 13
+    PASS_SE = 13
 
 
 class HexagonBasketballEnv(gym.Env):
@@ -106,14 +106,21 @@ class HexagonBasketballEnv(gym.Env):
             "action_mask": action_mask_space
         })
         
-        # Hexagon direction vectors for POINTY-TOPPED hexagons
+        # --- Hexagonal Grid Directions ---
+        # These are the 6 axial direction vectors for a pointy-topped hexagonal grid.
+        # In our (q, r) axial system:
+        # - Moving E/W changes only the q-axis.
+        # - Moving NW/SE changes only the r-axis.
+        # - Moving NE/SW changes both q and r axes.
+        # The previous vectors were incorrect, causing bugs in movement and passing.
+        # These vectors correctly map ActionType enums to their corresponding axial changes.
         self.hex_directions = [
-            (+1,  0), # E
-            ( 0, -1), # NE
-            (-1, -1), # NW
-            (-1,  0), # W
-            ( 0, +1), # SW
-            (+1, +1), # S
+            (+1,  0), # E:  Move one hex to the right.
+            (+1, -1), # NE: Move diagonally up-right.
+            ( 0, -1), # NW: Move diagonally up-left.
+            (-1,  0), # W:  Move one hex to the left.
+            (-1, +1), # SW: Move diagonally down-left.
+            ( 0, +1), # SE: Move diagonally down-right.
         ]
         
         self._rng = np.random.default_rng(seed)
@@ -272,7 +279,7 @@ class HexagonBasketballEnv(gym.Env):
         intended_moves = {}
         for player_id, action_val in enumerate(actions):
             action = ActionType(action_val)
-            if ActionType.MOVE_E.value <= action.value <= ActionType.MOVE_S.value:
+            if ActionType.MOVE_E.value <= action.value <= ActionType.MOVE_SE.value:
                 direction_idx = action.value - ActionType.MOVE_E.value
                 new_pos = self._get_adjacent_position(current_positions[player_id], direction_idx)
                 
@@ -338,6 +345,7 @@ class HexagonBasketballEnv(gym.Env):
     
     def _attempt_pass(self, passer_id: int, direction_idx: int) -> Dict:
         """Attempt a pass from the ball holder in a specific direction."""
+        print(f"[ENV] Attempting pass from {passer_id} with direction_idx: {direction_idx} -> {self.hex_directions[direction_idx]}")
         passer_pos = self.positions[passer_id]
         
         # Project a line of sight from the passer

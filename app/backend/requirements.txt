@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+numpy
+stable-baselines3
+mlflow
+-e ../.. # Install the local basketworld package in editable mode 

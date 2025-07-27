@@ -1,0 +1,166 @@
+<script setup>
+import { ref, computed, watch } from 'vue';
+import HexagonControlPad from './HexagonControlPad.vue';
+
+const props = defineProps({
+  gameState: {
+    type: Object,
+    required: true,
+  },
+  activePlayerId: {
+    type: Number,
+    default: null,
+  }
+});
+
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId']);
+
+const selectedActions = ref({});
+
+const userControlledPlayerIds = computed(() => {
+  if (!props.gameState || !props.gameState.user_team_name) {
+    return [];
+  }
+  return props.gameState.user_team_name === 'OFFENSE' 
+    ? props.gameState.offense_ids 
+    : props.gameState.defense_ids;
+});
+
+// Watch for the list of players to be populated, then set the first one as active.
+// The `immediate` flag ensures this runs on component creation.
+watch(userControlledPlayerIds, (newPlayerIds) => {
+    if (newPlayerIds && newPlayerIds.length > 0 && props.activePlayerId === null) {
+        emit('update:activePlayerId', newPlayerIds[0]);
+    }
+}, { immediate: true });
+
+const actionNames = Object.values({
+  0: "NOOP", 
+  1: "MOVE_E", 2: "MOVE_NE", 3: "MOVE_NW", 4: "MOVE_W", 5: "MOVE_SW", 6: "MOVE_SE", 
+  7: "SHOOT", 
+  8: "PASS_E", 9: "PASS_NE", 10: "PASS_NW", 11: "PASS_W", 12: "PASS_SW", 13: "PASS_SE"
+});
+
+function getLegalActions(playerId) {
+  if (!props.gameState.action_mask || !props.gameState.action_mask[playerId]) {
+    return [];
+  }
+  const mask = props.gameState.action_mask[playerId];
+  const legalActions = [];
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] === 1 && i < actionNames.length) {
+      legalActions.push(actionNames[i]);
+    }
+  }
+  return legalActions;
+}
+
+function handleActionSelected(action) {
+  if (props.activePlayerId !== null) {
+    // If the same action is clicked again, deselect it. Otherwise, select the new one.
+    if (selectedActions.value[props.activePlayerId] === action) {
+      delete selectedActions.value[props.activePlayerId];
+    } else {
+      selectedActions.value[props.activePlayerId] = action;
+      // Optional: automatically switch to next player only when a new action is chosen
+      const currentIndex = userControlledPlayerIds.value.indexOf(props.activePlayerId);
+      const nextIndex = (currentIndex + 1) % userControlledPlayerIds.value.length;
+      emit('update:activePlayerId', userControlledPlayerIds.value[nextIndex]);
+    }
+  }
+}
+
+function submitActions() {
+  const userActions = {};
+  for (const playerId of userControlledPlayerIds.value) {
+    const actionName = selectedActions.value[playerId] || 'NOOP';
+    userActions[playerId] = actionNames.indexOf(actionName);
+  }
+  console.log('[PlayerControls] Emitting actions-submitted with payload:', userActions);
+  emit('actions-submitted', userActions);
+  selectedActions.value = {};
+  if (userControlledPlayerIds.value.length > 0) {
+    emit('update:activePlayerId', userControlledPlayerIds.value[0]);
+  }
+}
+
+</script>
+
+<template>
+  <div class="player-controls-container">
+    <h3>Player Controls</h3>
+    <div class="player-tabs">
+        <button 
+            v-for="playerId in userControlledPlayerIds" 
+            :key="playerId"
+            :class="{ active: activePlayerId === playerId }"
+            @click="$emit('update:activePlayerId', playerId)"
+        >
+            Player {{ playerId }}
+            <span v-if="selectedActions[playerId]">
+              ({{ selectedActions[playerId].startsWith('MOVE') ? 'M' : selectedActions[playerId].startsWith('PASS') ? 'P' : selectedActions[playerId] }})
+            </span>
+        </button>
+    </div>
+    
+    <div class="control-pad-wrapper" v-if="activePlayerId !== null">
+        <HexagonControlPad 
+            :legal-actions="getLegalActions(activePlayerId)"
+            :selected-action="selectedActions[activePlayerId]"
+            @action-selected="handleActionSelected"
+        />
+        <p v-if="selectedActions[activePlayerId]">
+            Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
+        </p>
+    </div>
+
+    <button @click="submitActions" class="submit-button">
+      Submit Turn
+    </button>
+  </div>
+</template>
+
+<style scoped>
+.player-controls-container {
+  padding: 1rem;
+  background-color: #f8f9fa;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+}
+.player-tabs {
+    display: flex;
+    margin-bottom: 1rem;
+}
+.player-tabs button {
+    flex-grow: 1;
+    padding: 0.5rem;
+    border: 1px solid #ccc;
+    background: #fff;
+    cursor: pointer;
+}
+.player-tabs button.active {
+    background-color: #007bff;
+    color: white;
+    border-color: #007bff;
+}
+.control-pad-wrapper {
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    text-align: center;
+}
+.submit-button {
+  margin-top: auto; /* Pushes button to the bottom */
+  padding: 0.75rem;
+  background-color: #28a745;
+  color: white;
+  border: none;
+  font-size: 1.2rem;
+}
+.submit-button:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+}
+</style> 
