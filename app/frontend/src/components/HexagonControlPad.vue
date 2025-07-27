@@ -10,6 +10,10 @@ const props = defineProps({
     type: String,
     default: null,
   },
+  shotProbability: {
+    type: Number,
+    default: null,
+  }
 });
 
 const emit = defineEmits(['action-selected']);
@@ -27,7 +31,7 @@ const icons = {
 
 // --- Button Layout and Icon Configuration ---
 const buttonConfig = {
-  SHOOT: { style: { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }, icon: icons.shoot, rotation: 0 },
+  SHOOT: { style: { top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: '60px', borderRadius: '8px' }, icon: icons.shoot, rotation: 0 },
   // Moves
   MOVE_E:  { style: { top: '50%', left: '100%', transform: 'translate(-50%, -50%)' }, icon: icons.move, rotation: 0 },
   MOVE_NE: { style: { top: '15%', left: '75%', transform: 'translate(-50%, -50%)' }, icon: icons.move, rotation: -60 },
@@ -62,6 +66,9 @@ function selectAction(action) {
         :title="action"
       >
         <span class="icon-wrapper" :style="{ transform: `rotate(${buttonConfig[action].rotation}deg)` }" v-html="buttonConfig[action].icon"></span>
+        <span v-if="action === 'SHOOT' && shotProbability !== null" class="shot-prob">
+            {{ Math.round(shotProbability * 100) }}%
+        </span>
       </button>
     </div>
   </div>
@@ -94,6 +101,19 @@ function selectAction(action) {
   border: 1px solid #ccc;
   background-color: #f0f0f0;
   transition: background-color 0.2s, color 0.2s;
+}
+
+.shot-prob {
+  position: absolute;
+  bottom: -20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.7);
+  color: white;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: bold;
 }
 
 .action-button.selected {

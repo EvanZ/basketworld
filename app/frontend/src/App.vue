@@ -1,12 +1,13 @@
 <script setup>
-import { ref, computed } from 'vue';
+import { ref } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import GameOver from './components/GameOver.vue';
 import { initGame, stepGame } from './services/api';
 
-const gameState = ref(null);
+const gameState = ref(null);      // For current state and UI logic
+const gameHistory = ref([]);     // For ghost trails
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
@@ -15,11 +16,14 @@ const activePlayerId = ref(null);
 async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
-  initialSetup.value = setupData; // Save setup for play again
+  initialSetup.value = setupData;
+  gameState.value = null;      // Ensure old board is cleared
+  gameHistory.value = [];      // Clear history
   try {
     const response = await initGame(setupData.runId, setupData.userTeam);
     if (response.status === 'success') {
       gameState.value = response.state;
+      gameHistory.value.push(response.state);
     } else {
       throw new Error(response.message || 'Failed to start game.');
     }
@@ -33,32 +37,27 @@ async function handleGameStarted(setupData) {
 
 async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
-  console.log('[App] Received actions-submitted with:', actions);
-  isLoading.value = true;
-  error.value = null;
+  // No loading indicator for steps, feels more responsive
   try {
     const response = await stepGame(actions);
      if (response.status === 'success') {
-      console.log('[App] Step successful, updating gameState.');
       gameState.value = response.state;
+      gameHistory.value.push(response.state);
     } else {
-      console.error('[App] Step API returned an error status:', response);
       throw new Error(response.message || 'Failed to process step.');
     }
   } catch (err) {
-    console.error('[App] Error during stepGame call:', err);
     error.value = err.message;
     console.error(err);
-  } finally {
-    isLoading.value = false;
   }
 }
 
 function handlePlayAgain() {
-  gameState.value = null; // Clear the board
-  activePlayerId.value = null; // Reset active player
+  gameState.value = null;
+  gameHistory.value = [];
+  activePlayerId.value = null;
   if (initialSetup.value) {
-    handleGameStarted(initialSetup.value); // Start a new game with same settings
+    handleGameStarted(initialSetup.value);
   }
 }
 </script>
@@ -69,13 +68,13 @@ function handlePlayAgain() {
       <h1>Welcome to BasketWorld</h1>
     </header>
 
-    <GameSetup v-if="!gameState && !initialSetup" @game-started="handleGameStarted" :is-loading="isLoading" />
-
+    <GameSetup v-if="!gameState && !initialSetup" @game-started="handleGameStarted" />
+    
     <div v-if="isLoading && !gameState" class="loading">Loading Game...</div>
     <div v-if="error" class="error-message">{{ error }}</div>
 
     <div v-if="gameState" class="game-container">
-      <GameBoard :game-state="gameState" :active-player-id="activePlayerId" />
+      <GameBoard :game-history="gameHistory" :active-player-id="activePlayerId" />
       <div class="controls-area">
         <PlayerControls 
           v-if="!gameState.done" 

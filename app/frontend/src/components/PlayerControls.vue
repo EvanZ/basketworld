@@ -3,7 +3,7 @@ import { ref, computed, watch } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 
 const props = defineProps({
-  gameState: {
+  gameState: { // This is now the currentGameState computed property from App.vue
     type: Object,
     required: true,
   },
@@ -84,6 +84,41 @@ function submitActions() {
   }
 }
 
+// --- Shot Probability Logic (Ported from Python) ---
+function hexDistance(pos1, pos2) {
+  const [q1, r1] = pos1;
+  const [q2, r2] = pos2;
+  // This formula must exactly match the Python environment's _hex_distance method.
+  return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
+}
+
+function calculateShotProbability(distance) {
+  if (distance <= 1) return 0.9;
+  if (distance <= 3) return 0.5;
+  if (distance <= 5) return 0.2;
+  return 0.05;
+}
+
+const shotProbability = computed(() => {
+    if (props.activePlayerId === null || !props.gameState || !props.gameState.positions[props.activePlayerId]) {
+        return null;
+    }
+    const playerPos = props.gameState.positions[props.activePlayerId];
+    const basketPos = props.gameState.basket_position; 
+
+    // --- DEBUG LOG ---
+    console.log('[ShotCalc] Player Pos:', JSON.stringify(playerPos));
+    console.log('[ShotCalc] Basket Pos:', JSON.stringify(basketPos));
+
+    if (!playerPos || !basketPos) {
+        console.error('[ShotCalc] Error: One of the positions is missing.');
+        return null;
+    }
+    
+    const distance = hexDistance(playerPos, basketPos);
+    return calculateShotProbability(distance);
+});
+
 </script>
 
 <template>
@@ -107,6 +142,7 @@ function submitActions() {
         <HexagonControlPad 
             :legal-actions="getLegalActions(activePlayerId)"
             :selected-action="selectedActions[activePlayerId]"
+            :shot-probability="shotProbability"
             @action-selected="handleActionSelected"
         />
         <p v-if="selectedActions[activePlayerId]">

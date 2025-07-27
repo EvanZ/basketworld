@@ -2,8 +2,8 @@
 import { computed } from 'vue';
 
 const props = defineProps({
-  gameState: {
-    type: Object,
+  gameHistory: {
+    type: Array,
     required: true,
   },
   activePlayerId: {
@@ -32,13 +32,26 @@ function offsetToAxial(col, row) {
   return { q, r };
 }
 
+function getRenderablePlayers(gameState) {
+  if (!gameState || !gameState.positions) return [];
+  return gameState.positions.map((pos, index) => {
+    const [q, r] = pos;
+    const { x, y } = axialToCartesian(q, r);
+    const isOffense = gameState.offense_ids.includes(index);
+    const hasBall = gameState.ball_holder === index;
+    return { id: index, x, y, isOffense, hasBall };
+  });
+}
+
+const currentGameState = computed(() => {
+  return props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
+});
+
 const courtLayout = computed(() => {
     const hexes = [];
-    if (!props.gameState.court_width || !props.gameState.court_height) {
-        return [];
-    }
-    for (let r_off = 0; r_off < props.gameState.court_height; r_off++) {
-        for (let c_off = 0; c_off < props.gameState.court_width; c_off++) {
+    if (!currentGameState.value) return [];
+    for (let r_off = 0; r_off < currentGameState.value.court_height; r_off++) {
+        for (let c_off = 0; c_off < currentGameState.value.court_width; c_off++) {
             const { q, r } = offsetToAxial(c_off, r_off);
             const { x, y } = axialToCartesian(q, r);
             hexes.push({ q, r, x, y, key: `${q},${r}` });
@@ -47,20 +60,9 @@ const courtLayout = computed(() => {
     return hexes;
 });
 
-const renderedPlayers = computed(() => {
-  return props.gameState.positions.map((pos, index) => {
-    const [q, r] = pos;
-    const { x, y } = axialToCartesian(q, r);
-    const isOffense = props.gameState.offense_ids.includes(index);
-    const hasBall = props.gameState.ball_holder === index;
-    return { id: index, x, y, isOffense, hasBall };
-  });
-});
-
 const basketPosition = computed(() => {
-    if (!props.gameState.basket_position) return { x: 0, y: 0 };
-    const [q, r] = props.gameState.basket_position;
-    // Manually adjusting the basket 'up' by one row to match the original gym render.
+    if (!currentGameState.value) return { x: 0, y: 0 };
+    const [q, r] = currentGameState.value.basket_position;
     return axialToCartesian(q, r - 1);
 });
 
@@ -104,25 +106,55 @@ const viewBox = computed(() => {
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
 
-        <!-- Draw the players -->
-        <g v-for="player in renderedPlayers" :key="player.id">
-          <circle 
-            :cx="player.x" 
-            :cy="player.y" 
-            :r="HEX_RADIUS * 0.6" 
-            :class="[
-              player.isOffense ? 'player-offense' : 'player-defense',
-              { 'active-player-hex': player.id === activePlayerId }
-            ]"
-          />
-          <text :x="player.x" :y="player.y" dy=".3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
-          <!-- Ball handler indicator -->
-          <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
+        <!-- Draw Ghost Trails -->
+        <g 
+          v-for="(gameState, step) in gameHistory" 
+          :key="`step-${step}`" 
+          :style="{ opacity: 0.1 + (0.9 * step / (gameHistory.length - 1)) }"
+        >
+          <g v-for="player in getRenderablePlayers(gameState)" :key="player.id">
+            <circle 
+              v-if="step < gameHistory.length - 1"
+              :cx="player.x" 
+              :cy="player.y" 
+              :r="HEX_RADIUS * 0.6" 
+              :class="player.isOffense ? 'player-offense' : 'player-defense'"
+              class="ghost"
+            />
+            <text 
+              v-if="step < gameHistory.length - 1"
+              :x="player.x" 
+              :y="player.y" 
+              dy=".3em" 
+              text-anchor="middle" 
+              class="player-text ghost-text"
+            >
+              {{ player.id }}
+            </text>
+          </g>
+        </g>
+        
+        <!-- Draw the current players on top -->
+        <g v-if="currentGameState">
+          <g v-for="player in getRenderablePlayers(currentGameState)" :key="player.id">
+            <circle 
+              :cx="player.x" 
+              :cy="player.y" 
+              :r="HEX_RADIUS * 0.6" 
+              :class="[
+                player.isOffense ? 'player-offense' : 'player-defense',
+                { 'active-player-hex': player.id === activePlayerId }
+              ]"
+            />
+            <text :x="player.x" :y="player.y" dy=".3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
+            <!-- Ball handler indicator -->
+            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
+          </g>
         </g>
       </g>
     </svg>
     <div class="shot-clock-overlay">
-      {{ gameState.shot_clock }}
+      {{ currentGameState ? currentGameState.shot_clock : '' }}
     </div>
   </div>
 </template>
@@ -181,6 +213,11 @@ svg {
   stroke: black;
   stroke-width: 0.5;
 }
+.ghost-text {
+  font-size: 10px;
+  opacity: 0.7;
+  stroke-width: 0.2;
+}
 .basket-rim {
   fill: none;
   stroke: #ff8c00;
@@ -191,5 +228,8 @@ svg {
   stroke: orange;
   stroke-width: 3;
   stroke-dasharray: 6 3;
+}
+.ghost {
+  stroke: none;
 }
 </style> 
