@@ -16,6 +16,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import Logger, HumanOutputFormat
+from basketworld.utils.mlflow_logger import MLflowWriter
 
 import mlflow
 import sys
@@ -229,6 +231,9 @@ def main(args):
                 log_freq=args.n_steps
             )
             
+            offense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Offense")])
+            offense_policy.set_logger(offense_logger)
+
             offense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
                 reset_num_timesteps=False,
@@ -258,6 +263,9 @@ def main(args):
                 defense_policy=defense_policy, 
                 log_freq=args.n_steps
             )
+
+            defense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Defense")])
+            defense_policy.set_logger(defense_logger)
 
             defense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
