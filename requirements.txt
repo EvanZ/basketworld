@@ -2,7 +2,7 @@ absl-py==2.3.1
 alembic==1.16.4
 annotated-types==0.7.0
 anyio==4.9.0
--e file:///Users/evanzamir/projects/basketworld
+-e .
 black==25.1.0
 blinker==1.9.0
 cachetools==5.5.2

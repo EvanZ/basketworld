@@ -154,7 +154,7 @@ def get_policy_probabilities():
         
         # The .distribution attribute is a list of individual Categorical distributions.
         # We need to iterate through it to get the probs for each player.
-        probs_list = [dist.probs.detach().numpy().squeeze().tolist() for dist in distributions.distribution]
+        probs_list = [dist.probs.detach().cpu().numpy().squeeze().tolist() for dist in distributions.distribution]
 
         # Return as a dictionary mapping player_id to their list of probabilities
         response = {

@@ -345,7 +345,6 @@ class HexagonBasketballEnv(gym.Env):
     
     def _attempt_pass(self, passer_id: int, direction_idx: int) -> Dict:
         """Attempt a pass from the ball holder in a specific direction."""
-        print(f"[ENV] Attempting pass from {passer_id} with direction_idx: {direction_idx} -> {self.hex_directions[direction_idx]}")
         passer_pos = self.positions[passer_id]
         
         # Project a line of sight from the passer
