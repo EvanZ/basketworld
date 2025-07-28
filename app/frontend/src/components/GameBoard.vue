@@ -76,10 +76,11 @@ const viewBox = computed(() => {
     const allX = courtLayout.value.map(h => h.x);
     const allY = courtLayout.value.map(h => h.y);
     
-    const minX = Math.min(...allX) - HEX_RADIUS;
-    const maxX = Math.max(...allX) + HEX_RADIUS;
-    const minY = Math.min(...allY) - HEX_RADIUS;
-    const maxY = Math.max(...allY) + HEX_RADIUS;
+    const margin = HEX_RADIUS * 3; // Increased margin for more padding
+    const minX = Math.min(...allX) - margin;
+    const maxX = Math.max(...allX) + margin;
+    const minY = Math.min(...allY) - margin;
+    const maxY = Math.max(...allY) + margin;
 
     const width = maxX - minX;
     const height = maxY - minY;
