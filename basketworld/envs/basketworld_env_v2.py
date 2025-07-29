@@ -227,22 +227,24 @@ class HexagonBasketballEnv(gym.Env):
         positions = []
         taken_positions = set()
 
-        # Defense spawns near the basket (top of the court)
-        for _ in self.defense_ids:
+        # Offense spawns on the right side of the court (opposite the basket)
+        for _ in self.offense_ids:
             while True:
-                col = self._rng.integers(0, self.court_width)
-                row = self._rng.integers(0, self.court_height // 2)
+                # Spawn in the right half of the court
+                col = self._rng.integers(self.court_width // 2, self.court_width)
+                row = self._rng.integers(0, self.court_height)
                 axial_pos = self._offset_to_axial(col, row)
                 if axial_pos not in taken_positions and axial_pos != self.basket_position:
                     positions.append(axial_pos)
                     taken_positions.add(axial_pos)
                     break
 
-        # Offense spawns down-court (bottom half of the court)
-        for _ in self.offense_ids:
+        # Defense spawns near the center of the court, between the basket and half-court
+        for _ in self.defense_ids:
             while True:
-                col = self._rng.integers(0, self.court_width)
-                row = self._rng.integers(self.court_height // 2, self.court_height)
+                # Spawn in the second quarter of the court horizontally
+                col = self._rng.integers(self.court_width // 4, self.court_width // 2)
+                row = self._rng.integers(0, self.court_height)
                 axial_pos = self._offset_to_axial(col, row)
                 if axial_pos not in taken_positions and axial_pos != self.basket_position:
                     positions.append(axial_pos)
