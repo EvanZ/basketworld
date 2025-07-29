@@ -18,6 +18,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
+from basketworld.utils.callbacks import RolloutUpdateTimingCallback
 
 import mlflow
 import sys
@@ -189,6 +190,10 @@ def main(args):
         # SB3 requires an environment to initialize a policy. We'll create a temporary one.
         temp_env = DummyVecEnv([lambda: setup_environment(args, Team.OFFENSE)])
         
+        # --- Initialize Timing Callbacks ---
+        offense_timing_callback = RolloutUpdateTimingCallback()
+        defense_timing_callback = RolloutUpdateTimingCallback()
+
         print("Initializing policies...")
         offense_policy = PPO(
             "MultiInputPolicy", 
@@ -224,7 +229,7 @@ def main(args):
             ])
             offense_policy.set_env(offense_env)
             
-            offense_callback = MLflowCallback(
+            offense_mlflow_callback = MLflowCallback(
                 team_name="Offense", 
                 offense_policy=offense_policy, 
                 defense_policy=defense_policy, 
@@ -237,7 +242,7 @@ def main(args):
             offense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
                 reset_num_timesteps=False,
-                callback=offense_callback
+                callback=[offense_mlflow_callback, offense_timing_callback]
             )
             offense_env.close()
             
@@ -257,7 +262,7 @@ def main(args):
             ])
             defense_policy.set_env(defense_env)
 
-            defense_callback = MLflowCallback(
+            defense_mlflow_callback = MLflowCallback(
                 team_name="Defense", 
                 offense_policy=offense_policy, 
                 defense_policy=defense_policy, 
@@ -270,7 +275,7 @@ def main(args):
             defense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
                 reset_num_timesteps=False,
-                callback=defense_callback
+                callback=[defense_mlflow_callback, defense_timing_callback]
             )
             defense_env.close()
 
@@ -280,7 +285,25 @@ def main(args):
                 mlflow.log_artifact(defense_model_path, artifact_path="models")
             print(f"Logged defense model for alternation {i+1} to MLflow")
 
-    print("\n--- Training Complete ---")
+        print("\n--- Training Complete ---")
+
+        # --- Log final performance metrics ---
+        if offense_timing_callback.rollout_times:
+            mean_rollout_offense = np.mean(offense_timing_callback.rollout_times)
+            mean_update_offense = np.mean(offense_timing_callback.update_times)
+            print(f"Offense Mean Rollout Time: {mean_rollout_offense:.3f} s")
+            print(f"Offense Mean Update Time:  {mean_update_offense:.3f} s")
+            mlflow.log_param("perf_mean_rollout_sec_offense", f"{mean_rollout_offense:.3f}")
+            mlflow.log_param("perf_mean_update_sec_offense", f"{mean_update_offense:.3f}")
+
+        if defense_timing_callback.rollout_times:
+            mean_rollout_defense = np.mean(defense_timing_callback.rollout_times)
+            mean_update_defense = np.mean(defense_timing_callback.update_times)
+            print(f"Defense Mean Rollout Time: {mean_rollout_defense:.3f} s")
+            print(f"Defense Mean Update Time:  {mean_update_defense:.3f} s")
+            mlflow.log_param("perf_mean_rollout_sec_defense", f"{mean_rollout_defense:.3f}")
+            mlflow.log_param("perf_mean_update_sec_defense", f"{mean_update_defense:.3f}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO models using self-play.")
