@@ -10,8 +10,15 @@ class MLflowWriter(KVWriter):
     def __init__(self, team_name: str):
         self.team_name = team_name
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Any], step: int = 0) -> None:  # type: ignore[override]
+    def write(self, key_values: Dict[str, Any], key_excludes: Dict[str, str], step: int = 0) -> None:
         for key, value in key_values.items():
+            # The previous exclusion logic was too aggressive and has been removed.
+            # We will now attempt to log all scalar values passed to the writer.
+
+            # Handle tensor values by converting them to a scalar float
+            if hasattr(value, "item"):
+                value = value.item()
+            
             if isinstance(value, (int, float)):
                 mlflow.log_metric(f"{self.team_name} {key}", float(value), step=int(step))
 
