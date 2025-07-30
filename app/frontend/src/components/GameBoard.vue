@@ -26,7 +26,8 @@ const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
 // Formula identical to the one in basketworld_env_v2.py:_render_visual.
 function axialToCartesian(q, r) {
   const x = HEX_RADIUS * (Math.sqrt(3) * q + Math.sqrt(3) / 2 * r);
-  const y = HEX_RADIUS * (1.5 * r);
+  // Flip Y so that row 0 appears at the top of the SVG (training env orientation)
+  const y = -HEX_RADIUS * (1.5 * r);
   return { x, y };
 }
 // Helper function from Python environment to get axial coordinates for "odd-r"
@@ -67,7 +68,8 @@ const courtLayout = computed(() => {
 const basketPosition = computed(() => {
     if (!currentGameState.value) return { x: 0, y: 0 };
     const [q, r] = currentGameState.value.basket_position;
-    return axialToCartesian(q, r - 1);
+    // The basket axial coordinates already match the environment; no offset needed.
+    return axialToCartesian(q, r);
 });
 
 const viewBox = computed(() => {
