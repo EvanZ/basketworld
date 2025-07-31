@@ -13,7 +13,7 @@ const props = defineProps({
   }
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again']);
 
 const selectedActions = ref({});
 
@@ -150,8 +150,12 @@ const shotProbability = computed(() => {
         </p>
     </div>
 
-    <button @click="submitActions" class="submit-button">
+    <button @click="submitActions" class="submit-button" :disabled="gameState.done">
       Submit Turn
+    </button>
+    
+    <button @click="$emit('play-again')" class="new-game-button">
+      New Game
     </button>
   </div>
 </template>
@@ -186,6 +190,17 @@ const shotProbability = computed(() => {
     padding: 1rem;
     margin-bottom: 1rem;
     text-align: center;
+}
+.new-game-button {
+    margin-top: 1rem;
+    width: 100%;
+    padding: 0.75rem;
+    background-color: #28a745;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    cursor: pointer;
 }
 .submit-button {
   margin-top: auto; /* Pushes button to the bottom */

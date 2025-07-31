@@ -221,37 +221,54 @@ class HexagonBasketballEnv(gym.Env):
                 masks[i, shoot_pass_actions] = 0
                 
         return masks
-        
+         
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
-        """Generate initial non-overlapping positions for all players."""
-        positions = []
+        """
+        Generate initial positions with offense on the far edge and defense adjacent.
+        """
+        offense_positions = []
+        defense_positions = []
         taken_positions = set()
 
-        # Offense spawns on the right side of the court (opposite the basket)
-        for _ in self.offense_ids:
-            while True:
-                # Spawn in the right half of the court
-                col = self._rng.integers(self.court_width // 2, self.court_width)
-                row = self._rng.integers(0, self.court_height)
-                axial_pos = self._offset_to_axial(col, row)
-                if axial_pos not in taken_positions and axial_pos != self.basket_position:
-                    positions.append(axial_pos)
-                    taken_positions.add(axial_pos)
-                    break
+        # 1. Spawn offense on the far edge of the court (right side)
+        edge_col = self.court_width - 1
+        
+        # Ensure we don't try to sample more rows than available
+        num_to_sample = min(self.players_per_side, self.court_height)
+        offensive_rows = self._rng.choice(self.court_height, size=num_to_sample, replace=False)
 
-        # Defense spawns near the center of the court, between the basket and half-court
-        for _ in self.defense_ids:
-            while True:
-                # Spawn in the second quarter of the court horizontally
-                col = self._rng.integers(self.court_width // 4, self.court_width // 2)
-                row = self._rng.integers(0, self.court_height)
-                axial_pos = self._offset_to_axial(col, row)
-                if axial_pos not in taken_positions and axial_pos != self.basket_position:
-                    positions.append(axial_pos)
-                    taken_positions.add(axial_pos)
-                    break
-                    
-        return positions
+        for row in offensive_rows:
+            axial_pos = self._offset_to_axial(edge_col, row)
+            if axial_pos != self.basket_position:
+                offense_positions.append(axial_pos)
+                taken_positions.add(axial_pos)
+        
+        if len(offense_positions) < self.players_per_side:
+            raise ValueError("Could not spawn all offensive players on the edge. Check court dimensions and player count.")
+
+        # 2. Spawn defense adjacent to each offensive player
+        # Directions ordered from "in front of" (towards basket) to "behind"
+        # W, SW, NW, SE, NE, E
+        preferred_directions_indices = [3, 4, 2, 5, 1, 0]
+
+        for off_pos in offense_positions:
+            placed_defender = False
+            for dir_idx in preferred_directions_indices:
+                direction_vector = self.hex_directions[dir_idx]
+                def_pos = (off_pos[0] + direction_vector[0], off_pos[1] + direction_vector[1])
+
+                if self._is_valid_position(*def_pos) and def_pos not in taken_positions and def_pos != self.basket_position:
+                    defense_positions.append(def_pos)
+                    taken_positions.add(def_pos)
+                    placed_defender = True
+                    break  # Move to the next offensive player
+            
+            if not placed_defender:
+                # This should be rare, but is possible on very crowded/small courts
+                raise RuntimeError(f"Could not find a valid adjacent spawn for a defender near {off_pos}")
+
+        # The final list must have offense positions first, then defense
+        return offense_positions + defense_positions
     
     def _is_valid_position(self, q: int, r: int) -> bool:
         """Check if a hexagon position is within the rectangular court bounds."""

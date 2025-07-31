@@ -143,12 +143,75 @@ const ballHandlerShotProb = computed(() => {
     return probs[7];
 });
 
+const playerTransitions = computed(() => {
+  if (props.gameHistory.length < 2) {
+    return [];
+  }
+  const transitions = [];
+  // Start from the second state, as moves happen between states.
+  for (let step = 1; step < props.gameHistory.length; step++) {
+    const previousGameState = props.gameHistory[step - 1];
+    const currentGameState = props.gameHistory[step];
+    // Opacity should match the destination ghost cell's opacity.
+    const opacity = 0.1 + (0.9 * (step - 1) / (props.gameHistory.length - 1));
+
+    for (let playerId = 0; playerId < currentGameState.positions.length; playerId++) {
+      const prevPos = previousGameState.positions[playerId];
+      const currentPos = currentGameState.positions[playerId];
+
+      // Check if the position has changed
+      if (prevPos[0] !== currentPos[0] || prevPos[1] !== currentPos[1]) {
+        const { x: startX, y: startY } = axialToCartesian(prevPos[0], prevPos[1]);
+        const { x: endX, y: endY } = axialToCartesian(currentPos[0], currentPos[1]);
+        
+        const isOffense = currentGameState.offense_ids.includes(playerId);
+
+        transitions.push({
+          key: `arrow-${step}-${playerId}`,
+          startX,
+          startY,
+          endX,
+          endY,
+          opacity,
+          isOffense,
+        });
+      }
+    }
+  }
+  return transitions;
+});
+
 </script>
 
 <template>
   <div class="game-board-container">
     <svg :viewBox="viewBox" preserveAspectRatio="xMidYMid meet">
-      <g>
+      <defs>
+        <marker
+          id="arrowhead-offense"
+          viewBox="0 0 10 10"
+          refX="9"
+          refY="5"
+          markerWidth="5"
+          markerHeight="5"
+          orient="auto"
+        >
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#007bff" />
+        </marker>
+        <marker
+          id="arrowhead-defense"
+          viewBox="0 0 10 10"
+          refX="9"
+          refY="5"
+          markerWidth="5"
+          markerHeight="5"
+          orient="auto"
+        >
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc3545" />
+        </marker>
+      </defs>
+      <!-- Flip the whole court vertically with translation to keep it in view -->
+      <g :transform="boardTransform">
         <!-- Draw the court hexes -->
         <polygon
           v-for="hex in courtLayout"
@@ -194,6 +257,19 @@ const ballHandlerShotProb = computed(() => {
           </g>
         </g>
         
+        <!-- Draw Transition Arrows -->
+        <g v-for="move in playerTransitions" :key="move.key" :style="{ opacity: move.opacity }">
+          <line
+            :x1="move.startX"
+            :y1="move.startY"
+            :x2="move.endX"
+            :y2="move.endY"
+            :stroke="move.isOffense ? '#007bff' : '#dc3545'"
+            stroke-width="3"
+            :marker-end="move.isOffense ? 'url(#arrowhead-offense)' : 'url(#arrowhead-defense)'"
+          />
+        </g>
+
         <!-- Draw the current players on top -->
         <g v-if="currentGameState">
           <g v-for="player in getRenderablePlayers(currentGameState)" :key="player.id">
@@ -209,7 +285,7 @@ const ballHandlerShotProb = computed(() => {
             <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
             <!-- Display shot probability inside the ball handler's hex -->
             <text 
-              v-if="player.hasBall && ballHandlerShotProb !== null"
+              v-if="player.hasBall && player.id === activePlayerId && ballHandlerShotProb !== null"
               :x="player.x" 
               :y="player.y" 
               dy="1.4em" 

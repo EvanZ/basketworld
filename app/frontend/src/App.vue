@@ -3,7 +3,6 @@ import { ref, watch } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
-import GameOver from './components/GameOver.vue';
 import { initGame, stepGame, getPolicyProbs } from './services/api';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -97,19 +96,13 @@ function handlePlayAgain() {
       />
       <div class="controls-area">
         <PlayerControls 
-          v-if="!gameState.done" 
           :game-state="gameState" 
           v-model:activePlayerId="activePlayerId"
           @actions-submitted="handleActionsSubmitted" 
+          @play-again="handlePlayAgain"
         />
       </div>
     </div>
-
-    <GameOver 
-      v-if="gameState && gameState.done" 
-      :results="gameState.last_action_results" 
-      @play-again="handlePlayAgain" 
-    />
   </main>
 </template>
 
