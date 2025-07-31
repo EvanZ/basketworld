@@ -261,8 +261,7 @@ class HexagonBasketballEnv(gym.Env):
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
         """Process all player actions simultaneously with collision resolution."""
         results = {
-            "moves": {}, "passes": {}, "shots": {}, "collisions": [],
-            "out_of_bounds_turnover": False
+            "moves": {}, "passes": {}, "shots": {}, "collisions": [], "turnovers": []
         }
         
         current_positions = self.positions
@@ -289,10 +288,15 @@ class HexagonBasketballEnv(gym.Env):
                     intended_moves[player_id] = new_pos
                 else:
                     reason = "out_of_bounds" if new_pos != self.basket_position else "basket_collision"
-                    results["moves"][player_id] = {"success": False, "reason": reason}
                     if player_id == self.ball_holder:
-                        self._turnover_to_defense(player_id)
-                        results["out_of_bounds_turnover"] = True
+                        results["turnovers"] = results.get("turnovers", [])
+                        results["turnovers"].append({
+                            "player_id": player_id,
+                            "reason": "out_of_bounds",
+                            "turnover_pos": new_pos
+                        })
+                        self._turnover_to_defense(player_id) # This must happen after storing results
+                    results["moves"][player_id] = {"success": False, "reason": reason}
 
         # 3. Resolve movement based on conflicts
         
@@ -358,7 +362,7 @@ class HexagonBasketballEnv(gym.Env):
             # If pass goes out of bounds, it's a turnover
             if not self._is_valid_position(*target_pos):
                 self.ball_holder = None # No one has the ball
-                return {"success": False, "reason": "out_of_bounds", "turnover": True}
+                return {"success": False, "reason": "out_of_bounds", "turnover": True, "turnover_pos": target_pos}
             
             # Check if any player is at the target position
             for player_id, pos in enumerate(self.positions):
@@ -373,7 +377,13 @@ class HexagonBasketballEnv(gym.Env):
                     else:
                         # Intercepted by opponent
                         self._turnover_to_defense(passer_id)
-                        return {"success": False, "reason": "intercepted", "turnover": True}
+                        return {
+                            "success": False, 
+                            "reason": "intercepted", 
+                            "turnover": True, 
+                            "interceptor_id": player_id,
+                            "turnover_pos": pos
+                        }
 
             # If no player was found, continue the pass to the next hex
             distance += 1
@@ -477,7 +487,7 @@ class HexagonBasketballEnv(gym.Env):
                         rewards[self.offense_ids] = -1.0
         
         # Check for turnovers from moving out of bounds
-        if action_results.get("out_of_bounds_turnover", False):
+        if "turnovers" in action_results and any(t['reason'] == 'out_of_bounds' for t in action_results["turnovers"]):
             done = True
             rewards[self.offense_ids] -= 0.2
             rewards[self.defense_ids] += 0.2
@@ -617,6 +627,38 @@ class HexagonBasketballEnv(gym.Env):
         ax.set_xticks([])
         ax.set_yticks([])
 
+        # --- Draw Final Action Result Indicators ---
+        if self.episode_ended and self.last_action_results:
+            # Shot results
+            if self.last_action_results.get("shots"):
+                shot_result = list(self.last_action_results["shots"].values())[0]
+                basket_x, basket_y = axial_to_cartesian(*self.basket_position)
+                if shot_result["success"]:
+                    ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='green', alpha=0.7, zorder=20))
+                    ax.text(0.5, 0.9, "MADE!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
+                else:
+                    ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='red', alpha=0.7, zorder=20))
+                    ax.text(0.5, 0.9, "MISS!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
+
+            # Turnover results
+            turnovers = self.last_action_results.get("turnovers", [])
+            if self.last_action_results.get("passes"):
+                for pass_res in self.last_action_results["passes"].values():
+                    if pass_res.get("turnover"):
+                        turnovers.append(pass_res)
+            
+            if turnovers:
+                turnover_pos = turnovers[0].get("turnover_pos")
+                if turnover_pos:
+                    tx, ty = axial_to_cartesian(*turnover_pos)
+                    ax.text(tx, ty, "X", ha='center', va='center', fontsize=60, fontweight='bold', color='darkred', zorder=21)
+                ax.text(0.5, 0.9, "TURNOVER!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='darkred', alpha=0.9)
+
+            # Shot clock violation
+            elif self.shot_clock <= 0:
+                ax.text(0.5, 0.9, "SHOT CLOCK VIOLATION", transform=ax.transAxes, ha='center', va='center', fontsize=40, fontweight='bold', color='darkred', alpha=0.9)
+
+ 
         # Add shot clock text to the bottom right corner
         ax.text(0.95, 0.05, f"{self.shot_clock}",
                 fontsize=48,

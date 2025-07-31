@@ -30,5 +30,4 @@ def create_and_log_gif(frames, episode_num: int, outcome: str, temp_dir: str, ar
     imageio.mimsave(local_path, frames, fps=2, loop=0)
     
     # Log to MLflow in the categorized folder
-    full_artifact_path = f"{artifact_path}/{outcome_category}"
-    mlflow.log_artifact(local_path, artifact_path=full_artifact_path) 
+    mlflow.log_artifact(local_path, artifact_path=artifact_path) 

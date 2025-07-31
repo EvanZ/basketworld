@@ -158,18 +158,17 @@ def main(args):
                 # --- Post-episode analysis ---
                 final_info = info
                 action_results = final_info.get('action_results', {})
-                outcome = "Unknown"
+                outcome = "Unknown" # Default outcome
 
                 if action_results.get('shots'):
                     shot_result = list(action_results['shots'].values())[0]
                     outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
-                elif action_results.get('passes'):
-                    pass_result = list(action_results['passes'].values())[0]
-                    if pass_result.get('turnover'):
-                        outcome = "Turnover (Intercepted)"
-                elif action_results.get('out_of_bounds_turnover'):
-                    outcome = "Turnover (Move Out of Bounds)"
-                elif final_info.get('shot_clock', 1) <= 0:
+                elif 'passes' in action_results and any(p.get('turnover') for p in action_results['passes'].values()):
+                    outcome = "Turnover (Intercepted)"
+                elif 'turnovers' in action_results and any(t.get('reason') == 'out_of_bounds' for t in action_results['turnovers']):
+                    outcome = "Turnover (OOB)"
+                # Check the env state directly for shot clock violation, as info can be off by one step
+                elif env.unwrapped.shot_clock <= 0:
                     outcome = "Turnover (Shot Clock Violation)"
                 
                 # Store results for final summary
@@ -186,7 +185,7 @@ def main(args):
                         episode_num=i,
                         outcome=outcome,
                         temp_dir=temp_dir,
-                        artifact_path="gifs" # The default path for final evaluation
+                        artifact_path=f"gifs/{get_outcome_category(outcome)}"
                     )
 
             # --- Final Analysis ---
