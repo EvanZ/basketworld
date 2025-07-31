@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
+import { getActionValues } from '@/services/api';
 
 const props = defineProps({
   gameState: { // This is now the currentGameState computed property from App.vue
@@ -16,6 +17,8 @@ const props = defineProps({
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again']);
 
 const selectedActions = ref({});
+const actionValues = ref(null);
+const valueRange = ref({ min: 0, max: 0 });
 
 const userControlledPlayerIds = computed(() => {
   if (!props.gameState || !props.gameState.user_team_name) {
@@ -25,6 +28,34 @@ const userControlledPlayerIds = computed(() => {
     ? props.gameState.offense_ids 
     : props.gameState.defense_ids;
 });
+
+// Watch for the active player ID to change, then fetch the action values for that player.
+watch(() => props.activePlayerId, async (newPlayerId) => {
+    actionValues.value = null; // Clear previous values
+    valueRange.value = { min: 0, max: 0 };
+    if (newPlayerId !== null && props.gameState && !props.gameState.done) {
+        console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching action values...`);
+        try {
+            const values = await getActionValues(newPlayerId);
+            console.log('[PlayerControls] Received action values from API:', values);
+            actionValues.value = values;
+
+            // Calculate min and max for color scaling
+            const numericValues = Object.values(values).filter(v => typeof v === 'number');
+            if (numericValues.length > 0) {
+                valueRange.value.min = Math.min(...numericValues);
+                valueRange.value.max = Math.max(...numericValues);
+            }
+
+        } catch (error) {
+            console.error("Failed to fetch action values:", error);
+            actionValues.value = { error: "Failed to load" }; // Show an error state
+        }
+    } else {
+        console.log('[PlayerControls] No active player or game is done. Clearing action values.');
+        actionValues.value = null;
+    }
+}, { immediate: true });
 
 // Watch for the list of players to be populated, then set the first one as active.
 // The `immediate` flag ensures this runs on component creation.
@@ -143,7 +174,10 @@ const shotProbability = computed(() => {
             :legal-actions="getLegalActions(activePlayerId)"
             :selected-action="selectedActions[activePlayerId]"
             :shot-probability="shotProbability"
+            :pass-probabilities="passProbabilities"
             @action-selected="handleActionSelected"
+            :action-values="actionValues"
+            :value-range="valueRange"
         />
         <p v-if="selectedActions[activePlayerId]">
             Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>

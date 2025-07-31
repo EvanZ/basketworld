@@ -44,4 +44,14 @@ export async function getPolicyProbs() {
         throw new Error(errorData.detail || 'Failed to fetch policy probabilities');
     }
     return response.json();
+}
+
+export async function getActionValues(playerId) {
+    const response = await fetch(`${API_BASE_URL}/api/action_values/${playerId}`);
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to fetch action values' }));
+        console.error('[API] getActionValues failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to fetch action values');
+    }
+    return response.json();
 } 

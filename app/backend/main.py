@@ -11,6 +11,7 @@ from basketworld.envs.basketworld_env_v2 import Team, ActionType
 from stable_baselines3 import PPO
 import mlflow
 import torch
+import copy
 
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
@@ -176,6 +177,73 @@ def get_policy_probabilities():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get policy probabilities: {e}")
 
+
+@app.get("/api/action_values/{player_id}")
+def get_action_values(player_id: int):
+    """
+    Calculates the Q-value (state-action value) for all possible actions for a given player.
+    This is done via a one-step lookahead simulation.
+    """
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    print(f"\n[API] Received request for Q-values for player {player_id}")
+    action_values = {}
+    
+    # Determine which policy to use for value prediction
+    player_is_offense = player_id in game_state.env.offense_ids
+    value_policy = game_state.offense_policy if player_is_offense else game_state.defense_policy
+    gamma = value_policy.gamma # Get the discount factor
+
+    # Get the list of all possible action names from the enum
+    possible_actions = [action.name for action in ActionType]
+
+    for action_name in possible_actions:
+        action_id = ActionType[action_name].value
+        
+        # --- Simulate one step forward ---
+        temp_env = copy.deepcopy(game_state.env)
+        
+        # Construct the full action array for the simulation
+        # The target player takes the action, others act based on their policy
+        sim_action = np.zeros(temp_env.n_players, dtype=int)
+        
+        offense_actions, _ = game_state.offense_policy.predict(game_state.obs, deterministic=True)
+        defense_actions, _ = game_state.defense_policy.predict(game_state.obs, deterministic=True)
+
+        for i in range(temp_env.n_players):
+            if i == player_id:
+                sim_action[i] = action_id
+            elif i in temp_env.offense_ids:
+                sim_action[i] = offense_actions[i]
+            else:
+                sim_action[i] = defense_actions[i]
+
+        # Step the temporary environment
+        next_obs, reward, _, _, _ = temp_env.step(sim_action)
+
+        # Get the value of the resulting state
+        # Convert the next observation to a tensor for the policy
+        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(next_obs)
+        with torch.no_grad():
+            next_value = value_policy.policy.predict_values(next_obs_tensor)
+        
+        # Calculate the Q-value
+        # We need the specific reward for the team being evaluated
+        team_reward = reward[player_id]
+        q_value = team_reward + gamma * next_value.item()
+        
+        print(f"  - Simulating '{action_name}': "
+              f"Immediate Reward = {team_reward:.3f}, "
+              f"Next State Value = {next_value.item():.3f}, "
+              f"Q-Value = {q_value:.3f}")
+
+        action_values[action_name] = q_value
+
+    print(f"[API] Sending action values for player {player_id}:")
+    import json
+    print(json.dumps(action_values, indent=2))
+    return jsonable_encoder(action_values)
 
 def get_full_game_state():
     """Helper function to construct the full game state dictionary."""

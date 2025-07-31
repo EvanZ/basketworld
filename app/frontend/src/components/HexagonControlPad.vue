@@ -13,6 +13,18 @@ const props = defineProps({
   shotProbability: {
     type: Number,
     default: null,
+  },
+  passProbabilities: {
+    type: Object,
+    default: null,
+  },
+  actionValues: {
+    type: Object,
+    default: null,
+  },
+  valueRange: {
+    type: Object,
+    default: () => ({ min: 0, max: 0 }),
   }
 });
 
@@ -21,6 +33,30 @@ const emit = defineEmits(['action-selected']);
 const visibleActions = computed(() => {
     return props.legalActions.filter(action => action !== 'NOOP');
 });
+
+function getActionColor(action) {
+    if (!props.actionValues || props.actionValues[action] === undefined) {
+        return '#f0f0f0'; // Default background color
+    }
+
+    const value = props.actionValues[action];
+    const { min, max } = props.valueRange;
+
+    if (min === max) {
+        return 'rgba(255, 165, 0, 0.5)'; // Orange if all values are the same
+    }
+
+    // Normalize the value to a 0-1 range
+    const normalized = (value - min) / (max - min);
+
+    // Linear interpolation between blue and orange
+    // Blue: rgb(0, 0, 255), Orange: rgb(255, 165, 0)
+    const r = 0 + normalized * (255 - 0);
+    const g = 0 + normalized * (165 - 0);
+    const b = 255 * (1 - normalized);
+
+    return `rgba(${r}, ${g}, ${b}, 0.5)`;
+}
 
 // --- Icon Definitions ---
 const icons = {
@@ -59,15 +95,21 @@ function selectAction(action) {
       <button
         v-for="action in visibleActions"
         :key="action"
-        :style="buttonConfig[action].style"
+        :style="{ ...buttonConfig[action].style, backgroundColor: getActionColor(action) }"
         @click="selectAction(action)"
         class="action-button"
         :class="{ selected: action === selectedAction }"
         :title="action"
       >
         <span class="icon-wrapper" :style="{ transform: `rotate(${buttonConfig[action].rotation}deg)` }" v-html="buttonConfig[action].icon"></span>
-        <span v-if="action === 'SHOOT' && shotProbability !== null" class="shot-prob">
+        <span v-if="action === 'SHOOT' && shotProbability !== null" class="prob-tooltip">
             {{ Math.round(shotProbability * 100) }}%
+        </span>
+        <span v-else-if="passProbabilities && passProbabilities[action] !== undefined" class="prob-tooltip">
+            {{ Math.round(passProbabilities[action] * 100) }}%
+        </span>
+        <span v-if="actionValues && actionValues[action] !== undefined" class="value-display">
+            {{ actionValues[action].toFixed(2) }}
         </span>
       </button>
     </div>
@@ -93,6 +135,7 @@ function selectAction(action) {
   height: 44px; /* Standardize height */
   padding: 0;
   display: flex;
+  flex-direction: column; /* Stack icon and value vertically */
   justify-content: center;
   align-items: center;
   font-size: 14px; /* Slightly larger font */
@@ -103,17 +146,9 @@ function selectAction(action) {
   transition: background-color 0.2s, color 0.2s;
 }
 
-.shot-prob {
-  position: absolute;
-  bottom: -20px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: rgba(0,0,0,0.7);
-  color: white;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: bold;
+.value-display {
+  font-size: 11px;
+  color: #333;
 }
 
 .action-button.selected {
