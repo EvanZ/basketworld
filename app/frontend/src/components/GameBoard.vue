@@ -130,6 +130,19 @@ const policySuggestions = computed(() => {
     return suggestions;
 });
 
+const ballHandlerShotProb = computed(() => {
+    if (!currentGameState.value || currentGameState.value.ball_holder === null || !props.policyProbabilities) {
+        return null;
+    }
+    const ballHolderId = currentGameState.value.ball_holder;
+    const probs = props.policyProbabilities[ballHolderId];
+    if (!probs) {
+        return null;
+    }
+    // From ActionType enum in the backend, SHOOT is at index 7
+    return probs[7];
+});
+
 </script>
 
 <template>
@@ -193,7 +206,18 @@ const policySuggestions = computed(() => {
                 { 'active-player-hex': player.id === activePlayerId }
               ]"
             />
-            <text :x="player.x" :y="player.y" dy=".3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
+            <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
+            <!-- Display shot probability inside the ball handler's hex -->
+            <text 
+              v-if="player.hasBall && ballHandlerShotProb !== null"
+              :x="player.x" 
+              :y="player.y" 
+              dy="1.4em" 
+              text-anchor="middle" 
+              class="shot-prob-text"
+            >
+              {{ ballHandlerShotProb.toFixed(2) }}
+            </text>
             <!-- Ball handler indicator -->
             <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
           </g>
@@ -302,5 +326,13 @@ svg {
   stroke: white;
   stroke-width: 0.5;
   pointer-events: none;
+}
+.shot-prob-text {
+  font-size: 10px;
+  font-weight: bold;
+  fill: #000;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 0.5px;
 }
 </style> 
