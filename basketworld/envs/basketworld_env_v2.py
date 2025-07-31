@@ -447,8 +447,8 @@ class HexagonBasketballEnv(gym.Env):
             elif pass_result.get("turnover"):
                 done = True  # Episode ends on turnover
                 # Penalize offense, reward defense for the turnover
-                rewards[self.offense_ids] -= 0.2 # for now don't penalize offense for turnovers
-                rewards[self.defense_ids] += 0.2
+                rewards[self.offense_ids] -= 0.2 
+                rewards[self.defense_ids] += 0.5
         
         # Check for shots
         for player_id, shot_result in action_results["shots"].items():

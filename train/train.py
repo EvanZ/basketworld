@@ -23,6 +23,7 @@ from basketworld.utils.callbacks import RolloutUpdateTimingCallback
 import mlflow
 import sys
 import tempfile
+import random
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
@@ -145,6 +146,31 @@ class SelfPlayEnvWrapper(gym.Wrapper):
 
 # --- Main Training Logic ---
 
+def get_random_policy_from_artifacts(client, run_id, team_prefix, tmpdir):
+    """
+    Downloads a random historical policy for a given team from the MLflow run.
+    If no policies are found, returns None.
+    """
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+    
+    # Filter for the specific team's policy files (.zip)
+    team_policies = [
+        f.path for f in all_artifacts 
+        if f.path.startswith(f"{artifact_path}/{team_prefix}") and f.path.endswith(".zip")
+    ]
+
+    if not team_policies:
+        return None # No historical policies found for this team
+
+    # Select a random policy from the list
+    random_policy_path = random.choice(team_policies)
+    print(f"  - Selected random opponent policy: {os.path.basename(random_policy_path)}")
+
+    # Download the selected artifact
+    local_path = client.download_artifacts(run_id, random_policy_path, tmpdir)
+    return PPO.load(local_path)
+
 def setup_environment(args, training_team):
     """Create, configure, and wrap the environment for training."""
     env = basketworld.HexagonBasketballEnv(
@@ -200,6 +226,8 @@ def main(args):
             temp_env, 
             verbose=1, 
             n_steps=args.n_steps, 
+            vf_coef=args.vf_coef,
+            ent_coef=args.ent_coef,
             batch_size=args.batch_size,
             tensorboard_log=None # Disable TensorBoard if using MLflow
         )
@@ -208,6 +236,8 @@ def main(args):
             temp_env, 
             verbose=1, 
             n_steps=args.n_steps, 
+            vf_coef=args.vf_coef,
+            ent_coef=args.ent_coef,
             batch_size=args.batch_size,
             tensorboard_log=None # Disable TensorBoard if using MLflow
         )
@@ -219,12 +249,19 @@ def main(args):
             print(f"Alternation {i + 1} / {args.alternations}")
             print("-" * 50)
 
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # --- Load a random historical opponent for this alternation ---
+                print("\nLoading historical opponent policy...")
+                opponent_for_offense = get_random_policy_from_artifacts(
+                    mlflow.tracking.MlflowClient(), run.info.run_id, "defense", tmpdir
+                ) or defense_policy # Fallback to the latest if none are downloaded
+
             # --- 1. Train Offense against frozen Defense ---
             print(f"\nTraining Offense...")
             offense_env = DummyVecEnv([
                 lambda: SelfPlayEnvWrapper(
                     setup_environment(args, Team.OFFENSE),
-                    opponent_policy=defense_policy
+                    opponent_policy=opponent_for_offense
                 )
             ])
             offense_policy.set_env(offense_env)
@@ -252,12 +289,18 @@ def main(args):
                 mlflow.log_artifact(offense_model_path, artifact_path="models")
             print(f"Logged offense model for alternation {i+1} to MLflow")
 
+            with tempfile.TemporaryDirectory() as tmpdir:
+                print("\nLoading historical opponent policy...")
+                opponent_for_defense = get_random_policy_from_artifacts(
+                    mlflow.tracking.MlflowClient(), run.info.run_id, "offense", tmpdir
+                ) or offense_policy # Fallback to the latest if none are downloaded
+
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
             defense_env = DummyVecEnv([
                 lambda: SelfPlayEnvWrapper(
                     setup_environment(args, Team.DEFENSE),
-                    opponent_policy=offense_policy
+                    opponent_policy=opponent_for_defense
                 )
             ])
             defense_policy.set_env(defense_env)
@@ -313,6 +356,8 @@ if __name__ == "__main__":
     parser.add_argument("--alternations", type=int, default=10, help="Number of times to alternate training.")
     parser.add_argument("--steps-per-alternation", type=int, default=20_000, help="Timesteps to train each policy per alternation.")
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO hyperparameter: Number of steps to run for each environment per update.")
+    parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
+    parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
     # The --save-path argument is no longer needed
     # parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
