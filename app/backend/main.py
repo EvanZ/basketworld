@@ -152,9 +152,18 @@ def get_policy_probabilities():
         # Get the distribution over actions from the policy object
         distributions = policy.policy.get_distribution(obs_tensor)
         
-        # The .distribution attribute is a list of individual Categorical distributions.
-        # We need to iterate through it to get the probs for each player.
-        probs_list = [dist.probs.detach().cpu().numpy().squeeze().tolist() for dist in distributions.distribution]
+        # Extract raw probabilities for each player
+        raw_probs = [dist.probs.detach().cpu().numpy().squeeze() for dist in distributions.distribution]
+
+        # Apply action mask so illegal actions have probability 0, then renormalize.
+        action_mask = game_state.obs['action_mask']  # shape (n_players, n_actions)
+        probs_list = []
+        for pid, probs in enumerate(raw_probs):
+            masked = probs * action_mask[pid]
+            total = masked.sum()
+            if total > 0:
+                masked = masked / total
+            probs_list.append(masked.tolist())
 
         # Return as a dictionary mapping player_id to their list of probabilities
         response = {

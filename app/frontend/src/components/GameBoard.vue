@@ -112,14 +112,17 @@ const policySuggestions = computed(() => {
     const suggestions = [];
     for (let i = 0; i < hexDirections.length; i++) {
         const dir = hexDirections[i];
-        const moveActionIndex = i + 1; // Corresponds to MOVE_E ... MOVE_SE
+        const moveActionIndex = i + 1; // MOVE_E .. MOVE_SE
+        const passActionIndex = 8 + i; // PASS_E .. PASS_SE
+
         const targetPos = { q: currentPlayerPos[0] + dir.q, r: currentPlayerPos[1] + dir.r };
         const cartesianPos = axialToCartesian(targetPos.q, targetPos.r);
 
         suggestions.push({
             x: cartesianPos.x,
             y: cartesianPos.y,
-            prob: Math.round(probs[moveActionIndex] * 100),
+            moveProb: probs[moveActionIndex] ?? 0,
+            passProb: probs[passActionIndex] ?? 0,
             key: `sugg-${i}`
         });
     }
@@ -203,11 +206,11 @@ const policySuggestions = computed(() => {
             :key="sugg.key"
             :x="sugg.x"
             :y="sugg.y"
-            dy=".3em"
             text-anchor="middle"
             class="policy-suggestion-text"
           >
-            {{ sugg.prob }}%
+            <tspan :x="sugg.x" dy="-0.2em">{{ Number(sugg.moveProb).toFixed(3) }}</tspan>
+            <tspan :x="sugg.x" dy="1em">{{ Number(sugg.passProb).toFixed(3) }}</tspan>
           </text>
         </g>
       </g>

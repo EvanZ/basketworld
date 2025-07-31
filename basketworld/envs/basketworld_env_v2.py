@@ -436,15 +436,18 @@ class HexagonBasketballEnv(gym.Env):
         rewards = np.zeros(self.n_players)
         done = False
         
-        # --- Reward successful passes and penalize turnovers ---
+        # --- Reward pass attempts ---
+        # Any pass attempt gives the offense a small reward (+0.1) to encourage ball movement.
+        # A completed pass yields an additional +0.4 (total +0.5).
         for player_id, pass_result in action_results.get("passes", {}).items():
+
             if pass_result.get("success"):
-                # Small reward for a successful pass
+                # Extra reward for a completed pass (5× the base amount in total)
                 rewards[self.offense_ids] += 0.1
             elif pass_result.get("turnover"):
                 done = True  # Episode ends on turnover
                 # Penalize offense, reward defense for the turnover
-                rewards[self.offense_ids] -= 0.2
+                rewards[self.offense_ids] -= 0.2 # for now don't penalize offense for turnovers
                 rewards[self.defense_ids] += 0.2
         
         # Check for shots
