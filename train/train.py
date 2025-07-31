@@ -20,6 +20,11 @@ from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
 from basketworld.utils.callbacks import RolloutUpdateTimingCallback
 
+from basketworld.utils.evaluation_helpers import get_outcome_category, create_and_log_gif
+import imageio
+from collections import defaultdict
+import re
+
 import mlflow
 import sys
 import tempfile
@@ -327,6 +332,65 @@ def main(args):
                 defense_policy.save(defense_model_path)
                 mlflow.log_artifact(defense_model_path, artifact_path="models")
             print(f"Logged defense model for alternation {i+1} to MLflow")
+ 
+            # --- 3. Run Evaluation Phase ---
+            if args.eval_freq > 0 and (i + 1) % args.eval_freq == 0:
+                print(f"\n--- Running Evaluation for Alternation {i + 1} ---")
+                
+                # Create a renderable environment for evaluation
+                eval_env = basketworld.HexagonBasketballEnv(
+                    grid_size=args.grid_size,
+                    players_per_side=args.players,
+                    shot_clock_steps=args.shot_clock,
+                    render_mode="rgb_array"
+                )
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for ep_num in range(args.eval_episodes):
+                        obs, info = eval_env.reset()
+                        done = False
+                        episode_frames = []
+                        
+                        while not done:
+                            # Get actions from the latest policies
+                            offense_action, _ = offense_policy.predict(obs, deterministic=True)
+                            defense_action, _ = defense_policy.predict(obs, deterministic=True)
+
+                            full_action = np.zeros(eval_env.n_players, dtype=int)
+                            for player_id in range(eval_env.n_players):
+                                if player_id in eval_env.offense_ids:
+                                    full_action[player_id] = offense_action[player_id]
+                                else:
+                                    full_action[player_id] = defense_action[player_id]
+                            
+                            obs, reward, done, _, info = eval_env.step(full_action)
+                            frame = eval_env.render()
+                            episode_frames.append(frame)
+
+                        # Post-episode analysis to determine outcome
+                        final_info = info
+                        action_results = final_info.get('action_results', {})
+                        outcome = "Unknown"
+                        if action_results.get('shots'):
+                            shot_result = list(action_results['shots'].values())[0]
+                            outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
+                        elif action_results.get('out_of_bounds_turnover'):
+                            outcome = "Turnover (OOB)"
+                        elif final_info.get('shot_clock', 1) <= 0:
+                            outcome = "Turnover (Shot Clock)"
+                        
+                        # Define the artifact path for this specific evaluation context
+                        artifact_path = f"training_eval/alternation_{i + 1}"
+                        create_and_log_gif(
+                            frames=episode_frames, 
+                            episode_num=ep_num, 
+                            outcome=outcome, 
+                            temp_dir=tmpdir,
+                            artifact_path=artifact_path
+                        )
+
+                eval_env.close()
+                print(f"--- Evaluation for Alternation {i + 1} Complete ---")
 
         print("\n--- Training Complete ---")
 
@@ -359,6 +423,8 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
     parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
+    parser.add_argument("--eval-freq", type=int, default=2, help="Run evaluation every N alternations. Set to 0 to disable.")
+    parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to run for each evaluation.")
     # The --save-path argument is no longer needed
     # parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
     parser.add_argument("--tensorboard-path", type=str, default=None, help="Path to save TensorBoard logs (set to None if using MLflow).")

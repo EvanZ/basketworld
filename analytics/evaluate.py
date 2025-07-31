@@ -14,36 +14,10 @@ import re
 from stable_baselines3 import PPO
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
-import imageio
+import mlflow
+from basketworld.utils.evaluation_helpers import get_outcome_category, create_and_log_gif
 from collections import defaultdict
 from tqdm import tqdm
-import mlflow
-
-def get_outcome_category(outcome_str: str) -> str:
-    """Categorizes a detailed outcome string into a simple category for filenames."""
-    if "Made Shot" in outcome_str:
-        return "made_shot"
-    if "Missed Shot" in outcome_str:
-        return "missed_shot"
-    if "Turnover" in outcome_str:
-        return "turnover"
-    return "unknown"
-
-def create_and_log_gif(frames, episode_num: int, outcome: str, temp_dir: str):
-    """Saves frames as a GIF and logs it to MLflow."""
-    if not frames:
-        return
-
-    outcome_category = get_outcome_category(outcome)
-    gif_filename = f"episode_{episode_num:03d}.gif"
-    local_path = os.path.join(temp_dir, gif_filename)
-    
-    # Save the GIF
-    imageio.mimsave(local_path, frames, fps=1, loop=0)
-    
-    # Log to MLflow in the categorized folder
-    artifact_path = f"gifs/{outcome_category}"
-    mlflow.log_artifact(local_path, artifact_path=artifact_path)
 
 
 def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool):
@@ -207,7 +181,13 @@ def main(args):
 
                 # --- Save and log GIF for this episode ---
                 if not args.no_render:
-                    create_and_log_gif(episode_frames, i, outcome, temp_dir)
+                    create_and_log_gif(
+                        frames=episode_frames,
+                        episode_num=i,
+                        outcome=outcome,
+                        temp_dir=temp_dir,
+                        artifact_path="gifs" # The default path for final evaluation
+                    )
 
             # --- Final Analysis ---
             analyze_results(results, num_episodes)
