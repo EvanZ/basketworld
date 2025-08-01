@@ -212,6 +212,12 @@ def main(args):
         mlflow.log_params(vars(args))
         print(f"MLflow Run ID: {run.info.run_id}")
 
+        # --- Define Policy Kwargs ---
+        # This allows us to set the network architecture from the command line.
+        policy_kwargs = {}
+        if args.net_arch is not None:
+            policy_kwargs['net_arch'] = args.net_arch
+
         # The save_path is no longer needed as models are saved to a temp dir
         # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # save_path = os.path.join(args.save_path, f"basketworld_selfplay_{timestamp}")
@@ -234,7 +240,8 @@ def main(args):
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
             batch_size=args.batch_size,
-            tensorboard_log=None # Disable TensorBoard if using MLflow
+            tensorboard_log=None, # Disable TensorBoard if using MLflow
+            policy_kwargs=policy_kwargs
         )
         defense_policy = PPO(
             "MultiInputPolicy", 
@@ -244,9 +251,16 @@ def main(args):
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
             batch_size=args.batch_size,
-            tensorboard_log=None # Disable TensorBoard if using MLflow
+            tensorboard_log=None, # Disable TensorBoard if using MLflow
+            policy_kwargs=policy_kwargs
         )
         temp_env.close()
+
+        # --- Log the actual network architecture used ---
+        # This ensures we capture the default if no custom arch is provided.
+        actual_net_arch = str(offense_policy.policy.net_arch)
+        mlflow.log_param("net_arch_used", actual_net_arch)
+        print(f"  - Using network architecture: {actual_net_arch}")
 
         # --- Alternating Training Loop ---
         for i in range(args.alternations):
@@ -423,6 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
     parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
+    parser.add_argument("--net-arch", type=int, nargs='+', default=None, help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.")
     parser.add_argument("--eval-freq", type=int, default=2, help="Run evaluation every N alternations. Set to 0 to disable.")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to run for each evaluation.")
     # The --save-path argument is no longer needed
@@ -432,4 +447,5 @@ if __name__ == "__main__":
     parser.add_argument("--mlflow-run-name", type=str, default=None, help="Name of the MLflow run.")
     
     args = parser.parse_args()
+ 
     main(args) 

@@ -470,12 +470,12 @@ class HexagonBasketballEnv(gym.Env):
 
             if pass_result.get("success"):
                 # Extra reward for a completed pass (5× the base amount in total)
-                rewards[self.offense_ids] += 0.1
+                rewards[self.offense_ids] += 0.05
             elif pass_result.get("turnover"):
                 done = True  # Episode ends on turnover
                 # Penalize offense, reward defense for the turnover
                 rewards[self.offense_ids] -= 0.2 
-                rewards[self.defense_ids] += 0.5
+                rewards[self.defense_ids] += 0.2
         
         # Check for shots
         for player_id, shot_result in action_results["shots"].items():
