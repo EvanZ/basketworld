@@ -153,8 +153,12 @@ const episodeOutcome = computed(() => {
 
     // Check for shot results
     if (results.shots && Object.keys(results.shots).length > 0) {
-        const shotResult = Object.values(results.shots)[0];
-        return { type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT' };
+        const shooterId = Object.keys(results.shots)[0];
+        const shotResult = results.shots[shooterId];
+        return { 
+            type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT',
+            playerId: parseInt(shooterId, 10)
+        };
     }
 
     // Check for turnover results
@@ -364,10 +368,16 @@ const playerTransitions = computed(() => {
 
       <!-- Outcome Text (drawn outside the transformed group to keep it upright) -->
       <g v-if="episodeOutcome" class="outcome-text-group">
-          <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">MADE!</text>
-          <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">MISS!</text>
+          <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan x="50%" dy="1.2em">MADE!</tspan>
+          </text>
+          <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan x="50%" dy="1.2em">MISS!</tspan>
+          </text>
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
-          <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover">SHOT CLOCK VIOLATION</text>
+          <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>
       </g>
     </svg>
     <div class="shot-clock-overlay">
@@ -500,6 +510,12 @@ svg {
     paint-order: stroke;
     stroke-width: 2px;
     stroke: black;
+}
+.player-outcome-text {
+    font-size: 32px; /* Smaller font for the player ID */
+}
+.long-outcome-text {
+    font-size: 54px; /* A smaller font size for longer text */
 }
 .made { fill: lightgreen; }
 .missed { fill: #ff4d4d; }

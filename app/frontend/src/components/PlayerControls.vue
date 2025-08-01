@@ -20,6 +20,11 @@ const selectedActions = ref({});
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
 
+const isDefense = computed(() => {
+  if (!props.gameState || props.activePlayerId === null) return false;
+  return props.gameState.defense_ids.includes(props.activePlayerId);
+});
+
 const userControlledPlayerIds = computed(() => {
   if (!props.gameState || !props.gameState.user_team_name) {
     return [];
@@ -178,6 +183,7 @@ const shotProbability = computed(() => {
             @action-selected="handleActionSelected"
             :action-values="actionValues"
             :value-range="valueRange"
+            :is-defense="isDefense"
         />
         <p v-if="selectedActions[activePlayerId]">
             Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>

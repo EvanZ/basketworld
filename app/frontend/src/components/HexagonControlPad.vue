@@ -25,6 +25,10 @@ const props = defineProps({
   valueRange: {
     type: Object,
     default: () => ({ min: 0, max: 0 }),
+  },
+  isDefense: {
+    type: Boolean,
+    default: false,
   }
 });
 
@@ -47,7 +51,12 @@ function getActionColor(action) {
     }
 
     // Normalize the value to a 0-1 range
-    const normalized = (value - min) / (max - min);
+    let normalized = (value - min) / (max - min);
+
+    // If the player is on defense, a lower Q-value is better, so we flip the scale.
+    if (props.isDefense) {
+        normalized = 1 - normalized;
+    }
 
     // Linear interpolation between blue and orange
     // Blue: rgb(0, 0, 255), Orange: rgb(255, 165, 0)
