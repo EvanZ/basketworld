@@ -486,22 +486,31 @@ class HexagonBasketballEnv(gym.Env):
                 # Penalty is high at step 1 and decrements
                 # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
                 time_penalty = - (0.7 - self.step_count * 0.2)
-                rewards[self.offense_ids] += time_penalty
+                
+                # We only apply this penalty to the team that is currently training
+                if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
+                    rewards[self.offense_ids] += time_penalty
+                elif self.training_team == Team.DEFENSE and player_id in self.defense_ids:
+                    # This case is rare (defense shooting at own basket) but included for completeness
+                    rewards[self.defense_ids] += time_penalty
             
+            # Define the reward magnitude for shots
+            made_shot_reward = 1.0
+            missed_shot_penalty = 0.1 # Less punishing than a turnover (-0.2)
+
             if shot_result["success"]:
-                # Basket made
+                # Basket was made
                 if player_id in self.offense_ids:
-                    # Offense scored
-                    if self.training_team == Team.OFFENSE:
-                        rewards[self.offense_ids] = 1.0  # Reward offense
-                    else:
-                        rewards[self.defense_ids] = -1.0  # Penalty for defense
-                else:
-                    # Defense scored (rare but possible)
-                    if self.training_team == Team.DEFENSE:
-                        rewards[self.defense_ids] = 1.0
-                    else:
-                        rewards[self.offense_ids] = -1.0
+                    # Offense scored, good for them, bad for defense
+                    rewards[self.offense_ids] += made_shot_reward
+                    rewards[self.defense_ids] -= made_shot_reward
+                # else: handle rare case of defense scoring on own basket
+            else:
+                # Basket was missed
+                if player_id in self.offense_ids:
+                    # Offense missed, bad for them, good for defense
+                    rewards[self.offense_ids] -= missed_shot_penalty
+                    rewards[self.defense_ids] += missed_shot_penalty
         
         # Check for turnovers from moving out of bounds
         if "turnovers" in action_results and any(t['reason'] == 'out_of_bounds' for t in action_results["turnovers"]):
