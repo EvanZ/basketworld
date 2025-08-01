@@ -143,6 +143,43 @@ const ballHandlerShotProb = computed(() => {
     return probs[7];
 });
 
+const episodeOutcome = computed(() => {
+    if (!currentGameState.value || !currentGameState.value.done) {
+        return null; // Game is not over
+    }
+
+    const results = currentGameState.value.last_action_results;
+    if (!results) return null;
+
+    // Check for shot results
+    if (results.shots && Object.keys(results.shots).length > 0) {
+        const shotResult = Object.values(results.shots)[0];
+        return { type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT' };
+    }
+
+    // Check for turnover results
+    let allTurnovers = results.turnovers ? [...results.turnovers] : [];
+    if (results.passes) {
+        for (const pass_res of Object.values(results.passes)) {
+            if (pass_res.turnover) {
+                allTurnovers.push(pass_res);
+            }
+        }
+    }
+
+    if (allTurnovers.length > 0 && allTurnovers[0].turnover_pos) {
+        const { x, y } = axialToCartesian(allTurnovers[0].turnover_pos[0], allTurnovers[0].turnover_pos[1]);
+        return { type: 'TURNOVER', x, y };
+    }
+
+    // Check for shot clock violation
+    if (currentGameState.value.shot_clock <= 0) {
+        return { type: 'SHOT_CLOCK_VIOLATION' };
+    }
+
+    return null; // No definitive outcome found
+});
+
 const playerTransitions = computed(() => {
   if (props.gameHistory.length < 2) {
     return [];
@@ -313,6 +350,24 @@ const playerTransitions = computed(() => {
             <tspan :x="sugg.x" dy="1em">{{ Number(sugg.passProb).toFixed(3) }}</tspan>
           </text>
         </g>
+
+        <!-- Draw Episode Outcome Indicators -->
+        <g v-if="episodeOutcome" class="outcome-overlay">
+            <!-- Basket Fill for Shots -->
+            <circle v-if="episodeOutcome.type === 'MADE_SHOT'" :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS" class="basket-fill-made" />
+            <circle v-if="episodeOutcome.type === 'MISSED_SHOT'" :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS" class="basket-fill-missed" />
+
+            <!-- Turnover 'X' -->
+            <text v-if="episodeOutcome.type === 'TURNOVER'" :x="episodeOutcome.x" :y="episodeOutcome.y" class="turnover-x">X</text>
+        </g>
+      </g>
+
+      <!-- Outcome Text (drawn outside the transformed group to keep it upright) -->
+      <g v-if="episodeOutcome" class="outcome-text-group">
+          <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">MADE!</text>
+          <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">MISS!</text>
+          <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
+          <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover">SHOT CLOCK VIOLATION</text>
       </g>
     </svg>
     <div class="shot-clock-overlay">
@@ -329,17 +384,23 @@ const playerTransitions = computed(() => {
   max-width: 650px;
   margin: 0; /* Remove auto margin which conflicts with flexbox */
   border-radius: 8px;
-  overflow: hidden;
+  overflow: visible; /* Allow the shot clock to be positioned outside */
+  margin-bottom: 60px; /* Add space below the board for the clock */
 }
 
 .shot-clock-overlay {
   position: absolute;
-  bottom: 10px;
-  right: 15px;
+  bottom: -55px; /* Position it below the container */
+  left: 50%;
+  transform: translateX(-50%); /* Center it horizontally */
+  font-family: 'DSEG7 Classic', sans-serif;
   font-size: 48px;
-  font-weight: bold;
-  color: black;
-  opacity: 0.3;
+  color: #ff4d4d; /* Bright red for the LED color */
+  background-color: #1a1a1a; /* Dark background for contrast */
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid #333;
+  text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d; /* Glowing effect */
   pointer-events: none; /* Make it non-interactive */
 }
 
@@ -411,4 +472,36 @@ svg {
   stroke: #fff;
   stroke-width: 0.5px;
 }
+
+/* --- Outcome Indicator Styles --- */
+.basket-fill-made {
+    fill: green;
+    opacity: 0.6;
+}
+.basket-fill-missed {
+    fill: red;
+    opacity: 0.6;
+}
+.turnover-x {
+    font-size: 48px;
+    fill: darkred;
+    font-weight: bold;
+    text-anchor: middle;
+    dominant-baseline: central;
+    transform: scale(1, -1); /* Counteract the group flip */
+}
+.outcome-text-group {
+    pointer-events: none; /* Make it non-interactive */
+}
+.outcome-text {
+    font-size: 64px;
+    font-weight: bold;
+    text-anchor: middle;
+    paint-order: stroke;
+    stroke-width: 2px;
+    stroke: black;
+}
+.made { fill: lightgreen; }
+.missed { fill: #ff4d4d; }
+.turnover { fill: #ff4d4d; }
 </style> 

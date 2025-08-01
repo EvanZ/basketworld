@@ -185,7 +185,7 @@ const shotProbability = computed(() => {
     </div>
 
     <button @click="submitActions" class="submit-button" :disabled="gameState.done">
-      Submit Turn
+      {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
     </button>
     
     <button @click="$emit('play-again')" class="new-game-button">
