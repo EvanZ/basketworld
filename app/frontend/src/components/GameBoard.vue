@@ -396,6 +396,13 @@ const playerTransitions = computed(() => {
   border-radius: 8px;
   overflow: visible; /* Allow the shot clock to be positioned outside */
   margin-bottom: 60px; /* Add space below the board for the clock */
+  /* Parquet-style checkerboard background */
+  background-color: #d2b48c; /* Base light wood color */
+  background-image: 
+    linear-gradient(45deg, #c19a6b 25%, transparent 25%, transparent 75%, #c19a6b 75%), 
+    linear-gradient(45deg, #c19a6b 25%, transparent 25%, transparent 75%, #c19a6b 75%);
+  background-size: 60px 60px;
+  background-position: 0 0, 30px 30px;
 }
 
 .shot-clock-overlay {
@@ -417,10 +424,9 @@ const playerTransitions = computed(() => {
 /* Removed rotation; court now renders in original orientation */
 svg {
   display: block;
-  background-color: #f0f0f0;
 }
 .court-hex {
-  fill: #e0e0e0;
+  fill: rgba(255, 255, 255, 0.65); /* More transparent fill */
   stroke: #ffffff;
   stroke-width: 1;
 }
