@@ -478,7 +478,7 @@ class HexagonBasketballEnv(gym.Env):
                 rewards[self.defense_ids] += 0.2
         
         # Check for shots
-        for player_id, shot_result in action_results["shots"].items():
+        for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
             
             # --- Time-based penalty for shooting too early ---
@@ -688,7 +688,7 @@ class HexagonBasketballEnv(gym.Env):
         
         fig.canvas.draw()
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        fig.savefig(buf, format='png', dpi=150)
         buf.seek(0)
         
         img = Image.open(buf)
