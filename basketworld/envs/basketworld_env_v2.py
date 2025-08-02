@@ -61,7 +61,9 @@ class HexagonBasketballEnv(gym.Env):
         shot_clock_steps: int = 24,
         training_team: Team = Team.OFFENSE,
         seed: Optional[int] = None,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        defender_pressure_distance: int = 1,
+        defender_pressure_turnover_chance: float = 0.05
     ):
         super().__init__()
         
@@ -72,6 +74,8 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_clock_steps = shot_clock_steps
         self.training_team = training_team  # Which team is currently training
         self.render_mode = render_mode
+        self.defender_pressure_distance = defender_pressure_distance
+        self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -175,6 +179,42 @@ class HexagonBasketballEnv(gym.Env):
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
             
         self.step_count += 1
+        
+        # --- Defender Pressure Mechanic ---
+        if self.ball_holder in self.offense_ids:
+            ball_handler_pos = self.positions[self.ball_holder]
+            for defender_id in self.defense_ids:
+                defender_pos = self.positions[defender_id]
+                distance = self._hex_distance(ball_handler_pos, defender_pos)
+
+                if distance <= self.defender_pressure_distance:
+                    # This defender is applying pressure. Roll for a turnover.
+                    if self._rng.random() < self.defender_pressure_turnover_chance:
+                        # Turnover occurs!
+                        turnover_results = {
+                            "turnovers": [{
+                                "player_id": self.ball_holder,
+                                "reason": "defender_pressure",
+                                "stolen_by": defender_id,
+                                "turnover_pos": ball_handler_pos
+                            }]
+                        }
+                        self.last_action_results = turnover_results
+                        self.ball_holder = defender_id  # Defender gets the ball
+
+                        done = True
+                        rewards = np.zeros(self.n_players)
+                        rewards[self.offense_ids] -= 0.2
+                        rewards[self.defense_ids] += 0.2
+                        self.episode_ended = done
+
+                        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
+                        info = {"training_team": self.training_team.name, "action_results": turnover_results, "shot_clock": self.shot_clock}
+                        
+                        return obs, rewards, done, False, info
+                    
+                    break # Only check the first defender applying pressure each step
+
         actions = np.array(actions)
         
         # Decrement shot clock
@@ -291,7 +331,7 @@ class HexagonBasketballEnv(gym.Env):
                 results["shots"][player_id] = self._attempt_shot(player_id)
             elif "PASS" in action.name and player_id == self.ball_holder:
                 direction_idx = action.value - ActionType.PASS_E.value
-                results["passes"][player_id] = self._attempt_pass(player_id, direction_idx)
+                self._attempt_pass(player_id, direction_idx, results)
 
         # 2. Determine intended moves for all players
         intended_moves = {}
@@ -306,10 +346,9 @@ class HexagonBasketballEnv(gym.Env):
                 else:
                     reason = "out_of_bounds" if new_pos != self.basket_position else "basket_collision"
                     if player_id == self.ball_holder:
-                        results["turnovers"] = results.get("turnovers", [])
                         results["turnovers"].append({
                             "player_id": player_id,
-                            "reason": "out_of_bounds",
+                            "reason": "move_out_of_bounds",
                             "turnover_pos": new_pos
                         })
                         self._turnover_to_defense(player_id) # This must happen after storing results
@@ -366,8 +405,11 @@ class HexagonBasketballEnv(gym.Env):
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
     
-    def _attempt_pass(self, passer_id: int, direction_idx: int) -> Dict:
-        """Attempt a pass from the ball holder in a specific direction."""
+    def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
+        """
+        Attempt a pass from the ball holder, modifying the results dict directly.
+        A pass can result in success, an out-of-bounds turnover, or an interception turnover.
+        """
         passer_pos = self.positions[passer_id]
         
         # Project a line of sight from the passer
@@ -379,7 +421,13 @@ class HexagonBasketballEnv(gym.Env):
             # If pass goes out of bounds, it's a turnover
             if not self._is_valid_position(*target_pos):
                 self.ball_holder = None # No one has the ball
-                return {"success": False, "reason": "out_of_bounds", "turnover": True, "turnover_pos": target_pos}
+                results["turnovers"].append({
+                    "player_id": passer_id,
+                    "reason": "pass_out_of_bounds",
+                    "turnover_pos": target_pos
+                })
+                results["passes"][passer_id] = {"success": False, "reason": "out_of_bounds"}
+                return
             
             # Check if any player is at the target position
             for player_id, pos in enumerate(self.positions):
@@ -390,17 +438,23 @@ class HexagonBasketballEnv(gym.Env):
                     if is_teammate:
                         # Successful pass
                         self.ball_holder = player_id
-                        return {"success": True, "target": player_id, "turnover": False}
+                        results["passes"][passer_id] = {"success": True, "target": player_id}
+                        return
                     else:
                         # Intercepted by opponent
                         self._turnover_to_defense(passer_id)
-                        return {
+                        results["turnovers"].append({
+                            "player_id": passer_id,
+                            "reason": "intercepted",
+                            "stolen_by": player_id,
+                            "turnover_pos": pos
+                        })
+                        results["passes"][passer_id] = {
                             "success": False, 
                             "reason": "intercepted", 
-                            "turnover": True, 
-                            "interceptor_id": player_id,
-                            "turnover_pos": pos
+                            "interceptor_id": player_id
                         }
+                        return
 
             # If no player was found, continue the pass to the next hex
             distance += 1
@@ -463,19 +517,18 @@ class HexagonBasketballEnv(gym.Env):
         rewards = np.zeros(self.n_players)
         done = False
         
-        # --- Reward pass attempts ---
-        # Any pass attempt gives the offense a small reward (+0.1) to encourage ball movement.
-        # A completed pass yields an additional +0.4 (total +0.5).
-        for player_id, pass_result in action_results.get("passes", {}).items():
-
+        # --- Reward successful passes ---
+        for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                # Extra reward for a completed pass (5× the base amount in total)
                 rewards[self.offense_ids] += 0.05
-            elif pass_result.get("turnover"):
-                done = True  # Episode ends on turnover
-                # Penalize offense, reward defense for the turnover
-                rewards[self.offense_ids] -= 0.2 
-                rewards[self.defense_ids] += 0.2
+        
+        # --- Handle all turnovers from actions ---
+        if action_results.get("turnovers"):
+            done = True
+            # Penalize offense, reward defense for the turnover
+            # We assume only one turnover can happen per step
+            rewards[self.offense_ids] -= 0.2 
+            rewards[self.defense_ids] += 0.2
         
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
@@ -490,9 +543,6 @@ class HexagonBasketballEnv(gym.Env):
                 # We only apply this penalty to the team that is currently training
                 if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
                     rewards[self.offense_ids] += time_penalty
-                elif self.training_team == Team.DEFENSE and player_id in self.defense_ids:
-                    # This case is rare (defense shooting at own basket) but included for completeness
-                    rewards[self.defense_ids] += time_penalty
             
             # Define the reward magnitude for shots
             made_shot_reward = 1.0
@@ -511,12 +561,6 @@ class HexagonBasketballEnv(gym.Env):
                     # Offense missed, bad for them, good for defense
                     rewards[self.offense_ids] -= missed_shot_penalty
                     rewards[self.defense_ids] += missed_shot_penalty
-        
-        # Check for turnovers from moving out of bounds
-        if "turnovers" in action_results and any(t['reason'] == 'out_of_bounds' for t in action_results["turnovers"]):
-            done = True
-            rewards[self.offense_ids] -= 0.2
-            rewards[self.defense_ids] += 0.2
         
         return done, rewards
     

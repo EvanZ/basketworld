@@ -10,8 +10,16 @@ def get_outcome_category(outcome_str: str) -> str:
         return "made_shot"
     if "Missed Shot" in outcome_str:
         return "missed_shot"
+    if "Turnover (Pressure)" in outcome_str:
+        return "tov-pressure"
+    if "Turnover (Intercepted)" in outcome_str:
+        return "tov-intercepted"
+    if "Turnover (OOB)" in outcome_str:
+        return "tov-oob"
+    if "Turnover (Shot Clock Violation)" in outcome_str:
+        return "tov-shotclock"
     if "Turnover" in outcome_str:
-        return "turnover"
+        return "turnover" # Generic fallback
     return "unknown"
 
 def create_and_log_gif(frames, episode_num: int, outcome: str, temp_dir: str, artifact_path: str = "gifs"):

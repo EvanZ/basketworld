@@ -163,10 +163,16 @@ def main(args):
                 if action_results.get('shots'):
                     shot_result = list(action_results['shots'].values())[0]
                     outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
-                elif 'passes' in action_results and any(p.get('turnover') for p in action_results['passes'].values()):
-                    outcome = "Turnover (Intercepted)"
-                elif 'turnovers' in action_results and any(t.get('reason') == 'out_of_bounds' for t in action_results['turnovers']):
-                    outcome = "Turnover (OOB)"
+                elif action_results.get('turnovers'):
+                    turnover_reason = action_results['turnovers'][0]['reason']
+                    if turnover_reason == 'intercepted':
+                        outcome = "Turnover (Intercepted)"
+                    elif turnover_reason == 'pass_out_of_bounds':
+                        outcome = "Turnover (OOB)"
+                    elif turnover_reason == 'move_out_of_bounds':
+                        outcome = "Turnover (OOB)"
+                    elif turnover_reason == 'defender_pressure':
+                        outcome = "Turnover (Pressure)"
                 # Check the env state directly for shot clock violation, as info can be off by one step
                 elif env.unwrapped.shot_clock <= 0:
                     outcome = "Turnover (Shot Clock Violation)"

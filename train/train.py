@@ -182,6 +182,8 @@ def setup_environment(args, training_team):
         grid_size=args.grid_size,
         players_per_side=args.players,
         shot_clock_steps=args.shot_clock,
+        defender_pressure_distance=args.defender_pressure_distance,
+        defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
         training_team=training_team # Critical for correct rewards
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
@@ -359,7 +361,7 @@ def main(args):
                     render_mode="rgb_array"
                 )
 
-                with tempfile.TemporaryDirectory() as tmpdir:
+                with tempfile.TemporaryDirectory() as temp_dir:
                     for ep_num in range(args.eval_episodes):
                         obs, info = eval_env.reset()
                         done = False
@@ -384,22 +386,31 @@ def main(args):
                         # Post-episode analysis to determine outcome
                         final_info = info
                         action_results = final_info.get('action_results', {})
-                        outcome = "Unknown"
+                        outcome = "Unknown" # Default outcome
+
                         if action_results.get('shots'):
                             shot_result = list(action_results['shots'].values())[0]
                             outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
-                        elif action_results.get('out_of_bounds_turnover'):
-                            outcome = "Turnover (OOB)"
-                        elif final_info.get('shot_clock', 1) <= 0:
-                            outcome = "Turnover (Shot Clock)"
-                        
+                        elif action_results.get('turnovers'):
+                            turnover_reason = action_results['turnovers'][0]['reason']
+                            if turnover_reason == 'intercepted':
+                                outcome = "Turnover (Intercepted)"
+                            elif turnover_reason == 'pass_out_of_bounds':
+                                outcome = "Turnover (OOB)"
+                            elif turnover_reason == 'move_out_of_bounds':
+                                outcome = "Turnover (OOB)"
+                            elif turnover_reason == 'defender_pressure':
+                                outcome = "Turnover (Pressure)"
+                        elif eval_env.unwrapped.shot_clock <= 0:
+                            outcome = "Turnover (Shot Clock Violation)"
+
                         # Define the artifact path for this specific evaluation context
                         artifact_path = f"training_eval/alternation_{i + 1}"
                         create_and_log_gif(
                             frames=episode_frames, 
                             episode_num=ep_num, 
                             outcome=outcome, 
-                            temp_dir=tmpdir,
+                            temp_dir=temp_dir,
                             artifact_path=artifact_path
                         )
 
@@ -442,6 +453,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to run for each evaluation.")
     # The --save-path argument is no longer needed
     # parser.add_argument("--save-path", type=str, default="models/", help="Path to save the trained models.")
+    parser.add_argument("--defender-pressure-distance", type=int, default=1, help="Distance at which defender pressure is applied.")
+    parser.add_argument("--defender-pressure-turnover-chance", type=float, default=0.05, help="Chance of a defender pressure turnover.")
     parser.add_argument("--tensorboard-path", type=str, default=None, help="Path to save TensorBoard logs (set to None if using MLflow).")
     parser.add_argument("--mlflow-experiment-name", type=str, default="BasketWorld_Training", help="Name of the MLflow experiment.")
     parser.add_argument("--mlflow-run-name", type=str, default=None, help="Name of the MLflow run.")
