@@ -722,11 +722,22 @@ class HexagonBasketballEnv(gym.Env):
                         turnovers.append(pass_res)
             
             if turnovers:
-                turnover_pos = turnovers[0].get("turnover_pos")
+                first_turnover = turnovers[0]
+                turnover_pos = first_turnover.get("turnover_pos")
                 if turnover_pos:
                     tx, ty = axial_to_cartesian(*turnover_pos)
                     ax.text(tx, ty, "X", ha='center', va='center', fontsize=60, fontweight='bold', color='darkred', zorder=21)
-                ax.text(0.5, 0.9, "TURNOVER!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='darkred', alpha=0.9)
+
+                # Map backend reason codes to short labels for the banner
+                reason_code = first_turnover.get("reason", "")
+                reason_map = {
+                    "defender_pressure": "PRESSURE",
+                    "pass_out_of_bounds": "OOB",
+                    "move_out_of_bounds": "OOB",
+                    "intercepted": "STEAL",
+                }
+                reason_label = reason_map.get(reason_code, reason_code.replace("_", " ").upper())
+                ax.text(0.5, 0.9, f"TOV - {reason_label}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='darkred', alpha=0.9)
 
             # Shot clock violation
             elif self.shot_clock <= 0:
