@@ -60,4 +60,16 @@ export async function getActionValues(playerId) {
         throw new Error(errorData.detail || 'Failed to fetch action values');
     }
     return response.json();
+}
+
+export async function saveEpisode() {
+    const response = await fetch(`${API_BASE_URL}/api/save_episode`, {
+        method: 'POST'
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to save episode' }));
+        console.error('[API] saveEpisode failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to save episode');
+    }
+    return response.json();
 } 

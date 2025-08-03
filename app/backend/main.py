@@ -12,6 +12,8 @@ from stable_baselines3 import PPO
 import mlflow
 import torch
 import copy
+from datetime import datetime
+import imageio
 
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
@@ -23,6 +25,7 @@ class GameState:
         self.defense_policy = None
         self.user_team: Team = None
         self.obs = None
+        self.frames = []  # List of RGB frames for the current episode
 
 game_state = GameState()
 
@@ -84,8 +87,16 @@ def init_game(request: InitGameRequest):
             grid_size=grid_size,
             players_per_side=players,
             shot_clock_steps=shot_clock,
+            render_mode="rgb_array",  # enable frame rendering
         )
         game_state.obs, _ = game_state.env.reset()
+
+        # Capture the initial frame
+        try:
+            frame = game_state.env.render()
+            game_state.frames.append(frame)
+        except Exception:
+            pass
         game_state.user_team = Team[request.user_team_name.upper()]
 
         return {"status": "success", "state": get_full_game_state()}
@@ -132,8 +143,36 @@ def take_step(request: ActionRequest):
                 full_action[i] = 0
 
     game_state.obs, _, done, _, _ = game_state.env.step(full_action)
+
+    # Capture frame after step
+    try:
+        frame = game_state.env.render()
+        game_state.frames.append(frame)
+    except Exception:
+        pass
     
     return {"status": "success", "state": get_full_game_state()}
+
+@app.post("/api/save_episode")
+def save_episode():
+    """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
+    if not game_state.frames:
+        raise HTTPException(status_code=400, detail="No episode frames to save.")
+
+    os.makedirs("episodes", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = os.path.join("episodes", f"episode_{timestamp}.gif")
+
+    # Write frames to GIF
+    try:
+        imageio.mimsave(file_path, game_state.frames, fps=2, loop=0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save GIF: {e}")
+
+    # Clear frames list so next episode starts fresh
+    game_state.frames = []
+
+    return {"status": "success", "file_path": file_path}
 
 @app.get("/api/policy_probabilities")
 def get_policy_probabilities():

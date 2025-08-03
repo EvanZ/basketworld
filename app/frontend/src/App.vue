@@ -3,7 +3,7 @@ import { ref, watch } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
-import { initGame, stepGame, getPolicyProbs } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode } from './services/api';
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
@@ -122,6 +122,15 @@ async function handleActionsSubmitted(actions) {
   }
 }
 
+async function handleSaveEpisode() {
+  try {
+    const res = await saveEpisode();
+    alert(`Episode saved to ${res.file_path}`);
+  } catch (e) {
+    alert(`Failed to save episode: ${e.message}`);
+  }
+}
+
 function handlePlayAgain() {
   gameState.value = null;
   gameHistory.value = [];
@@ -164,6 +173,10 @@ function handlePlayAgain() {
           @actions-submitted="handleActionsSubmitted" 
           @play-again="handlePlayAgain"
         />
+
+        <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">
+          Save Episode
+        </button>
       </div>
     </div>
   </main>
@@ -200,5 +213,10 @@ header {
 .controls-area {
   width: 400px; /* Give the controls area a fixed width */
   flex-shrink: 0; /* Prevent the controls area from shrinking */
+}
+
+.save-episode-button {
+  margin-top: 1rem;
+  padding: 0.5rem 1rem;
 }
 </style>

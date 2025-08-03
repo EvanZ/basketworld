@@ -2,6 +2,8 @@ uvicorn
 fastapi
 python-dotenv
 numpy
+imageio
+pillow
 mlflow
 stable-baselines3
 torch

@@ -22,6 +22,10 @@ from typing import Dict, List, Tuple, Optional, Union
 from enum import Enum
 from collections import defaultdict
 
+# Use a non-interactive backend so rendering works in headless/threaded contexts
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
