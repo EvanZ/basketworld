@@ -190,6 +190,33 @@ def setup_environment(args, training_team):
     env = RewardAggregationWrapper(env)
     return Monitor(env)
 
+# ----------------------------------------------------------
+# Helper function to create a vectorized self-play environment
+# ----------------------------------------------------------
+
+
+def make_vector_env(
+    args,
+    training_team: Team,
+    opponent_policy,
+    num_envs: int,
+) -> DummyVecEnv:
+    """Return a DummyVecEnv with `num_envs` copies of the self-play environment.
+
+    Each copy is wrapped with `SelfPlayEnvWrapper` so that the opponent's
+    behaviour is provided by the frozen `opponent_policy`.
+    """
+
+    def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
+        # We capture the current parameters via default args so that each lambda
+        # has its own bound values (important inside list comprehension).
+        return SelfPlayEnvWrapper(
+            setup_environment(args, training_team),
+            opponent_policy=opponent_policy,
+        )
+
+    return DummyVecEnv([_single_env_factory for _ in range(num_envs)])
+
 def main(args):
     """Main training function."""
 
@@ -226,8 +253,11 @@ def main(args):
         # os.makedirs(save_path, exist_ok=True)
         
         # --- Initialize Base Environment (just for policy creation) ---
-        # SB3 requires an environment to initialize a policy. We'll create a temporary one.
-        temp_env = DummyVecEnv([lambda: setup_environment(args, Team.OFFENSE)])
+        # The model must be created with the same number of parallel envs that will be
+        # used later (SB3 stores this value internally).
+        temp_env = DummyVecEnv([
+            (lambda: setup_environment(args, Team.OFFENSE)) for _ in range(args.num_envs)
+        ])
         
         # --- Initialize Timing Callbacks ---
         offense_timing_callback = RolloutUpdateTimingCallback()
@@ -279,12 +309,12 @@ def main(args):
 
             # --- 1. Train Offense against frozen Defense ---
             print(f"\nTraining Offense...")
-            offense_env = DummyVecEnv([
-                lambda: SelfPlayEnvWrapper(
-                    setup_environment(args, Team.OFFENSE),
-                    opponent_policy=opponent_for_offense
-                )
-            ])
+            offense_env = make_vector_env(
+                args,
+                training_team=Team.OFFENSE,
+                opponent_policy=opponent_for_offense,
+                num_envs=args.num_envs,
+            )
             offense_policy.set_env(offense_env)
             
             offense_mlflow_callback = MLflowCallback(
@@ -318,12 +348,12 @@ def main(args):
 
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
-            defense_env = DummyVecEnv([
-                lambda: SelfPlayEnvWrapper(
-                    setup_environment(args, Team.DEFENSE),
-                    opponent_policy=opponent_for_defense
-                )
-            ])
+            defense_env = make_vector_env(
+                args,
+                training_team=Team.DEFENSE,
+                opponent_policy=opponent_for_defense,
+                num_envs=args.num_envs,
+            )
             defense_policy.set_env(defense_env)
 
             defense_mlflow_callback = MLflowCallback(
@@ -458,6 +488,7 @@ if __name__ == "__main__":
     parser.add_argument("--tensorboard-path", type=str, default=None, help="Path to save TensorBoard logs (set to None if using MLflow).")
     parser.add_argument("--mlflow-experiment-name", type=str, default="BasketWorld_Training", help="Name of the MLflow experiment.")
     parser.add_argument("--mlflow-run-name", type=str, default=None, help="Name of the MLflow run.")
+    parser.add_argument("--num-envs", type=int, default=8, help="Number of parallel environments to run for each policy during training.")
     
     args = parser.parse_args()
  

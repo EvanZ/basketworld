@@ -1,4 +1,10 @@
-const API_BASE_URL = 'http://localhost:8000';
+// Determine the backend base URL.
+// Priority:
+//  1. Vite env variable VITE_API_BASE_URL (e.g., set in .env or at build time)
+//  2. Default to localhost:8080 (common alternative when 8000 is occupied)
+//     You can of course change this to any port that matches your FastAPI server.
+
+const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
 
 export async function initGame(runId, userTeamName) {
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
