@@ -11,7 +11,11 @@ const props = defineProps({
   activePlayerId: {
     type: Number,
     default: null,
-  }
+  },
+  disabled: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again']);
@@ -92,6 +96,7 @@ function getLegalActions(playerId) {
 }
 
 function handleActionSelected(action) {
+  if (props.disabled) return; // ignore clicks when disabled
   if (props.activePlayerId !== null) {
     // If the same action is clicked again, deselect it. Otherwise, select the new one.
     if (selectedActions.value[props.activePlayerId] === action) {
@@ -158,7 +163,7 @@ const shotProbability = computed(() => {
 </script>
 
 <template>
-  <div class="player-controls-container">
+  <div class="player-controls-container" :class="{ disabled: disabled && !gameState.done }">
     <h3>Player Controls</h3>
     <div class="player-tabs">
         <button 
@@ -166,6 +171,7 @@ const shotProbability = computed(() => {
             :key="playerId"
             :class="{ active: activePlayerId === playerId }"
             @click="$emit('update:activePlayerId', playerId)"
+            :disabled="disabled && !gameState.done"
         >
             Player {{ playerId }}
             <span v-if="selectedActions[playerId]">
@@ -190,8 +196,8 @@ const shotProbability = computed(() => {
         </p>
     </div>
 
-    <button @click="submitActions" class="submit-button" :disabled="gameState.done">
-      {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
+    <button @click="submitActions" class="submit-button" :disabled="gameState.done || (disabled && !gameState.done)">
+      {{ gameState.done ? 'Game Over' : disabled ? 'AI Playing' : 'Submit Turn' }}
     </button>
     
     <button @click="$emit('play-again')" class="new-game-button">
@@ -253,5 +259,10 @@ const shotProbability = computed(() => {
 .submit-button:disabled {
   background-color: #6c757d;
   cursor: not-allowed;
+}
+
+.player-controls-container.disabled {
+  opacity: 0.5;
+  pointer-events: none;
 }
 </style> 
