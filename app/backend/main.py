@@ -32,7 +32,13 @@ game_state = GameState()
 # --- API Models ---
 class InitGameRequest(BaseModel):
     run_id: str
-    user_team_name: str # "OFFENSE" or "DEFENSE"
+    user_team_name: str  # "OFFENSE" or "DEFENSE"
+    offense_policy_name: str | None = None  # optional specific policy filename
+    defense_policy_name: str | None = None
+
+
+class ListPoliciesRequest(BaseModel):
+    run_id: str
 
 class ActionRequest(BaseModel):
     actions: dict[str, int] # JSON keys are strings, so we accept strings and convert later.
@@ -48,6 +54,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def list_policies_from_run(client, run_id):
+    """Return sorted lists of offense and defense policy artifact paths for a run."""
+    artifacts = client.list_artifacts(run_id, "models")
+    offense = [f.path for f in artifacts if f.path.endswith(".zip") and "offense" in f.path]
+    defense = [f.path for f in artifacts if f.path.endswith(".zip") and "defense" in f.path]
+
+    # sort by number embedded at end _<n>.zip if present
+    def sort_key(p):
+        import re
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
+    offense.sort(key=sort_key)
+    defense.sort(key=sort_key)
+    return offense, defense
+
+
+def get_policy_path(client, run_id, policy_name: str | None, team_prefix: str):
+    """Return artifact path for given policy (downloaded locally). If name None, use latest."""
+    # Use a persistent cache directory to avoid deletion before PPO.load
+    cache_dir = os.path.join("episodes", "_policy_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    offense_paths, defense_paths = list_policies_from_run(client, run_id)
+    choices = offense_paths if team_prefix == "offense" else defense_paths
+    if not choices:
+        raise HTTPException(status_code=404, detail=f"No {team_prefix} policy artifacts found.")
+
+    chosen_artifact = None
+    if policy_name and any(p.endswith(policy_name) for p in choices):
+        # find full path that ends with provided name
+        chosen_artifact = next(p for p in choices if p.endswith(policy_name))
+    else:
+        chosen_artifact = choices[-1]  # latest
+
+    return client.download_artifacts(run_id, chosen_artifact, cache_dir)
+
+# existing helper kept for internal use
 def get_latest_policies_from_run(client, run_id, tmpdir):
     """Downloads the latest policies from a given MLflow run."""
     artifacts = client.list_artifacts(run_id, "models")
@@ -61,6 +104,22 @@ def get_latest_policies_from_run(client, run_id, tmpdir):
     defense_local_path = client.download_artifacts(run_id, latest_defense_path, tmpdir)
 
     return offense_local_path, defense_local_path
+
+@app.post("/api/list_policies")
+def list_policies(request: ListPoliciesRequest):
+    """Return available offense and defense policy filenames for a run."""
+    mlflow.set_tracking_uri("http://localhost:5000")
+    client = mlflow.tracking.MlflowClient()
+    try:
+        offense_paths, defense_paths = list_policies_from_run(client, request.run_id)
+        # return only basenames to frontend
+        return {
+            "offense": [os.path.basename(p) for p in offense_paths],
+            "defense": [os.path.basename(p) for p in defense_paths],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list policies: {e}")
+
 
 @app.post("/api/init_game")
 def init_game(request: InitGameRequest):
@@ -78,10 +137,13 @@ def init_game(request: InitGameRequest):
         players = int(params["players"])
         shot_clock = int(params["shot_clock"])
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            offense_path, defense_path = get_latest_policies_from_run(client, request.run_id, tmpdir)
-            game_state.offense_policy = PPO.load(offense_path)
-            game_state.defense_policy = PPO.load(defense_path)
+        # Download selected or latest policies
+        game_state.offense_policy = PPO.load(
+            get_policy_path(client, request.run_id, request.offense_policy_name, "offense")
+        )
+        game_state.defense_policy = PPO.load(
+            get_policy_path(client, request.run_id, request.defense_policy_name, "defense")
+        )
 
         game_state.env = basketworld.HexagonBasketballEnv(
             grid_size=grid_size,

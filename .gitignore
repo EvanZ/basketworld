@@ -69,3 +69,5 @@ prompts/
 
 .vscode/
 .DS_Store
+
+app/backend/episodes/

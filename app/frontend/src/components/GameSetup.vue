@@ -1,17 +1,39 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
+import { listPolicies } from '@/services/api';
 
 const emit = defineEmits(['game-started']);
 
 const runId = ref('');
 const userTeam = ref('OFFENSE');
 
+const offensePolicies = ref([]);
+const defensePolicies = ref([]);
+const selectedOffensePolicy = ref(null);
+const selectedDefensePolicy = ref(null);
+
+async function fetchPolicies() {
+  if (!runId.value) return;
+  try {
+    const res = await listPolicies(runId.value);
+    offensePolicies.value = res.offense || [];
+    defensePolicies.value = res.defense || [];
+    selectedOffensePolicy.value = offensePolicies.value.at(-1) || null;
+    selectedDefensePolicy.value = defensePolicies.value.at(-1) || null;
+  } catch (e) {
+    console.error('Failed to fetch policies', e);
+  }
+}
+
+// fetch whenever runId changes with debounce-like watch
+watch(runId, () => { fetchPolicies(); });
+
 // This component now only needs to emit the user's choices.
 // The parent App.vue will handle the API call and loading state.
 function startGame() {
     if (runId.value) {
-        console.log('[GameSetup] Emitting game-started event with:', { runId: runId.value, userTeam: userTeam.value });
-        emit('game-started', { runId: runId.value, userTeam: userTeam.value });
+        console.log('[GameSetup] Emitting game-started event with:', { runId: runId.value, userTeam: userTeam.value, offensePolicyName: selectedOffensePolicy.value, defensePolicyName: selectedDefensePolicy.value });
+        emit('game-started', { runId: runId.value, userTeam: userTeam.value, offensePolicyName: selectedOffensePolicy.value, defensePolicyName: selectedDefensePolicy.value });
     }
 }
 </script>
@@ -39,6 +61,20 @@ function startGame() {
                 </label>
             </div>
             
+            <div class="form-group">
+                <label for="offensePol">Offense Policy:</label>
+                <select id="offensePol" v-model="selectedOffensePolicy">
+                    <option v-for="name in offensePolicies" :key="name" :value="name">{{ name }}</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="defensePol">Defense Policy:</label>
+                <select id="defensePol" v-model="selectedDefensePolicy">
+                    <option v-for="name in defensePolicies" :key="name" :value="name">{{ name }}</option>
+                </select>
+            </div>
+
             <button type="submit">
                 Start Game
             </button>

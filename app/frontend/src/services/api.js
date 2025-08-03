@@ -6,7 +6,7 @@
 
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
 
-export async function initGame(runId, userTeamName) {
+export async function initGame(runId, userTeamName, offensePolicyName = null, defensePolicyName = null) {
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
         method: 'POST',
         headers: {
@@ -15,6 +15,8 @@ export async function initGame(runId, userTeamName) {
         body: JSON.stringify({
             run_id: runId,
             user_team_name: userTeamName,
+            offense_policy_name: offensePolicyName,
+            defense_policy_name: defensePolicyName,
         }),
     });
     if (!response.ok) {
@@ -70,6 +72,20 @@ export async function saveEpisode() {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to save episode' }));
         console.error('[API] saveEpisode failed:', response.status, errorData);
         throw new Error(errorData.detail || 'Failed to save episode');
+    }
+    return response.json();
+}
+
+export async function listPolicies(runId) {
+    const response = await fetch(`${API_BASE_URL}/api/list_policies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: runId }),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to list policies' }));
+        console.error('[API] listPolicies failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to list policies');
     }
     return response.json();
 } 
