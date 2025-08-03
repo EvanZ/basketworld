@@ -15,7 +15,7 @@ I think — I propose? I hope? — that we can do something like this for basket
 
 Ok, so with my semi-short spiel out of the way, let's get to the good stuff. First, we need to think about how to build the BasketWorld. It starts with the geometry and the "court". Of course, my first thought was to use a regular square grid as in GridWorld. Squares are fine for what they are but *everyone* knows that the square walked so the hexagon could run. What is neat about the hexagon is that it is the largest regular polygon (in terms of number of sides) that can tesselate a plane completely (ie fills a plane with no gaps). (https://www.redblobgames.com/grids/hexagons/)
 
-![hex court](../fixed_scale_basketball.png)
+![hex court](../images/fixed_scale_basketball.png)
 
 We are also going to start with half-court simulations, and  hence, only one basket. We can vary the number of players, the size or coarseness of the hexagons, the dimensions of the court, without much additional complexity. Next, we need to decide on the "Action Space" and the physics or rules of the simulation. First it should be said that the "atomic unit" of RL training is an "episode". For our purposes, an episode right now is defined from the start of a possession until one of these events occurs:
 * a shot is attempted, regardless of whether it is missed or made (we are not modeling rebounds for now)
