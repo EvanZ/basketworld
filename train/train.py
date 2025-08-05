@@ -151,29 +151,70 @@ class SelfPlayEnvWrapper(gym.Wrapper):
 
 # --- Main Training Logic ---
 
-def get_random_policy_from_artifacts(client, run_id, team_prefix, tmpdir):
-    """
-    Downloads a random historical policy for a given team from the MLflow run.
-    If no policies are found, returns None.
+def sample_geometric(indices: list[int], beta: float) -> int:
+    """Return index sampled with decayed probability (newest highest)."""
+    K = len(indices)
+    # newest has i = K, oldest i=1
+    weights = [(1 - beta) * (beta ** (K - i)) for i in range(1, K + 1)]
+    total = sum(weights)
+    probs = [w / total for w in weights]
+    return random.choices(indices, weights=probs, k=1)[0]
+
+
+def get_random_policy_from_artifacts(
+    client,
+    run_id,
+    team_prefix,
+    tmpdir,
+    K: int = 20,
+    beta: float = 0.8,
+    uniform_eps: float = 0.10,
+):
+    """Sample an opponent checkpoint using a geometric decay over recent K snapshots.
+
+    Args:
+        client: MLflow client
+        run_id: experiment run
+        team_prefix: "offense" or "defense"
+        tmpdir: temp dir to download artifact
+        K: reservoir size (keep last K)
+        beta: geometric decay factor (0<beta<1)
+        uniform_eps: probability of picking uniformly among all snapshots.
     """
     artifact_path = "models"
     all_artifacts = client.list_artifacts(run_id, artifact_path)
-    
-    # Filter for the specific team's policy files (.zip)
+
+    # Extract paths for team
     team_policies = [
-        f.path for f in all_artifacts 
+        f.path
+        for f in all_artifacts
         if f.path.startswith(f"{artifact_path}/{team_prefix}") and f.path.endswith(".zip")
     ]
 
     if not team_policies:
-        return None # No historical policies found for this team
+        return None
 
-    # Select a random policy from the list
-    random_policy_path = random.choice(team_policies)
-    print(f"  - Selected random opponent policy: {os.path.basename(random_policy_path)}")
+    # sort chronologically by alternation number embedded at end _<n>.zip
+    def sort_key(p):
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
 
-    # Download the selected artifact
-    local_path = client.download_artifacts(run_id, random_policy_path, tmpdir)
+    team_policies.sort(key=sort_key)
+
+    # keep last K
+    recent_pols = team_policies[-K:]
+
+    # with small probability sample uniform over all for coverage
+    if random.random() < uniform_eps:
+        chosen = random.choice(team_policies)
+    else:
+        # geometric sampling over recent_pols
+        # indices list 0..len-1 correspond to oldest..newest in recent_pols
+        idx = sample_geometric(list(range(len(recent_pols))), beta)
+        chosen = recent_pols[idx]
+
+    print(f"  - Selected opponent policy: {os.path.basename(chosen)}")
+    local_path = client.download_artifacts(run_id, chosen, tmpdir)
     return PPO.load(local_path)
 
 def setup_environment(args, training_team):
