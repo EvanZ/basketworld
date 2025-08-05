@@ -271,6 +271,7 @@ def main(args):
             n_steps=args.n_steps, 
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
+            learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             tensorboard_log=None, # Disable TensorBoard if using MLflow
             policy_kwargs=policy_kwargs
@@ -282,6 +283,7 @@ def main(args):
             n_steps=args.n_steps, 
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
+            learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             tensorboard_log=None, # Disable TensorBoard if using MLflow
             policy_kwargs=policy_kwargs
@@ -478,6 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
     parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
+    parser.add_argument("--learning-rate", type=float, default=2.5e-4, help="Learning rate for PPO optimizers.")
     parser.add_argument("--net-arch", type=int, nargs='+', default=None, help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.")
     parser.add_argument("--eval-freq", type=int, default=2, help="Run evaluation every N alternations. Set to 0 to disable.")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to run for each evaluation.")
