@@ -72,6 +72,28 @@ const basketPosition = computed(() => {
     return axialToCartesian(q, r);
 });
 
+const threePointSegments = computed(() => {
+  const segs = [];
+  const gs = currentGameState.value;
+  if (!gs) return segs;
+  const dist3 = gs.three_point_distance ?? 4;
+  for (let r_off = 0; r_off < gs.court_height; r_off++) {
+    for (let c_off = 0; c_off < gs.court_width; c_off++) {
+      const { q, r } = offsetToAxial(c_off, r_off);
+      // hex distance in axial
+      const dq = Math.abs(q - gs.basket_position[0]);
+      const dr = Math.abs(r - gs.basket_position[1]);
+      const ds = Math.abs((q + r) - (gs.basket_position[0] + gs.basket_position[1]));
+      const hexDist = (dq + dr + ds) / 2;
+      if (hexDist === dist3) {
+        const { x, y } = axialToCartesian(q, r);
+        segs.push({ x, y, key: `tp-${q},${r}` });
+      }
+    }
+  }
+  return segs;
+});
+
 const viewBox = computed(() => {
     if (courtLayout.value.length === 0) return "-100 -100 200 200";
     
@@ -155,9 +177,17 @@ const episodeOutcome = computed(() => {
     if (results.shots && Object.keys(results.shots).length > 0) {
         const shooterId = Object.keys(results.shots)[0];
         const shotResult = results.shots[shooterId];
-        return { 
+        const pid = parseInt(shooterId, 10);
+        const pos = currentGameState.value.positions[pid];
+        const [q, r] = pos;
+        const bq = currentGameState.value.basket_position[0];
+        const br = currentGameState.value.basket_position[1];
+        const dist = (Math.abs(q - bq) + Math.abs((q + r) - (bq + br)) + Math.abs(r - br)) / 2;
+        const isThree = dist >= (currentGameState.value.three_point_distance ?? 4);
+        return {
             type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT',
-            playerId: parseInt(shooterId, 10)
+            isThree,
+            playerId: pid,
         };
     }
 
@@ -267,6 +297,22 @@ const playerTransitions = computed(() => {
           class="court-hex"
         />
 
+        <!-- 3PT line: red outlines on hexes at exactly the 3PT distance -->
+        <polygon
+          v-for="hex in threePointSegments"
+          :key="hex.key"
+          :points="[...Array(6)].map((_, i) => {
+            const ang = 60 * i + 30;
+            const rad = Math.PI / 180 * ang;
+            const xPoint = hex.x + HEX_RADIUS * Math.cos(rad);
+            const yPoint = hex.y + HEX_RADIUS * Math.sin(rad);
+            return `${xPoint},${yPoint}`;
+          }).join(' ')"
+          fill="none"
+          stroke="red"
+          stroke-width="2"
+        />
+
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
 
@@ -370,11 +416,11 @@ const playerTransitions = computed(() => {
       <g v-if="episodeOutcome" class="outcome-text-group">
           <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
-              <tspan x="50%" dy="1.2em">MADE!</tspan>
+              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isThree ? 'Made 3!' : 'Made 2!' }}</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
-              <tspan x="50%" dy="1.2em">MISS!</tspan>
+              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isThree ? 'Missed 3!' : 'Missed 2!' }}</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
           <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>

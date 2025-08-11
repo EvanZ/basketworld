@@ -67,7 +67,8 @@ class HexagonBasketballEnv(gym.Env):
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
         defender_pressure_distance: int = 1,
-        defender_pressure_turnover_chance: float = 0.05
+        defender_pressure_turnover_chance: float = 0.05,
+        three_point_distance: int = 4,
     ):
         super().__init__()
         
@@ -80,6 +81,8 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
+        # Three-point configuration
+        self.three_point_distance = three_point_distance
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -507,14 +510,23 @@ class HexagonBasketballEnv(gym.Env):
 
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot based on distance."""
+        SHOT_PROBS = {
+            "layup": 0.6,
+            "hook": 0.5,
+            "jumper": 0.4,
+            "three": 0.35,
+            "heave": 0.02
+        }
         if distance <= 1:
-            return 0.9  # Dunk/Layup
-        elif distance <= 3:
-            return 0.5  # Close shot
-        elif distance <= 5:
-            return 0.2  # Mid-range
+            return SHOT_PROBS["layup"]    # Dunk/Layup
+        elif distance <= 2:
+            return SHOT_PROBS["hook"]  # Close shot
+        elif distance <= self.three_point_distance - 1:
+            return SHOT_PROBS["jumper"]  # Mid-range
+        elif distance <= self.three_point_distance + 1:
+            return SHOT_PROBS["three"]  # Mid-range
         else:
-            return 0.05 # Long-range heave
+            return SHOT_PROBS["heave"] # Long-range heave
 
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
@@ -548,13 +560,23 @@ class HexagonBasketballEnv(gym.Env):
                 if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
                     rewards[self.offense_ids] += time_penalty
             
-            # Define the reward magnitude for shots
-            made_shot_reward = 1.0
+            # Define the reward magnitude for shots (3PT outside the line)
+            # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
+            made_shot_reward_inside = 1.0
+            made_shot_reward_three = 1.5
             missed_shot_penalty = 0.1 # Less punishing than a turnover (-0.2)
 
             if shot_result["success"]:
                 # Basket was made
                 if player_id in self.offense_ids:
+                    # Distance of the shot to determine 2PT vs 3PT
+                    shooter_pos = self.positions[player_id]
+                    dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
+                    made_shot_reward = (
+                        made_shot_reward_three
+                        if dist_to_basket >= self.three_point_distance
+                        else made_shot_reward_inside
+                    )
                     # Offense scored, good for them, bad for defense
                     rewards[self.offense_ids] += made_shot_reward
                     rewards[self.defense_ids] -= made_shot_reward
@@ -666,6 +688,15 @@ class HexagonBasketballEnv(gym.Env):
                     basket_ring = plt.Circle((x, y), hex_radius * 1.05, fill=False, edgecolor='red', linewidth=4, zorder=6)
                     ax.add_patch(basket_ring)
 
+                # Paint the three-point line: all hexes at exactly self.three_point_distance
+                cell_distance = self._hex_distance((q, r_ax), self.basket_position)
+                if cell_distance == self.three_point_distance:
+                    tp_outline = RegularPolygon(
+                        (x, y), numVertices=6, radius=hex_radius,
+                        orientation=0, facecolor='none', edgecolor='red', linewidth=2.5, zorder=7
+                    )
+                    ax.add_patch(tp_outline)
+
         # Draw players by filling their hexagon
         for i, (q, r) in enumerate(self.positions):
             x, y = axial_to_cartesian(q, r)
@@ -707,12 +738,18 @@ class HexagonBasketballEnv(gym.Env):
             if self.last_action_results.get("shots"):
                 shot_result = list(self.last_action_results["shots"].values())[0]
                 basket_x, basket_y = axial_to_cartesian(*self.basket_position)
+                # Determine 2PT or 3PT by shooter position at shot
+                shooter_id = list(self.last_action_results["shots"].keys())[0]
+                shooter_pos = self.positions[int(shooter_id)]
+                dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
+                is_three = dist_to_basket >= self.three_point_distance
+                label_suffix = "3" if is_three else "2"
                 if shot_result["success"]:
                     ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='green', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, "MADE!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
+                    ax.text(0.5, 0.9, f"Made {label_suffix}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
                 else:
                     ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='red', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, "MISS!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
+                    ax.text(0.5, 0.9, f"Missed {label_suffix}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
 
             # Turnover results
             turnovers = self.last_action_results.get("turnovers", [])

@@ -6,10 +6,14 @@ from collections import defaultdict
 
 def get_outcome_category(outcome_str: str) -> str:
     """Categorizes a detailed outcome string into a simple category for filenames."""
-    if "Made Shot" in outcome_str:
-        return "made_shot"
-    if "Missed Shot" in outcome_str:
-        return "missed_shot"
+    if "Made 2" in outcome_str:
+        return "made_2pt"
+    if "Made 3" in outcome_str:
+        return "made_3pt"
+    if "Missed 2" in outcome_str:
+        return "missed_2pt"
+    if "Missed 3" in outcome_str:
+        return "missed_3pt"
     if "Turnover (Pressure)" in outcome_str:
         return "tov-pressure"
     if "Turnover (Intercepted)" in outcome_str:

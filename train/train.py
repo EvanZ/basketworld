@@ -462,8 +462,17 @@ def main(args):
                         outcome = "Unknown" # Default outcome
 
                         if action_results.get('shots'):
+                            shooter_id = list(action_results['shots'].keys())[0]
                             shot_result = list(action_results['shots'].values())[0]
-                            outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
+                            # Determine 2 or 3 based on position at shot
+                            shooter_pos = eval_env.positions[int(shooter_id)]
+                            bq, br = eval_env.basket_position
+                            dist = (abs(shooter_pos[0] - bq) + abs((shooter_pos[0] + shooter_pos[1]) - (bq + br)) + abs(shooter_pos[1] - br)) // 2
+                            is_three = dist >= getattr(eval_env, 'three_point_distance', 4)
+                            if shot_result['success']:
+                                outcome = "Made 3" if is_three else "Made 2"
+                            else:
+                                outcome = "Missed 3" if is_three else "Missed 2"
                         elif action_results.get('turnovers'):
                             turnover_reason = action_results['turnovers'][0]['reason']
                             if turnover_reason == 'intercepted':

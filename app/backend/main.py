@@ -384,5 +384,6 @@ def get_full_game_state():
         "defense_ids": game_state.env.defense_ids,
         "basket_position": basket_pos_py,
         "court_width": game_state.env.court_width,
-        "court_height": game_state.env.court_height
+        "court_height": game_state.env.court_height,
+        "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
     } 
