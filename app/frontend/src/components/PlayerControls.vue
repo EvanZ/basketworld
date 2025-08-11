@@ -125,19 +125,28 @@ function submitActions() {
   }
 }
 
-// --- Shot Probability Logic (Ported from Python) ---
+// --- Shot Probability Logic (matches Python env) ---
 function hexDistance(pos1, pos2) {
   const [q1, r1] = pos1;
   const [q2, r2] = pos2;
-  // This formula must exactly match the Python environment's _hex_distance method.
+  // Must match Python _hex_distance: integer result
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
-function calculateShotProbability(distance) {
-  if (distance <= 1) return 0.9;
-  if (distance <= 3) return 0.5;
-  if (distance <= 5) return 0.2;
-  return 0.05;
+function calculateShotProbability(distance, threePointDistance, shotProbs) {
+  // Mirror backend env; prefer values from game state when provided
+  const SHOT_PROBS = shotProbs || {
+    layup: 0.6,
+    hook: 0.5,
+    jumper: 0.4,
+    three: 0.4,
+    heave: 0.02,
+  };
+  if (distance <= 1) return SHOT_PROBS.layup; // Dunk/Layup
+  if (distance <= 2) return SHOT_PROBS.hook;  // Close shot
+  if (distance <= (threePointDistance - 1)) return SHOT_PROBS.jumper; // Mid-range
+  if (distance <= (threePointDistance + 1)) return SHOT_PROBS.three;  // Three
+  return SHOT_PROBS.heave; // Long-range heave
 }
 
 const shotProbability = computed(() => {
@@ -157,7 +166,9 @@ const shotProbability = computed(() => {
     }
     
     const distance = hexDistance(playerPos, basketPos);
-    return calculateShotProbability(distance);
+    const tpd = props.gameState.three_point_distance ?? 4;
+    const shotProbs = props.gameState.shot_probs || null;
+    return calculateShotProbability(distance, tpd, shotProbs);
 });
 
 </script>

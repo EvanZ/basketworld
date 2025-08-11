@@ -83,6 +83,14 @@ class HexagonBasketballEnv(gym.Env):
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
         # Three-point configuration
         self.three_point_distance = three_point_distance
+        # Shot probability table (exposed for UI). Keep in sync with _calculate_shot_probability.
+        self.shot_probs = {
+            "layup": 0.67,
+            "hook": 0.55,
+            "jumper": 0.45,
+            "three": 0.35,
+            "heave": 0.1,
+        }
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -155,6 +163,13 @@ class HexagonBasketballEnv(gym.Env):
         col = q + (r - (r & 1)) // 2
         row = r
         return col, row
+
+    def _axial_to_cartesian(self, q: int, r: int) -> Tuple[float, float]:
+        """Convert axial (q, r) to cartesian (x, y) matching rendering geometry."""
+        size = 1.0
+        x = size * (math.sqrt(3) * q + math.sqrt(3) / 2 * r)
+        y = size * (1.5 * r)
+        return x, y
     
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment to initial state."""
@@ -414,58 +429,94 @@ class HexagonBasketballEnv(gym.Env):
     
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
         """
-        Attempt a pass from the ball holder, modifying the results dict directly.
-        A pass can result in success, an out-of-bounds turnover, or an interception turnover.
+        Arc-based passing:
+        - Determine a 60-degree arc centered on the chosen direction.
+        - Eligible receivers are same-team players whose angle from passer lies within the arc;
+          choose the nearest such teammate as target.
+        - If no eligible teammate, treat as pass out of bounds in that direction.
+        - If at least one defender lies in the same arc and is closer than the receiver,
+          a fixed 25% chance of interception applies (closest defender steals).
         """
         passer_pos = self.positions[passer_id]
-        
-        # Project a line of sight from the passer
-        distance = 1
-        while True:
-            vec = self.hex_directions[direction_idx]
-            target_pos = (passer_pos[0] + vec[0] * distance, passer_pos[1] + vec[1] * distance)
+        dir_dq, dir_dr = self.hex_directions[direction_idx]
 
-            # If pass goes out of bounds, it's a turnover
-            if not self._is_valid_position(*target_pos):
-                self.ball_holder = None # No one has the ball
+        # Compute angles in cartesian space
+        dir_x, dir_y = self._axial_to_cartesian(dir_dq, dir_dr)
+        dir_angle = math.atan2(dir_y, dir_x)
+        arc_half = math.pi / 6  # 30 degrees
+
+        def angle_in_arc(to_q: int, to_r: int) -> Tuple[float, float, bool]:
+            vx, vy = self._axial_to_cartesian(to_q - passer_pos[0], to_r - passer_pos[1])
+            ang = math.atan2(vy, vx)
+            # Smallest signed angle difference
+            diff = (ang - dir_angle + math.pi) % (2 * math.pi) - math.pi
+            return ang, diff, abs(diff) <= arc_half
+
+        # Pick closest teammate in arc
+        team_ids = self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        recv_id = None
+        recv_dist = None
+        for pid in team_ids:
+            if pid == passer_id:
+                continue
+            tq, tr = self.positions[pid]
+            _, _, in_arc = angle_in_arc(tq, tr)
+            if not in_arc:
+                continue
+            d = self._hex_distance(passer_pos, (tq, tr))
+            if recv_id is None or d < recv_dist:
+                recv_id = pid
+                recv_dist = d
+
+        if recv_id is None:
+            # No teammate in arc: pass sails out of bounds in that direction
+            step = 1
+            while True:
+                target = (passer_pos[0] + dir_dq * step, passer_pos[1] + dir_dr * step)
+                if not self._is_valid_position(*target):
+                    self.ball_holder = None
+                    results["turnovers"].append({
+                        "player_id": passer_id,
+                        "reason": "pass_out_of_bounds",
+                        "turnover_pos": target,
+                    })
+                    results["passes"][passer_id] = {"success": False, "reason": "out_of_bounds"}
+                    return
+                step += 1
+
+        # Possible interception by defender in same arc who is closer than receiver
+        opp_ids = self.defense_ids if passer_id in self.offense_ids else self.offense_ids
+        intercept_candidates: List[Tuple[int, int]] = []  # (defender_id, distance)
+        for did in opp_ids:
+            dq, dr = self.positions[did]
+            _, _, in_arc = angle_in_arc(dq, dr)
+            if not in_arc:
+                continue
+            dist_d = self._hex_distance(passer_pos, (dq, dr))
+            if recv_dist is not None and dist_d < recv_dist:
+                intercept_candidates.append((did, dist_d))
+
+        if intercept_candidates:
+            # Closest defender in arc
+            intercept_candidates.sort(key=lambda t: t[1])
+            thief_id = intercept_candidates[0][0]
+            if self._rng.random() < 0.25:
+                # Interception occurs
+                self.ball_holder = thief_id
                 results["turnovers"].append({
                     "player_id": passer_id,
-                    "reason": "pass_out_of_bounds",
-                    "turnover_pos": target_pos
+                    "reason": "intercepted",
+                    "stolen_by": thief_id,
+                    "turnover_pos": self.positions[thief_id],
                 })
-                results["passes"][passer_id] = {"success": False, "reason": "out_of_bounds"}
+                results["passes"][passer_id] = {"success": False, "reason": "intercepted", "interceptor_id": thief_id}
                 return
-            
-            # Check if any player is at the target position
-            for player_id, pos in enumerate(self.positions):
-                if pos == target_pos:
-                    is_teammate = (player_id in self.offense_ids and passer_id in self.offense_ids) or \
-                                  (player_id in self.defense_ids and passer_id in self.defense_ids)
-                    
-                    if is_teammate:
-                        # Successful pass
-                        self.ball_holder = player_id
-                        results["passes"][passer_id] = {"success": True, "target": player_id}
-                        return
-                    else:
-                        # Intercepted by opponent
-                        self._turnover_to_defense(passer_id)
-                        results["turnovers"].append({
-                            "player_id": passer_id,
-                            "reason": "intercepted",
-                            "stolen_by": player_id,
-                            "turnover_pos": pos
-                        })
-                        results["passes"][passer_id] = {
-                            "success": False, 
-                            "reason": "intercepted", 
-                            "interceptor_id": player_id
-                        }
-                        return
 
-            # If no player was found, continue the pass to the next hex
-            distance += 1
-    
+        # Successful pass to receiver in arc
+        self.ball_holder = recv_id
+        results["passes"][passer_id] = {"success": True, "target": recv_id}
+        return
+
     def _attempt_shot(self, shooter_id: int) -> Dict:
         """Attempt a shot from the ball holder."""
         shooter_pos = self.positions[shooter_id]
@@ -510,23 +561,16 @@ class HexagonBasketballEnv(gym.Env):
 
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot based on distance."""
-        SHOT_PROBS = {
-            "layup": 0.6,
-            "hook": 0.5,
-            "jumper": 0.4,
-            "three": 0.35,
-            "heave": 0.02
-        }
         if distance <= 1:
-            return SHOT_PROBS["layup"]    # Dunk/Layup
+            return self.shot_probs["layup"]    # Dunk/Layup
         elif distance <= 2:
-            return SHOT_PROBS["hook"]  # Close shot
+            return self.shot_probs["hook"]  # Close shot
         elif distance <= self.three_point_distance - 1:
-            return SHOT_PROBS["jumper"]  # Mid-range
+            return self.shot_probs["jumper"]  # Mid-range
         elif distance <= self.three_point_distance + 1:
-            return SHOT_PROBS["three"]  # Mid-range
+            return self.shot_probs["three"]  # Three
         else:
-            return SHOT_PROBS["heave"] # Long-range heave
+            return self.shot_probs["heave"] # Long-range heave
 
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""

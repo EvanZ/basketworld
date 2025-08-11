@@ -386,4 +386,5 @@ def get_full_game_state():
         "court_width": game_state.env.court_width,
         "court_height": game_state.env.court_height,
         "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
+        "shot_probs": getattr(game_state.env, "shot_probs", None),
     } 

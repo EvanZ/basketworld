@@ -80,7 +80,6 @@ const threePointSegments = computed(() => {
   for (let r_off = 0; r_off < gs.court_height; r_off++) {
     for (let c_off = 0; c_off < gs.court_width; c_off++) {
       const { q, r } = offsetToAxial(c_off, r_off);
-      // hex distance in axial
       const dq = Math.abs(q - gs.basket_position[0]);
       const dr = Math.abs(r - gs.basket_position[1]);
       const ds = Math.abs((q + r) - (gs.basket_position[0] + gs.basket_position[1]));
