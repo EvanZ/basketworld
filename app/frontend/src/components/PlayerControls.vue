@@ -133,20 +133,30 @@ function hexDistance(pos1, pos2) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
-function calculateShotProbability(distance, threePointDistance, shotProbs) {
-  // Mirror backend env; prefer values from game state when provided
+function calculateShotProbability(distance, threePointDistance, shotProbs, shotParams) {
+  // Prefer parametric model when present
+  if (shotParams && shotParams.model === 'linear') {
+    const d0 = 1;
+    const d1 = Math.max(threePointDistance, d0 + 1);
+    const p0 = Number(shotParams.layup_pct ?? 0.67);
+    const p1 = Number(shotParams.three_pt_pct ?? 0.35);
+    let prob = distance <= d0 ? p0 : (p0 + (p1 - p0) * ((distance - d0) / (d1 - d0)));
+    prob = Math.max(0.01, Math.min(0.99, prob));
+    return prob;
+  }
+  // Fallback to discrete table if provided
   const SHOT_PROBS = shotProbs || {
-    layup: 0.6,
-    hook: 0.5,
-    jumper: 0.4,
-    three: 0.4,
-    heave: 0.02,
+    layup: 0.67,
+    hook: 0.55,
+    jumper: 0.45,
+    three: 0.35,
+    heave: 0.1,
   };
-  if (distance <= 1) return SHOT_PROBS.layup; // Dunk/Layup
-  if (distance <= 2) return SHOT_PROBS.hook;  // Close shot
-  if (distance <= (threePointDistance - 1)) return SHOT_PROBS.jumper; // Mid-range
-  if (distance <= (threePointDistance + 1)) return SHOT_PROBS.three;  // Three
-  return SHOT_PROBS.heave; // Long-range heave
+  if (distance <= 1) return SHOT_PROBS.layup;
+  if (distance <= 2) return SHOT_PROBS.hook;
+  if (distance <= (threePointDistance - 1)) return SHOT_PROBS.jumper;
+  if (distance <= (threePointDistance + 1)) return SHOT_PROBS.three;
+  return SHOT_PROBS.heave;
 }
 
 const shotProbability = computed(() => {
@@ -168,7 +178,8 @@ const shotProbability = computed(() => {
     const distance = hexDistance(playerPos, basketPos);
     const tpd = props.gameState.three_point_distance ?? 4;
     const shotProbs = props.gameState.shot_probs || null;
-    return calculateShotProbability(distance, tpd, shotProbs);
+    const shotParams = props.gameState.shot_params || null;
+    return calculateShotProbability(distance, tpd, shotProbs, shotParams);
 });
 
 </script>

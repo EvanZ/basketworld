@@ -137,6 +137,35 @@ def init_game(request: InitGameRequest):
         players = int(params["players"])
         shot_clock = int(params["shot_clock"])
 
+        def get_param(params_dict, names, cast, default):
+            for n in names:
+                if n in params_dict and params_dict[n] != "":
+                    try:
+                        return cast(params_dict[n])
+                    except Exception:
+                        pass
+            return default
+
+        # Optional params (added later); try multiple name variants, fall back to defaults
+        three_point_distance = get_param(
+            params,
+            [
+                "three_point_distance",
+                "three-point-distance",
+                "three_pt_distance",
+                "three-pt-distance",
+            ],
+            int,
+            4,
+        )
+        layup_pct = get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
+        three_pt_pct = get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
+
+        print(
+            f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
+            f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}"
+        )
+
         # Download selected or latest policies
         game_state.offense_policy = PPO.load(
             get_policy_path(client, request.run_id, request.offense_policy_name, "offense")
@@ -150,6 +179,9 @@ def init_game(request: InitGameRequest):
             players_per_side=players,
             shot_clock_steps=shot_clock,
             render_mode="rgb_array",  # enable frame rendering
+            three_point_distance=three_point_distance,
+            layup_pct=layup_pct,
+            three_pt_pct=three_pt_pct,
         )
         game_state.obs, _ = game_state.env.reset()
 
@@ -387,4 +419,5 @@ def get_full_game_state():
         "court_height": game_state.env.court_height,
         "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
         "shot_probs": getattr(game_state.env, "shot_probs", None),
+        "shot_params": getattr(game_state.env, "shot_params", None),
     } 

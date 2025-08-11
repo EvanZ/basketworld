@@ -225,6 +225,9 @@ def setup_environment(args, training_team):
         shot_clock_steps=args.shot_clock,
         defender_pressure_distance=args.defender_pressure_distance,
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
+        three_point_distance=args.three_point_distance,
+        layup_pct=args.layup_pct,
+        three_pt_pct=args.three_pt_pct,
         training_team=training_team # Critical for correct rewards
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
@@ -431,7 +434,10 @@ def main(args):
                     grid_size=args.grid_size,
                     players_per_side=args.players,
                     shot_clock_steps=args.shot_clock,
-                    render_mode="rgb_array"
+                    render_mode="rgb_array",
+                    three_point_distance=args.three_point_distance,
+                    layup_pct=args.layup_pct,
+                    three_pt_pct=args.three_pt_pct,
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -522,6 +528,9 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO models using self-play.")
     parser.add_argument("--grid-size", type=int, default=12, help="The size of the grid.")
+    parser.add_argument("--layup-pct", type=float, default=0.60, help="Percentage of layups.")
+    parser.add_argument("--three-pt-pct", type=float, default=0.37, help="Percentage of three-pointers.")
+    parser.add_argument("--three-point-distance", type=int, default=4, help="Distance to the three-point line.")
     parser.add_argument("--players", type=int, default=2, help="Number of players per side.")
     parser.add_argument("--shot-clock", type=int, default=20, help="Steps in the shot clock.")
     parser.add_argument("--alternations", type=int, default=10, help="Number of times to alternate training.")

@@ -69,6 +69,8 @@ class HexagonBasketballEnv(gym.Env):
         defender_pressure_distance: int = 1,
         defender_pressure_turnover_chance: float = 0.05,
         three_point_distance: int = 4,
+        layup_pct: float = 0.60,
+        three_pt_pct: float = 0.37,
     ):
         super().__init__()
         
@@ -81,15 +83,17 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
-        # Three-point configuration
+        # Three-point configuration and shot model parameters
         self.three_point_distance = three_point_distance
-        # Shot probability table (exposed for UI). Keep in sync with _calculate_shot_probability.
-        self.shot_probs = {
-            "layup": 0.67,
-            "hook": 0.55,
-            "jumper": 0.45,
-            "three": 0.35,
-            "heave": 0.1,
+        self.layup_pct = float(layup_pct)
+        self.three_pt_pct = float(three_pt_pct)
+        # Back-compat field kept (UI may use it if shot_params absent). Not authoritative anymore.
+        self.shot_probs = None
+        # New descriptive params for UI
+        self.shot_params = {
+            "model": "linear",
+            "layup_pct": self.layup_pct,
+            "three_pt_pct": self.three_pt_pct,
         }
         
         # Basket position, using offset coordinates for placement
@@ -560,17 +564,25 @@ class HexagonBasketballEnv(gym.Env):
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
 
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
-        """Calculate probability of successful shot based on distance."""
-        if distance <= 1:
-            return self.shot_probs["layup"]    # Dunk/Layup
-        elif distance <= 2:
-            return self.shot_probs["hook"]  # Close shot
-        elif distance <= self.three_point_distance - 1:
-            return self.shot_probs["jumper"]  # Mid-range
-        elif distance <= self.three_point_distance + 1:
-            return self.shot_probs["three"]  # Three
+        """Calculate probability of successful shot using a simple linear model
+        anchored at layup (distance 1) and three-point (distance = three_point_distance).
+        Beyond the arc, we linearly extrapolate and clamp to [0.01, 0.99].
+        """
+        # Anchors
+        d0 = 1
+        d1 = max(self.three_point_distance, d0 + 1)
+        p0 = self.layup_pct
+        p1 = self.three_pt_pct
+
+        if distance <= d0:
+            prob = p0
         else:
-            return self.shot_probs["heave"] # Long-range heave
+            t = (distance - d0) / (d1 - d0)
+            prob = p0 + (p1 - p0) * t  # linear interpolation (or extrapolation if distance>d1)
+
+        # Clamp to sensible bounds
+        prob = max(0.01, min(0.99, prob))
+        return float(prob)
 
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
