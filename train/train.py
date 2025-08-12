@@ -228,6 +228,10 @@ def setup_environment(args, training_team):
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
         three_pt_pct=args.three_pt_pct,
+        shot_pressure_enabled=args.shot_pressure_enabled,
+        shot_pressure_max=args.shot_pressure_max,
+        shot_pressure_lambda=args.shot_pressure_lambda,
+        shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
         training_team=training_team # Critical for correct rewards
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
@@ -438,6 +442,10 @@ def main(args):
                     three_point_distance=args.three_point_distance,
                     layup_pct=args.layup_pct,
                     three_pt_pct=args.three_pt_pct,
+                    shot_pressure_enabled=args.shot_pressure_enabled,
+                    shot_pressure_max=args.shot_pressure_max,
+                    shot_pressure_lambda=args.shot_pressure_lambda,
+                    shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -551,6 +559,10 @@ if __name__ == "__main__":
     parser.add_argument("--mlflow-experiment-name", type=str, default="BasketWorld_Training", help="Name of the MLflow experiment.")
     parser.add_argument("--mlflow-run-name", type=str, default=None, help="Name of the MLflow run.")
     parser.add_argument("--num-envs", type=int, default=8, help="Number of parallel environments to run for each policy during training.")
+    parser.add_argument("--shot-pressure-enabled", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Enable defender shot pressure model.")
+    parser.add_argument("--shot-pressure-max", type=float, default=0.5, help="Max multiplicative reduction at distance 1 (e.g., 0.5 -> up to -50%).")
+    parser.add_argument("--shot-pressure-lambda", type=float, default=1.0, help="Exponential decay rate per hex for shot pressure.")
+    parser.add_argument("--shot-pressure-arc-degrees", type=float, default=60.0, help="Arc width centered toward basket for pressure eligibility.")
     
     args = parser.parse_args()
  

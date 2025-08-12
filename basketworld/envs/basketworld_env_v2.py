@@ -71,6 +71,11 @@ class HexagonBasketballEnv(gym.Env):
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
+        # Shot pressure parameters
+        shot_pressure_enabled: bool = True,
+        shot_pressure_max: float = 0.5,   # max reduction at distance=1 (multiplier = 1 - max)
+        shot_pressure_lambda: float = 1.0, # decay rate per hex away from shooter
+        shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
     ):
         super().__init__()
         
@@ -95,6 +100,11 @@ class HexagonBasketballEnv(gym.Env):
             "layup_pct": self.layup_pct,
             "three_pt_pct": self.three_pt_pct,
         }
+        # Defender shot pressure
+        self.shot_pressure_enabled = bool(shot_pressure_enabled)
+        self.shot_pressure_max = float(shot_pressure_max)
+        self.shot_pressure_lambda = float(shot_pressure_lambda)
+        self.shot_pressure_arc_rad = math.radians(shot_pressure_arc_degrees)
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -285,55 +295,86 @@ class HexagonBasketballEnv(gym.Env):
         for i in range(self.n_players):
             if i != self.ball_holder:
                 masks[i, shoot_pass_actions] = 0
-                
+
+            # Disallow out-of-bounds moves from current position
+            for dir_idx in range(6):
+                move_action_val = ActionType.MOVE_E.value + dir_idx
+                new_pos = self._get_adjacent_position(self.positions[i], dir_idx)
+                if (not self._is_valid_position(*new_pos)) or (new_pos == self.basket_position):
+                    masks[i, move_action_val] = 0
+        
         return masks
          
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
         """
-        Generate initial positions with offense on the far edge and defense adjacent.
+        Generate initial positions with:
+        - Offense spawned "behind" the 3pt line (distance >= three_point_distance)
+        - Defense spawned "inside" the 3pt line (distance < three_point_distance) and
+          closer to the basket than the matched offensive player, preferring the nearest
+          valid position to that offensive player.
         """
+        taken_positions: set[Tuple[int, int]] = set()
+
+        # List all axial cells on court
+        all_cells: List[Tuple[int, int]] = []
+        for row in range(self.court_height):
+            for col in range(self.court_width):
+                all_cells.append(self._offset_to_axial(col, row))
+
+        # Offense candidates: behind the arc but within 3 hexes of it
+        offense_candidates = []
+        for cell in all_cells:
+            if cell == self.basket_position:
+                continue
+            if not self._is_valid_position(*cell):
+                continue
+            dist = self._hex_distance(cell, self.basket_position)
+            if self.three_point_distance <= dist <= self.three_point_distance + 3:
+                offense_candidates.append(cell)
+
+        if len(offense_candidates) < self.players_per_side:
+            raise ValueError("Not enough cells behind the 3pt line to spawn offense.")
+
+        # Sample unique offense positions
         offense_positions = []
-        defense_positions = []
-        taken_positions = set()
+        for cell in self._rng.choice(len(offense_candidates), size=self.players_per_side, replace=False):
+            pos = offense_candidates[cell]
+            offense_positions.append(pos)
+            taken_positions.add(pos)
 
-        # 1. Spawn offense on the far edge of the court (right side)
-        edge_col = self.court_width - 1
-        
-        # Ensure we don't try to sample more rows than available
-        num_to_sample = min(self.players_per_side, self.court_height)
-        offensive_rows = self._rng.choice(self.court_height, size=num_to_sample, replace=False)
-
-        for row in offensive_rows:
-            axial_pos = self._offset_to_axial(edge_col, row)
-            if axial_pos != self.basket_position:
-                offense_positions.append(axial_pos)
-                taken_positions.add(axial_pos)
-        
-        if len(offense_positions) < self.players_per_side:
-            raise ValueError("Could not spawn all offensive players on the edge. Check court dimensions and player count.")
-
-        # 2. Spawn defense adjacent to each offensive player
-        # Directions ordered from "in front of" (towards basket) to "behind"
-        # W, SW, NW, SE, NE, E
-        preferred_directions_indices = [3, 4, 2, 5, 1, 0]
-
+        # Defense candidates: inside arc and closer to basket than offense counterpart
+        defense_positions: List[Tuple[int, int]] = []
         for off_pos in offense_positions:
-            placed_defender = False
-            for dir_idx in preferred_directions_indices:
-                direction_vector = self.hex_directions[dir_idx]
-                def_pos = (off_pos[0] + direction_vector[0], off_pos[1] + direction_vector[1])
+            off_dist = self._hex_distance(off_pos, self.basket_position)
+            candidates = [
+                cell for cell in all_cells
+                if cell != self.basket_position
+                and cell not in taken_positions
+                and self._is_valid_position(*cell)
+                and self._hex_distance(cell, self.basket_position) < off_dist
+                and self._hex_distance(cell, self.basket_position) < self.three_point_distance
+            ]
 
-                if self._is_valid_position(*def_pos) and def_pos not in taken_positions and def_pos != self.basket_position:
-                    defense_positions.append(def_pos)
-                    taken_positions.add(def_pos)
-                    placed_defender = True
-                    break  # Move to the next offensive player
-            
-            if not placed_defender:
-                # This should be rare, but is possible on very crowded/small courts
-                raise RuntimeError(f"Could not find a valid adjacent spawn for a defender near {off_pos}")
+            if not candidates:
+                # Fallback: pick any valid empty cell that is closer to basket
+                candidates = [
+                    cell for cell in all_cells
+                    if cell != self.basket_position
+                    and cell not in taken_positions
+                    and self._is_valid_position(*cell)
+                    and self._hex_distance(cell, self.basket_position) < off_dist
+                ]
 
-        # The final list must have offense positions first, then defense
+            if not candidates:
+                raise RuntimeError("Could not find a valid inside-arc spawn for a defender.")
+
+            # Choose the candidate nearest to the offensive player (to simulate marking)
+            candidates.sort(key=lambda c: self._hex_distance(c, off_pos))
+            def_pos = candidates[0]
+            defense_positions.append(def_pos)
+            taken_positions.add(def_pos)
+
+        # offense first then defense
         return offense_positions + defense_positions
     
     def _is_valid_position(self, q: int, r: int) -> bool:
@@ -446,15 +487,17 @@ class HexagonBasketballEnv(gym.Env):
 
         # Compute angles in cartesian space
         dir_x, dir_y = self._axial_to_cartesian(dir_dq, dir_dr)
-        dir_angle = math.atan2(dir_y, dir_x)
-        arc_half = math.pi / 6  # 30 degrees
+        dir_norm = math.hypot(dir_x, dir_y) or 1.0
+        # 60-degree arc total -> 30-degree half-angle
+        cos_threshold = math.cos(math.pi / 6)
 
-        def angle_in_arc(to_q: int, to_r: int) -> Tuple[float, float, bool]:
+        def in_arc(to_q: int, to_r: int) -> bool:
             vx, vy = self._axial_to_cartesian(to_q - passer_pos[0], to_r - passer_pos[1])
-            ang = math.atan2(vy, vx)
-            # Smallest signed angle difference
-            diff = (ang - dir_angle + math.pi) % (2 * math.pi) - math.pi
-            return ang, diff, abs(diff) <= arc_half
+            vnorm = math.hypot(vx, vy)
+            if vnorm == 0:
+                return False
+            cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+            return cosang >= cos_threshold
 
         # Pick closest teammate in arc
         team_ids = self.offense_ids if passer_id in self.offense_ids else self.defense_ids
@@ -464,8 +507,7 @@ class HexagonBasketballEnv(gym.Env):
             if pid == passer_id:
                 continue
             tq, tr = self.positions[pid]
-            _, _, in_arc = angle_in_arc(tq, tr)
-            if not in_arc:
+            if not in_arc(tq, tr):
                 continue
             d = self._hex_distance(passer_pos, (tq, tr))
             if recv_id is None or d < recv_dist:
@@ -493,8 +535,7 @@ class HexagonBasketballEnv(gym.Env):
         intercept_candidates: List[Tuple[int, int]] = []  # (defender_id, distance)
         for did in opp_ids:
             dq, dr = self.positions[did]
-            _, _, in_arc = angle_in_arc(dq, dr)
-            if not in_arc:
+            if not in_arc(dq, dr):
                 continue
             dist_d = self._hex_distance(passer_pos, (dq, dr))
             if recv_dist is not None and dist_d < recv_dist:
@@ -580,6 +621,43 @@ class HexagonBasketballEnv(gym.Env):
             t = (distance - d0) / (d1 - d0)
             prob = p0 + (p1 - p0) * t  # linear interpolation (or extrapolation if distance>d1)
 
+        # Apply defender shot pressure if any qualifying defender is between shooter and basket
+        if self.shot_pressure_enabled and shooter_id is not None:
+            shooter_pos = self.positions[shooter_id]
+            # Direction from shooter to basket
+            dir_q = self.basket_position[0] - shooter_pos[0]
+            dir_r = self.basket_position[1] - shooter_pos[1]
+            dir_x, dir_y = self._axial_to_cartesian(dir_q, dir_r)
+            dir_norm = math.hypot(dir_x, dir_y) or 1.0
+            cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
+
+            # Choose opposing team as potential pressurers
+            opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
+
+            closest_d = None
+            for did in opp_ids:
+                dq = self.positions[did][0] - shooter_pos[0]
+                dr = self.positions[did][1] - shooter_pos[1]
+                vx, vy = self._axial_to_cartesian(dq, dr)
+                if vx == 0 and vy == 0:
+                    continue
+                vnorm = math.hypot(vx, vy)
+                if vnorm == 0:
+                    continue
+                cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+                in_arc = cosang >= cos_threshold
+                d_def = self._hex_distance(shooter_pos, self.positions[did])
+                # Defender must be closer than basket along this direction
+                if in_arc and d_def < distance:
+                    if closest_d is None or d_def < closest_d:
+                        closest_d = d_def
+
+            if closest_d is not None:
+                # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
+                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * max(0, closest_d - 1))
+                pressure_mult = max(0.0, 1.0 - red)
+                prob *= pressure_mult
+
         # Clamp to sensible bounds
         prob = max(0.01, min(0.99, prob))
         return float(prob)
@@ -602,6 +680,16 @@ class HexagonBasketballEnv(gym.Env):
             rewards[self.offense_ids] -= 0.2 
             rewards[self.defense_ids] += 0.2
         
+        # Light penalty for any out-of-bounds move attempts (regardless of ball holder)
+        for pid, move_res in action_results.get("moves", {}).items():
+            if not move_res.get("success", True) and move_res.get("reason") == "out_of_bounds":
+                if pid in self.offense_ids:
+                    rewards[self.offense_ids] -= 0.02
+                    rewards[self.defense_ids] += 0.02
+                else:
+                    rewards[self.defense_ids] -= 0.02
+                    rewards[self.offense_ids] += 0.02
+
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
