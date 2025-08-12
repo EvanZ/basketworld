@@ -232,6 +232,7 @@ def setup_environment(args, training_team):
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+        enable_profiling=args.enable_env_profiling,
         training_team=training_team # Critical for correct rewards
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
@@ -285,6 +286,7 @@ def main(args):
         sys.exit(1)
     
     with mlflow.start_run(run_name=args.mlflow_run_name) as run:
+        print("MLflow tracking URI:", mlflow.get_tracking_uri())
         # Log hyperparameters
         mlflow.log_params(vars(args))
         print(f"MLflow Run ID: {run.info.run_id}")
@@ -446,6 +448,7 @@ def main(args):
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+                    enable_profiling=args.enable_env_profiling,
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -513,6 +516,25 @@ def main(args):
                 eval_env.close()
                 print(f"--- Evaluation for Alternation {i + 1} Complete ---")
 
+            # Log environment profiling if enabled
+            if args.enable_env_profiling:
+                try:
+                    prof = offense_env.envs[0].unwrapped.get_profile_stats()
+                    for k, v in prof.items():
+                        mlflow.log_metric(f"env_prof_{k}_avg_us_offense", v.get("avg_us", 0.0), step=i + 1)
+                    offense_env.envs[0].unwrapped.reset_profile_stats()
+                except Exception:
+                    pass
+                try:
+                    prof = defense_env.envs[0].unwrapped.get_profile_stats()
+                    for k, v in prof.items():
+                        mlflow.log_metric(f"env_prof_{k}_avg_us_defense", v.get("avg_us", 0.0), step=i + 1)
+                    defense_env.envs[0].unwrapped.reset_profile_stats()
+                except Exception:
+                    pass
+
+            # --- 4. Optional GIF Evaluation ---
+
         print("\n--- Training Complete ---")
 
         # --- Log final performance metrics ---
@@ -538,7 +560,7 @@ if __name__ == "__main__":
     parser.add_argument("--grid-size", type=int, default=12, help="The size of the grid.")
     parser.add_argument("--layup-pct", type=float, default=0.60, help="Percentage of layups.")
     parser.add_argument("--three-pt-pct", type=float, default=0.37, help="Percentage of three-pointers.")
-    parser.add_argument("--three-point-distance", type=int, default=4, help="Distance to the three-point line.")
+    parser.add_argument("--three-point-distance", type=int, default=4, help="Hex distance defining the three-point line.")
     parser.add_argument("--players", type=int, default=2, help="Number of players per side.")
     parser.add_argument("--shot-clock", type=int, default=20, help="Steps in the shot clock.")
     parser.add_argument("--alternations", type=int, default=10, help="Number of times to alternate training.")
@@ -563,6 +585,7 @@ if __name__ == "__main__":
     parser.add_argument("--shot-pressure-max", type=float, default=0.5, help="Max multiplicative reduction at distance 1 (e.g., 0.5 -> up to -50%).")
     parser.add_argument("--shot-pressure-lambda", type=float, default=1.0, help="Exponential decay rate per hex for shot pressure.")
     parser.add_argument("--shot-pressure-arc-degrees", type=float, default=60.0, help="Arc width centered toward basket for pressure eligibility.")
+    parser.add_argument("--enable-env-profiling", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.")
     
     args = parser.parse_args()
  

@@ -21,6 +21,7 @@ import math
 from typing import Dict, List, Tuple, Optional, Union
 from enum import Enum
 from collections import defaultdict
+from time import perf_counter_ns
 
 # Use a non-interactive backend so rendering works in headless/threaded contexts
 import matplotlib
@@ -29,6 +30,29 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+
+
+def profile_section(section_name: str):
+    """Decorator to measure method wall time in ns when env.enable_profiling is True.
+    Placed before class definition so it's available for method decorators.
+    """
+    def _decorator(func):
+        def _wrapped(self, *args, **kwargs):
+            if not getattr(self, "enable_profiling", False):
+                return func(self, *args, **kwargs)
+            t0 = perf_counter_ns()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                dt = perf_counter_ns() - t0
+                # Lazy init if constructor did not run yet
+                if not hasattr(self, "_profile_ns"):
+                    self._profile_ns = {}
+                    self._profile_calls = {}
+                self._profile_ns[section_name] = self._profile_ns.get(section_name, 0) + dt
+                self._profile_calls[section_name] = self._profile_calls.get(section_name, 0) + 1
+        return _wrapped
+    return _decorator
 
 
 class Team(Enum):
@@ -76,6 +100,7 @@ class HexagonBasketballEnv(gym.Env):
         shot_pressure_max: float = 0.5,   # max reduction at distance=1 (multiplier = 1 - max)
         shot_pressure_lambda: float = 1.0, # decay rate per hex away from shooter
         shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
+        enable_profiling: bool = False,
     ):
         super().__init__()
         
@@ -105,6 +130,10 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_pressure_max = float(shot_pressure_max)
         self.shot_pressure_lambda = float(shot_pressure_lambda)
         self.shot_pressure_arc_rad = math.radians(shot_pressure_arc_degrees)
+        # Profiling
+        self.enable_profiling = bool(enable_profiling)
+        self._profile_ns: Dict[str, int] = {}
+        self._profile_calls: Dict[str, int] = {}
         
         # Basket position, using offset coordinates for placement
         basket_col = 0
@@ -185,6 +214,7 @@ class HexagonBasketballEnv(gym.Env):
         y = size * (1.5 * r)
         return x, y
     
+    @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment to initial state."""
         if seed is not None:
@@ -209,6 +239,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return obs, info
     
+    @profile_section("step")
     def step(self, actions: Union[np.ndarray, List[int]]):
         """Execute one step of the environment."""
         if self.episode_ended:
@@ -285,6 +316,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return obs, rewards, done, False, info
 
+    @profile_section("action_masks")
     def _get_action_masks(self) -> np.ndarray:
         """Generate a mask of legal actions for each player."""
         masks = np.ones((self.n_players, len(ActionType)), dtype=np.int8)
@@ -382,6 +414,7 @@ class HexagonBasketballEnv(gym.Env):
         col, row = self._axial_to_offset(q, r)
         return 0 <= col < self.court_width and 0 <= row < self.court_height
     
+    @profile_section("process_actions")
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
         """Process all player actions simultaneously with collision resolution."""
         results = {
@@ -472,6 +505,7 @@ class HexagonBasketballEnv(gym.Env):
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
     
+    @profile_section("pass_logic")
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
         """
         Arc-based passing:
@@ -562,6 +596,7 @@ class HexagonBasketballEnv(gym.Env):
         results["passes"][passer_id] = {"success": True, "target": recv_id}
         return
 
+    @profile_section("attempt_shot")
     def _attempt_shot(self, shooter_id: int) -> Dict:
         """Attempt a shot from the ball holder."""
         shooter_pos = self.positions[shooter_id]
@@ -604,6 +639,7 @@ class HexagonBasketballEnv(gym.Env):
         q2, r2 = pos2
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
 
+    @profile_section("shot_prob")
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot using a simple linear model
         anchored at layup (distance 1) and three-point (distance = three_point_distance).
@@ -662,6 +698,7 @@ class HexagonBasketballEnv(gym.Env):
         prob = max(0.01, min(0.99, prob))
         return float(prob)
 
+    @profile_section("rewards")
     def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
@@ -950,6 +987,22 @@ class HexagonBasketballEnv(gym.Env):
     def switch_training_team(self):
         """Switch which team is currently training (for alternating optimization)."""
         self.training_team = Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
+
+    # --- Profiling helpers ---
+    def get_profile_stats(self) -> Dict[str, Dict[str, float]]:
+        stats: Dict[str, Dict[str, float]] = {}
+        for k, total_ns in self._profile_ns.items():
+            calls = max(1, self._profile_calls.get(k, 1))
+            stats[k] = {
+                "total_ms": total_ns / 1e6,
+                "avg_us": (total_ns / calls) / 1e3,
+                "calls": float(calls),
+            }
+        return stats
+
+    def reset_profile_stats(self) -> None:
+        self._profile_ns.clear()
+        self._profile_calls.clear()
 
 
 # Test/Demo code
