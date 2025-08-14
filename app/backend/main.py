@@ -161,9 +161,17 @@ def init_game(request: InitGameRequest):
         layup_pct = get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
         three_pt_pct = get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
 
+        # Shot pressure params (optional)
+        shot_pressure_enabled = get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        shot_pressure_max = get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
+        shot_pressure_lambda = get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
+        shot_pressure_arc_degrees = get_param(params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
+
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
-            f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}"
+            f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
+            f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
+            f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}"
         )
 
         # Download selected or latest policies
@@ -182,6 +190,10 @@ def init_game(request: InitGameRequest):
             three_point_distance=three_point_distance,
             layup_pct=layup_pct,
             three_pt_pct=three_pt_pct,
+            shot_pressure_enabled=shot_pressure_enabled,
+            shot_pressure_max=shot_pressure_max,
+            shot_pressure_lambda=shot_pressure_lambda,
+            shot_pressure_arc_degrees=shot_pressure_arc_degrees,
         )
         game_state.obs, _ = game_state.env.reset()
 
