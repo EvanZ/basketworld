@@ -378,6 +378,22 @@ def get_action_values(player_id: int):
     print(json.dumps(action_values, indent=2))
     return jsonable_encoder(action_values)
 
+@app.get("/api/shot_probability/{player_id}")
+def get_shot_probability(player_id: int):
+    """Returns the environment's shot success probability for a given player, including defender pressure effects."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    if player_id < 0 or player_id >= game_state.env.n_players:
+        raise HTTPException(status_code=400, detail="Invalid player id.")
+
+    shooter_pos = game_state.env.positions[player_id]
+    basket_pos = game_state.env.basket_position
+    distance = game_state.env._hex_distance(shooter_pos, basket_pos)
+    prob = game_state.env._calculate_shot_probability(player_id, distance)
+
+    return jsonable_encoder({"probability": float(prob)})
+
 def get_full_game_state():
     """Helper function to construct the full game state dictionary."""
     if not game_state.env:

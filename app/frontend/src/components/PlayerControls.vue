@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues } from '@/services/api';
+import { getActionValues, getShotProbability } from '@/services/api';
 
 const props = defineProps({
   gameState: { // This is now the currentGameState computed property from App.vue
@@ -38,7 +38,7 @@ const userControlledPlayerIds = computed(() => {
     : props.gameState.defense_ids;
 });
 
-// Watch for the active player ID to change, then fetch the action values for that player.
+// Watch for the active player ID to change, then fetch the action values and env shot prob for that player.
 watch(() => props.activePlayerId, async (newPlayerId) => {
     actionValues.value = null; // Clear previous values
     valueRange.value = { min: 0, max: 0 };
@@ -59,6 +59,16 @@ watch(() => props.activePlayerId, async (newPlayerId) => {
         } catch (error) {
             console.error("Failed to fetch action values:", error);
             actionValues.value = { error: "Failed to load" }; // Show an error state
+        }
+
+        // Fetch backend-computed shot probability to ensure parity with environment logic
+        try {
+            const sp = await getShotProbability(newPlayerId);
+            // Overwrite the computed shotProbability by setting a side value we use in the compute below
+            _backendShotProb.value = sp.probability;
+        } catch (e) {
+            console.warn('[PlayerControls] Failed to fetch backend shot probability', e);
+            _backendShotProb.value = null;
         }
     } else {
         console.log('[PlayerControls] No active player or game is done. Clearing action values.');
@@ -159,10 +169,14 @@ function calculateShotProbability(distance, threePointDistance, shotProbs, shotP
   return SHOT_PROBS.heave;
 }
 
+// Hold backend probability when available
+const _backendShotProb = ref(null);
+
 const shotProbability = computed(() => {
     if (props.activePlayerId === null || !props.gameState || !props.gameState.positions[props.activePlayerId]) {
         return null;
     }
+    if (_backendShotProb.value !== null) return _backendShotProb.value;
     const playerPos = props.gameState.positions[props.activePlayerId];
     const basketPos = props.gameState.basket_position; 
 
