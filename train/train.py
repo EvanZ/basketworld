@@ -318,6 +318,7 @@ def main(args):
             "MultiInputPolicy", 
             temp_env, 
             verbose=1, 
+            gamma=args.gamma,
             n_steps=args.n_steps, 
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
@@ -330,6 +331,7 @@ def main(args):
             "MultiInputPolicy", 
             temp_env, 
             verbose=1, 
+            gamma=args.gamma,
             n_steps=args.n_steps, 
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
@@ -566,6 +568,7 @@ if __name__ == "__main__":
     parser.add_argument("--alternations", type=int, default=10, help="Number of times to alternate training.")
     parser.add_argument("--steps-per-alternation", type=int, default=20_000, help="Timesteps to train each policy per alternation.")
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO hyperparameter: Number of steps to run for each environment per update.")
+    parser.add_argument("--gamma", type=float, default=0.99, help="PPO hyperparameter: Discount factor for future rewards.")
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
     parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")

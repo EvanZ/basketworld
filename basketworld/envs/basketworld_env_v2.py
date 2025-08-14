@@ -194,6 +194,22 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count: int = 0
         self.episode_ended: bool = False
         self.last_action_results: Dict = {}
+
+        # Precompute per-cell move validity mask (6 directions) to speed up action mask building
+        # 1 = allowed, 0 = blocked (OOB or basket hex)
+        self._move_mask_by_cell: Dict[Tuple[int, int], np.ndarray] = {}
+        for row in range(self.court_height):
+            for col in range(self.court_width):
+                cell = self._offset_to_axial(col, row)
+                allowed = np.ones(6, dtype=np.int8)
+                for dir_idx in range(6):
+                    nbr = (cell[0] + self.hex_directions[dir_idx][0], cell[1] + self.hex_directions[dir_idx][1])
+                    if (not self._is_valid_position(*nbr)) or (nbr == self.basket_position):
+                        allowed[dir_idx] = 0
+                self._move_mask_by_cell[cell] = allowed
+
+        # Precompute shoot/pass action indices
+        self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
         
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
@@ -322,19 +338,17 @@ class HexagonBasketballEnv(gym.Env):
         masks = np.ones((self.n_players, len(ActionType)), dtype=np.int8)
         
         # Only the ball holder can shoot or pass
-        shoot_pass_actions = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
-        
         for i in range(self.n_players):
             if i != self.ball_holder:
-                masks[i, shoot_pass_actions] = 0
+                masks[i, self._shoot_pass_action_indices] = 0
 
-            # Disallow out-of-bounds moves from current position
-            for dir_idx in range(6):
-                move_action_val = ActionType.MOVE_E.value + dir_idx
-                new_pos = self._get_adjacent_position(self.positions[i], dir_idx)
-                if (not self._is_valid_position(*new_pos)) or (new_pos == self.basket_position):
-                    masks[i, move_action_val] = 0
-        
+            # Apply precomputed movement validity from the player's current cell
+            cell = self.positions[i]
+            move_mask = self._move_mask_by_cell.get(cell)
+            if move_mask is not None:
+                for dir_idx in range(6):
+                    masks[i, ActionType.MOVE_E.value + dir_idx] = move_mask[dir_idx]
+                 
         return masks
          
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
@@ -579,7 +593,7 @@ class HexagonBasketballEnv(gym.Env):
             # Closest defender in arc
             intercept_candidates.sort(key=lambda t: t[1])
             thief_id = intercept_candidates[0][0]
-            if self._rng.random() < 0.25:
+            if self._rng.random() < 0.05:
                 # Interception occurs
                 self.ball_holder = thief_id
                 results["turnovers"].append({
@@ -707,7 +721,8 @@ class HexagonBasketballEnv(gym.Env):
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                rewards[self.offense_ids] += 0.05
+                rewards[self.offense_ids] += 0.1
+                rewards[self.defense_ids] -= 0.5
         
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
@@ -715,7 +730,7 @@ class HexagonBasketballEnv(gym.Env):
             # Penalize offense, reward defense for the turnover
             # We assume only one turnover can happen per step
             rewards[self.offense_ids] -= 0.2 
-            rewards[self.defense_ids] += 0.2
+            rewards[self.defense_ids] += 1.0
         
         # Light penalty for any out-of-bounds move attempts (regardless of ball holder)
         for pid, move_res in action_results.get("moves", {}).items():
@@ -735,7 +750,7 @@ class HexagonBasketballEnv(gym.Env):
             if self.step_count <= 3:
                 # Penalty is high at step 1 and decrements
                 # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
-                time_penalty = - (0.7 - self.step_count * 0.2)
+                time_penalty = - (1.0 - self.step_count * 0.2)
                 
                 # We only apply this penalty to the team that is currently training
                 if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
@@ -760,14 +775,14 @@ class HexagonBasketballEnv(gym.Env):
                     )
                     # Offense scored, good for them, bad for defense
                     rewards[self.offense_ids] += made_shot_reward
-                    rewards[self.defense_ids] -= made_shot_reward
+                    rewards[self.defense_ids] -= 10 * made_shot_reward
                 # else: handle rare case of defense scoring on own basket
             else:
                 # Basket was missed
                 if player_id in self.offense_ids:
                     # Offense missed, bad for them, good for defense
                     rewards[self.offense_ids] -= missed_shot_penalty
-                    rewards[self.defense_ids] += missed_shot_penalty
+                    rewards[self.defense_ids] += 10 * missed_shot_penalty
         
         return done, rewards
     
