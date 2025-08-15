@@ -29,6 +29,7 @@ import mlflow
 import sys
 import tempfile
 import random
+from typing import Optional
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
@@ -217,6 +218,31 @@ def get_random_policy_from_artifacts(
     local_path = client.download_artifacts(run_id, chosen, tmpdir)
     return PPO.load(local_path)
 
+# --- Continuation helpers ---
+
+def get_latest_policy_path(client, run_id: str, team_prefix: str) -> Optional[str]:
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+    candidates = [f.path for f in all_artifacts if f.path.startswith(f"{artifact_path}/{team_prefix}") and f.path.endswith('.zip')]
+    if not candidates:
+        return None
+    def sort_key(p):
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
+    candidates.sort(key=sort_key)
+    return candidates[-1]
+
+def get_max_alternation_index(client, run_id: str) -> int:
+    """Return the max alternation index already present in the run (0 if none)."""
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+    idxs = []
+    for f in all_artifacts:
+        m = re.search(r"_(\d+)\.zip$", f.path)
+        if m:
+            idxs.append(int(m.group(1)))
+    return max(idxs) if idxs else 0
+
 def setup_environment(args, training_team):
     """Create, configure, and wrap the environment for training."""
     env = basketworld.HexagonBasketballEnv(
@@ -314,32 +340,46 @@ def main(args):
         defense_timing_callback = RolloutUpdateTimingCallback()
 
         print("Initializing policies...")
-        offense_policy = PPO(
-            "MultiInputPolicy", 
-            temp_env, 
-            verbose=1, 
-            gamma=args.gamma,
-            n_steps=args.n_steps, 
-            vf_coef=args.vf_coef,
-            ent_coef=args.ent_coef,
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            tensorboard_log=None, # Disable TensorBoard if using MLflow
-            policy_kwargs=policy_kwargs
-        )
-        defense_policy = PPO(
-            "MultiInputPolicy", 
-            temp_env, 
-            verbose=1, 
-            gamma=args.gamma,
-            n_steps=args.n_steps, 
-            vf_coef=args.vf_coef,
-            ent_coef=args.ent_coef,
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            tensorboard_log=None, # Disable TensorBoard if using MLflow
-            policy_kwargs=policy_kwargs
-        )
+        offense_policy = None
+        defense_policy = None
+
+        if args.continue_run_id:
+            print(f"Continuing from run {args.continue_run_id}...")
+            client = mlflow.tracking.MlflowClient()
+            with tempfile.TemporaryDirectory() as tmpd:
+                off_art = get_latest_policy_path(client, args.continue_run_id, "offense")
+                def_art = get_latest_policy_path(client, args.continue_run_id, "defense")
+                if off_art and def_art:
+                    off_local = client.download_artifacts(args.continue_run_id, off_art, tmpd)
+                    def_local = client.download_artifacts(args.continue_run_id, def_art, tmpd)
+                    offense_policy = PPO.load(off_local, env=temp_env)
+                    defense_policy = PPO.load(def_local, env=temp_env)
+                    print(f"  - Loaded latest offense: {os.path.basename(off_art)}")
+                    print(f"  - Loaded latest defense: {os.path.basename(def_art)}")
+
+        if offense_policy is None or defense_policy is None:
+            offense_policy = PPO(
+                "MultiInputPolicy", 
+                temp_env, 
+                verbose=1, 
+                n_steps=args.n_steps, 
+                vf_coef=args.vf_coef,
+                ent_coef=args.ent_coef,
+                batch_size=args.batch_size,
+                tensorboard_log=None, # Disable TensorBoard if using MLflow
+                policy_kwargs=policy_kwargs
+            )
+            defense_policy = PPO(
+                "MultiInputPolicy", 
+                temp_env, 
+                verbose=1, 
+                n_steps=args.n_steps, 
+                vf_coef=args.vf_coef,
+                ent_coef=args.ent_coef,
+                batch_size=args.batch_size,
+                tensorboard_log=None, # Disable TensorBoard if using MLflow
+                policy_kwargs=policy_kwargs
+            )
         temp_env.close()
 
         # --- Log the actual network architecture used ---
@@ -349,9 +389,16 @@ def main(args):
         print(f"  - Using network architecture: {actual_net_arch}")
 
         # --- Alternating Training Loop ---
+        # Determine starting alternation index when continuing in-place
+        base_alt_idx = 0
+        if args.continue_run_id:
+            base_alt_idx = get_max_alternation_index(mlflow.tracking.MlflowClient(), args.continue_run_id)
+            print(f"Resuming alternations from index {base_alt_idx + 1}")
+
         for i in range(args.alternations):
             print("-" * 50)
-            print(f"Alternation {i + 1} / {args.alternations}")
+            global_alt = base_alt_idx + i + 1
+            print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             print("-" * 50)
 
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -389,10 +436,10 @@ def main(args):
             offense_env.close()
             
             with tempfile.TemporaryDirectory() as tmpdir:
-                offense_model_path = os.path.join(tmpdir, f"offense_policy_alt_{i+1}.zip")
+                offense_model_path = os.path.join(tmpdir, f"offense_policy_alt_{global_alt}.zip")
                 offense_policy.save(offense_model_path)
                 mlflow.log_artifact(offense_model_path, artifact_path="models")
-            print(f"Logged offense model for alternation {i+1} to MLflow")
+            print(f"Logged offense model for alternation {global_alt} to MLflow")
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 print("\nLoading historical opponent policy...")
@@ -428,14 +475,14 @@ def main(args):
             defense_env.close()
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                defense_model_path = os.path.join(tmpdir, f"defense_policy_alt_{i+1}.zip")
+                defense_model_path = os.path.join(tmpdir, f"defense_policy_alt_{global_alt}.zip")
                 defense_policy.save(defense_model_path)
                 mlflow.log_artifact(defense_model_path, artifact_path="models")
-            print(f"Logged defense model for alternation {i+1} to MLflow")
+            print(f"Logged defense model for alternation {global_alt} to MLflow")
  
             # --- 3. Run Evaluation Phase ---
             if args.eval_freq > 0 and (i + 1) % args.eval_freq == 0:
-                print(f"\n--- Running Evaluation for Alternation {i + 1} ---")
+                print(f"\n--- Running Evaluation for Alternation {global_alt} ---")
                 
                 # Create a renderable environment for evaluation
                 eval_env = basketworld.HexagonBasketballEnv(
@@ -506,7 +553,7 @@ def main(args):
                             outcome = "Turnover (Shot Clock Violation)"
 
                         # Define the artifact path for this specific evaluation context
-                        artifact_path = f"training_eval/alternation_{i + 1}"
+                        artifact_path = f"training_eval/alternation_{global_alt}"
                         create_and_log_gif(
                             frames=episode_frames, 
                             episode_num=ep_num, 
@@ -516,21 +563,21 @@ def main(args):
                         )
 
                 eval_env.close()
-                print(f"--- Evaluation for Alternation {i + 1} Complete ---")
+                print(f"--- Evaluation for Alternation {global_alt} Complete ---")
 
             # Log environment profiling if enabled
             if args.enable_env_profiling:
                 try:
                     prof = offense_env.envs[0].unwrapped.get_profile_stats()
                     for k, v in prof.items():
-                        mlflow.log_metric(f"env_prof_{k}_avg_us_offense", v.get("avg_us", 0.0), step=i + 1)
+                        mlflow.log_metric(f"env_prof_{k}_avg_us_offense", v.get("avg_us", 0.0), step=global_alt)
                     offense_env.envs[0].unwrapped.reset_profile_stats()
                 except Exception:
                     pass
                 try:
                     prof = defense_env.envs[0].unwrapped.get_profile_stats()
                     for k, v in prof.items():
-                        mlflow.log_metric(f"env_prof_{k}_avg_us_defense", v.get("avg_us", 0.0), step=i + 1)
+                        mlflow.log_metric(f"env_prof_{k}_avg_us_defense", v.get("avg_us", 0.0), step=global_alt)
                     defense_env.envs[0].unwrapped.reset_profile_stats()
                 except Exception:
                     pass
@@ -574,6 +621,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4, help="Learning rate for PPO optimizers.")
     parser.add_argument("--net-arch", type=int, nargs='+', default=None, help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.")
+    parser.add_argument("--continue-run-id", type=str, default=None, help="If set, load latest offense/defense policies from this MLflow run and continue training. Also appends new artifacts using continued alternation indices.")
     parser.add_argument("--eval-freq", type=int, default=2, help="Run evaluation every N alternations. Set to 0 to disable.")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Number of episodes to run for each evaluation.")
     # The --save-path argument is no longer needed
