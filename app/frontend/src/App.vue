@@ -104,14 +104,22 @@ async function handleSelfPlay() {
         // Get AI actions for user-controlled players
         for (const playerId of userControlledIds) {
           const probs = policyProbs.value[playerId];
-          if (Array.isArray(probs)) {
-            // Pick action with highest probability (argmax)
+          const actionMask = gameState.value.action_mask[playerId];
+          
+          if (Array.isArray(probs) && Array.isArray(actionMask)) {
+            // Pick action with highest probability (argmax) among LEGAL actions only
             let bestActionIndex = 0;
-            for (let i = 1; i < probs.length; i++) {
-              if (probs[i] > probs[bestActionIndex]) {
+            let bestProb = -1;
+            
+            for (let i = 0; i < probs.length && i < actionMask.length; i++) {
+              // Only consider legal actions (action_mask[i] === 1)
+              if (actionMask[i] === 1 && probs[i] > bestProb) {
+                bestProb = probs[i];
                 bestActionIndex = i;
               }
             }
+            
+            console.log(`[App] Self-play selected action ${bestActionIndex} for player ${playerId} (legal: ${actionMask[bestActionIndex] === 1}, prob: ${bestProb})`);
             aiActions[playerId] = bestActionIndex;
           }
         }

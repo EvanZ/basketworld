@@ -721,16 +721,16 @@ class HexagonBasketballEnv(gym.Env):
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                rewards[self.offense_ids] += 0.3/self.n_players
-                rewards[self.defense_ids] -= 0.3/self.n_players
+                rewards[self.offense_ids] += 0.3/self.players_per_side
+                rewards[self.defense_ids] -= 0.3/self.players_per_side
         
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
             done = True
             # Penalize offense, reward defense for the turnover
             # We assume only one turnover can happen per step
-            rewards[self.offense_ids] -= 1/self.n_players 
-            rewards[self.defense_ids] += 1/self.n_players
+            rewards[self.offense_ids] -= 1/self.players_per_side 
+            rewards[self.defense_ids] += 1/self.players_per_side
         
 
         # Check for shots
