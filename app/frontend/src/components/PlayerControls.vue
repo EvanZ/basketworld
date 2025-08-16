@@ -3,26 +3,33 @@ import { ref, computed, watch, onMounted } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import { getActionValues, getShotProbability, getRewards } from '@/services/api';
 
+// Import API_BASE_URL for policy probabilities fetch
+const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
+
 const props = defineProps({
-  gameState: { // This is now the currentGameState computed property from App.vue
-    type: Object,
-    required: true,
-  },
-  activePlayerId: {
-    type: Number,
-    default: null,
-  },
+  gameState: Object,
+  activePlayerId: Number,
   disabled: {
     type: Boolean,
     default: false,
   },
+  aiMode: {
+    type: Boolean,
+    default: false,
+  },
+  deterministic: {
+    type: Boolean,
+    default: true,
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play']);
 
 const selectedActions = ref({});
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
+const _backendShotProb = ref(null);
+const policyProbabilities = ref(null);
 
 // Add rewards tracking
 const activeTab = ref('controls');
@@ -43,29 +50,19 @@ const userControlledPlayerIds = computed(() => {
     : props.gameState.defense_ids;
 });
 
-// Watch for the active player ID to change, then fetch the action values and env shot prob for that player.
+// All player IDs for AI mode
+const allPlayerIds = computed(() => {
+  if (!props.gameState) {
+    return [];
+  }
+  return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
+});
+
+// Watch for the active player ID to change, then fetch the shot prob for that player.
 watch(() => props.activePlayerId, async (newPlayerId) => {
-    actionValues.value = null; // Clear previous values
-    valueRange.value = { min: 0, max: 0 };
     if (newPlayerId !== null && props.gameState && !props.gameState.done) {
-        console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching action values...`);
-        try {
-            const values = await getActionValues(newPlayerId);
-            console.log('[PlayerControls] Received action values from API:', values);
-            actionValues.value = values;
-
-            // Calculate min and max for color scaling
-            const numericValues = Object.values(values).filter(v => typeof v === 'number');
-            if (numericValues.length > 0) {
-                valueRange.value.min = Math.min(...numericValues);
-                valueRange.value.max = Math.max(...numericValues);
-            }
-
-        } catch (error) {
-            console.error("Failed to fetch action values:", error);
-            actionValues.value = { error: "Failed to load" }; // Show an error state
-        }
-
+        console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching shot probability...`);
+        
         // Fetch backend-computed shot probability to ensure parity with environment logic
         try {
             const sp = await getShotProbability(newPlayerId);
@@ -77,9 +74,122 @@ watch(() => props.activePlayerId, async (newPlayerId) => {
             _backendShotProb.value = null;
         }
     } else {
-        console.log('[PlayerControls] No active player or game is done. Clearing action values.');
-        actionValues.value = null;
+        console.log('[PlayerControls] No active player or game is done. Clearing shot prob.');
+        _backendShotProb.value = null;
     }
+}, { immediate: true });
+
+// Fetch policy probabilities for probabilistic action sampling
+async function fetchPolicyProbabilities() {
+  if (!props.gameState || props.gameState.done) {
+    console.log('[PlayerControls] Skipping fetchPolicyProbabilities - no game state or game done');
+    return;
+  }
+  
+  console.log('[PlayerControls] Attempting to fetch policy probabilities from:', `${API_BASE_URL}/api/policy_probabilities`);
+  
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/policy_probabilities`);
+    console.log('[PlayerControls] Response status:', response.status, response.statusText);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch policy probabilities: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+    
+    const probs = await response.json();
+    policyProbabilities.value = probs;
+    console.log('[PlayerControls] Fetched policy probabilities:', probs);
+  } catch (error) {
+    console.error('[PlayerControls] Failed to fetch policy probabilities:', error);
+    policyProbabilities.value = null;
+  }
+}
+
+// Sample an action from probability distribution
+function sampleFromProbabilities(probabilities) {
+  const cumSum = [];
+  let sum = 0;
+  
+  for (let i = 0; i < probabilities.length; i++) {
+    sum += probabilities[i];
+    cumSum.push(sum);
+  }
+  
+  if (sum === 0) return 0; // Default to NOOP if no valid probabilities
+  
+  const random = Math.random() * sum;
+  for (let i = 0; i < cumSum.length; i++) {
+    if (random <= cumSum[i]) {
+      return i;
+    }
+  }
+  return 0; // Fallback to NOOP
+}
+
+// Fetch action values for all user-controlled players (needed for AI mode)
+async function fetchAllActionValues() {
+  if (!props.gameState || props.gameState.done) {
+    console.log('[PlayerControls] Skipping fetchAllActionValues - no game state or game done');
+    return;
+  }
+  
+  const allValues = {};
+  const controlledIds = userControlledPlayerIds.value;
+  
+  console.log('[PlayerControls] Fetching action values for all players:', controlledIds);
+  
+  // Also calculate min/max for color scaling
+  let allNumericValues = [];
+  
+  for (const playerId of controlledIds) {
+    try {
+      const values = await getActionValues(playerId);
+      allValues[playerId] = values;
+      console.log(`[PlayerControls] Fetched action values for player ${playerId}:`, values);
+      
+      // Collect numeric values for scaling
+      const numericValues = Object.values(values).filter(v => typeof v === 'number');
+      allNumericValues.push(...numericValues);
+    } catch (error) {
+      console.error(`[PlayerControls] Failed to fetch action values for player ${playerId}:`, error);
+    }
+  }
+  
+  actionValues.value = allValues;
+  console.log('[PlayerControls] All action values:', allValues);
+  
+  // Set min/max for color scaling
+  if (allNumericValues.length > 0) {
+    valueRange.value = {
+      min: Math.min(...allNumericValues),
+      max: Math.max(...allNumericValues)
+    };
+  } else {
+    valueRange.value = { min: 0, max: 0 };
+  }
+}
+
+// Watch for game state changes to fetch all action values when needed
+watch(() => props.gameState, async (newGameState) => {
+  console.log('[PlayerControls] Game state changed, fetching AI data...');
+  if (newGameState && !newGameState.done) {
+    // Fetch both action values and policy probabilities for AI mode
+    try {
+      console.log('[PlayerControls] Starting to fetch action values...');
+      await fetchAllActionValues();
+      console.log('[PlayerControls] Action values fetched, now fetching policy probabilities...');
+      await fetchPolicyProbabilities();
+      console.log('[PlayerControls] Policy probabilities fetch completed');
+    } catch (error) {
+      console.error('[PlayerControls] Error during AI data fetch:', error);
+    }
+  } else {
+    console.log('[PlayerControls] Clearing AI data - no game state or game done');
+    actionValues.value = null;
+    policyProbabilities.value = null;
+    valueRange.value = { min: 0, max: 0 };
+  }
 }, { immediate: true });
 
 // Watch for the list of players to be populated, then set the first one as active.
@@ -128,18 +238,147 @@ function handleActionSelected(action) {
 }
 
 function submitActions() {
-  const userActions = {};
-  for (const playerId of userControlledPlayerIds.value) {
-    const actionName = selectedActions.value[playerId] || 'NOOP';
-    userActions[playerId] = actionNames.indexOf(actionName);
+  let actionsToSubmit = {};
+  
+  if (props.aiMode) {
+    // Use AI actions for user-controlled players (selected actions should already be set)
+    for (const playerId of userControlledPlayerIds.value) {
+      const actionName = selectedActions.value[playerId] || 'NOOP';
+      const actionIndex = actionNames.indexOf(actionName);
+      actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
+    }
+  } else {
+    // Use manually selected actions (only for user-controlled players)
+    for (const playerId of userControlledPlayerIds.value) {
+      const actionName = selectedActions.value[playerId] || 'NOOP';
+      const actionIndex = actionNames.indexOf(actionName);
+      actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
+    }
   }
-  console.log('[PlayerControls] Emitting actions-submitted with payload:', userActions);
-  emit('actions-submitted', userActions);
-  selectedActions.value = {};
-  if (userControlledPlayerIds.value.length > 0) {
-    emit('update:activePlayerId', userControlledPlayerIds.value[0]);
+  
+  console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
+  emit('actions-submitted', actionsToSubmit);
+  
+  if (!props.aiMode) {
+    // Only clear selections in manual mode
+    selectedActions.value = {};
+    if (userControlledPlayerIds.value.length > 0) {
+      emit('update:activePlayerId', userControlledPlayerIds.value[0]);
+    }
   }
 }
+
+// Watch for AI mode or deterministic mode changes to pre-select actions
+watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDeterministic]) => {
+  console.log('[PlayerControls] AI mode changed to:', newAiMode, 'Deterministic:', newDeterministic);
+  console.log('[PlayerControls] actionValues.value:', actionValues.value);
+  console.log('[PlayerControls] policyProbabilities.value:', policyProbabilities.value);
+  console.log('[PlayerControls] userControlledPlayerIds.value:', userControlledPlayerIds.value);
+  
+  try {
+    if (newAiMode) {
+      // Pre-select AI actions for USER-CONTROLLED players only when AI mode is enabled
+      const newSelections = {};
+      const controlledIds = userControlledPlayerIds.value;
+      
+      for (const playerId of controlledIds) {
+        const legalActions = getLegalActions(playerId);
+        
+        if (legalActions.length > 0) {
+          let selectedAction = null;
+          
+          if (newDeterministic && actionValues.value && actionValues.value[playerId]) {
+            // Deterministic: Use Q-values (argmax)
+            const playerActions = actionValues.value[playerId];
+            let bestValue = -Infinity;
+            
+            for (const [action, value] of Object.entries(playerActions)) {
+              if (typeof value === 'number' && legalActions.includes(action) && value > bestValue) {
+                bestValue = value;
+                selectedAction = action;
+              }
+            }
+            
+            if (selectedAction) {
+              console.log(`[PlayerControls] Selected DETERMINISTIC action for player ${playerId}: ${selectedAction} (Q-value: ${bestValue})`);
+            }
+          } else if (!newDeterministic && policyProbabilities.value && policyProbabilities.value[playerId]) {
+            // Probabilistic: Sample from policy probabilities
+            const playerProbs = policyProbabilities.value[playerId];
+            console.log(`[PlayerControls] Attempting probabilistic sampling for player ${playerId}`);
+            console.log(`[PlayerControls] Player probs:`, playerProbs);
+            console.log(`[PlayerControls] Legal actions:`, legalActions);
+            
+            const actionIndex = sampleFromProbabilities(playerProbs);
+            console.log(`[PlayerControls] Sampled action index:`, actionIndex, `(${actionNames[actionIndex]})`);
+            
+            if (actionIndex < actionNames.length && legalActions.includes(actionNames[actionIndex])) {
+              selectedAction = actionNames[actionIndex];
+              console.log(`[PlayerControls] Selected PROBABILISTIC action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
+            } else {
+              console.log(`[PlayerControls] Sampled action ${actionNames[actionIndex]} is not legal for player ${playerId}`);
+            }
+          } else {
+            console.log(`[PlayerControls] Cannot do probabilistic sampling for player ${playerId}:`);
+            console.log(`  - newDeterministic: ${newDeterministic}`);
+            console.log(`  - policyProbabilities.value: ${!!policyProbabilities.value}`);
+            console.log(`  - policyProbabilities.value[${playerId}]: ${!!policyProbabilities.value?.[playerId]}`);
+          }
+          
+          if (selectedAction) {
+            newSelections[playerId] = selectedAction;
+          } else {
+            console.log(`[PlayerControls] No valid action selected for player ${playerId}`);
+          }
+        } else {
+          console.log(`[PlayerControls] No legal actions for player ${playerId}`);
+        }
+      }
+      
+      selectedActions.value = newSelections;
+      console.log('[PlayerControls] Final selectedActions:', selectedActions.value);
+    } else {
+      // Clear selections when AI mode is disabled
+      console.log('[PlayerControls] Clearing AI mode selections');
+      selectedActions.value = {};
+    }
+  } catch (error) {
+    console.error('[PlayerControls] Error in AI mode watch:', error);
+  }
+});
+
+// Also pre-select when action values change and AI mode is on
+watch(() => actionValues.value, () => {
+  try {
+    if (props.aiMode && actionValues.value) {
+      const newSelections = {};
+      const controlledIds = userControlledPlayerIds.value;
+      
+      for (const playerId of controlledIds) {
+        if (actionValues.value[playerId]) {
+          const playerActions = actionValues.value[playerId];
+          let bestAction = null;
+          let bestValue = -Infinity;
+          
+          for (const [action, value] of Object.entries(playerActions)) {
+            if (value > bestValue) {
+              bestValue = value;
+              bestAction = action;
+            }
+          }
+          
+          if (bestAction) {
+            newSelections[playerId] = bestAction;
+          }
+        }
+      }
+      
+      selectedActions.value = newSelections;
+    }
+  } catch (error) {
+    console.error('[PlayerControls] Error in action values watch:', error);
+  }
+});
 
 // --- Shot Probability Logic (matches Python env) ---
 function hexDistance(pos1, pos2) {
@@ -185,8 +424,12 @@ onMounted(() => {
   fetchRewards();
 });
 
-// Hold backend probability when available
-const _backendShotProb = ref(null);
+// Backend probability is declared at the top
+
+const passProbabilities = computed(() => {
+  // For now, return empty object - this was likely removed in previous changes
+  return {};
+});
 
 const shotProbability = computed(() => {
     if (props.activePlayerId === null || !props.gameState || !props.gameState.positions[props.activePlayerId]) {
@@ -218,7 +461,7 @@ const shotProbability = computed(() => {
 </script>
 
 <template>
-  <div class="player-controls-container" :class="{ disabled: disabled && !gameState.done }">
+  <div class="player-controls-container">
     <h3>Player Controls</h3>
     
     <!-- Tab Navigation -->
@@ -245,7 +488,7 @@ const shotProbability = computed(() => {
               :key="playerId"
               :class="{ active: activePlayerId === playerId }"
               @click="$emit('update:activePlayerId', playerId)"
-              :disabled="disabled && !gameState.done"
+              :disabled="false"
           >
               Player {{ playerId }}
               <span v-if="selectedActions[playerId]">
@@ -261,7 +504,7 @@ const shotProbability = computed(() => {
               :shot-probability="shotProbability"
               :pass-probabilities="passProbabilities"
               @action-selected="handleActionSelected"
-              :action-values="actionValues"
+              :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
               :value-range="valueRange"
               :is-defense="isDefense"
           />
@@ -270,8 +513,16 @@ const shotProbability = computed(() => {
           </p>
       </div>
 
-      <button @click="submitActions" class="submit-button" :disabled="gameState.done || (disabled && !gameState.done)">
-        {{ gameState.done ? 'Game Over' : disabled ? 'AI Playing' : 'Submit Turn' }}
+      <button @click="submitActions" class="submit-button" :disabled="gameState.done">
+        {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
+      </button>
+      
+      <button 
+        @click="$emit('self-play')" 
+        class="self-play-button"
+        :disabled="!aiMode || gameState.done"
+      >
+        Self-Play
       </button>
       
       <button @click="$emit('play-again')" class="new-game-button">
@@ -549,6 +800,30 @@ const shotProbability = computed(() => {
 
 .new-game-button:hover {
   background-color: #0056b3;
+}
+
+.self-play-button {
+  background-color: #6c757d;
+  color: white;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: bold;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  min-width: 120px;
+}
+
+.self-play-button:hover:not(:disabled) {
+  background-color: #5a6268;
+}
+
+.self-play-button:disabled {
+  background-color: #e9ecef;
+  color: #6c757d;
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .disabled {
