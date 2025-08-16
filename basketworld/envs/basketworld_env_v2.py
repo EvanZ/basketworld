@@ -721,26 +721,17 @@ class HexagonBasketballEnv(gym.Env):
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                rewards[self.offense_ids] += 0.1
-                rewards[self.defense_ids] -= 0.5
+                rewards[self.offense_ids] += 0.3/self.n_players
+                rewards[self.defense_ids] -= 0.3/self.n_players
         
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
             done = True
             # Penalize offense, reward defense for the turnover
             # We assume only one turnover can happen per step
-            rewards[self.offense_ids] -= 0.2 
-            rewards[self.defense_ids] += 1.0
+            rewards[self.offense_ids] -= 1/self.n_players 
+            rewards[self.defense_ids] += 1/self.n_players
         
-        # Light penalty for any out-of-bounds move attempts (regardless of ball holder)
-        for pid, move_res in action_results.get("moves", {}).items():
-            if not move_res.get("success", True) and move_res.get("reason") == "out_of_bounds":
-                if pid in self.offense_ids:
-                    rewards[self.offense_ids] -= 0.02
-                    rewards[self.defense_ids] += 0.02
-                else:
-                    rewards[self.defense_ids] -= 0.02
-                    rewards[self.offense_ids] += 0.02
 
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
@@ -754,13 +745,13 @@ class HexagonBasketballEnv(gym.Env):
                 
                 # We only apply this penalty to the team that is currently training
                 if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
-                    rewards[self.offense_ids] += time_penalty
+                    rewards[self.offense_ids] += time_penalty/self.players_per_side
             
             # Define the reward magnitude for shots (3PT outside the line)
             # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
-            made_shot_reward_inside = 1.0
-            made_shot_reward_three = 1.5
-            missed_shot_penalty = 0.1 # Less punishing than a turnover (-0.2)
+            made_shot_reward_inside = 2.0
+            made_shot_reward_three = 3.0
+            missed_shot_penalty = 1.0 # Less punishing than a turnover (-0.2)
 
             if shot_result["success"]:
                 # Basket was made
@@ -774,15 +765,15 @@ class HexagonBasketballEnv(gym.Env):
                         else made_shot_reward_inside
                     )
                     # Offense scored, good for them, bad for defense
-                    rewards[self.offense_ids] += made_shot_reward
-                    rewards[self.defense_ids] -= 10 * made_shot_reward
+                    rewards[self.offense_ids] += made_shot_reward/self.players_per_side
+                    rewards[self.defense_ids] -= made_shot_reward/self.players_per_side
                 # else: handle rare case of defense scoring on own basket
             else:
                 # Basket was missed
                 if player_id in self.offense_ids:
                     # Offense missed, bad for them, good for defense
-                    rewards[self.offense_ids] -= missed_shot_penalty
-                    rewards[self.defense_ids] += 10 * missed_shot_penalty
+                    rewards[self.offense_ids] -= missed_shot_penalty/self.players_per_side
+                    rewards[self.defense_ids] += missed_shot_penalty/self.players_per_side
         
         return done, rewards
     

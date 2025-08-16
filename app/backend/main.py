@@ -26,6 +26,8 @@ class GameState:
         self.user_team: Team = None
         self.obs = None
         self.frames = []  # List of RGB frames for the current episode
+        self.reward_history = []  # Track rewards for each step
+        self.episode_rewards = {"offense": 0.0, "defense": 0.0}  # Running totals
 
 game_state = GameState()
 
@@ -122,7 +124,7 @@ def list_policies(request: ListPoliciesRequest):
 
 
 @app.post("/api/init_game")
-def init_game(request: InitGameRequest):
+async def init_game(request: InitGameRequest):
     """Initializes a new game from an MLflow run."""
     global game_state
     game_state = GameState() # Reset state
@@ -205,6 +207,11 @@ def init_game(request: InitGameRequest):
             pass
         game_state.user_team = Team[request.user_team_name.upper()]
 
+        # Clear any existing frames and reward tracking
+        game_state.frames = []
+        game_state.reward_history = []
+        game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+
         return {"status": "success", "state": get_full_game_state()}
 
     except Exception as e:
@@ -248,7 +255,139 @@ def take_step(request: ActionRequest):
                 print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking NOOP instead.")
                 full_action[i] = 0
 
-    game_state.obs, _, done, _, _ = game_state.env.step(full_action)
+    game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
+
+    # Track rewards
+    # Convert rewards to a list if it's a numpy array
+    if isinstance(rewards, np.ndarray):
+        rewards_list = rewards.tolist()
+    elif isinstance(rewards, (list, tuple)):
+        rewards_list = list(rewards)
+    else:
+        # Single scalar value
+        rewards_list = [rewards]
+    
+    if len(rewards_list) > 1:
+        step_rewards = {"offense": 0.0, "defense": 0.0}
+        # Sum rewards by team using actual team assignments
+        for i, reward in enumerate(rewards_list):
+            if i in game_state.env.offense_ids:
+                team = "offense"
+            elif i in game_state.env.defense_ids:
+                team = "defense"
+            else:
+                continue  # Skip if player not in either team
+            step_rewards[team] += float(reward)
+            game_state.episode_rewards[team] += float(reward)
+    else:
+        # Single agent case
+        step_rewards = {"offense": float(rewards_list[0]), "defense": 0.0}
+        game_state.episode_rewards["offense"] += float(rewards_list[0])
+
+    # Determine reward types based on actual action results from environment
+    offense_reasons = []
+    defense_reasons = []
+    
+    # Get action results from the environment info
+    action_results = info.get("action_results", {}) if info else {}
+    
+    # Debug logging for action results
+    if action_results:
+        print(f"[Action Results] Step {len(game_state.reward_history) + 1}:")
+        for key, value in action_results.items():
+            if value:  # Only log non-empty results
+                print(f"  {key}: {value}")
+    
+    # Check for specific actions that occurred
+    # 1. Check for shots
+    if action_results.get("shots"):
+        for player_id, shot_result in action_results["shots"].items():
+            if shot_result.get("success"):
+                # Determine if it was a 2PT or 3PT based on distance
+                shooter_pos = game_state.env.positions[player_id]
+                dist_to_basket = game_state.env._hex_distance(shooter_pos, game_state.env.basket_position)
+                if dist_to_basket >= game_state.env.three_point_distance:
+                    offense_reasons.append("Made 3PT")
+                else:
+                    offense_reasons.append("Made 2PT")
+                defense_reasons.append("Opp Made Shot")
+            else:
+                offense_reasons.append("Missed Shot")
+                defense_reasons.append("Opp Missed")
+    
+    # 2. Check for passes
+    if action_results.get("passes"):
+        successful_passes = 0
+        for player_id, pass_result in action_results["passes"].items():
+            if pass_result.get("success"):
+                successful_passes += 1
+        
+        if successful_passes > 0:
+            if successful_passes == 1:
+                offense_reasons.append("Pass")
+                defense_reasons.append("Opp Pass")
+            else:
+                offense_reasons.append(f"{successful_passes} Passes")
+                defense_reasons.append(f"Opp {successful_passes} Passes")
+    
+    # 3. Check for turnovers
+    if action_results.get("turnovers"):
+        for turnover_info in action_results["turnovers"]:
+            reason = turnover_info.get("reason", "Unknown")
+            if reason == "out_of_bounds":
+                offense_reasons.append("TO - OOB")
+                defense_reasons.append("Forced TO - OOB")
+            elif reason == "pressure":
+                offense_reasons.append("TO - Pressure")
+                defense_reasons.append("Forced TO - Pressure")
+            elif reason == "steal":
+                offense_reasons.append("TO - Steal")
+                defense_reasons.append("Forced TO - Steal")
+            else:
+                offense_reasons.append(f"TO - {reason}")
+                defense_reasons.append(f"Forced TO - {reason}")
+    
+    # 4. Check for movement penalties (OOB moves)
+    if action_results.get("moves"):
+        for player_id, move_result in action_results["moves"].items():
+            if not move_result.get("success", True) and move_result.get("reason") == "out_of_bounds":
+                if player_id in game_state.env.offense_ids:
+                    offense_reasons.append("OOB Move")
+                    defense_reasons.append("Opp OOB")
+                else:
+                    defense_reasons.append("OOB Move")
+                    offense_reasons.append("Opp OOB")
+    
+    # 5. If no specific actions detected but there are rewards, use generic labels
+    off_reward = step_rewards["offense"]
+    def_reward = step_rewards["defense"]
+    
+    if not offense_reasons and not defense_reasons:
+        if abs(off_reward) < 0.001 and abs(def_reward) < 0.001:
+            offense_reasons.append("None")
+            defense_reasons.append("None")
+        else:
+            if off_reward > 0:
+                offense_reasons.append("Positive")
+            elif off_reward < 0:
+                offense_reasons.append("Negative")
+            else:
+                offense_reasons.append("None")
+                
+            if def_reward > 0:
+                defense_reasons.append("Positive")
+            elif def_reward < 0:
+                defense_reasons.append("Negative")
+            else:
+                defense_reasons.append("None")
+
+    game_state.reward_history.append({
+        "step": len(game_state.reward_history) + 1,
+        "offense": float(step_rewards["offense"]),
+        "defense": float(step_rewards["defense"]),
+        "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
+        "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None"
+    })
 
     # Capture frame after step
     try:
@@ -257,7 +396,18 @@ def take_step(request: ActionRequest):
     except Exception:
         pass
     
-    return {"status": "success", "state": get_full_game_state()}
+    return {
+        "status": "success", 
+        "state": get_full_game_state(),
+        "step_rewards": {
+            "offense": float(step_rewards["offense"]),
+            "defense": float(step_rewards["defense"])
+        },
+        "episode_rewards": {
+            "offense": float(game_state.episode_rewards["offense"]),
+            "defense": float(game_state.episode_rewards["defense"])
+        }
+    }
 
 @app.post("/api/save_episode")
 def save_episode():
@@ -392,19 +542,43 @@ def get_action_values(player_id: int):
 
 @app.get("/api/shot_probability/{player_id}")
 def get_shot_probability(player_id: int):
-    """Returns the environment's shot success probability for a given player, including defender pressure effects."""
-    if not game_state.env or game_state.obs is None:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
+    """Get the shot probability for a specific player."""
+    if game_state.env is None:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    
+    try:
+        # Calculate distance from player to basket
+        player_pos = game_state.env.positions[player_id]
+        basket_pos = game_state.env.basket_position
+        distance = game_state.env._hex_distance(player_pos, basket_pos)
+        
+        # Calculate shot probability using environment method
+        shot_prob = game_state.env._calculate_shot_probability(player_id, distance)
+        return {"player_id": player_id, "shot_probability": shot_prob}
+    except Exception as e:
+        return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
 
-    if player_id < 0 or player_id >= game_state.env.n_players:
-        raise HTTPException(status_code=400, detail="Invalid player id.")
-
-    shooter_pos = game_state.env.positions[player_id]
-    basket_pos = game_state.env.basket_position
-    distance = game_state.env._hex_distance(shooter_pos, basket_pos)
-    prob = game_state.env._calculate_shot_probability(player_id, distance)
-
-    return jsonable_encoder({"probability": float(prob)})
+@app.get("/api/rewards")
+def get_rewards():
+    """Get the current reward history and episode totals."""
+    # Ensure all values are JSON serializable
+    serialized_history = []
+    for reward in game_state.reward_history:
+        serialized_history.append({
+            "step": int(reward["step"]),
+            "offense": float(reward["offense"]),
+            "defense": float(reward["defense"]),
+            "offense_reason": reward.get("offense_reason", "Unknown"),
+            "defense_reason": reward.get("defense_reason", "Unknown")
+        })
+    
+    return {
+        "reward_history": serialized_history,
+        "episode_rewards": {
+            "offense": float(game_state.episode_rewards["offense"]),
+            "defense": float(game_state.episode_rewards["defense"])
+        }
+    }
 
 def get_full_game_state():
     """Helper function to construct the full game state dictionary."""

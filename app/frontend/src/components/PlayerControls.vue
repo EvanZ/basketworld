@@ -1,7 +1,7 @@
 <script setup>
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, onMounted } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getShotProbability } from '@/services/api';
+import { getActionValues, getShotProbability, getRewards } from '@/services/api';
 
 const props = defineProps({
   gameState: { // This is now the currentGameState computed property from App.vue
@@ -23,6 +23,11 @@ const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-ag
 const selectedActions = ref({});
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
+
+// Add rewards tracking
+const activeTab = ref('controls');
+const rewardHistory = ref([]);
+const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -65,7 +70,8 @@ watch(() => props.activePlayerId, async (newPlayerId) => {
         try {
             const sp = await getShotProbability(newPlayerId);
             // Overwrite the computed shotProbability by setting a side value we use in the compute below
-            _backendShotProb.value = sp.probability;
+            _backendShotProb.value = sp.shot_probability;
+            console.log('[PlayerControls] Fetched backend shot prob:', sp.shot_probability);
         } catch (e) {
             console.warn('[PlayerControls] Failed to fetch backend shot probability', e);
             _backendShotProb.value = null;
@@ -143,40 +149,54 @@ function hexDistance(pos1, pos2) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
-function calculateShotProbability(distance, threePointDistance, shotProbs, shotParams) {
-  // Prefer parametric model when present
-  if (shotParams && shotParams.model === 'linear') {
-    const d0 = 1;
-    const d1 = Math.max(threePointDistance, d0 + 1);
-    const p0 = Number(shotParams.layup_pct ?? 0.67);
-    const p1 = Number(shotParams.three_pt_pct ?? 0.35);
-    let prob = distance <= d0 ? p0 : (p0 + (p1 - p0) * ((distance - d0) / (d1 - d0)));
-    prob = Math.max(0.01, Math.min(0.99, prob));
-    return prob;
+// Calculate shot probabilities for validation/display
+const calculateShotProbability = (distance) => {
+  if (!props.gameState?.shot_params) return 0;
+  
+  const { layup_pct, three_pt_pct } = props.gameState.shot_params;
+  const three_point_distance = props.gameState.three_point_distance || 4;
+  
+  // Linear interpolation between layup and 3pt percentages
+  const t = Math.min(distance / three_point_distance, 1.0);
+  return layup_pct * (1 - t) + three_pt_pct * t;
+};
+
+// Fetch rewards from API
+const fetchRewards = async () => {
+  try {
+    const data = await getRewards();
+    rewardHistory.value = data.reward_history || [];
+    episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
+    console.log('[Rewards] Fetched rewards. History length:', rewardHistory.value.length, 'Episode totals:', episodeRewards.value);
+  } catch (error) {
+    console.error('Failed to fetch rewards:', error);
   }
-  // Fallback to discrete table if provided
-  const SHOT_PROBS = shotProbs || {
-    layup: 0.67,
-    hook: 0.55,
-    jumper: 0.45,
-    three: 0.35,
-    heave: 0.1,
-  };
-  if (distance <= 1) return SHOT_PROBS.layup;
-  if (distance <= 2) return SHOT_PROBS.hook;
-  if (distance <= (threePointDistance - 1)) return SHOT_PROBS.jumper;
-  if (distance <= (threePointDistance + 1)) return SHOT_PROBS.three;
-  return SHOT_PROBS.heave;
-}
+};
+
+// Watch for game state changes to update rewards
+watch(() => props.gameState, () => {
+  if (props.gameState) {
+    console.log('[Rewards] Game state changed, fetching rewards. Done:', props.gameState.done);
+    fetchRewards();
+  }
+}, { deep: true });
+
+onMounted(() => {
+  fetchRewards();
+});
 
 // Hold backend probability when available
 const _backendShotProb = ref(null);
 
 const shotProbability = computed(() => {
     if (props.activePlayerId === null || !props.gameState || !props.gameState.positions[props.activePlayerId]) {
+        console.log('[ShotProb] Early return: no active player or game state');
         return null;
     }
-    if (_backendShotProb.value !== null) return _backendShotProb.value;
+    if (_backendShotProb.value !== null && _backendShotProb.value !== undefined) {
+        console.log('[ShotProb] Using backend prob:', _backendShotProb.value);
+        return _backendShotProb.value;
+    }
     const playerPos = props.gameState.positions[props.activePlayerId];
     const basketPos = props.gameState.basket_position; 
 
@@ -190,10 +210,9 @@ const shotProbability = computed(() => {
     }
     
     const distance = hexDistance(playerPos, basketPos);
-    const tpd = props.gameState.three_point_distance ?? 4;
-    const shotProbs = props.gameState.shot_probs || null;
-    const shotParams = props.gameState.shot_params || null;
-    return calculateShotProbability(distance, tpd, shotProbs, shotParams);
+    const prob = calculateShotProbability(distance);
+    console.log('[ShotProb] Calculated prob:', prob, 'for distance:', distance);
+    return prob;
 });
 
 </script>
@@ -201,44 +220,112 @@ const shotProbability = computed(() => {
 <template>
   <div class="player-controls-container" :class="{ disabled: disabled && !gameState.done }">
     <h3>Player Controls</h3>
-    <div class="player-tabs">
-        <button 
-            v-for="playerId in userControlledPlayerIds" 
-            :key="playerId"
-            :class="{ active: activePlayerId === playerId }"
-            @click="$emit('update:activePlayerId', playerId)"
-            :disabled="disabled && !gameState.done"
-        >
-            Player {{ playerId }}
-            <span v-if="selectedActions[playerId]">
-              ({{ selectedActions[playerId].startsWith('MOVE') ? 'M' : selectedActions[playerId].startsWith('PASS') ? 'P' : selectedActions[playerId] }})
-            </span>
-        </button>
-    </div>
     
-    <div class="control-pad-wrapper" v-if="activePlayerId !== null">
-        <HexagonControlPad 
-            :legal-actions="getLegalActions(activePlayerId)"
-            :selected-action="selectedActions[activePlayerId]"
-            :shot-probability="shotProbability"
-            :pass-probabilities="passProbabilities"
-            @action-selected="handleActionSelected"
-            :action-values="actionValues"
-            :value-range="valueRange"
-            :is-defense="isDefense"
-        />
-        <p v-if="selectedActions[activePlayerId]">
-            Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
-        </p>
+    <!-- Tab Navigation -->
+    <div class="tab-navigation">
+      <button 
+        :class="{ active: activeTab === 'controls' }"
+        @click="activeTab = 'controls'"
+      >
+        Controls
+      </button>
+      <button 
+        :class="{ active: activeTab === 'rewards' }"
+        @click="activeTab = 'rewards'"
+      >
+        Rewards
+      </button>
     </div>
 
-    <button @click="submitActions" class="submit-button" :disabled="gameState.done || (disabled && !gameState.done)">
-      {{ gameState.done ? 'Game Over' : disabled ? 'AI Playing' : 'Submit Turn' }}
-    </button>
-    
-    <button @click="$emit('play-again')" class="new-game-button">
-      New Game
-    </button>
+    <!-- Controls Tab -->
+    <div v-if="activeTab === 'controls'" class="tab-content">
+      <div class="player-tabs">
+          <button 
+              v-for="playerId in userControlledPlayerIds" 
+              :key="playerId"
+              :class="{ active: activePlayerId === playerId }"
+              @click="$emit('update:activePlayerId', playerId)"
+              :disabled="disabled && !gameState.done"
+          >
+              Player {{ playerId }}
+              <span v-if="selectedActions[playerId]">
+                ({{ selectedActions[playerId].startsWith('MOVE') ? 'M' : selectedActions[playerId].startsWith('PASS') ? 'P' : selectedActions[playerId] }})
+              </span>
+          </button>
+      </div>
+      
+      <div class="control-pad-wrapper" v-if="activePlayerId !== null">
+          <HexagonControlPad 
+              :legal-actions="getLegalActions(activePlayerId)"
+              :selected-action="selectedActions[activePlayerId]"
+              :shot-probability="shotProbability"
+              :pass-probabilities="passProbabilities"
+              @action-selected="handleActionSelected"
+              :action-values="actionValues"
+              :value-range="valueRange"
+              :is-defense="isDefense"
+          />
+          <p v-if="selectedActions[activePlayerId]">
+              Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
+          </p>
+      </div>
+
+      <button @click="submitActions" class="submit-button" :disabled="gameState.done || (disabled && !gameState.done)">
+        {{ gameState.done ? 'Game Over' : disabled ? 'AI Playing' : 'Submit Turn' }}
+      </button>
+      
+      <button @click="$emit('play-again')" class="new-game-button">
+        New Game
+      </button>
+    </div>
+
+    <!-- Rewards Tab -->
+    <div v-if="activeTab === 'rewards'" class="tab-content">
+      <div class="rewards-section">
+        <h4>Episode Totals</h4>
+        <div class="episode-totals">
+          <div class="total-item">
+            <span class="team-label offense">Offense:</span>
+            <span class="reward-value">{{ episodeRewards.offense.toFixed(2) }}</span>
+          </div>
+          <div class="total-item">
+            <span class="team-label defense">Defense:</span>
+            <span class="reward-value">{{ episodeRewards.defense.toFixed(2) }}</span>
+          </div>
+        </div>
+
+        <h4>Turn History</h4>
+        <div class="reward-history">
+          <div v-if="rewardHistory.length === 0" class="no-rewards">
+            No rewards recorded yet.
+          </div>
+          <div v-else class="reward-table">
+            <div class="reward-header">
+              <span>Turn</span>
+              <span>Offense</span>
+              <span>Off. Reason</span>
+              <span>Defense</span>
+              <span>Def. Reason</span>
+            </div>
+            <div 
+              v-for="reward in rewardHistory" 
+              :key="reward.step"
+              class="reward-row"
+            >
+              <span>{{ reward.step }}</span>
+              <span :class="{ positive: reward.offense > 0, negative: reward.offense < 0 }">
+                {{ reward.offense.toFixed(2) }}
+              </span>
+              <span class="reason-text">{{ reward.offense_reason }}</span>
+              <span :class="{ positive: reward.defense > 0, negative: reward.defense < 0 }">
+                {{ reward.defense.toFixed(2) }}
+              </span>
+              <span class="reason-text">{{ reward.defense_reason }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -249,56 +336,223 @@ const shotProbability = computed(() => {
   border-radius: 8px;
   display: flex;
   flex-direction: column;
+  gap: 1rem;
+  max-height: 80vh;
+  overflow-y: auto;
 }
+
+.tab-navigation {
+  display: flex;
+  gap: 0.5rem;
+  border-bottom: 1px solid #dee2e6;
+  margin-bottom: 1rem;
+}
+
+.tab-navigation button {
+  padding: 0.5rem 1rem;
+  border: none;
+  background-color: transparent;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.tab-navigation button:hover {
+  background-color: #e9ecef;
+}
+
+.tab-navigation button.active {
+  border-bottom-color: #007bff;
+  color: #007bff;
+}
+
+.tab-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Existing styles */
 .player-tabs {
-    display: flex;
-    margin-bottom: 1rem;
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
 }
+
 .player-tabs button {
-    flex-grow: 1;
-    padding: 0.5rem;
-    border: 1px solid #ccc;
-    background: #fff;
-    cursor: pointer;
+  padding: 0.5rem 1rem;
+  border: 1px solid #ccc;
+  background-color: white;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.2s ease;
 }
+
+.player-tabs button:hover {
+  background-color: #e9ecef;
+}
+
 .player-tabs button.active {
-    background-color: #007bff;
-    color: white;
-    border-color: #007bff;
+  background-color: #007bff;
+  color: white;
+  border-color: #007bff;
 }
-.control-pad-wrapper {
-    border: 1px solid #dee2e6;
-    border-radius: 4px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-    text-align: center;
+
+.player-tabs button:disabled {
+  background-color: #e9ecef;
+  color: #6c757d;
+  cursor: not-allowed;
+  opacity: 0.6;
 }
-.new-game-button {
-    margin-top: 1rem;
-    width: 100%;
-    padding: 0.75rem;
-    background-color: #28a745;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    font-size: 1rem;
-    cursor: pointer;
+
+/* Rewards styles */
+.rewards-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
 }
-.submit-button {
-  margin-top: auto; /* Pushes button to the bottom */
+
+.episode-totals {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  background-color: white;
+  border-radius: 4px;
+  border: 1px solid #dee2e6;
+}
+
+.total-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.team-label {
+  font-weight: bold;
+  font-size: 0.9rem;
+}
+
+.team-label.offense {
+  color: #dc3545;
+}
+
+.team-label.defense {
+  color: #007bff;
+}
+
+.reward-value {
+  font-size: 1.2rem;
+  font-weight: bold;
+}
+
+.reward-history {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.no-rewards {
+  text-align: center;
+  padding: 2rem;
+  color: #6c757d;
+  font-style: italic;
+}
+
+.reward-table {
+  background-color: white;
+  border-radius: 4px;
+  border: 1px solid #dee2e6;
+  overflow: hidden;
+}
+
+.reward-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr;
   padding: 0.75rem;
+  background-color: #f8f9fa;
+  font-weight: bold;
+  border-bottom: 1px solid #dee2e6;
+  text-align: center;
+}
+
+.reward-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #f1f3f4;
+  text-align: center;
+}
+
+.reward-row:last-child {
+  border-bottom: none;
+}
+
+.reward-row:hover {
+  background-color: #f8f9fa;
+}
+
+.positive {
+  color: #28a745;
+  font-weight: bold;
+}
+
+.negative {
+  color: #dc3545;
+  font-weight: bold;
+}
+
+.reason-text {
+  font-size: 0.85rem;
+  color: #6c757d;
+  font-style: italic;
+}
+
+/* Existing control styles */
+.control-pad-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+
+.submit-button, .new-game-button {
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: bold;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  min-width: 120px;
+}
+
+.submit-button {
   background-color: #28a745;
   color: white;
-  border: none;
-  font-size: 1.2rem;
 }
+
 .submit-button:disabled {
   background-color: #6c757d;
   cursor: not-allowed;
 }
 
-.player-controls-container.disabled {
-  opacity: 0.5;
+.submit-button:hover:not(:disabled) {
+  background-color: #218838;
+}
+
+.new-game-button {
+  background-color: #007bff;
+  color: white;
+}
+
+.new-game-button:hover {
+  background-color: #0056b3;
+}
+
+.disabled {
+  opacity: 0.7;
   pointer-events: none;
 }
 </style> 

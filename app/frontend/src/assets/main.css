@@ -33,7 +33,7 @@ a,
   }
 }
 
-@media (min-width: 1024px) {
+@media (min-width: 640) {
   body {
     display: flex;
     place-items: center;

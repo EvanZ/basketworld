@@ -64,15 +64,21 @@ export async function getActionValues(playerId) {
     return response.json();
 }
 
-export async function getShotProbability(playerId) {
-    const response = await fetch(`${API_BASE_URL}/api/shot_probability/${playerId}`);
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ detail: 'Failed to fetch shot probability' }));
-        console.error('[API] getShotProbability failed:', response.status, errorData);
-        throw new Error(errorData.detail || 'Failed to fetch shot probability');
-    }
-    return response.json();
-}
+export const getShotProbability = async (playerId) => {
+  const response = await fetch(`${API_BASE_URL}/api/shot_probability/${playerId}`);
+  if (!response.ok) {
+    throw new Error(`Failed to get shot probability: ${response.statusText}`);
+  }
+  return response.json();
+};
+
+export const getRewards = async () => {
+  const response = await fetch(`${API_BASE_URL}/api/rewards`);
+  if (!response.ok) {
+    throw new Error(`Failed to get rewards: ${response.statusText}`);
+  }
+  return response.json();
+};
 
 export async function saveEpisode() {
     const response = await fetch(`${API_BASE_URL}/api/save_episode`, {
