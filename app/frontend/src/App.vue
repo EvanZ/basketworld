@@ -17,6 +17,9 @@ const activePlayerId = ref(null);
 const aiMode = ref(false);
 const deterministic = ref(true);
 
+// Shared move tracking between manual and AI play
+const moveHistory = ref([]);
+
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState) => {
     if (newState && !newState.done) {
@@ -34,6 +37,11 @@ watch(gameState, async (newState) => {
 });
 
 async function handleGameStarted(setupData) {
+  console.log('[App] Starting game with data:', setupData);
+  
+  // Clear move history for new game
+  moveHistory.value = [];
+  
   isLoading.value = true;
   error.value = null;
   initialSetup.value = setupData;
@@ -72,6 +80,11 @@ async function handleActionsSubmitted(actions) {
   }
 }
 
+function handleMoveRecorded(moveData) {
+    console.log('[App] Recording move:', moveData);
+    moveHistory.value.push(moveData);
+}
+
 // New function for self-play mode (runs full episode)
 async function handleSelfPlay() {
   if (!gameState.value || !aiMode.value) return;
@@ -102,6 +115,28 @@ async function handleSelfPlay() {
             aiActions[playerId] = bestActionIndex;
           }
         }
+      }
+      
+      // Track moves for AI self-play
+      if (Object.keys(aiActions).length > 0) {
+        const currentTurn = moveHistory.value.length + 1;
+        const teamMoves = {};
+        
+        // Convert action indices back to action names for tracking
+        const actionNames = [
+          "NOOP", "MOVE_E", "MOVE_NE", "MOVE_NW", "MOVE_W", "MOVE_SW", "MOVE_SE", 
+          "SHOOT", "PASS_E", "PASS_NE", "PASS_NW", "PASS_W", "PASS_SW", "PASS_SE"
+        ];
+        
+        for (const [playerId, actionIndex] of Object.entries(aiActions)) {
+          const actionName = actionNames[actionIndex] || 'UNKNOWN';
+          teamMoves[`Player ${playerId}`] = actionName;
+        }
+        
+        moveHistory.value.push({
+          turn: currentTurn,
+          moves: teamMoves
+        });
       }
       
       const response = await stepGame(aiActions);
@@ -176,9 +211,11 @@ function handlePlayAgain() {
             :disabled="false"
             :ai-mode="aiMode"
             :deterministic="deterministic"
+            :move-history="moveHistory"
             @actions-submitted="handleActionsSubmitted" 
             @play-again="handlePlayAgain"
             @self-play="handleSelfPlay"
+            @move-recorded="handleMoveRecorded"
         />
 
         <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">

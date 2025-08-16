@@ -21,9 +21,13 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  moveHistory: {
+    type: Array,
+    default: () => [],
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play', 'move-recorded']);
 
 const selectedActions = ref({});
 const actionValues = ref(null);
@@ -35,6 +39,8 @@ const policyProbabilities = ref(null);
 const activeTab = ref('controls');
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
+
+// Move tracking is now handled by parent component
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -257,6 +263,21 @@ function submitActions() {
   }
   
   console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
+  
+  // Track moves for the selected team
+  const currentTurn = props.moveHistory.length + 1;
+  const teamMoves = {};
+  
+  for (const playerId of userControlledPlayerIds.value) {
+    const actionName = selectedActions.value[playerId] || 'NOOP';
+    teamMoves[`Player ${playerId}`] = actionName;
+  }
+  
+  emit('move-recorded', {
+    turn: currentTurn,
+    moves: teamMoves
+  });
+  
   emit('actions-submitted', actionsToSubmit);
   
   if (!props.aiMode) {
@@ -412,11 +433,13 @@ const fetchRewards = async () => {
   }
 };
 
-// Watch for game state changes to update rewards
-watch(() => props.gameState, () => {
-  if (props.gameState) {
-    console.log('[Rewards] Game state changed, fetching rewards. Done:', props.gameState.done);
+// Watch for game state changes to update rewards and clear moves
+watch(() => props.gameState, (newState, oldState) => {
+  if (newState) {
+    console.log('[Rewards] Game state changed, fetching rewards. Done:', newState.done);
     fetchRewards();
+    
+    // Move history clearing is now handled by parent component
   }
 }, { deep: true });
 
@@ -477,6 +500,12 @@ const shotProbability = computed(() => {
         @click="activeTab = 'rewards'"
       >
         Rewards
+      </button>
+      <button 
+        :class="{ active: activeTab === 'moves' }"
+        @click="activeTab = 'moves'"
+      >
+        Moves
       </button>
     </div>
 
@@ -575,6 +604,34 @@ const shotProbability = computed(() => {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Moves Tab -->
+    <div v-if="activeTab === 'moves'" class="tab-content">
+      <div class="moves-section">
+        <h4>Team Moves History ({{ props.gameState?.user_team_name || 'Unknown' }})</h4>
+        <div v-if="props.moveHistory.length === 0" class="no-moves">
+          No moves recorded yet.
+        </div>
+        <table v-else class="moves-table">
+          <thead>
+            <tr>
+              <th>Turn</th>
+              <th v-for="playerId in userControlledPlayerIds" :key="playerId">
+                Player {{ playerId }}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="move in props.moveHistory" :key="move.turn">
+              <td>{{ move.turn }}</td>
+              <td v-for="playerId in userControlledPlayerIds" :key="playerId">
+                {{ move.moves[`Player ${playerId}`] || 'NOOP' }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -829,5 +886,39 @@ const shotProbability = computed(() => {
 .disabled {
   opacity: 0.7;
   pointer-events: none;
+}
+
+/* Moves styles */
+.moves-section {
+  padding: 1rem;
+}
+
+.moves-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+}
+
+.moves-table th,
+.moves-table td {
+  border: 1px solid #ddd;
+  padding: 8px;
+  text-align: center;
+}
+
+.moves-table th {
+  background-color: #f5f5f5;
+  font-weight: bold;
+}
+
+.moves-table tr:nth-child(even) {
+  background-color: #f9f9f9;
+}
+
+.no-moves {
+  text-align: center;
+  color: #666;
+  font-style: italic;
+  padding: 20px;
 }
 </style> 
