@@ -162,7 +162,7 @@ async def init_game(request: InitGameRequest):
         )
         layup_pct = get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
         three_pt_pct = get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
-
+        spawn_distance = get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
         # Shot pressure params (optional)
         shot_pressure_enabled = get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         shot_pressure_max = get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
@@ -196,6 +196,7 @@ async def init_game(request: InitGameRequest):
             shot_pressure_max=shot_pressure_max,
             shot_pressure_lambda=shot_pressure_lambda,
             shot_pressure_arc_degrees=shot_pressure_arc_degrees,
+            spawn_distance=spawn_distance,
         )
         game_state.obs, _ = game_state.env.reset()
 

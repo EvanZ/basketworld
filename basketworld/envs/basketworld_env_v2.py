@@ -101,6 +101,7 @@ class HexagonBasketballEnv(gym.Env):
         shot_pressure_lambda: float = 1.0, # decay rate per hex away from shooter
         shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
         enable_profiling: bool = False,
+        spawn_distance: int = 3,
     ):
         super().__init__()
         
@@ -113,6 +114,7 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
+        self.spawn_distance = spawn_distance
         # Three-point configuration and shot model parameters
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
@@ -134,7 +136,6 @@ class HexagonBasketballEnv(gym.Env):
         self.enable_profiling = bool(enable_profiling)
         self._profile_ns: Dict[str, int] = {}
         self._profile_calls: Dict[str, int] = {}
-        
         # Basket position, using offset coordinates for placement
         basket_col = 0
         basket_row = self.court_height // 2
@@ -375,7 +376,7 @@ class HexagonBasketballEnv(gym.Env):
             if not self._is_valid_position(*cell):
                 continue
             dist = self._hex_distance(cell, self.basket_position)
-            if self.three_point_distance <= dist <= self.three_point_distance + 3:
+            if self.three_point_distance + self.spawn_distance <= dist <= self.court_width:
                 offense_candidates.append(cell)
 
         if len(offense_candidates) < self.players_per_side:
@@ -398,7 +399,7 @@ class HexagonBasketballEnv(gym.Env):
                 and cell not in taken_positions
                 and self._is_valid_position(*cell)
                 and self._hex_distance(cell, self.basket_position) < off_dist
-                and self._hex_distance(cell, self.basket_position) < self.three_point_distance
+                and self._hex_distance(cell, self.basket_position) >= self.three_point_distance + self.spawn_distance
             ]
 
             if not candidates:
@@ -408,7 +409,7 @@ class HexagonBasketballEnv(gym.Env):
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
-                    and self._hex_distance(cell, self.basket_position) < off_dist
+                    and self._hex_distance(cell, self.basket_position) < off_dist + self.spawn_distance
                 ]
 
             if not candidates:

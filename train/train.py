@@ -637,7 +637,7 @@ if __name__ == "__main__":
     parser.add_argument("--shot-pressure-lambda", type=float, default=1.0, help="Exponential decay rate per hex for shot pressure.")
     parser.add_argument("--shot-pressure-arc-degrees", type=float, default=60.0, help="Arc width centered toward basket for pressure eligibility.")
     parser.add_argument("--enable-env-profiling", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.")
-    
+    parser.add_argument("--spawn-distance", type=int, default=3, help="minimum distance from 3pt line at which players spawn.")
     args = parser.parse_args()
  
     main(args) 
