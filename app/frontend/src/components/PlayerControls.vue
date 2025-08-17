@@ -546,6 +546,12 @@ const shotProbability = computed(() => {
       >
         Moves
       </button>
+      <button 
+        :class="{ active: activeTab === 'parameters' }"
+        @click="activeTab = 'parameters'"
+      >
+        Parameters
+      </button>
     </div>
 
     <!-- Controls Tab -->
@@ -671,6 +677,108 @@ const shotProbability = computed(() => {
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Parameters Tab -->
+    <div v-if="activeTab === 'parameters'" class="tab-content">
+      <div class="parameters-section">
+        <h4>MLflow Parameters</h4>
+        <div v-if="!props.gameState" class="no-data">
+          No game loaded
+        </div>
+        <div v-else class="parameters-grid">
+          <div class="param-category">
+            <h5>Environment Settings</h5>
+            <div class="param-item">
+              <span class="param-name">Players per side:</span>
+              <span class="param-value">{{ Math.floor((props.gameState.offense_ids?.length || 0)) }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Court dimensions:</span>
+              <span class="param-value">{{ props.gameState.court_width }}×{{ props.gameState.court_height }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Ball holder:</span>
+              <span class="param-value">Player {{ props.gameState.ball_holder }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Shot clock:</span>
+              <span class="param-value">{{ props.gameState.shot_clock }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Shot Parameters</h5>
+            <div class="param-item">
+              <span class="param-name">Three point distance:</span>
+              <span class="param-value">{{ props.gameState.three_point_distance || 'N/A' }}</span>
+            </div>
+            <div v-if="props.gameState.shot_params" class="param-group">
+              <div class="param-item">
+                <span class="param-name">Layup percentage:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.layup_pct * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item">
+                <span class="param-name">Three-point percentage:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.three_pt_pct * 100).toFixed(1) }}%</span>
+              </div>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>Defender Turnover Pressure</h5>
+            <div class="param-item">
+              <span class="param-name">Pressure distance:</span>
+              <span class="param-value">{{ props.gameState.defender_pressure_distance || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Turnover chance:</span>
+              <span class="param-value">{{ props.gameState.defender_pressure_turnover_chance || 'N/A' }}</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>Spawn Distance</h5>
+            <div class="param-item">
+              <span class="param-name">Spawn distance:</span>
+              <span class="param-value">{{ props.gameState.spawn_distance || 'N/A' }}</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>Shot Pressure</h5>
+            <div class="param-item">
+              <span class="param-name">Pressure enabled:</span>
+              <span class="param-value">{{ props.gameState.shot_pressure_enabled || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Max pressure:</span>
+              <span class="param-value">{{ props.gameState.shot_pressure_max || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Pressure lambda:</span>
+              <span class="param-value">{{ props.gameState.shot_pressure_lambda || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Pressure arc degrees:</span>
+              <span class="param-value">{{ props.gameState.shot_pressure_arc_degrees || 'N/A' }}°</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Team Configuration</h5>
+            <div class="param-item">
+              <span class="param-name">User team:</span>
+              <span class="param-value">{{ props.gameState.user_team_name }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Offense IDs:</span>
+              <span class="param-value">{{ props.gameState.offense_ids?.join(', ') || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Defense IDs:</span>
+              <span class="param-value">{{ props.gameState.defense_ids?.join(', ') || 'N/A' }}</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -959,5 +1067,56 @@ const shotProbability = computed(() => {
   color: #666;
   font-style: italic;
   padding: 20px;
+}
+
+/* Parameters styles */
+.parameters-section {
+  padding: 1rem;
+}
+
+.parameters-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+}
+
+.param-category {
+  background: #f8f9fa;
+  border-radius: 6px;
+  padding: 1rem;
+}
+
+.param-category h5 {
+  margin: 0 0 0.5rem 0;
+  color: #333;
+  font-weight: 600;
+  border-bottom: 1px solid #ddd;
+  padding-bottom: 0.25rem;
+}
+
+.param-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid #eee;
+}
+
+.param-item:last-child {
+  border-bottom: none;
+}
+
+.param-name {
+  font-weight: 500;
+  color: #555;
+}
+
+.param-value {
+  font-family: 'Courier New', monospace;
+  background: #fff;
+  padding: 0.2rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid #ddd;
+  font-size: 0.9em;
 }
 </style> 

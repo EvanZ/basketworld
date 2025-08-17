@@ -168,7 +168,10 @@ async def init_game(request: InitGameRequest):
         shot_pressure_max = get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
         shot_pressure_lambda = get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
         shot_pressure_arc_degrees = get_param(params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
-
+        # Defender pressure params (optional)
+        defender_pressure_distance = get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
+        defender_pressure_turnover_chance = get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+        
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
@@ -197,6 +200,8 @@ async def init_game(request: InitGameRequest):
             shot_pressure_lambda=shot_pressure_lambda,
             shot_pressure_arc_degrees=shot_pressure_arc_degrees,
             spawn_distance=spawn_distance,
+            defender_pressure_distance=defender_pressure_distance,
+            defender_pressure_turnover_chance=defender_pressure_turnover_chance,
         )
         game_state.obs, _ = game_state.env.reset()
 
@@ -607,6 +612,7 @@ def get_full_game_state():
     action_mask_py = game_state.obs['action_mask'].tolist()
         
     return {
+        "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "positions": positions_py,
         "ball_holder": ball_holder_py,
         "shot_clock": int(game_state.env.shot_clock),
@@ -623,4 +629,11 @@ def get_full_game_state():
         "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
         "shot_probs": getattr(game_state.env, "shot_probs", None),
         "shot_params": getattr(game_state.env, "shot_params", None),
+        "defender_pressure_distance": int(getattr(game_state.env, "defender_pressure_distance", 1)),
+        "defender_pressure_turnover_chance": float(getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)),
+        "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
+        "shot_pressure_enabled": bool(getattr(game_state.env, "shot_pressure_enabled", True)),
+        "shot_pressure_max": float(getattr(game_state.env, "shot_pressure_max", 0.5)),
+        "shot_pressure_lambda": float(getattr(game_state.env, "shot_pressure_lambda", 1.0)),
+        "shot_pressure_arc_degrees": float(getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)),
     } 

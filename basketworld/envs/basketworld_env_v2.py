@@ -131,6 +131,7 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_pressure_enabled = bool(shot_pressure_enabled)
         self.shot_pressure_max = float(shot_pressure_max)
         self.shot_pressure_lambda = float(shot_pressure_lambda)
+        self.shot_pressure_arc_degrees = float(shot_pressure_arc_degrees)
         self.shot_pressure_arc_rad = math.radians(shot_pressure_arc_degrees)
         # Profiling
         self.enable_profiling = bool(enable_profiling)
