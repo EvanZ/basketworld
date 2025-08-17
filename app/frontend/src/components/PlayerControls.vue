@@ -30,6 +30,11 @@ const props = defineProps({
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play', 'move-recorded']);
 
 const selectedActions = ref({});
+
+// Debug: Watch for any changes to selectedActions
+watch(selectedActions, (newActions, oldActions) => {
+  console.log('[PlayerControls] 🔍 selectedActions changed from:', oldActions, 'to:', newActions);
+}, { deep: true });
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
 const _backendShotProb = ref(null);
@@ -66,8 +71,14 @@ const allPlayerIds = computed(() => {
 
 // Watch for the active player ID to change, then fetch the shot prob for that player.
 watch(() => props.activePlayerId, async (newPlayerId) => {
-    if (newPlayerId !== null && props.gameState && !props.gameState.done) {
-        console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching shot probability...`);
+  // Skip if AI mode is active to avoid interfering with AI selections
+  if (props.aiMode) {
+    console.log(`[PlayerControls] Skipping active player change (${newPlayerId}) because AI mode is active`);
+    return;
+  }
+  
+  if (newPlayerId !== null && props.gameState && !props.gameState.done) {
+    console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching shot probability...`);
         
         // Fetch backend-computed shot probability to ensure parity with environment logic
         try {
@@ -178,15 +189,15 @@ async function fetchAllActionValues() {
 
 // Watch for game state changes to fetch all action values when needed
 watch(() => props.gameState, async (newGameState) => {
-  console.log('[PlayerControls] Game state changed, fetching AI data...');
+  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder);
   if (newGameState && !newGameState.done) {
     // Fetch both action values and policy probabilities for AI mode
     try {
-      console.log('[PlayerControls] Starting to fetch action values...');
+      console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
       await fetchAllActionValues();
-      console.log('[PlayerControls] Action values fetched, now fetching policy probabilities...');
+      console.log('[PlayerControls] Action values fetched, now fetching policy probabilities for ball holder:', newGameState.ball_holder);
       await fetchPolicyProbabilities();
-      console.log('[PlayerControls] Policy probabilities fetch completed');
+      console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
     }
@@ -215,6 +226,7 @@ const actionNames = Object.values({
 
 function getLegalActions(playerId) {
   if (!props.gameState.action_mask || !props.gameState.action_mask[playerId]) {
+    console.log(`[getLegalActions] No action mask for player ${playerId}`);
     return [];
   }
   const mask = props.gameState.action_mask[playerId];
@@ -224,6 +236,14 @@ function getLegalActions(playerId) {
       legalActions.push(actionNames[i]);
     }
   }
+  
+  // Debug logging for SHOOT/PASS actions
+  const hasShoot = legalActions.includes('SHOOT');
+  const hasPass = legalActions.some(action => action.startsWith('PASS_'));
+  if (hasShoot || hasPass) {
+    console.log(`[getLegalActions] 🚨 Player ${playerId} has SHOOT: ${hasShoot}, PASS: ${hasPass}, Ball holder: ${props.gameState.ball_holder}, Action mask:`, mask);
+  }
+  
   return legalActions;
 }
 
@@ -291,7 +311,7 @@ function submitActions() {
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
 watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDeterministic]) => {
-  console.log('[PlayerControls] AI mode changed to:', newAiMode, 'Deterministic:', newDeterministic);
+  console.log('[PlayerControls] 🔄 AI mode watch triggered - AI:', newAiMode, 'Deterministic:', newDeterministic, 'Ball holder:', props.gameState?.ball_holder);
   console.log('[PlayerControls] actionValues.value:', actionValues.value);
   console.log('[PlayerControls] policyProbabilities.value:', policyProbabilities.value);
   console.log('[PlayerControls] userControlledPlayerIds.value:', userControlledPlayerIds.value);
@@ -304,6 +324,15 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
       
       for (const playerId of controlledIds) {
         const legalActions = getLegalActions(playerId);
+        
+        // Debug logging for action masking issues
+        console.log(`[PlayerControls] Player ${playerId} - Ball holder: ${props.gameState?.ball_holder}, Legal actions:`, legalActions);
+        if (legalActions.includes('SHOOT') && playerId !== props.gameState?.ball_holder) {
+          console.log(`[PlayerControls] 🚨 BUG: Player ${playerId} can SHOOT but is NOT ball holder (${props.gameState?.ball_holder})`);
+        }
+        if (legalActions.some(action => action.startsWith('PASS_')) && playerId !== props.gameState?.ball_holder) {
+          console.log(`[PlayerControls] 🚨 BUG: Player ${playerId} can PASS but is NOT ball holder (${props.gameState?.ball_holder})`);
+        }
         
         if (legalActions.length > 0) {
           let selectedAction = null;
@@ -330,14 +359,24 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
             console.log(`[PlayerControls] Player probs:`, playerProbs);
             console.log(`[PlayerControls] Legal actions:`, legalActions);
             
-            const actionIndex = sampleFromProbabilities(playerProbs);
-            console.log(`[PlayerControls] Sampled action index:`, actionIndex, `(${actionNames[actionIndex]})`);
+            // Filter probabilities to only include legal actions
+            const legalActionIndices = [];
+            const legalProbs = [];
             
-            if (actionIndex < actionNames.length && legalActions.includes(actionNames[actionIndex])) {
+            for (let i = 0; i < playerProbs.length && i < actionNames.length; i++) {
+              if (legalActions.includes(actionNames[i])) {
+                legalActionIndices.push(i);
+                legalProbs.push(playerProbs[i]);
+              }
+            }
+            
+            if (legalProbs.length > 0) {
+              const sampledIndex = sampleFromProbabilities(legalProbs);
+              const actionIndex = legalActionIndices[sampledIndex];
               selectedAction = actionNames[actionIndex];
               console.log(`[PlayerControls] Selected PROBABILISTIC action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
             } else {
-              console.log(`[PlayerControls] Sampled action ${actionNames[actionIndex]} is not legal for player ${playerId}`);
+              console.log(`[PlayerControls] No legal actions with probabilities for player ${playerId}`);
             }
           } else {
             console.log(`[PlayerControls] Cannot do probabilistic sampling for player ${playerId}:`);
@@ -357,7 +396,7 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
       }
       
       selectedActions.value = newSelections;
-      console.log('[PlayerControls] Final selectedActions:', selectedActions.value);
+      console.log('[PlayerControls] 📝 Updated selectedActions via AI mode:', selectedActions.value);
     } else {
       // Clear selections when AI mode is disabled
       console.log('[PlayerControls] Clearing AI mode selections');
