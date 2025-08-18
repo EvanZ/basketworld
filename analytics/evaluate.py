@@ -20,7 +20,11 @@ from collections import defaultdict
 from tqdm import tqdm
 
 
-def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool):
+def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool,
+                      three_point_distance: int, layup_pct: float, three_pt_pct: float,
+                      shot_pressure_enabled: bool, shot_pressure_max: float, shot_pressure_lambda: float, shot_pressure_arc_degrees: float,
+                      defender_pressure_distance: int, defender_pressure_turnover_chance: float,
+                      spawn_distance: int):
     """Create and wrap the environment for evaluation."""
     
     render_mode = "rgb_array" if not no_render else None
@@ -29,7 +33,17 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
         grid_size=grid_size,
         players_per_side=players,
         shot_clock_steps=shot_clock,
-        render_mode=render_mode
+        render_mode=render_mode,
+        three_point_distance=three_point_distance,
+        layup_pct=layup_pct,
+        three_pt_pct=three_pt_pct,
+        shot_pressure_enabled=shot_pressure_enabled,
+        shot_pressure_max=shot_pressure_max,
+        shot_pressure_lambda=shot_pressure_lambda,
+        shot_pressure_arc_degrees=shot_pressure_arc_degrees,
+        defender_pressure_distance=defender_pressure_distance,
+        defender_pressure_turnover_chance=defender_pressure_turnover_chance,
+        spawn_distance=spawn_distance
     )
     return env
 
@@ -39,10 +53,17 @@ def analyze_results(results: list, num_episodes: int):
     
     outcomes = defaultdict(int)
     episode_lengths = []
+    shot_probabilities = []
+    shot_distances = []
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
-        
+        shot_probabilities.append(res['probabilities'])
+        shot_distances.append(res['distances'])
+    print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
+    print(f"Shot Probabilities Std: {np.std(shot_probabilities)}")
+    print(f"Shot Distances Mean: {np.mean(shot_distances)}")
+    print(f"Shot Distances Std: {np.std(shot_distances)}")
     print(f"Total Episodes: {num_episodes}\n")
     
     # --- Episode Length Statistics ---
@@ -56,10 +77,26 @@ def analyze_results(results: list, num_episodes: int):
     print(f"  - Min/Max: {min_len}/{max_len}\n")
 
     # --- Scoring and Outcome Statistics ---
-    made_shots = outcomes.get("Made Shot", 0)
-    score_rate = (made_shots / num_episodes) * 100
-    print(f"Offensive Score Rate: {score_rate:.2f}%")
-    
+    made_2pts = outcomes.get("Made 2pt", 0)
+    made_3pts = outcomes.get("Made 3pt", 0)
+    missed_2pts = outcomes.get("Missed 2pt", 0)
+    missed_3pts = outcomes.get("Missed 3pt", 0)
+    score_rate = (made_2pts + made_3pts) / num_episodes
+    turnovers = outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)
+    print(f"Offensive Score Rate: {100.0 * score_rate:.2f}%")
+    print(f"Made 2pts: {made_2pts}")
+    print(f"Missed 2pts: {missed_2pts}")
+    print(f"Made 3pts: {made_3pts}")
+    print(f"Missed 3pts: {missed_3pts}")
+    print(f"Total made shots: {made_2pts + made_3pts}")
+    print(f"Total missed shots: {missed_2pts + missed_3pts}")
+    print(f"Total shots: {made_2pts + made_3pts + missed_2pts + missed_3pts}")
+    print(f"Total turnovers: {outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)}")
+    print(f"2PT%: {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
+    print(f"3PT%: {100.0 * made_3pts / (made_3pts + missed_3pts):.2f}%")
+    print(f"FG%: {100.0 * (made_2pts + made_3pts) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")
+    print(f"EFG%: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")    
+    print(f"PPP: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}%")
     print("\nEpisode Termination Breakdown:")
     for outcome, count in sorted(outcomes.items()):
         percentage = (count / num_episodes) * 100
@@ -91,6 +128,46 @@ def main(args):
         print(f"  - Grid Size: {grid_size}")
         print(f"  - Players: {players}")
         print(f"  - Shot Clock: {shot_clock}")
+        def get_param(params_dict, names, cast, default):
+            for n in names:
+                if n in params_dict and params_dict[n] != "":
+                    try:
+                        return cast(params_dict[n])
+                    except Exception:
+                        pass
+            return default
+
+        # Optional params (added later); try multiple name variants, fall back to defaults
+        three_point_distance = get_param(
+            run_params,
+            [
+                "three_point_distance",
+                "three-point-distance",
+                "three_pt_distance",
+                "three-pt-distance",
+            ],
+            int,
+            4,
+        )
+        layup_pct = get_param(run_params, ["layup_pct", "layup-pct"], float, 0.60)
+        three_pt_pct = get_param(run_params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
+        spawn_distance = get_param(run_params, ["spawn_distance", "spawn-distance"], int, 3)
+        # Shot pressure params (optional)
+        shot_pressure_enabled = get_param(run_params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        shot_pressure_max = get_param(run_params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
+        shot_pressure_lambda = get_param(run_params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
+        shot_pressure_arc_degrees = get_param(run_params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
+        # Defender pressure params (optional)
+        defender_pressure_distance = get_param(run_params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
+        defender_pressure_turnover_chance = get_param(run_params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+        
+        print(
+            f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
+            f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
+            f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
+            f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
+            f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}"
+        )
     except KeyError as e:
         print(f"Error: Run {args.run_id} is missing a required parameter: {e}")
         return
@@ -115,7 +192,22 @@ def main(args):
             
             # --- Setup ---
             print("\nSetting up environment for evaluation...")
-            env = setup_environment(grid_size, players, shot_clock, args.no_render)
+            env = setup_environment(
+                grid_size=grid_size,
+                players=players,
+                shot_clock=shot_clock,
+                three_point_distance=three_point_distance,
+                no_render=args.no_render,
+                layup_pct=layup_pct,
+                three_pt_pct=three_pt_pct,
+                shot_pressure_enabled=shot_pressure_enabled,
+                shot_pressure_max=shot_pressure_max,
+                shot_pressure_lambda=shot_pressure_lambda,
+                shot_pressure_arc_degrees=shot_pressure_arc_degrees,
+                spawn_distance=spawn_distance,
+                defender_pressure_distance=defender_pressure_distance,
+                defender_pressure_turnover_chance=defender_pressure_turnover_chance,
+            )
 
             print("Loading policies...")
             offense_policy = PPO.load(offense_policy_path)
@@ -159,10 +251,18 @@ def main(args):
                 final_info = info
                 action_results = final_info.get('action_results', {})
                 outcome = "Unknown" # Default outcome
-
                 if action_results.get('shots'):
                     shot_result = list(action_results['shots'].values())[0]
-                    outcome = "Made Shot" if shot_result['success'] else "Missed Shot"
+                    if shot_result['success'] and shot_result['distance'] < three_point_distance:
+                        outcome = "Made 2pt"
+                    elif shot_result['success'] and shot_result['distance'] >= three_point_distance:
+                        outcome = "Made 3pt"
+                    elif not shot_result['success'] and shot_result['distance'] < three_point_distance:
+                        outcome = "Missed 2pt"
+                    elif not shot_result['success'] and shot_result['distance'] >= three_point_distance:
+                        outcome = "Missed 3pt"
+                    else:
+                        outcome = "Unknown"
                 elif action_results.get('turnovers'):
                     turnover_reason = action_results['turnovers'][0]['reason']
                     if turnover_reason == 'intercepted':
@@ -181,7 +281,9 @@ def main(args):
                 results.append({
                     "outcome": outcome,
                     "length": env.unwrapped.step_count,
-                    "episode_num": i
+                    "episode_num": i,
+                    "probabilities": shot_result['probability'],
+                    "distances": shot_result['distance'],
                 })
 
                 # --- Save and log GIF for this episode ---
