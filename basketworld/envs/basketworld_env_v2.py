@@ -719,20 +719,22 @@ class HexagonBasketballEnv(gym.Env):
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
         done = False
+        pass_reward = 0.0
+        turnover_penalty = 1.0
         
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                rewards[self.offense_ids] += 0.3/self.players_per_side
-                rewards[self.defense_ids] -= 0.3/self.players_per_side
+                rewards[self.offense_ids] += pass_reward/self.players_per_side
+                rewards[self.defense_ids] -= pass_reward/self.players_per_side
         
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
             done = True
             # Penalize offense, reward defense for the turnover
             # We assume only one turnover can happen per step
-            rewards[self.offense_ids] -= 1/self.players_per_side 
-            rewards[self.defense_ids] += 1/self.players_per_side
+            rewards[self.offense_ids] -= turnover_penalty/self.players_per_side 
+            rewards[self.defense_ids] += turnover_penalty/self.players_per_side
         
 
         # Check for shots
@@ -740,14 +742,14 @@ class HexagonBasketballEnv(gym.Env):
             done = True  # Episode ends after any shot attempt
             
             # --- Time-based penalty for shooting too early ---
-            if self.step_count <= 3:
-                # Penalty is high at step 1 and decrements
-                # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
-                time_penalty = - (1.0 - self.step_count * 0.2)
+            # if self.step_count <= 3:
+            #     # Penalty is high at step 1 and decrements
+            #     # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
+            #     time_penalty = - (1.0 - self.step_count * 0.2)
                 
-                # We only apply this penalty to the team that is currently training
-                if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
-                    rewards[self.offense_ids] += time_penalty/self.players_per_side
+            #     # We only apply this penalty to the team that is currently training
+            #     if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
+            #         rewards[self.offense_ids] += time_penalty/self.players_per_side
             
             # Define the reward magnitude for shots (3PT outside the line)
             # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
