@@ -65,11 +65,17 @@ export async function getActionValues(playerId) {
 }
 
 export const getShotProbability = async (playerId) => {
-  const response = await fetch(`${API_BASE_URL}/api/shot_probability/${playerId}`);
+  const url = `${API_BASE_URL}/api/shot_probability/${playerId}`;
+  console.log('[API] getShotProbability →', url);
+  const response = await fetch(url);
   if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    console.error('[API] getShotProbability failed:', response.status, response.statusText, text);
     throw new Error(`Failed to get shot probability: ${response.statusText}`);
   }
-  return response.json();
+  const json = await response.json();
+  console.log('[API] getShotProbability ←', json);
+  return json;
 };
 
 export const getRewards = async () => {

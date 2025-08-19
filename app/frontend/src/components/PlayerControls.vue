@@ -71,30 +71,44 @@ const allPlayerIds = computed(() => {
 
 // Watch for the active player ID to change, then fetch the shot prob for that player.
 watch(() => props.activePlayerId, async (newPlayerId) => {
-  // Skip if AI mode is active to avoid interfering with AI selections
-  if (props.aiMode) {
-    console.log(`[PlayerControls] Skipping active player change (${newPlayerId}) because AI mode is active`);
-    return;
-  }
-  
   if (newPlayerId !== null && props.gameState && !props.gameState.done) {
     console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching shot probability...`);
-        
-        // Fetch backend-computed shot probability to ensure parity with environment logic
-        try {
-            const sp = await getShotProbability(newPlayerId);
-            // Overwrite the computed shotProbability by setting a side value we use in the compute below
-            _backendShotProb.value = sp.shot_probability;
-            console.log('[PlayerControls] Fetched backend shot prob:', sp.shot_probability);
-        } catch (e) {
-            console.warn('[PlayerControls] Failed to fetch backend shot probability', e);
-            _backendShotProb.value = null;
-        }
-    } else {
-        console.log('[PlayerControls] No active player or game is done. Clearing shot prob.');
-        _backendShotProb.value = null;
+    try {
+      const sp = await getShotProbability(newPlayerId);
+      const backendProb = (sp && (sp.shot_probability_final ?? sp.shot_probability));
+      _backendShotProb.value = backendProb;
+      console.log('[PlayerControls] Fetched backend shot prob (final):', backendProb, 'distance:', sp?.distance, 'base:', sp?.shot_probability);
+    } catch (e) {
+      console.warn('[PlayerControls] Failed to fetch backend shot probability', e);
+      _backendShotProb.value = null;
     }
+  } else {
+    console.log('[PlayerControls] No active player or game is done. Clearing shot prob.');
+    _backendShotProb.value = null;
+  }
 }, { immediate: true });
+
+// Also refetch when positions or ball holder change so distance/pressure updates are reflected
+watch(
+  () => ({
+    positions: props.gameState?.positions,
+    ball_holder: props.gameState?.ball_holder,
+  }),
+  async () => {
+    if (props.activePlayerId !== null && props.gameState && !props.gameState.done) {
+      console.log('[PlayerControls] Game state positions/ball_holder changed. Refreshing shot prob...');
+      try {
+        const sp = await getShotProbability(props.activePlayerId);
+        const backendProb = (sp && (sp.shot_probability_final ?? sp.shot_probability));
+        _backendShotProb.value = backendProb;
+        console.log('[PlayerControls] Refreshed backend shot prob (final):', backendProb, 'distance:', sp?.distance, 'base:', sp?.shot_probability);
+      } catch (e) {
+        console.warn('[PlayerControls] Failed to refresh backend shot probability', e);
+      }
+    }
+  },
+  { deep: true }
+);
 
 // Fetch policy probabilities for probabilistic action sampling
 async function fetchPolicyProbabilities() {
@@ -407,34 +421,78 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
   }
 });
 
-// Also pre-select when action values change and AI mode is on
-watch(() => actionValues.value, () => {
+// Re-sample probabilistic actions whenever policy probabilities update
+watch(() => policyProbabilities.value, () => {
   try {
-    if (props.aiMode && actionValues.value) {
-      const newSelections = {};
-      const controlledIds = userControlledPlayerIds.value;
-      
-      for (const playerId of controlledIds) {
-        if (actionValues.value[playerId]) {
-          const playerActions = actionValues.value[playerId];
-          let bestAction = null;
-          let bestValue = -Infinity;
-          
-          for (const [action, value] of Object.entries(playerActions)) {
-            if (value > bestValue) {
-              bestValue = value;
-              bestAction = action;
-            }
-          }
-          
-          if (bestAction) {
-            newSelections[playerId] = bestAction;
-          }
+    if (!(props.aiMode && !props.deterministic && policyProbabilities.value)) {
+      return;
+    }
+
+    const newSelections = {};
+    const controlledIds = userControlledPlayerIds.value;
+
+    for (const playerId of controlledIds) {
+      const legalActions = getLegalActions(playerId);
+      const playerProbs = policyProbabilities.value?.[playerId];
+      if (!playerProbs || legalActions.length === 0) continue;
+
+      const legalActionIndices = [];
+      const legalProbs = [];
+
+      for (let i = 0; i < playerProbs.length && i < actionNames.length; i++) {
+        if (legalActions.includes(actionNames[i])) {
+          legalActionIndices.push(i);
+          legalProbs.push(playerProbs[i]);
         }
       }
-      
+
+      if (legalProbs.length > 0) {
+        const sampledIndex = sampleFromProbabilities(legalProbs);
+        const actionIndex = legalActionIndices[sampledIndex];
+        const selectedAction = actionNames[actionIndex];
+        newSelections[playerId] = selectedAction;
+        console.log(`[PlayerControls] Re-sampled PROB action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
+      }
+    }
+
+    if (Object.keys(newSelections).length > 0) {
       selectedActions.value = newSelections;
     }
+  } catch (error) {
+    console.error('[PlayerControls] Error in policyProbabilities watch:', error);
+  }
+});
+
+// Also pre-select when action values change, but ONLY in deterministic mode (Q-values)
+watch(() => actionValues.value, () => {
+  try {
+    if (!(props.aiMode && props.deterministic && actionValues.value)) {
+      return; // do not override probabilistic selections
+    }
+
+    const newSelections = {};
+    const controlledIds = userControlledPlayerIds.value;
+    
+    for (const playerId of controlledIds) {
+      if (actionValues.value[playerId]) {
+        const playerActions = actionValues.value[playerId];
+        let bestAction = null;
+        let bestValue = -Infinity;
+        
+        for (const [action, value] of Object.entries(playerActions)) {
+          if (typeof value === 'number' && value > bestValue) {
+            bestValue = value;
+            bestAction = action;
+          }
+        }
+        
+        if (bestAction) {
+          newSelections[playerId] = bestAction;
+        }
+      }
+    }
+    
+    selectedActions.value = newSelections;
   } catch (error) {
     console.error('[PlayerControls] Error in action values watch:', error);
   }
@@ -455,9 +513,18 @@ const calculateShotProbability = (distance) => {
   const { layup_pct, three_pt_pct } = props.gameState.shot_params;
   const three_point_distance = props.gameState.three_point_distance || 4;
   
-  // Linear interpolation between layup and 3pt percentages
-  const t = Math.min(distance / three_point_distance, 1.0);
-  return layup_pct * (1 - t) + three_pt_pct * t;
+  // Match Python env formula: anchor at d0=1, d1=max(three_point_distance, 2)
+  const d0 = 1;
+  const d1 = Math.max(three_point_distance, d0 + 1);
+  let prob;
+  if (distance <= d0) {
+    prob = layup_pct;
+  } else {
+    const t = (distance - d0) / (d1 - d0);
+    prob = layup_pct + (three_pt_pct - layup_pct) * t;
+  }
+  // Clamp similar to backend
+  return Math.max(0.01, Math.min(0.99, prob));
 };
 
 // Fetch rewards from API

@@ -427,7 +427,7 @@ def save_episode():
 
     # Write frames to GIF
     try:
-        imageio.mimsave(file_path, game_state.frames, fps=2, loop=0)
+        imageio.mimsave(file_path, game_state.frames, fps=1, loop=0)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save GIF: {e}")
 
@@ -548,7 +548,11 @@ def get_action_values(player_id: int):
 
 @app.get("/api/shot_probability/{player_id}")
 def get_shot_probability(player_id: int):
-    """Get the shot probability for a specific player."""
+    """Get the shot probability for a specific player.
+
+    Returns base (unpressured) probability for UI display plus the
+    pressure-adjusted probability for diagnostics.
+    """
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
     
@@ -558,9 +562,35 @@ def get_shot_probability(player_id: int):
         basket_pos = game_state.env.basket_position
         distance = game_state.env._hex_distance(player_pos, basket_pos)
         
-        # Calculate shot probability using environment method
-        shot_prob = game_state.env._calculate_shot_probability(player_id, distance)
-        return {"player_id": player_id, "shot_probability": shot_prob}
+        # Debug: Log the basic parameters
+        print(f"[SHOT_PROB_DEBUG] Player {player_id} at {player_pos}, basket at {basket_pos}, distance: {distance}")
+        print(f"[SHOT_PROB_DEBUG] Environment params: layup_pct={game_state.env.layup_pct}, three_pt_pct={game_state.env.three_pt_pct}, three_point_distance={game_state.env.three_point_distance}")
+        print(f"[SHOT_PROB_DEBUG] Shot pressure params: enabled={game_state.env.shot_pressure_enabled}, max={game_state.env.shot_pressure_max}, lambda={game_state.env.shot_pressure_lambda}")
+        
+        # Calculate base probability first (without pressure)
+        d0 = 1
+        d1 = max(game_state.env.three_point_distance, d0 + 1)
+        p0 = game_state.env.layup_pct
+        p1 = game_state.env.three_pt_pct
+        
+        if distance <= d0:
+            base_prob = p0
+        else:
+            t = (distance - d0) / (d1 - d0)
+            base_prob = p0 + (p1 - p0) * t
+        
+        print(f"[SHOT_PROB_DEBUG] Base probability before pressure: {base_prob:.3f}")
+        
+        # Calculate pressure-adjusted probability (for logging/diagnostics)
+        final_prob = game_state.env._calculate_shot_probability(player_id, distance)
+        print(f"[SHOT_PROB_DEBUG] Final shot probability after pressure: {final_prob:.3f}")
+        
+        return {
+            "player_id": player_id,
+            "shot_probability": float(base_prob),
+            "shot_probability_final": float(final_prob),
+            "distance": int(distance),
+        }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
 

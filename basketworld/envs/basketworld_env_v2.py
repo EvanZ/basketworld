@@ -706,7 +706,8 @@ class HexagonBasketballEnv(gym.Env):
 
             if closest_d is not None:
                 # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
-                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * max(0, closest_d - 1))
+                exponent_arg = max(0, closest_d - 1)
+                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
                 pressure_mult = max(0.0, 1.0 - red)
                 prob *= pressure_mult
 

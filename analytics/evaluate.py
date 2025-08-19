@@ -58,10 +58,10 @@ def analyze_results(results: list, num_episodes: int):
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
-        shot_probabilities.append(res['probabilities'])
+        # shot_probabilities.append(res['probabilities'])
         shot_distances.append(res['distances'])
-    print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
-    print(f"Shot Probabilities Std: {np.std(shot_probabilities)}")
+    # print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
+    # print(f"Shot Probabilities Std: {np.std(shot_probabilities)}")
     print(f"Shot Distances Mean: {np.mean(shot_distances)}")
     print(f"Shot Distances Std: {np.std(shot_distances)}")
     print(f"Total Episodes: {num_episodes}\n")
@@ -93,10 +93,22 @@ def analyze_results(results: list, num_episodes: int):
     print(f"Total shots: {made_2pts + made_3pts + missed_2pts + missed_3pts}")
     print(f"Total turnovers: {outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)}")
     print(f"2PT%: {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
-    print(f"3PT%: {100.0 * made_3pts / (made_3pts + missed_3pts):.2f}%")
-    print(f"FG%: {100.0 * (made_2pts + made_3pts) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")
-    print(f"EFG%: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")    
-    print(f"PPP: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}%")
+    if made_3pts+missed_3pts > 0:
+        print(f"3PT%: {100.0 * made_3pts / (made_3pts + missed_3pts):.2f}%")
+    else:
+        print("3PT%: N/A")
+    if made_2pts+made_3pts+missed_2pts+missed_3pts > 0:
+        print(f"FG%: {100.0 * (made_2pts + made_3pts) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")
+    else:
+        print("FG%: N/A")
+    if made_2pts+made_3pts+missed_2pts+missed_3pts > 0:
+        print(f"EFG%: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")    
+    else:
+        print("EFG%: N/A")
+    if made_2pts+made_3pts+missed_2pts+missed_3pts+turnovers > 0:
+        print(f"PPP: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}%")
+    else:
+        print("PPP: N/A")
     print("\nEpisode Termination Breakdown:")
     for outcome, count in sorted(outcomes.items()):
         percentage = (count / num_episodes) * 100
@@ -282,7 +294,7 @@ def main(args):
                     "outcome": outcome,
                     "length": env.unwrapped.step_count,
                     "episode_num": i,
-                    "probabilities": shot_result['probability'],
+                    # "probabilities": shot_result['probability'],
                     "distances": shot_result['distance'],
                 })
 
