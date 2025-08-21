@@ -232,6 +232,27 @@ class HexagonBasketballEnv(gym.Env):
         y = size * (1.5 * r)
         return x, y
     
+    def _axial_to_cube(self, q: int, r: int) -> Tuple[int, int, int]:
+        """Convert axial (q, r) to cube (x, y, z) coordinates."""
+        x, z = q, r
+        y = -x - z
+        return x, y, z
+    
+    def _cube_to_axial(self, x: int, y: int, z: int) -> Tuple[int, int]:
+        """Convert cube (x, y, z) to axial (q, r) coordinates."""
+        return x, z
+    
+    def _rotate60_cw_cube(self, x: int, y: int, z: int) -> Tuple[int, int, int]:
+        """Rotate cube (x, y, z) by 60 degrees clockwise."""
+        return -z, -x, -y
+    
+    def _rotate_k60_axial(self, q: int, r: int, k: int) -> Tuple[int, int]:
+        """Rotate axial (q, r) by k*60 degrees clockwise."""
+        x, y, z = self._axial_to_cube(q, r)
+        for _ in range(k % 6):
+            x, y, z = self._rotate60_cw_cube(x, y, z)
+        return self._cube_to_axial(x, y, z)
+    
     @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment to initial state."""
