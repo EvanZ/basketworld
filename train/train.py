@@ -126,7 +126,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         We replace the opponent's actions with predictions from the frozen policy.
         """
         # Get action from the frozen opponent policy using the last observation
-        opponent_action_raw, _ = self.opponent_policy.predict(self.last_obs, deterministic=True)
+        opponent_action_raw, _ = self.opponent_policy.predict(self.last_obs, deterministic=args.deterministic_opponent)
         action_mask = self.last_obs['action_mask']
 
         # Combine the actions, ensuring the opponent's actions are legal
@@ -431,7 +431,8 @@ def main(args):
             offense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
                 reset_num_timesteps=False,
-                callback=[offense_mlflow_callback, offense_timing_callback]
+                callback=[offense_mlflow_callback, offense_timing_callback],
+                progress_bar=True
             )
             offense_env.close()
             
@@ -470,7 +471,8 @@ def main(args):
             defense_policy.learn(
                 total_timesteps=args.steps_per_alternation, 
                 reset_num_timesteps=False,
-                callback=[defense_mlflow_callback, defense_timing_callback]
+                callback=[defense_mlflow_callback, defense_timing_callback],
+                progress_bar=True
             )
             defense_env.close()
 
@@ -638,6 +640,7 @@ if __name__ == "__main__":
     parser.add_argument("--shot-pressure-arc-degrees", type=float, default=60.0, help="Arc width centered toward basket for pressure eligibility.")
     parser.add_argument("--enable-env-profiling", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.")
     parser.add_argument("--spawn-distance", type=int, default=3, help="minimum distance from 3pt line at which players spawn.")
+    parser.add_argument("--deterministic-opponent", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic opponent actions.")
     args = parser.parse_args()
  
     main(args) 

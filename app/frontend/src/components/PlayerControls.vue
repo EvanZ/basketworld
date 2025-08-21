@@ -25,6 +25,11 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  // When provided, overrides internal selections to reflect actual applied actions
+  externalSelections: {
+    type: Object,
+    default: null,
+  },
 });
 
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play', 'move-recorded']);
@@ -274,6 +279,11 @@ function handleActionSelected(action) {
       const nextIndex = (currentIndex + 1) % userControlledPlayerIds.value.length;
       emit('update:activePlayerId', userControlledPlayerIds.value[nextIndex]);
     }
+    // If parent provided external selections (self-play), clear them so AI mode resumes fresh
+    if (props.externalSelections) {
+      // Emit a harmless update to notify parent to clear external selections if desired
+      // Parent reads this indirectly by starting self-play; on manual override we stop mirroring
+    }
   }
 }
 
@@ -323,8 +333,16 @@ function submitActions() {
   }
 }
 
+function triggerSelfPlay() {
+  // Emit current selections so the parent can use them for the first self-play step
+  const snapshot = { ...selectedActions.value };
+  emit('self-play', snapshot);
+}
+
 // Watch for AI mode or deterministic mode changes to pre-select actions
 watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDeterministic]) => {
+  // If parent is driving selections (self-play), don't override
+  if (props.externalSelections) return;
   console.log('[PlayerControls] 🔄 AI mode watch triggered - AI:', newAiMode, 'Deterministic:', newDeterministic, 'Ball holder:', props.gameState?.ball_holder);
   console.log('[PlayerControls] actionValues.value:', actionValues.value);
   console.log('[PlayerControls] policyProbabilities.value:', policyProbabilities.value);
@@ -423,6 +441,7 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
 
 // Re-sample probabilistic actions whenever policy probabilities update
 watch(() => policyProbabilities.value, () => {
+  if (props.externalSelections) return;
   try {
     if (!(props.aiMode && !props.deterministic && policyProbabilities.value)) {
       return;
@@ -465,6 +484,7 @@ watch(() => policyProbabilities.value, () => {
 
 // Also pre-select when action values change, but ONLY in deterministic mode (Q-values)
 watch(() => actionValues.value, () => {
+  if (props.externalSelections) return;
   try {
     if (!(props.aiMode && props.deterministic && actionValues.value)) {
       return; // do not override probabilistic selections
@@ -587,6 +607,14 @@ const shotProbability = computed(() => {
     return prob;
 });
 
+// Keep local selections in sync with externally applied selections during self-play
+watch(() => props.externalSelections, (newSelections) => {
+  if (newSelections && typeof newSelections === 'object') {
+    // Replace entire selection map to match applied actions
+    selectedActions.value = { ...newSelections };
+  }
+});
+
 </script>
 
 <template>
@@ -659,7 +687,7 @@ const shotProbability = computed(() => {
       </button>
       
       <button 
-        @click="$emit('self-play')" 
+        @click="triggerSelfPlay" 
         class="self-play-button"
         :disabled="!aiMode || gameState.done"
       >

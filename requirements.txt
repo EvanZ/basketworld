@@ -72,6 +72,7 @@ python-dateutil==2.9.0.post0
 pytz==2025.2
 pyyaml==6.0.2
 requests==2.32.4
+rich==14.1.0
 rsa==4.9.1
 scikit-learn==1.7.1
 scipy==1.16.0

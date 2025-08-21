@@ -59,7 +59,7 @@ def analyze_results(results: list, num_episodes: int):
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
         # shot_probabilities.append(res['probabilities'])
-        shot_distances.append(res['distances'])
+        # shot_distances.append(res['distances'])
     # print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
     # print(f"Shot Probabilities Std: {np.std(shot_probabilities)}")
     print(f"Shot Distances Mean: {np.mean(shot_distances)}")
@@ -106,7 +106,7 @@ def analyze_results(results: list, num_episodes: int):
     else:
         print("EFG%: N/A")
     if made_2pts+made_3pts+missed_2pts+missed_3pts+turnovers > 0:
-        print(f"PPP: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}%")
+        print(f"PPP: {1.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}")
     else:
         print("PPP: N/A")
     print("\nEpisode Termination Breakdown:")
@@ -243,8 +243,8 @@ def main(args):
                     episode_frames.append(frame)
 
                 while not done:
-                    offense_action, _ = offense_policy.predict(obs, deterministic=True)
-                    defense_action, _ = defense_policy.predict(obs, deterministic=True)
+                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
+                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
 
                     full_action = np.zeros(env.n_players, dtype=int)
                     for player_id in range(env.n_players):
@@ -295,7 +295,7 @@ def main(args):
                     "length": env.unwrapped.step_count,
                     "episode_num": i,
                     # "probabilities": shot_result['probability'],
-                    "distances": shot_result['distance'],
+                    # "distances": shot_result['distance'],
                 })
 
                 # --- Save and log GIF for this episode ---
@@ -320,6 +320,8 @@ if __name__ == "__main__":
     parser.add_argument("--run-id", type=str, required=True, help="The MLflow Run ID to evaluate.")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to run for evaluation.")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering a sample GIF.")
+    parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic offense actions.")
+    parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic defense actions.")
     
     args = parser.parse_args()
     main(args) 

@@ -12,10 +12,15 @@ const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
+// Reflect the actions being applied on each step to keep UI tabs in sync during self-play
+const currentSelections = ref(null);
+const isSelfPlaying = ref(false);
+// Force remount of PlayerControls to clear internal state between games
+const controlsKey = ref(0);
 
 // AI Mode for pre-selecting actions, not automatic play
-const aiMode = ref(false);
-const deterministic = ref(true);
+const aiMode = ref(true);
+const deterministic = ref(false);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
@@ -32,7 +37,7 @@ watch(gameState, async (newState) => {
     }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done) {
-        aiMode.value = false;
+        aiMode.value = true;
     }
 });
 
@@ -41,6 +46,11 @@ async function handleGameStarted(setupData) {
   
   // Clear move history for new game
   moveHistory.value = [];
+  // Clear any self-play selections state
+  currentSelections.value = null;
+  isSelfPlaying.value = false;
+  // Bump key to reset PlayerControls' internal state (like selectedActions)
+  controlsKey.value += 1;
   
   isLoading.value = true;
   error.value = null;
@@ -67,7 +77,7 @@ async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
   // No loading indicator for steps, feels more responsive
   try {
-    const response = await stepGame(actions);
+    const response = await stepGame(actions, deterministic.value);
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
@@ -86,8 +96,10 @@ function handleMoveRecorded(moveData) {
 }
 
 // New function for self-play mode (runs full episode)
-async function handleSelfPlay() {
+async function handleSelfPlay(preselected = null) {
   if (!gameState.value || !aiMode.value) return;
+  isSelfPlaying.value = true;
+  currentSelections.value = null;
   
   // Run full episode with AI controlling all players
   while (gameState.value && !gameState.value.done) {
@@ -105,6 +117,29 @@ async function handleSelfPlay() {
         for (const playerId of userControlledIds) {
           const probs = policyProbs.value[playerId];
           const actionMask = gameState.value.action_mask[playerId];
+
+          // If this is the first loop iteration and preselected is provided, honor it
+          if (preselected && preselected[`$${playerId}`] === undefined && preselected[playerId] === undefined) {
+            // normalize to string and numeric lookup
+          }
+          if (preselected) {
+            let chosen = null;
+            const preVal = preselected[playerId] ?? preselected[`$${playerId}`];
+            if (typeof preVal === 'string') {
+              const names = [
+                "NOOP","MOVE_E","MOVE_NE","MOVE_NW","MOVE_W","MOVE_SW","MOVE_SE",
+                "SHOOT","PASS_E","PASS_NE","PASS_NW","PASS_W","PASS_SW","PASS_SE"
+              ];
+              const idx = names.indexOf(preVal);
+              if (idx >= 0 && actionMask[idx] === 1) chosen = idx;
+            } else if (typeof preVal === 'number') {
+              if (preVal >= 0 && preVal < actionMask.length && actionMask[preVal] === 1) chosen = preVal;
+            }
+            if (chosen != null) {
+              aiActions[playerId] = chosen;
+              continue; // do not override a valid preselection
+            }
+          }
           
           if (Array.isArray(probs) && Array.isArray(actionMask)) {
             // Pick action with highest probability (argmax) among LEGAL actions only
@@ -124,6 +159,8 @@ async function handleSelfPlay() {
           }
         }
       }
+      // Clear preselected after applying for the first step
+      preselected = null;
       
       // Track moves for AI self-play
       if (Object.keys(aiActions).length > 0) {
@@ -136,10 +173,14 @@ async function handleSelfPlay() {
           "SHOOT", "PASS_E", "PASS_NE", "PASS_NW", "PASS_W", "PASS_SW", "PASS_SE"
         ];
         
+        const appliedSelections = {};
         for (const [playerId, actionIndex] of Object.entries(aiActions)) {
           const actionName = actionNames[actionIndex] || 'UNKNOWN';
           teamMoves[`Player ${playerId}`] = actionName;
+          appliedSelections[playerId] = actionName;
         }
+        // Update UI tabs to mirror applied actions
+        currentSelections.value = appliedSelections;
         
         moveHistory.value.push({
           turn: currentTurn,
@@ -147,7 +188,7 @@ async function handleSelfPlay() {
         });
       }
       
-      const response = await stepGame(aiActions);
+      const response = await stepGame(aiActions, deterministic.value);
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(response.state);
@@ -162,6 +203,9 @@ async function handleSelfPlay() {
       break;
     }
   }
+  // Self-play finished
+  isSelfPlaying.value = false;
+  currentSelections.value = null;
 }
 
 async function handleSaveEpisode() {
@@ -178,6 +222,9 @@ function handlePlayAgain() {
   gameHistory.value = [];
   policyProbs.value = null;
   activePlayerId.value = null;
+  currentSelections.value = null;
+  isSelfPlaying.value = false;
+  controlsKey.value += 1;
   if (initialSetup.value) {
     handleGameStarted(initialSetup.value);
   }
@@ -202,7 +249,7 @@ function handlePlayAgain() {
         <input type="checkbox" v-model="aiMode" /> AI Mode
       </label>
       <label v-if="aiMode" style="margin-left: 10px;">
-        <input type="checkbox" v-model="deterministic" /> Deterministic (Q-values)
+        <input type="checkbox" v-model="deterministic" /> Deterministic
       </label>
     </div>
 
@@ -214,12 +261,14 @@ function handlePlayAgain() {
       />
       <div class="controls-area">
         <PlayerControls 
+            :key="controlsKey"
             :game-state="gameState" 
             v-model:activePlayerId="activePlayerId"
             :disabled="false"
             :ai-mode="aiMode"
             :deterministic="deterministic"
             :move-history="moveHistory"
+            :external-selections="isSelfPlaying ? currentSelections : null"
             @actions-submitted="handleActionsSubmitted" 
             @play-again="handlePlayAgain"
             @self-play="handleSelfPlay"

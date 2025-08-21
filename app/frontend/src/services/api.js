@@ -27,14 +27,14 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
     return response.json();
 }
 
-export async function stepGame(actions) {
+export async function stepGame(actions, deterministic = null) {
     console.log('[API] Sending step request with actions:', actions);
     const response = await fetch(`${API_BASE_URL}/api/step`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ actions }),
+        body: JSON.stringify({ actions, deterministic }),
     });
     if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to take step' }));

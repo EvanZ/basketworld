@@ -237,8 +237,9 @@ class HexagonBasketballEnv(gym.Env):
         """Reset the environment to initial state."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-            
-        self.shot_clock = self.shot_clock_steps
+
+        max_shot_clock = self.shot_clock_steps    
+        self.shot_clock = max(10, math.floor(max_shot_clock * self._rng.random()))
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
@@ -369,7 +370,7 @@ class HexagonBasketballEnv(gym.Env):
             for col in range(self.court_width):
                 all_cells.append(self._offset_to_axial(col, row))
 
-        # Offense candidates: behind the arc but within 3 hexes of it
+        # Offense candidates: behind the arc but within spawn_distance hexes of it
         offense_candidates = []
         for cell in all_cells:
             if cell == self.basket_position:
@@ -622,7 +623,52 @@ class HexagonBasketballEnv(gym.Env):
         
         # Use the distance-based probability calculation
         shot_success_prob = self._calculate_shot_probability(shooter_id, distance)
-        shot_made = self._rng.random() < shot_success_prob
+
+        # For diagnostics: compute base probability (no pressure) and pressure multiplier
+        d0 = 1
+        d1 = max(self.three_point_distance, d0 + 1)
+        if distance <= d0:
+            base_prob = self.layup_pct
+        else:
+            t = (distance - d0) / (d1 - d0)
+            base_prob = self.layup_pct + (self.three_pt_pct - self.layup_pct) * t
+        # Clamp similar to backend
+        base_prob = max(0.01, min(0.99, base_prob))
+
+        pressure_mult = 1.0
+        if self.shot_pressure_enabled and shooter_id is not None:
+            # Replicate pressure calc from _calculate_shot_probability
+            dir_q = self.basket_position[0] - shooter_pos[0]
+            dir_r = self.basket_position[1] - shooter_pos[1]
+            dir_x, dir_y = self._axial_to_cartesian(dir_q, dir_r)
+            dir_norm = math.hypot(dir_x, dir_y) or 1.0
+            cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
+
+            opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
+            closest_d = None
+            for did in opp_ids:
+                dq = self.positions[did][0] - shooter_pos[0]
+                dr = self.positions[did][1] - shooter_pos[1]
+                vx, vy = self._axial_to_cartesian(dq, dr)
+                if vx == 0 and vy == 0:
+                    continue
+                vnorm = math.hypot(vx, vy)
+                if vnorm == 0:
+                    continue
+                cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+                in_arc = cosang >= cos_threshold
+                d_def = self._hex_distance(shooter_pos, self.positions[did])
+                if in_arc and d_def < distance:
+                    if closest_d is None or d_def < closest_d:
+                        closest_d = d_def
+            if closest_d is not None:
+                exponent_arg = max(0, closest_d - 1)
+                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
+                pressure_mult = max(0.0, 1.0 - red)
+
+        # Sample RNG and decide outcome
+        rng_u = self._rng.random()
+        shot_made = rng_u < shot_success_prob
         
         if not shot_made:
             # Missed shot - possession ends
@@ -631,7 +677,10 @@ class HexagonBasketballEnv(gym.Env):
         return {
             "success": shot_made,
             "distance": distance,
-            "probability": shot_success_prob
+            "probability": shot_success_prob,
+            "rng": rng_u,
+            "base_probability": base_prob,
+            "pressure_multiplier": pressure_mult,
         }
     
     def _turnover_to_defense(self, from_player: int):
@@ -721,7 +770,7 @@ class HexagonBasketballEnv(gym.Env):
         rewards = np.zeros(self.n_players)
         done = False
         pass_reward = 0.0
-        turnover_penalty = 1.0
+        turnover_penalty = 0.0
         
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
@@ -741,22 +790,12 @@ class HexagonBasketballEnv(gym.Env):
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
-            
-            # --- Time-based penalty for shooting too early ---
-            # if self.step_count <= 3:
-            #     # Penalty is high at step 1 and decrements
-            #     # Step 1: -0.5, Step 2: -0.3, Step 3: -0.1
-            #     time_penalty = - (1.0 - self.step_count * 0.2)
-                
-            #     # We only apply this penalty to the team that is currently training
-            #     if self.training_team == Team.OFFENSE and player_id in self.offense_ids:
-            #         rewards[self.offense_ids] += time_penalty/self.players_per_side
-            
+                        
             # Define the reward magnitude for shots (3PT outside the line)
             # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
             made_shot_reward_inside = 2.0
             made_shot_reward_three = 3.0
-            missed_shot_penalty = 1.0 # Less punishing than a turnover (-0.2)
+            missed_shot_penalty = 0.0 # No penalty for missed shots
 
             if shot_result["success"]:
                 # Basket was made
