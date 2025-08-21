@@ -252,7 +252,13 @@ class HexagonBasketballEnv(gym.Env):
         for _ in range(k % 6):
             x, y, z = self._rotate60_cw_cube(x, y, z)
         return self._cube_to_axial(x, y, z)
-    
+
+    def _hex_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
+        """Calculate distance between two hexagon positions."""
+        q1, r1 = pos1
+        q2, r2 = pos2
+        return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
+
     @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment to initial state."""
@@ -719,12 +725,6 @@ class HexagonBasketballEnv(gym.Env):
         
         self.ball_holder = nearest_defender
     
-    def _hex_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
-        """Calculate distance between two hexagon positions."""
-        q1, r1 = pos1
-        q2, r2 = pos2
-        return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
-
     @profile_section("shot_prob")
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot using a simple linear model
