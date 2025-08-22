@@ -818,6 +818,11 @@ class HexagonBasketballEnv(gym.Env):
         done = False
         pass_reward = 0.0
         turnover_penalty = 0.0
+        # Define the reward magnitude for shots (3PT outside the line)
+        # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
+        made_shot_reward_inside = 2.0
+        made_shot_reward_three = 3.0
+        missed_shot_penalty = 0.0 # No penalty for missed shots
         
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
@@ -838,33 +843,24 @@ class HexagonBasketballEnv(gym.Env):
         for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
                         
-            # Define the reward magnitude for shots (3PT outside the line)
-            # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
-            made_shot_reward_inside = 2.0
-            made_shot_reward_three = 3.0
-            missed_shot_penalty = 0.0 # No penalty for missed shots
-
             if shot_result["success"]:
                 # Basket was made
-                if player_id in self.offense_ids:
-                    # Distance of the shot to determine 2PT vs 3PT
-                    shooter_pos = self.positions[player_id]
-                    dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
-                    made_shot_reward = (
-                        made_shot_reward_three
-                        if dist_to_basket >= self.three_point_distance
-                        else made_shot_reward_inside
-                    )
-                    # Offense scored, good for them, bad for defense
-                    rewards[self.offense_ids] += made_shot_reward/self.players_per_side
-                    rewards[self.defense_ids] -= made_shot_reward/self.players_per_side
+                # Distance of the shot to determine 2PT vs 3PT
+                shooter_pos = self.positions[player_id]
+                dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
+                made_shot_reward = (
+                    made_shot_reward_three
+                    if dist_to_basket >= self.three_point_distance
+                    else made_shot_reward_inside
+                )
+                # Offense scored, good for them, bad for defense
+                rewards[self.offense_ids] += made_shot_reward/self.players_per_side
+                rewards[self.defense_ids] -= made_shot_reward/self.players_per_side
                 # else: handle rare case of defense scoring on own basket
             else:
-                # Basket was missed
-                if player_id in self.offense_ids:
-                    # Offense missed, bad for them, good for defense
-                    rewards[self.offense_ids] -= missed_shot_penalty/self.players_per_side
-                    rewards[self.defense_ids] += missed_shot_penalty/self.players_per_side
+                # Offense missed, bad for them, good for defense
+                rewards[self.offense_ids] -= missed_shot_penalty/self.players_per_side
+                rewards[self.defense_ids] += missed_shot_penalty/self.players_per_side
         
         return done, rewards
     
