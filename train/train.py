@@ -265,6 +265,7 @@ def setup_environment(args, training_team):
         egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
         include_hoop_vector=args.include_hoop_vector,
         normalize_obs=args.normalize_obs,
+        mask_occupied_moves=args.mask_occupied_moves,
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
     env = RewardAggregationWrapper(env)
@@ -510,6 +511,7 @@ def main(args):
                     egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
                     include_hoop_vector=args.include_hoop_vector,
                     normalize_obs=args.normalize_obs,
+                    mask_occupied_moves=args.mask_occupied_moves,
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -656,6 +658,7 @@ if __name__ == "__main__":
     parser.add_argument("--egocentric-rotate-to-hoop", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Rotate egocentric frame so hoop is aligned to +q axis.")
     parser.add_argument("--include-hoop-vector", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Append hoop direction vector to observation.")
     parser.add_argument("--normalize-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Normalize relative coordinates to roughly [-1,1].")
+    parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Disallow moves into currently occupied neighboring hexes.")
     args = parser.parse_args()
  
     main(args) 

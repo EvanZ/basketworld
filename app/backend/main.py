@@ -180,6 +180,8 @@ async def init_game(request: InitGameRequest):
         # Defender pressure params (optional)
         defender_pressure_distance = get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
         defender_pressure_turnover_chance = get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+        # Movement mask (optional)
+        mask_occupied_moves = get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
 
         # Observation controls (optional)
         use_egocentric_obs = get_param(params, ["use_egocentric_obs", "use-egocentric-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
@@ -191,7 +193,8 @@ async def init_game(request: InitGameRequest):
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
-            f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}"
+            f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
+            f"mask_occupied_moves={mask_occupied_moves}"
         )
 
         # Download selected or latest policies and determine keys
@@ -230,6 +233,7 @@ async def init_game(request: InitGameRequest):
             egocentric_rotate_to_hoop=egocentric_rotate_to_hoop,
             include_hoop_vector=include_hoop_vector,
             normalize_obs=normalize_obs,
+            mask_occupied_moves=mask_occupied_moves,
         )
         game_state.obs, _ = game_state.env.reset()
 
@@ -275,7 +279,12 @@ def take_step(request: ActionRequest):
         if is_user_player:
             # Action comes from the user request
             # Convert player_id (int) to string for dict lookup
-            full_action[i] = request.actions.get(str(i), 0) # Default to NOOP if not provided
+            proposed = request.actions.get(str(i), 0)
+            # Enforce action mask for user as well
+            if action_mask[i][proposed] == 1:
+                full_action[i] = proposed
+            else:
+                full_action[i] = 0
         else:
             # Action comes from the AI policy
             if i in game_state.env.offense_ids:
@@ -771,4 +780,5 @@ def get_full_game_state():
         "shot_pressure_max": float(getattr(game_state.env, "shot_pressure_max", 0.5)),
         "shot_pressure_lambda": float(getattr(game_state.env, "shot_pressure_lambda", 1.0)),
         "shot_pressure_arc_degrees": float(getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)),
+        "mask_occupied_moves": bool(getattr(game_state.env, "mask_occupied_moves", False)),
     } 

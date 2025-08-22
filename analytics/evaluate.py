@@ -24,7 +24,8 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
                       three_point_distance: int, layup_pct: float, three_pt_pct: float,
                       shot_pressure_enabled: bool, shot_pressure_max: float, shot_pressure_lambda: float, shot_pressure_arc_degrees: float,
                       defender_pressure_distance: int, defender_pressure_turnover_chance: float,
-                      spawn_distance: int):
+                      spawn_distance: int,
+                      mask_occupied_moves: bool):
     """Create and wrap the environment for evaluation."""
     
     render_mode = "rgb_array" if not no_render else None
@@ -43,7 +44,8 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
         shot_pressure_arc_degrees=shot_pressure_arc_degrees,
         defender_pressure_distance=defender_pressure_distance,
         defender_pressure_turnover_chance=defender_pressure_turnover_chance,
-        spawn_distance=spawn_distance
+        spawn_distance=spawn_distance,
+        mask_occupied_moves=mask_occupied_moves,
     )
     return env
 
@@ -172,6 +174,8 @@ def main(args):
         # Defender pressure params (optional)
         defender_pressure_distance = get_param(run_params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
         defender_pressure_turnover_chance = get_param(run_params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+        # Movement mask (optional)
+        mask_occupied_moves_param = get_param(run_params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
         
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
@@ -219,6 +223,7 @@ def main(args):
                 spawn_distance=spawn_distance,
                 defender_pressure_distance=defender_pressure_distance,
                 defender_pressure_turnover_chance=defender_pressure_turnover_chance,
+                mask_occupied_moves=(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param),
             )
 
             print("Loading policies...")
@@ -322,6 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-render", action="store_true", help="Disable rendering a sample GIF.")
     parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic offense actions.")
     parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic defense actions.")
+    parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="If set, disallow moves into currently occupied neighboring hexes.")
     
     args = parser.parse_args()
     main(args) 

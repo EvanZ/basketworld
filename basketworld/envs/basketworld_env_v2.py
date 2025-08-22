@@ -107,6 +107,8 @@ class HexagonBasketballEnv(gym.Env):
         egocentric_rotate_to_hoop: bool = True,
         include_hoop_vector: bool = True,
         normalize_obs: bool = True,
+        # Movement mask controls
+        mask_occupied_moves: bool = False,
     ):
         super().__init__()
         
@@ -124,6 +126,8 @@ class HexagonBasketballEnv(gym.Env):
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
         self.normalize_obs = bool(normalize_obs)
+        # Movement mask behavior
+        self.mask_occupied_moves = bool(mask_occupied_moves)
         # Three-point configuration and shot model parameters
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
@@ -388,6 +392,20 @@ class HexagonBasketballEnv(gym.Env):
             if move_mask is not None:
                 for dir_idx in range(6):
                     masks[i, ActionType.MOVE_E.value + dir_idx] = move_mask[dir_idx]
+        
+        # Optionally disallow moving into any currently occupied neighboring hex
+        if self.mask_occupied_moves:
+            occupied = set(self.positions)
+            for i in range(self.n_players):
+                curr_q, curr_r = self.positions[i]
+                for dir_idx in range(6):
+                    action_idx = ActionType.MOVE_E.value + dir_idx
+                    if masks[i, action_idx] == 0:
+                        continue
+                    dq, dr = self.hex_directions[dir_idx]
+                    nbr = (curr_q + dq, curr_r + dr)
+                    if nbr in occupied:
+                        masks[i, action_idx] = 0
                  
         return masks
          
@@ -507,6 +525,17 @@ class HexagonBasketballEnv(gym.Env):
                         })
                         self._turnover_to_defense(player_id) # This must happen after storing results
                     results["moves"][player_id] = {"success": False, "reason": reason}
+
+        # If configured, block moves into any cell that was occupied at the start of the step
+        if self.mask_occupied_moves and intended_moves:
+            occupied_start = set(current_positions)
+            to_remove = []
+            for pid, dest in intended_moves.items():
+                if dest in occupied_start:
+                    results["moves"][pid] = {"success": False, "reason": "occupied_neighbor"}
+                    to_remove.append(pid)
+            for pid in to_remove:
+                intended_moves.pop(pid, None)
 
         # 3. Resolve movement based on conflicts
         
