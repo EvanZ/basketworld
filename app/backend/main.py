@@ -180,6 +180,12 @@ async def init_game(request: InitGameRequest):
         # Defender pressure params (optional)
         defender_pressure_distance = get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
         defender_pressure_turnover_chance = get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+
+        # Observation controls (optional)
+        use_egocentric_obs = get_param(params, ["use_egocentric_obs", "use-egocentric-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        egocentric_rotate_to_hoop = get_param(params, ["egocentric_rotate_to_hoop", "egocentric-rotate-to-hoop"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        include_hoop_vector = get_param(params, ["include_hoop_vector", "include-hoop-vector"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        normalize_obs = get_param(params, ["normalize_obs", "normalize-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
@@ -219,6 +225,11 @@ async def init_game(request: InitGameRequest):
             spawn_distance=spawn_distance,
             defender_pressure_distance=defender_pressure_distance,
             defender_pressure_turnover_chance=defender_pressure_turnover_chance,
+            # Observation controls
+            use_egocentric_obs=use_egocentric_obs,
+            egocentric_rotate_to_hoop=egocentric_rotate_to_hoop,
+            include_hoop_vector=include_hoop_vector,
+            normalize_obs=normalize_obs,
         )
         game_state.obs, _ = game_state.env.reset()
 

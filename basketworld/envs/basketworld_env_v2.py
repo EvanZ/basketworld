@@ -102,6 +102,11 @@ class HexagonBasketballEnv(gym.Env):
         shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
         enable_profiling: bool = False,
         spawn_distance: int = 3,
+        # Observation controls
+        use_egocentric_obs: bool = True,
+        egocentric_rotate_to_hoop: bool = True,
+        include_hoop_vector: bool = True,
+        normalize_obs: bool = True,
     ):
         super().__init__()
         
@@ -115,6 +120,10 @@ class HexagonBasketballEnv(gym.Env):
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
         self.spawn_distance = spawn_distance
+        self.use_egocentric_obs = bool(use_egocentric_obs)
+        self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
+        self.include_hoop_vector = bool(include_hoop_vector)
+        self.normalize_obs = bool(normalize_obs)
         # Three-point configuration and shot model parameters
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
@@ -151,11 +160,14 @@ class HexagonBasketballEnv(gym.Env):
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)
         
         # Define the two parts of our observation space
+        # Observation length depends on configuration flags
+        base_len = (self.n_players * 2) + self.n_players + 1
+        hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=((self.n_players * 2) + self.n_players + 1,), 
-            dtype=np.float32
+            low=-np.inf,
+            high=np.inf,
+            shape=(base_len + hoop_extra,),
+            dtype=np.float32,
         )
         action_mask_space = spaces.Box(
             low=0, 
@@ -288,6 +300,9 @@ class HexagonBasketballEnv(gym.Env):
     @profile_section("step")
     def step(self, actions: Union[np.ndarray, List[int]]):
         """Execute one step of the environment."""
+        # Initialize rewards
+        rewards = np.zeros(self.n_players)
+
         if self.episode_ended:
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
             
@@ -316,9 +331,6 @@ class HexagonBasketballEnv(gym.Env):
                         self.ball_holder = defender_id  # Defender gets the ball
 
                         done = True
-                        rewards = np.zeros(self.n_players)
-                        rewards[self.offense_ids] -= 0.2
-                        rewards[self.defense_ids] += 0.2
                         self.episode_ended = done
 
                         obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
@@ -333,8 +345,6 @@ class HexagonBasketballEnv(gym.Env):
         # Decrement shot clock
         self.shot_clock -= 1
         
-        # Initialize rewards
-        rewards = np.zeros(self.n_players)
         
         # Process all actions simultaneously
         action_results = self._process_simultaneous_actions(actions)
@@ -843,22 +853,71 @@ class HexagonBasketballEnv(gym.Env):
         return done, rewards
     
     def _get_observation(self) -> np.ndarray:
-        """Get current observation of the game state."""
-        obs = []
-        
-        # Player positions (q, r for each player)
+        """Get current observation of the game state.
+
+        Ego-centric vector:
+        - For each player i: (dq_i, dr_i) relative to current ball handler, normalized
+        - One-hot ball holder (redundant but retained for compatibility/debugging)
+        - Shot clock (raw value)
+        - Hoop vector relative to ball handler, normalized
+        """
+        obs: List[float] = []
+
+        # Choose the ego-center. If there is no ball holder (e.g., after a missed shot in a terminal state),
+        # fall back to the basket position to avoid undefined relative coordinates.
+        if self.ball_holder is not None:
+            center_q, center_r = self.positions[self.ball_holder]
+        else:
+            center_q, center_r = self.basket_position
+
+        # Normalization factor to put deltas roughly in [-1, 1]
+        # Using the larger of width/height bounds axial deltas conservatively
+        norm_den: float = float(max(self.court_width, self.court_height)) or 1.0
+        if not self.normalize_obs:
+            norm_den = 1.0
+
+        # Compute rotation k so that hoop vector is aligned toward +q (if enabled)
+        # Work with unnormalized axial deltas, rotate, then normalize.
+        hoop_dq_raw = self.basket_position[0] - center_q
+        hoop_dr_raw = self.basket_position[1] - center_r
+
+        best_k = 0
+        if self.egocentric_rotate_to_hoop:
+            best_score = None
+            for k in range(6):
+                rq, rr = self._rotate_k60_axial(hoop_dq_raw, hoop_dr_raw, k)
+                # Prefer minimal |rr| (close to +q axis), then prefer rq>=0, then maximize rq
+                score = (abs(rr), 0 if rq >= 0 else 1, -rq)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_k = k
+
+        # Player positions relative to ego-center, rotated if configured, then normalized
         for q, r in self.positions:
-            obs.extend([q, r])
-        
+            rdq = q - center_q
+            rdr = r - center_r
+            if best_k:
+                rdq, rdr = self._rotate_k60_axial(rdq, rdr, best_k)
+            obs.extend([rdq / norm_den, rdr / norm_den])
+
         # One-hot encode the ball holder
-        ball_holder_one_hot = np.zeros(self.n_players)
+        ball_holder_one_hot = np.zeros(self.n_players, dtype=np.float32)
         if self.ball_holder is not None:
             ball_holder_one_hot[self.ball_holder] = 1.0
-        obs.extend(ball_holder_one_hot)
-        
-        # Shot clock
-        obs.append(self.shot_clock)
-        
+        obs.extend(ball_holder_one_hot.tolist())
+
+        # Shot clock (kept unnormalized)
+        obs.append(float(self.shot_clock))
+
+        # Hoop vector relative to ego-center, rotated consistently (optional)
+        if self.include_hoop_vector:
+            hoop_dq, hoop_dr = hoop_dq_raw, hoop_dr_raw
+            if best_k:
+                hoop_dq, hoop_dr = self._rotate_k60_axial(hoop_dq, hoop_dr, best_k)
+            hoop_dq /= norm_den
+            hoop_dr /= norm_den
+            obs.extend([hoop_dq, hoop_dr])
+
         return np.array(obs, dtype=np.float32)
     
     def render(self):
