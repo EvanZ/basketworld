@@ -259,7 +259,12 @@ def setup_environment(args, training_team):
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
         enable_profiling=args.enable_env_profiling,
-        training_team=training_team # Critical for correct rewards
+        training_team=training_team, # Critical for correct rewards
+        # Observation controls
+        use_egocentric_obs=args.use_egocentric_obs,
+        egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
+        include_hoop_vector=args.include_hoop_vector,
+        normalize_obs=args.normalize_obs,
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
     env = RewardAggregationWrapper(env)
@@ -500,6 +505,11 @@ def main(args):
                     shot_pressure_lambda=args.shot_pressure_lambda,
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
                     enable_profiling=args.enable_env_profiling,
+                    # Observation controls
+                    use_egocentric_obs=args.use_egocentric_obs,
+                    egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
+                    include_hoop_vector=args.include_hoop_vector,
+                    normalize_obs=args.normalize_obs,
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -641,6 +651,11 @@ if __name__ == "__main__":
     parser.add_argument("--enable-env-profiling", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.")
     parser.add_argument("--spawn-distance", type=int, default=3, help="minimum distance from 3pt line at which players spawn.")
     parser.add_argument("--deterministic-opponent", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic opponent actions.")
+    # Observation controls
+    parser.add_argument("--use-egocentric-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Use egocentric observations centered at the ball handler.")
+    parser.add_argument("--egocentric-rotate-to-hoop", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Rotate egocentric frame so hoop is aligned to +q axis.")
+    parser.add_argument("--include-hoop-vector", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Append hoop direction vector to observation.")
+    parser.add_argument("--normalize-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Normalize relative coordinates to roughly [-1,1].")
     args = parser.parse_args()
  
     main(args) 
