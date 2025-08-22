@@ -300,6 +300,9 @@ class HexagonBasketballEnv(gym.Env):
     @profile_section("step")
     def step(self, actions: Union[np.ndarray, List[int]]):
         """Execute one step of the environment."""
+        # Initialize rewards
+        rewards = np.zeros(self.n_players)
+
         if self.episode_ended:
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
             
@@ -328,9 +331,6 @@ class HexagonBasketballEnv(gym.Env):
                         self.ball_holder = defender_id  # Defender gets the ball
 
                         done = True
-                        rewards = np.zeros(self.n_players)
-                        rewards[self.offense_ids] -= 0.2
-                        rewards[self.defense_ids] += 0.2
                         self.episode_ended = done
 
                         obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
@@ -345,8 +345,6 @@ class HexagonBasketballEnv(gym.Env):
         # Decrement shot clock
         self.shot_clock -= 1
         
-        # Initialize rewards
-        rewards = np.zeros(self.n_players)
         
         # Process all actions simultaneously
         action_results = self._process_simultaneous_actions(actions)
