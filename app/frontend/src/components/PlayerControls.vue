@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getShotProbability, getRewards } from '@/services/api';
+import { getActionValues, getRewards } from '@/services/api';
 
 // Import API_BASE_URL for policy probabilities fetch
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
@@ -42,7 +42,7 @@ watch(selectedActions, (newActions, oldActions) => {
 }, { deep: true });
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
-const _backendShotProb = ref(null);
+// shot probability is displayed on the board, not in controls
 const policyProbabilities = ref(null);
 
 // Add rewards tracking
@@ -74,46 +74,7 @@ const allPlayerIds = computed(() => {
   return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
 });
 
-// Watch for the active player ID to change, then fetch the shot prob for that player.
-watch(() => props.activePlayerId, async (newPlayerId) => {
-  if (newPlayerId !== null && props.gameState && !props.gameState.done) {
-    console.log(`[PlayerControls] Active player changed to ${newPlayerId}. Fetching shot probability...`);
-    try {
-      const sp = await getShotProbability(newPlayerId);
-      const backendProb = (sp && (sp.shot_probability_final ?? sp.shot_probability));
-      _backendShotProb.value = backendProb;
-      console.log('[PlayerControls] Fetched backend shot prob (final):', backendProb, 'distance:', sp?.distance, 'base:', sp?.shot_probability);
-    } catch (e) {
-      console.warn('[PlayerControls] Failed to fetch backend shot probability', e);
-      _backendShotProb.value = null;
-    }
-  } else {
-    console.log('[PlayerControls] No active player or game is done. Clearing shot prob.');
-    _backendShotProb.value = null;
-  }
-}, { immediate: true });
-
-// Also refetch when positions or ball holder change so distance/pressure updates are reflected
-watch(
-  () => ({
-    positions: props.gameState?.positions,
-    ball_holder: props.gameState?.ball_holder,
-  }),
-  async () => {
-    if (props.activePlayerId !== null && props.gameState && !props.gameState.done) {
-      console.log('[PlayerControls] Game state positions/ball_holder changed. Refreshing shot prob...');
-      try {
-        const sp = await getShotProbability(props.activePlayerId);
-        const backendProb = (sp && (sp.shot_probability_final ?? sp.shot_probability));
-        _backendShotProb.value = backendProb;
-        console.log('[PlayerControls] Refreshed backend shot prob (final):', backendProb, 'distance:', sp?.distance, 'base:', sp?.shot_probability);
-      } catch (e) {
-        console.warn('[PlayerControls] Failed to refresh backend shot probability', e);
-      }
-    }
-  },
-  { deep: true }
-);
+// Shot probability display is handled on the board
 
 // Fetch policy probabilities for probabilistic action sampling
 async function fetchPolicyProbabilities() {
@@ -518,34 +479,7 @@ watch(() => actionValues.value, () => {
   }
 });
 
-// --- Shot Probability Logic (matches Python env) ---
-function hexDistance(pos1, pos2) {
-  const [q1, r1] = pos1;
-  const [q2, r2] = pos2;
-  // Must match Python _hex_distance: integer result
-  return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
-}
-
-// Calculate shot probabilities for validation/display
-const calculateShotProbability = (distance) => {
-  if (!props.gameState?.shot_params) return 0;
-  
-  const { layup_pct, three_pt_pct } = props.gameState.shot_params;
-  const three_point_distance = props.gameState.three_point_distance || 4;
-  
-  // Match Python env formula: anchor at d0=1, d1=max(three_point_distance, 2)
-  const d0 = 1;
-  const d1 = Math.max(three_point_distance, d0 + 1);
-  let prob;
-  if (distance <= d0) {
-    prob = layup_pct;
-  } else {
-    const t = (distance - d0) / (d1 - d0);
-    prob = layup_pct + (three_pt_pct - layup_pct) * t;
-  }
-  // Clamp similar to backend
-  return Math.max(0.01, Math.min(0.99, prob));
-};
+// Shot probability helpers removed
 
 // Fetch rewards from API
 const fetchRewards = async () => {
@@ -580,32 +514,7 @@ const passProbabilities = computed(() => {
   return {};
 });
 
-const shotProbability = computed(() => {
-    if (props.activePlayerId === null || !props.gameState || !props.gameState.positions[props.activePlayerId]) {
-        console.log('[ShotProb] Early return: no active player or game state');
-        return null;
-    }
-    if (_backendShotProb.value !== null && _backendShotProb.value !== undefined) {
-        console.log('[ShotProb] Using backend prob:', _backendShotProb.value);
-        return _backendShotProb.value;
-    }
-    const playerPos = props.gameState.positions[props.activePlayerId];
-    const basketPos = props.gameState.basket_position; 
-
-    // --- DEBUG LOG ---
-    console.log('[ShotCalc] Player Pos:', JSON.stringify(playerPos));
-    console.log('[ShotCalc] Basket Pos:', JSON.stringify(basketPos));
-
-    if (!playerPos || !basketPos) {
-        console.error('[ShotCalc] Error: One of the positions is missing.');
-        return null;
-    }
-    
-    const distance = hexDistance(playerPos, basketPos);
-    const prob = calculateShotProbability(distance);
-    console.log('[ShotProb] Calculated prob:', prob, 'for distance:', distance);
-    return prob;
-});
+// shotProbability computed removed
 
 // Keep local selections in sync with externally applied selections during self-play
 watch(() => props.externalSelections, (newSelections) => {
@@ -670,7 +579,6 @@ watch(() => props.externalSelections, (newSelections) => {
           <HexagonControlPad 
               :legal-actions="getLegalActions(activePlayerId)"
               :selected-action="selectedActions[activePlayerId]"
-              :shot-probability="shotProbability"
               :pass-probabilities="passProbabilities"
               @action-selected="handleActionSelected"
               :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"

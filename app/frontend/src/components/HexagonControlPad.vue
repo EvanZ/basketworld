@@ -10,10 +10,7 @@ const props = defineProps({
     type: String,
     default: null,
   },
-  shotProbability: {
-    type: Number,
-    default: null,
-  },
+  // shotProbability removed (shown on board instead)
   passProbabilities: {
     type: Object,
     default: null,
@@ -111,10 +108,8 @@ function selectAction(action) {
         :title="action"
       >
         <span class="icon-wrapper" :style="{ transform: `rotate(${buttonConfig[action].rotation}deg)` }" v-html="buttonConfig[action].icon"></span>
-        <span v-if="action === 'SHOOT' && shotProbability !== null" class="prob-tooltip">
-            {{ Math.round(shotProbability * 100) }}%
-        </span>
-        <span v-else-if="passProbabilities && passProbabilities[action] !== undefined" class="prob-tooltip">
+        <!-- Removed shot % display from control button -->
+        <span v-if="passProbabilities && passProbabilities[action] !== undefined" class="prob-tooltip">
             {{ Math.round(passProbabilities[action] * 100) }}%
         </span>
         <span v-if="actionValues && actionValues[action] !== undefined" class="value-display">

@@ -650,6 +650,54 @@ class HexagonBasketballEnv(gym.Env):
         results["passes"][passer_id] = {"success": True, "target": recv_id}
         return
 
+    def _compute_shot_pressure_multiplier(
+        self,
+        shooter_id: Optional[int],
+        shooter_pos: Tuple[int, int],
+        distance_to_basket: int,
+    ) -> float:
+        """Compute multiplicative reduction to shot probability due to nearest defender
+        in a forward arc toward the basket. Returns 1.0 if no qualifying defender.
+        """
+        if not self.shot_pressure_enabled or shooter_id is None:
+            return 1.0
+
+        # Direction from shooter to basket in cartesian
+        dir_q = self.basket_position[0] - shooter_pos[0]
+        dir_r = self.basket_position[1] - shooter_pos[1]
+        dir_x, dir_y = self._axial_to_cartesian(dir_q, dir_r)
+        dir_norm = math.hypot(dir_x, dir_y) or 1.0
+        cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
+
+        # Opposing team
+        opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
+
+        closest_d: Optional[int] = None
+        for did in opp_ids:
+            dq = self.positions[did][0] - shooter_pos[0]
+            dr = self.positions[did][1] - shooter_pos[1]
+            vx, vy = self._axial_to_cartesian(dq, dr)
+            if vx == 0 and vy == 0:
+                continue
+            vnorm = math.hypot(vx, vy)
+            if vnorm == 0:
+                continue
+            cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+            in_arc = cosang >= cos_threshold
+            d_def = self._hex_distance(shooter_pos, self.positions[did])
+            # Defender must be closer than basket along this direction
+            if in_arc and d_def < distance_to_basket:
+                if closest_d is None or d_def < closest_d:
+                    closest_d = d_def
+
+        if closest_d is None:
+            return 1.0
+
+        # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
+        exponent_arg = max(0, closest_d - 1)
+        reduction = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
+        return max(0.0, 1.0 - reduction)
+
     @profile_section("attempt_shot")
     def _attempt_shot(self, shooter_id: int) -> Dict:
         """Attempt a shot from the ball holder."""
@@ -672,36 +720,7 @@ class HexagonBasketballEnv(gym.Env):
         # Clamp similar to backend
         base_prob = max(0.01, min(0.99, base_prob))
 
-        pressure_mult = 1.0
-        if self.shot_pressure_enabled and shooter_id is not None:
-            # Replicate pressure calc from _calculate_shot_probability
-            dir_q = self.basket_position[0] - shooter_pos[0]
-            dir_r = self.basket_position[1] - shooter_pos[1]
-            dir_x, dir_y = self._axial_to_cartesian(dir_q, dir_r)
-            dir_norm = math.hypot(dir_x, dir_y) or 1.0
-            cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
-
-            opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
-            closest_d = None
-            for did in opp_ids:
-                dq = self.positions[did][0] - shooter_pos[0]
-                dr = self.positions[did][1] - shooter_pos[1]
-                vx, vy = self._axial_to_cartesian(dq, dr)
-                if vx == 0 and vy == 0:
-                    continue
-                vnorm = math.hypot(vx, vy)
-                if vnorm == 0:
-                    continue
-                cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
-                in_arc = cosang >= cos_threshold
-                d_def = self._hex_distance(shooter_pos, self.positions[did])
-                if in_arc and d_def < distance:
-                    if closest_d is None or d_def < closest_d:
-                        closest_d = d_def
-            if closest_d is not None:
-                exponent_arg = max(0, closest_d - 1)
-                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
-                pressure_mult = max(0.0, 1.0 - red)
+        pressure_mult = self._compute_shot_pressure_multiplier(shooter_id, shooter_pos, distance)
 
         # Sample RNG and decide outcome
         rng_u = self._rng.random()
@@ -756,40 +775,8 @@ class HexagonBasketballEnv(gym.Env):
         # Apply defender shot pressure if any qualifying defender is between shooter and basket
         if self.shot_pressure_enabled and shooter_id is not None:
             shooter_pos = self.positions[shooter_id]
-            # Direction from shooter to basket
-            dir_q = self.basket_position[0] - shooter_pos[0]
-            dir_r = self.basket_position[1] - shooter_pos[1]
-            dir_x, dir_y = self._axial_to_cartesian(dir_q, dir_r)
-            dir_norm = math.hypot(dir_x, dir_y) or 1.0
-            cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
-
-            # Choose opposing team as potential pressurers
-            opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
-
-            closest_d = None
-            for did in opp_ids:
-                dq = self.positions[did][0] - shooter_pos[0]
-                dr = self.positions[did][1] - shooter_pos[1]
-                vx, vy = self._axial_to_cartesian(dq, dr)
-                if vx == 0 and vy == 0:
-                    continue
-                vnorm = math.hypot(vx, vy)
-                if vnorm == 0:
-                    continue
-                cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
-                in_arc = cosang >= cos_threshold
-                d_def = self._hex_distance(shooter_pos, self.positions[did])
-                # Defender must be closer than basket along this direction
-                if in_arc and d_def < distance:
-                    if closest_d is None or d_def < closest_d:
-                        closest_d = d_def
-
-            if closest_d is not None:
-                # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
-                exponent_arg = max(0, closest_d - 1)
-                red = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
-                pressure_mult = max(0.0, 1.0 - red)
-                prob *= pressure_mult
+            pressure_mult = self._compute_shot_pressure_multiplier(shooter_id, shooter_pos, distance)
+            prob *= pressure_mult
 
         # Clamp to sensible bounds
         prob = max(0.01, min(0.99, prob))

@@ -1,5 +1,6 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref, watch, onMounted } from 'vue';
+import { getShotProbability } from '@/services/api';
 
 const props = defineProps({
   gameHistory: {
@@ -51,6 +52,8 @@ function getRenderablePlayers(gameState) {
 const currentGameState = computed(() => {
   return props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
 });
+
+// no-op
 
 const courtLayout = computed(() => {
     const hexes = [];
@@ -163,6 +166,41 @@ const ballHandlerShotProb = computed(() => {
     // From ActionType enum in the backend, SHOOT is at index 7
     return probs[7];
 });
+
+// Backend-calculated conditional make probability for the ball handler (pressure-adjusted)
+const ballHandlerMakeProb = ref(null);
+
+async function fetchBallHandlerMakeProb() {
+  const gs = currentGameState.value;
+  if (!gs || gs.ball_holder === null) {
+    ballHandlerMakeProb.value = null;
+    return;
+  }
+  try {
+    const resp = await getShotProbability(gs.ball_holder);
+    const p = resp?.shot_probability_final ?? resp?.shot_probability ?? null;
+    ballHandlerMakeProb.value = typeof p === 'number' ? p : null;
+  } catch (e) {
+    console.warn('[GameBoard] Failed to fetch ball-handler make prob', e);
+    ballHandlerMakeProb.value = null;
+  }
+}
+
+onMounted(() => {
+  fetchBallHandlerMakeProb();
+});
+
+watch(
+  () => ({
+    ball_holder: currentGameState.value?.ball_holder,
+    positions: currentGameState.value?.positions,
+    shot_clock: currentGameState.value?.shot_clock,
+  }),
+  () => {
+    fetchBallHandlerMakeProb();
+  },
+  { deep: true }
+);
 
 const episodeOutcome = computed(() => {
     if (!currentGameState.value || !currentGameState.value.done) {
@@ -369,16 +407,29 @@ const playerTransitions = computed(() => {
               ]"
             />
             <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
-            <!-- Display shot probability inside the ball handler's hex -->
+            <!-- Display policy attempt probability for ball handler -->
             <text 
-              v-if="player.hasBall && player.id === activePlayerId && ballHandlerShotProb !== null"
+              v-if="player.hasBall && ballHandlerShotProb !== null"
               :x="player.x" 
               :y="player.y" 
-              dy="1.4em" 
+              dy="0.4em" 
+              dx="3.4em"
               text-anchor="middle" 
               class="shot-prob-text"
             >
               {{ ballHandlerShotProb.toFixed(2) }}
+            </text>
+            <!-- Display conditional make percentage for ball handler -->
+            <text 
+              v-if="player.hasBall && ballHandlerMakeProb !== null"
+              :x="player.x" 
+              :y="player.y" 
+              dy="-0.4em" 
+              dx="3.4em"
+              text-anchor="middle" 
+              class="shot-prob-text"
+            >
+              {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
             <!-- Ball handler indicator -->
             <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
@@ -395,8 +446,8 @@ const playerTransitions = computed(() => {
             text-anchor="middle"
             class="policy-suggestion-text"
           >
-            <tspan :x="sugg.x" dy="-0.2em">{{ Number(sugg.moveProb).toFixed(3) }}</tspan>
-            <tspan :x="sugg.x" dy="1em">{{ Number(sugg.passProb).toFixed(3) }}</tspan>
+            <tspan :x="sugg.x" dy="-0.4em">{{ Number(sugg.moveProb).toFixed(3) }}</tspan>
+            <tspan :x="sugg.x" dy="1.4em">{{ Number(sugg.passProb).toFixed(3) }}</tspan>
           </text>
         </g>
 
