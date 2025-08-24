@@ -6,6 +6,11 @@ from collections import defaultdict
 
 def get_outcome_category(outcome_str: str) -> str:
     """Categorizes a detailed outcome string into a simple category for filenames."""
+    # Dunks
+    if "Made Dunk" in outcome_str:
+        return "made_dunk"
+    if "Missed Dunk" in outcome_str:
+        return "missed_dunk"
     if "Made 2" in outcome_str:
         return "made_2pt"
     if "Made 3" in outcome_str:

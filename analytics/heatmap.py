@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+Generate offense and defense heatmaps over N self-play episodes for a given MLflow run.
+
+- Loads policies (latest by default) from the run's model artifacts
+  - Can override to specific alternation index for offense/defense
+- Reconstructs the environment with the run's parameters
+- Accumulates positions for offense and defense separately across steps
+- Saves heatmaps as PNGs and logs them to MLflow under heatmaps/
+"""
+import argparse
+import os
+import re
+import tempfile
+from typing import Optional
+
+import mlflow
+from mlflow.tracking import MlflowClient
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import RegularPolygon
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+from matplotlib import colormaps as mpl_cmaps
+import math
+from stable_baselines3 import PPO
+
+import basketworld
+from tqdm import tqdm
+
+
+def _get_param(params_dict, names, cast, default):
+    for n in names:
+        if n in params_dict and params_dict[n] != "":
+            try:
+                return cast(params_dict[n])
+            except Exception:
+                pass
+    return default
+
+
+def _select_policy_artifact(artifacts, role: str, alternation: Optional[int]) -> str:
+    """Match evaluate.py logic: filter by role substring and select by r'_(\d+)\.zip'."""
+    role_artifacts = [f.path for f in artifacts if role in f.path]
+    if not role_artifacts:
+        raise RuntimeError(f"No artifacts found for role '{role}' under models/.")
+    if alternation is not None:
+        # Choose the one whose pattern r'_(n)\.zip' matches the requested n
+        for p in sorted(role_artifacts):
+            m = re.search(r'_(\d+)\.zip', p)
+            if m and int(m.group(1)) == alternation:
+                return p
+        raise RuntimeError(f"No {role} policy found for alternation {alternation}. Candidates: {role_artifacts}")
+    # Latest by max alternation number, exactly like evaluate.py
+    return max(role_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+
+
+def main(args):
+    tracking_uri = "http://localhost:5000"
+    mlflow.set_tracking_uri(tracking_uri)
+    client = MlflowClient()
+
+    run = client.get_run(args.run_id)
+    params = run.data.params
+
+    # Required
+    grid_size = int(params["grid_size"]) if "grid_size" in params else 16
+    players = int(params["players"]) if "players" in params else 3
+    shot_clock = int(params["shot_clock"]) if "shot_clock" in params else 24
+
+    # Optional
+    three_point_distance = _get_param(params, [
+        "three_point_distance", "three-point-distance", "three_pt_distance", "three-pt-distance"
+    ], int, 4)
+    layup_pct = _get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
+    three_pt_pct = _get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
+    spawn_distance = _get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
+    allow_dunks = _get_param(params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+    dunk_pct = _get_param(params, ["dunk_pct", "dunk-pct"], float, 0.90)
+    shot_pressure_enabled = _get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+    shot_pressure_max = _get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
+    shot_pressure_lambda = _get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
+    shot_pressure_arc_degrees = _get_param(params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
+    defender_pressure_distance = _get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
+    defender_pressure_turnover_chance = _get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
+    mask_occupied_moves_param = _get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+
+    # Optional CLI overrides for dunk params
+    if args.allow_dunks is not None:
+        allow_dunks = args.allow_dunks
+    if args.dunk_pct is not None:
+        dunk_pct = args.dunk_pct
+
+    print(
+        f"[heatmap] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
+        f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
+        f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, "
+        f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
+        f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
+        f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
+        f"mask_occupied_moves={mask_occupied_moves_param}"
+    )
+
+    # Download models
+    # Match evaluate.py behavior: list immediate files under models/
+    artifacts = client.list_artifacts(args.run_id, "models")
+    offense_art_path = _select_policy_artifact(artifacts, "offense", args.offense_alt)
+    defense_art_path = _select_policy_artifact(artifacts, "defense", args.defense_alt)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
+        defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
+
+        # Print chosen alternations if parsable
+        def _alt_of(path):
+            m = re.search(r'_(\d+)\.zip', os.path.basename(path))
+            return int(m.group(1)) if m else None
+        print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
+        print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
+
+        # Setup environment (no render for speed)
+        env = basketworld.HexagonBasketballEnv(
+            grid_size=grid_size,
+            players_per_side=players,
+            shot_clock_steps=shot_clock,
+            render_mode=None,
+            three_point_distance=three_point_distance,
+            layup_pct=layup_pct,
+            three_pt_pct=three_pt_pct,
+            allow_dunks=allow_dunks,
+            dunk_pct=dunk_pct,
+            shot_pressure_enabled=shot_pressure_enabled,
+            shot_pressure_max=shot_pressure_max,
+            shot_pressure_lambda=shot_pressure_lambda,
+            shot_pressure_arc_degrees=shot_pressure_arc_degrees,
+            defender_pressure_distance=defender_pressure_distance,
+            defender_pressure_turnover_chance=defender_pressure_turnover_chance,
+            spawn_distance=spawn_distance,
+            mask_occupied_moves=mask_occupied_moves_param,
+        )
+
+        offense_policy = PPO.load(offense_policy_path)
+        defense_policy = PPO.load(defense_policy_path)
+
+        # Heatmap accumulators (rows=height, cols=width)
+        offense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
+        defense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
+
+        def accumulate_positions():
+            # Count current step's positions into heatmaps
+            for pid in env.offense_ids:
+                q, r = env.positions[pid]
+                col, row = env._axial_to_offset(q, r)  # use env helper
+                if 0 <= row < env.court_height and 0 <= col < env.court_width:
+                    offense_heat[row, col] += 1
+            for pid in env.defense_ids:
+                q, r = env.positions[pid]
+                col, row = env._axial_to_offset(q, r)
+                if 0 <= row < env.court_height and 0 <= col < env.court_width:
+                    defense_heat[row, col] += 1
+
+        # Run episodes
+        for _ in tqdm(range(args.episodes), total=args.episodes, desc="Heatmap episodes"):
+            obs, _ = env.reset()
+            done = False
+            # include initial state
+            accumulate_positions()
+            while not done:
+                offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
+                defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
+                full_action = np.zeros(env.n_players, dtype=int)
+                for player_id in range(env.n_players):
+                    if player_id in env.offense_ids:
+                        full_action[player_id] = offense_action[player_id]
+                    else:
+                        full_action[player_id] = defense_action[player_id]
+                obs, _, done, _, _ = env.step(full_action)
+                accumulate_positions()
+
+        # Plot and save heatmaps (append alternation numbers to avoid overwrite)
+        os.makedirs(args.output_dir, exist_ok=True)
+        # Derive alternation from downloaded local filenames (matches printed values)
+        off_alt = _alt_of(offense_policy_path)
+        def_alt = _alt_of(defense_policy_path)
+        off_alt_label = str(off_alt) if off_alt is not None else "latest"
+        def_alt_label = str(def_alt) if def_alt is not None else "latest"
+        offense_path = os.path.join(args.output_dir, f"heatmap_offense_alt_{off_alt_label}.png")
+        defense_path = os.path.join(args.output_dir, f"heatmap_defense_alt_{def_alt_label}.png")
+
+        def _plot_hex_heat(arr: np.ndarray, title: str, path: str, cmap_name: str):
+            fig, ax = plt.subplots(figsize=(max(8, env.court_width/1.5), max(6, env.court_height/1.5)))
+            ax.set_aspect('equal')
+
+            # Axial -> cartesian for pointy-topped hexes (match env)
+            def axial_to_cartesian(q: int, r: int, size: float = 1.0):
+                x = size * (math.sqrt(3) * q + (math.sqrt(3) / 2.0) * r)
+                y = size * (1.5 * r)
+                return x, y
+
+            hex_radius = 1.0
+            vmax = int(arr.max()) if arr.size > 0 else 0
+            vmax = vmax if vmax > 0 else 1
+            norm = Normalize(vmin=0, vmax=vmax)
+            cmap = mpl_cmaps.get_cmap(cmap_name)
+
+            # Draw grid of hexes colored by counts
+            for r in range(env.court_height):
+                for c in range(env.court_width):
+                    q, r_ax = env._offset_to_axial(c, r)
+                    x, y = axial_to_cartesian(q, r_ax)
+                    val = int(arr[r, c])
+                    color = cmap(norm(val)) if val > 0 else (0.92, 0.92, 0.92, 0.4)
+                    hexagon = RegularPolygon(
+                        (x, y), numVertices=6, radius=hex_radius, orientation=0,
+                        facecolor=color, edgecolor='white', linewidth=1.0, alpha=1.0
+                    )
+                    ax.add_patch(hexagon)
+
+                    # Draw 3pt outline
+                    cell_distance = env._hex_distance((q, r_ax), env.basket_position)
+                    if cell_distance == env.three_point_distance:
+                        tp_outline = RegularPolygon((x, y), numVertices=6, radius=hex_radius,
+                                                    orientation=0, facecolor='none', edgecolor='red', linewidth=1.8, zorder=5)
+                        ax.add_patch(tp_outline)
+
+                    # Basket ring
+                    if (q, r_ax) == env.basket_position:
+                        basket_ring = plt.Circle((x, y), hex_radius * 1.05, fill=False, edgecolor='red', linewidth=3, zorder=6)
+                        ax.add_patch(basket_ring)
+
+            # Axis limits
+            coords = [axial_to_cartesian(*env._offset_to_axial(c, r)) for r in range(env.court_height) for c in range(env.court_width)]
+            xs = [p[0] for p in coords]
+            ys = [p[1] for p in coords]
+            margin = 2.0
+            ax.set_xlim(min(xs) - margin, max(xs) + margin)
+            ax.set_ylim(min(ys) - margin, max(ys) + margin)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(title)
+
+            # Colorbar
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('counts')
+
+            plt.tight_layout()
+            plt.savefig(path, dpi=220)
+            plt.close(fig)
+
+        _plot_hex_heat(offense_heat, "Offense Heatmap", offense_path, cmap_name='Reds')
+        _plot_hex_heat(defense_heat, "Defense Heatmap", defense_path, cmap_name='Blues')
+        print(f"Saved: {offense_path}\nSaved: {defense_path}")
+
+        # Log to MLflow
+        if not args.no_log_mlflow:
+            with mlflow.start_run(run_id=args.run_id):
+                mlflow.log_artifact(offense_path, artifact_path="heatmaps")
+                mlflow.log_artifact(defense_path, artifact_path="heatmaps")
+            print("Logged heatmaps to MLflow under 'heatmaps/'.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate offense/defense heatmaps from a BasketWorld MLflow run.")
+    parser.add_argument("--run-id", type=str, required=True, help="MLflow Run ID")
+    parser.add_argument("--episodes", type=int, default=200, help="Number of self-play episodes")
+    parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
+    parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
+    parser.add_argument("--offense-alt", type=int, default=None, help="Use specific alternation for offense policy")
+    parser.add_argument("--defense-alt", type=int, default=None, help="Use specific alternation for defense policy")
+    parser.add_argument("--output-dir", type=str, default=".", help="Directory to save heatmaps")
+    parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
+    # Optional overrides
+    parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None)
+    parser.add_argument("--dunk-pct", type=float, default=None)
+
+    args = parser.parse_args()
+    main(args)
+
+

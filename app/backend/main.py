@@ -172,6 +172,9 @@ async def init_game(request: InitGameRequest):
         layup_pct = get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
         three_pt_pct = get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
         spawn_distance = get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
+        # Dunk params (optional)
+        allow_dunks = get_param(params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+        dunk_pct = get_param(params, ["dunk_pct", "dunk-pct"], float, 0.90)
         # Shot pressure params (optional)
         shot_pressure_enabled = get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         shot_pressure_max = get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
@@ -194,7 +197,7 @@ async def init_game(request: InitGameRequest):
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
             f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-            f"mask_occupied_moves={mask_occupied_moves}"
+            f"mask_occupied_moves={mask_occupied_moves}, allow_dunks={allow_dunks}, dunk_pct={dunk_pct}"
         )
 
         # Download selected or latest policies and determine keys
@@ -221,6 +224,8 @@ async def init_game(request: InitGameRequest):
             three_point_distance=three_point_distance,
             layup_pct=layup_pct,
             three_pt_pct=three_pt_pct,
+            allow_dunks=allow_dunks,
+            dunk_pct=dunk_pct,
             shot_pressure_enabled=shot_pressure_enabled,
             shot_pressure_max=shot_pressure_max,
             shot_pressure_lambda=shot_pressure_lambda,

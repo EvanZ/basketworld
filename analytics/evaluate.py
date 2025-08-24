@@ -25,7 +25,9 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
                       shot_pressure_enabled: bool, shot_pressure_max: float, shot_pressure_lambda: float, shot_pressure_arc_degrees: float,
                       defender_pressure_distance: int, defender_pressure_turnover_chance: float,
                       spawn_distance: int,
-                      mask_occupied_moves: bool):
+                      mask_occupied_moves: bool,
+                      allow_dunks: bool,
+                      dunk_pct: float):
     """Create and wrap the environment for evaluation."""
     
     render_mode = "rgb_array" if not no_render else None
@@ -38,6 +40,8 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
         three_point_distance=three_point_distance,
         layup_pct=layup_pct,
         three_pt_pct=three_pt_pct,
+        allow_dunks=allow_dunks,
+        dunk_pct=dunk_pct,
         shot_pressure_enabled=shot_pressure_enabled,
         shot_pressure_max=shot_pressure_max,
         shot_pressure_lambda=shot_pressure_lambda,
@@ -83,32 +87,45 @@ def analyze_results(results: list, num_episodes: int):
     made_3pts = outcomes.get("Made 3pt", 0)
     missed_2pts = outcomes.get("Missed 2pt", 0)
     missed_3pts = outcomes.get("Missed 3pt", 0)
-    score_rate = (made_2pts + made_3pts) / num_episodes
+    made_dunks = outcomes.get("Made Dunk", 0)
+    missed_dunks = outcomes.get("Missed Dunk", 0)
+    score_rate = (made_2pts + made_3pts + made_dunks) / num_episodes
     turnovers = outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)
+    total_made = made_2pts + made_3pts + made_dunks
+    total_missed = missed_2pts + missed_3pts + missed_dunks
+    total_shots = total_made + total_missed
     print(f"Offensive Score Rate: {100.0 * score_rate:.2f}%")
     print(f"Made 2pts: {made_2pts}")
     print(f"Missed 2pts: {missed_2pts}")
     print(f"Made 3pts: {made_3pts}")
     print(f"Missed 3pts: {missed_3pts}")
-    print(f"Total made shots: {made_2pts + made_3pts}")
-    print(f"Total missed shots: {missed_2pts + missed_3pts}")
-    print(f"Total shots: {made_2pts + made_3pts + missed_2pts + missed_3pts}")
-    print(f"Total turnovers: {outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)}")
-    print(f"2PT%: {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
+    print(f"Made Dunks: {made_dunks}")
+    print(f"Missed Dunks: {missed_dunks}")
+    print(f"Total made shots: {total_made}")
+    print(f"Total missed shots: {total_missed}")
+    print(f"Total shots: {total_shots}")
+    print(f"Total turnovers: {turnovers}")
+    # Traditional 2PT% excludes dunks for separate reporting
+    if (made_2pts + missed_2pts) > 0:
+        print(f"2PT% (non-dunk): {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
+    else:
+        print("2PT% (non-dunk): N/A")
+    if (made_dunks + missed_dunks) > 0:
+        print(f"Dunk%: {100.0 * made_dunks / (made_dunks + missed_dunks):.2f}%")
+    else:
+        print("Dunk%: N/A")
     if made_3pts+missed_3pts > 0:
         print(f"3PT%: {100.0 * made_3pts / (made_3pts + missed_3pts):.2f}%")
     else:
         print("3PT%: N/A")
-    if made_2pts+made_3pts+missed_2pts+missed_3pts > 0:
-        print(f"FG%: {100.0 * (made_2pts + made_3pts) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")
+    if total_shots > 0:
+        print(f"FG%: {100.0 * total_made / total_shots:.2f}%")
+        print(f"EFG%: {100.0 * (made_2pts + made_dunks + made_3pts * 1.5) / total_shots:.2f}%")    
     else:
         print("FG%: N/A")
-    if made_2pts+made_3pts+missed_2pts+missed_3pts > 0:
-        print(f"EFG%: {100.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts):.2f}%")    
-    else:
         print("EFG%: N/A")
-    if made_2pts+made_3pts+missed_2pts+missed_3pts+turnovers > 0:
-        print(f"PPP: {1.0 * (made_2pts + made_3pts * 1.5) / (made_2pts + made_3pts + missed_2pts + missed_3pts + turnovers):.2f}")
+    if (total_shots + turnovers) > 0:
+        print(f"PPP: {1.0 * (made_2pts + made_dunks + made_3pts * 1.5) / (total_shots + turnovers):.2f}")
     else:
         print("PPP: N/A")
     print("\nEpisode Termination Breakdown:")
@@ -166,6 +183,9 @@ def main(args):
         layup_pct = get_param(run_params, ["layup_pct", "layup-pct"], float, 0.60)
         three_pt_pct = get_param(run_params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
         spawn_distance = get_param(run_params, ["spawn_distance", "spawn-distance"], int, 3)
+        # Dunk params (optional)
+        allow_dunks = get_param(run_params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+        dunk_pct = get_param(run_params, ["dunk_pct", "dunk-pct"], float, 0.90)
         # Shot pressure params (optional)
         shot_pressure_enabled = get_param(run_params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         shot_pressure_max = get_param(run_params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
@@ -180,6 +200,7 @@ def main(args):
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
+            f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
             f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
             f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}"
@@ -208,6 +229,12 @@ def main(args):
             
             # --- Setup ---
             print("\nSetting up environment for evaluation...")
+            # Optional CLI overrides for dunk settings
+            if getattr(args, "allow_dunks", None) is not None:
+                allow_dunks = args.allow_dunks
+            if getattr(args, "dunk_pct", None) is not None:
+                dunk_pct = args.dunk_pct
+
             env = setup_environment(
                 grid_size=grid_size,
                 players=players,
@@ -224,6 +251,8 @@ def main(args):
                 defender_pressure_distance=defender_pressure_distance,
                 defender_pressure_turnover_chance=defender_pressure_turnover_chance,
                 mask_occupied_moves=(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param),
+                allow_dunks=allow_dunks,
+                dunk_pct=dunk_pct,
             )
 
             print("Loading policies...")
@@ -270,7 +299,10 @@ def main(args):
                 outcome = "Unknown" # Default outcome
                 if action_results.get('shots'):
                     shot_result = list(action_results['shots'].values())[0]
-                    if shot_result['success'] and shot_result['distance'] < three_point_distance:
+                    is_dunk = (shot_result.get('distance', 999) == 0)
+                    if is_dunk:
+                        outcome = "Made Dunk" if shot_result['success'] else "Missed Dunk"
+                    elif shot_result['success'] and shot_result['distance'] < three_point_distance:
                         outcome = "Made 2pt"
                     elif shot_result['success'] and shot_result['distance'] >= three_point_distance:
                         outcome = "Made 3pt"
@@ -328,6 +360,9 @@ if __name__ == "__main__":
     parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic offense actions.")
     parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic defense actions.")
     parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="If set, disallow moves into currently occupied neighboring hexes.")
+    # Optional overrides for dunk evaluation
+    parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="Override run param to enable/disable dunks during evaluation.")
+    parser.add_argument("--dunk-pct", type=float, default=None, help="Override run param for dunk make probability during evaluation.")
     
     args = parser.parse_args()
     main(args) 

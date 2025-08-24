@@ -14,7 +14,7 @@ import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
@@ -254,6 +254,8 @@ def setup_environment(args, training_team):
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
         three_pt_pct=args.three_pt_pct,
+        allow_dunks=args.allow_dunks,
+        dunk_pct=args.dunk_pct,
         shot_pressure_enabled=args.shot_pressure_enabled,
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
@@ -372,6 +374,7 @@ def main(args):
                 vf_coef=args.vf_coef,
                 ent_coef=args.ent_coef,
                 batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
                 tensorboard_log=None, # Disable TensorBoard if using MLflow
                 policy_kwargs=policy_kwargs
             )
@@ -383,6 +386,7 @@ def main(args):
                 vf_coef=args.vf_coef,
                 ent_coef=args.ent_coef,
                 batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
                 tensorboard_log=None, # Disable TensorBoard if using MLflow
                 policy_kwargs=policy_kwargs
             )
@@ -501,6 +505,8 @@ def main(args):
                     three_point_distance=args.three_point_distance,
                     layup_pct=args.layup_pct,
                     three_pt_pct=args.three_pt_pct,
+                    allow_dunks=args.allow_dunks,
+                    dunk_pct=args.dunk_pct,
                     shot_pressure_enabled=args.shot_pressure_enabled,
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
@@ -653,6 +659,9 @@ if __name__ == "__main__":
     parser.add_argument("--enable-env-profiling", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.")
     parser.add_argument("--spawn-distance", type=int, default=3, help="minimum distance from 3pt line at which players spawn.")
     parser.add_argument("--deterministic-opponent", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic opponent actions.")
+    # Dunk controls
+    parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Allow players to enter basket hex and enable dunk shots from basket cell.")
+    parser.add_argument("--dunk-pct", type=float, default=0.90, help="Probability of a dunk (shot from basket cell).")
     # Observation controls
     parser.add_argument("--use-egocentric-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Use egocentric observations centered at the ball handler.")
     parser.add_argument("--egocentric-rotate-to-hoop", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Rotate egocentric frame so hoop is aligned to +q axis.")

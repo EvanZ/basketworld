@@ -95,6 +95,9 @@ class HexagonBasketballEnv(gym.Env):
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
+        # Dunk controls
+        allow_dunks: bool = False,
+        dunk_pct: float = 0.90,
         # Shot pressure parameters
         shot_pressure_enabled: bool = True,
         shot_pressure_max: float = 0.5,   # max reduction at distance=1 (multiplier = 1 - max)
@@ -132,6 +135,9 @@ class HexagonBasketballEnv(gym.Env):
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
         self.three_pt_pct = float(three_pt_pct)
+        # Dunk configuration
+        self.allow_dunks = bool(allow_dunks)
+        self.dunk_pct = float(dunk_pct)
         # Back-compat field kept (UI may use it if shot_params absent). Not authoritative anymore.
         self.shot_probs = None
         # New descriptive params for UI
@@ -139,6 +145,8 @@ class HexagonBasketballEnv(gym.Env):
             "model": "linear",
             "layup_pct": self.layup_pct,
             "three_pt_pct": self.three_pt_pct,
+            "dunk_pct": self.dunk_pct,
+            "allow_dunks": self.allow_dunks,
         }
         # Defender shot pressure
         self.shot_pressure_enabled = bool(shot_pressure_enabled)
@@ -214,7 +222,7 @@ class HexagonBasketballEnv(gym.Env):
         self.last_action_results: Dict = {}
 
         # Precompute per-cell move validity mask (6 directions) to speed up action mask building
-        # 1 = allowed, 0 = blocked (OOB or basket hex)
+        # 1 = allowed, 0 = blocked (OOB or basket hex if dunks disabled)
         self._move_mask_by_cell: Dict[Tuple[int, int], np.ndarray] = {}
         for row in range(self.court_height):
             for col in range(self.court_width):
@@ -222,7 +230,7 @@ class HexagonBasketballEnv(gym.Env):
                 allowed = np.ones(6, dtype=np.int8)
                 for dir_idx in range(6):
                     nbr = (cell[0] + self.hex_directions[dir_idx][0], cell[1] + self.hex_directions[dir_idx][1])
-                    if (not self._is_valid_position(*nbr)) or (nbr == self.basket_position):
+                    if (not self._is_valid_position(*nbr)) or ((nbr == self.basket_position) and (not self.allow_dunks)):
                         allowed[dir_idx] = 0
                 self._move_mask_by_cell[cell] = allowed
 
@@ -513,18 +521,29 @@ class HexagonBasketballEnv(gym.Env):
                 direction_idx = action.value - ActionType.MOVE_E.value
                 new_pos = self._get_adjacent_position(current_positions[player_id], direction_idx)
                 
-                if self._is_valid_position(*new_pos) and new_pos != self.basket_position:
-                    intended_moves[player_id] = new_pos
+                if self._is_valid_position(*new_pos):
+                    if (new_pos == self.basket_position) and (not self.allow_dunks):
+                        # Basket hex blocked when dunks disabled
+                        if player_id == self.ball_holder:
+                            results["turnovers"].append({
+                                "player_id": player_id,
+                                "reason": "move_out_of_bounds",
+                                "turnover_pos": new_pos
+                            })
+                            self._turnover_to_defense(player_id)
+                        results["moves"][player_id] = {"success": False, "reason": "basket_collision"}
+                    else:
+                        intended_moves[player_id] = new_pos
                 else:
-                    reason = "out_of_bounds" if new_pos != self.basket_position else "basket_collision"
+                    # Out of bounds move
                     if player_id == self.ball_holder:
                         results["turnovers"].append({
                             "player_id": player_id,
                             "reason": "move_out_of_bounds",
                             "turnover_pos": new_pos
                         })
-                        self._turnover_to_defense(player_id) # This must happen after storing results
-                    results["moves"][player_id] = {"success": False, "reason": reason}
+                        self._turnover_to_defense(player_id)
+                    results["moves"][player_id] = {"success": False, "reason": "out_of_bounds"}
 
         # If configured, block moves into any cell that was occupied at the start of the step
         if self.mask_occupied_moves and intended_moves:
@@ -741,7 +760,9 @@ class HexagonBasketballEnv(gym.Env):
         # For diagnostics: compute base probability (no pressure) and pressure multiplier
         d0 = 1
         d1 = max(self.three_point_distance, d0 + 1)
-        if distance <= d0:
+        if self.allow_dunks and distance == 0:
+            base_prob = self.dunk_pct
+        elif distance <= d0:
             base_prob = self.layup_pct
         else:
             t = (distance - d0) / (d1 - d0)
@@ -795,7 +816,9 @@ class HexagonBasketballEnv(gym.Env):
         p0 = self.layup_pct
         p1 = self.three_pt_pct
 
-        if distance <= d0:
+        if self.allow_dunks and distance == 0:
+            prob = self.dunk_pct
+        elif distance <= d0:
             prob = p0
         else:
             t = (distance - d0) / (d1 - d0)
