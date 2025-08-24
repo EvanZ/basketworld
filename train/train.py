@@ -439,7 +439,7 @@ def main(args):
             offense_policy.set_logger(offense_logger)
 
             offense_policy.learn(
-                total_timesteps=args.steps_per_alternation, 
+                total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
                 callback=[offense_mlflow_callback, offense_timing_callback],
                 progress_bar=True
@@ -479,7 +479,7 @@ def main(args):
             defense_policy.set_logger(defense_logger)
 
             defense_policy.learn(
-                total_timesteps=args.steps_per_alternation, 
+                total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
                 callback=[defense_mlflow_callback, defense_timing_callback],
                 progress_bar=True
@@ -633,7 +633,7 @@ if __name__ == "__main__":
     parser.add_argument("--players", type=int, default=2, help="Number of players per side.")
     parser.add_argument("--shot-clock", type=int, default=20, help="Steps in the shot clock.")
     parser.add_argument("--alternations", type=int, default=10, help="Number of times to alternate training.")
-    parser.add_argument("--steps-per-alternation", type=int, default=20_000, help="Timesteps to train each policy per alternation.")
+    parser.add_argument("--steps-per-alternation", type=int, default=1, help="Timesteps to train each policy per alternation.")
     parser.add_argument("--n-steps", type=int, default=2048, help="PPO hyperparameter: Number of steps to run for each environment per update.")
     parser.add_argument("--gamma", type=float, default=0.99, help="PPO hyperparameter: Discount factor for future rewards.")
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")

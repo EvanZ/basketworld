@@ -75,6 +75,8 @@ function startGame() {
                 </select>
             </div>
 
+            
+
             <button type="submit">
                 Start Game
             </button>

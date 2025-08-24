@@ -419,11 +419,10 @@ class HexagonBasketballEnv(gym.Env):
          
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
         """
-        Generate initial positions with:
-        - Offense spawned "behind" the 3pt line (distance >= three_point_distance)
-        - Defense spawned "inside" the 3pt line (distance < three_point_distance) and
-          closer to the basket than the matched offensive player, preferring the nearest
-          valid position to that offensive player.
+        Generate initial positions with distances defined RELATIVE to the basket:
+        - Offense: any valid cell with distance >= spawn_distance (negative => 0)
+        - Defense: closer to basket than the matched offense and distance >= spawn_distance (negative => 0)
+          If no such cells, broaden progressively to avoid spawn failures.
         """
         taken_positions: set[Tuple[int, int]] = set()
 
@@ -433,7 +432,9 @@ class HexagonBasketballEnv(gym.Env):
             for col in range(self.court_width):
                 all_cells.append(self._offset_to_axial(col, row))
 
-        # Offense candidates: behind the arc but within spawn_distance hexes of it
+        # Minimum distance from basket (negative means no minimum)
+        min_spawn_dist = max(0, self.spawn_distance)
+        # Offense candidates: any valid cell at least min_spawn_dist from basket
         offense_candidates = []
         for cell in all_cells:
             if cell == self.basket_position:
@@ -441,11 +442,14 @@ class HexagonBasketballEnv(gym.Env):
             if not self._is_valid_position(*cell):
                 continue
             dist = self._hex_distance(cell, self.basket_position)
-            if self.three_point_distance + self.spawn_distance <= dist <= self.court_width:
+            if dist >= min_spawn_dist:
                 offense_candidates.append(cell)
 
         if len(offense_candidates) < self.players_per_side:
-            raise ValueError("Not enough cells behind the 3pt line to spawn offense.")
+            # Fallback to any valid non-basket cell
+            offense_candidates = [cell for cell in all_cells if cell != self.basket_position and self._is_valid_position(*cell)]
+            if len(offense_candidates) < self.players_per_side:
+                raise ValueError("Not enough valid cells to spawn offense.")
 
         # Sample unique offense positions
         offense_positions = []
@@ -454,7 +458,9 @@ class HexagonBasketballEnv(gym.Env):
             offense_positions.append(pos)
             taken_positions.add(pos)
 
-        # Defense candidates: inside arc and closer to basket than offense counterpart
+        # Defense candidates: closer to basket than the offense counterpart, with a
+        # minimum distance from the basket defined RELATIVE to the basket.
+        # A negative spawn_distance means no minimum (allow anywhere on court).
         defense_positions: List[Tuple[int, int]] = []
         for off_pos in offense_positions:
             off_dist = self._hex_distance(off_pos, self.basket_position)
@@ -464,21 +470,27 @@ class HexagonBasketballEnv(gym.Env):
                 and cell not in taken_positions
                 and self._is_valid_position(*cell)
                 and self._hex_distance(cell, self.basket_position) < off_dist
-                and self._hex_distance(cell, self.basket_position) >= self.three_point_distance + self.spawn_distance
+                and self._hex_distance(cell, self.basket_position) >= min_spawn_dist
             ]
 
             if not candidates:
-                # Fallback: pick any valid empty cell that is closer to basket
+                # Fallback: pick any valid empty cell meeting only the minimum spawn distance
                 candidates = [
                     cell for cell in all_cells
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
-                    and self._hex_distance(cell, self.basket_position) < off_dist + self.spawn_distance
+                    and self._hex_distance(cell, self.basket_position) >= min_spawn_dist
                 ]
 
             if not candidates:
-                raise RuntimeError("Could not find a valid inside-arc spawn for a defender.")
+                # Final fallback: any valid empty cell (avoid crashing)
+                candidates = [
+                    cell for cell in all_cells
+                    if cell != self.basket_position
+                    and cell not in taken_positions
+                    and self._is_valid_position(*cell)
+                ]
 
             # Choose the candidate nearest to the offensive player (to simulate marking)
             candidates.sort(key=lambda c: self._hex_distance(c, off_pos))

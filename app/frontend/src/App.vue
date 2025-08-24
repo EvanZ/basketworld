@@ -58,7 +58,12 @@ async function handleGameStarted(setupData) {
   gameState.value = null;      // Ensure old board is cleared
   gameHistory.value = [];      // Clear history
   try {
-    const response = await initGame(setupData.runId, setupData.userTeam, setupData.offensePolicyName, setupData.defensePolicyName);
+    const response = await initGame(
+      setupData.runId,
+      setupData.userTeam,
+      setupData.offensePolicyName,
+      setupData.defensePolicyName,
+    );
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);

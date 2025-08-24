@@ -198,9 +198,9 @@ def main(args):
         mask_occupied_moves_param = get_param(run_params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
         
         print(
-            f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
+            f"[run_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
-            f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, "
+            f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
             f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
             f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}"
@@ -229,11 +229,24 @@ def main(args):
             
             # --- Setup ---
             print("\nSetting up environment for evaluation...")
-            # Optional CLI overrides for dunk settings
+            # Optional CLI overrides for dunk and spawn settings
             if getattr(args, "allow_dunks", None) is not None:
                 allow_dunks = args.allow_dunks
             if getattr(args, "dunk_pct", None) is not None:
                 dunk_pct = args.dunk_pct
+            if getattr(args, "spawn_distance", None) is not None:
+                spawn_distance = args.spawn_distance
+
+            # Log effective params just before environment creation
+            print(
+                f"[effective_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "
+                f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
+                f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}, "
+                f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
+                f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
+                f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
+                f"mask_occupied_moves={(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param)}"
+            )
 
             env = setup_environment(
                 grid_size=grid_size,
@@ -360,9 +373,10 @@ if __name__ == "__main__":
     parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic offense actions.")
     parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic defense actions.")
     parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="If set, disallow moves into currently occupied neighboring hexes.")
-    # Optional overrides for dunk evaluation
+    # Optional overrides for dunk and spawn evaluation
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="Override run param to enable/disable dunks during evaluation.")
     parser.add_argument("--dunk-pct", type=float, default=None, help="Override run param for dunk make probability during evaluation.")
+    parser.add_argument("--spawn-distance", type=int, default=None, help="Override run param for spawn distance relative to basket (can be negative).")
     
     args = parser.parse_args()
     main(args) 

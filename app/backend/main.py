@@ -41,6 +41,10 @@ class InitGameRequest(BaseModel):
     user_team_name: str  # "OFFENSE" or "DEFENSE"
     offense_policy_name: str | None = None  # optional specific policy filename
     defense_policy_name: str | None = None
+    # Optional overrides
+    spawn_distance: int | None = None
+    allow_dunks: bool | None = None
+    dunk_pct: float | None = None
 
 
 class ListPoliciesRequest(BaseModel):
@@ -192,12 +196,20 @@ async def init_game(request: InitGameRequest):
         include_hoop_vector = get_param(params, ["include_hoop_vector", "include-hoop-vector"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         normalize_obs = get_param(params, ["normalize_obs", "normalize-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         
+        # Apply request overrides if provided
+        if request.spawn_distance is not None:
+            spawn_distance = int(request.spawn_distance)
+        if request.allow_dunks is not None:
+            allow_dunks = bool(request.allow_dunks)
+        if request.dunk_pct is not None:
+            dunk_pct = float(request.dunk_pct)
+
         print(
             f"[init_game] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
             f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-            f"mask_occupied_moves={mask_occupied_moves}, allow_dunks={allow_dunks}, dunk_pct={dunk_pct}"
+            f"mask_occupied_moves={mask_occupied_moves}, allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}"
         )
 
         # Download selected or latest policies and determine keys
