@@ -30,9 +30,19 @@ import sys
 import tempfile
 import random
 from typing import Optional
+import torch
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
+
+# --- CPU thread caps to avoid oversubscription in parallel env workers ---
+# These defaults can be overridden by user environment.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 # --- Custom MLflow Callback ---
 
@@ -283,8 +293,8 @@ def make_vector_env(
     training_team: Team,
     opponent_policy,
     num_envs: int,
-) -> DummyVecEnv:
-    """Return a DummyVecEnv with `num_envs` copies of the self-play environment.
+) -> SubprocVecEnv:
+    """Return a SubprocVecEnv with `num_envs` copies of the self-play environment.
 
     Each copy is wrapped with `SelfPlayEnvWrapper` so that the opponent's
     behaviour is provided by the frozen `opponent_policy`.
@@ -298,7 +308,11 @@ def make_vector_env(
             opponent_policy=opponent_policy,
         )
 
-    return DummyVecEnv([_single_env_factory for _ in range(num_envs)])
+    # Use subprocesses for true parallelism across CPU cores.
+    # On Linux, "fork" is efficient and avoids pickling issues for closures.
+    return SubprocVecEnv([
+        _single_env_factory for _ in range(num_envs)
+    ], start_method="fork")
 
 def main(args):
     """Main training function."""
