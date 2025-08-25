@@ -30,9 +30,38 @@ import sys
 import tempfile
 import random
 from typing import Optional
+import torch
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
+
+# --- CPU thread caps to avoid oversubscription in parallel env workers ---
+# These defaults can be overridden by user environment.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+# --- GPU Configuration ---
+# Check if CUDA is available and configure device
+def get_device(device_arg):
+    if device_arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        else:
+            return torch.device("cpu")
+    elif device_arg == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        else:
+            print("CUDA requested but not available, falling back to CPU")
+            return torch.device("cpu")
+    else:
+        return torch.device(device_arg)
+
+# Device will be set in main() after parsing args
 
 # --- Custom MLflow Callback ---
 
@@ -283,8 +312,8 @@ def make_vector_env(
     training_team: Team,
     opponent_policy,
     num_envs: int,
-) -> DummyVecEnv:
-    """Return a DummyVecEnv with `num_envs` copies of the self-play environment.
+) -> SubprocVecEnv:
+    """Return a SubprocVecEnv with `num_envs` copies of the self-play environment.
 
     Each copy is wrapped with `SelfPlayEnvWrapper` so that the opponent's
     behaviour is provided by the frozen `opponent_policy`.
@@ -298,10 +327,22 @@ def make_vector_env(
             opponent_policy=opponent_policy,
         )
 
-    return DummyVecEnv([_single_env_factory for _ in range(num_envs)])
+    # Use subprocesses for true parallelism across CPU cores.
+    # Use "spawn" for better compatibility across different Linux configurations.
+    return SubprocVecEnv([
+        _single_env_factory for _ in range(num_envs)
+    ], start_method="spawn")
 
 def main(args):
     """Main training function."""
+
+    # --- Set up Device ---
+    device = get_device(args.device)
+    if device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name()}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("Using CPU")
 
     # --- Set up MLflow Tracking ---
     # MLflow requires a running server to log artifacts correctly.
@@ -360,8 +401,8 @@ def main(args):
                 if off_art and def_art:
                     off_local = client.download_artifacts(args.continue_run_id, off_art, tmpd)
                     def_local = client.download_artifacts(args.continue_run_id, def_art, tmpd)
-                    offense_policy = PPO.load(off_local, env=temp_env)
-                    defense_policy = PPO.load(def_local, env=temp_env)
+                    offense_policy = PPO.load(off_local, env=temp_env, device=device)
+                    defense_policy = PPO.load(def_local, env=temp_env, device=device)
                     print(f"  - Loaded latest offense: {os.path.basename(off_art)}")
                     print(f"  - Loaded latest defense: {os.path.basename(def_art)}")
 
@@ -376,7 +417,8 @@ def main(args):
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 tensorboard_log=None, # Disable TensorBoard if using MLflow
-                policy_kwargs=policy_kwargs
+                policy_kwargs=policy_kwargs,
+                device=device
             )
             defense_policy = PPO(
                 "MultiInputPolicy", 
@@ -388,7 +430,8 @@ def main(args):
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 tensorboard_log=None, # Disable TensorBoard if using MLflow
-                policy_kwargs=policy_kwargs
+                policy_kwargs=policy_kwargs,
+                device=device
             )
         temp_env.close()
 
@@ -668,6 +711,7 @@ if __name__ == "__main__":
     parser.add_argument("--include-hoop-vector", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Append hoop direction vector to observation.")
     parser.add_argument("--normalize-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Normalize relative coordinates to roughly [-1,1].")
     parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Disallow moves into currently occupied neighboring hexes.")
+    parser.add_argument("--device", type=str, default="auto", help="Device to use for training ('cuda', 'cpu', or 'auto').")
     args = parser.parse_args()
  
     main(args) 
