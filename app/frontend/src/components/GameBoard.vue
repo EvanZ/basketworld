@@ -221,9 +221,11 @@ const episodeOutcome = computed(() => {
         const br = currentGameState.value.basket_position[1];
         const dist = (Math.abs(q - bq) + Math.abs((q + r) - (bq + br)) + Math.abs(r - br)) / 2;
         const isThree = dist >= (currentGameState.value.three_point_distance ?? 4);
+        const isDunk = dist === 0;
         return {
             type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT',
             isThree,
+            isDunk,
             playerId: pid,
         };
     }
@@ -466,11 +468,11 @@ const playerTransitions = computed(() => {
       <g v-if="episodeOutcome" class="outcome-text-group">
           <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
-              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isThree ? 'Made 3!' : 'Made 2!' }}</tspan>
+              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Made Dunk!' : (episodeOutcome.isThree ? 'Made 3!' : 'Made 2!') }}</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
-              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isThree ? 'Missed 3!' : 'Missed 2!' }}</tspan>
+              <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Missed Dunk!' : (episodeOutcome.isThree ? 'Missed 3!' : 'Missed 2!') }}</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
           <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>

@@ -169,7 +169,9 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 if action_mask[i][predicted_action] == 1:
                     full_action[i] = predicted_action
                 else:
-                    full_action[i] = 0 # Fallback to NOOP if illegal
+                    # Fallback: pick the first legal action for this player
+                    legal_indices = np.where(action_mask[i] == 1)[0]
+                    full_action[i] = int(legal_indices[0]) if len(legal_indices) > 0 else 0
                 
         # Step the underlying environment with the combined action
         obs, reward, done, truncated, info = self.env.step(full_action)

@@ -137,6 +137,8 @@ def main(args):
             defender_pressure_turnover_chance=defender_pressure_turnover_chance,
             spawn_distance=spawn_distance,
             mask_occupied_moves=mask_occupied_moves_param,
+            illegal_defense_enabled=True,
+            illegal_defense_max_steps=3,
         )
 
         offense_policy = PPO.load(offense_policy_path)

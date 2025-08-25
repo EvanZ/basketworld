@@ -27,7 +27,9 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
                       spawn_distance: int,
                       mask_occupied_moves: bool,
                       allow_dunks: bool,
-                      dunk_pct: float):
+                      dunk_pct: float,
+                      illegal_defense_enabled: bool,
+                      illegal_defense_max_steps: int):
     """Create and wrap the environment for evaluation."""
     
     render_mode = "rgb_array" if not no_render else None
@@ -50,6 +52,8 @@ def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: 
         defender_pressure_turnover_chance=defender_pressure_turnover_chance,
         spawn_distance=spawn_distance,
         mask_occupied_moves=mask_occupied_moves,
+        illegal_defense_enabled=illegal_defense_enabled,
+        illegal_defense_max_steps=illegal_defense_max_steps,
     )
     return env
 
@@ -266,6 +270,8 @@ def main(args):
                 mask_occupied_moves=(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param),
                 allow_dunks=allow_dunks,
                 dunk_pct=dunk_pct,
+                illegal_defense_enabled=True,
+                illegal_defense_max_steps=3,
             )
 
             print("Loading policies...")

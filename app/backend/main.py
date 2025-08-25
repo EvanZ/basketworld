@@ -14,6 +14,7 @@ import torch
 import copy
 from datetime import datetime
 import imageio
+from basketworld.utils.evaluation_helpers import get_outcome_category
 
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
@@ -314,8 +315,11 @@ def take_step(request: ActionRequest):
                 print(f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}")
                 full_action[i] = predicted_action
             else:
-                print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking NOOP instead.")
-                full_action[i] = 0
+                # Fallback: choose the first legal action instead of NOOP
+                legal = np.where(action_mask[i] == 1)[0]
+                fallback = int(legal[0]) if len(legal) > 0 else 0
+                print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
+                full_action[i] = fallback
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
@@ -554,7 +558,41 @@ def save_episode():
 
     os.makedirs("episodes", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path = os.path.join("episodes", f"episode_{timestamp}.gif")
+    # Determine outcome label (carry dunk logic like evaluation/ui)
+    outcome = "Unknown"
+    try:
+        ar = game_state.env.last_action_results or {}
+        if ar.get("shots"):
+            # Take first shot result
+            shooter_id_str = list(ar["shots"].keys())[0]
+            shot_res = ar["shots"][shooter_id_str]
+            distance = int(shot_res.get("distance", 999))
+            is_dunk = (distance == 0)
+            if is_dunk:
+                outcome = "Made Dunk" if shot_res.get("success") else "Missed Dunk"
+            else:
+                # Determine 2 vs 3 by distance to basket at shot time
+                if shot_res.get("success"):
+                    outcome = "Made 3pt" if distance >= game_state.env.three_point_distance else "Made 2pt"
+                else:
+                    outcome = "Missed 3pt" if distance >= game_state.env.three_point_distance else "Missed 2pt"
+        elif ar.get("turnovers"):
+            reason = ar["turnovers"][0].get("reason", "turnover")
+            if reason == "intercepted":
+                outcome = "Turnover (Intercepted)"
+            elif reason in ("pass_out_of_bounds", "move_out_of_bounds"):
+                outcome = "Turnover (OOB)"
+            elif reason == "defender_pressure":
+                outcome = "Turnover (Pressure)"
+            else:
+                outcome = f"Turnover ({reason})"
+        elif getattr(game_state.env, "shot_clock", 1) <= 0:
+            outcome = "Turnover (Shot Clock Violation)"
+    except Exception:
+        pass
+
+    category = get_outcome_category(outcome)
+    file_path = os.path.join("episodes", f"episode_{timestamp}_{category}.gif")
 
     # Write frames to GIF
     try:

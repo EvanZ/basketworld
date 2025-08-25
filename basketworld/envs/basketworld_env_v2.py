@@ -98,6 +98,9 @@ class HexagonBasketballEnv(gym.Env):
         # Dunk controls
         allow_dunks: bool = False,
         dunk_pct: float = 0.90,
+        # Illegal defense (3-in-the-key) controls
+        illegal_defense_enabled: bool = True,
+        illegal_defense_max_steps: int = 3,
         # Shot pressure parameters
         shot_pressure_enabled: bool = True,
         shot_pressure_max: float = 0.5,   # max reduction at distance=1 (multiplier = 1 - max)
@@ -162,6 +165,9 @@ class HexagonBasketballEnv(gym.Env):
         basket_col = 0
         basket_row = self.court_height // 2
         self.basket_position = self._offset_to_axial(basket_col, basket_row)
+        # Illegal defense configuration
+        self.illegal_defense_enabled = bool(illegal_defense_enabled)
+        self.illegal_defense_max_steps = int(illegal_defense_max_steps)
         
         # Total players
         self.n_players = players_per_side * 2
@@ -220,6 +226,8 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count: int = 0
         self.episode_ended: bool = False
         self.last_action_results: Dict = {}
+        # Track consecutive defender steps in the basket (key) cell
+        self._defender_in_key_steps: Dict[int, int] = {}
 
         # Precompute per-cell move validity mask (6 directions) to speed up action mask building
         # 1 = allowed, 0 = blocked (OOB or basket hex if dunks disabled)
@@ -294,6 +302,7 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
+        self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         
         # Initialize positions (offense on right side, defense on left)
         self.positions = self._generate_initial_positions()
@@ -372,6 +381,14 @@ class HexagonBasketballEnv(gym.Env):
             
         self.episode_ended = done
         
+        # Update illegal defense counters based on resulting positions
+        if self.illegal_defense_enabled:
+            for did in self.defense_ids:
+                if self.positions and tuple(self.positions[did]) == tuple(self.basket_position):
+                    self._defender_in_key_steps[did] = self._defender_in_key_steps.get(did, 0) + 1
+                else:
+                    self._defender_in_key_steps[did] = 0
+
         obs = {
             "obs": self._get_observation(),
             "action_mask": self._get_action_masks()
@@ -414,7 +431,14 @@ class HexagonBasketballEnv(gym.Env):
                     nbr = (curr_q + dq, curr_r + dr)
                     if nbr in occupied:
                         masks[i, action_idx] = 0
-                 
+        
+        # Enforce illegal defense: after max steps in basket, mask NOOP so defender must move
+        if self.illegal_defense_enabled and self.illegal_defense_max_steps > 0:
+            for did in self.defense_ids:
+                if self._defender_in_key_steps.get(did, 0) >= self.illegal_defense_max_steps:
+                    if tuple(self.positions[did]) == tuple(self.basket_position):
+                        masks[did, ActionType.NOOP.value] = 0
+        
         return masks
          
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
@@ -1096,18 +1120,23 @@ class HexagonBasketballEnv(gym.Env):
             if self.last_action_results.get("shots"):
                 shot_result = list(self.last_action_results["shots"].values())[0]
                 basket_x, basket_y = axial_to_cartesian(*self.basket_position)
-                # Determine 2PT or 3PT by shooter position at shot
+                # Determine Dunk vs 2PT/3PT
                 shooter_id = list(self.last_action_results["shots"].keys())[0]
                 shooter_pos = self.positions[int(shooter_id)]
                 dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
-                is_three = dist_to_basket >= self.three_point_distance
-                label_suffix = "3" if is_three else "2"
+                is_dunk = (shot_result.get("distance") == 0)
+                if is_dunk:
+                    label_text = "Dunk"
+                else:
+                    is_three = dist_to_basket >= self.three_point_distance
+                    label_text = "3" if is_three else "2"
+
                 if shot_result["success"]:
                     ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='green', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, f"Made {label_suffix}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
+                    ax.text(0.5, 0.9, f"Made {label_text}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
                 else:
                     ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='red', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, f"Missed {label_suffix}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
+                    ax.text(0.5, 0.9, f"Missed {label_text}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
 
             # Turnover results
             turnovers = self.last_action_results.get("turnovers", [])
