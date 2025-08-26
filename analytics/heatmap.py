@@ -24,6 +24,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib import colormaps as mpl_cmaps
 import math
 from stable_baselines3 import PPO
+from PIL import Image
 
 import basketworld
 from tqdm import tqdm
@@ -84,6 +85,8 @@ def main(args):
     defender_pressure_distance = _get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
     defender_pressure_turnover_chance = _get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
     mask_occupied_moves_param = _get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+    illegal_defense_enabled = _get_param(params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+    illegal_defense_max_steps = _get_param(params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
 
     # Optional CLI overrides for dunk params
     if args.allow_dunks is not None:
@@ -101,22 +104,28 @@ def main(args):
         f"mask_occupied_moves={mask_occupied_moves_param}"
     )
 
-    # Download models
-    # Match evaluate.py behavior: list immediate files under models/
+    # Download models: list immediate files under models/
     artifacts = client.list_artifacts(args.run_id, "models")
-    offense_art_path = _select_policy_artifact(artifacts, "offense", args.offense_alt)
-    defense_art_path = _select_policy_artifact(artifacts, "defense", args.defense_alt)
+
+    # Support lists of alternations; must be same length
+    def _parse_alts(list_arg, single_arg):
+        if list_arg is not None and str(list_arg).strip() != "":
+            parts = re.split(r"[\s,]+", str(list_arg).strip())
+            return [int(p) for p in parts if p != ""]
+        if single_arg is not None:
+            return [int(single_arg)]
+        return [None]
+
+    offense_alts = _parse_alts(getattr(args, "offense_alts", None), args.offense_alt)
+    defense_alts = _parse_alts(getattr(args, "defense_alts", None), args.defense_alt)
+    if len(offense_alts) != len(defense_alts):
+        raise ValueError(f"--offense-alts and --defense-alts must have same length (got {len(offense_alts)} vs {len(defense_alts)})")
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
-        defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
-
-        # Print chosen alternations if parsable
+        # Helper to read alternation from filename
         def _alt_of(path):
             m = re.search(r'_(\d+)\.zip', os.path.basename(path))
             return int(m.group(1)) if m else None
-        print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
-        print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
 
         # Setup environment (no render for speed)
         env = basketworld.HexagonBasketballEnv(
@@ -137,58 +146,11 @@ def main(args):
             defender_pressure_turnover_chance=defender_pressure_turnover_chance,
             spawn_distance=spawn_distance,
             mask_occupied_moves=mask_occupied_moves_param,
-            illegal_defense_enabled=True,
-            illegal_defense_max_steps=3,
+            illegal_defense_enabled=illegal_defense_enabled,
+            illegal_defense_max_steps=illegal_defense_max_steps,
         )
 
-        offense_policy = PPO.load(offense_policy_path)
-        defense_policy = PPO.load(defense_policy_path)
-
-        # Heatmap accumulators (rows=height, cols=width)
-        offense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
-        defense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
-
-        def accumulate_positions():
-            # Count current step's positions into heatmaps
-            for pid in env.offense_ids:
-                q, r = env.positions[pid]
-                col, row = env._axial_to_offset(q, r)  # use env helper
-                if 0 <= row < env.court_height and 0 <= col < env.court_width:
-                    offense_heat[row, col] += 1
-            for pid in env.defense_ids:
-                q, r = env.positions[pid]
-                col, row = env._axial_to_offset(q, r)
-                if 0 <= row < env.court_height and 0 <= col < env.court_width:
-                    defense_heat[row, col] += 1
-
-        # Run episodes
-        for _ in tqdm(range(args.episodes), total=args.episodes, desc="Heatmap episodes"):
-            obs, _ = env.reset()
-            done = False
-            # include initial state
-            accumulate_positions()
-            while not done:
-                offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
-                defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
-                full_action = np.zeros(env.n_players, dtype=int)
-                for player_id in range(env.n_players):
-                    if player_id in env.offense_ids:
-                        full_action[player_id] = offense_action[player_id]
-                    else:
-                        full_action[player_id] = defense_action[player_id]
-                obs, _, done, _, _ = env.step(full_action)
-                accumulate_positions()
-
-        # Plot and save heatmaps (append alternation numbers to avoid overwrite)
-        os.makedirs(args.output_dir, exist_ok=True)
-        # Derive alternation from downloaded local filenames (matches printed values)
-        off_alt = _alt_of(offense_policy_path)
-        def_alt = _alt_of(defense_policy_path)
-        off_alt_label = str(off_alt) if off_alt is not None else "latest"
-        def_alt_label = str(def_alt) if def_alt is not None else "latest"
-        offense_path = os.path.join(args.output_dir, f"heatmap_offense_alt_{off_alt_label}.png")
-        defense_path = os.path.join(args.output_dir, f"heatmap_defense_alt_{def_alt_label}.png")
-
+        # Plot helper (defined once)
         def _plot_hex_heat(arr: np.ndarray, title: str, path: str, cmap_name: str):
             fig, ax = plt.subplots(figsize=(max(8, env.court_width/1.5), max(6, env.court_height/1.5)))
             ax.set_aspect('equal')
@@ -218,11 +180,15 @@ def main(args):
                     )
                     ax.add_patch(hexagon)
 
+                    # Count label at center
+                    label_color = 'white' if val > 0 else '#666666'
+                    ax.text(x, y, str(val), color=label_color, ha='center', va='center', fontsize=7.0, zorder=7)
+
                     # Draw 3pt outline
                     cell_distance = env._hex_distance((q, r_ax), env.basket_position)
                     if cell_distance == env.three_point_distance:
                         tp_outline = RegularPolygon((x, y), numVertices=6, radius=hex_radius,
-                                                    orientation=0, facecolor='none', edgecolor='red', linewidth=1.8, zorder=5)
+                                                    orientation=0, facecolor='none', edgecolor='red', linewidth=3, zorder=5)
                         ax.add_patch(tp_outline)
 
                     # Basket ring
@@ -251,16 +217,114 @@ def main(args):
             plt.savefig(path, dpi=220)
             plt.close(fig)
 
-        _plot_hex_heat(offense_heat, "Offense Heatmap", offense_path, cmap_name='Reds')
-        _plot_hex_heat(defense_heat, "Defense Heatmap", defense_path, cmap_name='Blues')
-        print(f"Saved: {offense_path}\nSaved: {defense_path}")
+        all_saved_paths = []
+        offense_paths = []
+        defense_paths = []
+        # Iterate through each alternation pair
+        for off_alt_req, def_alt_req in zip(offense_alts, defense_alts):
+            offense_art_path = _select_policy_artifact(artifacts, "offense", off_alt_req)
+            defense_art_path = _select_policy_artifact(artifacts, "defense", def_alt_req)
 
-        # Log to MLflow
-        if not args.no_log_mlflow:
+            offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
+            defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
+
+            print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
+            print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
+
+            offense_policy = PPO.load(offense_policy_path)
+            defense_policy = PPO.load(defense_policy_path)
+
+            # Heatmap accumulators (rows=height, cols=width)
+            offense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
+            defense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
+
+            def accumulate_positions():
+                # Count current step's positions into heatmaps
+                for pid in env.offense_ids:
+                    q, r = env.positions[pid]
+                    col, row = env._axial_to_offset(q, r)
+                    if 0 <= row < env.court_height and 0 <= col < env.court_width:
+                        offense_heat[row, col] += 1
+                for pid in env.defense_ids:
+                    q, r = env.positions[pid]
+                    col, row = env._axial_to_offset(q, r)
+                    if 0 <= row < env.court_height and 0 <= col < env.court_width:
+                        defense_heat[row, col] += 1
+
+            # Run episodes for this pair
+            for _ in tqdm(range(args.episodes), total=args.episodes, desc="Heatmap episodes"):
+                obs, _ = env.reset()
+                done = False
+                accumulate_positions()
+                while not done:
+                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
+                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
+                    full_action = np.zeros(env.n_players, dtype=int)
+                    for player_id in range(env.n_players):
+                        if player_id in env.offense_ids:
+                            full_action[player_id] = offense_action[player_id]
+                        else:
+                            full_action[player_id] = defense_action[player_id]
+                    obs, _, done, _, _ = env.step(full_action)
+                    accumulate_positions()
+
+            # Plot and save heatmaps with alternation labels for both policies
+            os.makedirs(args.output_dir, exist_ok=True)
+            off_alt = _alt_of(offense_policy_path)
+            def_alt = _alt_of(defense_policy_path)
+            off_alt_label = str(off_alt) if off_alt is not None else "latest"
+            def_alt_label = str(def_alt) if def_alt is not None else "latest"
+            offense_path = os.path.join(args.output_dir, f"heatmap_offense_off_{off_alt_label}_def_{def_alt_label}.png")
+            defense_path = os.path.join(args.output_dir, f"heatmap_defense_off_{off_alt_label}_def_{def_alt_label}.png")
+
+            _plot_hex_heat(offense_heat, f"Offense Heatmap: Offense {off_alt_label} vs Defense {def_alt_label}", offense_path, cmap_name=args.cmap_name_offense)
+            _plot_hex_heat(defense_heat, f"Defense Heatmap: Offense {off_alt_label} vs Defense {def_alt_label}", defense_path, cmap_name=args.cmap_name_defense)
+            print(f"Saved: {offense_path}\nSaved: {defense_path}")
+            all_saved_paths.extend([offense_path, defense_path])
+            offense_paths.append(offense_path)
+            defense_paths.append(defense_path)
+
+        # Log to MLflow (all generated)
+        if not args.no_log_mlflow and all_saved_paths:
             with mlflow.start_run(run_id=args.run_id):
-                mlflow.log_artifact(offense_path, artifact_path="heatmaps")
-                mlflow.log_artifact(defense_path, artifact_path="heatmaps")
+                for p in all_saved_paths:
+                    mlflow.log_artifact(p, artifact_path="heatmaps")
             print("Logged heatmaps to MLflow under 'heatmaps/'.")
+
+        # Optional: create animated GIFs across alternations
+        if getattr(args, "make_gif", False):
+            try:
+                if len(offense_paths) > 0:
+                    offense_gif = os.path.join(args.output_dir, "heatmap_offense_anim.gif")
+                    offense_frames = [Image.open(p) for p in offense_paths]
+                    offense_frames[0].save(
+                        offense_gif,
+                        save_all=True,
+                        append_images=offense_frames[1:],
+                        duration=int(args.gif_duration * 1000),
+                        loop=0,
+                        optimize=False,
+                    )
+                if len(defense_paths) > 0:
+                    defense_gif = os.path.join(args.output_dir, "heatmap_defense_anim.gif")
+                    defense_frames = [Image.open(p) for p in defense_paths]
+                    defense_frames[0].save(
+                        defense_gif,
+                        save_all=True,
+                        append_images=defense_frames[1:],
+                        duration=int(args.gif_duration * 1000),
+                        loop=0,
+                        optimize=False,
+                    )
+                print("Saved animated GIFs for heatmaps.")
+                if not args.no_log_mlflow:
+                    with mlflow.start_run(run_id=args.run_id):
+                        if len(offense_paths) > 0:
+                            mlflow.log_artifact(offense_gif, artifact_path="heatmaps")
+                        if len(defense_paths) > 0:
+                            mlflow.log_artifact(defense_gif, artifact_path="heatmaps")
+            except Exception as e:
+                print(f"[warn] Failed to create heatmap GIFs: {e}")
 
 
 if __name__ == "__main__":
@@ -271,11 +335,17 @@ if __name__ == "__main__":
     parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
     parser.add_argument("--offense-alt", type=int, default=None, help="Use specific alternation for offense policy")
     parser.add_argument("--defense-alt", type=int, default=None, help="Use specific alternation for defense policy")
+    parser.add_argument("--offense-alts", type=str, default=None, help="Comma/space separated list of offense alternations")
+    parser.add_argument("--defense-alts", type=str, default=None, help="Comma/space separated list of defense alternations")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory to save heatmaps")
     parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
     # Optional overrides
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None)
     parser.add_argument("--dunk-pct", type=float, default=None)
+    parser.add_argument("--cmap-name-offense", type=str, default="winter")
+    parser.add_argument("--cmap-name-defense", type=str, default="summer")
+    parser.add_argument("--make-gif", action="store_true", help="Also compile generated images into an animated GIF")
+    parser.add_argument("--gif-duration", type=float, default=0.8, help="Seconds per frame in GIF")
 
     args = parser.parse_args()
     main(args)

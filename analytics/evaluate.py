@@ -129,7 +129,7 @@ def analyze_results(results: list, num_episodes: int):
         print("FG%: N/A")
         print("EFG%: N/A")
     if (total_shots + turnovers) > 0:
-        print(f"PPP: {1.0 * (made_2pts + made_dunks + made_3pts * 1.5) / (total_shots + turnovers):.2f}")
+        print(f"PPP: {2.0 * (made_2pts + made_dunks + made_3pts * 1.5) / (total_shots + turnovers):.2f}")
     else:
         print("PPP: N/A")
     print("\nEpisode Termination Breakdown:")
@@ -200,14 +200,17 @@ def main(args):
         defender_pressure_turnover_chance = get_param(run_params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
         # Movement mask (optional)
         mask_occupied_moves_param = get_param(run_params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        
+        illegal_defense_enabled = get_param(run_params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+        illegal_defense_max_steps = get_param(run_params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
+
         print(
             f"[run_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "
             f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
             f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}, "
             f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
             f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-            f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}"
+            f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
+            f"mask_occupied_moves={mask_occupied_moves_param}, illegal_defense_enabled={illegal_defense_enabled}, illegal_defense_max_steps={illegal_defense_max_steps}"
         )
     except KeyError as e:
         print(f"Error: Run {args.run_id} is missing a required parameter: {e}")
@@ -270,8 +273,8 @@ def main(args):
                 mask_occupied_moves=(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param),
                 allow_dunks=allow_dunks,
                 dunk_pct=dunk_pct,
-                illegal_defense_enabled=True,
-                illegal_defense_max_steps=3,
+                illegal_defense_enabled=illegal_defense_enabled,
+                illegal_defense_max_steps=illegal_defense_max_steps,
             )
 
             print("Loading policies...")

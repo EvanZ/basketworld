@@ -190,7 +190,8 @@ async def init_game(request: InitGameRequest):
         defender_pressure_turnover_chance = get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
         # Movement mask (optional)
         mask_occupied_moves = get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-
+        illegal_defense_enabled = get_param(params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
+        illegal_defense_max_steps = get_param(params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
         # Observation controls (optional)
         use_egocentric_obs = get_param(params, ["use_egocentric_obs", "use-egocentric-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
         egocentric_rotate_to_hoop = get_param(params, ["egocentric_rotate_to_hoop", "egocentric-rotate-to-hoop"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
@@ -252,6 +253,8 @@ async def init_game(request: InitGameRequest):
             include_hoop_vector=include_hoop_vector,
             normalize_obs=normalize_obs,
             mask_occupied_moves=mask_occupied_moves,
+            illegal_defense_enabled=illegal_defense_enabled,
+            illegal_defense_max_steps=illegal_defense_max_steps,
         )
         game_state.obs, _ = game_state.env.reset()
 

@@ -299,6 +299,8 @@ def setup_environment(args, training_team):
         include_hoop_vector=args.include_hoop_vector,
         normalize_obs=args.normalize_obs,
         mask_occupied_moves=args.mask_occupied_moves,
+        illegal_defense_enabled=args.illegal_defense_enabled,
+        illegal_defense_max_steps=args.illegal_defense_max_steps,
     )
     # IMPORTANT: Aggregate rewards BEFORE monitoring
     env = RewardAggregationWrapper(env)
@@ -714,6 +716,8 @@ if __name__ == "__main__":
     parser.add_argument("--normalize-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Normalize relative coordinates to roughly [-1,1].")
     parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Disallow moves into currently occupied neighboring hexes.")
     parser.add_argument("--device", type=str, default="auto", help="Device to use for training ('cuda', 'cpu', or 'auto').")
+    parser.add_argument("--illegal-defense-enabled", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable illegal defense mode.")
+    parser.add_argument("--illegal-defense-max-steps", type=int, default=3, help="Maximum number of steps to allow illegal defense.")
     args = parser.parse_args()
  
     main(args) 
