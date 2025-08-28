@@ -32,9 +32,17 @@ def analyze_results(results: list, num_episodes: int):
     episode_lengths = []
     shot_probabilities = []
     shot_distances = []
+    total_pass_attempts = 0
+    total_pass_completions = 0
+    total_pass_intercepts = 0
+    total_pass_oob = 0
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
+        total_pass_attempts += res.get('pass_attempts', 0)
+        total_pass_completions += res.get('pass_completions', 0)
+        total_pass_intercepts += res.get('pass_intercepts', 0)
+        total_pass_oob += res.get('pass_oob', 0)
         # shot_probabilities.append(res['probabilities'])
         # shot_distances.append(res['distances'])
     # print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
@@ -61,7 +69,13 @@ def analyze_results(results: list, num_episodes: int):
     made_dunks = outcomes.get("Made Dunk", 0)
     missed_dunks = outcomes.get("Missed Dunk", 0)
     score_rate = (made_2pts + made_3pts + made_dunks) / num_episodes
-    turnovers = outcomes.get('Turnover (Pressure)', 0) + outcomes.get('Turnover (OOB)', 0) + outcomes.get('Turnover (Intercepted)', 0) + outcomes.get('Turnover (Shot Clock Violation)', 0)
+    turnovers = (
+        outcomes.get('Turnover (Pressure)', 0)
+        + outcomes.get('Turnover (OOB - Move)', 0)
+        + outcomes.get('Turnover (OOB - Pass)', 0)
+        + outcomes.get('Turnover (Intercepted)', 0)
+        + outcomes.get('Turnover (Shot Clock Violation)', 0)
+    )
     total_made = made_2pts + made_3pts + made_dunks
     total_missed = missed_2pts + missed_3pts + missed_dunks
     total_shots = total_made + total_missed
@@ -76,6 +90,22 @@ def analyze_results(results: list, num_episodes: int):
     print(f"Total missed shots: {total_missed}")
     print(f"Total shots: {total_shots}")
     print(f"Total turnovers: {turnovers}")
+    if turnovers > 0:
+        print(f"  - OOB (Move): {outcomes.get('Turnover (OOB - Move)', 0)}")
+        print(f"  - OOB (Pass): {outcomes.get('Turnover (OOB - Pass)', 0)}")
+        print(f"  - Intercepted: {outcomes.get('Turnover (Intercepted)', 0)}")
+        print(f"  - Pressure: {outcomes.get('Turnover (Pressure)', 0)}")
+        print(f"  - Shot Clock: {outcomes.get('Turnover (Shot Clock Violation)', 0)}")
+    # --- Passing Statistics ---
+    print("\nPassing Stats:")
+    print(f"Pass attempts: {total_pass_attempts}")
+    print(f"Completed passes: {total_pass_completions}")
+    if total_pass_attempts > 0:
+        print(f"Pass completion%: {100.0 * total_pass_completions / total_pass_attempts:.2f}%")
+    else:
+        print("Pass completion%: N/A")
+    print(f"Intercepted passes: {total_pass_intercepts}")
+    print(f"Out-of-bounds passes: {total_pass_oob}")
     # Traditional 2PT% excludes dunks for separate reporting
     if (made_2pts + missed_2pts) > 0:
         print(f"2PT% (non-dunk): {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
@@ -170,6 +200,11 @@ def main(args):
                 offense_ids = env.offense_ids
                 
                 episode_frames = []
+                # Per-episode passing counters
+                pass_attempts = 0
+                pass_completions = 0
+                pass_intercepts = 0
+                pass_oob = 0
                 if not args.no_render:
                     frame = env.render()
                     episode_frames.append(frame)
@@ -186,6 +221,17 @@ def main(args):
                             full_action[player_id] = defense_action[player_id]
                     
                     obs, reward, done, _, info = env.step(full_action)
+                    # Count pass attempts and completions from this step
+                    step_results = info.get('action_results', {})
+                    if step_results.get('passes'):
+                        attempts_this_step = len(step_results['passes'])
+                        completions_this_step = sum(1 for _pid, pres in step_results['passes'].items() if pres.get('success'))
+                        intercepts_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'intercepted')
+                        oob_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'out_of_bounds')
+                        pass_attempts += attempts_this_step
+                        pass_completions += completions_this_step
+                        pass_intercepts += intercepts_this_step
+                        pass_oob += oob_this_step
                     
                     if not args.no_render:
                         frame = env.render()
@@ -216,9 +262,9 @@ def main(args):
                     if turnover_reason == 'intercepted':
                         outcome = "Turnover (Intercepted)"
                     elif turnover_reason == 'pass_out_of_bounds':
-                        outcome = "Turnover (OOB)"
+                        outcome = "Turnover (OOB - Pass)"
                     elif turnover_reason == 'move_out_of_bounds':
-                        outcome = "Turnover (OOB)"
+                        outcome = "Turnover (OOB - Move)"
                     elif turnover_reason == 'defender_pressure':
                         outcome = "Turnover (Pressure)"
                 # Check the env state directly for shot clock violation, as info can be off by one step
@@ -230,6 +276,10 @@ def main(args):
                     "outcome": outcome,
                     "length": env.unwrapped.step_count,
                     "episode_num": i,
+                    "pass_attempts": pass_attempts,
+                    "pass_completions": pass_completions,
+                    "pass_intercepts": pass_intercepts,
+                    "pass_oob": pass_oob,
                     # "probabilities": shot_result['probability'],
                     # "distances": shot_result['distance'],
                 })

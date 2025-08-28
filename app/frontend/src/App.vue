@@ -3,7 +3,7 @@ import { ref, watch } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
@@ -15,6 +15,8 @@ const activePlayerId = ref(null);
 // Reflect the actions being applied on each step to keep UI tabs in sync during self-play
 const currentSelections = ref(null);
 const isSelfPlaying = ref(false);
+const canReplay = ref(false);
+const isReplaying = ref(false);
 // Force remount of PlayerControls to clear internal state between games
 const controlsKey = ref(0);
 
@@ -103,6 +105,19 @@ function handleMoveRecorded(moveData) {
 // New function for self-play mode (runs full episode)
 async function handleSelfPlay(preselected = null) {
   if (!gameState.value || !aiMode.value) return;
+  // Start deterministic self-play on backend: snapshot seed and initial state
+  try {
+    const res = await startSelfPlay();
+    if (res && res.status === 'success' && res.state) {
+      // Reset UI to backend's reset state so trajectories align
+      gameState.value = res.state;
+      gameHistory.value = [res.state];
+      moveHistory.value = [];
+      currentSelections.value = null;
+    }
+  } catch (e) {
+    console.error('[App] Failed to start self-play on backend:', e);
+  }
   isSelfPlaying.value = true;
   currentSelections.value = null;
   
@@ -211,6 +226,7 @@ async function handleSelfPlay(preselected = null) {
   // Self-play finished
   isSelfPlaying.value = false;
   currentSelections.value = null;
+  canReplay.value = true;
 }
 
 async function handleSaveEpisode() {
@@ -219,6 +235,29 @@ async function handleSaveEpisode() {
     alert(`Episode saved to ${res.file_path}`);
   } catch (e) {
     alert(`Failed to save episode: ${e.message}`);
+  }
+}
+
+async function handleReplay() {
+  try {
+    const res = await replayLastEpisode();
+    if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
+      // Animate the replay so it is visible in the UI
+      isReplaying.value = true;
+      gameHistory.value = [];
+      for (const s of res.states) {
+        gameState.value = s;
+        gameHistory.value.push(s);
+        // Small delay between frames
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+      isReplaying.value = false;
+    } else {
+      throw new Error('Invalid replay response');
+    }
+  } catch (e) {
+    alert(`Failed to replay episode: ${e.message}`);
   }
 }
 
@@ -250,12 +289,14 @@ function handlePlayAgain() {
 
 
     <div v-if="gameState" class="ai-toggle">
-      <label>
-        <input type="checkbox" v-model="aiMode" /> AI Mode
-      </label>
-      <label v-if="aiMode" style="margin-left: 10px;">
-        <input type="checkbox" v-model="deterministic" /> Deterministic
-      </label>
+      <button class="toggle-btn" @click="aiMode = !aiMode">
+        <font-awesome-icon :icon="aiMode ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+        <span class="toggle-label">AI Mode</span>
+      </button>
+      <button class="toggle-btn" @click="deterministic = !deterministic" :disabled="!aiMode">
+        <font-awesome-icon :icon="deterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+        <span class="toggle-label">Deterministic</span>
+      </button>
     </div>
 
     <div v-if="gameState" class="game-container">
@@ -283,6 +324,9 @@ function handlePlayAgain() {
         <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">
           Save Episode
         </button>
+        <button v-if="gameState.done && canReplay" @click="handleReplay" class="save-episode-button" style="margin-left: 0.5rem;">
+          <font-awesome-icon :icon="['fas', 'redo']" />
+        </button>
       </div>
     </div>
   </main>
@@ -307,6 +351,25 @@ header {
 .ai-toggle {
   text-align: center;
   margin-bottom: 1rem;
+}
+.toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  margin: 0 0.5rem;
+  font-size: 1.2rem;
+}
+.toggle-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.toggle-label {
+  font-weight: 500;
 }
 .game-container {
   display: flex;

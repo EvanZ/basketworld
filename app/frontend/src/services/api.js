@@ -98,6 +98,30 @@ export async function saveEpisode() {
     return response.json();
 }
 
+export async function startSelfPlay() {
+    const response = await fetch(`${API_BASE_URL}/api/start_self_play`, {
+        method: 'POST'
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to start self-play' }));
+        console.error('[API] startSelfPlay failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to start self-play');
+    }
+    return response.json();
+}
+
+export async function replayLastEpisode() {
+    const response = await fetch(`${API_BASE_URL}/api/replay_last_episode`, {
+        method: 'POST'
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to replay last episode' }));
+        console.error('[API] replayLastEpisode failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to replay last episode');
+    }
+    return response.json();
+}
+
 export async function listPolicies(runId) {
     const response = await fetch(`${API_BASE_URL}/api/list_policies`, {
         method: 'POST',

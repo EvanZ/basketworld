@@ -34,6 +34,13 @@ class GameState:
         # Track which policies are currently loaded so we can persist logs across episodes
         self.offense_policy_key: str | None = None
         self.defense_policy_key: str | None = None
+        # Self-play / replay tracking
+        self.self_play_active: bool = False
+        self.replay_seed: int | None = None
+        self.replay_initial_positions: list[tuple[int, int]] | None = None
+        self.replay_ball_holder: int | None = None
+        self.replay_shot_clock: int | None = None
+        self.actions_log: list[list[int]] = []  # full action arrays per step
 
 game_state = GameState()
 
@@ -240,6 +247,14 @@ def take_step(request: ActionRequest):
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
+    # If in self-play mode, record the full action array for replay
+    if game_state.self_play_active:
+        try:
+            game_state.actions_log.append([int(a) for a in full_action.tolist()])
+        except Exception:
+            # Ensure we still append something even if not a numpy array
+            game_state.actions_log.append([int(a) for a in list(full_action)])
+
     # Track rewards
     # Convert rewards to a list if it's a numpy array
     if isinstance(rewards, np.ndarray):
@@ -400,6 +415,9 @@ def take_step(request: ActionRequest):
         game_state.frames.append(frame)
     except Exception:
         pass
+    # End of self-play: mark inactive when episode is done
+    if game_state.self_play_active and done:
+        game_state.self_play_active = False
     
     return {
         "status": "success", 
@@ -413,6 +431,90 @@ def take_step(request: ActionRequest):
             "defense": float(game_state.episode_rewards["defense"])
         }
     }
+
+@app.post("/api/start_self_play")
+def start_self_play():
+    """Prepare deterministic self-play by resetting with current initial conditions and a fixed seed.
+
+    This ensures that replaying with the same seed and overrides reproduces outcomes.
+    """
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    # Snapshot current initial conditions
+    init_positions = [(int(q), int(r)) for (q, r) in game_state.env.positions]
+    init_ball_holder = int(game_state.env.ball_holder) if game_state.env.ball_holder is not None else None
+    init_shot_clock = int(getattr(game_state.env, "shot_clock", 24))
+
+    # Choose a seed for the episode and store everything for replay
+    # Use numpy to generate a large random seed if none present
+    import numpy as _np
+    episode_seed = int(_np.random.SeedSequence().entropy % (2**32 - 1))
+
+    game_state.replay_seed = episode_seed
+    game_state.replay_initial_positions = init_positions
+    game_state.replay_ball_holder = init_ball_holder
+    game_state.replay_shot_clock = init_shot_clock
+    game_state.actions_log = []
+    game_state.self_play_active = True
+    game_state.frames = []
+    game_state.reward_history = []
+    game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+
+    # Reset environment using overrides to avoid RNG draws during reset
+    options = {
+        "initial_positions": init_positions,
+        "ball_holder": init_ball_holder,
+        "shot_clock": init_shot_clock,
+    }
+    game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
+
+    # Capture initial frame
+    try:
+        frame = game_state.env.render()
+        game_state.frames.append(frame)
+    except Exception:
+        pass
+
+    return {"status": "success", "state": get_full_game_state(), "seed": episode_seed}
+
+@app.post("/api/replay_last_episode")
+def replay_last_episode():
+    """Replay the last self-play episode using stored seed, initial state, and action log.
+
+    Returns the sequence of states so the frontend can render the replay instantly.
+    """
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if game_state.replay_seed is None or game_state.replay_initial_positions is None or game_state.actions_log is None:
+        raise HTTPException(status_code=400, detail="No episode available to replay.")
+
+    # Reset with stored seed and overrides
+    options = {
+        "initial_positions": game_state.replay_initial_positions,
+        "ball_holder": game_state.replay_ball_holder,
+        "shot_clock": game_state.replay_shot_clock,
+    }
+    obs, _ = game_state.env.reset(seed=game_state.replay_seed, options=options)
+
+    # Build state sequence
+    states = [get_full_game_state()]
+
+    # Run through stored actions deterministically
+    for action in game_state.actions_log:
+        obs, _, _, _, _ = game_state.env.step(action)
+        # Capture frame for optional saving
+        try:
+            frame = game_state.env.render()
+            game_state.frames.append(frame)
+        except Exception:
+            pass
+        states.append(get_full_game_state())
+
+    # Update current obs/game_state to the final state
+    game_state.obs = obs
+
+    return {"status": "success", "states": states}
 
 @app.get("/api/shot_stats")
 def get_shot_stats():

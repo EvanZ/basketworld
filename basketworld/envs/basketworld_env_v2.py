@@ -94,6 +94,10 @@ class HexagonBasketballEnv(gym.Env):
         normalize_obs: bool = True,
         # Movement mask controls
         mask_occupied_moves: bool = False,
+        # Deterministic overrides (optional)
+        initial_positions: Optional[List[Tuple[int, int]]] = None,
+        initial_ball_holder: Optional[int] = None,
+        fixed_shot_clock: Optional[int] = None,
     ):
         super().__init__()
         
@@ -221,6 +225,14 @@ class HexagonBasketballEnv(gym.Env):
 
         # Precompute shoot/pass action indices
         self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
+
+        # Optional deterministic start overrides
+        self._initial_positions_override: Optional[List[Tuple[int, int]]] = None
+        if initial_positions is not None:
+            # Shallow copy to avoid accidental external mutation
+            self._initial_positions_override = [tuple(p) for p in initial_positions]
+        self._initial_ball_holder_override: Optional[int] = initial_ball_holder
+        self._fixed_shot_clock: Optional[int] = fixed_shot_clock
         
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
@@ -273,19 +285,45 @@ class HexagonBasketballEnv(gym.Env):
         """Reset the environment to initial state."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        # Resolve overrides from options (takes precedence over ctor overrides)
+        opt_positions = None
+        opt_ball_holder = None
+        opt_shot_clock = None
+        if options:
+            opt_positions = options.get("initial_positions")
+            opt_ball_holder = options.get("ball_holder")
+            opt_shot_clock = options.get("shot_clock")
 
-        max_shot_clock = self.shot_clock_steps    
-        self.shot_clock = max(10, math.floor(max_shot_clock * self._rng.random()))
+        # Shot clock setup: option > ctor fixed > random
+        if opt_shot_clock is not None:
+            self.shot_clock = int(opt_shot_clock)
+        elif self._fixed_shot_clock is not None:
+            self.shot_clock = int(self._fixed_shot_clock)
+        else:
+            max_shot_clock = self.shot_clock_steps    
+            self.shot_clock = max(10, math.floor(max_shot_clock * self._rng.random()))
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         
-        # Initialize positions (offense on right side, defense on left)
-        self.positions = self._generate_initial_positions()
+        # Initialize positions
+        if opt_positions is not None:
+            self._set_initial_positions_from_override(opt_positions)
+        elif self._initial_positions_override is not None:
+            self._set_initial_positions_from_override(self._initial_positions_override)
+        else:
+            # Offense on right side, defense on left (randomized)
+            self.positions = self._generate_initial_positions()
         
-        # Random offensive player starts with ball
-        self.ball_holder = self._rng.choice(self.offense_ids)
+        # Determine ball holder: option > ctor override > random offense
+        if opt_ball_holder is not None:
+            self._set_initial_ball_holder(int(opt_ball_holder))
+        elif self._initial_ball_holder_override is not None:
+            self._set_initial_ball_holder(int(self._initial_ball_holder_override))
+        else:
+            # Random offensive player starts with ball
+            self.ball_holder = int(self._rng.choice(self.offense_ids))
         
         obs = {
             "obs": self._get_observation(),
@@ -501,6 +539,34 @@ class HexagonBasketballEnv(gym.Env):
 
         # offense first then defense
         return offense_positions + defense_positions
+
+    def _set_initial_positions_from_override(self, positions: List[Tuple[int, int]]) -> None:
+        """Validate and set fixed initial positions by player index.
+        Expects length == n_players. Positions must be on-court and unique.
+        Basket cell is allowed only when dunks are enabled.
+        """
+        if len(positions) != self.n_players:
+            raise ValueError(f"initial_positions must have length {self.n_players}, got {len(positions)}")
+        normalized: List[Tuple[int, int]] = [tuple(p) for p in positions]
+        # Validate legality
+        seen: set[Tuple[int, int]] = set()
+        for pos in normalized:
+            if not isinstance(pos, tuple) or len(pos) != 2:
+                raise ValueError("Each initial position must be a (q, r) tuple")
+            q, r = int(pos[0]), int(pos[1])
+            if (q, r) == tuple(self.basket_position) and not self.allow_dunks:
+                raise ValueError("initial position cannot be the basket cell when dunks are disabled")
+            if not self._is_valid_position(q, r):
+                raise ValueError(f"initial position {(q, r)} is out of bounds")
+            if (q, r) in seen:
+                raise ValueError(f"duplicate initial position {(q, r)}")
+            seen.add((q, r))
+        self.positions = normalized
+
+    def _set_initial_ball_holder(self, player_id: int) -> None:
+        if not (0 <= player_id < self.n_players):
+            raise ValueError(f"ball_holder must be in [0, {self.n_players - 1}], got {player_id}")
+        self.ball_holder = int(player_id)
     
     def _is_valid_position(self, q: int, r: int) -> bool:
         """Check if a hexagon position is within the rectangular court bounds."""
