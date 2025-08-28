@@ -3,6 +3,29 @@ import imageio
 import mlflow
 import re
 from collections import defaultdict
+from time import perf_counter_ns
+
+def profile_section(section_name: str):
+    """Decorator to measure method wall time in ns when env.enable_profiling is True.
+    Placed before class definition so it's available for method decorators.
+    """
+    def _decorator(func):
+        def _wrapped(self, *args, **kwargs):
+            if not getattr(self, "enable_profiling", False):
+                return func(self, *args, **kwargs)
+            t0 = perf_counter_ns()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                dt = perf_counter_ns() - t0
+                # Lazy init if constructor did not run yet
+                if not hasattr(self, "_profile_ns"):
+                    self._profile_ns = {}
+                    self._profile_calls = {}
+                self._profile_ns[section_name] = self._profile_ns.get(section_name, 0) + dt
+                self._profile_calls[section_name] = self._profile_calls.get(section_name, 0) + 1
+        return _wrapped
+    return _decorator
 
 def get_outcome_category(outcome_str: str) -> str:
     """Categorizes a detailed outcome string into a simple category for filenames."""

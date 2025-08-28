@@ -18,6 +18,7 @@ import mlflow
 from basketworld.utils.evaluation_helpers import get_outcome_category, create_and_log_gif
 from collections import defaultdict
 from tqdm import tqdm
+from basketworld.utils.mlflow_params import get_mlflow_params
 
 
 def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool,
@@ -155,53 +156,27 @@ def main(args):
     # --- Get Hyperparameters from MLflow Run ---
     print("Fetching hyperparameters from MLflow run...")
     run_params = run.data.params
-    # Parameters are logged as strings, so we must cast them to integers
     try:
-        grid_size = int(run_params["grid_size"])
-        players = int(run_params["players"])
-        shot_clock = int(run_params["shot_clock"])
-        print(f"  - Grid Size: {grid_size}")
-        print(f"  - Players: {players}")
-        print(f"  - Shot Clock: {shot_clock}")
-        def get_param(params_dict, names, cast, default):
-            for n in names:
-                if n in params_dict and params_dict[n] != "":
-                    try:
-                        return cast(params_dict[n])
-                    except Exception:
-                        pass
-            return default
+        required, optional = get_mlflow_params(client, args.run_id)
+        grid_size = required["grid_size"]
+        players = required["players"]
+        shot_clock = required["shot_clock"]
 
-        # Optional params (added later); try multiple name variants, fall back to defaults
-        three_point_distance = get_param(
-            run_params,
-            [
-                "three_point_distance",
-                "three-point-distance",
-                "three_pt_distance",
-                "three-pt-distance",
-            ],
-            int,
-            4,
-        )
-        layup_pct = get_param(run_params, ["layup_pct", "layup-pct"], float, 0.60)
-        three_pt_pct = get_param(run_params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
-        spawn_distance = get_param(run_params, ["spawn_distance", "spawn-distance"], int, 3)
-        # Dunk params (optional)
-        allow_dunks = get_param(run_params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        dunk_pct = get_param(run_params, ["dunk_pct", "dunk-pct"], float, 0.90)
-        # Shot pressure params (optional)
-        shot_pressure_enabled = get_param(run_params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-        shot_pressure_max = get_param(run_params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
-        shot_pressure_lambda = get_param(run_params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
-        shot_pressure_arc_degrees = get_param(run_params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
-        # Defender pressure params (optional)
-        defender_pressure_distance = get_param(run_params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
-        defender_pressure_turnover_chance = get_param(run_params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
-        # Movement mask (optional)
-        mask_occupied_moves_param = get_param(run_params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        illegal_defense_enabled = get_param(run_params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        illegal_defense_max_steps = get_param(run_params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
+        three_point_distance = optional["three_point_distance"]
+        layup_pct = optional["layup_pct"]
+        three_pt_pct = optional["three_pt_pct"]
+        spawn_distance = optional["spawn_distance"]
+        allow_dunks = optional["allow_dunks"]
+        dunk_pct = optional["dunk_pct"]
+        shot_pressure_enabled = optional["shot_pressure_enabled"]
+        shot_pressure_max = optional["shot_pressure_max"]
+        shot_pressure_lambda = optional["shot_pressure_lambda"]
+        shot_pressure_arc_degrees = optional["shot_pressure_arc_degrees"]
+        defender_pressure_distance = optional["defender_pressure_distance"]
+        defender_pressure_turnover_chance = optional["defender_pressure_turnover_chance"]
+        mask_occupied_moves_param = optional["mask_occupied_moves"]
+        illegal_defense_enabled = optional["illegal_defense_enabled"]
+        illegal_defense_max_steps = optional["illegal_defense_max_steps"]
 
         print(
             f"[run_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "

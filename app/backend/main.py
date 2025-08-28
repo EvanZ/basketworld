@@ -15,6 +15,7 @@ import copy
 from datetime import datetime
 import imageio
 from basketworld.utils.evaluation_helpers import get_outcome_category
+from basketworld.utils.mlflow_params import get_mlflow_params
 
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
@@ -149,54 +150,30 @@ async def init_game(request: InitGameRequest):
     try:
         run = client.get_run(request.run_id)
         params = run.data.params
-        grid_size = int(params["grid_size"])
-        players = int(params["players"])
-        shot_clock = int(params["shot_clock"])
+        required, optional = get_mlflow_params(client, request.run_id)
+        grid_size = required["grid_size"]
+        players = required["players"]
+        shot_clock = required["shot_clock"]
 
-        def get_param(params_dict, names, cast, default):
-            for n in names:
-                if n in params_dict and params_dict[n] != "":
-                    try:
-                        return cast(params_dict[n])
-                    except Exception:
-                        pass
-            return default
-
-        # Optional params (added later); try multiple name variants, fall back to defaults
-        three_point_distance = get_param(
-            params,
-            [
-                "three_point_distance",
-                "three-point-distance",
-                "three_pt_distance",
-                "three-pt-distance",
-            ],
-            int,
-            4,
-        )
-        layup_pct = get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
-        three_pt_pct = get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
-        spawn_distance = get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
-        # Dunk params (optional)
-        allow_dunks = get_param(params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        dunk_pct = get_param(params, ["dunk_pct", "dunk-pct"], float, 0.90)
-        # Shot pressure params (optional)
-        shot_pressure_enabled = get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-        shot_pressure_max = get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
-        shot_pressure_lambda = get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
-        shot_pressure_arc_degrees = get_param(params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
-        # Defender pressure params (optional)
-        defender_pressure_distance = get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
-        defender_pressure_turnover_chance = get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
-        # Movement mask (optional)
-        mask_occupied_moves = get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        illegal_defense_enabled = get_param(params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-        illegal_defense_max_steps = get_param(params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
-        # Observation controls (optional)
-        use_egocentric_obs = get_param(params, ["use_egocentric_obs", "use-egocentric-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-        egocentric_rotate_to_hoop = get_param(params, ["egocentric_rotate_to_hoop", "egocentric-rotate-to-hoop"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-        include_hoop_vector = get_param(params, ["include_hoop_vector", "include-hoop-vector"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-        normalize_obs = get_param(params, ["normalize_obs", "normalize-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
+        three_point_distance = optional["three_point_distance"]
+        layup_pct = optional["layup_pct"]
+        three_pt_pct = optional["three_pt_pct"]
+        spawn_distance = optional["spawn_distance"]
+        allow_dunks = optional["allow_dunks"]
+        dunk_pct = optional["dunk_pct"]
+        shot_pressure_enabled = optional["shot_pressure_enabled"]
+        shot_pressure_max = optional["shot_pressure_max"]
+        shot_pressure_lambda = optional["shot_pressure_lambda"]
+        shot_pressure_arc_degrees = optional["shot_pressure_arc_degrees"]
+        defender_pressure_distance = optional["defender_pressure_distance"]
+        defender_pressure_turnover_chance = optional["defender_pressure_turnover_chance"]
+        mask_occupied_moves = optional["mask_occupied_moves"]
+        illegal_defense_enabled = optional["illegal_defense_enabled"]
+        illegal_defense_max_steps = optional["illegal_defense_max_steps"]
+        use_egocentric_obs = optional["use_egocentric_obs"]
+        egocentric_rotate_to_hoop = optional["egocentric_rotate_to_hoop"]
+        include_hoop_vector = optional["include_hoop_vector"]
+        normalize_obs = optional["normalize_obs"]
         
         # Apply request overrides if provided
         if request.spawn_distance is not None:
@@ -839,4 +816,6 @@ def get_full_game_state():
         "shot_pressure_lambda": float(getattr(game_state.env, "shot_pressure_lambda", 1.0)),
         "shot_pressure_arc_degrees": float(getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)),
         "mask_occupied_moves": bool(getattr(game_state.env, "mask_occupied_moves", False)),
+        "illegal_defense_enabled": bool(getattr(game_state.env, "illegal_defense_enabled", False)),
+        "illegal_defense_max_steps": int(getattr(game_state.env, "illegal_defense_max_steps", 3)),
     } 

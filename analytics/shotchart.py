@@ -29,16 +29,10 @@ from PIL import Image
 
 import basketworld
 from tqdm import tqdm
+from basketworld.utils.mlflow_params import get_mlflow_params
 
 
-def _get_param(params_dict, names, cast, default):
-    for n in names:
-        if n in params_dict and params_dict[n] != "":
-            try:
-                return cast(params_dict[n])
-            except Exception:
-                pass
-    return default
+# moved to utils: basketworld.utils.mlflow_params
 
 
 def _select_policy_artifact(artifacts, role: str, alternation: Optional[int]) -> str:
@@ -88,32 +82,27 @@ def main(args):
     mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient()
 
-    run = client.get_run(args.run_id)
-    params = run.data.params
+    required, optional = get_mlflow_params(client, args.run_id)
 
-    # Required
-    grid_size = int(params["grid_size"]) if "grid_size" in params else 16
-    players = int(params["players"]) if "players" in params else 3
-    shot_clock = int(params["shot_clock"]) if "shot_clock" in params else 24
+    grid_size = required["grid_size"]
+    players = required["players"]
+    shot_clock = required["shot_clock"]
 
-    # Optional
-    three_point_distance = _get_param(params, [
-        "three_point_distance", "three-point-distance", "three_pt_distance", "three-pt-distance"
-    ], int, 4)
-    layup_pct = _get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
-    three_pt_pct = _get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
-    spawn_distance = _get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
-    allow_dunks = _get_param(params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-    dunk_pct = _get_param(params, ["dunk_pct", "dunk-pct"], float, 0.90)
-    shot_pressure_enabled = _get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
-    shot_pressure_max = _get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
-    shot_pressure_lambda = _get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
-    shot_pressure_arc_degrees = _get_param(params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0)
-    defender_pressure_distance = _get_param(params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1)
-    defender_pressure_turnover_chance = _get_param(params, ["defender_pressure_turnover_chance", "defender-pressure-turnover-chance"], float, 0.05)
-    mask_occupied_moves_param = _get_param(params, ["mask_occupied_moves", "mask-occupied-moves"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-    illegal_defense_enabled = _get_param(params, ["illegal_defense_enabled", "illegal-defense-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
-    illegal_defense_max_steps = _get_param(params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3)
+    three_point_distance = optional["three_point_distance"]
+    layup_pct = optional["layup_pct"]
+    three_pt_pct = optional["three_pt_pct"]
+    spawn_distance = optional["spawn_distance"]
+    allow_dunks = optional["allow_dunks"]
+    dunk_pct = optional["dunk_pct"]
+    shot_pressure_enabled = optional["shot_pressure_enabled"]
+    shot_pressure_max = optional["shot_pressure_max"]
+    shot_pressure_lambda = optional["shot_pressure_lambda"]
+    shot_pressure_arc_degrees = optional["shot_pressure_arc_degrees"]
+    defender_pressure_distance = optional["defender_pressure_distance"]
+    defender_pressure_turnover_chance = optional["defender_pressure_turnover_chance"]
+    mask_occupied_moves_param = optional["mask_occupied_moves"]
+    illegal_defense_enabled = optional["illegal_defense_enabled"]
+    illegal_defense_max_steps = optional["illegal_defense_max_steps"]
 
     # Optional CLI overrides for dunk params
     if args.allow_dunks is not None:

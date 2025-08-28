@@ -21,7 +21,6 @@ import math
 from typing import Dict, List, Tuple, Optional, Union
 from enum import Enum
 from collections import defaultdict
-from time import perf_counter_ns
 
 # Use a non-interactive backend so rendering works in headless/threaded contexts
 import matplotlib
@@ -31,29 +30,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-
-def profile_section(section_name: str):
-    """Decorator to measure method wall time in ns when env.enable_profiling is True.
-    Placed before class definition so it's available for method decorators.
-    """
-    def _decorator(func):
-        def _wrapped(self, *args, **kwargs):
-            if not getattr(self, "enable_profiling", False):
-                return func(self, *args, **kwargs)
-            t0 = perf_counter_ns()
-            try:
-                return func(self, *args, **kwargs)
-            finally:
-                dt = perf_counter_ns() - t0
-                # Lazy init if constructor did not run yet
-                if not hasattr(self, "_profile_ns"):
-                    self._profile_ns = {}
-                    self._profile_calls = {}
-                self._profile_ns[section_name] = self._profile_ns.get(section_name, 0) + dt
-                self._profile_calls[section_name] = self._profile_calls.get(section_name, 0) + 1
-        return _wrapped
-    return _decorator
-
+from basketworld.utils.evaluation_helpers import profile_section
 
 class Team(Enum):
     OFFENSE = 0
@@ -141,16 +118,6 @@ class HexagonBasketballEnv(gym.Env):
         # Dunk configuration
         self.allow_dunks = bool(allow_dunks)
         self.dunk_pct = float(dunk_pct)
-        # Back-compat field kept (UI may use it if shot_params absent). Not authoritative anymore.
-        self.shot_probs = None
-        # New descriptive params for UI
-        self.shot_params = {
-            "model": "linear",
-            "layup_pct": self.layup_pct,
-            "three_pt_pct": self.three_pt_pct,
-            "dunk_pct": self.dunk_pct,
-            "allow_dunks": self.allow_dunks,
-        }
         # Defender shot pressure
         self.shot_pressure_enabled = bool(shot_pressure_enabled)
         self.shot_pressure_max = float(shot_pressure_max)
