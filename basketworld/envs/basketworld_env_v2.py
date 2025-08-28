@@ -62,7 +62,9 @@ class HexagonBasketballEnv(gym.Env):
     def __init__(
         self,
         grid_size: int = 16,
-        players_per_side: int = 3,
+        players: int | None = None,
+        players_per_side: int | None = None,
+        shot_clock: int | None = None,
         shot_clock_steps: int = 24,
         training_team: Team = Team.OFFENSE,
         seed: Optional[int] = None,
@@ -98,8 +100,16 @@ class HexagonBasketballEnv(gym.Env):
         self.grid_size = grid_size
         self.court_width = int(grid_size * 1.0)
         self.court_height = grid_size
-        self.players_per_side = players_per_side
-        self.shot_clock_steps = shot_clock_steps
+        # Prefer new canonical name `players`; fall back to legacy `players_per_side`
+        if players is None and players_per_side is not None:
+            players = players_per_side
+        if players is None:
+            players = 3
+        self.players_per_side = int(players)
+        # Prefer new canonical name `shot_clock`; fall back to legacy `shot_clock_steps`
+        if shot_clock is None:
+            shot_clock = shot_clock_steps
+        self.shot_clock_steps = int(shot_clock)
         self.training_team = training_team  # Which team is currently training
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
@@ -137,9 +147,9 @@ class HexagonBasketballEnv(gym.Env):
         self.illegal_defense_max_steps = int(illegal_defense_max_steps)
         
         # Total players
-        self.n_players = players_per_side * 2
-        self.offense_ids = list(range(players_per_side))
-        self.defense_ids = list(range(players_per_side, self.n_players))
+        self.n_players = self.players_per_side * 2
+        self.offense_ids = list(range(self.players_per_side))
+        self.defense_ids = list(range(self.players_per_side, self.n_players))
         
         # Action space: each player can take one of 9 actions
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)

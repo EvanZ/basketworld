@@ -48,7 +48,7 @@ def main():
     print("Setting up environment...")
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
-        players_per_side=args.players,
+        players=args.players,
         shot_clock_steps=args.shot_clock,
         render_mode="rgb_array"
     )

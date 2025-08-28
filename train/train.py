@@ -278,7 +278,7 @@ def setup_environment(args, training_team):
     """Create, configure, and wrap the environment for training."""
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
-        players_per_side=args.players,
+        players=args.players,
         shot_clock_steps=args.shot_clock,
         defender_pressure_distance=args.defender_pressure_distance,
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
@@ -546,7 +546,7 @@ def main(args):
                 # Create a renderable environment for evaluation
                 eval_env = basketworld.HexagonBasketballEnv(
                     grid_size=args.grid_size,
-                    players_per_side=args.players,
+                    players=args.players,
                     shot_clock_steps=args.shot_clock,
                     render_mode="rgb_array",
                     three_point_distance=args.three_point_distance,

@@ -18,45 +18,11 @@ import mlflow
 from basketworld.utils.evaluation_helpers import get_outcome_category, create_and_log_gif
 from collections import defaultdict
 from tqdm import tqdm
+
 from basketworld.utils.mlflow_params import get_mlflow_params
+from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv
 
 
-def setup_environment(grid_size: int, players: int, shot_clock: int, no_render: bool,
-                      three_point_distance: int, layup_pct: float, three_pt_pct: float,
-                      shot_pressure_enabled: bool, shot_pressure_max: float, shot_pressure_lambda: float, shot_pressure_arc_degrees: float,
-                      defender_pressure_distance: int, defender_pressure_turnover_chance: float,
-                      spawn_distance: int,
-                      mask_occupied_moves: bool,
-                      allow_dunks: bool,
-                      dunk_pct: float,
-                      illegal_defense_enabled: bool,
-                      illegal_defense_max_steps: int):
-    """Create and wrap the environment for evaluation."""
-    
-    render_mode = "rgb_array" if not no_render else None
-
-    env = basketworld.HexagonBasketballEnv(
-        grid_size=grid_size,
-        players_per_side=players,
-        shot_clock_steps=shot_clock,
-        render_mode=render_mode,
-        three_point_distance=three_point_distance,
-        layup_pct=layup_pct,
-        three_pt_pct=three_pt_pct,
-        allow_dunks=allow_dunks,
-        dunk_pct=dunk_pct,
-        shot_pressure_enabled=shot_pressure_enabled,
-        shot_pressure_max=shot_pressure_max,
-        shot_pressure_lambda=shot_pressure_lambda,
-        shot_pressure_arc_degrees=shot_pressure_arc_degrees,
-        defender_pressure_distance=defender_pressure_distance,
-        defender_pressure_turnover_chance=defender_pressure_turnover_chance,
-        spawn_distance=spawn_distance,
-        mask_occupied_moves=mask_occupied_moves,
-        illegal_defense_enabled=illegal_defense_enabled,
-        illegal_defense_max_steps=illegal_defense_max_steps,
-    )
-    return env
 
 def analyze_results(results: list, num_episodes: int):
     """Analyzes and prints the evaluation results."""
@@ -155,38 +121,9 @@ def main(args):
 
     # --- Get Hyperparameters from MLflow Run ---
     print("Fetching hyperparameters from MLflow run...")
-    run_params = run.data.params
     try:
         required, optional = get_mlflow_params(client, args.run_id)
-        grid_size = required["grid_size"]
-        players = required["players"]
-        shot_clock = required["shot_clock"]
 
-        three_point_distance = optional["three_point_distance"]
-        layup_pct = optional["layup_pct"]
-        three_pt_pct = optional["three_pt_pct"]
-        spawn_distance = optional["spawn_distance"]
-        allow_dunks = optional["allow_dunks"]
-        dunk_pct = optional["dunk_pct"]
-        shot_pressure_enabled = optional["shot_pressure_enabled"]
-        shot_pressure_max = optional["shot_pressure_max"]
-        shot_pressure_lambda = optional["shot_pressure_lambda"]
-        shot_pressure_arc_degrees = optional["shot_pressure_arc_degrees"]
-        defender_pressure_distance = optional["defender_pressure_distance"]
-        defender_pressure_turnover_chance = optional["defender_pressure_turnover_chance"]
-        mask_occupied_moves_param = optional["mask_occupied_moves"]
-        illegal_defense_enabled = optional["illegal_defense_enabled"]
-        illegal_defense_max_steps = optional["illegal_defense_max_steps"]
-
-        print(
-            f"[run_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "
-            f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
-            f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}, "
-            f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
-            f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-            f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
-            f"mask_occupied_moves={mask_occupied_moves_param}, illegal_defense_enabled={illegal_defense_enabled}, illegal_defense_max_steps={illegal_defense_max_steps}"
-        )
     except KeyError as e:
         print(f"Error: Run {args.run_id} is missing a required parameter: {e}")
         return
@@ -210,46 +147,10 @@ def main(args):
             print(f"  - Downloaded Defense Policy: {os.path.basename(latest_defense)}")
             
             # --- Setup ---
-            print("\nSetting up environment for evaluation...")
-            # Optional CLI overrides for dunk and spawn settings
-            if getattr(args, "allow_dunks", None) is not None:
-                allow_dunks = args.allow_dunks
-            if getattr(args, "dunk_pct", None) is not None:
-                dunk_pct = args.dunk_pct
-            if getattr(args, "spawn_distance", None) is not None:
-                spawn_distance = args.spawn_distance
 
-            # Log effective params just before environment creation
-            print(
-                f"[effective_params] grid={grid_size}, players={players}, shot_clock={shot_clock}, "
-                f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
-                f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, spawn_distance={spawn_distance}, "
-                f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
-                f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-                f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
-                f"mask_occupied_moves={(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param)}"
-            )
-
-            env = setup_environment(
-                grid_size=grid_size,
-                players=players,
-                shot_clock=shot_clock,
-                three_point_distance=three_point_distance,
-                no_render=args.no_render,
-                layup_pct=layup_pct,
-                three_pt_pct=three_pt_pct,
-                shot_pressure_enabled=shot_pressure_enabled,
-                shot_pressure_max=shot_pressure_max,
-                shot_pressure_lambda=shot_pressure_lambda,
-                shot_pressure_arc_degrees=shot_pressure_arc_degrees,
-                spawn_distance=spawn_distance,
-                defender_pressure_distance=defender_pressure_distance,
-                defender_pressure_turnover_chance=defender_pressure_turnover_chance,
-                mask_occupied_moves=(args.mask_occupied_moves if args.mask_occupied_moves is not None else mask_occupied_moves_param),
-                allow_dunks=allow_dunks,
-                dunk_pct=dunk_pct,
-                illegal_defense_enabled=illegal_defense_enabled,
-                illegal_defense_max_steps=illegal_defense_max_steps,
+            env = HexagonBasketballEnv(
+                **required,
+                **optional,
             )
 
             print("Loading policies...")
@@ -294,6 +195,7 @@ def main(args):
                 final_info = info
                 action_results = final_info.get('action_results', {})
                 outcome = "Unknown" # Default outcome
+                three_point_distance = env.three_point_distance
                 if action_results.get('shots'):
                     shot_result = list(action_results['shots'].values())[0]
                     is_dunk = (shot_result.get('distance', 999) == 0)

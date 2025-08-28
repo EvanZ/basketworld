@@ -84,43 +84,6 @@ def main(args):
 
     required, optional = get_mlflow_params(client, args.run_id)
 
-    grid_size = required["grid_size"]
-    players = required["players"]
-    shot_clock = required["shot_clock"]
-
-    three_point_distance = optional["three_point_distance"]
-    layup_pct = optional["layup_pct"]
-    three_pt_pct = optional["three_pt_pct"]
-    spawn_distance = optional["spawn_distance"]
-    allow_dunks = optional["allow_dunks"]
-    dunk_pct = optional["dunk_pct"]
-    shot_pressure_enabled = optional["shot_pressure_enabled"]
-    shot_pressure_max = optional["shot_pressure_max"]
-    shot_pressure_lambda = optional["shot_pressure_lambda"]
-    shot_pressure_arc_degrees = optional["shot_pressure_arc_degrees"]
-    defender_pressure_distance = optional["defender_pressure_distance"]
-    defender_pressure_turnover_chance = optional["defender_pressure_turnover_chance"]
-    mask_occupied_moves_param = optional["mask_occupied_moves"]
-    illegal_defense_enabled = optional["illegal_defense_enabled"]
-    illegal_defense_max_steps = optional["illegal_defense_max_steps"]
-
-    # Optional CLI overrides for dunk params
-    if args.allow_dunks is not None:
-        allow_dunks = args.allow_dunks
-    if args.dunk_pct is not None:
-        dunk_pct = args.dunk_pct
-
-    print(
-        f"[shotchart] Using params: grid={grid_size}, players={players}, shot_clock={shot_clock}, "
-        f"three_point_distance={three_point_distance}, layup_pct={layup_pct}, three_pt_pct={three_pt_pct}, "
-        f"allow_dunks={allow_dunks}, dunk_pct={dunk_pct}, "
-        f"shot_pressure_enabled={shot_pressure_enabled}, shot_pressure_max={shot_pressure_max}, "
-        f"shot_pressure_lambda={shot_pressure_lambda}, shot_pressure_arc_degrees={shot_pressure_arc_degrees}, "
-        f"defender_pressure_distance={defender_pressure_distance}, defender_pressure_turnover_chance={defender_pressure_turnover_chance}, "
-        f"mask_occupied_moves={mask_occupied_moves_param}, "
-        f"illegal_defense_enabled={illegal_defense_enabled}, illegal_defense_max_steps={illegal_defense_max_steps}"
-    )
-
     # Download models and support alternation lists
     artifacts = client.list_artifacts(args.run_id, "models")
     def _parse_alts(list_arg, single_arg):
@@ -144,25 +107,8 @@ def main(args):
 
         # Setup environment (no render for speed)
         env = basketworld.HexagonBasketballEnv(
-            grid_size=grid_size,
-            players_per_side=players,
-            shot_clock_steps=shot_clock,
-            render_mode=None,
-            three_point_distance=three_point_distance,
-            layup_pct=layup_pct,
-            three_pt_pct=three_pt_pct,
-            allow_dunks=allow_dunks,
-            dunk_pct=dunk_pct,
-            shot_pressure_enabled=shot_pressure_enabled,
-            shot_pressure_max=shot_pressure_max,
-            shot_pressure_lambda=shot_pressure_lambda,
-            shot_pressure_arc_degrees=shot_pressure_arc_degrees,
-            defender_pressure_distance=defender_pressure_distance,
-            defender_pressure_turnover_chance=defender_pressure_turnover_chance,
-            spawn_distance=spawn_distance,
-            mask_occupied_moves=mask_occupied_moves_param,
-            illegal_defense_enabled=illegal_defense_enabled,
-            illegal_defense_max_steps=illegal_defense_max_steps,
+            **required,
+            **optional,
         )
 
         # Plot helper (define before loop so we can call per alternation pair)
