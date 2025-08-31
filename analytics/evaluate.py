@@ -16,6 +16,7 @@ import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 import mlflow
 from basketworld.utils.evaluation_helpers import get_outcome_category, create_and_log_gif
+import csv
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -134,6 +135,198 @@ def analyze_results(results: list, num_episodes: int):
         percentage = (count / num_episodes) * 100
         print(f"- {outcome}: {count}/{num_episodes} ({percentage:.2f}%)")
 
+def list_models_by_alternation(client, run_id: str):
+    """Return dict alt_idx -> { 'offense': path, 'defense': path } for available pairs."""
+    artifacts = client.list_artifacts(run_id, "models")
+    offense = [f.path for f in artifacts if f.path.endswith(".zip") and ("offense_policy" in f.path or "offense" in f.path)]
+    defense = [f.path for f in artifacts if f.path.endswith(".zip") and ("defense_policy" in f.path or "defense" in f.path)]
+
+    def idx_of(p):
+        # Prefer explicit 'alt_<n>.zip'; fall back to last '_<n>.zip'
+        m = re.search(r"alt_(\d+)\.zip$", p)
+        if not m:
+            m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else None
+
+    off_map = {idx_of(p): p for p in offense if idx_of(p) is not None}
+    def_map = {idx_of(p): p for p in defense if idx_of(p) is not None}
+
+    common_idxs = sorted(set(off_map.keys()) & set(def_map.keys()))
+    result = {i: {"offense": off_map[i], "defense": def_map[i]} for i in common_idxs}
+    return result
+
+
+def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_episodes: int, required, optional, args, client, run_id: str, temp_dir: str):
+    env = HexagonBasketballEnv(
+        **required,
+        **optional,
+        render_mode="rgb_array" if not args.no_render else None,
+    )
+
+    offense_policy = PPO.load(offense_policy_path)
+    defense_policy = PPO.load(defense_policy_path)
+
+    results = []
+    for i in range(num_episodes):
+        obs, info = env.reset()
+        done = False
+        offense_ids = env.offense_ids
+
+        episode_frames = []
+        pass_attempts = 0
+        pass_completions = 0
+        pass_intercepts = 0
+        pass_oob = 0
+        if not args.no_render:
+            frame = env.render()
+            if frame is not None:
+                episode_frames.append(frame)
+
+        while not done:
+            offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
+            defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
+
+            full_action = np.zeros(env.n_players, dtype=int)
+            for player_id in range(env.n_players):
+                if player_id in offense_ids:
+                    full_action[player_id] = offense_action[player_id]
+                else:
+                    full_action[player_id] = defense_action[player_id]
+
+            obs, reward, done, _, info = env.step(full_action)
+
+            step_results = info.get('action_results', {})
+            if step_results.get('passes'):
+                attempts_this_step = len(step_results['passes'])
+                completions_this_step = sum(1 for _pid, pres in step_results['passes'].items() if pres.get('success'))
+                intercepts_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'intercepted')
+                oob_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'out_of_bounds')
+                pass_attempts += attempts_this_step
+                pass_completions += completions_this_step
+                pass_intercepts += intercepts_this_step
+                pass_oob += oob_this_step
+
+            if not args.no_render:
+                frame = env.render()
+                if frame is not None:
+                    episode_frames.append(frame)
+
+        # Determine outcome
+        final_info = info
+        action_results = final_info.get('action_results', {})
+        outcome = "Unknown"
+        three_point_distance = env.three_point_distance
+        if action_results.get('shots'):
+            shot_result = list(action_results['shots'].values())[0]
+            is_dunk = (shot_result.get('distance', 999) == 0)
+            if is_dunk:
+                outcome = "Made Dunk" if shot_result['success'] else "Missed Dunk"
+            elif shot_result['success'] and shot_result['distance'] < three_point_distance:
+                outcome = "Made 2pt"
+            elif shot_result['success'] and shot_result['distance'] >= three_point_distance:
+                outcome = "Made 3pt"
+            elif not shot_result['success'] and shot_result['distance'] < three_point_distance:
+                outcome = "Missed 2pt"
+            elif not shot_result['success'] and shot_result['distance'] >= three_point_distance:
+                outcome = "Missed 3pt"
+        elif action_results.get('turnovers'):
+            turnover_reason = action_results['turnovers'][0]['reason']
+            if turnover_reason == 'intercepted':
+                outcome = "Turnover (Intercepted)"
+            elif turnover_reason == 'pass_out_of_bounds':
+                outcome = "Turnover (OOB - Pass)"
+            elif turnover_reason == 'move_out_of_bounds':
+                outcome = "Turnover (OOB - Move)"
+            elif turnover_reason == 'defender_pressure':
+                outcome = "Turnover (Pressure)"
+        elif env.unwrapped.shot_clock <= 0:
+            outcome = "Turnover (Shot Clock Violation)"
+
+        results.append({
+            "outcome": outcome,
+            "length": env.unwrapped.step_count,
+            "pass_attempts": pass_attempts,
+            "pass_completions": pass_completions,
+            "pass_intercepts": pass_intercepts,
+            "pass_oob": pass_oob,
+        })
+
+        if not args.no_render and args.log_gifs:
+            # Optional per-episode logging if requested
+            valid_frames = [f for f in episode_frames if f is not None]
+            if valid_frames:
+                create_and_log_gif(
+                    frames=valid_frames,
+                    episode_num=i,
+                    outcome=outcome,
+                    temp_dir=temp_dir,
+                    artifact_path=f"gifs/{get_outcome_category(outcome)}"
+                )
+
+    return results
+
+
+def summarize_to_row(results: list, alternation_index: int):
+    outcomes = defaultdict(int)
+    episode_lengths = []
+    total_pass_attempts = 0
+    total_pass_completions = 0
+    total_pass_intercepts = 0
+    total_pass_oob = 0
+    for res in results:
+        outcomes[res['outcome']] += 1
+        episode_lengths.append(res['length'])
+        total_pass_attempts += res.get('pass_attempts', 0)
+        total_pass_completions += res.get('pass_completions', 0)
+        total_pass_intercepts += res.get('pass_intercepts', 0)
+        total_pass_oob += res.get('pass_oob', 0)
+
+    num_episodes = max(1, len(results))
+    avg_len = float(np.mean(episode_lengths)) if episode_lengths else 0.0
+    made_2pts = outcomes.get("Made 2pt", 0)
+    made_3pts = outcomes.get("Made 3pt", 0)
+    missed_2pts = outcomes.get("Missed 2pt", 0)
+    missed_3pts = outcomes.get("Missed 3pt", 0)
+    made_dunks = outcomes.get("Made Dunk", 0)
+    missed_dunks = outcomes.get("Missed Dunk", 0)
+    total_made = made_2pts + made_3pts + made_dunks
+    total_missed = missed_2pts + missed_3pts + missed_dunks
+    total_shots = total_made + total_missed
+    turnovers = (
+        outcomes.get('Turnover (Pressure)', 0)
+        + outcomes.get('Turnover (OOB - Move)', 0)
+        + outcomes.get('Turnover (OOB - Pass)', 0)
+        + outcomes.get('Turnover (Intercepted)', 0)
+        + outcomes.get('Turnover (Shot Clock Violation)', 0)
+    )
+
+    row = {
+        "alternation": alternation_index,
+        "episodes": num_episodes,
+        "avg_len": avg_len,
+        "score_rate": total_made / num_episodes if num_episodes else 0.0,
+        "made_2pt": made_2pts,
+        "missed_2pt": missed_2pts,
+        "made_3pt": made_3pts,
+        "missed_3pt": missed_3pts,
+        "made_dunk": made_dunks,
+        "missed_dunk": missed_dunks,
+        "total_shots": total_shots,
+        "turnovers": turnovers,
+        "pass_attempts": total_pass_attempts,
+        "pass_completions": total_pass_completions,
+        "pass_intercepts": total_pass_intercepts,
+        "pass_oob": total_pass_oob,
+        "pct_2pt": (made_2pts / (made_2pts + missed_2pts)) if (made_2pts + missed_2pts) > 0 else 0.0,
+        "pct_3pt": (made_3pts / (made_3pts + missed_3pts)) if (made_3pts + missed_3pts) > 0 else 0.0,
+        "pct_dunk": (made_dunks / (made_dunks + missed_dunks)) if (made_dunks + missed_dunks) > 0 else 0.0,
+        "fg_pct": (total_made / total_shots) if total_shots > 0 else 0.0,
+        "efg_pct": ((made_2pts + made_dunks + 1.5 * made_3pts) / total_shots) if total_shots > 0 else 0.0,
+        "ppp": (2.0 * (made_2pts + made_dunks + 1.5 * made_3pts) / (total_shots + turnovers)) if (total_shots + turnovers) > 0 else 0.0,
+    }
+    return row
+
+
 def main(args):
     """Main evaluation function."""
     
@@ -161,141 +354,50 @@ def main(args):
     # Re-open the original run context to log new artifacts to the correct run
     with mlflow.start_run(run_id=args.run_id):
         with tempfile.TemporaryDirectory() as temp_dir:
-            # --- Download Model Artifacts ---
-            print(f"Fetching latest models from MLflow Run ID: {args.run_id}")
-            
-            artifacts = client.list_artifacts(args.run_id, "models")
-            
-            # Find the latest offense and defense policies by alternation number
-            latest_offense = max([f.path for f in artifacts if "offense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
-            latest_defense = max([f.path for f in artifacts if "defense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
-            
-            offense_policy_path = client.download_artifacts(args.run_id, latest_offense, temp_dir)
-            defense_policy_path = client.download_artifacts(args.run_id, latest_defense, temp_dir)
+            if args.all_alternations:
+                print("Evaluating across all alternations...")
+                pairs = list_models_by_alternation(client, args.run_id)
+                rows = []
+                for alt_idx, pair in tqdm(pairs.items(), desc="Alternations"):
+                    offense_policy_path = client.download_artifacts(args.run_id, pair["offense"], temp_dir)
+                    defense_policy_path = client.download_artifacts(args.run_id, pair["defense"], temp_dir)
 
-            print(f"  - Downloaded Offense Policy: {os.path.basename(latest_offense)}")
-            print(f"  - Downloaded Defense Policy: {os.path.basename(latest_defense)}")
-            
-            # --- Setup ---
+                    results = run_eval_for_pair(offense_policy_path, defense_policy_path, args.episodes, required, optional, args, client, args.run_id, temp_dir)
+                    row = summarize_to_row(results, alt_idx)
+                    rows.append(row)
 
-            env = HexagonBasketballEnv(
-                **required,
-                **optional,
-            )
+                # Write CSV
+                csv_path = os.path.join(temp_dir, "evaluation_by_alternation.csv")
+                if rows:
+                    fieldnames = list(rows[0].keys())
+                    with open(csv_path, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    mlflow.log_artifact(csv_path, artifact_path="metrics")
+                    print(f"Logged CSV: {csv_path}")
+                else:
+                    print("No rows to write.")
+            else:
+                # --- Download latest matched pair (by alternation) and run single evaluation set ---
+                print(f"Fetching latest matched models from MLflow Run ID: {args.run_id}")
+                pairs = list_models_by_alternation(client, args.run_id)
+                if not pairs:
+                    print("No matched offense/defense artifacts found under 'models/'.")
+                    # Print what we see for debugging
+                    artifacts = client.list_artifacts(args.run_id, "models")
+                    print("Artifacts:")
+                    for f in artifacts:
+                        print(" -", f.path)
+                    return
+                latest_idx = max(pairs.keys())
+                latest_pair = pairs[latest_idx]
+                offense_policy_path = client.download_artifacts(args.run_id, latest_pair["offense"], temp_dir)
+                defense_policy_path = client.download_artifacts(args.run_id, latest_pair["defense"], temp_dir)
 
-            print("Loading policies...")
-            offense_policy = PPO.load(offense_policy_path)
-            defense_policy = PPO.load(defense_policy_path)
-
-            # --- Evaluation Loop ---
-            print(f"\nRunning {args.episodes} evaluation episodes...")
-            
-            num_episodes = args.episodes
-            results = []
-
-            for i in tqdm(range(num_episodes), desc="Running Evaluation"):
-                obs, info = env.reset()
-                done = False
-                
-                offense_ids = env.offense_ids
-                
-                episode_frames = []
-                # Per-episode passing counters
-                pass_attempts = 0
-                pass_completions = 0
-                pass_intercepts = 0
-                pass_oob = 0
-                if not args.no_render:
-                    frame = env.render()
-                    episode_frames.append(frame)
-
-                while not done:
-                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
-                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
-
-                    full_action = np.zeros(env.n_players, dtype=int)
-                    for player_id in range(env.n_players):
-                        if player_id in offense_ids:
-                            full_action[player_id] = offense_action[player_id]
-                        else:
-                            full_action[player_id] = defense_action[player_id]
-                    
-                    obs, reward, done, _, info = env.step(full_action)
-                    # Count pass attempts and completions from this step
-                    step_results = info.get('action_results', {})
-                    if step_results.get('passes'):
-                        attempts_this_step = len(step_results['passes'])
-                        completions_this_step = sum(1 for _pid, pres in step_results['passes'].items() if pres.get('success'))
-                        intercepts_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'intercepted')
-                        oob_this_step = sum(1 for _pid, pres in step_results['passes'].items() if not pres.get('success') and pres.get('reason') == 'out_of_bounds')
-                        pass_attempts += attempts_this_step
-                        pass_completions += completions_this_step
-                        pass_intercepts += intercepts_this_step
-                        pass_oob += oob_this_step
-                    
-                    if not args.no_render:
-                        frame = env.render()
-                        episode_frames.append(frame)
-
-                # --- Post-episode analysis ---
-                final_info = info
-                action_results = final_info.get('action_results', {})
-                outcome = "Unknown" # Default outcome
-                three_point_distance = env.three_point_distance
-                if action_results.get('shots'):
-                    shot_result = list(action_results['shots'].values())[0]
-                    is_dunk = (shot_result.get('distance', 999) == 0)
-                    if is_dunk:
-                        outcome = "Made Dunk" if shot_result['success'] else "Missed Dunk"
-                    elif shot_result['success'] and shot_result['distance'] < three_point_distance:
-                        outcome = "Made 2pt"
-                    elif shot_result['success'] and shot_result['distance'] >= three_point_distance:
-                        outcome = "Made 3pt"
-                    elif not shot_result['success'] and shot_result['distance'] < three_point_distance:
-                        outcome = "Missed 2pt"
-                    elif not shot_result['success'] and shot_result['distance'] >= three_point_distance:
-                        outcome = "Missed 3pt"
-                    else:
-                        outcome = "Unknown"
-                elif action_results.get('turnovers'):
-                    turnover_reason = action_results['turnovers'][0]['reason']
-                    if turnover_reason == 'intercepted':
-                        outcome = "Turnover (Intercepted)"
-                    elif turnover_reason == 'pass_out_of_bounds':
-                        outcome = "Turnover (OOB - Pass)"
-                    elif turnover_reason == 'move_out_of_bounds':
-                        outcome = "Turnover (OOB - Move)"
-                    elif turnover_reason == 'defender_pressure':
-                        outcome = "Turnover (Pressure)"
-                # Check the env state directly for shot clock violation, as info can be off by one step
-                elif env.unwrapped.shot_clock <= 0:
-                    outcome = "Turnover (Shot Clock Violation)"
-                
-                # Store results for final summary
-                results.append({
-                    "outcome": outcome,
-                    "length": env.unwrapped.step_count,
-                    "episode_num": i,
-                    "pass_attempts": pass_attempts,
-                    "pass_completions": pass_completions,
-                    "pass_intercepts": pass_intercepts,
-                    "pass_oob": pass_oob,
-                    # "probabilities": shot_result['probability'],
-                    # "distances": shot_result['distance'],
-                })
-
-                # --- Save and log GIF for this episode ---
-                if not args.no_render:
-                    create_and_log_gif(
-                        frames=episode_frames,
-                        episode_num=i,
-                        outcome=outcome,
-                        temp_dir=temp_dir,
-                        artifact_path=f"gifs/{get_outcome_category(outcome)}"
-                    )
-
-            # --- Final Analysis ---
-            analyze_results(results, num_episodes)
+                print(f"Loading policies for alternation {latest_idx}...")
+                results = run_eval_for_pair(offense_policy_path, defense_policy_path, args.episodes, required, optional, args, client, args.run_id, temp_dir)
+                analyze_results(results, args.episodes)
 
 
 if __name__ == "__main__":
@@ -304,11 +406,13 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--run-id", type=str, required=True, help="The MLflow Run ID to evaluate.")
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to run for evaluation.")
+    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to run per evaluation (or per alternation if --all-alternations).")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering a sample GIF.")
+    parser.add_argument("--log-gifs", action="store_true", help="Also log per-episode GIFs (can be large).")
     parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic offense actions.")
     parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Use deterministic defense actions.")
     parser.add_argument("--mask-occupied-moves", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="If set, disallow moves into currently occupied neighboring hexes.")
+    parser.add_argument("--all-alternations", action="store_true", help="Evaluate and aggregate metrics across all alternations and log a CSV artifact.")
     # Optional overrides for dunk and spawn evaluation
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None, help="Override run param to enable/disable dunks during evaluation.")
     parser.add_argument("--dunk-pct", type=float, default=None, help="Override run param for dunk make probability during evaluation.")

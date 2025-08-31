@@ -46,6 +46,8 @@ models/
 
 # data
 data/
+*.csv
+
 
 # temp
 temp/

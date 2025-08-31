@@ -176,6 +176,7 @@ async def init_game(request: InitGameRequest):
         game_state.env = basketworld.HexagonBasketballEnv(
             **required,
             **optional,
+            render_mode="rgb_array",
         )
         game_state.obs, _ = game_state.env.reset()
 
@@ -188,7 +189,8 @@ async def init_game(request: InitGameRequest):
         # Capture and keep the initial frame so saved episodes include the starting court state
         try:
             frame = game_state.env.render()
-            game_state.frames.append(frame)
+            if frame is not None:
+                game_state.frames.append(frame)
         except Exception:
             pass
 
@@ -412,7 +414,8 @@ def take_step(request: ActionRequest):
     # Capture frame after step
     try:
         frame = game_state.env.render()
-        game_state.frames.append(frame)
+        if frame is not None:
+            game_state.frames.append(frame)
     except Exception:
         pass
     # End of self-play: mark inactive when episode is done
@@ -472,7 +475,8 @@ def start_self_play():
     # Capture initial frame
     try:
         frame = game_state.env.render()
-        game_state.frames.append(frame)
+        if frame is not None:
+            game_state.frames.append(frame)
     except Exception:
         pass
 
@@ -506,7 +510,8 @@ def replay_last_episode():
         # Capture frame for optional saving
         try:
             frame = game_state.env.render()
-            game_state.frames.append(frame)
+            if frame is not None:
+                game_state.frames.append(frame)
         except Exception:
             pass
         states.append(get_full_game_state())
@@ -613,9 +618,12 @@ def save_episode():
     category = get_outcome_category(outcome)
     file_path = os.path.join("episodes", f"episode_{timestamp}_{category}.gif")
 
-    # Write frames to GIF
+    # Write frames to GIF (filter any None frames)
     try:
-        imageio.mimsave(file_path, game_state.frames, fps=1, loop=0)
+        valid_frames = [f for f in game_state.frames if f is not None]
+        if not valid_frames:
+            raise HTTPException(status_code=400, detail="No valid frames to save.")
+        imageio.mimsave(file_path, valid_frames, fps=1, loop=0)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save GIF: {e}")
 
