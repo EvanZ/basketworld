@@ -370,6 +370,29 @@ def main(args):
         mlflow.log_params(vars(args))
         print(f"MLflow Run ID: {run.info.run_id}")
 
+        # --- If continuing from a prior run, copy over prior model artifacts ---
+        # This lets us sample frozen policies from the full history in the new run.
+        if args.continue_run_id:
+            try:
+                client = mlflow.tracking.MlflowClient()
+                prior = client.list_artifacts(args.continue_run_id, "models")
+                current = client.list_artifacts(run.info.run_id, "models")
+                current_names = {os.path.basename(f.path) for f in current}
+
+                # Download and re-log any missing prior models into this run's models/ dir
+                with tempfile.TemporaryDirectory() as _tmp_copy_dir:
+                    for f in prior:
+                        if not f.path.endswith(".zip"):
+                            continue
+                        base = os.path.basename(f.path)
+                        if base in current_names:
+                            continue
+                        local_path = client.download_artifacts(args.continue_run_id, f.path, _tmp_copy_dir)
+                        mlflow.log_artifact(local_path, artifact_path="models")
+                print("Copied prior models from run", args.continue_run_id)
+            except Exception as e:
+                print("Warning: failed to copy prior models:", e)
+
         # --- Define Policy Kwargs ---
         # This allows us to set the network architecture from the command line.
         policy_kwargs = {}
