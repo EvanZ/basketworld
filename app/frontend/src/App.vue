@@ -65,6 +65,7 @@ async function handleGameStarted(setupData) {
       setupData.userTeam,
       setupData.offensePolicyName,
       setupData.defensePolicyName,
+      setupData.unifiedPolicyName ?? null,
     );
     if (response.status === 'success') {
       gameState.value = response.state;

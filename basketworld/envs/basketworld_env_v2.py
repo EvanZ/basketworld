@@ -160,7 +160,8 @@ class HexagonBasketballEnv(gym.Env):
         
         # Define the two parts of our observation space
         # Observation length depends on configuration flags
-        base_len = (self.n_players * 2) + self.n_players + 1
+        # +1 for unified policy role flag (offense=1.0, defense=0.0)
+        base_len = (self.n_players * 2) + self.n_players + 1 + 1
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -974,6 +975,7 @@ class HexagonBasketballEnv(gym.Env):
         - One-hot ball holder (redundant but retained for compatibility/debugging)
         - Shot clock (raw value)
         - Hoop vector relative to ball handler, normalized
+        - Role flag for unified policy: 1.0 if training OFFENSE else 0.0
         """
         obs: List[float] = []
 
@@ -1022,6 +1024,10 @@ class HexagonBasketballEnv(gym.Env):
 
         # Shot clock (kept unnormalized)
         obs.append(float(self.shot_clock))
+
+        # Unified policy role flag
+        role_flag = 1.0 if self.training_team == Team.OFFENSE else 0.0
+        obs.append(role_flag)
 
         # Hoop vector relative to ego-center, rotated consistently (optional)
         if self.include_hoop_vector:

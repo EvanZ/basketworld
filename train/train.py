@@ -70,20 +70,18 @@ class MLflowCallback(BaseCallback):
     A custom callback for logging metrics to MLflow.
     This callback logs the mean reward and episode length periodically.
     """
-    def __init__(self, team_name: str, offense_policy, defense_policy, log_freq: int = 2048, verbose=0):
+    def __init__(self, team_name: str, log_freq: int = 2048, verbose=0):
         super(MLflowCallback, self).__init__(verbose)
         self.team_name = team_name
         self.log_freq = log_freq
-        self.offense_policy = offense_policy
-        self.defense_policy = defense_policy
 
     def _on_step(self) -> bool:
         # Log metrics periodically to avoid performance overhead
         if self.n_calls % self.log_freq == 0:
             # The ep_info_buffer contains info from the last 100 episodes
             if self.model.ep_info_buffer:
-                # Calculate the global step by summing timesteps from both policies
-                global_step = self.offense_policy.num_timesteps + self.defense_policy.num_timesteps
+                # Use the current model's timesteps as global step
+                global_step = self.model.num_timesteps
                 
                 # Calculate the mean reward and length
                 ep_rew_mean = np.mean([ep_info["r"] for ep_info in self.model.ep_info_buffer])
@@ -128,9 +126,10 @@ class SelfPlayEnvWrapper(gym.Wrapper):
     gets an action from the frozen opponent policy, combines them, and passes
     the full action to the underlying environment.
     """
-    def __init__(self, env, opponent_policy):
+    def __init__(self, env, opponent_policy, deterministic_opponent: bool = False):
         super().__init__(env)
         self.opponent_policy = opponent_policy
+        self.deterministic_opponent = bool(deterministic_opponent)
         self._set_team_ids()
 
     def _set_team_ids(self):
@@ -155,7 +154,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         We replace the opponent's actions with predictions from the frozen policy.
         """
         # Get action from the frozen opponent policy using the last observation
-        opponent_action_raw, _ = self.opponent_policy.predict(self.last_obs, deterministic=args.deterministic_opponent)
+        opponent_action_raw, _ = self.opponent_policy.predict(self.last_obs, deterministic=self.deterministic_opponent)
         action_mask = self.last_obs['action_mask']
 
         # Combine the actions, ensuring the opponent's actions are legal
@@ -180,6 +179,25 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         self.last_obs = obs
         
         return obs, reward, done, truncated, info
+class FrozenPolicyProxy:
+    """Picklable proxy that loads a PPO policy from a local .zip path on first use.
+
+    This avoids passing non-picklable PPO instances into subprocess workers.
+    """
+    def __init__(self, policy_path: str, device: torch.device | str = "cpu"):
+        self.policy_path = str(policy_path)
+        # Store a string for device to keep picklable
+        self.device = str(device) if isinstance(device, torch.device) else device
+        self._policy = None
+
+    def _ensure_loaded(self):
+        if self._policy is None:
+            self._policy = PPO.load(self.policy_path, device=self.device)
+
+    def predict(self, obs, deterministic: bool = False):
+        self._ensure_loaded()
+        return self._policy.predict(obs, deterministic=deterministic)
+
 
 # --- Main Training Logic ---
 
@@ -196,7 +214,7 @@ def sample_geometric(indices: list[int], beta: float) -> int:
 def get_random_policy_from_artifacts(
     client,
     run_id,
-    team_prefix,
+    model_prefix,
     tmpdir,
     K: int = 20,
     beta: float = 0.8,
@@ -216,11 +234,11 @@ def get_random_policy_from_artifacts(
     artifact_path = "models"
     all_artifacts = client.list_artifacts(run_id, artifact_path)
 
-    # Extract paths for team
+    # Extract paths for prefix (e.g., unified)
     team_policies = [
         f.path
         for f in all_artifacts
-        if f.path.startswith(f"{artifact_path}/{team_prefix}") and f.path.endswith(".zip")
+        if f.path.startswith(f"{artifact_path}/{model_prefix}") and f.path.endswith(".zip")
     ]
 
     if not team_policies:
@@ -247,7 +265,7 @@ def get_random_policy_from_artifacts(
 
     print(f"  - Selected opponent policy: {os.path.basename(chosen)}")
     local_path = client.download_artifacts(run_id, chosen, tmpdir)
-    return PPO.load(local_path)
+    return local_path
 
 # --- Continuation helpers ---
 
@@ -255,6 +273,19 @@ def get_latest_policy_path(client, run_id: str, team_prefix: str) -> Optional[st
     artifact_path = "models"
     all_artifacts = client.list_artifacts(run_id, artifact_path)
     candidates = [f.path for f in all_artifacts if f.path.startswith(f"{artifact_path}/{team_prefix}") and f.path.endswith('.zip')]
+    if not candidates:
+        return None
+    def sort_key(p):
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
+    candidates.sort(key=sort_key)
+    return candidates[-1]
+
+def get_latest_unified_policy_path(client, run_id: str) -> Optional[str]:
+    """Return latest unified policy artifact path if present."""
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+    candidates = [f.path for f in all_artifacts if f.path.startswith(f"{artifact_path}/unified") and f.path.endswith('.zip')]
     if not candidates:
         return None
     def sort_key(p):
@@ -316,6 +347,7 @@ def make_vector_env(
     training_team: Team,
     opponent_policy,
     num_envs: int,
+    deterministic_opponent: bool,
 ) -> SubprocVecEnv:
     """Return a SubprocVecEnv with `num_envs` copies of the self-play environment.
 
@@ -329,10 +361,10 @@ def make_vector_env(
         return SelfPlayEnvWrapper(
             setup_environment(args, training_team),
             opponent_policy=opponent_policy,
+            deterministic_opponent=deterministic_opponent,
         )
 
-    # Use subprocesses for true parallelism across CPU cores.
-    # Use "spawn" for better compatibility across different Linux configurations.
+    # Use subprocesses for parallelism.
     return SubprocVecEnv([
         _single_env_factory for _ in range(num_envs)
     ], start_method="spawn")
@@ -415,39 +447,21 @@ def main(args):
         offense_timing_callback = RolloutUpdateTimingCallback()
         defense_timing_callback = RolloutUpdateTimingCallback()
 
-        print("Initializing policies...")
-        offense_policy = None
-        defense_policy = None
+        print("Initializing unified policy...")
+        unified_policy = None
 
         if args.continue_run_id:
             print(f"Continuing from run {args.continue_run_id}...")
             client = mlflow.tracking.MlflowClient()
             with tempfile.TemporaryDirectory() as tmpd:
-                off_art = get_latest_policy_path(client, args.continue_run_id, "offense")
-                def_art = get_latest_policy_path(client, args.continue_run_id, "defense")
-                if off_art and def_art:
-                    off_local = client.download_artifacts(args.continue_run_id, off_art, tmpd)
-                    def_local = client.download_artifacts(args.continue_run_id, def_art, tmpd)
-                    offense_policy = PPO.load(off_local, env=temp_env, device=device)
-                    defense_policy = PPO.load(def_local, env=temp_env, device=device)
-                    print(f"  - Loaded latest offense: {os.path.basename(off_art)}")
-                    print(f"  - Loaded latest defense: {os.path.basename(def_art)}")
+                uni_art = get_latest_unified_policy_path(client, args.continue_run_id)
+                if uni_art:
+                    uni_local = client.download_artifacts(args.continue_run_id, uni_art, tmpd)
+                    unified_policy = PPO.load(uni_local, env=temp_env, device=device)
+                    print(f"  - Loaded latest unified policy: {os.path.basename(uni_art)}")
 
-        if offense_policy is None or defense_policy is None:
-            offense_policy = PPO(
-                "MultiInputPolicy", 
-                temp_env, 
-                verbose=1, 
-                n_steps=args.n_steps, 
-                vf_coef=args.vf_coef,
-                ent_coef=args.ent_coef,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                tensorboard_log=None, # Disable TensorBoard if using MLflow
-                policy_kwargs=policy_kwargs,
-                device=device
-            )
-            defense_policy = PPO(
+        if unified_policy is None:
+            unified_policy = PPO(
                 "MultiInputPolicy", 
                 temp_env, 
                 verbose=1, 
@@ -464,7 +478,7 @@ def main(args):
 
         # --- Log the actual network architecture used ---
         # This ensures we capture the default if no custom arch is provided.
-        actual_net_arch = str(offense_policy.policy.net_arch)
+        actual_net_arch = str(unified_policy.policy.net_arch)
         mlflow.log_param("net_arch_used", actual_net_arch)
         print(f"  - Using network architecture: {actual_net_arch}")
 
@@ -475,80 +489,83 @@ def main(args):
             base_alt_idx = get_max_alternation_index(mlflow.tracking.MlflowClient(), args.continue_run_id)
             print(f"Resuming alternations from index {base_alt_idx + 1}")
 
+        # Create a persistent cache directory for opponent policy files used by workers
+        opponent_cache_dir = os.path.join(".opponent_cache", run.info.run_id)
+        os.makedirs(opponent_cache_dir, exist_ok=True)
+
         for i in range(args.alternations):
             print("-" * 50)
             global_alt = base_alt_idx + i + 1
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             print("-" * 50)
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # --- Load a random historical opponent for this alternation ---
-                print("\nLoading historical opponent policy...")
-                opponent_for_offense = get_random_policy_from_artifacts(
-                    mlflow.tracking.MlflowClient(), run.info.run_id, "defense", tmpdir
-                ) or defense_policy # Fallback to the latest if none are downloaded
+            # --- Load a random historical opponent for this alternation ---
+            print("\nLoading historical opponent policy...")
+            opponent_for_offense = get_random_policy_from_artifacts(
+                mlflow.tracking.MlflowClient(), run.info.run_id, "unified", opponent_cache_dir
+            )
+            if opponent_for_offense is None:
+                # Fallback: save current unified policy to a stable path
+                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
+                unified_policy.save(fallback_path)
+                opponent_for_offense = fallback_path
 
             # --- 1. Train Offense against frozen Defense ---
             print(f"\nTraining Offense...")
             offense_env = make_vector_env(
                 args,
                 training_team=Team.OFFENSE,
-                opponent_policy=opponent_for_offense,
+                opponent_policy=FrozenPolicyProxy(opponent_for_offense, device),
                 num_envs=args.num_envs,
+                deterministic_opponent=bool(args.deterministic_opponent),
             )
-            offense_policy.set_env(offense_env)
+            unified_policy.set_env(offense_env)
             
             offense_mlflow_callback = MLflowCallback(
                 team_name="Offense", 
-                offense_policy=offense_policy, 
-                defense_policy=defense_policy, 
                 log_freq=args.n_steps
             )
             
             offense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Offense")])
-            offense_policy.set_logger(offense_logger)
+            unified_policy.set_logger(offense_logger)
 
-            offense_policy.learn(
+            unified_policy.learn(
                 total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
                 callback=[offense_mlflow_callback, offense_timing_callback],
                 progress_bar=True
             )
             offense_env.close()
-            
-            with tempfile.TemporaryDirectory() as tmpdir:
-                offense_model_path = os.path.join(tmpdir, f"offense_policy_alt_{global_alt}.zip")
-                offense_policy.save(offense_model_path)
-                mlflow.log_artifact(offense_model_path, artifact_path="models")
-            print(f"Logged offense model for alternation {global_alt} to MLflow")
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                print("\nLoading historical opponent policy...")
-                opponent_for_defense = get_random_policy_from_artifacts(
-                    mlflow.tracking.MlflowClient(), run.info.run_id, "offense", tmpdir
-                ) or offense_policy # Fallback to the latest if none are downloaded
+            print("\nLoading historical opponent policy...")
+            opponent_for_defense = get_random_policy_from_artifacts(
+                mlflow.tracking.MlflowClient(), run.info.run_id, "unified", opponent_cache_dir
+            )
+            if opponent_for_defense is None:
+                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
+                unified_policy.save(fallback_path)
+                opponent_for_defense = fallback_path
 
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
             defense_env = make_vector_env(
                 args,
                 training_team=Team.DEFENSE,
-                opponent_policy=opponent_for_defense,
+                opponent_policy=FrozenPolicyProxy(opponent_for_defense, device),
                 num_envs=args.num_envs,
+                deterministic_opponent=bool(args.deterministic_opponent),
             )
-            defense_policy.set_env(defense_env)
+            unified_policy.set_env(defense_env)
 
             defense_mlflow_callback = MLflowCallback(
                 team_name="Defense", 
-                offense_policy=offense_policy, 
-                defense_policy=defense_policy, 
                 log_freq=args.n_steps
             )
 
             defense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Defense")])
-            defense_policy.set_logger(defense_logger)
+            unified_policy.set_logger(defense_logger)
 
-            defense_policy.learn(
+            unified_policy.learn(
                 total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
                 callback=[defense_mlflow_callback, defense_timing_callback],
@@ -556,11 +573,12 @@ def main(args):
             )
             defense_env.close()
 
+            # Save one unified checkpoint per alternation
             with tempfile.TemporaryDirectory() as tmpdir:
-                defense_model_path = os.path.join(tmpdir, f"defense_policy_alt_{global_alt}.zip")
-                defense_policy.save(defense_model_path)
-                mlflow.log_artifact(defense_model_path, artifact_path="models")
-            print(f"Logged defense model for alternation {global_alt} to MLflow")
+                unified_model_path = os.path.join(tmpdir, f"unified_policy_alt_{global_alt}.zip")
+                unified_policy.save(unified_model_path)
+                mlflow.log_artifact(unified_model_path, artifact_path="models")
+            print(f"Logged unified model for alternation {global_alt} to MLflow")
  
             # --- 3. Run Evaluation Phase ---
             if args.eval_freq > 0 and (i + 1) % args.eval_freq == 0:
@@ -597,17 +615,8 @@ def main(args):
                         episode_frames = []
                         
                         while not done:
-                            # Get actions from the latest policies
-                            offense_action, _ = offense_policy.predict(obs, deterministic=True)
-                            defense_action, _ = defense_policy.predict(obs, deterministic=True)
-
-                            full_action = np.zeros(eval_env.n_players, dtype=int)
-                            for player_id in range(eval_env.n_players):
-                                if player_id in eval_env.offense_ids:
-                                    full_action[player_id] = offense_action[player_id]
-                                else:
-                                    full_action[player_id] = defense_action[player_id]
-                            
+                            # Single unified policy chooses all actions
+                            full_action, _ = unified_policy.predict(obs, deterministic=True)
                             obs, reward, done, _, info = eval_env.step(full_action)
                             frame = eval_env.render()
                             episode_frames.append(frame)
