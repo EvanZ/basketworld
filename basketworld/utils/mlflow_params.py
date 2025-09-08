@@ -61,6 +61,19 @@ def get_mlflow_params(client: mlflow.tracking.MlflowClient, run_id: str) -> Tupl
     optional["include_hoop_vector"] = _get_param(params, ["include_hoop_vector", "include-hoop-vector"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
     optional["normalize_obs"] = _get_param(params, ["normalize_obs", "normalize-obs"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
 
+    # Reward parameters (to ensure evaluation uses the same reward shaping)
+    optional["pass_reward"] = _get_param(params, ["pass_reward", "pass-reward"], float, 0.0)
+    optional["turnover_penalty"] = _get_param(params, ["turnover_penalty", "turnover-penalty"], float, 0.0)
+    optional["made_shot_reward_inside"] = _get_param(params, ["made_shot_reward_inside", "made-shot-reward-inside"], float, 2.0)
+    optional["made_shot_reward_three"] = _get_param(params, ["made_shot_reward_three", "made-shot-reward-three"], float, 3.0)
+    optional["missed_shot_penalty"] = _get_param(params, ["missed_shot_penalty", "missed-shot-penalty"], float, 0.0)
+    optional["potential_assist_reward"] = _get_param(params, ["potential_assist_reward", "potential-assist-reward"], float, 0.1)
+    optional["full_assist_bonus"] = _get_param(params, ["full_assist_bonus", "full-assist-bonus"], float, 0.2)
+    # Backward-compat: support both names; map to unified 'assist_window'
+    optional["assist_window"] = _get_param(params, ["assist_window", "assist-window", "assist_window_steps", "assist-window-steps"], int, 2)
+    optional["potential_assist_pct"] = _get_param(params, ["potential_assist_pct", "potential-assist-pct"], float, 0.10)
+    optional["full_assist_bonus_pct"] = _get_param(params, ["full_assist_bonus_pct", "full-assist-bonus-pct"], float, 0.05)
+    optional["steal_chance"] = _get_param(params, ["steal_chance", "steal-chance"], float, 0.05)
     return required, optional
 
 

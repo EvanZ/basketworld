@@ -6,7 +6,7 @@
 
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
 
-export async function initGame(runId, userTeamName, offensePolicyName = null, defensePolicyName = null) {
+export async function initGame(runId, userTeamName, offensePolicyName = null, defensePolicyName = null, unifiedPolicyName = null) {
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
         method: 'POST',
         headers: {
@@ -17,6 +17,7 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
             user_team_name: userTeamName,
             offense_policy_name: offensePolicyName,
             defense_policy_name: defensePolicyName,
+            unified_policy_name: unifiedPolicyName,
         }),
     });
     if (!response.ok) {

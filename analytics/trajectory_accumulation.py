@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Create cumulative player trajectory animations over N self-play episodes for a given MLflow run.
+Create cumulative player trajectory animations over N self-play episodes for a given MLflow run (unified-only).
 
-- Loads policies (latest by default) from the run's model artifacts (supports alternation selection)
+- Loads unified policies (latest by default) from the run's model artifacts (supports alternation selection)
 - Reconstructs the environment with the run's parameters
 - Accumulates per-cell occupancy counts for offense and defense over time
 - Stores cumulative snapshots each episode to render animations where colors are scaled by the final max
@@ -31,18 +31,29 @@ from basketworld.utils.mlflow_params import get_mlflow_params
 from tqdm import tqdm
 
 
-def _select_policy_artifact(artifacts, role: str, alternation: Optional[int]) -> str:
-    """Match evaluate.py/heatmap.py logic: filter by role substring and select by r'_(\d+)\.zip'."""
-    role_artifacts = [f.path for f in artifacts if role in f.path]
-    if not role_artifacts:
-        raise RuntimeError(f"No artifacts found for role '{role}' under models/.")
+def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
+    unified_artifacts = [f.path for f in artifacts if "unified" in f.path]
+    if not unified_artifacts:
+        raise RuntimeError("No artifacts found for role 'unified' under models/.")
     if alternation is not None:
-        for p in sorted(role_artifacts):
+        for p in sorted(unified_artifacts):
             m = re.search(r'_(\d+)\.zip', p)
             if m and int(m.group(1)) == alternation:
                 return p
-        raise RuntimeError(f"No {role} policy found for alternation {alternation}. Candidates: {role_artifacts}")
-    return max(role_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+        raise RuntimeError(f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}")
+    return max(unified_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+
+def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
+    unified_artifacts = [f.path for f in artifacts if "unified" in f.path]
+    if not unified_artifacts:
+        raise RuntimeError("No artifacts found for role 'unified' under models/.")
+    if alternation is not None:
+        for p in sorted(unified_artifacts):
+            m = re.search(r'_(\d+)\.zip', p)
+            if m and int(m.group(1)) == alternation:
+                return p
+        raise RuntimeError(f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}")
+    return max(unified_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
 
 
 def _parse_alts(list_arg, single_arg):
@@ -124,11 +135,7 @@ def main(args):
     required, optional = get_mlflow_params(client, args.run_id)
 
     artifacts = client.list_artifacts(args.run_id, "models")
-
-    offense_alts = _parse_alts(getattr(args, "offense_alts", None), args.offense_alt)
-    defense_alts = _parse_alts(getattr(args, "defense_alts", None), args.defense_alt)
-    if len(offense_alts) != len(defense_alts):
-        raise ValueError(f"--offense-alts and --defense-alts must have same length (got {len(offense_alts)} vs {len(defense_alts)})")
+    unified_alts = _parse_alts(getattr(args, "unified_alts", None), args.unified_alt)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         def _alt_of(path):
@@ -143,18 +150,11 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
         all_gifs = []
 
-        for off_alt_req, def_alt_req in zip(offense_alts, defense_alts):
-            offense_art_path = _select_policy_artifact(artifacts, "offense", off_alt_req)
-            defense_art_path = _select_policy_artifact(artifacts, "defense", def_alt_req)
-
-            offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
-            defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
-
-            print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
-            print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
-
-            offense_policy = PPO.load(offense_policy_path)
-            defense_policy = PPO.load(defense_policy_path)
+        for uni_alt_req in unified_alts:
+            unified_art_path = _select_unified_artifact(artifacts, uni_alt_req)
+            unified_policy_path = client.download_artifacts(args.run_id, unified_art_path, temp_dir)
+            print(f"  - Unified policy: {os.path.basename(unified_policy_path)} (alt={_alt_of(unified_policy_path)})")
+            policy = PPO.load(unified_policy_path)
 
             offense_counts = np.zeros((env.court_height, env.court_width), dtype=np.int64)
             defense_counts = np.zeros((env.court_height, env.court_width), dtype=np.int64)
@@ -181,24 +181,16 @@ def main(args):
                 done = False
                 accumulate_positions()
                 while not done:
-                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
-                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
-                    full_action = np.zeros(env.n_players, dtype=int)
-                    for player_id in range(env.n_players):
-                        if player_id in env.offense_ids:
-                            full_action[player_id] = offense_action[player_id]
-                        else:
-                            full_action[player_id] = defense_action[player_id]
+                    full_action, _ = policy.predict(obs, deterministic=args.deterministic)
                     obs, _, done, _, _ = env.step(full_action)
                     accumulate_positions()
-                # Store deep copies for snapshots
-                offense_snapshots.append(offense_counts.copy())
-                defense_snapshots.append(defense_counts.copy())
+                # End of episode: store a cumulative snapshot so GIF animates growth
+                if done:
+                    offense_snapshots.append(offense_counts.copy())
+                    defense_snapshots.append(defense_counts.copy())
 
-            off_alt = _alt_of(offense_policy_path)
-            def_alt = _alt_of(defense_policy_path)
-            off_alt_label = str(off_alt) if off_alt is not None else "latest"
-            def_alt_label = str(def_alt) if def_alt is not None else "latest"
+            uni_alt = _alt_of(unified_policy_path)
+            uni_alt_label = str(uni_alt) if uni_alt is not None else "latest"
 
             # Fixed color scale based on final frame max
             off_vmax = int(offense_snapshots[-1].max()) if offense_snapshots else 1
@@ -211,22 +203,22 @@ def main(args):
             defense_pngs = []
 
             for idx, arr in enumerate(offense_snapshots):
-                fig = _render_hex_grid(env, arr, f"Offense Trajectory (frame {idx+1}/{len(offense_snapshots)})", args.cmap_name_offense, vmax=off_vmax, show_counts=args.show_counts)
-                out_path = os.path.join(args.output_dir, f"trajectory_offense_{off_alt_label}_{def_alt_label}_{idx:04d}.png")
+                fig = _render_hex_grid(env, arr, f"Offense Trajectory (frame {idx+1}/{len(offense_snapshots)})", args.cmap_name, vmax=off_vmax, show_counts=args.show_counts)
+                out_path = os.path.join(args.output_dir, f"trajectory_offense_unified_{uni_alt_label}_{idx:04d}.png")
                 plt.savefig(out_path, dpi=220)
                 plt.close(fig)
                 offense_pngs.append(out_path)
 
             for idx, arr in enumerate(defense_snapshots):
-                fig = _render_hex_grid(env, arr, f"Defense Trajectory (frame {idx+1}/{len(defense_snapshots)})", args.cmap_name_defense, vmax=def_vmax, show_counts=args.show_counts)
-                out_path = os.path.join(args.output_dir, f"trajectory_defense_{off_alt_label}_{def_alt_label}_{idx:04d}.png")
+                fig = _render_hex_grid(env, arr, f"Defense Trajectory (frame {idx+1}/{len(defense_snapshots)})", args.cmap_name, vmax=def_vmax, show_counts=args.show_counts)
+                out_path = os.path.join(args.output_dir, f"trajectory_defense_unified_{uni_alt_label}_{idx:04d}.png")
                 plt.savefig(out_path, dpi=220)
                 plt.close(fig)
                 defense_pngs.append(out_path)
 
             # GIF compile
             if offense_pngs:
-                offense_gif = os.path.join(args.output_dir, f"trajectory_offense_off_{off_alt_label}_def_{def_alt_label}.gif")
+                offense_gif = os.path.join(args.output_dir, f"trajectory_offense_unified_{uni_alt_label}.gif")
                 frames = [Image.open(p) for p in offense_pngs]
                 frames[0].save(
                     offense_gif,
@@ -239,7 +231,7 @@ def main(args):
                 all_gifs.append(offense_gif)
 
             if defense_pngs:
-                defense_gif = os.path.join(args.output_dir, f"trajectory_defense_off_{off_alt_label}_def_{def_alt_label}.gif")
+                defense_gif = os.path.join(args.output_dir, f"trajectory_defense_unified_{uni_alt_label}.gif")
                 frames = [Image.open(p) for p in defense_pngs]
                 frames[0].save(
                     defense_gif,
@@ -251,7 +243,7 @@ def main(args):
                 )
                 all_gifs.append(defense_gif)
 
-        # Log to MLflow
+        # Always write GIFs; also log to MLflow if enabled
         if not args.no_log_mlflow and all_gifs:
             with mlflow.start_run(run_id=args.run_id):
                 for p in all_gifs:
@@ -260,24 +252,22 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate cumulative trajectory animations from a BasketWorld MLflow run.")
+    parser = argparse.ArgumentParser(description="Generate cumulative trajectory animations from a BasketWorld MLflow run (unified-only).")
     parser.add_argument("--run-id", type=str, required=True, help="MLflow Run ID")
     parser.add_argument("--episodes", type=int, default=200, help="Number of self-play episodes")
-    parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--offense-alt", type=int, default=None, help="Use specific alternation for offense policy")
-    parser.add_argument("--defense-alt", type=int, default=None, help="Use specific alternation for defense policy")
-    parser.add_argument("--offense-alts", type=str, default=None, help="Comma/space separated list of offense alternations")
-    parser.add_argument("--defense-alts", type=str, default=None, help="Comma/space separated list of defense alternations")
+    parser.add_argument("--deterministic", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
+    parser.add_argument("--unified-alt", type=int, default=None, help="Use specific alternation for unified policy")
+    parser.add_argument("--unified-alts", type=str, default=None, help="Comma/space separated list of unified alternations")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory to save frames and GIFs")
     parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
     # Optional overrides
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None)
     parser.add_argument("--dunk-pct", type=float, default=None)
-    parser.add_argument("--cmap-name-offense", type=str, default="winter")
-    parser.add_argument("--cmap-name-defense", type=str, default="summer")
+    parser.add_argument("--cmap-name", type=str, default="winter")
     parser.add_argument("--gif-duration", type=float, default=0.5, help="Seconds per frame in GIF")
     parser.add_argument("--show-counts", action="store_true", help="Overlay integer counts on cells")
+    # Swallow stray args from older invocations
+    parser.add_argument("extras", nargs="*", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     main(args)

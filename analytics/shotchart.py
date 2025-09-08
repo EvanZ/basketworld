@@ -3,6 +3,7 @@
 Generate an offense shot chart over N self-play episodes for a given MLflow run.
 
 - Loads policies (latest by default) from the run's model artifacts
+- Supports unified policy or separate offense/defense
 - Reconstructs the environment with the run's parameters
 - Accumulates per-cell shot attempts and makes (offense) across episodes
 - Colors hexes by FG% and scales hex sizes by attempts (max attempts -> normal size)
@@ -50,6 +51,18 @@ def _select_policy_artifact(artifacts, role: str, alternation: Optional[int]) ->
     # Latest by max alternation number, exactly like evaluate.py
     return max(role_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
 
+def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
+    unified_artifacts = [f.path for f in artifacts if "unified" in f.path]
+    if not unified_artifacts:
+        raise RuntimeError("No artifacts found for role 'unified' under models/.")
+    if alternation is not None:
+        for p in sorted(unified_artifacts):
+            m = re.search(r'_(\d+)\.zip', p)
+            if m and int(m.group(1)) == alternation:
+                return p
+        raise RuntimeError(f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}")
+    return max(unified_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+
 """
 supported values are 'Accent', 'Accent_r', 'Blues', 'Blues_r', 'BrBG', 'BrBG_r', 'BuGn', 
 'BuGn_r', 'BuPu', 'BuPu_r', 'CMRmap', 'CMRmap_r', 'Dark2', 'Dark2_r', 'GnBu', 'GnBu_r', 
@@ -84,7 +97,7 @@ def main(args):
 
     required, optional = get_mlflow_params(client, args.run_id)
 
-    # Download models and support alternation lists
+    # Download models and support unified alternation list
     artifacts = client.list_artifacts(args.run_id, "models")
     def _parse_alts(list_arg, single_arg):
         if list_arg is not None and str(list_arg).strip() != "":
@@ -94,10 +107,7 @@ def main(args):
             return [int(single_arg)]
         return [None]
 
-    offense_alts = _parse_alts(getattr(args, "offense_alts", None), args.offense_alt)
-    defense_alts = _parse_alts(getattr(args, "defense_alts", None), args.defense_alt)
-    if len(offense_alts) != len(defense_alts):
-        raise ValueError(f"--offense-alts and --defense-alts must have same length (got {len(offense_alts)} vs {len(defense_alts)})")
+    unified_alts = _parse_alts(getattr(args, "unified_alts", None), args.unified_alt)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Helper to parse alternation from filename
@@ -208,18 +218,11 @@ def main(args):
 
         all_saved_paths = []
         sequence_paths = []
-        for off_alt_req, def_alt_req in zip(offense_alts, defense_alts):
-            offense_art_path = _select_policy_artifact(artifacts, "offense", off_alt_req)
-            defense_art_path = _select_policy_artifact(artifacts, "defense", def_alt_req)
-
-            offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
-            defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
-
-            print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
-            print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
-
-            offense_policy = PPO.load(offense_policy_path)
-            defense_policy = PPO.load(defense_policy_path)
+        for uni_alt_req in unified_alts:
+            unified_art_path = _select_unified_artifact(artifacts, uni_alt_req)
+            unified_policy_path = client.download_artifacts(args.run_id, unified_art_path, temp_dir)
+            print(f"  - Unified policy: {os.path.basename(unified_policy_path)} (alt={_alt_of(unified_policy_path)})")
+            policy = PPO.load(unified_policy_path)
 
             # Shot accumulators (rows=height, cols=width)
             attempts = np.zeros((env.court_height, env.court_width), dtype=np.int64)
@@ -230,17 +233,9 @@ def main(args):
                 obs, _ = env.reset()
                 done = False
                 while not done:
-                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
-                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
-                    full_action = np.zeros(env.n_players, dtype=int)
-                    for player_id in range(env.n_players):
-                        if player_id in env.offense_ids:
-                            full_action[player_id] = offense_action[player_id]
-                        else:
-                            full_action[player_id] = defense_action[player_id]
+                    full_action, _ = policy.predict(obs, deterministic=args.deterministic)
                     obs, _, done, _, info = env.step(full_action)
 
-                    # Record shot attempts and makes by origin cell
                     action_results = info.get("action_results", {}) if info else {}
                     if action_results.get("shots"):
                         for shooter_id, shot_res in action_results["shots"].items():
@@ -251,16 +246,11 @@ def main(args):
                                 if bool(shot_res.get("success", False)):
                                     makes[row, col] += 1
 
-            # Prepare output path for this pair
             os.makedirs(args.output_dir, exist_ok=True)
-            off_alt = _alt_of(offense_policy_path)
-            def_alt = _alt_of(defense_policy_path)
-            off_alt_label = str(off_alt) if off_alt is not None else "latest"
-            def_alt_label = str(def_alt) if def_alt is not None else "latest"
-            out_path = os.path.join(args.output_dir, f"shotchart_off_{off_alt_label}_def_{def_alt_label}.png")
-
-            # Render and save for this pair
-            _plot_shot_chart(attempts, makes, f"Shot Chart: Offense {off_alt_label} vs Defense {def_alt_label}", out_path, cmap_name=args.cmap_name)
+            uni_alt = _alt_of(unified_policy_path)
+            uni_alt_label = str(uni_alt) if uni_alt is not None else "latest"
+            out_path = os.path.join(args.output_dir, f"shotchart_unified_{uni_alt_label}.png")
+            _plot_shot_chart(attempts, makes, f"Shot Chart: Unified {uni_alt_label}", out_path, cmap_name=args.cmap_name)
             print(f"Saved: {out_path}")
             all_saved_paths.append(out_path)
             sequence_paths.append(out_path)
@@ -295,15 +285,12 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate an offense shot chart from a BasketWorld MLflow run.")
+    parser = argparse.ArgumentParser(description="Generate an offense shot chart from a BasketWorld MLflow run (unified-only).")
     parser.add_argument("--run-id", type=str, required=True, help="MLflow Run ID")
     parser.add_argument("--episodes", type=int, default=200, help="Number of self-play episodes")
-    parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--offense-alt", type=int, default=None, help="Use specific alternation for offense policy")
-    parser.add_argument("--defense-alt", type=int, default=None, help="Use specific alternation for defense policy")
-    parser.add_argument("--offense-alts", type=str, default=None, help="Comma/space separated list of offense alternations")
-    parser.add_argument("--defense-alts", type=str, default=None, help="Comma/space separated list of defense alternations")
+    parser.add_argument("--deterministic", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
+    parser.add_argument("--unified-alt", type=int, default=None, help="Use specific alternation for unified policy")
+    parser.add_argument("--unified-alts", type=str, default=None, help="Comma/space separated list of unified alternations")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory to save shot chart")
     parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
     # Optional overrides
@@ -315,6 +302,8 @@ if __name__ == "__main__":
     parser.add_argument("--label-fontsize", type=float, default=7.0, help="Base FG% label font size")
     parser.add_argument("--make-gif", action="store_true", help="Also compile generated images into an animated GIF")
     parser.add_argument("--gif-duration", type=float, default=0.8, help="Seconds per frame in GIF")
+    # Swallow stray args from older invocations
+    parser.add_argument("extras", nargs="*", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     main(args)

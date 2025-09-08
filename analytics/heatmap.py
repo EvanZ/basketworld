@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate offense and defense heatmaps over N self-play episodes for a given MLflow run.
+Generate offense and defense heatmaps over N self-play episodes for a given MLflow run (unified-only).
 
-- Loads policies (latest by default) from the run's model artifacts
-  - Can override to specific alternation index for offense/defense
+- Loads unified policies (latest by default) from the run's model artifacts
 - Reconstructs the environment with the run's parameters
 - Accumulates positions for offense and defense separately across steps
 - Saves heatmaps as PNGs and logs them to MLflow under heatmaps/
@@ -34,20 +33,17 @@ from tqdm import tqdm
 # moved to utils: basketworld.utils.mlflow_params
 
 
-def _select_policy_artifact(artifacts, role: str, alternation: Optional[int]) -> str:
-    """Match evaluate.py logic: filter by role substring and select by r'_(\d+)\.zip'."""
-    role_artifacts = [f.path for f in artifacts if role in f.path]
-    if not role_artifacts:
-        raise RuntimeError(f"No artifacts found for role '{role}' under models/.")
+def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
+    unified_artifacts = [f.path for f in artifacts if "unified" in f.path]
+    if not unified_artifacts:
+        raise RuntimeError("No artifacts found for role 'unified' under models/.")
     if alternation is not None:
-        # Choose the one whose pattern r'_(n)\.zip' matches the requested n
-        for p in sorted(role_artifacts):
+        for p in sorted(unified_artifacts):
             m = re.search(r'_(\d+)\.zip', p)
             if m and int(m.group(1)) == alternation:
                 return p
-        raise RuntimeError(f"No {role} policy found for alternation {alternation}. Candidates: {role_artifacts}")
-    # Latest by max alternation number, exactly like evaluate.py
-    return max(role_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+        raise RuntimeError(f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}")
+    return max(unified_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
 
 
 def main(args):
@@ -70,10 +66,7 @@ def main(args):
             return [int(single_arg)]
         return [None]
 
-    offense_alts = _parse_alts(getattr(args, "offense_alts", None), args.offense_alt)
-    defense_alts = _parse_alts(getattr(args, "defense_alts", None), args.defense_alt)
-    if len(offense_alts) != len(defense_alts):
-        raise ValueError(f"--offense-alts and --defense-alts must have same length (got {len(offense_alts)} vs {len(defense_alts)})")
+    unified_alts = _parse_alts(getattr(args, "unified_alts", None), args.unified_alt)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Helper to read alternation from filename
@@ -157,19 +150,13 @@ def main(args):
         all_saved_paths = []
         offense_paths = []
         defense_paths = []
-        # Iterate through each alternation pair
-        for off_alt_req, def_alt_req in zip(offense_alts, defense_alts):
-            offense_art_path = _select_policy_artifact(artifacts, "offense", off_alt_req)
-            defense_art_path = _select_policy_artifact(artifacts, "defense", def_alt_req)
+        # Unified-only: iterate through alternations
+        for uni_alt_req in unified_alts:
+            unified_art_path = _select_unified_artifact(artifacts, uni_alt_req)
+            unified_policy_path = client.download_artifacts(args.run_id, unified_art_path, temp_dir)
+            print(f"  - Unified policy: {os.path.basename(unified_policy_path)} (alt={_alt_of(unified_policy_path)})")
 
-            offense_policy_path = client.download_artifacts(args.run_id, offense_art_path, temp_dir)
-            defense_policy_path = client.download_artifacts(args.run_id, defense_art_path, temp_dir)
-
-            print(f"  - Offense policy: {os.path.basename(offense_policy_path)} (alt={_alt_of(offense_policy_path)})")
-            print(f"  - Defense policy: {os.path.basename(defense_policy_path)} (alt={_alt_of(defense_policy_path)})")
-
-            offense_policy = PPO.load(offense_policy_path)
-            defense_policy = PPO.load(defense_policy_path)
+            policy = PPO.load(unified_policy_path)
 
             # Heatmap accumulators (rows=height, cols=width)
             offense_heat = np.zeros((env.court_height, env.court_width), dtype=np.int64)
@@ -188,38 +175,30 @@ def main(args):
                     if 0 <= row < env.court_height and 0 <= col < env.court_width:
                         defense_heat[row, col] += 1
 
-            # Run episodes for this pair
+            # Run episodes
             for _ in tqdm(range(args.episodes), total=args.episodes, desc="Heatmap episodes"):
                 obs, _ = env.reset()
                 done = False
                 accumulate_positions()
                 while not done:
-                    offense_action, _ = offense_policy.predict(obs, deterministic=args.deterministic_offense)
-                    defense_action, _ = defense_policy.predict(obs, deterministic=args.deterministic_defense)
-                    full_action = np.zeros(env.n_players, dtype=int)
-                    for player_id in range(env.n_players):
-                        if player_id in env.offense_ids:
-                            full_action[player_id] = offense_action[player_id]
-                        else:
-                            full_action[player_id] = defense_action[player_id]
+                    full_action, _ = policy.predict(obs, deterministic=args.deterministic)
                     obs, _, done, _, _ = env.step(full_action)
                     accumulate_positions()
-
-            # Plot and save heatmaps with alternation labels for both policies
+            # Plot with unified label
             os.makedirs(args.output_dir, exist_ok=True)
-            off_alt = _alt_of(offense_policy_path)
-            def_alt = _alt_of(defense_policy_path)
-            off_alt_label = str(off_alt) if off_alt is not None else "latest"
-            def_alt_label = str(def_alt) if def_alt is not None else "latest"
-            offense_path = os.path.join(args.output_dir, f"heatmap_offense_off_{off_alt_label}_def_{def_alt_label}.png")
-            defense_path = os.path.join(args.output_dir, f"heatmap_defense_off_{off_alt_label}_def_{def_alt_label}.png")
-
-            _plot_hex_heat(offense_heat, f"Offense Heatmap: Offense {off_alt_label} vs Defense {def_alt_label}", offense_path, cmap_name=args.cmap_name_offense)
-            _plot_hex_heat(defense_heat, f"Defense Heatmap: Offense {off_alt_label} vs Defense {def_alt_label}", defense_path, cmap_name=args.cmap_name_defense)
+            uni_alt = _alt_of(unified_policy_path)
+            uni_alt_label = str(uni_alt) if uni_alt is not None else "latest"
+            offense_path = os.path.join(args.output_dir, f"heatmap_offense_unified_{uni_alt_label}.png")
+            defense_path = os.path.join(args.output_dir, f"heatmap_defense_unified_{uni_alt_label}.png")
+            cmap_uni = args.cmap_name
+            _plot_hex_heat(offense_heat, f"Offense Heatmap: Unified {uni_alt_label}", offense_path, cmap_name=cmap_uni)
+            _plot_hex_heat(defense_heat, f"Defense Heatmap: Unified {uni_alt_label}", defense_path, cmap_name=cmap_uni)
             print(f"Saved: {offense_path}\nSaved: {defense_path}")
             all_saved_paths.extend([offense_path, defense_path])
             offense_paths.append(offense_path)
             defense_paths.append(defense_path)
+
+            # Unified-only path does not produce paired labels; already saved above
 
         # Log to MLflow (all generated)
         if not args.no_log_mlflow and all_saved_paths:
@@ -265,24 +244,22 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate offense/defense heatmaps from a BasketWorld MLflow run.")
+    parser = argparse.ArgumentParser(description="Generate heatmaps from a BasketWorld MLflow run (unified-only).")
     parser.add_argument("--run-id", type=str, required=True, help="MLflow Run ID")
     parser.add_argument("--episodes", type=int, default=200, help="Number of self-play episodes")
-    parser.add_argument("--deterministic-offense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--deterministic-defense", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--offense-alt", type=int, default=None, help="Use specific alternation for offense policy")
-    parser.add_argument("--defense-alt", type=int, default=None, help="Use specific alternation for defense policy")
-    parser.add_argument("--offense-alts", type=str, default=None, help="Comma/space separated list of offense alternations")
-    parser.add_argument("--defense-alts", type=str, default=None, help="Comma/space separated list of defense alternations")
+    parser.add_argument("--deterministic", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
+    parser.add_argument("--unified-alt", type=int, default=None, help="Use specific alternation for unified policy")
+    parser.add_argument("--unified-alts", type=str, default=None, help="Comma/space separated list of unified alternations")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory to save heatmaps")
     parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
     # Optional overrides
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None)
     parser.add_argument("--dunk-pct", type=float, default=None)
-    parser.add_argument("--cmap-name-offense", type=str, default="winter")
-    parser.add_argument("--cmap-name-defense", type=str, default="summer")
+    parser.add_argument("--cmap-name", type=str, default="winter")
     parser.add_argument("--make-gif", action="store_true", help="Also compile generated images into an animated GIF")
     parser.add_argument("--gif-duration", type=float, default=0.8, help="Seconds per frame in GIF")
+    # Swallow any stray args to be robust to older invocations
+    parser.add_argument("extras", nargs="*", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     main(args)

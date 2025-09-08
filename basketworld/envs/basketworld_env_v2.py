@@ -71,6 +71,7 @@ class HexagonBasketballEnv(gym.Env):
         render_mode: Optional[str] = None,
         defender_pressure_distance: int = 1,
         defender_pressure_turnover_chance: float = 0.05,
+        steal_chance: float = 0.05,
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
@@ -87,6 +88,17 @@ class HexagonBasketballEnv(gym.Env):
         shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
         enable_profiling: bool = False,
         spawn_distance: int = 3,
+        # Reward shaping parameters
+        pass_reward: float = 0.0,
+        turnover_penalty: float = 0.0,
+        made_shot_reward_inside: float = 2.0,
+        made_shot_reward_three: float = 3.0,
+        missed_shot_penalty: float = 0.0,
+        potential_assist_reward: float = 0.1,
+        full_assist_bonus: float = 0.2,
+        # Preferred: percentage-based assist shaping
+        potential_assist_pct: float = 0.10,
+        full_assist_bonus_pct: float = 0.05,
         # Observation controls
         use_egocentric_obs: bool = True,
         egocentric_rotate_to_hoop: bool = True,
@@ -98,6 +110,7 @@ class HexagonBasketballEnv(gym.Env):
         initial_positions: Optional[List[Tuple[int, int]]] = None,
         initial_ball_holder: Optional[int] = None,
         fixed_shot_clock: Optional[int] = None,
+        assist_window: int = 2,
     ):
         super().__init__()
         
@@ -118,6 +131,7 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
+        self.steal_chance = steal_chance
         self.spawn_distance = spawn_distance
         self.use_egocentric_obs = bool(use_egocentric_obs)
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
@@ -154,13 +168,17 @@ class HexagonBasketballEnv(gym.Env):
         self.n_players = self.players_per_side * 2
         self.offense_ids = list(range(self.players_per_side))
         self.defense_ids = list(range(self.players_per_side, self.n_players))
+
+        # Assist window
+        self.assist_window = int(assist_window)
         
         # Action space: each player can take one of 9 actions
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)
         
         # Define the two parts of our observation space
         # Observation length depends on configuration flags
-        base_len = (self.n_players * 2) + self.n_players + 1
+        # +1 for unified policy role flag (offense=1.0, defense=0.0)
+        base_len = (self.n_players * 2) + self.n_players + 1 + 1
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -209,6 +227,9 @@ class HexagonBasketballEnv(gym.Env):
         self.last_action_results: Dict = {}
         # Track consecutive defender steps in the basket (key) cell
         self._defender_in_key_steps: Dict[int, int] = {}
+        # Assist tracking: window after a successful pass where a shot counts as assisted
+        # Structure: { 'passer_id': int, 'recipient_id': int, 'expires_at_step': int }
+        self._assist_candidate: Optional[Dict[str, int]] = None
 
         # Precompute per-cell move validity mask (6 directions) to speed up action mask building
         # 1 = allowed, 0 = blocked (OOB or basket hex if dunks disabled)
@@ -225,6 +246,19 @@ class HexagonBasketballEnv(gym.Env):
 
         # Precompute shoot/pass action indices
         self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
+
+        # --- Reward parameters (stored on env for evaluation compatibility) ---
+        self.pass_reward: float = float(pass_reward)
+        self.turnover_penalty: float = float(turnover_penalty)
+        self.made_shot_reward_inside: float = float(made_shot_reward_inside)
+        self.made_shot_reward_three: float = float(made_shot_reward_three)
+        self.missed_shot_penalty: float = float(missed_shot_penalty)
+        # Absolute assist rewards (legacy; prefer percentage fields below)
+        self.potential_assist_reward: float = float(potential_assist_reward)
+        self.full_assist_bonus: float = float(full_assist_bonus)
+        # Percentage-based assist rewards (preferred)
+        self.potential_assist_pct: float = float(potential_assist_pct)
+        self.full_assist_bonus_pct: float = float(full_assist_bonus_pct)
 
         # Optional deterministic start overrides
         self._initial_positions_override: Optional[List[Tuple[int, int]]] = None
@@ -306,6 +340,7 @@ class HexagonBasketballEnv(gym.Env):
         self.episode_ended = False
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
+        self._assist_candidate = None
         
         # Initialize positions
         if opt_positions is not None:
@@ -760,7 +795,7 @@ class HexagonBasketballEnv(gym.Env):
             # Closest defender in arc
             intercept_candidates.sort(key=lambda t: t[1])
             thief_id = intercept_candidates[0][0]
-            if self._rng.random() < 0.05:
+            if self._rng.random() < self.steal_chance:
                 # Interception occurs
                 self.ball_holder = thief_id
                 results["turnovers"].append({
@@ -775,6 +810,12 @@ class HexagonBasketballEnv(gym.Env):
         # Successful pass to receiver in arc
         self.ball_holder = recv_id
         results["passes"][passer_id] = {"success": True, "target": recv_id}
+        # Start/refresh assist window (configurable steps including current step)
+        self._assist_candidate = {
+            "passer_id": int(passer_id),
+            "recipient_id": int(recv_id),
+            "expires_at_step": int(self.step_count + self.assist_window),
+        }
         return
 
     def _compute_shot_pressure_multiplier(
@@ -918,13 +959,15 @@ class HexagonBasketballEnv(gym.Env):
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
         done = False
-        pass_reward = 0.0
-        turnover_penalty = 0.0
-        # Define the reward magnitude for shots (3PT outside the line)
-        # Inside arc: 1.0, At/Outside arc (>= distance) : 1.5
-        made_shot_reward_inside = 2.0
-        made_shot_reward_three = 3.0
-        missed_shot_penalty = 0.0 # No penalty for missed shots
+        pass_reward = self.pass_reward
+        turnover_penalty = self.turnover_penalty
+        # Assist shaping
+        potential_assist_reward = self.potential_assist_reward
+        full_assist_bonus = self.full_assist_bonus
+        # Define the reward magnitude for shots (2PT vs 3PT)
+        made_shot_reward_inside = self.made_shot_reward_inside
+        made_shot_reward_three = self.made_shot_reward_three
+        missed_shot_penalty = self.missed_shot_penalty
         
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
@@ -944,12 +987,13 @@ class HexagonBasketballEnv(gym.Env):
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
-                        
+
+            # Compute distance to basket for both made/missed cases
+            shooter_pos = self.positions[player_id]
+            dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
+
             if shot_result["success"]:
                 # Basket was made
-                # Distance of the shot to determine 2PT vs 3PT
-                shooter_pos = self.positions[player_id]
-                dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
                 made_shot_reward = (
                     made_shot_reward_three
                     if dist_to_basket >= self.three_point_distance
@@ -963,6 +1007,52 @@ class HexagonBasketballEnv(gym.Env):
                 # Offense missed, bad for them, good for defense
                 rewards[self.offense_ids] -= missed_shot_penalty/self.players_per_side
                 rewards[self.defense_ids] += missed_shot_penalty/self.players_per_side
+
+            # --- Assist rewards and annotations ---
+            assist_potential = False
+            assist_full = False
+            assist_passer: Optional[int] = None
+            if self._assist_candidate is not None and self._assist_candidate.get("recipient_id") == int(player_id):
+                if self.step_count <= int(self._assist_candidate.get("expires_at_step", -1)):
+                    assist_potential = True
+                    assist_passer = int(self._assist_candidate["passer_id"])
+                    # Reward potential assist
+                    # Prefer % of shot reward if configured; otherwise fall back to absolute
+                    if shot_result["success"]:
+                        base_for_pct = made_shot_reward
+                    else:
+                        # If missed, use would-be shot reward magnitude as base.
+                        # Recompute distance locally to avoid scope issues.
+                        _dist_for_pct = self._hex_distance(self.positions[player_id], self.basket_position)
+                        base_for_pct = (
+                            made_shot_reward_three if _dist_for_pct >= self.three_point_distance else made_shot_reward_inside
+                        )
+                    potential_assist_amt = (
+                        max(0.0, float(self.potential_assist_pct) * float(base_for_pct))
+                        if hasattr(self, "potential_assist_pct") and self.potential_assist_pct is not None
+                        else potential_assist_reward
+                    )
+                    # Assist shaping is symmetric: reward offense, penalize defense
+                    rewards[self.offense_ids] += potential_assist_amt/self.players_per_side
+                    rewards[self.defense_ids] -= potential_assist_amt/self.players_per_side
+                    if shot_result["success"]:
+                        assist_full = True
+                        # Full assist bonus proportional to made shot reward if configured
+                        full_bonus_amt = (
+                            max(0.0, float(self.full_assist_bonus_pct) * float(made_shot_reward))
+                            if hasattr(self, "full_assist_bonus_pct") and self.full_assist_bonus_pct is not None
+                            else full_assist_bonus
+                        )
+                        # Full assist bonus is symmetric as well
+                        rewards[self.offense_ids] += full_bonus_amt/self.players_per_side
+                        rewards[self.defense_ids] -= full_bonus_amt/self.players_per_side
+            # Annotate shot result for evaluation
+            shot_result["assist_potential"] = bool(assist_potential)
+            shot_result["assist_full"] = bool(assist_full)
+            if assist_passer is not None:
+                shot_result["assist_passer_id"] = assist_passer
+            # Clear assist window after a shot attempt (episode ends anyway)
+            self._assist_candidate = None
         
         return done, rewards
     
@@ -974,6 +1064,7 @@ class HexagonBasketballEnv(gym.Env):
         - One-hot ball holder (redundant but retained for compatibility/debugging)
         - Shot clock (raw value)
         - Hoop vector relative to ball handler, normalized
+        - Role flag for unified policy: 1.0 if training OFFENSE else 0.0
         """
         obs: List[float] = []
 
@@ -1022,6 +1113,10 @@ class HexagonBasketballEnv(gym.Env):
 
         # Shot clock (kept unnormalized)
         obs.append(float(self.shot_clock))
+
+        # Unified policy role flag
+        role_flag = 1.0 if self.training_team == Team.OFFENSE else 0.0
+        obs.append(role_flag)
 
         # Hoop vector relative to ego-center, rotated consistently (optional)
         if self.include_hoop_vector:

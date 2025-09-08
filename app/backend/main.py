@@ -25,6 +25,7 @@ class GameState:
         self.env = None
         self.offense_policy = None
         self.defense_policy = None
+        self.unified_policy = None
         self.user_team: Team = None
         self.obs = None
         self.frames = []  # List of RGB frames for the current episode
@@ -34,6 +35,7 @@ class GameState:
         # Track which policies are currently loaded so we can persist logs across episodes
         self.offense_policy_key: str | None = None
         self.defense_policy_key: str | None = None
+        self.unified_policy_key: str | None = None
         # Self-play / replay tracking
         self.self_play_active: bool = False
         self.replay_seed: int | None = None
@@ -48,8 +50,7 @@ game_state = GameState()
 class InitGameRequest(BaseModel):
     run_id: str
     user_team_name: str  # "OFFENSE" or "DEFENSE"
-    offense_policy_name: str | None = None  # optional specific policy filename
-    defense_policy_name: str | None = None
+    unified_policy_name: str | None = None
     # Optional overrides
     spawn_distance: int | None = None
     allow_dunks: bool | None = None
@@ -75,31 +76,29 @@ app.add_middleware(
 )
 
 def list_policies_from_run(client, run_id):
-    """Return sorted lists of offense and defense policy artifact paths for a run."""
+    """Return sorted list of unified policy artifact paths for a run."""
     artifacts = client.list_artifacts(run_id, "models")
-    offense = [f.path for f in artifacts if f.path.endswith(".zip") and "offense" in f.path]
-    defense = [f.path for f in artifacts if f.path.endswith(".zip") and "defense" in f.path]
+    unified = [f.path for f in artifacts if f.path.endswith(".zip") and "unified" in f.path]
 
     # sort by number embedded at end _<n>.zip if present
     def sort_key(p):
         import re
         m = re.search(r"_(\d+)\.zip$", p)
         return int(m.group(1)) if m else 0
-    offense.sort(key=sort_key)
-    defense.sort(key=sort_key)
-    return offense, defense
+    unified.sort(key=sort_key)
+    return unified
 
 
-def get_policy_path(client, run_id, policy_name: str | None, team_prefix: str):
-    """Return artifact path for given policy (downloaded locally). If name None, use latest."""
+def get_unified_policy_path(client, run_id, policy_name: str | None):
+    """Return artifact path for unified policy (downloaded locally). If name None, use latest."""
     # Use a persistent cache directory to avoid deletion before PPO.load
     cache_dir = os.path.join("episodes", "_policy_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
-    offense_paths, defense_paths = list_policies_from_run(client, run_id)
-    choices = offense_paths if team_prefix == "offense" else defense_paths
+    unified_paths = list_policies_from_run(client, run_id)
+    choices = unified_paths
     if not choices:
-        raise HTTPException(status_code=404, detail=f"No {team_prefix} policy artifacts found.")
+        raise HTTPException(status_code=404, detail=f"No unified policy artifacts found.")
 
     chosen_artifact = None
     if policy_name and any(p.endswith(policy_name) for p in choices):
@@ -127,15 +126,14 @@ def get_latest_policies_from_run(client, run_id, tmpdir):
 
 @app.post("/api/list_policies")
 def list_policies(request: ListPoliciesRequest):
-    """Return available offense and defense policy filenames for a run."""
+    """Return available unified policy filenames for a run."""
     mlflow.set_tracking_uri("http://localhost:5000")
     client = mlflow.tracking.MlflowClient()
     try:
-        offense_paths, defense_paths = list_policies_from_run(client, request.run_id)
+        unified_paths = list_policies_from_run(client, request.run_id)
         # return only basenames to frontend
         return {
-            "offense": [os.path.basename(p) for p in offense_paths],
-            "defense": [os.path.basename(p) for p in defense_paths],
+            "unified": [os.path.basename(p) for p in unified_paths],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list policies: {e}")
@@ -157,21 +155,21 @@ async def init_game(request: InitGameRequest):
     try:
         required, optional = get_mlflow_params(client, request.run_id)        
 
-        # Download selected or latest policies and determine keys
-        offense_path = get_policy_path(client, request.run_id, request.offense_policy_name, "offense")
-        defense_path = get_policy_path(client, request.run_id, request.defense_policy_name, "defense")
-        offense_key = os.path.basename(offense_path)
-        defense_key = os.path.basename(defense_path)
+        # Unified-only
+        unified_path = get_unified_policy_path(client, request.run_id, request.unified_policy_name)
+        unified_key = os.path.basename(unified_path)
 
         # Reset shot log only if policies changed
-        if game_state.offense_policy_key != offense_key or game_state.defense_policy_key != defense_key:
+        if getattr(game_state, "unified_policy_key", None) != unified_key:
             game_state.shot_log = []
-            game_state.offense_policy_key = offense_key
-            game_state.defense_policy_key = defense_key
+            game_state.unified_policy_key = unified_key
+            game_state.offense_policy_key = None
+            game_state.defense_policy_key = None
 
         # (Re)load policies from the selected paths
-        game_state.offense_policy = PPO.load(offense_path)
-        game_state.defense_policy = PPO.load(defense_path)
+        game_state.unified_policy = PPO.load(unified_path)
+        game_state.offense_policy = None
+        game_state.defense_policy = None
 
         game_state.env = basketworld.HexagonBasketballEnv(
             **required,
@@ -205,12 +203,21 @@ def take_step(request: ActionRequest):
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
-    # Get AI actions
+    # Get AI actions (unified-only)
     ai_obs = game_state.obs
     # Default to deterministic=True if not provided to preserve previous behavior
     pred_deterministic = True if request.deterministic is None else bool(request.deterministic)
-    offense_action_raw, _ = game_state.offense_policy.predict(ai_obs, deterministic=pred_deterministic)
-    defense_action_raw, _ = game_state.defense_policy.predict(ai_obs, deterministic=pred_deterministic)
+    full_action_ai, _ = game_state.unified_policy.predict(ai_obs, deterministic=pred_deterministic)
+
+    # If deterministic, precompute policy probabilities to choose best-legal fallback
+    unified_probs = None
+    if pred_deterministic:
+        try:
+            obs_tensor = game_state.unified_policy.policy.obs_to_tensor(ai_obs)[0]
+            dists = game_state.unified_policy.policy.get_distribution(obs_tensor)
+            unified_probs = [dist.probs.detach().cpu().numpy().squeeze() for dist in dists.distribution]
+        except Exception:
+            unified_probs = None
 
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
@@ -231,21 +238,29 @@ def take_step(request: ActionRequest):
                 full_action[i] = 0
         else:
             # Action comes from the AI policy
-            if i in game_state.env.offense_ids:
-                predicted_action = offense_action_raw[i]
-            else:
-                predicted_action = defense_action_raw[i]
+            predicted_action = full_action_ai[i]
             
             # Enforce action mask and add logging
             if action_mask[i][predicted_action] == 1:
                 print(f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}")
                 full_action[i] = predicted_action
             else:
-                # Fallback: choose the first legal action instead of NOOP
+                # Fallback: if deterministic, choose best legal by policy prob; else first legal
                 legal = np.where(action_mask[i] == 1)[0]
-                fallback = int(legal[0]) if len(legal) > 0 else 0
-                print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
-                full_action[i] = fallback
+                if pred_deterministic and unified_probs is not None and len(legal) > 0:
+                    probs_vec = unified_probs[i] if i < len(unified_probs) else None
+                    if probs_vec is not None and len(probs_vec) >= int(max(legal)) + 1:
+                        best_idx = int(legal[np.argmax(probs_vec[legal])])
+                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob.")
+                        full_action[i] = best_idx
+                    else:
+                        fallback = int(legal[0])
+                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}.")
+                        full_action[i] = fallback
+                else:
+                    fallback = int(legal[0]) if len(legal) > 0 else 0
+                    print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
+                    full_action[i] = fallback
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
@@ -582,8 +597,9 @@ def save_episode():
 
     os.makedirs("episodes", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Determine outcome label (carry dunk logic like evaluation/ui)
+    # Determine outcome label with assist annotations for shot outcomes
     outcome = "Unknown"
+    category = None
     try:
         ar = game_state.env.last_action_results or {}
         if ar.get("shots"):
@@ -592,14 +608,24 @@ def save_episode():
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
             is_dunk = (distance == 0)
-            if is_dunk:
-                outcome = "Made Dunk" if shot_res.get("success") else "Missed Dunk"
+            is_three = (distance >= game_state.env.three_point_distance)
+            success = bool(shot_res.get("success"))
+            assist_full = bool(shot_res.get("assist_full", False))
+            assist_potential = bool(shot_res.get("assist_potential", False))
+
+            # Build detailed category
+            shot_type = "dunk" if is_dunk else ("3pt" if is_three else "2pt")
+            if success:
+                outcome = f"Made {shot_type.upper()}" if shot_type != "dunk" else "Made Dunk"
+                category = (
+                    f"made_assisted_{shot_type}" if assist_full else f"made_unassisted_{shot_type}"
+                )
             else:
-                # Determine 2 vs 3 by distance to basket at shot time
-                if shot_res.get("success"):
-                    outcome = "Made 3pt" if distance >= game_state.env.three_point_distance else "Made 2pt"
+                outcome = f"Missed {shot_type.upper()}" if shot_type != "dunk" else "Missed Dunk"
+                if assist_potential:
+                    category = f"missed_potentially_assisted_{shot_type}"
                 else:
-                    outcome = "Missed 3pt" if distance >= game_state.env.three_point_distance else "Missed 2pt"
+                    category = f"missed_{shot_type}"
         elif ar.get("turnovers"):
             reason = ar["turnovers"][0].get("reason", "turnover")
             if reason == "intercepted":
@@ -615,7 +641,9 @@ def save_episode():
     except Exception:
         pass
 
-    category = get_outcome_category(outcome)
+    # If we didn't build a detailed category (e.g., turnover), fall back to generic mapping
+    if category is None:
+        category = get_outcome_category(outcome)
     file_path = os.path.join("episodes", f"episode_{timestamp}_{category}.gif")
 
     # Write frames to GIF (filter any None frames)
@@ -642,7 +670,7 @@ def get_policy_probabilities():
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
     try:
-        policy = game_state.offense_policy if game_state.user_team == Team.OFFENSE else game_state.defense_policy
+        policy = game_state.unified_policy
         
         # Convert observation to the format the policy expects
         obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
@@ -687,10 +715,9 @@ def get_action_values(player_id: int):
     print(f"\n[API] Received request for Q-values for player {player_id}")
     action_values = {}
     
-    # Determine which policy to use for value prediction
-    player_is_offense = player_id in game_state.env.offense_ids
-    value_policy = game_state.offense_policy if player_is_offense else game_state.defense_policy
-    gamma = value_policy.gamma # Get the discount factor
+    # Unified-only
+    value_policy = game_state.unified_policy
+    gamma = value_policy.gamma
 
     # Get the list of all possible action names from the enum
     possible_actions = [action.name for action in ActionType]
@@ -705,16 +732,13 @@ def get_action_values(player_id: int):
         # The target player takes the action, others act based on their policy
         sim_action = np.zeros(temp_env.n_players, dtype=int)
         
-        offense_actions, _ = game_state.offense_policy.predict(game_state.obs, deterministic=True)
-        defense_actions, _ = game_state.defense_policy.predict(game_state.obs, deterministic=True)
+        full_actions, _ = game_state.unified_policy.predict(game_state.obs, deterministic=True)
 
         for i in range(temp_env.n_players):
             if i == player_id:
                 sim_action[i] = action_id
-            elif i in temp_env.offense_ids:
-                sim_action[i] = offense_actions[i]
             else:
-                sim_action[i] = defense_actions[i]
+                sim_action[i] = full_actions[i]
 
         # Step the temporary environment
         next_obs, reward, _, _, _ = temp_env.step(sim_action)
@@ -804,12 +828,32 @@ def get_rewards():
             "defense_reason": reward.get("defense_reason", "Unknown")
         })
     
+    # Include reward shaping parameters so frontend can display them in Rewards tab
+    env = game_state.env
+    reward_params = {}
+    try:
+        reward_params = {
+            # Absolute team-averaged rewards
+            "pass_reward": float(getattr(env, "pass_reward", 0.0)),
+            "turnover_penalty": float(getattr(env, "turnover_penalty", 0.0)),
+            "made_shot_reward_inside": float(getattr(env, "made_shot_reward_inside", 0.0)),
+            "made_shot_reward_three": float(getattr(env, "made_shot_reward_three", 0.0)),
+            "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
+            # Percentage-based assist shaping
+            "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
+            "full_assist_bonus_pct": float(getattr(env, "full_assist_bonus_pct", 0.0)),
+            "assist_window": int(getattr(env, "assist_window", 2)),
+        }
+    except Exception:
+        reward_params = {}
+
     return {
         "reward_history": serialized_history,
         "episode_rewards": {
             "offense": float(game_state.episode_rewards["offense"]),
             "defense": float(game_state.episode_rewards["defense"])
-        }
+        },
+        "reward_params": reward_params,
     }
 
 def get_full_game_state():
@@ -845,6 +889,7 @@ def get_full_game_state():
         "shot_clock": int(game_state.env.shot_clock),
         "user_team_name": game_state.user_team.name,
         "done": game_state.env.episode_ended,
+        "training_team": getattr(game_state.env, "training_team", None).name if getattr(game_state.env, "training_team", None) else None,
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
         "last_action_results": last_action_results_py,
