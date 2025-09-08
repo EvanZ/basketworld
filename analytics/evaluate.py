@@ -37,6 +37,13 @@ def analyze_results(results: list, num_episodes: int):
     total_pass_completions = 0
     total_pass_intercepts = 0
     total_pass_oob = 0
+    total_potential_assists = 0
+    total_assists = 0
+    total_assisted_2pt = 0
+    total_assisted_3pt = 0
+    total_assisted_dunk = 0
+    avg_reward_offense_total = 0.0
+    avg_reward_defense_total = 0.0
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
@@ -44,6 +51,13 @@ def analyze_results(results: list, num_episodes: int):
         total_pass_completions += res.get('pass_completions', 0)
         total_pass_intercepts += res.get('pass_intercepts', 0)
         total_pass_oob += res.get('pass_oob', 0)
+        total_potential_assists += res.get('potential_assists', 0)
+        total_assists += res.get('assists', 0)
+        total_assisted_2pt += res.get('assisted_2pt', 0)
+        total_assisted_3pt += res.get('assisted_3pt', 0)
+        total_assisted_dunk += res.get('assisted_dunk', 0)
+        avg_reward_offense_total += float(res.get('avg_reward_offense', 0.0))
+        avg_reward_defense_total += float(res.get('avg_reward_defense', 0.0))
         # shot_probabilities.append(res['probabilities'])
         # shot_distances.append(res['distances'])
     # print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
@@ -107,6 +121,18 @@ def analyze_results(results: list, num_episodes: int):
         print("Pass completion%: N/A")
     print(f"Intercepted passes: {total_pass_intercepts}")
     print(f"Out-of-bounds passes: {total_pass_oob}")
+    # --- Assist Statistics ---
+    print("\nAssist Stats:")
+    print(f"Potential assists: {total_potential_assists}")
+    print(f"Assists: {total_assists}")
+    print(f"Assisted 2pt FGM: {total_assisted_2pt}")
+    print(f"Assisted 3pt FGM: {total_assisted_3pt}")
+    print(f"Assisted dunk FGM: {total_assisted_dunk}")
+    # --- Reward Statistics ---
+    if num_episodes > 0:
+        print("\nAverage Reward (per player):")
+        print(f"Offense avg reward: {avg_reward_offense_total / num_episodes:.4f}")
+        print(f"Defense avg reward: {avg_reward_defense_total / num_episodes:.4f}")
     # Traditional 2PT% excludes dunks for separate reporting
     if (made_2pts + missed_2pts) > 0:
         print(f"2PT% (non-dunk): {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
@@ -191,6 +217,7 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
         pass_completions = 0
         pass_intercepts = 0
         pass_oob = 0
+        cumulative_rewards = np.zeros(env.n_players, dtype=float)
         if not args.no_render:
             frame = env.render()
             if frame is not None:
@@ -208,6 +235,7 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
                     full_action[player_id] = defense_action[player_id]
 
             obs, reward, done, _, info = env.step(full_action)
+            cumulative_rewards += reward
 
             step_results = info.get('action_results', {})
             if step_results.get('passes'):
@@ -230,6 +258,12 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
         action_results = final_info.get('action_results', {})
         outcome = "Unknown"
         three_point_distance = env.three_point_distance
+        potential_assists = 0
+        assists = 0
+        assisted_2pt = 0
+        assisted_3pt = 0
+        assisted_dunk = 0
+        assisted_dunk = 0
         if action_results.get('shots'):
             shot_result = list(action_results['shots'].values())[0]
             is_dunk = (shot_result.get('distance', 999) == 0)
@@ -243,6 +277,18 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
                 outcome = "Missed 2pt"
             elif not shot_result['success'] and shot_result['distance'] >= three_point_distance:
                 outcome = "Missed 3pt"
+            # Assist flags
+            if shot_result.get('assist_potential'):
+                potential_assists += 1
+            if shot_result.get('assist_full'):
+                assists += 1
+                if shot_result.get('success'):
+                    if is_dunk:
+                        assisted_dunk += 1
+                    elif shot_result.get('distance', 999) >= three_point_distance:
+                        assisted_3pt += 1
+                    else:
+                        assisted_2pt += 1
         elif action_results.get('turnovers'):
             turnover_reason = action_results['turnovers'][0]['reason']
             if turnover_reason == 'intercepted':
@@ -256,6 +302,10 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
         elif env.unwrapped.shot_clock <= 0:
             outcome = "Turnover (Shot Clock Violation)"
 
+        # Average per-player rewards by team for this episode
+        avg_reward_offense = float(np.mean(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
+        avg_reward_defense = float(np.mean(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
+
         results.append({
             "outcome": outcome,
             "length": env.unwrapped.step_count,
@@ -263,6 +313,13 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
             "pass_completions": pass_completions,
             "pass_intercepts": pass_intercepts,
             "pass_oob": pass_oob,
+            "potential_assists": potential_assists,
+            "assists": assists,
+            "assisted_2pt": assisted_2pt,
+            "assisted_3pt": assisted_3pt,
+            "assisted_dunk": assisted_dunk,
+            "avg_reward_offense": avg_reward_offense,
+            "avg_reward_defense": avg_reward_defense,
         })
 
         if not args.no_render and args.log_gifs:
@@ -297,6 +354,7 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
         pass_completions = 0
         pass_intercepts = 0
         pass_oob = 0
+        cumulative_rewards = np.zeros(env.n_players, dtype=float)
         if not args.no_render:
             frame = env.render()
             if frame is not None:
@@ -305,6 +363,7 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
         while not done:
             full_action, _ = policy.predict(obs, deterministic=args.deterministic_unified)
             obs, reward, done, _, info = env.step(full_action)
+            cumulative_rewards += reward
 
             step_results = info.get('action_results', {})
             if step_results.get('passes'):
@@ -326,6 +385,11 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
         action_results = final_info.get('action_results', {})
         outcome = "Unknown"
         three_point_distance = env.three_point_distance
+        potential_assists = 0
+        assists = 0
+        assisted_2pt = 0
+        assisted_3pt = 0
+        assisted_dunk = 0
         if action_results.get('shots'):
             shot_result = list(action_results['shots'].values())[0]
             is_dunk = (shot_result.get('distance', 999) == 0)
@@ -339,6 +403,18 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
                 outcome = "Missed 2pt"
             elif not shot_result['success'] and shot_result['distance'] >= three_point_distance:
                 outcome = "Missed 3pt"
+            # Assist flags
+            if shot_result.get('assist_potential'):
+                potential_assists += 1
+            if shot_result.get('assist_full'):
+                assists += 1
+                if shot_result.get('success'):
+                    if is_dunk:
+                        assisted_dunk += 1
+                    elif shot_result.get('distance', 999) >= three_point_distance:
+                        assisted_3pt += 1
+                    else:
+                        assisted_2pt += 1
         elif action_results.get('turnovers'):
             turnover_reason = action_results['turnovers'][0]['reason']
             if turnover_reason == 'intercepted':
@@ -352,6 +428,10 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
         elif env.unwrapped.shot_clock <= 0:
             outcome = "Turnover (Shot Clock Violation)"
 
+        # Average per-player rewards by team for this episode
+        avg_reward_offense = float(np.mean(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
+        avg_reward_defense = float(np.mean(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
+
         results.append({
             "outcome": outcome,
             "length": env.unwrapped.step_count,
@@ -359,6 +439,13 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
             "pass_completions": pass_completions,
             "pass_intercepts": pass_intercepts,
             "pass_oob": pass_oob,
+            "potential_assists": potential_assists,
+            "assists": assists,
+            "assisted_2pt": assisted_2pt,
+            "assisted_3pt": assisted_3pt,
+            "assisted_dunk": assisted_dunk,
+            "avg_reward_offense": avg_reward_offense,
+            "avg_reward_defense": avg_reward_defense,
         })
 
         if not args.no_render and args.log_gifs:
@@ -382,6 +469,13 @@ def summarize_to_row(results: list, alternation_index: int):
     total_pass_completions = 0
     total_pass_intercepts = 0
     total_pass_oob = 0
+    total_potential_assists = 0
+    total_assists = 0
+    total_assisted_2pt = 0
+    total_assisted_3pt = 0
+    total_assisted_dunk = 0
+    avg_reward_offense_total = 0.0
+    avg_reward_defense_total = 0.0
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
@@ -389,6 +483,13 @@ def summarize_to_row(results: list, alternation_index: int):
         total_pass_completions += res.get('pass_completions', 0)
         total_pass_intercepts += res.get('pass_intercepts', 0)
         total_pass_oob += res.get('pass_oob', 0)
+        total_potential_assists += res.get('potential_assists', 0)
+        total_assists += res.get('assists', 0)
+        total_assisted_2pt += res.get('assisted_2pt', 0)
+        total_assisted_3pt += res.get('assisted_3pt', 0)
+        avg_reward_offense_total += float(res.get('avg_reward_offense', 0.0))
+        avg_reward_defense_total += float(res.get('avg_reward_defense', 0.0))
+        total_assisted_dunk += res.get('assisted_dunk', 0)
 
     num_episodes = max(1, len(results))
     avg_len = float(np.mean(episode_lengths)) if episode_lengths else 0.0
@@ -426,12 +527,19 @@ def summarize_to_row(results: list, alternation_index: int):
         "pass_completions": total_pass_completions,
         "pass_intercepts": total_pass_intercepts,
         "pass_oob": total_pass_oob,
+        "potential_assists": total_potential_assists,
+        "assists": total_assists,
+        "assisted_2pt": total_assisted_2pt,
+        "assisted_3pt": total_assisted_3pt,
+        "assisted_dunk": total_assisted_dunk,
         "pct_2pt": (made_2pts / (made_2pts + missed_2pts)) if (made_2pts + missed_2pts) > 0 else 0.0,
         "pct_3pt": (made_3pts / (made_3pts + missed_3pts)) if (made_3pts + missed_3pts) > 0 else 0.0,
         "pct_dunk": (made_dunks / (made_dunks + missed_dunks)) if (made_dunks + missed_dunks) > 0 else 0.0,
         "fg_pct": (total_made / total_shots) if total_shots > 0 else 0.0,
         "efg_pct": ((made_2pts + made_dunks + 1.5 * made_3pts) / total_shots) if total_shots > 0 else 0.0,
         "ppp": (2.0 * (made_2pts + made_dunks + 1.5 * made_3pts) / (total_shots + turnovers)) if (total_shots + turnovers) > 0 else 0.0,
+        "avg_reward_offense": (avg_reward_offense_total / num_episodes) if num_episodes else 0.0,
+        "avg_reward_defense": (avg_reward_defense_total / num_episodes) if num_episodes else 0.0,
     }
     return row
 

@@ -49,6 +49,7 @@ const policyProbabilities = ref(null);
 const activeTab = ref('controls');
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
+const rewardParams = ref(null);
 
 // Move tracking is now handled by parent component
 
@@ -330,20 +331,21 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
         if (legalActions.length > 0) {
           let selectedAction = null;
           
-          if (newDeterministic && actionValues.value && actionValues.value[playerId]) {
-            // Deterministic: Use Q-values (argmax)
-            const playerActions = actionValues.value[playerId];
-            let bestValue = -Infinity;
-            
-            for (const [action, value] of Object.entries(playerActions)) {
-              if (typeof value === 'number' && legalActions.includes(action) && value > bestValue) {
-                bestValue = value;
-                selectedAction = action;
+          if (newDeterministic && policyProbabilities.value && policyProbabilities.value[playerId]) {
+            // Deterministic: mimic policy.predict(..., deterministic=True) → argmax of policy distribution
+            const probs = policyProbabilities.value[playerId];
+            let bestIdx = -1;
+            let bestProb = -1;
+            for (let i = 0; i < probs.length && i < actionNames.length; i++) {
+              const name = actionNames[i];
+              if (!legalActions.includes(name)) continue;
+              if (probs[i] > bestProb) {
+                bestProb = probs[i];
+                bestIdx = i;
               }
             }
-            
-            if (selectedAction) {
-              console.log(`[PlayerControls] Selected DETERMINISTIC action for player ${playerId}: ${selectedAction} (Q-value: ${bestValue})`);
+            if (bestIdx >= 0) {
+              selectedAction = actionNames[bestIdx];
             }
           } else if (!newDeterministic && policyProbabilities.value && policyProbabilities.value[playerId]) {
             // Probabilistic: Sample from policy probabilities
@@ -404,7 +406,7 @@ watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDetermini
 watch(() => policyProbabilities.value, () => {
   if (props.externalSelections) return;
   try {
-    if (!(props.aiMode && !props.deterministic && policyProbabilities.value)) {
+    if (!(props.aiMode && policyProbabilities.value)) {
       return;
     }
 
@@ -416,9 +418,9 @@ watch(() => policyProbabilities.value, () => {
       const playerProbs = policyProbabilities.value?.[playerId];
       if (!playerProbs || legalActions.length === 0) continue;
 
+      // Build list of legal (index, prob)
       const legalActionIndices = [];
       const legalProbs = [];
-
       for (let i = 0; i < playerProbs.length && i < actionNames.length; i++) {
         if (legalActions.includes(actionNames[i])) {
           legalActionIndices.push(i);
@@ -426,7 +428,24 @@ watch(() => policyProbabilities.value, () => {
         }
       }
 
-      if (legalProbs.length > 0) {
+      if (legalProbs.length === 0) continue;
+
+      if (props.deterministic) {
+        // Deterministic: argmax among legal
+        let bestIdxLocal = 0;
+        let bestProb = -1;
+        for (let j = 0; j < legalProbs.length; j++) {
+          if (legalProbs[j] > bestProb) {
+            bestProb = legalProbs[j];
+            bestIdxLocal = j;
+          }
+        }
+        const actionIndex = legalActionIndices[bestIdxLocal];
+        const selectedAction = actionNames[actionIndex];
+        newSelections[playerId] = selectedAction;
+        console.log(`[PlayerControls] Deterministic argmax action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
+      } else {
+        // Probabilistic: sample among legal
         const sampledIndex = sampleFromProbabilities(legalProbs);
         const actionIndex = legalActionIndices[sampledIndex];
         const selectedAction = actionNames[actionIndex];
@@ -441,43 +460,10 @@ watch(() => policyProbabilities.value, () => {
   } catch (error) {
     console.error('[PlayerControls] Error in policyProbabilities watch:', error);
   }
-});
+}, { immediate: true });
 
-// Also pre-select when action values change, but ONLY in deterministic mode (Q-values)
-watch(() => actionValues.value, () => {
-  if (props.externalSelections) return;
-  try {
-    if (!(props.aiMode && props.deterministic && actionValues.value)) {
-      return; // do not override probabilistic selections
-    }
-
-    const newSelections = {};
-    const controlledIds = userControlledPlayerIds.value;
-    
-    for (const playerId of controlledIds) {
-      if (actionValues.value[playerId]) {
-        const playerActions = actionValues.value[playerId];
-        let bestAction = null;
-        let bestValue = -Infinity;
-        
-        for (const [action, value] of Object.entries(playerActions)) {
-          if (typeof value === 'number' && value > bestValue) {
-            bestValue = value;
-            bestAction = action;
-          }
-        }
-        
-        if (bestAction) {
-          newSelections[playerId] = bestAction;
-        }
-      }
-    }
-    
-    selectedActions.value = newSelections;
-  } catch (error) {
-    console.error('[PlayerControls] Error in action values watch:', error);
-  }
-});
+// Disable Q-value-driven deterministic preselection to match analytics behavior
+watch(() => actionValues.value, () => { /* no-op for deterministic mode */ });
 
 // Shot probability helpers removed
 
@@ -487,6 +473,7 @@ const fetchRewards = async () => {
     const data = await getRewards();
     rewardHistory.value = data.reward_history || [];
     episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
+    rewardParams.value = data.reward_params || null;
     console.log('[Rewards] Fetched rewards. History length:', rewardHistory.value.length, 'Episode totals:', episodeRewards.value);
   } catch (error) {
     console.error('Failed to fetch rewards:', error);
@@ -610,6 +597,28 @@ watch(() => props.externalSelections, (newSelections) => {
     <!-- Rewards Tab -->
     <div v-if="activeTab === 'rewards'" class="tab-content">
       <div class="rewards-section">
+        <h4>Reward Parameters</h4>
+        <div class="parameters-grid" v-if="rewardParams">
+          <div class="param-category">
+            <h5>Shot Rewards</h5>
+            <div class="param-item"><span class="param-name">Made 2pt reward:</span><span class="param-value">{{ rewardParams.made_shot_reward_inside }}</span></div>
+            <div class="param-item"><span class="param-name">Made 3pt reward:</span><span class="param-value">{{ rewardParams.made_shot_reward_three }}</span></div>
+            <div class="param-item"><span class="param-name">Missed shot penalty:</span><span class="param-value">{{ rewardParams.missed_shot_penalty }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>Assist Shaping</h5>
+            <div class="param-item"><span class="param-name">Potential assist % of shot:</span><span class="param-value">{{ (rewardParams.potential_assist_pct * 100).toFixed(1) }}%</span></div>
+            <div class="param-item"><span class="param-name">Full assist bonus % of shot:</span><span class="param-value">{{ (rewardParams.full_assist_bonus_pct * 100).toFixed(1) }}%</span></div>
+            <div class="param-item"><span class="param-name">Assist window (steps):</span><span class="param-value">{{ rewardParams.assist_window }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>Other</h5>
+            <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
+            <div class="param-item"><span class="param-name">Turnover penalty:</span><span class="param-value">{{ rewardParams.turnover_penalty }}</span></div>
+          </div>
+        </div>
+        <div v-else class="no-rewards">No reward parameters available.</div>
+
         <h4>Episode Totals</h4>
         <div class="episode-totals">
           <div class="total-item">

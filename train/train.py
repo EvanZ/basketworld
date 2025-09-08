@@ -84,12 +84,35 @@ class MLflowCallback(BaseCallback):
                 global_step = self.model.num_timesteps
                 
                 # Calculate the mean reward and length
-                ep_rew_mean = np.mean([ep_info["r"] for ep_info in self.model.ep_info_buffer])
-                ep_len_mean = np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer])
-                
+                ep_rew_mean = np.mean([ep_info.get("r", 0.0) for ep_info in self.model.ep_info_buffer])
+                ep_len_mean = np.mean([ep_info.get("l", 0.0) for ep_info in self.model.ep_info_buffer])
+
+                # Optional shot/pass metrics if present in episode infos
+                def mean_key(key: str, default: float = 0.0):
+                    vals = [ep.get(key) for ep in self.model.ep_info_buffer if key in ep]
+                    return float(np.mean(vals)) if vals else default
+
+                shot_dunk_pct = mean_key("shot_dunk")
+                shot_2pt_pct = mean_key("shot_2pt")
+                shot_3pt_pct = mean_key("shot_3pt")
+                asst_dunk_pct = mean_key("assisted_dunk")
+                asst_2pt_pct = mean_key("assisted_2pt")
+                asst_3pt_pct = mean_key("assisted_3pt")
+                passes_avg = mean_key("passes")
+                turnover_pct = mean_key("turnover")
+
                 # Log to MLflow
                 mlflow.log_metric(f"{self.team_name} Mean Episode Reward", ep_rew_mean, step=global_step)
                 mlflow.log_metric(f"{self.team_name} Mean Episode Length", ep_len_mean, step=global_step)
+                # Distributions
+                mlflow.log_metric(f"{self.team_name} ShotPct Dunk", shot_dunk_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} ShotPct 2PT", shot_2pt_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} ShotPct 3PT", shot_3pt_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} Assist ShotPct Dunk", asst_dunk_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} Assist ShotPct 2PT", asst_2pt_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} Assist ShotPct 3PT", asst_3pt_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} Passes / Episode", passes_avg, step=global_step)
+                mlflow.log_metric(f"{self.team_name} TurnoverPct", turnover_pct, step=global_step)
         return True
 
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
@@ -115,6 +138,80 @@ class RewardAggregationWrapper(gym.Wrapper):
         aggregated_reward = sum(rewards[i] for i in training_player_ids)
         
         return obs, aggregated_reward, done, truncated, info
+
+# --- Episode Statistics Wrapper ---
+class EpisodeStatsWrapper(gym.Wrapper):
+    """Track per-episode shot/pass distributions and expose via info['episode'].
+
+    - shot_dunk/shot_2pt/shot_3pt: 1.0 if that shot type occurred in the episode, else 0.0
+    - assisted_dunk/assisted_2pt/assisted_3pt: 1.0 if the made shot in that type was assisted
+    - passes: total number of pass attempts in the episode
+    """
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self._reset_stats()
+
+    def _reset_stats(self):
+        self._passes = 0
+        self._shot_dunk = 0.0
+        self._shot_2pt = 0.0
+        self._shot_3pt = 0.0
+        self._asst_dunk = 0.0
+        self._asst_2pt = 0.0
+        self._asst_3pt = 0.0
+        self._turnover = 0.0
+
+    def reset(self, **kwargs):  # type: ignore[override]
+        self._reset_stats()
+        return self.env.reset(**kwargs)
+
+    def step(self, action):  # type: ignore[override]
+        obs, reward, done, truncated, info = self.env.step(action)
+        try:
+            ar = info.get("action_results", {}) if info else {}
+            # Pass attempts
+            if ar.get("passes"):
+                self._passes += int(len(ar["passes"]))
+
+            # Shots happen at episode end in this env
+            if ar.get("shots"):
+                # Assume single shot per episode
+                shot_res = list(ar["shots"].values())[0]
+                # Determine distance category using env to avoid stale data
+                shooter_id = int(list(ar["shots"].keys())[0])
+                shooter_pos = self.env.unwrapped.positions[shooter_id]
+                dist = self.env.unwrapped._hex_distance(shooter_pos, self.env.unwrapped.basket_position)
+                is_dunk = (dist == 0)
+                is_three = (dist >= getattr(self.env.unwrapped, 'three_point_distance', 4))
+                if is_dunk:
+                    self._shot_dunk = 1.0
+                    if shot_res.get("assist_full") and shot_res.get("success"):
+                        self._asst_dunk = 1.0
+                elif is_three:
+                    self._shot_3pt = 1.0
+                    if shot_res.get("assist_full") and shot_res.get("success"):
+                        self._asst_3pt = 1.0
+                else:
+                    self._shot_2pt = 1.0
+                    if shot_res.get("assist_full") and shot_res.get("success"):
+                        self._asst_2pt = 1.0
+            elif ar.get("turnovers"):
+                # Episode ends via turnover
+                self._turnover = 1.0
+        except Exception:
+            pass
+
+        if done and info is not None:
+            # Expose stats as top-level info keys; Monitor(info_keywords=...) will include them in episode info
+            info['shot_dunk'] = self._shot_dunk
+            info['shot_2pt'] = self._shot_2pt
+            info['shot_3pt'] = self._shot_3pt
+            info['assisted_dunk'] = self._asst_dunk
+            info['assisted_2pt'] = self._asst_2pt
+            info['assisted_3pt'] = self._asst_3pt
+            info['passes'] = float(self._passes)
+            info['turnover'] = self._turnover
+        return obs, reward, done, truncated, info
 
 # --- Custom Environment Wrapper for Self-Play ---
 
@@ -322,6 +419,17 @@ def setup_environment(args, training_team):
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+        # Reward shaping
+        pass_reward=getattr(args, "pass_reward", 0.0),
+        turnover_penalty=getattr(args, "turnover_penalty", 0.0),
+        made_shot_reward_inside=getattr(args, "made_shot_reward_inside", 2.0),
+        made_shot_reward_three=getattr(args, "made_shot_reward_three", 3.0),
+        missed_shot_penalty=getattr(args, "missed_shot_penalty", 0.0),
+        potential_assist_reward=getattr(args, "potential_assist_reward", 0.1),
+        full_assist_bonus=getattr(args, "full_assist_bonus", 0.2),
+        assist_window=getattr(args, "assist_window", getattr(args, "assist_window", 2)),
+        potential_assist_pct=getattr(args, "potential_assist_pct", 0.10),
+        full_assist_bonus_pct=getattr(args, "full_assist_bonus_pct", 0.05),
         enable_profiling=args.enable_env_profiling,
         training_team=training_team, # Critical for correct rewards
         # Observation controls
@@ -333,9 +441,12 @@ def setup_environment(args, training_team):
         illegal_defense_enabled=args.illegal_defense_enabled,
         illegal_defense_max_steps=args.illegal_defense_max_steps,
     )
-    # IMPORTANT: Aggregate rewards BEFORE monitoring
+    # Wrap with episode stats collector then aggregate reward for Monitor/SB3
+    env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
-    return Monitor(env)
+    return Monitor(env, info_keywords=(
+        'shot_dunk','shot_2pt','shot_3pt','assisted_dunk','assisted_2pt','assisted_3pt','passes','turnover'
+    ))
 
 # ----------------------------------------------------------
 # Helper function to create a vectorized self-play environment
@@ -599,6 +710,17 @@ def main(args):
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+                    # Reward shaping
+                    pass_reward=getattr(args, "pass_reward", 0.0),
+                    turnover_penalty=getattr(args, "turnover_penalty", 0.0),
+                    made_shot_reward_inside=getattr(args, "made_shot_reward_inside", 2.0),
+                    made_shot_reward_three=getattr(args, "made_shot_reward_three", 3.0),
+                    missed_shot_penalty=getattr(args, "missed_shot_penalty", 0.0),
+                    potential_assist_reward=getattr(args, "potential_assist_reward", 0.1),
+                    full_assist_bonus=getattr(args, "full_assist_bonus", 0.2),
+                    assist_window=getattr(args, "assist_window", 2),
+                    potential_assist_pct=getattr(args, "potential_assist_pct", 0.10),
+                    full_assist_bonus_pct=getattr(args, "full_assist_bonus_pct", 0.05),
                     enable_profiling=args.enable_env_profiling,
                     # Observation controls
                     use_egocentric_obs=args.use_egocentric_obs,
@@ -750,6 +872,18 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto", help="Device to use for training ('cuda', 'cpu', or 'auto').")
     parser.add_argument("--illegal-defense-enabled", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Enable illegal defense mode.")
     parser.add_argument("--illegal-defense-max-steps", type=int, default=3, help="Maximum number of steps to allow illegal defense.")
+    # Reward shaping CLI (also logged to MLflow)
+    parser.add_argument("--pass-reward", dest="pass_reward", type=float, default=0.0, help="Reward for successful pass (team-averaged).")
+    parser.add_argument("--turnover-penalty", dest="turnover_penalty", type=float, default=0.0, help="Penalty for turnover (team-averaged).")
+    parser.add_argument("--made-shot-reward-inside", dest="made_shot_reward_inside", type=float, default=2.0, help="Reward for made 2pt (team-averaged).")
+    parser.add_argument("--made-shot-reward-three", dest="made_shot_reward_three", type=float, default=3.0, help="Reward for made 3pt (team-averaged).")
+    parser.add_argument("--missed-shot-penalty", dest="missed_shot_penalty", type=float, default=0.0, help="Penalty for missed shot (team-averaged).")
+    parser.add_argument("--potential-assist-reward", dest="potential_assist_reward", type=float, default=0.1, help="Reward for potential assist within window (team-averaged).")
+    parser.add_argument("--full-assist-bonus", dest="full_assist_bonus", type=float, default=0.2, help="Additional reward for made shot within assist window (team-averaged).")
+    parser.add_argument("--assist-window", dest="assist_window", type=int, default=2, help="Steps after pass that count toward assist window.")
+    parser.add_argument("--potential-assist-pct", dest="potential_assist_pct", type=float, default=0.10, help="Potential assist reward as % of shot reward.")
+    parser.add_argument("--full-assist-bonus-pct", dest="full_assist_bonus_pct", type=float, default=0.05, help="Full assist bonus as % of shot reward.")
+    parser.add_argument("--steal-chance", dest="steal_chance", type=float, default=0.05, help="Chance of a steal.")
     args = parser.parse_args()
  
     main(args) 

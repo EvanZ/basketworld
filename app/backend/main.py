@@ -209,6 +209,16 @@ def take_step(request: ActionRequest):
     pred_deterministic = True if request.deterministic is None else bool(request.deterministic)
     full_action_ai, _ = game_state.unified_policy.predict(ai_obs, deterministic=pred_deterministic)
 
+    # If deterministic, precompute policy probabilities to choose best-legal fallback
+    unified_probs = None
+    if pred_deterministic:
+        try:
+            obs_tensor = game_state.unified_policy.policy.obs_to_tensor(ai_obs)[0]
+            dists = game_state.unified_policy.policy.get_distribution(obs_tensor)
+            unified_probs = [dist.probs.detach().cpu().numpy().squeeze() for dist in dists.distribution]
+        except Exception:
+            unified_probs = None
+
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
     action_mask = ai_obs['action_mask']
@@ -235,11 +245,22 @@ def take_step(request: ActionRequest):
                 print(f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}")
                 full_action[i] = predicted_action
             else:
-                # Fallback: choose the first legal action instead of NOOP
+                # Fallback: if deterministic, choose best legal by policy prob; else first legal
                 legal = np.where(action_mask[i] == 1)[0]
-                fallback = int(legal[0]) if len(legal) > 0 else 0
-                print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
-                full_action[i] = fallback
+                if pred_deterministic and unified_probs is not None and len(legal) > 0:
+                    probs_vec = unified_probs[i] if i < len(unified_probs) else None
+                    if probs_vec is not None and len(probs_vec) >= int(max(legal)) + 1:
+                        best_idx = int(legal[np.argmax(probs_vec[legal])])
+                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob.")
+                        full_action[i] = best_idx
+                    else:
+                        fallback = int(legal[0])
+                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}.")
+                        full_action[i] = fallback
+                else:
+                    fallback = int(legal[0]) if len(legal) > 0 else 0
+                    print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
+                    full_action[i] = fallback
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
@@ -576,8 +597,9 @@ def save_episode():
 
     os.makedirs("episodes", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Determine outcome label (carry dunk logic like evaluation/ui)
+    # Determine outcome label with assist annotations for shot outcomes
     outcome = "Unknown"
+    category = None
     try:
         ar = game_state.env.last_action_results or {}
         if ar.get("shots"):
@@ -586,14 +608,24 @@ def save_episode():
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
             is_dunk = (distance == 0)
-            if is_dunk:
-                outcome = "Made Dunk" if shot_res.get("success") else "Missed Dunk"
+            is_three = (distance >= game_state.env.three_point_distance)
+            success = bool(shot_res.get("success"))
+            assist_full = bool(shot_res.get("assist_full", False))
+            assist_potential = bool(shot_res.get("assist_potential", False))
+
+            # Build detailed category
+            shot_type = "dunk" if is_dunk else ("3pt" if is_three else "2pt")
+            if success:
+                outcome = f"Made {shot_type.upper()}" if shot_type != "dunk" else "Made Dunk"
+                category = (
+                    f"made_assisted_{shot_type}" if assist_full else f"made_unassisted_{shot_type}"
+                )
             else:
-                # Determine 2 vs 3 by distance to basket at shot time
-                if shot_res.get("success"):
-                    outcome = "Made 3pt" if distance >= game_state.env.three_point_distance else "Made 2pt"
+                outcome = f"Missed {shot_type.upper()}" if shot_type != "dunk" else "Missed Dunk"
+                if assist_potential:
+                    category = f"missed_potentially_assisted_{shot_type}"
                 else:
-                    outcome = "Missed 3pt" if distance >= game_state.env.three_point_distance else "Missed 2pt"
+                    category = f"missed_{shot_type}"
         elif ar.get("turnovers"):
             reason = ar["turnovers"][0].get("reason", "turnover")
             if reason == "intercepted":
@@ -609,7 +641,9 @@ def save_episode():
     except Exception:
         pass
 
-    category = get_outcome_category(outcome)
+    # If we didn't build a detailed category (e.g., turnover), fall back to generic mapping
+    if category is None:
+        category = get_outcome_category(outcome)
     file_path = os.path.join("episodes", f"episode_{timestamp}_{category}.gif")
 
     # Write frames to GIF (filter any None frames)
@@ -794,12 +828,32 @@ def get_rewards():
             "defense_reason": reward.get("defense_reason", "Unknown")
         })
     
+    # Include reward shaping parameters so frontend can display them in Rewards tab
+    env = game_state.env
+    reward_params = {}
+    try:
+        reward_params = {
+            # Absolute team-averaged rewards
+            "pass_reward": float(getattr(env, "pass_reward", 0.0)),
+            "turnover_penalty": float(getattr(env, "turnover_penalty", 0.0)),
+            "made_shot_reward_inside": float(getattr(env, "made_shot_reward_inside", 0.0)),
+            "made_shot_reward_three": float(getattr(env, "made_shot_reward_three", 0.0)),
+            "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
+            # Percentage-based assist shaping
+            "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
+            "full_assist_bonus_pct": float(getattr(env, "full_assist_bonus_pct", 0.0)),
+            "assist_window": int(getattr(env, "assist_window", 2)),
+        }
+    except Exception:
+        reward_params = {}
+
     return {
         "reward_history": serialized_history,
         "episode_rewards": {
             "offense": float(game_state.episode_rewards["offense"]),
             "defense": float(game_state.episode_rewards["defense"])
-        }
+        },
+        "reward_params": reward_params,
     }
 
 def get_full_game_state():
