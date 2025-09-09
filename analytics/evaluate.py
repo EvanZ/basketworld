@@ -42,8 +42,9 @@ def analyze_results(results: list, num_episodes: int):
     total_assisted_2pt = 0
     total_assisted_3pt = 0
     total_assisted_dunk = 0
-    avg_reward_offense_total = 0.0
-    avg_reward_defense_total = 0.0
+    avg_reward_offense_total = 0.0  # per-player average reward (unused in final report)
+    avg_reward_defense_total = 0.0  # per-player average reward (unused in final report)
+    team_reward_offense_total = 0.0  # team-summed reward (matches training logs)
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
@@ -58,6 +59,7 @@ def analyze_results(results: list, num_episodes: int):
         total_assisted_dunk += res.get('assisted_dunk', 0)
         avg_reward_offense_total += float(res.get('avg_reward_offense', 0.0))
         avg_reward_defense_total += float(res.get('avg_reward_defense', 0.0))
+        team_reward_offense_total += float(res.get('team_reward_offense', 0.0))
         # shot_probabilities.append(res['probabilities'])
         # shot_distances.append(res['distances'])
     # print(f"Shot Probabilities Mean: {np.mean(shot_probabilities)}")
@@ -130,9 +132,8 @@ def analyze_results(results: list, num_episodes: int):
     print(f"Assisted dunk FGM: {total_assisted_dunk}")
     # --- Reward Statistics ---
     if num_episodes > 0:
-        print("\nAverage Reward (per player):")
-        print(f"Offense avg reward: {avg_reward_offense_total / num_episodes:.4f}")
-        print(f"Defense avg reward: {avg_reward_defense_total / num_episodes:.4f}")
+        print("\nAverage Team Reward (offense only; defense symmetric):")
+        print(f"Offense team reward: {team_reward_offense_total / num_episodes:.4f}")
     # Traditional 2PT% excludes dunks for separate reporting
     if (made_2pts + missed_2pts) > 0:
         print(f"2PT% (non-dunk): {100.0 * made_2pts / (made_2pts + missed_2pts):.2f}%")
@@ -302,9 +303,13 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
         elif env.unwrapped.shot_clock <= 0:
             outcome = "Turnover (Shot Clock Violation)"
 
-        # Average per-player rewards by team for this episode
+        # Rewards by team for this episode
+        # Per-player average (historically printed in analysis)
         avg_reward_offense = float(np.mean(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
         avg_reward_defense = float(np.mean(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
+        # Team-summed reward (matches training "Mean Episode Reward" which aggregates over teammates)
+        team_reward_offense = float(np.sum(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
+        team_reward_defense = float(np.sum(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
 
         results.append({
             "outcome": outcome,
@@ -320,6 +325,8 @@ def run_eval_for_pair(offense_policy_path: str, defense_policy_path: str, num_ep
             "assisted_dunk": assisted_dunk,
             "avg_reward_offense": avg_reward_offense,
             "avg_reward_defense": avg_reward_defense,
+            "team_reward_offense": team_reward_offense,
+            "team_reward_defense": team_reward_defense,
         })
 
         if not args.no_render and args.log_gifs:
@@ -428,9 +435,13 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
         elif env.unwrapped.shot_clock <= 0:
             outcome = "Turnover (Shot Clock Violation)"
 
-        # Average per-player rewards by team for this episode
+        # Rewards by team for this episode
+        # Per-player average (historically printed in analysis)
         avg_reward_offense = float(np.mean(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
         avg_reward_defense = float(np.mean(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
+        # Team-summed reward (matches training logs)
+        team_reward_offense = float(np.sum(cumulative_rewards[env.offense_ids])) if env.offense_ids else 0.0
+        team_reward_defense = float(np.sum(cumulative_rewards[env.defense_ids])) if env.defense_ids else 0.0
 
         results.append({
             "outcome": outcome,
@@ -446,6 +457,8 @@ def run_eval_for_unified(unified_policy_path: str, num_episodes: int, required, 
             "assisted_dunk": assisted_dunk,
             "avg_reward_offense": avg_reward_offense,
             "avg_reward_defense": avg_reward_defense,
+            "team_reward_offense": team_reward_offense,
+            "team_reward_defense": team_reward_defense,
         })
 
         if not args.no_render and args.log_gifs:
@@ -474,8 +487,9 @@ def summarize_to_row(results: list, alternation_index: int):
     total_assisted_2pt = 0
     total_assisted_3pt = 0
     total_assisted_dunk = 0
-    avg_reward_offense_total = 0.0
-    avg_reward_defense_total = 0.0
+    avg_reward_offense_total = 0.0  # per-player average (unused in final row)
+    avg_reward_defense_total = 0.0  # per-player average (unused in final row)
+    team_reward_offense_total = 0.0  # team-summed
     for res in results:
         outcomes[res['outcome']] += 1
         episode_lengths.append(res['length'])
@@ -489,6 +503,7 @@ def summarize_to_row(results: list, alternation_index: int):
         total_assisted_3pt += res.get('assisted_3pt', 0)
         avg_reward_offense_total += float(res.get('avg_reward_offense', 0.0))
         avg_reward_defense_total += float(res.get('avg_reward_defense', 0.0))
+        team_reward_offense_total += float(res.get('team_reward_offense', 0.0))
         total_assisted_dunk += res.get('assisted_dunk', 0)
 
     num_episodes = max(1, len(results))
@@ -538,8 +553,8 @@ def summarize_to_row(results: list, alternation_index: int):
         "fg_pct": (total_made / total_shots) if total_shots > 0 else 0.0,
         "efg_pct": ((made_2pts + made_dunks + 1.5 * made_3pts) / total_shots) if total_shots > 0 else 0.0,
         "ppp": (2.0 * (made_2pts + made_dunks + 1.5 * made_3pts) / (total_shots + turnovers)) if (total_shots + turnovers) > 0 else 0.0,
-        "avg_reward_offense": (avg_reward_offense_total / num_episodes) if num_episodes else 0.0,
-        "avg_reward_defense": (avg_reward_defense_total / num_episodes) if num_episodes else 0.0,
+        # Team-summed reward for offense only (defense symmetric)
+        "avg_team_reward_offense": (team_reward_offense_total / num_episodes) if num_episodes else 0.0,
     }
     return row
 
