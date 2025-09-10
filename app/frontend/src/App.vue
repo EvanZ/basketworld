@@ -40,6 +40,8 @@ watch(gameState, async (newState) => {
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done) {
         aiMode.value = true;
+        // Allow replay after any completed episode (manual or self-play)
+        canReplay.value = true;
     }
 });
 
@@ -53,6 +55,8 @@ async function handleGameStarted(setupData) {
   isSelfPlaying.value = false;
   // Bump key to reset PlayerControls' internal state (like selectedActions)
   controlsKey.value += 1;
+  // Reset replay availability for a fresh episode
+  canReplay.value = false;
   
   isLoading.value = true;
   error.value = null;
