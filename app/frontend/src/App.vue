@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from 'vue';
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
@@ -19,6 +19,7 @@ const canReplay = ref(false);
 const isReplaying = ref(false);
 // Force remount of PlayerControls to clear internal state between games
 const controlsKey = ref(0);
+const controlsRef = ref(null);
 
 // AI Mode for pre-selecting actions, not automatic play
 const aiMode = ref(true);
@@ -58,9 +59,11 @@ async function handleGameStarted(setupData) {
   // Reset replay availability for a fresh episode
   canReplay.value = false;
   
+  // Start loading BEFORE clearing state to avoid interim UI flicker
   isLoading.value = true;
   error.value = null;
   initialSetup.value = setupData;
+  // Keep board hidden but avoid flashing setup screen when we already have a setup
   gameState.value = null;      // Ensure old board is cleared
   gameHistory.value = [];      // Clear history
   try {
@@ -278,6 +281,39 @@ function handlePlayAgain() {
     handleGameStarted(initialSetup.value);
   }
 }
+
+// --- Global keyboard shortcuts ---
+function onKeydown(e) {
+  const tag = (e.target?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return; // avoid typing conflicts
+  const key = e.key?.toLowerCase();
+  if (key === 'n') {
+    // New Game
+    if (initialSetup.value) handleGameStarted(initialSetup.value);
+  } else if (key === 'p') {
+    // Self-Play
+    if (gameState.value && !gameState.value.done) handleSelfPlay();
+  } else if (key === 's') {
+    // Save Episode
+    if (gameState.value?.done) handleSaveEpisode();
+  } else if (key === 'y') {
+    // Replay
+    if (gameState.value?.done && canReplay.value) handleReplay();
+  } else if (key === 'r') {
+    // Reset Stats
+    try { controlsRef.value?.resetStats?.(); } catch (_) {}
+  } else if (key === 'c') {
+    // Copy stats as Markdown
+    try { controlsRef.value?.copyStatsMarkdown?.(); } catch (_) {}
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown);
+});
 </script>
 
 <template>
@@ -286,9 +322,10 @@ function handlePlayAgain() {
       <h1>Welcome to BasketWorld</h1>
     </header>
 
-    <GameSetup v-if="!gameState" @game-started="handleGameStarted" />
+    <!-- Only render setup when no initialSetup has been chosen -->
+    <GameSetup v-if="!initialSetup" @game-started="handleGameStarted" />
     
-    <div v-if="isLoading && !gameState" class="loading">Loading Game...</div>
+    <div v-if="isLoading" class="loading">Loading Game...</div>
     <div v-if="error" class="error-message">{{ error }}</div>
     
 
@@ -305,17 +342,21 @@ function handlePlayAgain() {
     </div>
 
     <div v-if="gameState" class="game-container">
-      <GameBoard 
-        :game-history="gameHistory" 
-        :active-player-id="activePlayerId"
-        :policy-probabilities="policyProbs"
-      />
+      <div class="board-area">
+        <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
+        <GameBoard 
+          :game-history="gameHistory" 
+          v-model:activePlayerId="activePlayerId"
+          :policy-probabilities="policyProbs"
+        />
+      </div>
       <div class="controls-area">
         <PlayerControls 
             :key="controlsKey"
             :game-state="gameState" 
             v-model:activePlayerId="activePlayerId"
             :disabled="false"
+            :is-replaying="isReplaying"
             :ai-mode="aiMode"
             :deterministic="deterministic"
             :move-history="moveHistory"
@@ -324,6 +365,7 @@ function handlePlayAgain() {
             @play-again="handlePlayAgain"
             @self-play="handleSelfPlay"
             @move-recorded="handleMoveRecorded"
+            ref="controlsRef"
         />
 
         <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">
@@ -379,9 +421,24 @@ header {
 .game-container {
   display: flex;
   flex-direction: row; /* Changed to row */
-  justify-content: center; /* Center items horizontally */
+  justify-content: flex-start; /* Left area fills available space */
   align-items: flex-start; /* Align items to the top */
   gap: 2rem; /* Increased gap */
+}
+
+.board-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  min-width: 0; /* allow flex child to shrink properly */
+}
+
+.run-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  text-align: center;
 }
 
 .controls-area {

@@ -17,6 +17,8 @@ const props = defineProps({
   },
 });
 
+const emit = defineEmits(['update:activePlayerId']);
+
 // ------------------------------------------------------------
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
 // ------------------------------------------------------------
@@ -47,6 +49,12 @@ function getRenderablePlayers(gameState) {
     const hasBall = gameState.ball_holder === index;
     return { id: index, x, y, isOffense, hasBall };
   });
+}
+
+function onPlayerClick(player) {
+  // Only allow selecting offensive players from the board
+  if (!player || !player.isOffense) return;
+  emit('update:activePlayerId', player.id);
 }
 
 const currentGameState = computed(() => {
@@ -407,8 +415,9 @@ const playerTransitions = computed(() => {
                 player.isOffense ? 'player-offense' : 'player-defense',
                 { 'active-player-hex': player.id === activePlayerId }
               ]"
+              @click="onPlayerClick(player)"
             />
-            <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text">{{ player.id }}</text>
+            <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text" @click="onPlayerClick(player)">{{ player.id }}</text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
               v-if="player.hasBall && ballHandlerShotProb !== null"
@@ -489,7 +498,7 @@ const playerTransitions = computed(() => {
   position: relative; /* Needed for overlay positioning */
   flex: 1; /* Allow this component to grow and fill available space */
   min-width: 400px; /* Ensure it doesn't get too small */
-  max-width: 650px;
+  width: 100%;
   margin: 0; /* Remove auto margin which conflicts with flexbox */
   border-radius: 8px;
   overflow: visible; /* Allow the shot clock to be positioned outside */
@@ -522,6 +531,8 @@ const playerTransitions = computed(() => {
 /* Removed rotation; court now renders in original orientation */
 svg {
   display: block;
+  width: 100%;
+  height: auto;
 }
 .court-hex {
   fill: rgba(255, 255, 255, 0.65); /* More transparent fill */

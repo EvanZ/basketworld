@@ -1,7 +1,9 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
+import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import { getActionValues, getRewards } from '@/services/api';
+import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
@@ -10,6 +12,10 @@ const props = defineProps({
   gameState: Object,
   activePlayerId: Number,
   disabled: {
+    type: Boolean,
+    default: false,
+  },
+  isReplaying: {
     type: Boolean,
     default: false,
   },
@@ -52,6 +58,122 @@ const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 
 // Move tracking is now handled by parent component
+
+// --- Stats tracking (persistent across sessions) ---
+const statsState = ref(loadStats());
+function safeDiv(n, d) { return d > 0 ? (n / d) : 0; }
+const totalAssists = computed(() => (statsState.value.dunk.assists + statsState.value.twoPt.assists + statsState.value.threePt.assists));
+const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
+const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
+const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
+
+async function recordEpisodeStats(finalState) {
+  const results = finalState?.last_action_results || {};
+  // Shot attempt (at most one at termination)
+  const shots = results?.shots || {};
+  const shotEntries = Object.entries(shots);
+  if (shotEntries.length > 0) {
+    const [, shot] = shotEntries[0];
+    const distance = Number(shot?.distance ?? 9999);
+    const isDunk = distance === 0;
+    const isThree = !isDunk && distance >= Number(finalState?.three_point_distance ?? 4);
+    const isTwo = !isDunk && !isThree;
+    const made = Boolean(shot?.success);
+    const assisted = Boolean(shot?.assist_full);
+
+    if (isDunk) {
+      statsState.value.dunk.attempts += 1;
+      if (made) statsState.value.dunk.made += 1;
+      if (assisted) statsState.value.dunk.assists += 1;
+    } else if (isThree) {
+      statsState.value.threePt.attempts += 1;
+      if (made) statsState.value.threePt.made += 1;
+      if (assisted) statsState.value.threePt.assists += 1;
+    } else if (isTwo) {
+      statsState.value.twoPt.attempts += 1;
+      if (made) statsState.value.twoPt.made += 1;
+      if (assisted) statsState.value.twoPt.assists += 1;
+    }
+
+    if (made) {
+      statsState.value.points += isThree ? 3 : 2;
+    }
+  }
+
+  // Turnovers at termination (array contains a single turnover if present)
+  const tovCount = Array.isArray(results?.turnovers) ? results.turnovers.length : 0;
+  statsState.value.turnovers += Number(tovCount || 0);
+
+  // Add episode reward for user's team
+  try {
+    const data = await getRewards();
+    const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
+    const userTeam = finalState?.user_team_name || 'OFFENSE';
+    statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+    const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
+    statsState.value.episodeStepsSum += Number(steps || 0);
+  } catch (_) { /* ignore */ }
+
+  // Increment episode count last
+  statsState.value.episodes += 1;
+  saveStats(statsState.value);
+}
+
+function resetStats() {
+  statsState.value = resetStatsStorage();
+}
+
+async function copyStatsMarkdown() {
+  try {
+    const s = statsState.value;
+    const fg = (made, att) => (safeDiv(made, Math.max(1, att)) * 100).toFixed(1) + '%';
+    const summary = [
+      ['Episodes', String(s.episodes)],
+      ['PPP', ppp.value.toFixed(2)],
+      ['Avg reward/ep', avgRewardPerEp.value.toFixed(2)],
+      ['Avg ep length (steps)', safeDiv(s.episodeStepsSum, Math.max(1, s.episodes)).toFixed(1)],
+      ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
+      ['Total turnovers', String(s.turnovers)],
+    ];
+    const shotsHeader = ['Type', 'Attempts', 'Made', 'FG%', 'Assists'];
+    const shotsRows = [
+      ['Dunks', s.dunk.attempts, s.dunk.made, fg(s.dunk.made, s.dunk.attempts), s.dunk.assists],
+      ['2PT', s.twoPt.attempts, s.twoPt.made, fg(s.twoPt.made, s.twoPt.attempts), s.twoPt.assists],
+      ['3PT', s.threePt.attempts, s.threePt.made, fg(s.threePt.made, s.threePt.attempts), s.threePt.assists],
+    ];
+    const table = (rows) => rows.map(r => `| ${r.join(' | ')} |`).join('\n');
+    const md = [
+      '## Summary',
+      '| Metric | Value |',
+      '| --- | --- |',
+      table(summary),
+      '',
+      '## Shots',
+      `| ${shotsHeader.join(' | ')} |`,
+      `| ${shotsHeader.map(()=>'---').join(' | ')} |`,
+      table(shotsRows),
+      '',
+    ].join('\n');
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(md);
+      alert('Stats copied to clipboard as Markdown');
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = md;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      alert('Stats copied to clipboard as Markdown');
+    }
+  } catch (e) {
+    console.warn('[Stats] Failed to copy stats markdown', e);
+    alert('Failed to copy stats');
+  }
+}
+
+// Expose for parent (keyboard shortcut)
+defineExpose({ resetStats, copyStatsMarkdown });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -189,6 +311,7 @@ watch(() => props.gameState, async (newGameState) => {
     valueRange.value = { min: 0, max: 0 };
   }
 }, { immediate: true });
+
 
 // Watch for the list of players to be populated, then set the first one as active.
 // The `immediate` flag ensures this runs on component creation.
@@ -494,6 +617,13 @@ onMounted(() => {
   fetchRewards();
 });
 
+// Record stats once on episode completion
+watch(() => props.gameState?.done, async (done, prevDone) => {
+  if (done && !prevDone && props.gameState && !props.isReplaying) {
+    try { await recordEpisodeStats(props.gameState); } catch (e) { console.warn('[Stats] record failed', e); }
+  }
+});
+
 // Backend probability is declared at the top
 
 const passProbabilities = computed(() => {
@@ -508,6 +638,13 @@ watch(() => props.externalSelections, (newSelections) => {
   if (newSelections && typeof newSelections === 'object') {
     // Replace entire selection map to match applied actions
     selectedActions.value = { ...newSelections };
+  }
+});
+
+// Ensure Controls tab is visible when active player changes (e.g., from board clicks)
+watch(() => props.activePlayerId, (newVal, oldVal) => {
+  if (newVal !== oldVal) {
+    activeTab.value = 'controls';
   }
 });
 
@@ -530,6 +667,12 @@ watch(() => props.externalSelections, (newSelections) => {
         @click="activeTab = 'rewards'"
       >
         Rewards
+      </button>
+      <button 
+        :class="{ active: activeTab === 'stats' }"
+        @click="activeTab = 'stats'"
+      >
+        Stats
       </button>
       <button 
         :class="{ active: activeTab === 'moves' }"
@@ -664,6 +807,49 @@ watch(() => props.externalSelections, (newSelections) => {
       </div>
     </div>
 
+    <!-- Stats Tab -->
+    <div v-if="activeTab === 'stats'" class="tab-content">
+      <div class="rewards-section">
+        <h4>Episode Stats</h4>
+        <div class="parameters-grid">
+          <div class="param-category">
+            <h5>Totals</h5>
+            <div class="param-item"><span class="param-name">Episodes played:</span><span class="param-value">{{ statsState.episodes }}</span></div>
+            <div class="param-item"><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
+            <div class="param-item"><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
+            <div class="param-item"><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
+            <div class="param-item"><span class="param-name">Avg reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
+            <div class="param-item"><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>Dunks</h5>
+            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.dunk.attempts }}</span></div>
+            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.dunk.made }}</span></div>
+            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.dunk.made, Math.max(1, statsState.dunk.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.dunk.assists }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>2PT</h5>
+            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.twoPt.attempts }}</span></div>
+            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.twoPt.made }}</span></div>
+            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.twoPt.made, Math.max(1, statsState.twoPt.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.twoPt.assists }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>3PT</h5>
+            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.threePt.attempts }}</span></div>
+            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.threePt.made }}</span></div>
+            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.threePt.made, Math.max(1, statsState.threePt.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.threePt.assists }}</span></div>
+          </div>
+        </div>
+        <div style="display:flex; gap: 0.5rem;">
+          <button class="new-game-button" @click="resetStats">Reset Stats</button>
+          <button class="submit-button" @click="copyStatsMarkdown">Copy</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Moves Tab -->
     <div v-if="activeTab === 'moves'" class="tab-content">
       <div class="moves-section">
@@ -728,13 +914,44 @@ watch(() => props.externalSelections, (newSelections) => {
             </div>
             <div v-if="props.gameState.shot_params" class="param-group">
               <div class="param-item">
-                <span class="param-name">Layup percentage:</span>
+                <span class="param-name">Layup mean:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.layup_pct * 100).toFixed(1) }}%</span>
               </div>
               <div class="param-item">
-                <span class="param-name">Three-point percentage:</span>
+                <span class="param-name">Layup std:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.layup_std * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item">
+                <span class="param-name">Three-point mean:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.three_pt_pct * 100).toFixed(1) }}%</span>
               </div>
+              <div class="param-item">
+                <span class="param-name">Three-point std:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.three_pt_std * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item">
+                <span class="param-name">Dunk mean:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.dunk_pct * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item">
+                <span class="param-name">Dunk std:</span>
+                <span class="param-value">{{ (props.gameState.shot_params.dunk_std * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item">
+                <span class="param-name">Dunks enabled:</span>
+                <span class="param-value">{{ props.gameState.shot_params.allow_dunks ? 'Yes' : 'No' }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="param-category" v-if="props.gameState.offense_shooting_pct_by_player">
+            <h5>Sampled Player Skills (Offense)</h5>
+            <div class="param-item" v-for="(pid, idx) in (props.gameState.offense_ids || [])" :key="`skill-${pid}`">
+              <span class="param-name">Player {{ pid }}:</span>
+              <span class="param-value">
+                L {{ ((props.gameState.offense_shooting_pct_by_player.layup?.[idx] || 0) * 100).toFixed(1) }}% ·
+                3 {{ ((props.gameState.offense_shooting_pct_by_player.three_pt?.[idx] || 0) * 100).toFixed(1) }}% ·
+                D {{ ((props.gameState.offense_shooting_pct_by_player.dunk?.[idx] || 0) * 100).toFixed(1) }}%
+              </span>
             </div>
           </div>
           <div class="param-category">
@@ -746,6 +963,13 @@ watch(() => props.externalSelections, (newSelections) => {
             <div class="param-item">
               <span class="param-name">Turnover chance:</span>
               <span class="param-value">{{ props.gameState.defender_pressure_turnover_chance || 'N/A' }}</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>Pass Interception</h5>
+            <div class="param-item">
+              <span class="param-name">Steal chance:</span>
+              <span class="param-value">{{ props.gameState.steal_chance ?? 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">

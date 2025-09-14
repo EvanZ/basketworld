@@ -75,9 +75,13 @@ class HexagonBasketballEnv(gym.Env):
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
+        # Baseline shooting variability (per-player, sampled each episode)
+        layup_std: float = 0.0,
+        three_pt_std: float = 0.0,
         # Dunk controls
         allow_dunks: bool = False,
         dunk_pct: float = 0.90,
+        dunk_std: float = 0.0,
         # Illegal defense (3-in-the-key) controls
         illegal_defense_enabled: bool = True,
         illegal_defense_max_steps: int = 3,
@@ -143,9 +147,13 @@ class HexagonBasketballEnv(gym.Env):
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
         self.three_pt_pct = float(three_pt_pct)
+        # Std deviations for per-player variability (sampled each episode)
+        self.layup_std = float(layup_std)
+        self.three_pt_std = float(three_pt_std)
         # Dunk configuration
         self.allow_dunks = bool(allow_dunks)
         self.dunk_pct = float(dunk_pct)
+        self.dunk_std = float(dunk_std)
         # Defender shot pressure
         self.shot_pressure_enabled = bool(shot_pressure_enabled)
         self.shot_pressure_max = float(shot_pressure_max)
@@ -178,7 +186,10 @@ class HexagonBasketballEnv(gym.Env):
         # Define the two parts of our observation space
         # Observation length depends on configuration flags
         # +1 for unified policy role flag (offense=1.0, defense=0.0)
-        base_len = (self.n_players * 2) + self.n_players + 1 + 1
+        # +players_per_side for per-offense nearest-defender distances
+        # Additional features per offensive player: baseline layup/3pt/dunk percentages
+        per_offense_skill_features = self.players_per_side * 3
+        base_len = (self.n_players * 2) + self.n_players + 1 + 1 + self.players_per_side + per_offense_skill_features
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -267,6 +278,12 @@ class HexagonBasketballEnv(gym.Env):
             self._initial_positions_override = [tuple(p) for p in initial_positions]
         self._initial_ball_holder_override: Optional[int] = initial_ball_holder
         self._fixed_shot_clock: Optional[int] = fixed_shot_clock
+
+        # Per-episode, per-offensive-player baseline shooting percentages
+        # Initialized to means; re-sampled each reset.
+        self.offense_layup_pct_by_player: List[float] = [float(self.layup_pct)] * self.players_per_side
+        self.offense_three_pt_pct_by_player: List[float] = [float(self.three_pt_pct)] * self.players_per_side
+        self.offense_dunk_pct_by_player: List[float] = [float(self.dunk_pct)] * self.players_per_side
         
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
@@ -341,6 +358,18 @@ class HexagonBasketballEnv(gym.Env):
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         self._assist_candidate = None
+        
+        # Sample per-player baseline shooting percentages for OFFENSE for this episode
+        # Use truncated normal around means with stds, clamped to [0.01, 0.99]
+        def _sample_prob(mean: float, std: float) -> float:
+            if std <= 0.0:
+                return float(mean)
+            val = float(self._rng.normal(loc=float(mean), scale=float(std)))
+            return float(max(0.01, min(0.99, val)))
+        for i in range(self.players_per_side):
+            self.offense_layup_pct_by_player[i] = _sample_prob(self.layup_pct, self.layup_std)
+            self.offense_three_pt_pct_by_player[i] = _sample_prob(self.three_pt_pct, self.three_pt_std)
+            self.offense_dunk_pct_by_player[i] = _sample_prob(self.dunk_pct, self.dunk_std)
         
         # Initialize positions
         if opt_positions is not None:
@@ -880,13 +909,23 @@ class HexagonBasketballEnv(gym.Env):
         # For diagnostics: compute base probability (no pressure) and pressure multiplier
         d0 = 1
         d1 = max(self.three_point_distance, d0 + 1)
+        # Use per-offense-player baselines if shooter is offense; else global baselines
+        if shooter_id in self.offense_ids:
+            idx = int(shooter_id)
+            dunk_p = self.offense_dunk_pct_by_player[idx]
+            layup_p = self.offense_layup_pct_by_player[idx]
+            three_p = self.offense_three_pt_pct_by_player[idx]
+        else:
+            dunk_p = self.dunk_pct
+            layup_p = self.layup_pct
+            three_p = self.three_pt_pct
         if self.allow_dunks and distance == 0:
-            base_prob = self.dunk_pct
+            base_prob = dunk_p
         elif distance <= d0:
-            base_prob = self.layup_pct
+            base_prob = layup_p
         else:
             t = (distance - d0) / (d1 - d0)
-            base_prob = self.layup_pct + (self.three_pt_pct - self.layup_pct) * t
+            base_prob = layup_p + (three_p - layup_p) * t
         # Clamp similar to backend
         base_prob = max(0.01, min(0.99, base_prob))
 
@@ -933,11 +972,19 @@ class HexagonBasketballEnv(gym.Env):
         # Anchors
         d0 = 1
         d1 = max(self.three_point_distance, d0 + 1)
-        p0 = self.layup_pct
-        p1 = self.three_pt_pct
+        # Use per-offense-player anchors if applicable
+        if shooter_id in self.offense_ids:
+            idx = int(shooter_id)
+            p0 = float(self.offense_layup_pct_by_player[idx])
+            p1 = float(self.offense_three_pt_pct_by_player[idx])
+            dunk_p = float(self.offense_dunk_pct_by_player[idx])
+        else:
+            p0 = float(self.layup_pct)
+            p1 = float(self.three_pt_pct)
+            dunk_p = float(self.dunk_pct)
 
         if self.allow_dunks and distance == 0:
-            prob = self.dunk_pct
+            prob = dunk_p
         elif distance <= d0:
             prob = p0
         else:
@@ -1065,6 +1112,7 @@ class HexagonBasketballEnv(gym.Env):
         - Shot clock (raw value)
         - Hoop vector relative to ball handler, normalized
         - Role flag for unified policy: 1.0 if training OFFENSE else 0.0
+        - For each offensive player: distance to nearest defender (normalized if enabled)
         """
         obs: List[float] = []
 
@@ -1126,6 +1174,26 @@ class HexagonBasketballEnv(gym.Env):
             hoop_dq /= norm_den
             hoop_dr /= norm_den
             obs.extend([hoop_dq, hoop_dr])
+
+        # Distances from each offensive player to the nearest defender
+        # Appended in ascending offensive player id order
+        for offense_id in self.offense_ids:
+            offense_pos = self.positions[offense_id]
+            nearest_defender_distance = min(
+                self._hex_distance(offense_pos, self.positions[defender_id])
+                for defender_id in self.defense_ids
+            )
+            if self.normalize_obs:
+                obs.append(float(nearest_defender_distance) / norm_den)
+            else:
+                obs.append(float(nearest_defender_distance))
+
+        # Append baseline shooting deltas (relative to global means) for each offensive player
+        # Order per offense player: (layup_delta, three_pt_delta, dunk_delta)
+        for i in range(self.players_per_side):
+            obs.append(float(self.offense_layup_pct_by_player[i]) - float(self.layup_pct))
+            obs.append(float(self.offense_three_pt_pct_by_player[i]) - float(self.three_pt_pct))
+            obs.append(float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct))
 
         return np.array(obs, dtype=np.float32)
     

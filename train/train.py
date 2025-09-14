@@ -100,6 +100,22 @@ class MLflowCallback(BaseCallback):
                 asst_3pt_pct = mean_key("assisted_3pt")
                 passes_avg = mean_key("passes")
                 turnover_pct = mean_key("turnover")
+                # PPP per episode: (2*made_2pt + 3*made_3pt + 2*made_dunk) / (attempts + turnovers)
+                def mean_ppp(default: float = 0.0):
+                    numer = []
+                    denom = []
+                    for ep in self.model.ep_info_buffer:
+                        m2 = float(ep.get("made_2pt", 0.0))
+                        m3 = float(ep.get("made_3pt", 0.0))
+                        md = float(ep.get("made_dunk", 0.0))
+                        att = float(ep.get("attempts", 0.0))
+                        tov = float(ep.get("turnover", 0.0))
+                        n = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
+                        d = max(1.0, att + tov)  # avoid div-by-zero; count turnovers as possessions
+                        numer.append(n / d)
+                        denom.append(1.0)
+                    return float(np.mean(numer)) if numer else default
+                ppp_avg = mean_ppp()
 
                 # Log to MLflow
                 mlflow.log_metric(f"{self.team_name} Mean Episode Reward", ep_rew_mean, step=global_step)
@@ -113,6 +129,7 @@ class MLflowCallback(BaseCallback):
                 mlflow.log_metric(f"{self.team_name} Assist ShotPct 3PT", asst_3pt_pct, step=global_step)
                 mlflow.log_metric(f"{self.team_name} Passes / Episode", passes_avg, step=global_step)
                 mlflow.log_metric(f"{self.team_name} TurnoverPct", turnover_pct, step=global_step)
+                mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
         return True
 
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
@@ -160,6 +177,11 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._asst_2pt = 0.0
         self._asst_3pt = 0.0
         self._turnover = 0.0
+        # For PPP computation: made buckets and attempts
+        self._made_dunk = 0.0
+        self._made_2pt = 0.0
+        self._made_3pt = 0.0
+        self._attempts = 0.0
 
     def reset(self, **kwargs):  # type: ignore[override]
         self._reset_stats()
@@ -183,16 +205,23 @@ class EpisodeStatsWrapper(gym.Wrapper):
                 dist = self.env.unwrapped._hex_distance(shooter_pos, self.env.unwrapped.basket_position)
                 is_dunk = (dist == 0)
                 is_three = (dist >= getattr(self.env.unwrapped, 'three_point_distance', 4))
+                self._attempts = 1.0
                 if is_dunk:
                     self._shot_dunk = 1.0
+                    if shot_res.get("success"):
+                        self._made_dunk = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_dunk = 1.0
                 elif is_three:
                     self._shot_3pt = 1.0
+                    if shot_res.get("success"):
+                        self._made_3pt = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_3pt = 1.0
                 else:
                     self._shot_2pt = 1.0
+                    if shot_res.get("success"):
+                        self._made_2pt = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_2pt = 1.0
             elif ar.get("turnovers"):
@@ -211,6 +240,10 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info['assisted_3pt'] = self._asst_3pt
             info['passes'] = float(self._passes)
             info['turnover'] = self._turnover
+            info['made_dunk'] = self._made_dunk
+            info['made_2pt'] = self._made_2pt
+            info['made_3pt'] = self._made_3pt
+            info['attempts'] = self._attempts
         return obs, reward, done, truncated, info
 
 # --- Custom Environment Wrapper for Self-Play ---
@@ -412,9 +445,12 @@ def setup_environment(args, training_team):
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
+        layup_std=getattr(args, "layup_std", 0.0),
         three_pt_pct=args.three_pt_pct,
+        three_pt_std=getattr(args, "three_pt_std", 0.0),
         allow_dunks=args.allow_dunks,
         dunk_pct=args.dunk_pct,
+        dunk_std=getattr(args, "dunk_std", 0.0),
         shot_pressure_enabled=args.shot_pressure_enabled,
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
@@ -445,7 +481,11 @@ def setup_environment(args, training_team):
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
     return Monitor(env, info_keywords=(
-        'shot_dunk','shot_2pt','shot_3pt','assisted_dunk','assisted_2pt','assisted_3pt','passes','turnover'
+        'shot_dunk', 'shot_2pt', 'shot_3pt',
+        'assisted_dunk', 'assisted_2pt', 'assisted_3pt',
+        'passes', 'turnover',
+        # Keys required for PPP calculation
+        'made_dunk', 'made_2pt', 'made_3pt', 'attempts'
     ))
 
 # ----------------------------------------------------------
@@ -703,9 +743,12 @@ def main(args):
                     render_mode="rgb_array",
                     three_point_distance=args.three_point_distance,
                     layup_pct=args.layup_pct,
+                    layup_std=getattr(args, "layup_std", 0.0),
                     three_pt_pct=args.three_pt_pct,
+                    three_pt_std=getattr(args, "three_pt_std", 0.0),
                     allow_dunks=args.allow_dunks,
                     dunk_pct=args.dunk_pct,
+                    dunk_std=getattr(args, "dunk_std", 0.0),
                     shot_pressure_enabled=args.shot_pressure_enabled,
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
@@ -829,7 +872,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO models using self-play.")
     parser.add_argument("--grid-size", type=int, default=12, help="The size of the grid.")
     parser.add_argument("--layup-pct", type=float, default=0.60, help="Percentage of layups.")
+    parser.add_argument("--layup-std", type=float, default=0.0, help="Std dev for per-player layup percentage sampling.")
     parser.add_argument("--three-pt-pct", type=float, default=0.37, help="Percentage of three-pointers.")
+    parser.add_argument("--three-pt-std", type=float, default=0.0, help="Std dev for per-player three-point percentage sampling.")
     parser.add_argument("--three-point-distance", type=int, default=4, help="Hex distance defining the three-point line.")
     parser.add_argument("--players", type=int, default=2, help="Number of players per side.")
     parser.add_argument("--shot-clock", type=int, default=20, help="Steps in the shot clock.")
@@ -863,6 +908,7 @@ if __name__ == "__main__":
     # Dunk controls
     parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False, help="Allow players to enter basket hex and enable dunk shots from basket cell.")
     parser.add_argument("--dunk-pct", type=float, default=0.90, help="Probability of a dunk (shot from basket cell).")
+    parser.add_argument("--dunk-std", type=float, default=0.0, help="Std dev for per-player dunk percentage sampling.")
     # Observation controls
     parser.add_argument("--use-egocentric-obs", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Use egocentric observations centered at the ball handler.")
     parser.add_argument("--egocentric-rotate-to-hoop", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=True, help="Rotate egocentric frame so hoop is aligned to +q axis.")

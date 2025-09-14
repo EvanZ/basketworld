@@ -59,6 +59,8 @@ temp/
 *.pyz
 *.pywz
 *.pyzw
+*.tmp.md
+*.tmp.html
 
 
 # prompts

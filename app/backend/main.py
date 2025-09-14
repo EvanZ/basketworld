@@ -45,6 +45,9 @@ class GameState:
         self.actions_log: list[list[int]] = []  # full action arrays per step
         # General replay buffers (manual or AI). We store full game states for instant replay
         self.episode_states: list[dict] = []  # includes initial state and each post-step state
+        # MLflow run metadata
+        self.run_id: str | None = None
+        self.run_name: str | None = None
 
 game_state = GameState()
 
@@ -157,6 +160,10 @@ async def init_game(request: InitGameRequest):
     try:
         required, optional = get_mlflow_params(client, request.run_id)        
 
+        # Fetch run metadata
+        run = client.get_run(request.run_id)
+        run_name = run.data.tags.get("mlflow.runName") if run and run.data else None
+
         # Unified-only
         unified_path = get_unified_policy_path(client, request.run_id, request.unified_policy_name)
         unified_key = os.path.basename(unified_path)
@@ -182,6 +189,9 @@ async def init_game(request: InitGameRequest):
 
         # Set user team and ensure tracking containers start empty for the episode
         game_state.user_team = Team[request.user_team_name.upper()]
+        # Store MLflow run metadata on game state for later use (saving, UI)
+        game_state.run_id = request.run_id
+        game_state.run_name = run_name or request.run_id
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
@@ -611,8 +621,11 @@ def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
     if not game_state.frames:
         raise HTTPException(status_code=400, detail="No episode frames to save.")
-
-    os.makedirs("episodes", exist_ok=True)
+    # Determine directory using MLflow run_id if available
+    base_dir = "episodes"
+    if getattr(game_state, "run_id", None):
+        base_dir = os.path.join(base_dir, str(game_state.run_id))
+    os.makedirs(base_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Determine outcome label with assist annotations for shot outcomes
     outcome = "Unknown"
@@ -661,7 +674,7 @@ def save_episode():
     # If we didn't build a detailed category (e.g., turnover), fall back to generic mapping
     if category is None:
         category = get_outcome_category(outcome)
-    file_path = os.path.join("episodes", f"episode_{timestamp}_{category}.gif")
+    file_path = os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
 
     # Write frames to GIF (filter any None frames)
     try:
@@ -917,9 +930,19 @@ def get_full_game_state():
         "court_height": game_state.env.court_height,
         "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
         "shot_probs": getattr(game_state.env, "shot_probs", None),
-        "shot_params": getattr(game_state.env, "shot_params", None),
+        # Expose global shot means/stds used to sample per-player skills each episode
+        "shot_params": {
+            "layup_pct": float(getattr(game_state.env, "layup_pct", 0.0)),
+            "three_pt_pct": float(getattr(game_state.env, "three_pt_pct", 0.0)),
+            "dunk_pct": float(getattr(game_state.env, "dunk_pct", 0.0)),
+            "layup_std": float(getattr(game_state.env, "layup_std", 0.0)),
+            "three_pt_std": float(getattr(game_state.env, "three_pt_std", 0.0)),
+            "dunk_std": float(getattr(game_state.env, "dunk_std", 0.0)),
+            "allow_dunks": bool(getattr(game_state.env, "allow_dunks", False)),
+        },
         "defender_pressure_distance": int(getattr(game_state.env, "defender_pressure_distance", 1)),
         "defender_pressure_turnover_chance": float(getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)),
+        "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
         "shot_pressure_enabled": bool(getattr(game_state.env, "shot_pressure_enabled", True)),
         "shot_pressure_max": float(getattr(game_state.env, "shot_pressure_max", 0.5)),
@@ -928,4 +951,13 @@ def get_full_game_state():
         "mask_occupied_moves": bool(getattr(game_state.env, "mask_occupied_moves", False)),
         "illegal_defense_enabled": bool(getattr(game_state.env, "illegal_defense_enabled", False)),
         "illegal_defense_max_steps": int(getattr(game_state.env, "illegal_defense_max_steps", 3)),
+        # MLflow metadata for UI display
+        "run_id": getattr(game_state, "run_id", None),
+        "run_name": getattr(game_state, "run_name", None),
+        # Per-episode sampled shooting skills (offense only), aligned by offense index
+        "offense_shooting_pct_by_player": {
+            "layup": [float(x) for x in getattr(game_state.env, "offense_layup_pct_by_player", [])],
+            "three_pt": [float(x) for x in getattr(game_state.env, "offense_three_pt_pct_by_player", [])],
+            "dunk": [float(x) for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])],
+        },
     } 

@@ -42,9 +42,13 @@ def get_mlflow_params(client: mlflow.tracking.MlflowClient, run_id: str) -> Tupl
     ], int, 4)
     optional["layup_pct"] = _get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
     optional["three_pt_pct"] = _get_param(params, ["three_pt_pct", "three-pt-pct"], float, 0.37)
+    # Per-player shooting variability (std dev) for episode sampling
+    optional["layup_std"] = _get_param(params, ["layup_std", "layup-std"], float, 0.0)
+    optional["three_pt_std"] = _get_param(params, ["three_pt_std", "three-pt-std"], float, 0.0)
     optional["spawn_distance"] = _get_param(params, ["spawn_distance", "spawn-distance"], int, 3)
     optional["allow_dunks"] = _get_param(params, ["allow_dunks", "allow-dunks"], lambda v: str(v).lower() in ["1","true","yes","y","t"], False)
     optional["dunk_pct"] = _get_param(params, ["dunk_pct", "dunk-pct"], float, 0.90)
+    optional["dunk_std"] = _get_param(params, ["dunk_std", "dunk-std"], float, 0.0)
     optional["shot_pressure_enabled"] = _get_param(params, ["shot_pressure_enabled", "shot-pressure-enabled"], lambda v: str(v).lower() in ["1","true","yes","y","t"], True)
     optional["shot_pressure_max"] = _get_param(params, ["shot_pressure_max", "shot-pressure-max"], float, 0.5)
     optional["shot_pressure_lambda"] = _get_param(params, ["shot_pressure_lambda", "shot-pressure-lambda"], float, 1.0)
