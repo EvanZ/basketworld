@@ -173,7 +173,7 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown });
+defineExpose({ resetStats, copyStatsMarkdown, submitActions });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;

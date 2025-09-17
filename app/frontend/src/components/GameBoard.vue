@@ -486,6 +486,18 @@ const playerTransitions = computed(() => {
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
           <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>
       </g>
+
+      <!-- MLflow Run ID label (top-left) -->
+      <text
+        v-if="currentGameState && currentGameState.run_id"
+        x="0%"
+        y="-15%"
+        text-anchor="start"
+        dominant-baseline="hanging"
+        class="run-id-label"
+      >
+        {{ currentGameState.run_id }}
+      </text>
     </svg>
     <div class="shot-clock-overlay">
       {{ currentGameState ? currentGameState.shot_clock : '' }}
@@ -635,4 +647,16 @@ svg {
 .made { fill: lightgreen; }
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
+</style>
+
+<style scoped>
+.run-id-label {
+  font-size: 14px;
+  font-weight: bold;
+  fill: white;
+  paint-order: stroke;
+  stroke: black;
+  stroke-width: 1.2px;
+  pointer-events: none;
+}
 </style> 

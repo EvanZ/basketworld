@@ -63,6 +63,11 @@ def get_device(device_arg):
 
 # Device will be set in main() after parsing args
 
+def linear_schedule(start, end):
+    def f(progress_remaining: float):
+        return end + (start - end) * progress_remaining
+    return f
+    
 # --- Custom MLflow Callback ---
 
 class MLflowCallback(BaseCallback):
@@ -120,6 +125,20 @@ class MLflowCallback(BaseCallback):
                 # Log to MLflow
                 mlflow.log_metric(f"{self.team_name} Mean Episode Reward", ep_rew_mean, step=global_step)
                 mlflow.log_metric(f"{self.team_name} Mean Episode Length", ep_len_mean, step=global_step)
+                # Entropy coefficient (supports constant or schedule)
+                try:
+                    total_ts = getattr(self.model, "_total_timesteps", None)
+                    if callable(getattr(self.model, "ent_coef", None)):
+                        # Approximate current progress remaining consistent with SB3 definition
+                        progress_remaining = 1.0
+                        if total_ts and total_ts > 0:
+                            progress_remaining = max(0.0, min(1.0, 1.0 - (self.model.num_timesteps / float(total_ts))))
+                        current_ent_coef = float(self.model.ent_coef(progress_remaining))
+                    else:
+                        current_ent_coef = float(getattr(self.model, "ent_coef", 0.0))
+                    mlflow.log_metric(f"{self.team_name} Entropy Coef", current_ent_coef, step=global_step)
+                except Exception:
+                    pass
                 # Distributions
                 mlflow.log_metric(f"{self.team_name} ShotPct Dunk", shot_dunk_pct, step=global_step)
                 mlflow.log_metric(f"{self.team_name} ShotPct 2PT", shot_2pt_pct, step=global_step)
@@ -130,6 +149,90 @@ class MLflowCallback(BaseCallback):
                 mlflow.log_metric(f"{self.team_name} Passes / Episode", passes_avg, step=global_step)
                 mlflow.log_metric(f"{self.team_name} TurnoverPct", turnover_pct, step=global_step)
                 mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
+        return True
+
+# --- Entropy Schedule Callback ---
+
+class EntropyScheduleCallback(BaseCallback):
+    """Linearly decay entropy coefficient from start to end across the entire run.
+
+    This uses the cumulative `self.model.num_timesteps` and a provided
+    `total_planned_timesteps` to compute global progress, then updates
+    `self.model.ent_coef` in-place so the change persists across segments.
+    """
+    def __init__(self, start: float, end: float, total_planned_timesteps: int):
+        super().__init__()
+        self.start = float(start)
+        self.end = float(end)
+        self.total = int(max(1, total_planned_timesteps))
+
+    def _on_step(self) -> bool:
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0))
+            progress = min(1.0, max(0.0, t / float(self.total)))
+            current = self.end + (self.start - self.end) * (1.0 - progress)
+            # Update the algorithm's entropy coefficient
+            self.model.ent_coef = float(current)
+        except Exception:
+            pass
+        return True
+
+class EntropyExpScheduleCallback(BaseCallback):
+    """Exponential (log-linear) decay of entropy coef with optional per-alternation bump.
+
+    Schedule: ent(progress) = end * (start / end) ** (1 - progress)
+    where progress = timesteps / total_planned_timesteps in [0,1].
+
+    Bump: At the start of each alternation segment, call `start_new_alternation()`
+    to apply a temporary multiplier to the scheduled entropy for the next
+    `bump_updates` PPO updates (one update per rollout segment).
+    """
+    def __init__(self, start: float, end: float, total_planned_timesteps: int, bump_updates: int = 0, bump_multiplier: float = 1.0):
+        super().__init__()
+        self.start = float(max(1e-12, start))
+        self.end = float(max(1e-12, end))
+        self.total = int(max(1, total_planned_timesteps))
+        self.bump_updates = int(max(0, bump_updates))
+        self.bump_multiplier = float(max(1.0, bump_multiplier))
+        self._bump_updates_remaining = 0
+
+    def start_new_alternation(self):
+        self._bump_updates_remaining = self.bump_updates
+
+    def _scheduled_value(self, t: int) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        # Log-linear interpolation between start and end hitting end at progress=1 exactly
+        ratio = self.start / self.end
+        current = self.end * (ratio ** (1.0 - progress))
+        return float(current)
+
+    def _apply_current(self):
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0))
+            current = self._scheduled_value(t)
+            if self._bump_updates_remaining > 0:
+                current = float(current * self.bump_multiplier)
+            self.model.ent_coef = float(current)
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_start(self) -> None:
+        # Ensure ent coef is set before update happens after rollout
+        self._apply_current()
+
+    def _on_rollout_end(self) -> None:
+        # One rollout finished -> one PPO update will follow; reduce bump if active
+        if self._bump_updates_remaining > 0:
+            self._bump_updates_remaining -= 1
+        # Also refresh current value after potential bump decrement
+        self._apply_current()
+
+    def _on_step(self) -> bool:
+        # Keep it updated during collection too (harmless)
+        self._apply_current()
         return True
 
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
@@ -612,13 +715,18 @@ def main(args):
                     print(f"  - Loaded latest unified policy: {os.path.basename(uni_art)}")
 
         if unified_policy is None:
+            # If an entropy schedule is requested, start PPO at the starting coefficient
+            initial_ent_coef = args.ent_coef
+            if (args.ent_coef_start is not None) or (args.ent_coef_end is not None):
+                start = args.ent_coef_start if args.ent_coef_start is not None else args.ent_coef
+                initial_ent_coef = float(start)
             unified_policy = PPO(
                 "MultiInputPolicy", 
                 temp_env, 
                 verbose=1, 
                 n_steps=args.n_steps, 
                 vf_coef=args.vf_coef,
-                ent_coef=args.ent_coef,
+                ent_coef=initial_ent_coef,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 tensorboard_log=None, # Disable TensorBoard if using MLflow
@@ -643,6 +751,23 @@ def main(args):
         # Create a persistent cache directory for opponent policy files used by workers
         opponent_cache_dir = os.path.join(".opponent_cache", run.info.run_id)
         os.makedirs(opponent_cache_dir, exist_ok=True)
+
+        # Prepare optional entropy scheduler across the whole run
+        entropy_callback = None
+        if (args.ent_coef_start is not None) or (args.ent_coef_end is not None):
+            ent_start = args.ent_coef_start if args.ent_coef_start is not None else args.ent_coef
+            ent_end = args.ent_coef_end if args.ent_coef_end is not None else 0.0
+            total_planned_ts = int(2 * args.alternations * args.steps_per_alternation * args.num_envs * args.n_steps)
+            if getattr(args, "ent_schedule", "linear") == "exp":
+                entropy_callback = EntropyExpScheduleCallback(
+                    ent_start,
+                    ent_end,
+                    total_planned_ts,
+                    bump_updates=getattr(args, "ent_bump_updates", getattr(args, "ent_bump_rollouts", 0)),
+                    bump_multiplier=getattr(args, "ent_bump_multiplier", 1.0),
+                )
+            else:
+                entropy_callback = EntropyScheduleCallback(ent_start, ent_end, total_planned_ts)
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -680,10 +805,20 @@ def main(args):
             offense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Offense")])
             unified_policy.set_logger(offense_logger)
 
+            # Bump entropy at the start of each alternation segment if supported
+            if entropy_callback is not None and hasattr(entropy_callback, "start_new_alternation"):
+                try:
+                    entropy_callback.start_new_alternation()
+                except Exception:
+                    pass
+
+            offense_callbacks = [offense_mlflow_callback, offense_timing_callback]
+            if entropy_callback is not None:
+                offense_callbacks.append(entropy_callback)
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
-                callback=[offense_mlflow_callback, offense_timing_callback],
+                callback=offense_callbacks,
                 progress_bar=True
             )
             offense_env.close()
@@ -716,10 +851,20 @@ def main(args):
             defense_logger = Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Defense")])
             unified_policy.set_logger(defense_logger)
 
+            # Bump entropy again at the start of the defense segment
+            if entropy_callback is not None and hasattr(entropy_callback, "start_new_alternation"):
+                try:
+                    entropy_callback.start_new_alternation()
+                except Exception:
+                    pass
+
+            defense_callbacks = [defense_mlflow_callback, defense_timing_callback]
+            if entropy_callback is not None:
+                defense_callbacks.append(entropy_callback)
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation*args.num_envs*args.n_steps, 
                 reset_num_timesteps=False,
-                callback=[defense_mlflow_callback, defense_timing_callback],
+                callback=defense_callbacks,
                 progress_bar=True
             )
             defense_env.close()
@@ -884,6 +1029,13 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.99, help="PPO hyperparameter: Discount factor for future rewards.")
     parser.add_argument("--vf-coef", type=float, default=0.5, help="PPO hyperparameter: Weight for value function loss.")
     parser.add_argument("--ent-coef", type=float, default=0, help="PPO hyperparameter: Weight for entropy loss.")
+    # Optional entropy schedule across entire training
+    parser.add_argument("--ent-coef-start", type=float, default=None, help="If set, start entropy coefficient at this value and decay linearly.")
+    parser.add_argument("--ent-coef-end", type=float, default=None, help="If set with --ent-coef-start, end entropy coefficient at this value.")
+    parser.add_argument("--ent-schedule", type=str, choices=["linear","exp"], default="linear", help="Entropy schedule type when start/end are provided.")
+    parser.add_argument("--ent-bump-updates", type=int, default=0, help="If >0 with schedule, number of PPO updates to multiply entropy at start of each segment.")
+    parser.add_argument("--ent-bump-rollouts", type=int, default=0, help="Deprecated alias of --ent-bump-updates; counted as updates.")
+    parser.add_argument("--ent-bump-multiplier", type=float, default=1.0, help="Multiplier applied to entropy during bump rollouts (>=1.0).")
     parser.add_argument("--batch-size", type=int, default=64, help="PPO hyperparameter: Minibatch size.")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4, help="Learning rate for PPO optimizers.")
     parser.add_argument("--net-arch", type=int, nargs='+', default=None, help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.")

@@ -3,6 +3,7 @@ import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -287,6 +288,19 @@ function onKeydown(e) {
   const tag = (e.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') return; // avoid typing conflicts
   const key = e.key?.toLowerCase();
+  // Numeric keys: select player by exact ID if present on current team; otherwise by team index
+  if (/^[0-9]$/.test(key)) {
+    if (gameState.value) {
+      const idx = Number(key);
+      const isOffense = gameState.value.user_team_name === 'OFFENSE';
+      const teamIds = isOffense ? (gameState.value.offense_ids || []) : (gameState.value.defense_ids || []);
+      // Prefer exact player ID match on current team (useful when IDs are 2,3,...)
+      if (teamIds.includes(idx)) {
+        activePlayerId.value = idx;
+        return;
+      }
+    }
+  }
   if (key === 'n') {
     // New Game
     if (initialSetup.value) handleGameStarted(initialSetup.value);
@@ -305,6 +319,9 @@ function onKeydown(e) {
   } else if (key === 'c') {
     // Copy stats as Markdown
     try { controlsRef.value?.copyStatsMarkdown?.(); } catch (_) {}
+  } else if (key === 't') {
+    // Submit Turn
+    try { controlsRef.value?.submitActions?.(); } catch (_) {}
   }
 }
 
@@ -374,6 +391,8 @@ onBeforeUnmount(() => {
         <button v-if="gameState.done && canReplay" @click="handleReplay" class="save-episode-button" style="margin-left: 0.5rem;">
           <font-awesome-icon :icon="['fas', 'redo']" />
         </button>
+
+        <KeyboardLegend />
       </div>
     </div>
   </main>
