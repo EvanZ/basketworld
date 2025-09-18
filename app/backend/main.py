@@ -17,6 +17,7 @@ import imageio
 from basketworld.utils.evaluation_helpers import get_outcome_category
 from basketworld.utils.mlflow_params import get_mlflow_params
 
+
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
 # For a multi-user app, you would need a more robust session management system.
@@ -44,12 +45,16 @@ class GameState:
         self.replay_shot_clock: int | None = None
         self.actions_log: list[list[int]] = []  # full action arrays per step
         # General replay buffers (manual or AI). We store full game states for instant replay
-        self.episode_states: list[dict] = []  # includes initial state and each post-step state
+        self.episode_states: list[dict] = (
+            []
+        )  # includes initial state and each post-step state
         # MLflow run metadata
         self.run_id: str | None = None
         self.run_name: str | None = None
 
+
 game_state = GameState()
+
 
 # --- API Models ---
 class InitGameRequest(BaseModel):
@@ -65,9 +70,13 @@ class InitGameRequest(BaseModel):
 class ListPoliciesRequest(BaseModel):
     run_id: str
 
+
 class ActionRequest(BaseModel):
-    actions: dict[str, int] # JSON keys are strings, so we accept strings and convert later.
+    actions: dict[
+        str, int
+    ]  # JSON keys are strings, so we accept strings and convert later.
     deterministic: bool | None = None
+
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -80,16 +89,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def list_policies_from_run(client, run_id):
     """Return sorted list of unified policy artifact paths for a run."""
     artifacts = client.list_artifacts(run_id, "models")
-    unified = [f.path for f in artifacts if f.path.endswith(".zip") and "unified" in f.path]
+    unified = [
+        f.path for f in artifacts if f.path.endswith(".zip") and "unified" in f.path
+    ]
 
     # sort by number embedded at end _<n>.zip if present
     def sort_key(p):
         import re
+
         m = re.search(r"_(\d+)\.zip$", p)
         return int(m.group(1)) if m else 0
+
     unified.sort(key=sort_key)
     return unified
 
@@ -103,7 +117,9 @@ def get_unified_policy_path(client, run_id, policy_name: str | None):
     unified_paths = list_policies_from_run(client, run_id)
     choices = unified_paths
     if not choices:
-        raise HTTPException(status_code=404, detail=f"No unified policy artifacts found.")
+        raise HTTPException(
+            status_code=404, detail=f"No unified policy artifacts found."
+        )
 
     chosen_artifact = None
     if policy_name and any(p.endswith(policy_name) for p in choices):
@@ -114,20 +130,30 @@ def get_unified_policy_path(client, run_id, policy_name: str | None):
 
     return client.download_artifacts(run_id, chosen_artifact, cache_dir)
 
+
 # existing helper kept for internal use
 def get_latest_policies_from_run(client, run_id, tmpdir):
     """Downloads the latest policies from a given MLflow run."""
     artifacts = client.list_artifacts(run_id, "models")
     if not artifacts:
-        raise HTTPException(status_code=404, detail="No model artifacts found in the specified run.")
+        raise HTTPException(
+            status_code=404, detail="No model artifacts found in the specified run."
+        )
 
-    latest_offense_path = max([f.path for f in artifacts if "offense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
-    latest_defense_path = max([f.path for f in artifacts if "defense" in f.path], key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
-    
+    latest_offense_path = max(
+        [f.path for f in artifacts if "offense" in f.path],
+        key=lambda p: int(re.search(r"_(\d+)\.zip", p).group(1)),
+    )
+    latest_defense_path = max(
+        [f.path for f in artifacts if "defense" in f.path],
+        key=lambda p: int(re.search(r"_(\d+)\.zip", p).group(1)),
+    )
+
     offense_local_path = client.download_artifacts(run_id, latest_offense_path, tmpdir)
     defense_local_path = client.download_artifacts(run_id, latest_defense_path, tmpdir)
 
     return offense_local_path, defense_local_path
+
 
 @app.post("/api/list_policies")
 def list_policies(request: ListPoliciesRequest):
@@ -158,14 +184,16 @@ async def init_game(request: InitGameRequest):
     client = mlflow.tracking.MlflowClient()
 
     try:
-        required, optional = get_mlflow_params(client, request.run_id)        
+        required, optional = get_mlflow_params(client, request.run_id)
 
         # Fetch run metadata
         run = client.get_run(request.run_id)
         run_name = run.data.tags.get("mlflow.runName") if run and run.data else None
 
         # Unified-only
-        unified_path = get_unified_policy_path(client, request.run_id, request.unified_policy_name)
+        unified_path = get_unified_policy_path(
+            client, request.run_id, request.unified_policy_name
+        )
         unified_key = os.path.basename(unified_path)
 
         # Reset shot log only if policies changed
@@ -216,6 +244,7 @@ async def init_game(request: InitGameRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize game: {e}")
 
+
 @app.post("/api/step")
 def take_step(request: ActionRequest):
     """Takes a single step in the environment."""
@@ -225,8 +254,12 @@ def take_step(request: ActionRequest):
     # Get AI actions (unified-only)
     ai_obs = game_state.obs
     # Default to deterministic=True if not provided to preserve previous behavior
-    pred_deterministic = True if request.deterministic is None else bool(request.deterministic)
-    full_action_ai, _ = game_state.unified_policy.predict(ai_obs, deterministic=pred_deterministic)
+    pred_deterministic = (
+        True if request.deterministic is None else bool(request.deterministic)
+    )
+    full_action_ai, _ = game_state.unified_policy.predict(
+        ai_obs, deterministic=pred_deterministic
+    )
 
     # If deterministic, precompute policy probabilities to choose best-legal fallback
     unified_probs = None
@@ -234,17 +267,21 @@ def take_step(request: ActionRequest):
         try:
             obs_tensor = game_state.unified_policy.policy.obs_to_tensor(ai_obs)[0]
             dists = game_state.unified_policy.policy.get_distribution(obs_tensor)
-            unified_probs = [dist.probs.detach().cpu().numpy().squeeze() for dist in dists.distribution]
+            unified_probs = [
+                dist.probs.detach().cpu().numpy().squeeze()
+                for dist in dists.distribution
+            ]
         except Exception:
             unified_probs = None
 
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
-    action_mask = ai_obs['action_mask']
+    action_mask = ai_obs["action_mask"]
 
     for i in range(game_state.env.n_players):
-        is_user_player = (i in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or \
-                         (i in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+        is_user_player = (
+            i in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE
+        ) or (i in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
 
         if is_user_player:
             # Action comes from the user request
@@ -258,10 +295,12 @@ def take_step(request: ActionRequest):
         else:
             # Action comes from the AI policy
             predicted_action = full_action_ai[i]
-            
+
             # Enforce action mask and add logging
             if action_mask[i][predicted_action] == 1:
-                print(f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}")
+                print(
+                    f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}"
+                )
                 full_action[i] = predicted_action
             else:
                 # Fallback: if deterministic, choose best legal by policy prob; else first legal
@@ -270,15 +309,21 @@ def take_step(request: ActionRequest):
                     probs_vec = unified_probs[i] if i < len(unified_probs) else None
                     if probs_vec is not None and len(probs_vec) >= int(max(legal)) + 1:
                         best_idx = int(legal[np.argmax(probs_vec[legal])])
-                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob.")
+                        print(
+                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob."
+                        )
                         full_action[i] = best_idx
                     else:
                         fallback = int(legal[0])
-                        print(f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}.")
+                        print(
+                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}."
+                        )
                         full_action[i] = fallback
                 else:
                     fallback = int(legal[0]) if len(legal) > 0 else 0
-                    print(f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead.")
+                    print(
+                        f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead."
+                    )
                     full_action[i] = fallback
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
@@ -299,7 +344,7 @@ def take_step(request: ActionRequest):
     else:
         # Single scalar value
         rewards_list = [rewards]
-    
+
     if len(rewards_list) > 1:
         step_rewards = {"offense": 0.0, "defense": 0.0}
         # Sum rewards by team using actual team assignments
@@ -320,7 +365,7 @@ def take_step(request: ActionRequest):
     # Determine reward types based on actual action results from environment
     offense_reasons = []
     defense_reasons = []
-    
+
     # Get action results from the environment info
     action_results = info.get("action_results", {}) if info else {}
 
@@ -334,25 +379,29 @@ def take_step(request: ActionRequest):
             # Use the shot distance at the time of the attempt for labeling
             dist_at_shot = int(shot_res.get("distance", 0))
             is_three = bool(dist_at_shot >= game_state.env.three_point_distance)
-            game_state.shot_log.append({
-                "step": int(len(game_state.reward_history) + 1),
-                "player_id": int(pid_int),
-                "distance": dist_at_shot,
-                "probability": float(shot_res.get("probability", 0.0)),
-                "success": bool(shot_res.get("success", False)),
-                "is_three": is_three,
-                "rng": float(shot_res.get("rng", -1.0)),
-                "base_probability": float(shot_res.get("base_probability", -1.0)),
-                "pressure_multiplier": float(shot_res.get("pressure_multiplier", -1.0)),
-            })
-    
+            game_state.shot_log.append(
+                {
+                    "step": int(len(game_state.reward_history) + 1),
+                    "player_id": int(pid_int),
+                    "distance": dist_at_shot,
+                    "probability": float(shot_res.get("probability", 0.0)),
+                    "success": bool(shot_res.get("success", False)),
+                    "is_three": is_three,
+                    "rng": float(shot_res.get("rng", -1.0)),
+                    "base_probability": float(shot_res.get("base_probability", -1.0)),
+                    "pressure_multiplier": float(
+                        shot_res.get("pressure_multiplier", -1.0)
+                    ),
+                }
+            )
+
     # Debug logging for action results
     if action_results:
         print(f"[Action Results] Step {len(game_state.reward_history) + 1}:")
         for key, value in action_results.items():
             if value:  # Only log non-empty results
                 print(f"  {key}: {value}")
-    
+
     # Check for specific actions that occurred
     # 1. Check for shots
     if action_results.get("shots"):
@@ -360,7 +409,9 @@ def take_step(request: ActionRequest):
             if shot_result.get("success"):
                 # Determine if it was a 2PT or 3PT based on distance
                 shooter_pos = game_state.env.positions[player_id]
-                dist_to_basket = game_state.env._hex_distance(shooter_pos, game_state.env.basket_position)
+                dist_to_basket = game_state.env._hex_distance(
+                    shooter_pos, game_state.env.basket_position
+                )
                 if dist_to_basket >= game_state.env.three_point_distance:
                     offense_reasons.append("Made 3PT")
                 else:
@@ -369,14 +420,14 @@ def take_step(request: ActionRequest):
             else:
                 offense_reasons.append("Missed Shot")
                 defense_reasons.append("Opp Missed")
-    
+
     # 2. Check for passes
     if action_results.get("passes"):
         successful_passes = 0
         for player_id, pass_result in action_results["passes"].items():
             if pass_result.get("success"):
                 successful_passes += 1
-        
+
         if successful_passes > 0:
             if successful_passes == 1:
                 offense_reasons.append("Pass")
@@ -384,7 +435,7 @@ def take_step(request: ActionRequest):
             else:
                 offense_reasons.append(f"{successful_passes} Passes")
                 defense_reasons.append(f"Opp {successful_passes} Passes")
-    
+
     # 3. Check for turnovers
     if action_results.get("turnovers"):
         for turnover_info in action_results["turnovers"]:
@@ -401,22 +452,25 @@ def take_step(request: ActionRequest):
             else:
                 offense_reasons.append(f"TO - {reason}")
                 defense_reasons.append(f"Forced TO - {reason}")
-    
+
     # 4. Check for movement penalties (OOB moves)
     if action_results.get("moves"):
         for player_id, move_result in action_results["moves"].items():
-            if not move_result.get("success", True) and move_result.get("reason") == "out_of_bounds":
+            if (
+                not move_result.get("success", True)
+                and move_result.get("reason") == "out_of_bounds"
+            ):
                 if player_id in game_state.env.offense_ids:
                     offense_reasons.append("OOB Move")
                     defense_reasons.append("Opp OOB")
                 else:
                     defense_reasons.append("OOB Move")
                     offense_reasons.append("Opp OOB")
-    
+
     # 5. If no specific actions detected but there are rewards, use generic labels
     off_reward = step_rewards["offense"]
     def_reward = step_rewards["defense"]
-    
+
     if not offense_reasons and not defense_reasons:
         if abs(off_reward) < 0.001 and abs(def_reward) < 0.001:
             offense_reasons.append("None")
@@ -428,7 +482,7 @@ def take_step(request: ActionRequest):
                 offense_reasons.append("Negative")
             else:
                 offense_reasons.append("None")
-                
+
             if def_reward > 0:
                 defense_reasons.append("Positive")
             elif def_reward < 0:
@@ -436,13 +490,15 @@ def take_step(request: ActionRequest):
             else:
                 defense_reasons.append("None")
 
-    game_state.reward_history.append({
-        "step": len(game_state.reward_history) + 1,
-        "offense": float(step_rewards["offense"]),
-        "defense": float(step_rewards["defense"]),
-        "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
-        "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None"
-    })
+    game_state.reward_history.append(
+        {
+            "step": len(game_state.reward_history) + 1,
+            "offense": float(step_rewards["offense"]),
+            "defense": float(step_rewards["defense"]),
+            "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
+            "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None",
+        }
+    )
 
     # Capture frame after step
     try:
@@ -459,19 +515,20 @@ def take_step(request: ActionRequest):
     # End of self-play: mark inactive when episode is done
     if game_state.self_play_active and done:
         game_state.self_play_active = False
-    
+
     return {
-        "status": "success", 
+        "status": "success",
         "state": get_full_game_state(),
         "step_rewards": {
             "offense": float(step_rewards["offense"]),
-            "defense": float(step_rewards["defense"])
+            "defense": float(step_rewards["defense"]),
         },
         "episode_rewards": {
             "offense": float(game_state.episode_rewards["offense"]),
-            "defense": float(game_state.episode_rewards["defense"])
-        }
+            "defense": float(game_state.episode_rewards["defense"]),
+        },
     }
+
 
 @app.post("/api/start_self_play")
 def start_self_play():
@@ -484,12 +541,17 @@ def start_self_play():
 
     # Snapshot current initial conditions
     init_positions = [(int(q), int(r)) for (q, r) in game_state.env.positions]
-    init_ball_holder = int(game_state.env.ball_holder) if game_state.env.ball_holder is not None else None
+    init_ball_holder = (
+        int(game_state.env.ball_holder)
+        if game_state.env.ball_holder is not None
+        else None
+    )
     init_shot_clock = int(getattr(game_state.env, "shot_clock", 24))
 
     # Choose a seed for the episode and store everything for replay
     # Use numpy to generate a large random seed if none present
     import numpy as _np
+
     episode_seed = int(_np.random.SeedSequence().entropy % (2**32 - 1))
 
     game_state.replay_seed = episode_seed
@@ -520,6 +582,7 @@ def start_self_play():
 
     return {"status": "success", "state": get_full_game_state(), "seed": episode_seed}
 
+
 @app.post("/api/replay_last_episode")
 def replay_last_episode():
     """Return the recorded sequence of states for the last episode (manual or self-play).
@@ -531,14 +594,17 @@ def replay_last_episode():
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
     # Preferred: if we have recorded states, return them directly
-    if getattr(game_state, "episode_states", None) and len(game_state.episode_states) > 0:
+    if (
+        getattr(game_state, "episode_states", None)
+        and len(game_state.episode_states) > 0
+    ):
         return {"status": "success", "states": list(game_state.episode_states)}
 
     # Fallback to deterministic reconstruction using stored seed and actions
     if (
-        game_state.replay_seed is None or
-        game_state.replay_initial_positions is None or
-        game_state.actions_log is None
+        game_state.replay_seed is None
+        or game_state.replay_initial_positions is None
+        or game_state.actions_log is None
     ):
         raise HTTPException(status_code=400, detail="No episode available to replay.")
 
@@ -563,6 +629,7 @@ def replay_last_episode():
     game_state.obs = obs
     return {"status": "success", "states": states}
 
+
 @app.get("/api/shot_stats")
 def get_shot_stats():
     """Return raw shot log and simple aggregates to compare displayed probabilities vs outcomes."""
@@ -570,26 +637,58 @@ def get_shot_stats():
     total = len(logs)
     made = sum(1 for s in logs if s.get("success"))
     avg_prob = (sum(s.get("probability", 0.0) for s in logs) / total) if total else 0.0
-    avg_base = (sum(s.get("base_probability", 0.0) for s in logs if s.get("base_probability", -1.0) >= 0) / max(1, sum(1 for s in logs if s.get("base_probability", -1.0) >= 0)))
-    avg_pressure_mult = (sum(s.get("pressure_multiplier", 0.0) for s in logs if s.get("pressure_multiplier", -1.0) >= 0) / max(1, sum(1 for s in logs if s.get("pressure_multiplier", -1.0) >= 0)))
+    avg_base = sum(
+        s.get("base_probability", 0.0)
+        for s in logs
+        if s.get("base_probability", -1.0) >= 0
+    ) / max(1, sum(1 for s in logs if s.get("base_probability", -1.0) >= 0))
+    avg_pressure_mult = sum(
+        s.get("pressure_multiplier", 0.0)
+        for s in logs
+        if s.get("pressure_multiplier", -1.0) >= 0
+    ) / max(1, sum(1 for s in logs if s.get("pressure_multiplier", -1.0) >= 0))
     total_three = sum(1 for s in logs if s.get("is_three"))
     made_three = sum(1 for s in logs if s.get("is_three") and s.get("success"))
     avg_prob_three = (
         sum(s.get("probability", 0.0) for s in logs if s.get("is_three")) / total_three
-        if total_three else 0.0
+        if total_three
+        else 0.0
     )
-    avg_base_three = (
-        sum(s.get("base_probability", 0.0) for s in logs if s.get("is_three") and s.get("base_probability", -1.0) >= 0) / max(1, sum(1 for s in logs if s.get("is_three") and s.get("base_probability", -1.0) >= 0))
+    avg_base_three = sum(
+        s.get("base_probability", 0.0)
+        for s in logs
+        if s.get("is_three") and s.get("base_probability", -1.0) >= 0
+    ) / max(
+        1,
+        sum(
+            1
+            for s in logs
+            if s.get("is_three") and s.get("base_probability", -1.0) >= 0
+        ),
     )
-    avg_pressure_three = (
-        sum(s.get("pressure_multiplier", 0.0) for s in logs if s.get("is_three") and s.get("pressure_multiplier", -1.0) >= 0) / max(1, sum(1 for s in logs if s.get("is_three") and s.get("pressure_multiplier", -1.0) >= 0))
+    avg_pressure_three = sum(
+        s.get("pressure_multiplier", 0.0)
+        for s in logs
+        if s.get("is_three") and s.get("pressure_multiplier", -1.0) >= 0
+    ) / max(
+        1,
+        sum(
+            1
+            for s in logs
+            if s.get("is_three") and s.get("pressure_multiplier", -1.0) >= 0
+        ),
     )
     # Group by distance
     by_distance = {}
     for s in logs:
         d = int(s.get("distance", -1))
         if d not in by_distance:
-            by_distance[d] = {"attempts": 0, "made": 0, "avg_prob": 0.0, "_prob_sum": 0.0}
+            by_distance[d] = {
+                "attempts": 0,
+                "made": 0,
+                "avg_prob": 0.0,
+                "_prob_sum": 0.0,
+            }
         by_distance[d]["attempts"] += 1
         by_distance[d]["made"] += 1 if s.get("success") else 0
         by_distance[d]["_prob_sum"] += float(s.get("probability", 0.0))
@@ -616,6 +715,7 @@ def get_shot_stats():
         "log": logs[-100:],  # return last 100 for brevity
     }
 
+
 @app.post("/api/save_episode")
 def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
@@ -637,8 +737,8 @@ def save_episode():
             shooter_id_str = list(ar["shots"].keys())[0]
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
-            is_dunk = (distance == 0)
-            is_three = (distance >= game_state.env.three_point_distance)
+            is_dunk = distance == 0
+            is_three = distance >= game_state.env.three_point_distance
             success = bool(shot_res.get("success"))
             assist_full = bool(shot_res.get("assist_full", False))
             assist_potential = bool(shot_res.get("assist_potential", False))
@@ -646,12 +746,20 @@ def save_episode():
             # Build detailed category
             shot_type = "dunk" if is_dunk else ("3pt" if is_three else "2pt")
             if success:
-                outcome = f"Made {shot_type.upper()}" if shot_type != "dunk" else "Made Dunk"
+                outcome = (
+                    f"Made {shot_type.upper()}" if shot_type != "dunk" else "Made Dunk"
+                )
                 category = (
-                    f"made_assisted_{shot_type}" if assist_full else f"made_unassisted_{shot_type}"
+                    f"made_assisted_{shot_type}"
+                    if assist_full
+                    else f"made_unassisted_{shot_type}"
                 )
             else:
-                outcome = f"Missed {shot_type.upper()}" if shot_type != "dunk" else "Missed Dunk"
+                outcome = (
+                    f"Missed {shot_type.upper()}"
+                    if shot_type != "dunk"
+                    else "Missed Dunk"
+                )
                 if assist_potential:
                     category = f"missed_potentially_assisted_{shot_type}"
                 else:
@@ -690,6 +798,7 @@ def save_episode():
 
     return {"status": "success", "file_path": file_path}
 
+
 @app.get("/api/policy_probabilities")
 def get_policy_probabilities():
     """
@@ -701,18 +810,21 @@ def get_policy_probabilities():
 
     try:
         policy = game_state.unified_policy
-        
+
         # Convert observation to the format the policy expects
         obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
-        
+
         # Get the distribution over actions from the policy object
         distributions = policy.policy.get_distribution(obs_tensor)
-        
+
         # Extract raw probabilities for each player
-        raw_probs = [dist.probs.detach().cpu().numpy().squeeze() for dist in distributions.distribution]
+        raw_probs = [
+            dist.probs.detach().cpu().numpy().squeeze()
+            for dist in distributions.distribution
+        ]
 
         # Apply action mask so illegal actions have probability 0, then renormalize.
-        action_mask = game_state.obs['action_mask']  # shape (n_players, n_actions)
+        action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
         probs_list = []
         for pid, probs in enumerate(raw_probs):
             masked = probs * action_mask[pid]
@@ -723,14 +835,17 @@ def get_policy_probabilities():
 
         # Return as a dictionary mapping player_id to their list of probabilities
         response = {
-            player_id: probs 
-            for player_id, probs in enumerate(probs_list) 
-            if player_id in game_state.env.offense_ids or player_id in game_state.env.defense_ids
+            player_id: probs
+            for player_id, probs in enumerate(probs_list)
+            if player_id in game_state.env.offense_ids
+            or player_id in game_state.env.defense_ids
         }
         return jsonable_encoder(response)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get policy probabilities: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get policy probabilities: {e}"
+        )
 
 
 @app.get("/api/action_values/{player_id}")
@@ -744,7 +859,7 @@ def get_action_values(player_id: int):
 
     print(f"\n[API] Received request for Q-values for player {player_id}")
     action_values = {}
-    
+
     # Unified-only
     value_policy = game_state.unified_policy
     gamma = value_policy.gamma
@@ -754,15 +869,17 @@ def get_action_values(player_id: int):
 
     for action_name in possible_actions:
         action_id = ActionType[action_name].value
-        
+
         # --- Simulate one step forward ---
         temp_env = copy.deepcopy(game_state.env)
-        
+
         # Construct the full action array for the simulation
         # The target player takes the action, others act based on their policy
         sim_action = np.zeros(temp_env.n_players, dtype=int)
-        
-        full_actions, _ = game_state.unified_policy.predict(game_state.obs, deterministic=True)
+
+        full_actions, _ = game_state.unified_policy.predict(
+            game_state.obs, deterministic=True
+        )
 
         for i in range(temp_env.n_players):
             if i == player_id:
@@ -778,23 +895,27 @@ def get_action_values(player_id: int):
         next_obs_tensor, _ = value_policy.policy.obs_to_tensor(next_obs)
         with torch.no_grad():
             next_value = value_policy.policy.predict_values(next_obs_tensor)
-        
+
         # Calculate the Q-value
         # We need the specific reward for the team being evaluated
         team_reward = reward[player_id]
         q_value = team_reward + gamma * next_value.item()
-        
-        print(f"  - Simulating '{action_name}': "
-              f"Immediate Reward = {team_reward:.3f}, "
-              f"Next State Value = {next_value.item():.3f}, "
-              f"Q-Value = {q_value:.3f}")
+
+        print(
+            f"  - Simulating '{action_name}': "
+            f"Immediate Reward = {team_reward:.3f}, "
+            f"Next State Value = {next_value.item():.3f}, "
+            f"Q-Value = {q_value:.3f}"
+        )
 
         action_values[action_name] = q_value
 
     print(f"[API] Sending action values for player {player_id}:")
     import json
+
     print(json.dumps(action_values, indent=2))
     return jsonable_encoder(action_values)
+
 
 @app.get("/api/shot_probability/{player_id}")
 def get_shot_probability(player_id: int):
@@ -805,36 +926,44 @@ def get_shot_probability(player_id: int):
     """
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
-    
+
     try:
         # Calculate distance from player to basket
         player_pos = game_state.env.positions[player_id]
         basket_pos = game_state.env.basket_position
         distance = game_state.env._hex_distance(player_pos, basket_pos)
-        
+
         # Debug: Log the basic parameters
-        print(f"[SHOT_PROB_DEBUG] Player {player_id} at {player_pos}, basket at {basket_pos}, distance: {distance}")
-        print(f"[SHOT_PROB_DEBUG] Environment params: layup_pct={game_state.env.layup_pct}, three_pt_pct={game_state.env.three_pt_pct}, three_point_distance={game_state.env.three_point_distance}")
-        print(f"[SHOT_PROB_DEBUG] Shot pressure params: enabled={game_state.env.shot_pressure_enabled}, max={game_state.env.shot_pressure_max}, lambda={game_state.env.shot_pressure_lambda}")
-        
+        print(
+            f"[SHOT_PROB_DEBUG] Player {player_id} at {player_pos}, basket at {basket_pos}, distance: {distance}"
+        )
+        print(
+            f"[SHOT_PROB_DEBUG] Environment params: layup_pct={game_state.env.layup_pct}, three_pt_pct={game_state.env.three_pt_pct}, three_point_distance={game_state.env.three_point_distance}"
+        )
+        print(
+            f"[SHOT_PROB_DEBUG] Shot pressure params: enabled={game_state.env.shot_pressure_enabled}, max={game_state.env.shot_pressure_max}, lambda={game_state.env.shot_pressure_lambda}"
+        )
+
         # Calculate base probability first (without pressure)
         d0 = 1
         d1 = max(game_state.env.three_point_distance, d0 + 1)
         p0 = game_state.env.layup_pct
         p1 = game_state.env.three_pt_pct
-        
+
         if distance <= d0:
             base_prob = p0
         else:
             t = (distance - d0) / (d1 - d0)
             base_prob = p0 + (p1 - p0) * t
-        
+
         print(f"[SHOT_PROB_DEBUG] Base probability before pressure: {base_prob:.3f}")
-        
+
         # Calculate pressure-adjusted probability (for logging/diagnostics)
         final_prob = game_state.env._calculate_shot_probability(player_id, distance)
-        print(f"[SHOT_PROB_DEBUG] Final shot probability after pressure: {final_prob:.3f}")
-        
+        print(
+            f"[SHOT_PROB_DEBUG] Final shot probability after pressure: {final_prob:.3f}"
+        )
+
         return {
             "player_id": player_id,
             "shot_probability": float(base_prob),
@@ -844,20 +973,23 @@ def get_shot_probability(player_id: int):
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
 
+
 @app.get("/api/rewards")
 def get_rewards():
     """Get the current reward history and episode totals."""
     # Ensure all values are JSON serializable
     serialized_history = []
     for reward in game_state.reward_history:
-        serialized_history.append({
-            "step": int(reward["step"]),
-            "offense": float(reward["offense"]),
-            "defense": float(reward["defense"]),
-            "offense_reason": reward.get("offense_reason", "Unknown"),
-            "defense_reason": reward.get("defense_reason", "Unknown")
-        })
-    
+        serialized_history.append(
+            {
+                "step": int(reward["step"]),
+                "offense": float(reward["offense"]),
+                "defense": float(reward["defense"]),
+                "offense_reason": reward.get("offense_reason", "Unknown"),
+                "defense_reason": reward.get("defense_reason", "Unknown"),
+            }
+        )
+
     # Include reward shaping parameters so frontend can display them in Rewards tab
     env = game_state.env
     reward_params = {}
@@ -866,8 +998,12 @@ def get_rewards():
             # Absolute team-averaged rewards
             "pass_reward": float(getattr(env, "pass_reward", 0.0)),
             "turnover_penalty": float(getattr(env, "turnover_penalty", 0.0)),
-            "made_shot_reward_inside": float(getattr(env, "made_shot_reward_inside", 0.0)),
-            "made_shot_reward_three": float(getattr(env, "made_shot_reward_three", 0.0)),
+            "made_shot_reward_inside": float(
+                getattr(env, "made_shot_reward_inside", 0.0)
+            ),
+            "made_shot_reward_three": float(
+                getattr(env, "made_shot_reward_three", 0.0)
+            ),
             "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
             # Percentage-based assist shaping
             "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
@@ -881,16 +1017,17 @@ def get_rewards():
         "reward_history": serialized_history,
         "episode_rewards": {
             "offense": float(game_state.episode_rewards["offense"]),
-            "defense": float(game_state.episode_rewards["defense"])
+            "defense": float(game_state.episode_rewards["defense"]),
         },
         "reward_params": reward_params,
     }
+
 
 def get_full_game_state():
     """Helper function to construct the full game state dictionary."""
     if not game_state.env:
         return {}
-    
+
     # Use FastAPI's own jsonable_encoder with custom rules for numpy types.
     # This is the robust way to handle serialization.
     custom_encoder = {
@@ -898,28 +1035,38 @@ def get_full_game_state():
         np.floating: float,
         np.bool_: bool,
     }
-    
+
     last_action_results_py = jsonable_encoder(
         game_state.env.last_action_results, custom_encoder=custom_encoder
     )
 
     # Convert numpy types to standard Python types for JSON serialization
-    positions_py = [
-        (int(q), int(r)) for q, r in game_state.env.positions
-    ]
-    ball_holder_py = int(game_state.env.ball_holder) if game_state.env.ball_holder is not None else None
-    basket_pos_py = (int(game_state.env.basket_position[0]), int(game_state.env.basket_position[1]))
-    action_mask_py = game_state.obs['action_mask'].tolist()
-        
+    positions_py = [(int(q), int(r)) for q, r in game_state.env.positions]
+    ball_holder_py = (
+        int(game_state.env.ball_holder)
+        if game_state.env.ball_holder is not None
+        else None
+    )
+    basket_pos_py = (
+        int(game_state.env.basket_position[0]),
+        int(game_state.env.basket_position[1]),
+    )
+    action_mask_py = game_state.obs["action_mask"].tolist()
+
     return {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
         "positions": positions_py,
         "ball_holder": ball_holder_py,
         "shot_clock": int(game_state.env.shot_clock),
+        "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
         "user_team_name": game_state.user_team.name,
         "done": game_state.env.episode_ended,
-        "training_team": getattr(game_state.env, "training_team", None).name if getattr(game_state.env, "training_team", None) else None,
+        "training_team": (
+            getattr(game_state.env, "training_team", None).name
+            if getattr(game_state.env, "training_team", None)
+            else None
+        ),
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
         "last_action_results": last_action_results_py,
@@ -940,24 +1087,49 @@ def get_full_game_state():
             "dunk_std": float(getattr(game_state.env, "dunk_std", 0.0)),
             "allow_dunks": bool(getattr(game_state.env, "allow_dunks", False)),
         },
-        "defender_pressure_distance": int(getattr(game_state.env, "defender_pressure_distance", 1)),
-        "defender_pressure_turnover_chance": float(getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)),
+        "defender_pressure_distance": int(
+            getattr(game_state.env, "defender_pressure_distance", 1)
+        ),
+        "defender_pressure_turnover_chance": float(
+            getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)
+        ),
         "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
-        "shot_pressure_enabled": bool(getattr(game_state.env, "shot_pressure_enabled", True)),
+        "shot_pressure_enabled": bool(
+            getattr(game_state.env, "shot_pressure_enabled", True)
+        ),
         "shot_pressure_max": float(getattr(game_state.env, "shot_pressure_max", 0.5)),
-        "shot_pressure_lambda": float(getattr(game_state.env, "shot_pressure_lambda", 1.0)),
-        "shot_pressure_arc_degrees": float(getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)),
-        "mask_occupied_moves": bool(getattr(game_state.env, "mask_occupied_moves", False)),
-        "illegal_defense_enabled": bool(getattr(game_state.env, "illegal_defense_enabled", False)),
-        "illegal_defense_max_steps": int(getattr(game_state.env, "illegal_defense_max_steps", 3)),
+        "shot_pressure_lambda": float(
+            getattr(game_state.env, "shot_pressure_lambda", 1.0)
+        ),
+        "shot_pressure_arc_degrees": float(
+            getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)
+        ),
+        "mask_occupied_moves": bool(
+            getattr(game_state.env, "mask_occupied_moves", False)
+        ),
+        "illegal_defense_enabled": bool(
+            getattr(game_state.env, "illegal_defense_enabled", False)
+        ),
+        "illegal_defense_max_steps": int(
+            getattr(game_state.env, "illegal_defense_max_steps", 3)
+        ),
         # MLflow metadata for UI display
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),
         # Per-episode sampled shooting skills (offense only), aligned by offense index
         "offense_shooting_pct_by_player": {
-            "layup": [float(x) for x in getattr(game_state.env, "offense_layup_pct_by_player", [])],
-            "three_pt": [float(x) for x in getattr(game_state.env, "offense_three_pt_pct_by_player", [])],
-            "dunk": [float(x) for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])],
+            "layup": [
+                float(x)
+                for x in getattr(game_state.env, "offense_layup_pct_by_player", [])
+            ],
+            "three_pt": [
+                float(x)
+                for x in getattr(game_state.env, "offense_three_pt_pct_by_player", [])
+            ],
+            "dunk": [
+                float(x)
+                for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])
+            ],
         },
-    } 
+    }

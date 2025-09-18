@@ -904,6 +904,10 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
               <span class="param-name">Shot clock:</span>
               <span class="param-value">{{ props.gameState.shot_clock }}</span>
             </div>
+            <div class="param-item">
+              <span class="param-name">Min shot clock at reset:</span>
+              <span class="param-value">{{ props.gameState.min_shot_clock ?? 'N/A' }}</span>
+            </div>
           </div>
 
           <div class="param-category">

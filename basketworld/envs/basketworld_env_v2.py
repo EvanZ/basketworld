@@ -1,4 +1,3 @@
-
 # basketworld_env_v2.py
 """
 Hexagon-tessellated basketball environment for reinforcement learning.
@@ -24,6 +23,7 @@ from collections import defaultdict
 
 # Use a non-interactive backend so rendering works in headless/threaded contexts
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import gymnasium as gym
@@ -31,6 +31,7 @@ import numpy as np
 from gymnasium import spaces
 
 from basketworld.utils.evaluation_helpers import profile_section
+
 
 class Team(Enum):
     OFFENSE = 0
@@ -56,9 +57,9 @@ class ActionType(Enum):
 
 class HexagonBasketballEnv(gym.Env):
     """Hexagon-tessellated basketball environment for self-play RL."""
-    
+
     metadata = {"render.modes": ["human", "rgb_array"]}
-    
+
     def __init__(
         self,
         grid_size: int = 16,
@@ -66,6 +67,7 @@ class HexagonBasketballEnv(gym.Env):
         players_per_side: int | None = None,
         shot_clock: int | None = None,
         shot_clock_steps: int = 24,
+        min_shot_clock: int = 10,
         training_team: Team = Team.OFFENSE,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
@@ -87,9 +89,9 @@ class HexagonBasketballEnv(gym.Env):
         illegal_defense_max_steps: int = 3,
         # Shot pressure parameters
         shot_pressure_enabled: bool = True,
-        shot_pressure_max: float = 0.5,   # max reduction at distance=1 (multiplier = 1 - max)
-        shot_pressure_lambda: float = 1.0, # decay rate per hex away from shooter
-        shot_pressure_arc_degrees: float = 60.0, # arc width centered toward basket
+        shot_pressure_max: float = 0.5,  # max reduction at distance=1 (multiplier = 1 - max)
+        shot_pressure_lambda: float = 1.0,  # decay rate per hex away from shooter
+        shot_pressure_arc_degrees: float = 60.0,  # arc width centered toward basket
         enable_profiling: bool = False,
         spawn_distance: int = 3,
         # Reward shaping parameters
@@ -117,7 +119,7 @@ class HexagonBasketballEnv(gym.Env):
         assist_window: int = 2,
     ):
         super().__init__()
-        
+
         self.grid_size = grid_size
         self.court_width = int(grid_size * 1.0)
         self.court_height = grid_size
@@ -131,6 +133,8 @@ class HexagonBasketballEnv(gym.Env):
         if shot_clock is None:
             shot_clock = shot_clock_steps
         self.shot_clock_steps = int(shot_clock)
+        # Minimum starting value when randomly initializing the shot clock at reset
+        self.min_shot_clock = int(min_shot_clock)
         self.training_team = training_team  # Which team is currently training
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
@@ -171,7 +175,7 @@ class HexagonBasketballEnv(gym.Env):
         # Illegal defense configuration
         self.illegal_defense_enabled = bool(illegal_defense_enabled)
         self.illegal_defense_max_steps = int(illegal_defense_max_steps)
-        
+
         # Total players
         self.n_players = self.players_per_side * 2
         self.offense_ids = list(range(self.players_per_side))
@@ -179,17 +183,24 @@ class HexagonBasketballEnv(gym.Env):
 
         # Assist window
         self.assist_window = int(assist_window)
-        
+
         # Action space: each player can take one of 9 actions
         self.action_space = spaces.MultiDiscrete([len(ActionType)] * self.n_players)
-        
+
         # Define the two parts of our observation space
         # Observation length depends on configuration flags
         # +1 for unified policy role flag (offense=1.0, defense=0.0)
         # +players_per_side for per-offense nearest-defender distances
         # Additional features per offensive player: baseline layup/3pt/dunk percentages
         per_offense_skill_features = self.players_per_side * 3
-        base_len = (self.n_players * 2) + self.n_players + 1 + 1 + self.players_per_side + per_offense_skill_features
+        base_len = (
+            (self.n_players * 2)
+            + self.n_players
+            + 1
+            + 1
+            + self.players_per_side
+            + per_offense_skill_features
+        )
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -198,18 +209,14 @@ class HexagonBasketballEnv(gym.Env):
             dtype=np.float32,
         )
         action_mask_space = spaces.Box(
-            low=0, 
-            high=1, 
-            shape=(self.n_players, len(ActionType)), 
-            dtype=np.int8
+            low=0, high=1, shape=(self.n_players, len(ActionType)), dtype=np.int8
         )
-        
+
         # The full observation space is a dictionary containing the state and the mask
-        self.observation_space = spaces.Dict({
-            "obs": state_space,
-            "action_mask": action_mask_space
-        })
-        
+        self.observation_space = spaces.Dict(
+            {"obs": state_space, "action_mask": action_mask_space}
+        )
+
         # --- Hexagonal Grid Directions ---
         # These are the 6 axial direction vectors for a pointy-topped hexagonal grid.
         # In our (q, r) axial system:
@@ -219,16 +226,16 @@ class HexagonBasketballEnv(gym.Env):
         # The previous vectors were incorrect, causing bugs in movement and passing.
         # These vectors correctly map ActionType enums to their corresponding axial changes.
         self.hex_directions = [
-            (+1,  0), # E:  Move one hex to the right.
-            (+1, -1), # NE: Move diagonally up-right.
-            ( 0, -1), # NW: Move diagonally up-left.
-            (-1,  0), # W:  Move one hex to the left.
-            (-1, +1), # SW: Move diagonally down-left.
-            ( 0, +1), # SE: Move diagonally down-right.
+            (+1, 0),  # E:  Move one hex to the right.
+            (+1, -1),  # NE: Move diagonally up-right.
+            (0, -1),  # NW: Move diagonally up-left.
+            (-1, 0),  # W:  Move one hex to the left.
+            (-1, +1),  # SW: Move diagonally down-left.
+            (0, +1),  # SE: Move diagonally down-right.
         ]
-        
+
         self._rng = np.random.default_rng(seed)
-        
+
         # Game state
         self.positions: List[Tuple[int, int]] = []  # (q, r) axial coordinates
         self.ball_holder: int = 0
@@ -250,13 +257,20 @@ class HexagonBasketballEnv(gym.Env):
                 cell = self._offset_to_axial(col, row)
                 allowed = np.ones(6, dtype=np.int8)
                 for dir_idx in range(6):
-                    nbr = (cell[0] + self.hex_directions[dir_idx][0], cell[1] + self.hex_directions[dir_idx][1])
-                    if (not self._is_valid_position(*nbr)) or ((nbr == self.basket_position) and (not self.allow_dunks)):
+                    nbr = (
+                        cell[0] + self.hex_directions[dir_idx][0],
+                        cell[1] + self.hex_directions[dir_idx][1],
+                    )
+                    if (not self._is_valid_position(*nbr)) or (
+                        (nbr == self.basket_position) and (not self.allow_dunks)
+                    ):
                         allowed[dir_idx] = 0
                 self._move_mask_by_cell[cell] = allowed
 
         # Precompute shoot/pass action indices
-        self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [a.value for a in ActionType if "PASS" in a.name]
+        self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [
+            a.value for a in ActionType if "PASS" in a.name
+        ]
 
         # --- Reward parameters (stored on env for evaluation compatibility) ---
         self.pass_reward: float = float(pass_reward)
@@ -281,10 +295,16 @@ class HexagonBasketballEnv(gym.Env):
 
         # Per-episode, per-offensive-player baseline shooting percentages
         # Initialized to means; re-sampled each reset.
-        self.offense_layup_pct_by_player: List[float] = [float(self.layup_pct)] * self.players_per_side
-        self.offense_three_pt_pct_by_player: List[float] = [float(self.three_pt_pct)] * self.players_per_side
-        self.offense_dunk_pct_by_player: List[float] = [float(self.dunk_pct)] * self.players_per_side
-        
+        self.offense_layup_pct_by_player: List[float] = [
+            float(self.layup_pct)
+        ] * self.players_per_side
+        self.offense_three_pt_pct_by_player: List[float] = [
+            float(self.three_pt_pct)
+        ] * self.players_per_side
+        self.offense_dunk_pct_by_player: List[float] = [
+            float(self.dunk_pct)
+        ] * self.players_per_side
+
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
         q = col - (row - (row & 1)) // 2
@@ -303,21 +323,21 @@ class HexagonBasketballEnv(gym.Env):
         x = size * (math.sqrt(3) * q + math.sqrt(3) / 2 * r)
         y = size * (1.5 * r)
         return x, y
-    
+
     def _axial_to_cube(self, q: int, r: int) -> Tuple[int, int, int]:
         """Convert axial (q, r) to cube (x, y, z) coordinates."""
         x, z = q, r
         y = -x - z
         return x, y, z
-    
+
     def _cube_to_axial(self, x: int, y: int, z: int) -> Tuple[int, int]:
         """Convert cube (x, y, z) to axial (q, r) coordinates."""
         return x, z
-    
+
     def _rotate60_cw_cube(self, x: int, y: int, z: int) -> Tuple[int, int, int]:
         """Rotate cube (x, y, z) by 60 degrees clockwise."""
         return -z, -x, -y
-    
+
     def _rotate_k60_axial(self, q: int, r: int, k: int) -> Tuple[int, int]:
         """Rotate axial (q, r) by k*60 degrees clockwise."""
         x, y, z = self._axial_to_cube(q, r)
@@ -351,14 +371,19 @@ class HexagonBasketballEnv(gym.Env):
         elif self._fixed_shot_clock is not None:
             self.shot_clock = int(self._fixed_shot_clock)
         else:
-            max_shot_clock = self.shot_clock_steps    
-            self.shot_clock = max(10, math.floor(max_shot_clock * self._rng.random()))
+            # Sample uniformly between min and max (inclusive)
+            min_sc = int(self.min_shot_clock)
+            max_sc = int(self.shot_clock_steps)
+            if max_sc < min_sc:
+                min_sc, max_sc = max_sc, min_sc
+            # numpy Generator.integers samples [low, high) → add 1 to include max
+            self.shot_clock = int(self._rng.integers(min_sc, max_sc + 1))
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         self._assist_candidate = None
-        
+
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
         def _sample_prob(mean: float, std: float) -> float:
@@ -366,11 +391,18 @@ class HexagonBasketballEnv(gym.Env):
                 return float(mean)
             val = float(self._rng.normal(loc=float(mean), scale=float(std)))
             return float(max(0.01, min(0.99, val)))
+
         for i in range(self.players_per_side):
-            self.offense_layup_pct_by_player[i] = _sample_prob(self.layup_pct, self.layup_std)
-            self.offense_three_pt_pct_by_player[i] = _sample_prob(self.three_pt_pct, self.three_pt_std)
-            self.offense_dunk_pct_by_player[i] = _sample_prob(self.dunk_pct, self.dunk_std)
-        
+            self.offense_layup_pct_by_player[i] = _sample_prob(
+                self.layup_pct, self.layup_std
+            )
+            self.offense_three_pt_pct_by_player[i] = _sample_prob(
+                self.three_pt_pct, self.three_pt_std
+            )
+            self.offense_dunk_pct_by_player[i] = _sample_prob(
+                self.dunk_pct, self.dunk_std
+            )
+
         # Initialize positions
         if opt_positions is not None:
             self._set_initial_positions_from_override(opt_positions)
@@ -379,7 +411,7 @@ class HexagonBasketballEnv(gym.Env):
         else:
             # Offense on right side, defense on left (randomized)
             self.positions = self._generate_initial_positions()
-        
+
         # Determine ball holder: option > ctor override > random offense
         if opt_ball_holder is not None:
             self._set_initial_ball_holder(int(opt_ball_holder))
@@ -388,15 +420,12 @@ class HexagonBasketballEnv(gym.Env):
         else:
             # Random offensive player starts with ball
             self.ball_holder = int(self._rng.choice(self.offense_ids))
-        
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks()
-        }
+
+        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
         info = {"training_team": self.training_team.name}
-        
+
         return obs, info
-    
+
     @profile_section("step")
     def step(self, actions: Union[np.ndarray, List[int]]):
         """Execute one step of the environment."""
@@ -405,9 +434,9 @@ class HexagonBasketballEnv(gym.Env):
 
         if self.episode_ended:
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
-            
+
         self.step_count += 1
-        
+
         # --- Defender Pressure Mechanic ---
         if self.ball_holder in self.offense_ids:
             ball_handler_pos = self.positions[self.ball_holder]
@@ -420,12 +449,14 @@ class HexagonBasketballEnv(gym.Env):
                     if self._rng.random() < self.defender_pressure_turnover_chance:
                         # Turnover occurs!
                         turnover_results = {
-                            "turnovers": [{
-                                "player_id": self.ball_holder,
-                                "reason": "defender_pressure",
-                                "stolen_by": defender_id,
-                                "turnover_pos": ball_handler_pos
-                            }]
+                            "turnovers": [
+                                {
+                                    "player_id": self.ball_holder,
+                                    "reason": "defender_pressure",
+                                    "stolen_by": defender_id,
+                                    "turnover_pos": ball_handler_pos,
+                                }
+                            ]
                         }
                         self.last_action_results = turnover_results
                         self.ball_holder = defender_id  # Defender gets the ball
@@ -433,58 +464,65 @@ class HexagonBasketballEnv(gym.Env):
                         done = True
                         self.episode_ended = done
 
-                        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
-                        info = {"training_team": self.training_team.name, "action_results": turnover_results, "shot_clock": self.shot_clock}
-                        
+                        obs = {
+                            "obs": self._get_observation(),
+                            "action_mask": self._get_action_masks(),
+                        }
+                        info = {
+                            "training_team": self.training_team.name,
+                            "action_results": turnover_results,
+                            "shot_clock": self.shot_clock,
+                        }
+
                         return obs, rewards, done, False, info
-                    
-                    break # Only check the first defender applying pressure each step
+
+                    break  # Only check the first defender applying pressure each step
 
         actions = np.array(actions)
-        
+
         # Decrement shot clock
         self.shot_clock -= 1
-        
-        
+
         # Process all actions simultaneously
         action_results = self._process_simultaneous_actions(actions)
         self.last_action_results = action_results
-        
+
         # Check for episode termination and calculate rewards
         done, episode_rewards = self._check_termination_and_rewards(action_results)
         rewards += episode_rewards
-        
+
         # Check shot clock expiration
         if self.shot_clock <= 0:
             done = True
-            
+
         self.episode_ended = done
-        
+
         # Update illegal defense counters based on resulting positions
         if self.illegal_defense_enabled:
             for did in self.defense_ids:
-                if self.positions and tuple(self.positions[did]) == tuple(self.basket_position):
-                    self._defender_in_key_steps[did] = self._defender_in_key_steps.get(did, 0) + 1
+                if self.positions and tuple(self.positions[did]) == tuple(
+                    self.basket_position
+                ):
+                    self._defender_in_key_steps[did] = (
+                        self._defender_in_key_steps.get(did, 0) + 1
+                    )
                 else:
                     self._defender_in_key_steps[did] = 0
 
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks()
-        }
+        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
-            "shot_clock": self.shot_clock
+            "shot_clock": self.shot_clock,
         }
-        
+
         return obs, rewards, done, False, info
 
     @profile_section("action_masks")
     def _get_action_masks(self) -> np.ndarray:
         """Generate a mask of legal actions for each player."""
         masks = np.ones((self.n_players, len(ActionType)), dtype=np.int8)
-        
+
         # Only the ball holder can shoot or pass
         for i in range(self.n_players):
             if i != self.ball_holder:
@@ -496,7 +534,7 @@ class HexagonBasketballEnv(gym.Env):
             if move_mask is not None:
                 for dir_idx in range(6):
                     masks[i, ActionType.MOVE_E.value + dir_idx] = move_mask[dir_idx]
-        
+
         # Optionally disallow moving into any currently occupied neighboring hex
         if self.mask_occupied_moves:
             occupied = set(self.positions)
@@ -510,16 +548,19 @@ class HexagonBasketballEnv(gym.Env):
                     nbr = (curr_q + dq, curr_r + dr)
                     if nbr in occupied:
                         masks[i, action_idx] = 0
-        
+
         # Enforce illegal defense: after max steps in basket, mask NOOP so defender must move
         if self.illegal_defense_enabled and self.illegal_defense_max_steps > 0:
             for did in self.defense_ids:
-                if self._defender_in_key_steps.get(did, 0) >= self.illegal_defense_max_steps:
+                if (
+                    self._defender_in_key_steps.get(did, 0)
+                    >= self.illegal_defense_max_steps
+                ):
                     if tuple(self.positions[did]) == tuple(self.basket_position):
                         masks[did, ActionType.NOOP.value] = 0
-        
+
         return masks
-         
+
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
         """
         Generate initial positions with distances defined RELATIVE to the basket:
@@ -550,13 +591,19 @@ class HexagonBasketballEnv(gym.Env):
 
         if len(offense_candidates) < self.players_per_side:
             # Fallback to any valid non-basket cell
-            offense_candidates = [cell for cell in all_cells if cell != self.basket_position and self._is_valid_position(*cell)]
+            offense_candidates = [
+                cell
+                for cell in all_cells
+                if cell != self.basket_position and self._is_valid_position(*cell)
+            ]
             if len(offense_candidates) < self.players_per_side:
                 raise ValueError("Not enough valid cells to spawn offense.")
 
         # Sample unique offense positions
         offense_positions = []
-        for cell in self._rng.choice(len(offense_candidates), size=self.players_per_side, replace=False):
+        for cell in self._rng.choice(
+            len(offense_candidates), size=self.players_per_side, replace=False
+        ):
             pos = offense_candidates[cell]
             offense_positions.append(pos)
             taken_positions.add(pos)
@@ -568,7 +615,8 @@ class HexagonBasketballEnv(gym.Env):
         for off_pos in offense_positions:
             off_dist = self._hex_distance(off_pos, self.basket_position)
             candidates = [
-                cell for cell in all_cells
+                cell
+                for cell in all_cells
                 if cell != self.basket_position
                 and cell not in taken_positions
                 and self._is_valid_position(*cell)
@@ -579,7 +627,8 @@ class HexagonBasketballEnv(gym.Env):
             if not candidates:
                 # Fallback: pick any valid empty cell meeting only the minimum spawn distance
                 candidates = [
-                    cell for cell in all_cells
+                    cell
+                    for cell in all_cells
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
@@ -589,7 +638,8 @@ class HexagonBasketballEnv(gym.Env):
             if not candidates:
                 # Final fallback: any valid empty cell (avoid crashing)
                 candidates = [
-                    cell for cell in all_cells
+                    cell
+                    for cell in all_cells
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
@@ -604,13 +654,17 @@ class HexagonBasketballEnv(gym.Env):
         # offense first then defense
         return offense_positions + defense_positions
 
-    def _set_initial_positions_from_override(self, positions: List[Tuple[int, int]]) -> None:
+    def _set_initial_positions_from_override(
+        self, positions: List[Tuple[int, int]]
+    ) -> None:
         """Validate and set fixed initial positions by player index.
         Expects length == n_players. Positions must be on-court and unique.
         Basket cell is allowed only when dunks are enabled.
         """
         if len(positions) != self.n_players:
-            raise ValueError(f"initial_positions must have length {self.n_players}, got {len(positions)}")
+            raise ValueError(
+                f"initial_positions must have length {self.n_players}, got {len(positions)}"
+            )
         normalized: List[Tuple[int, int]] = [tuple(p) for p in positions]
         # Validate legality
         seen: set[Tuple[int, int]] = set()
@@ -619,7 +673,9 @@ class HexagonBasketballEnv(gym.Env):
                 raise ValueError("Each initial position must be a (q, r) tuple")
             q, r = int(pos[0]), int(pos[1])
             if (q, r) == tuple(self.basket_position) and not self.allow_dunks:
-                raise ValueError("initial position cannot be the basket cell when dunks are disabled")
+                raise ValueError(
+                    "initial position cannot be the basket cell when dunks are disabled"
+                )
             if not self._is_valid_position(q, r):
                 raise ValueError(f"initial position {(q, r)} is out of bounds")
             if (q, r) in seen:
@@ -629,24 +685,30 @@ class HexagonBasketballEnv(gym.Env):
 
     def _set_initial_ball_holder(self, player_id: int) -> None:
         if not (0 <= player_id < self.n_players):
-            raise ValueError(f"ball_holder must be in [0, {self.n_players - 1}], got {player_id}")
+            raise ValueError(
+                f"ball_holder must be in [0, {self.n_players - 1}], got {player_id}"
+            )
         self.ball_holder = int(player_id)
-    
+
     def _is_valid_position(self, q: int, r: int) -> bool:
         """Check if a hexagon position is within the rectangular court bounds."""
         col, row = self._axial_to_offset(q, r)
         return 0 <= col < self.court_width and 0 <= row < self.court_height
-    
+
     @profile_section("process_actions")
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
         """Process all player actions simultaneously with collision resolution."""
         results = {
-            "moves": {}, "passes": {}, "shots": {}, "collisions": [], "turnovers": []
+            "moves": {},
+            "passes": {},
+            "shots": {},
+            "collisions": [],
+            "turnovers": [],
         }
-        
+
         current_positions = self.positions
         final_positions = current_positions.copy()
-        
+
         # 1. Handle non-movement actions first (shots, passes)
         for player_id, action_val in enumerate(actions):
             action = ActionType(action_val)
@@ -662,31 +724,43 @@ class HexagonBasketballEnv(gym.Env):
             action = ActionType(action_val)
             if ActionType.MOVE_E.value <= action.value <= ActionType.MOVE_SE.value:
                 direction_idx = action.value - ActionType.MOVE_E.value
-                new_pos = self._get_adjacent_position(current_positions[player_id], direction_idx)
-                
+                new_pos = self._get_adjacent_position(
+                    current_positions[player_id], direction_idx
+                )
+
                 if self._is_valid_position(*new_pos):
                     if (new_pos == self.basket_position) and (not self.allow_dunks):
                         # Basket hex blocked when dunks disabled
                         if player_id == self.ball_holder:
-                            results["turnovers"].append({
-                                "player_id": player_id,
-                                "reason": "move_out_of_bounds",
-                                "turnover_pos": new_pos
-                            })
+                            results["turnovers"].append(
+                                {
+                                    "player_id": player_id,
+                                    "reason": "move_out_of_bounds",
+                                    "turnover_pos": new_pos,
+                                }
+                            )
                             self._turnover_to_defense(player_id)
-                        results["moves"][player_id] = {"success": False, "reason": "basket_collision"}
+                        results["moves"][player_id] = {
+                            "success": False,
+                            "reason": "basket_collision",
+                        }
                     else:
                         intended_moves[player_id] = new_pos
                 else:
                     # Out of bounds move
                     if player_id == self.ball_holder:
-                        results["turnovers"].append({
-                            "player_id": player_id,
-                            "reason": "move_out_of_bounds",
-                            "turnover_pos": new_pos
-                        })
+                        results["turnovers"].append(
+                            {
+                                "player_id": player_id,
+                                "reason": "move_out_of_bounds",
+                                "turnover_pos": new_pos,
+                            }
+                        )
                         self._turnover_to_defense(player_id)
-                    results["moves"][player_id] = {"success": False, "reason": "out_of_bounds"}
+                    results["moves"][player_id] = {
+                        "success": False,
+                        "reason": "out_of_bounds",
+                    }
 
         # If configured, block moves into any cell that was occupied at the start of the step
         if self.mask_occupied_moves and intended_moves:
@@ -694,19 +768,22 @@ class HexagonBasketballEnv(gym.Env):
             to_remove = []
             for pid, dest in intended_moves.items():
                 if dest in occupied_start:
-                    results["moves"][pid] = {"success": False, "reason": "occupied_neighbor"}
+                    results["moves"][pid] = {
+                        "success": False,
+                        "reason": "occupied_neighbor",
+                    }
                     to_remove.append(pid)
             for pid in to_remove:
                 intended_moves.pop(pid, None)
 
         # 3. Resolve movement based on conflicts
-        
+
         # Players who are not moving this turn
         static_players = set(range(self.n_players)) - set(intended_moves.keys())
-        
+
         # Positions that will be occupied by players who are not moving
         occupied_by_static = {current_positions[pid] for pid in static_players}
-        
+
         # Group moving players by their intended destination
         move_destinations = defaultdict(list)
         for player_id, dest in intended_moves.items():
@@ -717,8 +794,11 @@ class HexagonBasketballEnv(gym.Env):
             # a. Check for collisions with players who aren't moving
             if dest in occupied_by_static:
                 for player_id in players_intending_to_move:
-                    results["moves"][player_id] = {"success": False, "reason": "collision_static"}
-                continue # No one can move here
+                    results["moves"][player_id] = {
+                        "success": False,
+                        "reason": "collision_static",
+                    }
+                continue  # No one can move here
 
             # b. Check for collisions between multiple moving players
             if len(players_intending_to_move) > 1:
@@ -726,30 +806,39 @@ class HexagonBasketballEnv(gym.Env):
                 winner = self._rng.choice(players_intending_to_move)
                 final_positions[winner] = dest
                 results["moves"][winner] = {"success": True, "new_position": dest}
-                
+
                 # Others fail
                 for player_id in players_intending_to_move:
                     if player_id != winner:
-                        results["moves"][player_id] = {"success": False, "reason": "collision_dynamic"}
-                
-                results["collisions"].append({
-                    "position": dest, "players": players_intending_to_move, "winner": winner
-                })
+                        results["moves"][player_id] = {
+                            "success": False,
+                            "reason": "collision_dynamic",
+                        }
+
+                results["collisions"].append(
+                    {
+                        "position": dest,
+                        "players": players_intending_to_move,
+                        "winner": winner,
+                    }
+                )
             else:
                 # No collision, single player moves
                 player_id = players_intending_to_move[0]
                 final_positions[player_id] = dest
                 results["moves"][player_id] = {"success": True, "new_position": dest}
-        
+
         self.positions = final_positions
         return results
-    
-    def _get_adjacent_position(self, pos: Tuple[int, int], direction_idx: int) -> Tuple[int, int]:
+
+    def _get_adjacent_position(
+        self, pos: Tuple[int, int], direction_idx: int
+    ) -> Tuple[int, int]:
         """Get adjacent hexagon position in given direction."""
         q, r = pos
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
-    
+
     @profile_section("pass_logic")
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
         """
@@ -771,7 +860,9 @@ class HexagonBasketballEnv(gym.Env):
         cos_threshold = math.cos(math.pi / 6)
 
         def in_arc(to_q: int, to_r: int) -> bool:
-            vx, vy = self._axial_to_cartesian(to_q - passer_pos[0], to_r - passer_pos[1])
+            vx, vy = self._axial_to_cartesian(
+                to_q - passer_pos[0], to_r - passer_pos[1]
+            )
             vnorm = math.hypot(vx, vy)
             if vnorm == 0:
                 return False
@@ -779,7 +870,9 @@ class HexagonBasketballEnv(gym.Env):
             return cosang >= cos_threshold
 
         # Pick closest teammate in arc
-        team_ids = self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        team_ids = (
+            self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        )
         recv_id = None
         recv_dist = None
         for pid in team_ids:
@@ -800,17 +893,24 @@ class HexagonBasketballEnv(gym.Env):
                 target = (passer_pos[0] + dir_dq * step, passer_pos[1] + dir_dr * step)
                 if not self._is_valid_position(*target):
                     self.ball_holder = None
-                    results["turnovers"].append({
-                        "player_id": passer_id,
-                        "reason": "pass_out_of_bounds",
-                        "turnover_pos": target,
-                    })
-                    results["passes"][passer_id] = {"success": False, "reason": "out_of_bounds"}
+                    results["turnovers"].append(
+                        {
+                            "player_id": passer_id,
+                            "reason": "pass_out_of_bounds",
+                            "turnover_pos": target,
+                        }
+                    )
+                    results["passes"][passer_id] = {
+                        "success": False,
+                        "reason": "out_of_bounds",
+                    }
                     return
                 step += 1
 
         # Possible interception by defender in same arc who is closer than receiver
-        opp_ids = self.defense_ids if passer_id in self.offense_ids else self.offense_ids
+        opp_ids = (
+            self.defense_ids if passer_id in self.offense_ids else self.offense_ids
+        )
         intercept_candidates: List[Tuple[int, int]] = []  # (defender_id, distance)
         for did in opp_ids:
             dq, dr = self.positions[did]
@@ -827,13 +927,19 @@ class HexagonBasketballEnv(gym.Env):
             if self._rng.random() < self.steal_chance:
                 # Interception occurs
                 self.ball_holder = thief_id
-                results["turnovers"].append({
-                    "player_id": passer_id,
+                results["turnovers"].append(
+                    {
+                        "player_id": passer_id,
+                        "reason": "intercepted",
+                        "stolen_by": thief_id,
+                        "turnover_pos": self.positions[thief_id],
+                    }
+                )
+                results["passes"][passer_id] = {
+                    "success": False,
                     "reason": "intercepted",
-                    "stolen_by": thief_id,
-                    "turnover_pos": self.positions[thief_id],
-                })
-                results["passes"][passer_id] = {"success": False, "reason": "intercepted", "interceptor_id": thief_id}
+                    "interceptor_id": thief_id,
+                }
                 return
 
         # Successful pass to receiver in arc
@@ -867,7 +973,9 @@ class HexagonBasketballEnv(gym.Env):
         cos_threshold = math.cos(self.shot_pressure_arc_rad / 2.0)
 
         # Opposing team
-        opp_ids = self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
+        opp_ids = (
+            self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
+        )
 
         closest_d: Optional[int] = None
         for did in opp_ids:
@@ -892,7 +1000,9 @@ class HexagonBasketballEnv(gym.Env):
 
         # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
         exponent_arg = max(0, closest_d - 1)
-        reduction = self.shot_pressure_max * math.exp(-self.shot_pressure_lambda * exponent_arg)
+        reduction = self.shot_pressure_max * math.exp(
+            -self.shot_pressure_lambda * exponent_arg
+        )
         return max(0.0, 1.0 - reduction)
 
     @profile_section("attempt_shot")
@@ -900,9 +1010,9 @@ class HexagonBasketballEnv(gym.Env):
         """Attempt a shot from the ball holder."""
         shooter_pos = self.positions[shooter_id]
         basket_pos = self.basket_position
-        
+
         distance = self._hex_distance(shooter_pos, basket_pos)
-        
+
         # Use the distance-based probability calculation
         shot_success_prob = self._calculate_shot_probability(shooter_id, distance)
 
@@ -929,16 +1039,18 @@ class HexagonBasketballEnv(gym.Env):
         # Clamp similar to backend
         base_prob = max(0.01, min(0.99, base_prob))
 
-        pressure_mult = self._compute_shot_pressure_multiplier(shooter_id, shooter_pos, distance)
+        pressure_mult = self._compute_shot_pressure_multiplier(
+            shooter_id, shooter_pos, distance
+        )
 
         # Sample RNG and decide outcome
         rng_u = self._rng.random()
         shot_made = rng_u < shot_success_prob
-        
+
         if not shot_made:
             # Missed shot - possession ends
             self.ball_holder = None
-        
+
         return {
             "success": shot_made,
             "distance": distance,
@@ -947,22 +1059,28 @@ class HexagonBasketballEnv(gym.Env):
             "base_probability": base_prob,
             "pressure_multiplier": pressure_mult,
         }
-    
+
     def _turnover_to_defense(self, from_player: int):
         """Handle turnover - ball goes to nearest defender."""
         if from_player in self.offense_ids:
             # Find nearest defender
-            nearest_defender = min(self.defense_ids, 
-                                 key=lambda d: self._hex_distance(self.positions[from_player], 
-                                                                self.positions[d]))
+            nearest_defender = min(
+                self.defense_ids,
+                key=lambda d: self._hex_distance(
+                    self.positions[from_player], self.positions[d]
+                ),
+            )
         else:
             # Find nearest offensive player
-            nearest_defender = min(self.offense_ids,
-                                 key=lambda o: self._hex_distance(self.positions[from_player],
-                                                                self.positions[o]))
-        
+            nearest_defender = min(
+                self.offense_ids,
+                key=lambda o: self._hex_distance(
+                    self.positions[from_player], self.positions[o]
+                ),
+            )
+
         self.ball_holder = nearest_defender
-    
+
     @profile_section("shot_prob")
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot using a simple linear model
@@ -989,12 +1107,16 @@ class HexagonBasketballEnv(gym.Env):
             prob = p0
         else:
             t = (distance - d0) / (d1 - d0)
-            prob = p0 + (p1 - p0) * t  # linear interpolation (or extrapolation if distance>d1)
+            prob = (
+                p0 + (p1 - p0) * t
+            )  # linear interpolation (or extrapolation if distance>d1)
 
         # Apply defender shot pressure if any qualifying defender is between shooter and basket
         if self.shot_pressure_enabled and shooter_id is not None:
             shooter_pos = self.positions[shooter_id]
-            pressure_mult = self._compute_shot_pressure_multiplier(shooter_id, shooter_pos, distance)
+            pressure_mult = self._compute_shot_pressure_multiplier(
+                shooter_id, shooter_pos, distance
+            )
             prob *= pressure_mult
 
         # Clamp to sensible bounds
@@ -1002,7 +1124,9 @@ class HexagonBasketballEnv(gym.Env):
         return float(prob)
 
     @profile_section("rewards")
-    def _check_termination_and_rewards(self, action_results: Dict) -> Tuple[bool, np.ndarray]:
+    def _check_termination_and_rewards(
+        self, action_results: Dict
+    ) -> Tuple[bool, np.ndarray]:
         """Check if episode should terminate and calculate rewards."""
         rewards = np.zeros(self.n_players)
         done = False
@@ -1015,21 +1139,20 @@ class HexagonBasketballEnv(gym.Env):
         made_shot_reward_inside = self.made_shot_reward_inside
         made_shot_reward_three = self.made_shot_reward_three
         missed_shot_penalty = self.missed_shot_penalty
-        
+
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
             if pass_result.get("success"):
-                rewards[self.offense_ids] += pass_reward/self.players_per_side
-                rewards[self.defense_ids] -= pass_reward/self.players_per_side
-        
+                rewards[self.offense_ids] += pass_reward / self.players_per_side
+                rewards[self.defense_ids] -= pass_reward / self.players_per_side
+
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
             done = True
             # Penalize offense, reward defense for the turnover
             # We assume only one turnover can happen per step
-            rewards[self.offense_ids] -= turnover_penalty/self.players_per_side 
-            rewards[self.defense_ids] += turnover_penalty/self.players_per_side
-        
+            rewards[self.offense_ids] -= turnover_penalty / self.players_per_side
+            rewards[self.defense_ids] += turnover_penalty / self.players_per_side
 
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
@@ -1047,20 +1170,24 @@ class HexagonBasketballEnv(gym.Env):
                     else made_shot_reward_inside
                 )
                 # Offense scored, good for them, bad for defense
-                rewards[self.offense_ids] += made_shot_reward/self.players_per_side
-                rewards[self.defense_ids] -= made_shot_reward/self.players_per_side
+                rewards[self.offense_ids] += made_shot_reward / self.players_per_side
+                rewards[self.defense_ids] -= made_shot_reward / self.players_per_side
                 # else: handle rare case of defense scoring on own basket
             else:
                 # Offense missed, bad for them, good for defense
-                rewards[self.offense_ids] -= missed_shot_penalty/self.players_per_side
-                rewards[self.defense_ids] += missed_shot_penalty/self.players_per_side
+                rewards[self.offense_ids] -= missed_shot_penalty / self.players_per_side
+                rewards[self.defense_ids] += missed_shot_penalty / self.players_per_side
 
             # --- Assist rewards and annotations ---
             assist_potential = False
             assist_full = False
             assist_passer: Optional[int] = None
-            if self._assist_candidate is not None and self._assist_candidate.get("recipient_id") == int(player_id):
-                if self.step_count <= int(self._assist_candidate.get("expires_at_step", -1)):
+            if self._assist_candidate is not None and self._assist_candidate.get(
+                "recipient_id"
+            ) == int(player_id):
+                if self.step_count <= int(
+                    self._assist_candidate.get("expires_at_step", -1)
+                ):
                     assist_potential = True
                     assist_passer = int(self._assist_candidate["passer_id"])
                     # Reward potential assist
@@ -1070,29 +1197,47 @@ class HexagonBasketballEnv(gym.Env):
                     else:
                         # If missed, use would-be shot reward magnitude as base.
                         # Recompute distance locally to avoid scope issues.
-                        _dist_for_pct = self._hex_distance(self.positions[player_id], self.basket_position)
+                        _dist_for_pct = self._hex_distance(
+                            self.positions[player_id], self.basket_position
+                        )
                         base_for_pct = (
-                            made_shot_reward_three if _dist_for_pct >= self.three_point_distance else made_shot_reward_inside
+                            made_shot_reward_three
+                            if _dist_for_pct >= self.three_point_distance
+                            else made_shot_reward_inside
                         )
                     potential_assist_amt = (
                         max(0.0, float(self.potential_assist_pct) * float(base_for_pct))
-                        if hasattr(self, "potential_assist_pct") and self.potential_assist_pct is not None
+                        if hasattr(self, "potential_assist_pct")
+                        and self.potential_assist_pct is not None
                         else potential_assist_reward
                     )
                     # Assist shaping is symmetric: reward offense, penalize defense
-                    rewards[self.offense_ids] += potential_assist_amt/self.players_per_side
-                    rewards[self.defense_ids] -= potential_assist_amt/self.players_per_side
+                    rewards[self.offense_ids] += (
+                        potential_assist_amt / self.players_per_side
+                    )
+                    rewards[self.defense_ids] -= (
+                        potential_assist_amt / self.players_per_side
+                    )
                     if shot_result["success"]:
                         assist_full = True
                         # Full assist bonus proportional to made shot reward if configured
                         full_bonus_amt = (
-                            max(0.0, float(self.full_assist_bonus_pct) * float(made_shot_reward))
-                            if hasattr(self, "full_assist_bonus_pct") and self.full_assist_bonus_pct is not None
+                            max(
+                                0.0,
+                                float(self.full_assist_bonus_pct)
+                                * float(made_shot_reward),
+                            )
+                            if hasattr(self, "full_assist_bonus_pct")
+                            and self.full_assist_bonus_pct is not None
                             else full_assist_bonus
                         )
                         # Full assist bonus is symmetric as well
-                        rewards[self.offense_ids] += full_bonus_amt/self.players_per_side
-                        rewards[self.defense_ids] -= full_bonus_amt/self.players_per_side
+                        rewards[self.offense_ids] += (
+                            full_bonus_amt / self.players_per_side
+                        )
+                        rewards[self.defense_ids] -= (
+                            full_bonus_amt / self.players_per_side
+                        )
             # Annotate shot result for evaluation
             shot_result["assist_potential"] = bool(assist_potential)
             shot_result["assist_full"] = bool(assist_full)
@@ -1100,9 +1245,9 @@ class HexagonBasketballEnv(gym.Env):
                 shot_result["assist_passer_id"] = assist_passer
             # Clear assist window after a shot attempt (episode ends anyway)
             self._assist_candidate = None
-        
+
         return done, rewards
-    
+
     def _get_observation(self) -> np.ndarray:
         """Get current observation of the game state.
 
@@ -1191,34 +1336,40 @@ class HexagonBasketballEnv(gym.Env):
         # Append baseline shooting deltas (relative to global means) for each offensive player
         # Order per offense player: (layup_delta, three_pt_delta, dunk_delta)
         for i in range(self.players_per_side):
-            obs.append(float(self.offense_layup_pct_by_player[i]) - float(self.layup_pct))
-            obs.append(float(self.offense_three_pt_pct_by_player[i]) - float(self.three_pt_pct))
+            obs.append(
+                float(self.offense_layup_pct_by_player[i]) - float(self.layup_pct)
+            )
+            obs.append(
+                float(self.offense_three_pt_pct_by_player[i]) - float(self.three_pt_pct)
+            )
             obs.append(float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct))
 
         return np.array(obs, dtype=np.float32)
-    
+
     def render(self):
         """Render the current state of the environment."""
         if self.render_mode == "human":
             return self._render_ascii()
         elif self.render_mode == "rgb_array":
             return self._render_visual()
-    
+
     def _render_ascii(self):
         """Simple ASCII rendering for training."""
         print(f"\nShot Clock: {self.shot_clock}")
         print(f"Ball Holder: Player {self.ball_holder}")
-        
-        grid = [[' · ' for _ in range(self.court_width)] for _ in range(self.court_height)]
-        
+
+        grid = [
+            [" · " for _ in range(self.court_width)] for _ in range(self.court_height)
+        ]
+
         # Place players and basket
         for r in range(self.court_height):
             for c in range(self.court_width):
                 q, r_ax = self._offset_to_axial(c, r)
-                
+
                 if (q, r_ax) == self.basket_position:
                     grid[r][c] = " B "
-                    
+
                 for i, pos in enumerate(self.positions):
                     if pos == (q, r_ax):
                         symbol = f"O{i}" if i in self.offense_ids else f"D{i}"
@@ -1232,90 +1383,131 @@ class HexagonBasketballEnv(gym.Env):
             # Indent odd rows for hex layout
             indent = " " if r_idx % 2 != 0 else ""
             print(indent + "".join(row))
-        
+
         if self.last_action_results:
             print(f"\nLast Action Results: {self.last_action_results}")
         print("-" * 40)
-    
+
     def _render_visual(self):
         """Visual rendering using matplotlib."""
         import matplotlib.pyplot as plt
         from matplotlib.patches import RegularPolygon
         import io
         from PIL import Image
-        
+
         fig, ax = plt.subplots(figsize=(12, 10))
-        ax.set_aspect('equal')
-        
+        ax.set_aspect("equal")
+
         # Convert axial coordinates to cartesian for pointy-topped hexes
         def axial_to_cartesian(q, r):
             size = 1.0  # Defines the size (radius) of the hexagons
             x = size * (math.sqrt(3) * q + math.sqrt(3) / 2 * r)
-            y = size * (3. / 2. * r)
+            y = size * (3.0 / 2.0 * r)
             return x, y
-        
+
         hex_radius = 1.0
-        
+
         # Draw hexagonal grid for the entire court
         for c in range(self.court_width):
             for r in range(self.court_height):
                 q, r_ax = self._offset_to_axial(c, r)
                 x, y = axial_to_cartesian(q, r_ax)
-                
+
                 # Draw the base grid hexagon
                 hexagon = RegularPolygon(
-                    (x, y), numVertices=6, radius=hex_radius, 
-                    orientation=0, # for pointy-topped
-                    facecolor='lightgray', edgecolor='white', alpha=0.5,
-                    linewidth=1
+                    (x, y),
+                    numVertices=6,
+                    radius=hex_radius,
+                    orientation=0,  # for pointy-topped
+                    facecolor="lightgray",
+                    edgecolor="white",
+                    alpha=0.5,
+                    linewidth=1,
                 )
                 ax.add_patch(hexagon)
 
                 # For the basket, add a thick red ring around it
                 if (q, r_ax) == self.basket_position:
-                    basket_ring = plt.Circle((x, y), hex_radius * 1.05, fill=False, edgecolor='red', linewidth=4, zorder=6)
+                    basket_ring = plt.Circle(
+                        (x, y),
+                        hex_radius * 1.05,
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=4,
+                        zorder=6,
+                    )
                     ax.add_patch(basket_ring)
 
                 # Paint the three-point line: all hexes at exactly self.three_point_distance
                 cell_distance = self._hex_distance((q, r_ax), self.basket_position)
                 if cell_distance == self.three_point_distance:
                     tp_outline = RegularPolygon(
-                        (x, y), numVertices=6, radius=hex_radius,
-                        orientation=0, facecolor='none', edgecolor='red', linewidth=2.5, zorder=7
+                        (x, y),
+                        numVertices=6,
+                        radius=hex_radius,
+                        orientation=0,
+                        facecolor="none",
+                        edgecolor="red",
+                        linewidth=2.5,
+                        zorder=7,
                     )
                     ax.add_patch(tp_outline)
 
         # Draw players by filling their hexagon
         for i, (q, r) in enumerate(self.positions):
             x, y = axial_to_cartesian(q, r)
-            color = 'blue' if i in self.offense_ids else 'red'
-            
+            color = "blue" if i in self.offense_ids else "red"
+
             player_hexagon = RegularPolygon(
-                (x, y), numVertices=6, radius=hex_radius,
-                orientation=0, # for pointy-topped
+                (x, y),
+                numVertices=6,
+                radius=hex_radius,
+                orientation=0,  # for pointy-topped
                 facecolor=color,
-                edgecolor='white',
+                edgecolor="white",
                 alpha=0.9,
-                zorder=10
+                zorder=10,
             )
             ax.add_patch(player_hexagon)
-            ax.text(x, y, str(i), ha='center', va='center', fontsize=24, fontweight='bold', color='white', zorder=11)
-            
+            ax.text(
+                x,
+                y,
+                str(i),
+                ha="center",
+                va="center",
+                fontsize=24,
+                fontweight="bold",
+                color="white",
+                zorder=11,
+            )
+
             if i == self.ball_holder:
-                ball_ring = plt.Circle((x, y), hex_radius * 0.9, fill=False, color='orange', linewidth=4, zorder=12)
+                ball_ring = plt.Circle(
+                    (x, y),
+                    hex_radius * 0.9,
+                    fill=False,
+                    color="orange",
+                    linewidth=4,
+                    zorder=12,
+                )
                 ax.add_patch(ball_ring)
-        
+
         # Calculate court boundaries to set axis limits
-        cartesian_coords = [axial_to_cartesian(*self._offset_to_axial(c, r))
-                            for c in range(self.court_width) for r in range(self.court_height)]
+        cartesian_coords = [
+            axial_to_cartesian(*self._offset_to_axial(c, r))
+            for c in range(self.court_width)
+            for r in range(self.court_height)
+        ]
         x_coords = [c[0] for c in cartesian_coords]
         y_coords = [c[1] for c in cartesian_coords]
-        
+
         margin = 2.0
         ax.set_xlim(min(x_coords) - margin, max(x_coords) + margin)
         ax.set_ylim(min(y_coords) - margin, max(y_coords) + margin)
 
-        ax.set_title(f'Hexagon Basketball {self.players_per_side}v{self.players_per_side}')
+        ax.set_title(
+            f"Hexagon Basketball {self.players_per_side}v{self.players_per_side}"
+        )
         ax.grid(False)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -1330,7 +1522,7 @@ class HexagonBasketballEnv(gym.Env):
                 shooter_id = list(self.last_action_results["shots"].keys())[0]
                 shooter_pos = self.positions[int(shooter_id)]
                 dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
-                is_dunk = (shot_result.get("distance") == 0)
+                is_dunk = shot_result.get("distance") == 0
                 if is_dunk:
                     label_text = "Dunk"
                 else:
@@ -1338,11 +1530,49 @@ class HexagonBasketballEnv(gym.Env):
                     label_text = "3" if is_three else "2"
 
                 if shot_result["success"]:
-                    ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='green', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, f"Made {label_text}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='green', alpha=0.9)
+                    ax.add_patch(
+                        plt.Circle(
+                            (basket_x, basket_y),
+                            hex_radius,
+                            color="green",
+                            alpha=0.7,
+                            zorder=20,
+                        )
+                    )
+                    ax.text(
+                        0.5,
+                        0.9,
+                        f"Made {label_text}!",
+                        transform=ax.transAxes,
+                        ha="center",
+                        va="center",
+                        fontsize=50,
+                        fontweight="bold",
+                        color="green",
+                        alpha=0.9,
+                    )
                 else:
-                    ax.add_patch(plt.Circle((basket_x, basket_y), hex_radius, color='red', alpha=0.7, zorder=20))
-                    ax.text(0.5, 0.9, f"Missed {label_text}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='red', alpha=0.9)
+                    ax.add_patch(
+                        plt.Circle(
+                            (basket_x, basket_y),
+                            hex_radius,
+                            color="red",
+                            alpha=0.7,
+                            zorder=20,
+                        )
+                    )
+                    ax.text(
+                        0.5,
+                        0.9,
+                        f"Missed {label_text}!",
+                        transform=ax.transAxes,
+                        ha="center",
+                        va="center",
+                        fontsize=50,
+                        fontweight="bold",
+                        color="red",
+                        alpha=0.9,
+                    )
 
             # Turnover results
             turnovers = self.last_action_results.get("turnovers", [])
@@ -1350,13 +1580,23 @@ class HexagonBasketballEnv(gym.Env):
                 for pass_res in self.last_action_results["passes"].values():
                     if pass_res.get("turnover"):
                         turnovers.append(pass_res)
-            
+
             if turnovers:
                 first_turnover = turnovers[0]
                 turnover_pos = first_turnover.get("turnover_pos")
                 if turnover_pos:
                     tx, ty = axial_to_cartesian(*turnover_pos)
-                    ax.text(tx, ty, "X", ha='center', va='center', fontsize=60, fontweight='bold', color='darkred', zorder=21)
+                    ax.text(
+                        tx,
+                        ty,
+                        "X",
+                        ha="center",
+                        va="center",
+                        fontsize=60,
+                        fontweight="bold",
+                        color="darkred",
+                        zorder=21,
+                    )
 
                 # Map backend reason codes to short labels for the banner
                 reason_code = first_turnover.get("reason", "")
@@ -1366,39 +1606,68 @@ class HexagonBasketballEnv(gym.Env):
                     "move_out_of_bounds": "OOB",
                     "intercepted": "STEAL",
                 }
-                reason_label = reason_map.get(reason_code, reason_code.replace("_", " ").upper())
-                ax.text(0.5, 0.9, f"TOV - {reason_label}!", transform=ax.transAxes, ha='center', va='center', fontsize=50, fontweight='bold', color='darkred', alpha=0.9)
+                reason_label = reason_map.get(
+                    reason_code, reason_code.replace("_", " ").upper()
+                )
+                ax.text(
+                    0.5,
+                    0.9,
+                    f"TOV - {reason_label}!",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=50,
+                    fontweight="bold",
+                    color="darkred",
+                    alpha=0.9,
+                )
 
             # Shot clock violation
             elif self.shot_clock <= 0:
-                ax.text(0.5, 0.9, "SHOT CLOCK VIOLATION", transform=ax.transAxes, ha='center', va='center', fontsize=40, fontweight='bold', color='darkred', alpha=0.9)
+                ax.text(
+                    0.5,
+                    0.9,
+                    "SHOT CLOCK VIOLATION",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=40,
+                    fontweight="bold",
+                    color="darkred",
+                    alpha=0.9,
+                )
 
- 
         # Add shot clock text to the bottom right corner
-        ax.text(0.95, 0.05, f"{self.shot_clock}",
-                fontsize=48,
-                fontweight='bold',
-                color='black',
-                ha='right',
-                va='bottom',
-                alpha=0.5,
-                transform=ax.transAxes)
-        
+        ax.text(
+            0.95,
+            0.05,
+            f"{self.shot_clock}",
+            fontsize=48,
+            fontweight="bold",
+            color="black",
+            ha="right",
+            va="bottom",
+            alpha=0.5,
+            transform=ax.transAxes,
+        )
+
         fig.canvas.draw()
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=150)
+        fig.savefig(buf, format="png", dpi=150)
         buf.seek(0)
-        
+
         img = Image.open(buf)
         rgb_array = np.array(img)
         plt.close(fig)
         buf.close()
-        
+
         return rgb_array
-    
+
     def switch_training_team(self):
         """Switch which team is currently training (for alternating optimization)."""
-        self.training_team = Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
+        self.training_team = (
+            Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
+        )
 
     # --- Profiling helpers ---
     def get_profile_stats(self) -> Dict[str, Dict[str, float]]:
@@ -1425,32 +1694,32 @@ if __name__ == "__main__":
         players_per_side=3,
         shot_clock_steps=24,
         training_team=Team.OFFENSE,
-        seed=42
+        seed=42,
     )
-    
+
     print("=== Hexagon Basketball Environment Demo ===")
     obs, info = env.reset()
     print(f"Initial observation shape: {obs['obs'].shape}")
     print(f"Action space: {env.action_space}")
-    
+
     env.render()
-    
+
     # Run a few random steps
     for step in range(5):
         actions = env.action_space.sample()
         obs, rewards, done, truncated, info = env.step(actions)
-        
+
         print(f"\nStep {step + 1}:")
         print(f"Actions: {actions}")
         print(f"Rewards: {rewards}")
         print(f"Done: {done}")
-        
+
         env.render()
-        
+
         if done:
             print("Episode ended!")
             break
-    
+
     print("\n=== Switching to Defense Training ===")
     env.switch_training_team()
     obs, info = env.reset()
