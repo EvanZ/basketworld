@@ -473,8 +473,28 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         We replace the opponent's actions with predictions from the frozen policy.
         """
         # Get action from the frozen opponent policy using the last observation
+        # IMPORTANT: Flip the unified role flag for the opponent, so it
+        # conditions on the opposite role (defense vs offense). The role flag
+        # is appended as the last element of the flat observation vector.
+        opponent_obs = self.last_obs
+        try:
+            # Create a shallow copy of the dict to avoid mutating self.last_obs
+            opponent_obs = {
+                "obs": np.copy(self.last_obs["obs"]),
+                "action_mask": self.last_obs["action_mask"],
+            }
+            if opponent_obs["obs"].ndim == 1 and opponent_obs["obs"].size > 0:
+                role_flag_idx = opponent_obs["obs"].size - 1
+                # Flip 1.0 <-> 0.0
+                opponent_obs["obs"][role_flag_idx] = (
+                    1.0 - opponent_obs["obs"][role_flag_idx]
+                )
+        except Exception:
+            # If anything goes wrong, fall back to original observation
+            opponent_obs = self.last_obs
+
         opponent_action_raw, _ = self.opponent_policy.predict(
-            self.last_obs, deterministic=self.deterministic_opponent
+            opponent_obs, deterministic=self.deterministic_opponent
         )
         action_mask = self.last_obs["action_mask"]
 
