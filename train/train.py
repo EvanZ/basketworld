@@ -836,10 +836,16 @@ def main(args):
                 print("Warning: failed to copy prior models:", e)
 
         # --- Define Policy Kwargs ---
-        # This allows us to set the network architecture from the command line.
+        # Allow specifying shared or separate actor/critic network architectures.
         policy_kwargs = {}
         if args.net_arch is not None:
+            # Backwards-compat: if a single net_arch is provided, use it as-is
             policy_kwargs["net_arch"] = args.net_arch
+        else:
+            # Default to separate policy/value arches with defaults [64, 64] each
+            pi_arch = getattr(args, "net_arch_pi", [64, 64])
+            vf_arch = getattr(args, "net_arch_vf", [64, 64])
+            policy_kwargs["net_arch"] = [dict(pi=pi_arch, vf=vf_arch)]
 
         # The save_path is no longer needed as models are saved to a temp dir
         # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1376,6 +1382,20 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.",
+    )
+    parser.add_argument(
+        "--net-arch-pi",
+        type=int,
+        nargs="+",
+        default=[64, 64],
+        help="Actor (policy) MLP hidden sizes, e.g. 64 64. Ignored if --net-arch is set.",
+    )
+    parser.add_argument(
+        "--net-arch-vf",
+        type=int,
+        nargs="+",
+        default=[64, 64],
+        help="Critic (value) MLP hidden sizes, e.g. 64 64. Ignored if --net-arch is set.",
     )
     parser.add_argument(
         "--continue-run-id",
