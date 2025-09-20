@@ -189,17 +189,14 @@ class HexagonBasketballEnv(gym.Env):
 
         # Define the two parts of our observation space
         # Observation length depends on configuration flags
-        # +1 for unified policy role flag (offense=1.0, defense=0.0)
+        # Role flag moved to separate observation key `role_flag` (Box shape=(1,))
         # +players_per_side for per-offense nearest-defender distances
-        # Additional features per offensive player: baseline layup/3pt/dunk percentages
-        per_offense_skill_features = self.players_per_side * 3
+        # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
         base_len = (
             (self.n_players * 2)
             + self.n_players
             + 1
-            + 1
             + self.players_per_side
-            + per_offense_skill_features
         )
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
@@ -213,8 +210,20 @@ class HexagonBasketballEnv(gym.Env):
         )
 
         # The full observation space is a dictionary containing the state and the mask
+        role_flag_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        skills_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.players_per_side * 3,),
+            dtype=np.float32,
+        )
         self.observation_space = spaces.Dict(
-            {"obs": state_space, "action_mask": action_mask_space}
+            {
+                "obs": state_space,
+                "action_mask": action_mask_space,
+                "role_flag": role_flag_space,
+                "skills": skills_space,
+            }
         )
 
         # --- Hexagonal Grid Directions ---
@@ -421,7 +430,15 @@ class HexagonBasketballEnv(gym.Env):
             # Random offensive player starts with ball
             self.ball_holder = int(self._rng.choice(self.offense_ids))
 
-        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks(),
+            "role_flag": np.array(
+                [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                dtype=np.float32,
+            ),
+            "skills": self._get_offense_skills_array(),
+        }
         info = {"training_team": self.training_team.name}
 
         return obs, info
@@ -467,6 +484,11 @@ class HexagonBasketballEnv(gym.Env):
                         obs = {
                             "obs": self._get_observation(),
                             "action_mask": self._get_action_masks(),
+                            "role_flag": np.array(
+                                [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                                dtype=np.float32,
+                            ),
+                            "skills": self._get_offense_skills_array(),
                         }
                         info = {
                             "training_team": self.training_team.name,
@@ -509,7 +531,15 @@ class HexagonBasketballEnv(gym.Env):
                 else:
                     self._defender_in_key_steps[did] = 0
 
-        obs = {"obs": self._get_observation(), "action_mask": self._get_action_masks()}
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks(),
+            "role_flag": np.array(
+                [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                dtype=np.float32,
+            ),
+            "skills": self._get_offense_skills_array(),
+        }
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
@@ -1256,7 +1286,7 @@ class HexagonBasketballEnv(gym.Env):
         - One-hot ball holder (redundant but retained for compatibility/debugging)
         - Shot clock (raw value)
         - Hoop vector relative to ball handler, normalized
-        - Role flag for unified policy: 1.0 if training OFFENSE else 0.0
+        - Role flag now provided separately as observation key `role_flag`
         - For each offensive player: distance to nearest defender (normalized if enabled)
         """
         obs: List[float] = []
@@ -1307,10 +1337,6 @@ class HexagonBasketballEnv(gym.Env):
         # Shot clock (kept unnormalized)
         obs.append(float(self.shot_clock))
 
-        # Unified policy role flag
-        role_flag = 1.0 if self.training_team == Team.OFFENSE else 0.0
-        obs.append(role_flag)
-
         # Hoop vector relative to ego-center, rotated consistently (optional)
         if self.include_hoop_vector:
             hoop_dq, hoop_dr = hoop_dq_raw, hoop_dr_raw
@@ -1333,18 +1359,25 @@ class HexagonBasketballEnv(gym.Env):
             else:
                 obs.append(float(nearest_defender_distance))
 
-        # Append baseline shooting deltas (relative to global means) for each offensive player
-        # Order per offense player: (layup_delta, three_pt_delta, dunk_delta)
+        return np.array(obs, dtype=np.float32)
+
+    def _get_offense_skills_array(self) -> np.ndarray:
+        """Return per-offense-player skill deltas as a flat array of length players_per_side*3.
+
+        Order per offense player: (layup_delta, three_pt_delta, dunk_delta)
+        """
+        skills: List[float] = []
         for i in range(self.players_per_side):
-            obs.append(
+            skills.append(
                 float(self.offense_layup_pct_by_player[i]) - float(self.layup_pct)
             )
-            obs.append(
+            skills.append(
                 float(self.offense_three_pt_pct_by_player[i]) - float(self.three_pt_pct)
             )
-            obs.append(float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct))
-
-        return np.array(obs, dtype=np.float32)
+            skills.append(
+                float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct)
+            )
+        return np.array(skills, dtype=np.float32)
 
     def render(self):
         """Render the current state of the environment."""
