@@ -1492,6 +1492,56 @@ class HexagonBasketballEnv(gym.Env):
                 )
                 ax.add_patch(ball_ring)
 
+        # --- Draw pass arrow (successful pass in the last action) ---
+        try:
+            if self.last_action_results and self.last_action_results.get("passes"):
+                for passer_id_str, pass_res in self.last_action_results["passes"].items():
+                    if pass_res.get("success") and "target" in pass_res:
+                        passer_id = int(passer_id_str)
+                        target_id = int(pass_res.get("target"))
+                        pq, pr = self.positions[passer_id]
+                        tq, tr = self.positions[target_id]
+                        x1, y1 = axial_to_cartesian(pq, pr)
+                        x2, y2 = axial_to_cartesian(tq, tr)
+                        # Solid black arrow from passer to receiver
+                        ax.annotate(
+                            "",
+                            xy=(x2, y2),
+                            xytext=(x1, y1),
+                            arrowprops=dict(arrowstyle="->", color="black", linewidth=3),
+                            zorder=19,
+                        )
+        except Exception:
+            pass
+
+        # --- Annotate per-offensive-player shot make percentages (with pressure) ---
+        try:
+            for oid in self.offense_ids:
+                q, r = self.positions[oid]
+                # Distance to basket in hex metric
+                dist = self._hex_distance((q, r), self.basket_position)
+                # Use the env's probability model (accounts for player skill and pressure)
+                prob = float(self._calculate_shot_probability(int(oid), int(dist)))
+                pct_text = f"{int(round(prob * 100))}%"
+                x, y = axial_to_cartesian(q, r)
+                # Offset label slightly above-right of the player
+                tx = x + hex_radius * 0.0
+                ty = y + hex_radius * 1.2
+                ax.text(
+                    tx,
+                    ty,
+                    pct_text,
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    fontweight="bold",
+                    color="white",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="black", alpha=0.7),
+                    zorder=13,
+                )
+        except Exception:
+            pass
+
         # Calculate court boundaries to set axis limits
         cartesian_coords = [
             axial_to_cartesian(*self._offset_to_axial(c, r))
