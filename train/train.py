@@ -37,6 +37,7 @@ import torch
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
 # These defaults can be overridden by user environment.
@@ -845,7 +846,9 @@ def main(args):
             # Default to separate policy/value arches with defaults [64, 64] each
             pi_arch = getattr(args, "net_arch_pi", [64, 64])
             vf_arch = getattr(args, "net_arch_vf", [64, 64])
-            policy_kwargs["net_arch"] = [dict(pi=pi_arch, vf=vf_arch)]
+            policy_kwargs["net_arch"] = dict(pi=pi_arch, vf=vf_arch)
+        # Prevent the policy from learning directly from action_mask
+        policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
 
         # The save_path is no longer needed as models are saved to a temp dir
         # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

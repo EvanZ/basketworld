@@ -501,6 +501,16 @@ class HexagonBasketballEnv(gym.Env):
                     break  # Only check the first defender applying pressure each step
 
         actions = np.array(actions)
+        # Map illegal actions to NO-OP (index 0) to avoid support flips/invalid ops
+        try:
+            masks = self._get_action_masks()
+            for i in range(self.n_players):
+                a = int(actions[i])
+                if a < 0 or a >= masks.shape[1] or masks[i, a] == 0:
+                    actions[i] = ActionType.NOOP.value
+        except Exception:
+            # If masking fails for any reason, proceed without remapping
+            pass
 
         # Decrement shot clock
         self.shot_clock -= 1
