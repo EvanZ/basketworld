@@ -898,12 +898,14 @@ def main(args):
                 temp_env,
                 verbose=1,
                 n_steps=args.n_steps,
+                n_epochs=args.n_epochs,
                 vf_coef=args.vf_coef,
                 ent_coef=initial_ent_coef,
                 batch_size=args.batch_size,
                 learning_rate=args.learning_rate,
                 tensorboard_log=None,  # Disable TensorBoard if using MLflow
                 policy_kwargs=policy_kwargs,
+                target_kl=args.target_kl,
                 device=device,
             )
         temp_env.close()
@@ -1310,6 +1312,18 @@ if __name__ == "__main__":
         type=int,
         default=2048,
         help="PPO hyperparameter: Number of steps to run for each environment per update.",
+    )
+    parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.025,
+        help="PPO hyperparameter: Target KL divergence for early stopping.",
+    )
+    parser.add_argument(
+        "--n-epochs",
+        type=int,
+        default=10,
+        help="PPO hyperparameter: Number of epochs when optimizing the surrogate.",
     )
     parser.add_argument(
         "--gamma",
