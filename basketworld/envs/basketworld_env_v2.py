@@ -1450,6 +1450,38 @@ class HexagonBasketballEnv(gym.Env):
 
         hex_radius = 1.0
 
+        # Helper: map standardized delta (in units of std dev) to a color (blue→green→orange)
+        def _lerp(c1, c2, t):
+            return (
+                c1[0] + (c2[0] - c1[0]) * t,
+                c1[1] + (c2[1] - c1[1]) * t,
+                c1[2] + (c2[2] - c1[2]) * t,
+            )
+
+        def color_from_zscore(delta: float, std: float, zmax: float = 2.0):
+            # Convert delta to z = (sample - baseline) / std; handle std≈0
+            if std is None or std <= 1e-9:
+                z = 0.0
+            else:
+                z = float(delta) / float(std)
+            # Clamp to [−zmax, +zmax]
+            if z < -zmax:
+                z = -zmax
+            elif z > zmax:
+                z = zmax
+            # Anchors
+            blue = (0.20, 0.40, 0.90)
+            green = (0.20, 0.70, 0.20)
+            orange = (1.00, 0.60, 0.00)
+            if z < 0.0:
+                # Map [−zmax, 0] → [blue, green]
+                t = 1.0 - (abs(z) / zmax)  # z=-zmax→0, z=0→1
+                return _lerp(blue, green, t)
+            else:
+                # Map [0, +zmax] → [green, orange]
+                t = z / zmax  # z=0→0, z=+zmax→1
+                return _lerp(green, orange, t)
+
         # Draw hexagonal grid for the entire court
         for c in range(self.court_width):
             for r in range(self.court_height):
@@ -1534,6 +1566,69 @@ class HexagonBasketballEnv(gym.Env):
                     zorder=12,
                 )
                 ax.add_patch(ball_ring)
+
+            # Baseline skill labels at the three lower vertices (Offense only),
+            # with background color coded by (sampled − baseline) delta.
+            try:
+                if i in self.offense_ids:
+                    lay = float(self.offense_layup_pct_by_player[int(i)])
+                    three = float(self.offense_three_pt_pct_by_player[int(i)])
+                    dunk = float(self.offense_dunk_pct_by_player[int(i)])
+                    # Baselines
+                    base_lay = float(self.layup_pct)
+                    base_three = float(self.three_pt_pct)
+                    base_dunk = float(self.dunk_pct)
+                    # Deltas
+                    d_lay = lay - base_lay
+                    d_three = three - base_three
+                    d_dunk = dunk - base_dunk
+
+                    rscale = hex_radius * 1.05
+                    sqrt3 = math.sqrt(3.0)
+                    verts = [
+                        # bottom-left: Dunk value with dunk delta color
+                        (
+                            x - (sqrt3 / 2.0) * rscale,
+                            y - 0.5 * rscale,
+                            f"{int(round(dunk * 100))}%D",
+                            color_from_zscore(d_dunk, float(self.dunk_std)),
+                        ),
+                        # bottom-center: Layup value with layup delta color
+                        (
+                            x + 0.0,
+                            y - 1.0 * rscale,
+                            f"{int(round(lay * 100))}%L",
+                            color_from_zscore(d_lay, float(self.layup_std)),
+                        ),
+                        # bottom-right: Three value with three-point delta color
+                        (
+                            x + (sqrt3 / 2.0) * rscale,
+                            y - 0.5 * rscale,
+                            f"{int(round(three * 100))}%3",
+                            color_from_zscore(d_three, float(self.three_pt_std)),
+                        ),
+                    ]
+
+                    for vx, vy, text, fc_col in verts:
+                        ax.text(
+                            vx,
+                            vy,
+                            text,
+                            ha="center",
+                            va="center",
+                            fontsize=9,
+                            fontweight="bold",
+                            color="white",
+                            bbox=dict(
+                                boxstyle="round,pad=0.15",
+                                fc=fc_col,
+                                ec=fc_col,
+                                alpha=0.85,
+                            ),
+                            zorder=13,
+                        )
+            except Exception:
+                pass
 
         # --- Draw pass arrow (successful pass in the last action) ---
         try:
