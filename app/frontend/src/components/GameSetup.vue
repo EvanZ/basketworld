@@ -9,6 +9,8 @@ const userTeam = ref('OFFENSE');
 
 const unifiedPolicies = ref([]);
 const selectedUnifiedPolicy = ref(null);
+const useDifferentOpponentPolicy = ref(false);
+const selectedOpponentUnifiedPolicy = ref(null);
 
 async function fetchPolicies() {
   if (!runId.value) return;
@@ -16,6 +18,7 @@ async function fetchPolicies() {
     const res = await listPolicies(runId.value);
     unifiedPolicies.value = res.unified || [];
     selectedUnifiedPolicy.value = unifiedPolicies.value.at(-1) || null;
+    selectedOpponentUnifiedPolicy.value = selectedUnifiedPolicy.value;
   } catch (e) {
     console.error('Failed to fetch policies', e);
   }
@@ -28,8 +31,16 @@ watch(runId, () => { fetchPolicies(); });
 // The parent App.vue will handle the API call and loading state.
 function startGame() {
     if (runId.value) {
-        console.log('[GameSetup] Emitting game-started event with:', { runId: runId.value, userTeam: userTeam.value, unifiedPolicyName: selectedUnifiedPolicy.value });
-        emit('game-started', { runId: runId.value, userTeam: userTeam.value, unifiedPolicyName: selectedUnifiedPolicy.value });
+        const payload = {
+            runId: runId.value,
+            userTeam: userTeam.value,
+            unifiedPolicyName: selectedUnifiedPolicy.value,
+            opponentUnifiedPolicyName: useDifferentOpponentPolicy.value
+                ? (selectedOpponentUnifiedPolicy.value || selectedUnifiedPolicy.value)
+                : null,
+        };
+        console.log('[GameSetup] Emitting game-started event with:', payload);
+        emit('game-started', payload);
     }
 }
 </script>
@@ -64,7 +75,18 @@ function startGame() {
                 </select>
             </div>
 
-            
+            <div class="form-group" v-if="unifiedPolicies.length > 0">
+                <label>
+                    <input type="checkbox" v-model="useDifferentOpponentPolicy">
+                    Use different policy for frozen opponent
+                </label>
+            </div>
+            <div class="form-group" v-if="useDifferentOpponentPolicy && unifiedPolicies.length > 0">
+                <label for="opponentUnifiedPol">Opponent Policy:</label>
+                <select id="opponentUnifiedPol" v-model="selectedOpponentUnifiedPolicy">
+                    <option v-for="name in unifiedPolicies" :key="name" :value="name">{{ name }}</option>
+                </select>
+            </div>
 
             <button type="submit">
                 Start Game

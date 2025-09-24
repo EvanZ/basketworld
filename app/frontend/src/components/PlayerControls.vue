@@ -911,6 +911,18 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
           </div>
 
           <div class="param-category">
+            <h5>Policies</h5>
+            <div class="param-item">
+              <span class="param-name">Player 1 team:</span>
+              <span class="param-value">{{ (props.gameState.user_team_name || 'OFFENSE') }} · {{ props.gameState.unified_policy_name || 'Latest unified' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Opponent:</span>
+              <span class="param-value">{{ (props.gameState.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE') }} · {{ props.gameState.opponent_unified_policy_name || props.gameState.unified_policy_name || 'Same as unified' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
             <h5>Shot Parameters</h5>
             <div class="param-item">
               <span class="param-name">Three point distance:</span>

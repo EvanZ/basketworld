@@ -5,6 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
+import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
@@ -63,10 +64,12 @@ async function handleGameStarted(setupData) {
   // Start loading BEFORE clearing state to avoid interim UI flicker
   isLoading.value = true;
   error.value = null;
+  policyProbs.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
   gameState.value = null;      // Ensure old board is cleared
   gameHistory.value = [];      // Clear history
+  activePlayerId.value = null;
   try {
     const response = await initGame(
       setupData.runId,
@@ -74,6 +77,7 @@ async function handleGameStarted(setupData) {
       setupData.offensePolicyName,
       setupData.defensePolicyName,
       setupData.unifiedPolicyName ?? null,
+      setupData.opponentUnifiedPolicyName ?? null,
     );
     if (response.status === 'success') {
       gameState.value = response.state;
@@ -326,6 +330,8 @@ function onKeydown(e) {
 }
 
 onMounted(() => {
+  // Clear persisted stats once per app load
+  try { resetStatsStorage(); } catch (_) {}
   window.addEventListener('keydown', onKeydown);
 });
 onBeforeUnmount(() => {

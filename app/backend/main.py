@@ -37,6 +37,8 @@ class GameState:
         self.offense_policy_key: str | None = None
         self.defense_policy_key: str | None = None
         self.unified_policy_key: str | None = None
+        # Opponent unified policy (if different from unified)
+        self.opponent_unified_policy_key: str | None = None
         # Self-play / replay tracking
         self.self_play_active: bool = False
         self.replay_seed: int | None = None
@@ -61,6 +63,7 @@ class InitGameRequest(BaseModel):
     run_id: str
     user_team_name: str  # "OFFENSE" or "DEFENSE"
     unified_policy_name: str | None = None
+    opponent_unified_policy_name: str | None = None
     # Optional overrides
     spawn_distance: int | None = None
     allow_dunks: bool | None = None
@@ -194,19 +197,28 @@ async def init_game(request: InitGameRequest):
         unified_path = get_unified_policy_path(
             client, request.run_id, request.unified_policy_name
         )
+        opponent_unified_path = None
+        if request.opponent_unified_policy_name:
+            opponent_unified_path = get_unified_policy_path(
+                client, request.run_id, request.opponent_unified_policy_name
+            )
         unified_key = os.path.basename(unified_path)
 
-        # Reset shot log only if policies changed
-        if getattr(game_state, "unified_policy_key", None) != unified_key:
-            game_state.shot_log = []
-            game_state.unified_policy_key = unified_key
-            game_state.offense_policy_key = None
-            game_state.defense_policy_key = None
+        # Reset per-episode stats/logs and set policy keys for UI on every init
+        game_state.shot_log = []
+        game_state.unified_policy_key = unified_key
+        game_state.offense_policy_key = None
+        game_state.defense_policy_key = None
+        game_state.opponent_unified_policy_key = (
+            os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        )
 
         # (Re)load policies from the selected paths
         game_state.unified_policy = PPO.load(unified_path)
         game_state.offense_policy = None
-        game_state.defense_policy = None
+        game_state.defense_policy = (
+            PPO.load(opponent_unified_path) if opponent_unified_path else None
+        )
 
         game_state.env = basketworld.HexagonBasketballEnv(
             **required,
@@ -260,6 +272,27 @@ def take_step(request: ActionRequest):
     full_action_ai, _ = game_state.unified_policy.predict(
         ai_obs, deterministic=pred_deterministic
     )
+    full_action_ai_opponent = None
+    if game_state.defense_policy is not None:
+        try:
+            # Flip role flag for opponent so it conditions on opposite role
+            opp_obs = ai_obs
+            try:
+                opp_obs = {
+                    "obs": np.copy(ai_obs["obs"]),
+                    "action_mask": ai_obs["action_mask"],
+                    "role_flag": np.copy(ai_obs.get("role_flag")),
+                    "skills": np.copy(ai_obs.get("skills")),
+                }
+                if opp_obs.get("role_flag") is not None:
+                    opp_obs["role_flag"] = 1.0 - opp_obs["role_flag"]
+            except Exception:
+                opp_obs = ai_obs
+            full_action_ai_opponent, _ = game_state.defense_policy.predict(
+                opp_obs, deterministic=pred_deterministic
+            )
+        except Exception:
+            full_action_ai_opponent = None
 
     # If deterministic, precompute policy probabilities to choose best-legal fallback
     unified_probs = None
@@ -293,8 +326,14 @@ def take_step(request: ActionRequest):
             else:
                 full_action[i] = 0
         else:
-            # Action comes from the AI policy
+            # Action comes from the AI policy; if opponent policy present use it for non-user team
             predicted_action = full_action_ai[i]
+            if full_action_ai_opponent is not None:
+                is_user_offense = game_state.user_team == Team.OFFENSE
+                if (is_user_offense and i in game_state.env.defense_ids) or (
+                    (not is_user_offense) and i in game_state.env.offense_ids
+                ):
+                    predicted_action = full_action_ai_opponent[i]
 
             # Enforce action mask and add logging
             if action_mask[i][predicted_action] == 1:
@@ -1117,6 +1156,11 @@ def get_full_game_state():
         # MLflow metadata for UI display
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),
+        # Policies in use
+        "unified_policy_name": getattr(game_state, "unified_policy_key", None),
+        "opponent_unified_policy_name": getattr(
+            game_state, "opponent_unified_policy_key", None
+        ),
         # Per-episode sampled shooting skills (offense only), aligned by offense index
         "offense_shooting_pct_by_player": {
             "layup": [
