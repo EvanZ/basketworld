@@ -15,6 +15,16 @@ import copy
 from datetime import datetime
 import imageio
 from basketworld.utils.evaluation_helpers import get_outcome_category
+from basketworld.utils.action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
+from basketworld.utils.action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
 from basketworld.utils.mlflow_params import get_mlflow_params
 
 
@@ -289,27 +299,45 @@ def take_step(request: ActionRequest):
             except Exception:
                 opp_obs = ai_obs
             full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                opp_obs, deterministic=pred_deterministic
+                opp_obs, deterministic=True
             )
         except Exception:
             full_action_ai_opponent = None
 
-    # If deterministic, precompute policy probabilities to choose best-legal fallback
-    unified_probs = None
-    if pred_deterministic:
-        try:
-            obs_tensor = game_state.unified_policy.policy.obs_to_tensor(ai_obs)[0]
-            dists = game_state.unified_policy.policy.get_distribution(obs_tensor)
-            unified_probs = [
-                dist.probs.detach().cpu().numpy().squeeze()
-                for dist in dists.distribution
-            ]
-        except Exception:
-            unified_probs = None
+    # Prepare action masks and probability vectors
+    action_mask = ai_obs["action_mask"]
+    unified_probs = get_policy_action_probabilities(game_state.unified_policy, ai_obs)
+    opponent_probs = (
+        get_policy_action_probabilities(game_state.defense_policy, opp_obs)
+        if full_action_ai_opponent is not None
+        else None
+    )
+    player_team_strategy = (
+        IllegalActionStrategy.BEST_PROB
+        if pred_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    resolved_unified = resolve_illegal_actions(
+        np.array(full_action_ai),
+        action_mask,
+        player_team_strategy,
+        pred_deterministic,
+        unified_probs,
+    )
+    resolved_opponent = (
+        resolve_illegal_actions(
+            np.array(full_action_ai_opponent),
+            action_mask,
+            IllegalActionStrategy.BEST_PROB,
+            True,
+            opponent_probs,
+        )
+        if full_action_ai_opponent is not None
+        else None
+    )
 
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
-    action_mask = ai_obs["action_mask"]
 
     for i in range(game_state.env.n_players):
         is_user_player = (
@@ -326,44 +354,16 @@ def take_step(request: ActionRequest):
             else:
                 full_action[i] = 0
         else:
-            # Action comes from the AI policy; if opponent policy present use it for non-user team
-            predicted_action = full_action_ai[i]
-            if full_action_ai_opponent is not None:
-                is_user_offense = game_state.user_team == Team.OFFENSE
-                if (is_user_offense and i in game_state.env.defense_ids) or (
-                    (not is_user_offense) and i in game_state.env.offense_ids
-                ):
-                    predicted_action = full_action_ai_opponent[i]
+            is_user_offense = game_state.user_team == Team.OFFENSE
+            use_opponent = (
+                (is_user_offense and i in game_state.env.defense_ids)
+                or ((not is_user_offense) and i in game_state.env.offense_ids)
+            ) and (resolved_opponent is not None)
 
-            # Enforce action mask and add logging
-            if action_mask[i][predicted_action] == 1:
-                print(
-                    f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}"
-                )
-                full_action[i] = predicted_action
+            if use_opponent:
+                full_action[i] = int(resolved_opponent[i])
             else:
-                # Fallback: if deterministic, choose best legal by policy prob; else first legal
-                legal = np.where(action_mask[i] == 1)[0]
-                if pred_deterministic and unified_probs is not None and len(legal) > 0:
-                    probs_vec = unified_probs[i] if i < len(unified_probs) else None
-                    if probs_vec is not None and len(probs_vec) >= int(max(legal)) + 1:
-                        best_idx = int(legal[np.argmax(probs_vec[legal])])
-                        print(
-                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob."
-                        )
-                        full_action[i] = best_idx
-                    else:
-                        fallback = int(legal[0])
-                        print(
-                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}."
-                        )
-                        full_action[i] = fallback
-                else:
-                    fallback = int(legal[0]) if len(legal) > 0 else 0
-                    print(
-                        f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead."
-                    )
-                    full_action[i] = fallback
+                full_action[i] = int(resolved_unified[i])
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 

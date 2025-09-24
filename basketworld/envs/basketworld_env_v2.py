@@ -55,6 +55,14 @@ class ActionType(Enum):
     PASS_SE = 13
 
 
+class IllegalActionPolicy(Enum):
+    """Strategy for resolving illegal actions supplied to env.step()."""
+
+    NOOP = "noop"  # Map illegal actions to NOOP
+    BEST_PROB = "best_prob"  # Use highest-probability legal action
+    SAMPLE_PROB = "sample_prob"  # Sample among legal actions using probabilities
+
+
 class HexagonBasketballEnv(gym.Env):
     """Hexagon-tessellated basketball environment for self-play RL."""
 
@@ -117,6 +125,10 @@ class HexagonBasketballEnv(gym.Env):
         initial_ball_holder: Optional[int] = None,
         fixed_shot_clock: Optional[int] = None,
         assist_window: int = 2,
+        # Illegal action resolution policy (see IllegalActionPolicy)
+        illegal_action_policy: str = "noop",
+        # If True, raise a clear error when an illegal action is passed to step()
+        raise_on_illegal_action: bool = False,
     ):
         super().__init__()
 
@@ -192,12 +204,7 @@ class HexagonBasketballEnv(gym.Env):
         # Role flag moved to separate observation key `role_flag` (Box shape=(1,))
         # +players_per_side for per-offense nearest-defender distances
         # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
-        base_len = (
-            (self.n_players * 2)
-            + self.n_players
-            + 1
-            + self.players_per_side
-        )
+        base_len = (self.n_players * 2) + self.n_players + 1 + self.players_per_side
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -392,6 +399,15 @@ class HexagonBasketballEnv(gym.Env):
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         self._assist_candidate = None
+        # --- Illegal action handling configuration/state ---
+        try:
+            self.illegal_action_policy = IllegalActionPolicy(illegal_action_policy)
+        except Exception:
+            self.illegal_action_policy = IllegalActionPolicy.NOOP
+        # Optional per-step action probabilities provided by caller
+        self._pending_action_probs: Optional[np.ndarray] = None
+        # Clear any pending external probabilities on reset
+        self._pending_action_probs = None
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
@@ -501,13 +517,65 @@ class HexagonBasketballEnv(gym.Env):
                     break  # Only check the first defender applying pressure each step
 
         actions = np.array(actions)
-        # Map illegal actions to NO-OP (index 0) to avoid support flips/invalid ops
+        # Resolve illegal actions according to configured policy
         try:
             masks = self._get_action_masks()
             for i in range(self.n_players):
                 a = int(actions[i])
-                if a < 0 or a >= masks.shape[1] or masks[i, a] == 0:
+                # Legal and in-bounds → keep
+                if 0 <= a < masks.shape[1] and masks[i, a] == 1:
+                    continue
+
+                legal = np.where(masks[i] == 1)[0]
+                if len(legal) == 0:
                     actions[i] = ActionType.NOOP.value
+                    continue
+
+                # Optional strict mode: surface illegal action immediately
+                if self.raise_on_illegal_action:
+                    raise ValueError(
+                        f"Illegal action {a} by player {i}. Legal actions: {legal.tolist()}"
+                    )
+
+                if self.illegal_action_policy == IllegalActionPolicy.NOOP:
+                    actions[i] = ActionType.NOOP.value
+                else:
+                    # Use external probabilities if provided
+                    probs_vec = None
+                    if (
+                        self._pending_action_probs is not None
+                        and i < self._pending_action_probs.shape[0]
+                    ):
+                        probs_vec = self._pending_action_probs[i]
+
+                    chosen = None
+                    if (
+                        probs_vec is not None
+                        and len(probs_vec) >= int(np.max(legal)) + 1
+                    ):
+                        masked = probs_vec[legal]
+                        total = float(np.sum(masked))
+                        if total > 0.0:
+                            if (
+                                self.illegal_action_policy
+                                == IllegalActionPolicy.BEST_PROB
+                            ):
+                                chosen = int(legal[int(np.argmax(masked))])
+                            elif (
+                                self.illegal_action_policy
+                                == IllegalActionPolicy.SAMPLE_PROB
+                            ):
+                                normed = masked / total
+                                chosen = int(np.random.choice(legal, p=normed))
+
+                    if chosen is None:
+                        non_noop = [
+                            int(idx) for idx in legal if idx != ActionType.NOOP.value
+                        ]
+                        chosen = (
+                            int(non_noop[0]) if len(non_noop) > 0 else int(legal[0])
+                        )
+                    actions[i] = chosen
         except Exception:
             # If masking fails for any reason, proceed without remapping
             pass
@@ -541,6 +609,9 @@ class HexagonBasketballEnv(gym.Env):
                 else:
                     self._defender_in_key_steps[did] = 0
 
+        # Clear per-step external probabilities after use to avoid reuse
+        self._pending_action_probs = None
+
         obs = {
             "obs": self._get_observation(),
             "action_mask": self._get_action_masks(),
@@ -557,6 +628,22 @@ class HexagonBasketballEnv(gym.Env):
         }
 
         return obs, rewards, done, False, info
+
+    def set_illegal_action_probs(self, probs: Optional[np.ndarray]) -> None:
+        """Provide per-player action probabilities for resolving illegal actions.
+
+        Shape expected: (n_players, n_actions). Only used when
+        illegal_action_policy is BEST_PROB or SAMPLE_PROB. Passing None clears
+        previously set probabilities.
+        """
+        if probs is None:
+            self._pending_action_probs = None
+            return
+        try:
+            arr = np.asarray(probs)
+            self._pending_action_probs = arr
+        except Exception:
+            self._pending_action_probs = None
 
     @profile_section("action_masks")
     def _get_action_masks(self) -> np.ndarray:
@@ -1633,7 +1720,9 @@ class HexagonBasketballEnv(gym.Env):
         # --- Draw pass arrow (successful pass in the last action) ---
         try:
             if self.last_action_results and self.last_action_results.get("passes"):
-                for passer_id_str, pass_res in self.last_action_results["passes"].items():
+                for passer_id_str, pass_res in self.last_action_results[
+                    "passes"
+                ].items():
                     if pass_res.get("success") and "target" in pass_res:
                         passer_id = int(passer_id_str)
                         target_id = int(pass_res.get("target"))
@@ -1646,7 +1735,9 @@ class HexagonBasketballEnv(gym.Env):
                             "",
                             xy=(x2, y2),
                             xytext=(x1, y1),
-                            arrowprops=dict(arrowstyle="->", color="black", linewidth=3),
+                            arrowprops=dict(
+                                arrowstyle="->", color="black", linewidth=3
+                            ),
                             zorder=19,
                         )
         except Exception:
@@ -1674,7 +1765,9 @@ class HexagonBasketballEnv(gym.Env):
                     fontsize=12,
                     fontweight="bold",
                     color="white",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="black", alpha=0.7),
+                    bbox=dict(
+                        boxstyle="round,pad=0.2", fc="black", ec="black", alpha=0.7
+                    ),
                     zorder=13,
                 )
         except Exception:

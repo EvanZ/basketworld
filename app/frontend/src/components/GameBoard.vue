@@ -418,6 +418,17 @@ const playerTransitions = computed(() => {
               @click="onPlayerClick(player)"
             />
             <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text" @click="onPlayerClick(player)">{{ player.id }}</text>
+            <!-- NOOP probability label (index 0) for the player -->
+            <text
+              v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined"
+              :x="player.x"
+              :y="player.y"
+              dy="1.2em"
+              text-anchor="middle"
+              class="noop-prob-text"
+            >
+              {{ Number(policyProbabilities[player.id][0]).toFixed(2) }}
+            </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
               v-if="player.hasBall && ballHandlerShotProb !== null"
@@ -608,6 +619,15 @@ svg {
   paint-order: stroke;
   stroke: #fff;
   stroke-width: 0.5px;
+}
+
+.noop-prob-text {
+  font-size: 10px;
+  font-weight: 700;
+  fill: #111;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 0.6px;
 }
 
 /* --- Outcome Indicator Styles --- */

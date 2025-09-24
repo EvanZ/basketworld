@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from typing import Optional
+
+import gymnasium as gym
+import numpy as np
+from stable_baselines3 import PPO
+
+from .action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
+from basketworld.envs.basketworld_env_v2 import Team
+
+
+class SelfPlayEnvWrapper(gym.Wrapper):
+    """Wrap an env to manage opponent actions and resolve illegal actions.
+
+    - training_strategy: strategy for the current training team
+    - opponent_strategy: strategy for the frozen opponent
+    - deterministic_opponent: when True, use deterministic choice in sampling
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        opponent_policy: PPO,
+        training_strategy: IllegalActionStrategy = IllegalActionStrategy.SAMPLE_PROB,
+        opponent_strategy: IllegalActionStrategy = IllegalActionStrategy.BEST_PROB,
+        deterministic_opponent: bool = False,
+    ) -> None:
+        super().__init__(env)
+        self.opponent_policy = opponent_policy
+        self.training_strategy = training_strategy
+        self.opponent_strategy = opponent_strategy
+        self.deterministic_opponent = bool(deterministic_opponent)
+        self._set_team_ids()
+
+    def _set_team_ids(self) -> None:
+        if self.env.unwrapped.training_team == Team.OFFENSE:
+            self.training_player_ids = self.env.unwrapped.offense_ids
+            self.opponent_player_ids = self.env.unwrapped.defense_ids
+        else:
+            self.training_player_ids = self.env.unwrapped.defense_ids
+            self.opponent_player_ids = self.env.unwrapped.offense_ids
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._last_obs = obs
+        self._set_team_ids()
+        return obs, info
+
+    def step(self, action):
+        # Build opponent observation (flip role flag if present)
+        opponent_obs = self._last_obs
+        try:
+            opponent_obs = {
+                "obs": np.copy(self._last_obs["obs"]),
+                "action_mask": self._last_obs["action_mask"],
+                "role_flag": np.copy(self._last_obs.get("role_flag")),
+                "skills": np.copy(self._last_obs.get("skills")),
+            }
+            if opponent_obs.get("role_flag") is not None:
+                opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
+        except Exception:
+            opponent_obs = self._last_obs
+
+        # Opponent raw actions and probs
+        opp_actions_raw, _ = self.opponent_policy.predict(
+            opponent_obs, deterministic=self.deterministic_opponent
+        )
+        action_mask = self._last_obs["action_mask"]
+
+        # Resolve opponent illegal actions
+        opp_probs = get_policy_action_probabilities(self.opponent_policy, opponent_obs)
+        opp_actions = resolve_illegal_actions(
+            np.array(opp_actions_raw),
+            action_mask,
+            self.opponent_strategy,
+            self.deterministic_opponent,
+            opp_probs,
+        )
+
+        # Build full action vector
+        full_action = np.zeros(self.env.unwrapped.n_players, dtype=int)
+        for i in range(self.env.unwrapped.n_players):
+            if i in self.training_player_ids:
+                full_action[i] = int(action[i])
+            else:
+                full_action[i] = int(opp_actions[i])
+
+        obs, reward, done, truncated, info = self.env.step(full_action)
+        self._last_obs = obs
+        return obs, reward, done, truncated, info

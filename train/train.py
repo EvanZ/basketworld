@@ -38,6 +38,10 @@ import torch
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
+from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
+from basketworld.utils.action_resolution import IllegalActionStrategy
+from basketworld.utils.policy_proxy import FrozenPolicyProxy
+from basketworld.utils.wrappers import RewardAggregationWrapper, EpisodeStatsWrapper
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
 # These defaults can be overridden by user environment.
@@ -314,235 +318,15 @@ class EntropyExpScheduleCallback(BaseCallback):
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
 
 
-class RewardAggregationWrapper(gym.Wrapper):
-    """
-    A wrapper to aggregate multi-agent rewards for the Monitor wrapper.
-    It sums the rewards of the team currently being trained.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-
-    def step(self, action):
-        obs, rewards, done, truncated, info = self.env.step(action)
-
-        # Determine which player IDs belong to the training team
-        if self.env.unwrapped.training_team == Team.OFFENSE:
-            training_player_ids = self.env.unwrapped.offense_ids
-        else:
-            training_player_ids = self.env.unwrapped.defense_ids
-
-        # Sum the rewards for only the players on the training team
-        aggregated_reward = sum(rewards[i] for i in training_player_ids)
-
-        return obs, aggregated_reward, done, truncated, info
 
 
 # --- Episode Statistics Wrapper ---
-class EpisodeStatsWrapper(gym.Wrapper):
-    """Track per-episode shot/pass distributions and expose via info['episode'].
-
-    - shot_dunk/shot_2pt/shot_3pt: 1.0 if that shot type occurred in the episode, else 0.0
-    - assisted_dunk/assisted_2pt/assisted_3pt: 1.0 if the made shot in that type was assisted
-    - passes: total number of pass attempts in the episode
-    """
-
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-        self._reset_stats()
-
-    def _reset_stats(self):
-        self._passes = 0
-        self._shot_dunk = 0.0
-        self._shot_2pt = 0.0
-        self._shot_3pt = 0.0
-        self._asst_dunk = 0.0
-        self._asst_2pt = 0.0
-        self._asst_3pt = 0.0
-        self._turnover = 0.0
-        # For PPP computation: made buckets and attempts
-        self._made_dunk = 0.0
-        self._made_2pt = 0.0
-        self._made_3pt = 0.0
-        self._attempts = 0.0
-
-    def reset(self, **kwargs):  # type: ignore[override]
-        self._reset_stats()
-        return self.env.reset(**kwargs)
-
-    def step(self, action):  # type: ignore[override]
-        obs, reward, done, truncated, info = self.env.step(action)
-        try:
-            ar = info.get("action_results", {}) if info else {}
-            # Pass attempts
-            if ar.get("passes"):
-                self._passes += int(len(ar["passes"]))
-
-            # Shots happen at episode end in this env
-            if ar.get("shots"):
-                # Assume single shot per episode
-                shot_res = list(ar["shots"].values())[0]
-                # Determine distance category using env to avoid stale data
-                shooter_id = int(list(ar["shots"].keys())[0])
-                shooter_pos = self.env.unwrapped.positions[shooter_id]
-                dist = self.env.unwrapped._hex_distance(
-                    shooter_pos, self.env.unwrapped.basket_position
-                )
-                is_dunk = dist == 0
-                is_three = dist >= getattr(
-                    self.env.unwrapped, "three_point_distance", 4
-                )
-                self._attempts = 1.0
-                if is_dunk:
-                    self._shot_dunk = 1.0
-                    if shot_res.get("success"):
-                        self._made_dunk = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_dunk = 1.0
-                elif is_three:
-                    self._shot_3pt = 1.0
-                    if shot_res.get("success"):
-                        self._made_3pt = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_3pt = 1.0
-                else:
-                    self._shot_2pt = 1.0
-                    if shot_res.get("success"):
-                        self._made_2pt = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_2pt = 1.0
-            elif ar.get("turnovers"):
-                # Episode ends via turnover
-                self._turnover = 1.0
-        except Exception:
-            pass
-
-        if done and info is not None:
-            # Expose stats as top-level info keys; Monitor(info_keywords=...) will include them in episode info
-            info["shot_dunk"] = self._shot_dunk
-            info["shot_2pt"] = self._shot_2pt
-            info["shot_3pt"] = self._shot_3pt
-            info["assisted_dunk"] = self._asst_dunk
-            info["assisted_2pt"] = self._asst_2pt
-            info["assisted_3pt"] = self._asst_3pt
-            info["passes"] = float(self._passes)
-            info["turnover"] = self._turnover
-            info["made_dunk"] = self._made_dunk
-            info["made_2pt"] = self._made_2pt
-            info["made_3pt"] = self._made_3pt
-            info["attempts"] = self._attempts
-        return obs, reward, done, truncated, info
 
 
-# --- Custom Environment Wrapper for Self-Play ---
 
 
-class SelfPlayEnvWrapper(gym.Wrapper):
-    """
-    A wrapper that manages the opponent's policy in a self-play setup.
 
-    When the learning agent takes a step, this wrapper intercepts the action,
-    gets an action from the frozen opponent policy, combines them, and passes
-    the full action to the underlying environment.
-    """
-
-    def __init__(self, env, opponent_policy, deterministic_opponent: bool = False):
-        super().__init__(env)
-        self.opponent_policy = opponent_policy
-        self.deterministic_opponent = bool(deterministic_opponent)
-        self._set_team_ids()
-
-    def _set_team_ids(self):
-        """Determine which player IDs belong to the training team and opponent."""
-        if self.env.unwrapped.training_team == Team.OFFENSE:
-            self.training_player_ids = self.env.unwrapped.offense_ids
-            self.opponent_player_ids = self.env.unwrapped.defense_ids
-        else:
-            self.training_player_ids = self.env.unwrapped.defense_ids
-            self.opponent_player_ids = self.env.unwrapped.offense_ids
-
-    def reset(self, **kwargs):
-        """Reset the environment and store the initial observation."""
-        obs, info = self.env.reset(**kwargs)
-        self.last_obs = obs
-        return obs, info
-
-    def step(self, action):
-        """
-        Take a step in the environment.
-        'action' comes from the learning agent and is for ALL players.
-        We replace the opponent's actions with predictions from the frozen policy.
-        """
-        # Get action from the frozen opponent policy using the last observation
-        # IMPORTANT: Flip the unified role flag for the opponent, so it
-        # conditions on the opposite role (defense vs offense). The role flag
-        # is now provided as a separate observation key `role_flag` (shape (1,)).
-        opponent_obs = self.last_obs
-        try:
-            # Create a shallow copy of the dict to avoid mutating self.last_obs
-            opponent_obs = {
-                "obs": np.copy(self.last_obs["obs"]),
-                "action_mask": self.last_obs["action_mask"],
-                "role_flag": np.copy(self.last_obs.get("role_flag")),
-                "skills": np.copy(self.last_obs.get("skills")),
-            }
-            # Flip role flag 1.0 <-> 0.0
-            if opponent_obs.get("role_flag") is not None:
-                opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
-        except Exception:
-            # If anything goes wrong, fall back to original observation
-            opponent_obs = self.last_obs
-
-        opponent_action_raw, _ = self.opponent_policy.predict(
-            opponent_obs, deterministic=self.deterministic_opponent
-        )
-        action_mask = self.last_obs["action_mask"]
-
-        # Combine the actions, ensuring the opponent's actions are legal
-        full_action = np.zeros(self.env.unwrapped.n_players, dtype=int)
-        for i in range(self.env.unwrapped.n_players):
-            if i in self.training_player_ids:
-                full_action[i] = action[i]
-            else:  # This is an opponent player
-                predicted_action = opponent_action_raw[i]
-                # Enforce the action mask for the opponent
-                if action_mask[i][predicted_action] == 1:
-                    full_action[i] = predicted_action
-                else:
-                    # Fallback: pick the first legal action for this player
-                    legal_indices = np.where(action_mask[i] == 1)[0]
-                    full_action[i] = (
-                        int(legal_indices[0]) if len(legal_indices) > 0 else 0
-                    )
-
-        # Step the underlying environment with the combined action
-        obs, reward, done, truncated, info = self.env.step(full_action)
-
-        # Store the latest observation for the opponent's next decision
-        self.last_obs = obs
-
-        return obs, reward, done, truncated, info
-
-
-class FrozenPolicyProxy:
-    """Picklable proxy that loads a PPO policy from a local .zip path on first use.
-
-    This avoids passing non-picklable PPO instances into subprocess workers.
-    """
-
-    def __init__(self, policy_path: str, device: torch.device | str = "cpu"):
-        self.policy_path = str(policy_path)
-        # Store a string for device to keep picklable
-        self.device = str(device) if isinstance(device, torch.device) else device
-        self._policy = None
-
-    def _ensure_loaded(self):
-        if self._policy is None:
-            self._policy = PPO.load(self.policy_path, device=self.device)
-
-    def predict(self, obs, deterministic: bool = False):
-        self._ensure_loaded()
-        return self._policy.predict(obs, deterministic=deterministic)
+## Local FrozenPolicyProxy removed; using basketworld.utils.policy_proxy.FrozenPolicyProxy
 
 
 # --- Main Training Logic ---
@@ -758,9 +542,12 @@ def make_vector_env(
     def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
         # We capture the current parameters via default args so that each lambda
         # has its own bound values (important inside list comprehension).
+        base_env = setup_environment(args, training_team)
         return SelfPlayEnvWrapper(
-            setup_environment(args, training_team),
+            base_env,
             opponent_policy=opponent_policy,
+            training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+            opponent_strategy=IllegalActionStrategy.BEST_PROB,
             deterministic_opponent=deterministic_opponent,
         )
 
