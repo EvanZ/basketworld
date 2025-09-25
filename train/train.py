@@ -34,13 +34,14 @@ import tempfile
 import random
 from typing import Optional
 import torch
+import gc
+import time
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
-from basketworld.utils.policy_proxy import FrozenPolicyProxy
 from basketworld.utils.wrappers import RewardAggregationWrapper, EpisodeStatsWrapper
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
@@ -770,7 +771,7 @@ def main(args):
             offense_env = make_vector_env(
                 args,
                 training_team=Team.OFFENSE,
-                opponent_policy=FrozenPolicyProxy(opponent_for_offense, device),
+                opponent_policy=opponent_for_offense,
                 num_envs=args.num_envs,
                 deterministic_opponent=bool(args.deterministic_opponent),
             )
@@ -807,6 +808,12 @@ def main(args):
                 progress_bar=True,
             )
             offense_env.close()
+            try:
+                del offense_env
+            except Exception:
+                pass
+            gc.collect()
+            time.sleep(0.05)
 
             print("\nLoading historical opponent policy...")
             opponent_for_defense = get_random_policy_from_artifacts(
@@ -825,7 +832,7 @@ def main(args):
             defense_env = make_vector_env(
                 args,
                 training_team=Team.DEFENSE,
-                opponent_policy=FrozenPolicyProxy(opponent_for_defense, device),
+                opponent_policy=opponent_for_defense,
                 num_envs=args.num_envs,
                 deterministic_opponent=bool(args.deterministic_opponent),
             )
@@ -862,6 +869,12 @@ def main(args):
                 progress_bar=True,
             )
             defense_env.close()
+            try:
+                del defense_env
+            except Exception:
+                pass
+            gc.collect()
+            time.sleep(0.05)
 
             # Save one unified checkpoint per alternation
             with tempfile.TemporaryDirectory() as tmpdir:
