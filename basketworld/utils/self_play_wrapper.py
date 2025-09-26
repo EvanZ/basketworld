@@ -63,19 +63,8 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             ) from e
 
     def step(self, action):
-        # Build opponent observation (flip role flag if present)
+        # Use the current observation directly for opponent prediction
         opponent_obs = self._last_obs
-        try:
-            opponent_obs = {
-                "obs": np.copy(self._last_obs["obs"]),
-                "action_mask": self._last_obs["action_mask"],
-                "role_flag": np.copy(self._last_obs.get("role_flag")),
-                "skills": np.copy(self._last_obs.get("skills")),
-            }
-            if opponent_obs.get("role_flag") is not None:
-                opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
-        except Exception:
-            opponent_obs = self._last_obs
 
         # Opponent raw actions and probs
         try:
@@ -118,5 +107,6 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             raise RuntimeError(
                 f"SelfPlayEnvWrapper.step env.step failed: {type(e).__name__}: {e}"
             ) from e
+        # (Reverted) do not mutate info here
         self._last_obs = obs
         return obs, reward, done, truncated, info

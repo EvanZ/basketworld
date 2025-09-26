@@ -18,7 +18,13 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
-from basketworld.utils.callbacks import RolloutUpdateTimingCallback
+from basketworld.utils.callbacks import (
+    RolloutUpdateTimingCallback,
+    MLflowCallback as UtilsMLflowCallback,
+    EntropyScheduleCallback as UtilsEntropyScheduleCallback,
+    EntropyExpScheduleCallback as UtilsEntropyExpScheduleCallback,
+    EpisodeSampleLogger as UtilsEpisodeSampleLogger,
+)
 
 from basketworld.utils.evaluation_helpers import (
     get_outcome_category,
@@ -43,6 +49,7 @@ from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtrac
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.utils.wrappers import RewardAggregationWrapper, EpisodeStatsWrapper
+import csv
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
 # These defaults can be overridden by user environment.
@@ -82,238 +89,7 @@ def linear_schedule(start, end):
     return f
 
 
-# --- Custom MLflow Callback ---
-
-
-class MLflowCallback(BaseCallback):
-    """
-    A custom callback for logging metrics to MLflow.
-    This callback logs the mean reward and episode length periodically.
-    """
-
-    def __init__(self, team_name: str, log_freq: int = 2048, verbose=0):
-        super(MLflowCallback, self).__init__(verbose)
-        self.team_name = team_name
-        self.log_freq = log_freq
-
-    def _on_step(self) -> bool:
-        # Log metrics periodically to avoid performance overhead
-        if self.n_calls % self.log_freq == 0:
-            # The ep_info_buffer contains info from the last 100 episodes
-            if self.model.ep_info_buffer:
-                # Use the current model's timesteps as global step
-                global_step = self.model.num_timesteps
-
-                # Calculate the mean reward and length
-                ep_rew_mean = np.mean(
-                    [ep_info.get("r", 0.0) for ep_info in self.model.ep_info_buffer]
-                )
-                ep_len_mean = np.mean(
-                    [ep_info.get("l", 0.0) for ep_info in self.model.ep_info_buffer]
-                )
-
-                # Optional shot/pass metrics if present in episode infos
-                def mean_key(key: str, default: float = 0.0):
-                    vals = [
-                        ep.get(key) for ep in self.model.ep_info_buffer if key in ep
-                    ]
-                    return float(np.mean(vals)) if vals else default
-
-                shot_dunk_pct = mean_key("shot_dunk")
-                shot_2pt_pct = mean_key("shot_2pt")
-                shot_3pt_pct = mean_key("shot_3pt")
-                asst_dunk_pct = mean_key("assisted_dunk")
-                asst_2pt_pct = mean_key("assisted_2pt")
-                asst_3pt_pct = mean_key("assisted_3pt")
-                passes_avg = mean_key("passes")
-                turnover_pct = mean_key("turnover")
-
-                # PPP per episode: (2*made_2pt + 3*made_3pt + 2*made_dunk) / (attempts + turnovers)
-                def mean_ppp(default: float = 0.0):
-                    numer = []
-                    denom = []
-                    for ep in self.model.ep_info_buffer:
-                        m2 = float(ep.get("made_2pt", 0.0))
-                        m3 = float(ep.get("made_3pt", 0.0))
-                        md = float(ep.get("made_dunk", 0.0))
-                        att = float(ep.get("attempts", 0.0))
-                        tov = float(ep.get("turnover", 0.0))
-                        n = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
-                        d = max(
-                            1.0, att + tov
-                        )  # avoid div-by-zero; count turnovers as possessions
-                        numer.append(n / d)
-                        denom.append(1.0)
-                    return float(np.mean(numer)) if numer else default
-
-                ppp_avg = mean_ppp()
-
-                # Log to MLflow
-                mlflow.log_metric(
-                    f"{self.team_name} Mean Episode Reward",
-                    ep_rew_mean,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Mean Episode Length",
-                    ep_len_mean,
-                    step=global_step,
-                )
-                # Entropy coefficient (supports constant or schedule)
-                try:
-                    total_ts = getattr(self.model, "_total_timesteps", None)
-                    if callable(getattr(self.model, "ent_coef", None)):
-                        # Approximate current progress remaining consistent with SB3 definition
-                        progress_remaining = 1.0
-                        if total_ts and total_ts > 0:
-                            progress_remaining = max(
-                                0.0,
-                                min(
-                                    1.0,
-                                    1.0 - (self.model.num_timesteps / float(total_ts)),
-                                ),
-                            )
-                        current_ent_coef = float(
-                            self.model.ent_coef(progress_remaining)
-                        )
-                    else:
-                        current_ent_coef = float(getattr(self.model, "ent_coef", 0.0))
-                    mlflow.log_metric(
-                        f"{self.team_name} Entropy Coef",
-                        current_ent_coef,
-                        step=global_step,
-                    )
-                except Exception:
-                    pass
-                # Distributions
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct Dunk", shot_dunk_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct 2PT", shot_2pt_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct 3PT", shot_3pt_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct Dunk",
-                    asst_dunk_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct 2PT",
-                    asst_2pt_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct 3PT",
-                    asst_3pt_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Passes / Episode", passes_avg, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} TurnoverPct", turnover_pct, step=global_step
-                )
-                mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
-        return True
-
-
-# --- Entropy Schedule Callback ---
-
-
-class EntropyScheduleCallback(BaseCallback):
-    """Linearly decay entropy coefficient from start to end across the entire run.
-
-    This uses the cumulative `self.model.num_timesteps` and a provided
-    `total_planned_timesteps` to compute global progress, then updates
-    `self.model.ent_coef` in-place so the change persists across segments.
-    """
-
-    def __init__(self, start: float, end: float, total_planned_timesteps: int):
-        super().__init__()
-        self.start = float(start)
-        self.end = float(end)
-        self.total = int(max(1, total_planned_timesteps))
-
-    def _on_step(self) -> bool:
-        try:
-            t = int(getattr(self.model, "num_timesteps", 0))
-            progress = min(1.0, max(0.0, t / float(self.total)))
-            current = self.end + (self.start - self.end) * (1.0 - progress)
-            # Update the algorithm's entropy coefficient
-            self.model.ent_coef = float(current)
-        except Exception:
-            pass
-        return True
-
-
-class EntropyExpScheduleCallback(BaseCallback):
-    """Exponential (log-linear) decay of entropy coef with optional per-alternation bump.
-
-    Schedule: ent(progress) = end * (start / end) ** (1 - progress)
-    where progress = timesteps / total_planned_timesteps in [0,1].
-
-    Bump: At the start of each alternation segment, call `start_new_alternation()`
-    to apply a temporary multiplier to the scheduled entropy for the next
-    `bump_updates` PPO updates (one update per rollout segment).
-    """
-
-    def __init__(
-        self,
-        start: float,
-        end: float,
-        total_planned_timesteps: int,
-        bump_updates: int = 0,
-        bump_multiplier: float = 1.0,
-    ):
-        super().__init__()
-        self.start = float(max(1e-12, start))
-        self.end = float(max(1e-12, end))
-        self.total = int(max(1, total_planned_timesteps))
-        self.bump_updates = int(max(0, bump_updates))
-        self.bump_multiplier = float(max(1.0, bump_multiplier))
-        self._bump_updates_remaining = 0
-
-    def start_new_alternation(self):
-        self._bump_updates_remaining = self.bump_updates
-
-    def _scheduled_value(self, t: int) -> float:
-        progress = min(1.0, max(0.0, t / float(self.total)))
-        # Log-linear interpolation between start and end hitting end at progress=1 exactly
-        ratio = self.start / self.end
-        current = self.end * (ratio ** (1.0 - progress))
-        return float(current)
-
-    def _apply_current(self):
-        try:
-            t = int(getattr(self.model, "num_timesteps", 0))
-            current = self._scheduled_value(t)
-            if self._bump_updates_remaining > 0:
-                current = float(current * self.bump_multiplier)
-            self.model.ent_coef = float(current)
-        except Exception:
-            pass
-
-    def _on_training_start(self) -> None:
-        self._apply_current()
-
-    def _on_rollout_start(self) -> None:
-        # Ensure ent coef is set before update happens after rollout
-        self._apply_current()
-
-    def _on_rollout_end(self) -> None:
-        # One rollout finished -> one PPO update will follow; reduce bump if active
-        if self._bump_updates_remaining > 0:
-            self._bump_updates_remaining -= 1
-        # Also refresh current value after potential bump decrement
-        self._apply_current()
-
-    def _on_step(self) -> bool:
-        # Keep it updated during collection too (harmless)
-        self._apply_current()
-        return True
+## Callbacks moved to basketworld.utils.callbacks
 
 
 # --- Custom Reward Wrapper for Multi-Agent Aggregation ---
@@ -326,6 +102,11 @@ class EntropyExpScheduleCallback(BaseCallback):
 
 
 # --- Main Training Logic ---
+
+
+## EpisodeSampleLogger moved to basketworld.utils.callbacks
+class EpisodeSampleLogger(BaseCallback):
+    pass
 
 
 def sample_geometric(indices: list[int], beta: float) -> int:
@@ -513,6 +294,16 @@ def setup_environment(args, training_team):
             "made_2pt",
             "made_3pt",
             "attempts",
+            # minimal audit
+            "gt_is_three",
+            "gt_is_dunk",
+            "gt_points",
+            "gt_shooter_off",
+            "gt_shooter_q",
+            "gt_shooter_r",
+            "gt_distance",
+            "basket_q",
+            "basket_r",
         ),
     )
 
@@ -543,7 +334,7 @@ def make_vector_env(
             base_env,
             opponent_policy=opponent_policy,
             training_strategy=IllegalActionStrategy.SAMPLE_PROB,
-            opponent_strategy=IllegalActionStrategy.BEST_PROB,
+            opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
             deterministic_opponent=deterministic_opponent,
         )
 
@@ -765,6 +556,17 @@ def main(args):
                 fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
                 unified_policy.save(fallback_path)
                 opponent_for_offense = fallback_path
+            # Log which opponent checkpoint is used this alternation
+            try:
+                with tempfile.TemporaryDirectory() as _tmp_note_dir:
+                    note_path = os.path.join(
+                        _tmp_note_dir, f"opponent_alt_{global_alt}.txt"
+                    )
+                    with open(note_path, "w") as f:
+                        f.write(os.path.basename(str(opponent_for_offense)))
+                    mlflow.log_artifact(note_path, artifact_path=f"opponents")
+            except Exception:
+                pass
 
             # --- 1. Train Offense against frozen Defense ---
             print(f"\nTraining Offense...")
@@ -777,7 +579,7 @@ def main(args):
             )
             unified_policy.set_env(offense_env)
 
-            offense_mlflow_callback = MLflowCallback(
+            offense_mlflow_callback = UtilsMLflowCallback(
                 team_name="Offense", log_freq=args.n_steps
             )
 
@@ -799,6 +601,11 @@ def main(args):
             offense_callbacks = [offense_mlflow_callback, offense_timing_callback]
             if entropy_callback is not None:
                 offense_callbacks.append(entropy_callback)
+            offense_callbacks.append(
+                UtilsEpisodeSampleLogger(
+                    team_name="Offense", alternation_id=global_alt, sample_prob=1e-2
+                )
+            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
@@ -815,17 +622,8 @@ def main(args):
             gc.collect()
             time.sleep(0.05)
 
-            print("\nLoading historical opponent policy...")
-            opponent_for_defense = get_random_policy_from_artifacts(
-                mlflow.tracking.MlflowClient(),
-                run.info.run_id,
-                "unified",
-                opponent_cache_dir,
-            )
-            if opponent_for_defense is None:
-                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
-                unified_policy.save(fallback_path)
-                opponent_for_defense = fallback_path
+            # Reuse the same frozen opponent for defense segment to keep distributions comparable
+            opponent_for_defense = opponent_for_offense
 
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
@@ -838,7 +636,7 @@ def main(args):
             )
             unified_policy.set_env(defense_env)
 
-            defense_mlflow_callback = MLflowCallback(
+            defense_mlflow_callback = UtilsMLflowCallback(
                 team_name="Defense", log_freq=args.n_steps
             )
 
@@ -860,6 +658,11 @@ def main(args):
             defense_callbacks = [defense_mlflow_callback, defense_timing_callback]
             if entropy_callback is not None:
                 defense_callbacks.append(entropy_callback)
+            defense_callbacks.append(
+                UtilsEpisodeSampleLogger(
+                    team_name="Defense", alternation_id=global_alt, sample_prob=1e-2
+                )
+            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs

@@ -51,6 +51,16 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._made_2pt = 0.0
         self._made_3pt = 0.0
         self._attempts = 0.0
+        # Minimal audit
+        self._gt_is_three = 0.0
+        self._gt_is_dunk = 0.0
+        self._gt_points = 0.0
+        self._gt_shooter_off = 0.0
+        self._gt_shooter_q = 0.0
+        self._gt_shooter_r = 0.0
+        self._gt_distance = -1.0
+        self._basket_q = 0.0
+        self._basket_r = 0.0
 
     def reset(self, **kwargs):  # type: ignore[override]
         self._reset_stats()
@@ -75,6 +85,28 @@ class EpisodeStatsWrapper(gym.Wrapper):
                     self.env.unwrapped, "three_point_distance", 4
                 )
                 self._attempts = 1.0
+                self._gt_is_three = 1.0 if (not is_dunk and is_three) else 0.0
+                self._gt_is_dunk = 1.0 if is_dunk else 0.0
+                self._gt_points = 2.0 if (is_dunk or not is_three) else 3.0
+                self._gt_shooter_off = (
+                    1.0 if shooter_id in self.env.unwrapped.offense_ids else 0.0
+                )
+                try:
+                    self._gt_shooter_q = float(shooter_pos[0])
+                    self._gt_shooter_r = float(shooter_pos[1])
+                    self._gt_distance = float(dist)
+                    self._basket_q = float(self.env.unwrapped.basket_position[0])
+                    self._basket_r = float(self.env.unwrapped.basket_position[1])
+                except Exception:
+                    self._gt_shooter_q = 0.0
+                    self._gt_shooter_r = 0.0
+                    self._gt_distance = -1.0
+                    try:
+                        self._basket_q = float(self.env.unwrapped.basket_position[0])
+                        self._basket_r = float(self.env.unwrapped.basket_position[1])
+                    except Exception:
+                        self._basket_q = 0.0
+                        self._basket_r = 0.0
                 if is_dunk:
                     self._shot_dunk = 1.0
                     if shot_res.get("success"):
@@ -111,4 +143,14 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt
             info["attempts"] = self._attempts
+            info["gt_is_three"] = self._gt_is_three
+            info["gt_is_dunk"] = self._gt_is_dunk
+            info["gt_points"] = self._gt_points
+            info["gt_shooter_off"] = self._gt_shooter_off
+            info["gt_shooter_q"] = self._gt_shooter_q
+            info["gt_shooter_r"] = self._gt_shooter_r
+            info["gt_distance"] = self._gt_distance
+            info["basket_q"] = self._basket_q
+            info["basket_r"] = self._basket_r
+            # (Reverted) keep only the original episode summary fields
         return obs, reward, done, truncated, info

@@ -43,6 +43,8 @@ mlruns/
 
 # models
 models/
+mlruns/
+mlartifacts/
 .opponent_cache/
 
 # data
