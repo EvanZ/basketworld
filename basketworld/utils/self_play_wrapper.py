@@ -63,8 +63,18 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             ) from e
 
     def step(self, action):
-        # Use the current observation directly for opponent prediction
-        opponent_obs = self._last_obs
+        # Build opponent observation with flipped role flag for unified policy
+        opponent_obs = dict(self._last_obs)
+        try:
+            # Opponent is offense when training team is defense, and vice versa
+            opponent_is_offense = self.env.unwrapped.training_team != Team.OFFENSE
+            opponent_obs["role_flag"] = (
+                np.array([1.0], dtype=np.float32)
+                if opponent_is_offense
+                else np.array([0.0], dtype=np.float32)
+            )
+        except Exception:
+            pass
 
         # Opponent raw actions and probs
         try:

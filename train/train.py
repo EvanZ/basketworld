@@ -20,10 +20,10 @@ from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
 from basketworld.utils.callbacks import (
     RolloutUpdateTimingCallback,
-    MLflowCallback as UtilsMLflowCallback,
-    EntropyScheduleCallback as UtilsEntropyScheduleCallback,
-    EntropyExpScheduleCallback as UtilsEntropyExpScheduleCallback,
-    EpisodeSampleLogger as UtilsEpisodeSampleLogger,
+    MLflowCallback,
+    EntropyScheduleCallback,
+    EntropyExpScheduleCallback,
+    EpisodeSampleLogger,
 )
 
 from basketworld.utils.evaluation_helpers import (
@@ -79,34 +79,11 @@ def get_device(device_arg):
         return torch.device(device_arg)
 
 
-# Device will be set in main() after parsing args
-
-
 def linear_schedule(start, end):
     def f(progress_remaining: float):
         return end + (start - end) * progress_remaining
 
     return f
-
-
-## Callbacks moved to basketworld.utils.callbacks
-
-
-# --- Custom Reward Wrapper for Multi-Agent Aggregation ---
-
-
-# --- Episode Statistics Wrapper ---
-
-
-## Local FrozenPolicyProxy removed; using basketworld.utils.policy_proxy.FrozenPolicyProxy
-
-
-# --- Main Training Logic ---
-
-
-## EpisodeSampleLogger moved to basketworld.utils.callbacks
-class EpisodeSampleLogger(BaseCallback):
-    pass
 
 
 def sample_geometric(indices: list[int], beta: float) -> int:
@@ -333,8 +310,8 @@ def make_vector_env(
         return SelfPlayEnvWrapper(
             base_env,
             opponent_policy=opponent_policy,
-            training_strategy=IllegalActionStrategy.SAMPLE_PROB,
-            opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
+            training_strategy=IllegalActionStrategy.NOOP,
+            opponent_strategy=IllegalActionStrategy.NOOP,
             deterministic_opponent=deterministic_opponent,
         )
 
@@ -579,7 +556,7 @@ def main(args):
             )
             unified_policy.set_env(offense_env)
 
-            offense_mlflow_callback = UtilsMLflowCallback(
+            offense_mlflow_callback = MLflowCallback(
                 team_name="Offense", log_freq=args.n_steps
             )
 
@@ -602,7 +579,7 @@ def main(args):
             if entropy_callback is not None:
                 offense_callbacks.append(entropy_callback)
             offense_callbacks.append(
-                UtilsEpisodeSampleLogger(
+                EpisodeSampleLogger(
                     team_name="Offense", alternation_id=global_alt, sample_prob=1e-2
                 )
             )
@@ -636,7 +613,7 @@ def main(args):
             )
             unified_policy.set_env(defense_env)
 
-            defense_mlflow_callback = UtilsMLflowCallback(
+            defense_mlflow_callback = MLflowCallback(
                 team_name="Defense", log_freq=args.n_steps
             )
 
@@ -659,7 +636,7 @@ def main(args):
             if entropy_callback is not None:
                 defense_callbacks.append(entropy_callback)
             defense_callbacks.append(
-                UtilsEpisodeSampleLogger(
+                EpisodeSampleLogger(
                     team_name="Defense", alternation_id=global_alt, sample_prob=1e-2
                 )
             )
