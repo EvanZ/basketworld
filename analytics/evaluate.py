@@ -261,29 +261,59 @@ def run_eval_for_pair(
             if frame is not None:
                 episode_frames.append(frame)
 
+        # Choose illegal-action strategies (overrides keep current defaults if not set)
+        offense_strategy = IllegalActionStrategy.SAMPLE_PROB
+        if getattr(args, "offense_illegal_strategy", None):
+            s = str(args.offense_illegal_strategy).lower()
+            if s == "noop":
+                offense_strategy = IllegalActionStrategy.NOOP
+            elif s == "best":
+                offense_strategy = IllegalActionStrategy.BEST_PROB
+            else:
+                offense_strategy = IllegalActionStrategy.SAMPLE_PROB
+
+        defense_strategy = IllegalActionStrategy.BEST_PROB
+        if getattr(args, "defense_illegal_strategy", None):
+            s = str(args.defense_illegal_strategy).lower()
+            if s == "noop":
+                defense_strategy = IllegalActionStrategy.NOOP
+            elif s == "sample":
+                defense_strategy = IllegalActionStrategy.SAMPLE_PROB
+            else:
+                defense_strategy = IllegalActionStrategy.BEST_PROB
+
         while not done:
+            # Build role-conditional observations (match SelfPlayEnvWrapper/backend)
+            offense_obs = dict(obs)
+            defense_obs = dict(obs)
+            try:
+                offense_obs["role_flag"] = np.array([1.0], dtype=np.float32)
+                defense_obs["role_flag"] = np.array([0.0], dtype=np.float32)
+            except Exception:
+                pass
+
             offense_action, _ = offense_policy.predict(
-                obs, deterministic=args.deterministic_offense
+                offense_obs, deterministic=args.deterministic_offense
             )
             defense_action, _ = defense_policy.predict(
-                obs, deterministic=args.deterministic_defense
+                defense_obs, deterministic=args.deterministic_defense
             )
 
             action_mask = obs.get("action_mask")
-            offense_probs = get_policy_action_probabilities(offense_policy, obs)
-            defense_probs = get_policy_action_probabilities(defense_policy, obs)
+            offense_probs = get_policy_action_probabilities(offense_policy, offense_obs)
+            defense_probs = get_policy_action_probabilities(defense_policy, defense_obs)
 
             offense_resolved = resolve_illegal_actions(
                 np.array(offense_action),
                 action_mask,
-                IllegalActionStrategy.SAMPLE_PROB,
+                offense_strategy,
                 args.deterministic_offense,
                 offense_probs,
             )
             defense_resolved = resolve_illegal_actions(
                 np.array(defense_action),
                 action_mask,
-                IllegalActionStrategy.BEST_PROB,
+                defense_strategy,
                 args.deterministic_defense,
                 defense_probs,
             )
@@ -479,6 +509,15 @@ def run_eval_for_unified(
             if frame is not None:
                 episode_frames.append(frame)
 
+        # Resolve strategy for unified policy (default: sample)
+        unified_strategy = IllegalActionStrategy.SAMPLE_PROB
+        if getattr(args, "unified_illegal_strategy", None):
+            s = str(args.unified_illegal_strategy).lower()
+            if s == "noop":
+                unified_strategy = IllegalActionStrategy.NOOP
+            elif s == "best":
+                unified_strategy = IllegalActionStrategy.BEST_PROB
+
         while not done:
             predicted, _ = policy.predict(obs, deterministic=args.deterministic_unified)
             action_mask = obs.get("action_mask")
@@ -486,7 +525,7 @@ def run_eval_for_unified(
             resolved = resolve_illegal_actions(
                 np.array(predicted),
                 action_mask,
-                IllegalActionStrategy.SAMPLE_PROB,
+                unified_strategy,
                 args.deterministic_unified,
                 probs,
             )
@@ -938,6 +977,28 @@ if __name__ == "__main__":
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
         help="Use deterministic actions for unified policy.",
+    )
+    # Illegal-action resolution strategies (noop|sample|best)
+    parser.add_argument(
+        "--offense-illegal-strategy",
+        type=str,
+        choices=["noop", "sample", "best"],
+        default=None,
+        help="Strategy to resolve illegal actions for offense (default: sample).",
+    )
+    parser.add_argument(
+        "--defense-illegal-strategy",
+        type=str,
+        choices=["noop", "sample", "best"],
+        default=None,
+        help="Strategy to resolve illegal actions for defense (default: best).",
+    )
+    parser.add_argument(
+        "--unified-illegal-strategy",
+        type=str,
+        choices=["noop", "sample", "best"],
+        default=None,
+        help="Strategy to resolve illegal actions for unified policy (default: sample).",
     )
     parser.add_argument(
         "--mask-occupied-moves",

@@ -1117,8 +1117,8 @@ class HexagonBasketballEnv(gym.Env):
             cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
             in_arc = cosang >= cos_threshold
             d_def = self._hex_distance(shooter_pos, self.positions[did])
-            # Defender must be closer than basket along this direction
-            if in_arc and d_def < distance_to_basket:
+            # Defender must be at or closer than the basket along this direction
+            if in_arc and d_def <= distance_to_basket:
                 if closest_d is None or d_def < closest_d:
                     closest_d = d_def
 

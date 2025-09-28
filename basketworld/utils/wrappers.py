@@ -61,6 +61,8 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._gt_distance = -1.0
         self._basket_q = 0.0
         self._basket_r = 0.0
+        # Pressure-adjusted FG% at time of shot (for CSV logging)
+        self._shooter_fg_pct = -1.0
 
     def reset(self, **kwargs):  # type: ignore[override]
         self._reset_stats()
@@ -88,6 +90,11 @@ class EpisodeStatsWrapper(gym.Wrapper):
                 self._gt_is_three = 1.0 if (not is_dunk and is_three) else 0.0
                 self._gt_is_dunk = 1.0 if is_dunk else 0.0
                 self._gt_points = 2.0 if (is_dunk or not is_three) else 3.0
+                # Capture pressure-adjusted FG% from env shot result if present
+                try:
+                    self._shooter_fg_pct = float(shot_res.get("probability", -1.0))
+                except Exception:
+                    self._shooter_fg_pct = -1.0
                 self._gt_shooter_off = (
                     1.0 if shooter_id in self.env.unwrapped.offense_ids else 0.0
                 )
@@ -152,5 +159,6 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["gt_distance"] = self._gt_distance
             info["basket_q"] = self._basket_q
             info["basket_r"] = self._basket_r
+            info["shooter_fg_pct"] = self._shooter_fg_pct
             # (Reverted) keep only the original episode summary fields
         return obs, reward, done, truncated, info

@@ -27,7 +27,20 @@ from PIL import Image
 
 import basketworld
 from basketworld.utils.mlflow_params import get_mlflow_params
-from tqdm import tqdm
+from basketworld.utils.action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
+
+
+def _tqdm(iterable, **kwargs):
+    try:
+        from tqdm import tqdm as _tqdm_impl  # type: ignore
+
+        return _tqdm_impl(iterable, **kwargs)
+    except Exception:
+        return iterable
 
 
 # moved to utils: basketworld.utils.mlflow_params
@@ -39,11 +52,19 @@ def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
         raise RuntimeError("No artifacts found for role 'unified' under models/.")
     if alternation is not None:
         for p in sorted(unified_artifacts):
-            m = re.search(r'_(\d+)\.zip', p)
-            if m and int(m.group(1)) == alternation:
+            m = re.search(r"_(\d+)\.zip", p)
+            idx = int(m.group(1)) if m is not None else None
+            if idx == alternation:
                 return p
-        raise RuntimeError(f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}")
-    return max(unified_artifacts, key=lambda p: int(re.search(r'_(\d+)\.zip', p).group(1)))
+        raise RuntimeError(
+            f"No unified policy found for alternation {alternation}. Candidates: {unified_artifacts}"
+        )
+
+    def _artifact_idx(path: str) -> int:
+        m = re.search(r"_(\d+)\.zip", path)
+        return int(m.group(1)) if m else -1
+
+    return max(unified_artifacts, key=_artifact_idx)
 
 
 def main(args):
@@ -52,7 +73,6 @@ def main(args):
     client = MlflowClient()
 
     required, optional = get_mlflow_params(client, args.run_id)
-
 
     # Download models: list immediate files under models/
     artifacts = client.list_artifacts(args.run_id, "models")
@@ -71,7 +91,7 @@ def main(args):
     with tempfile.TemporaryDirectory() as temp_dir:
         # Helper to read alternation from filename
         def _alt_of(path):
-            m = re.search(r'_(\d+)\.zip', os.path.basename(path))
+            m = re.search(r"_(\d+)\.zip", os.path.basename(path))
             return int(m.group(1)) if m else None
 
         # Setup environment (no render for speed)
@@ -82,8 +102,10 @@ def main(args):
 
         # Plot helper (defined once)
         def _plot_hex_heat(arr: np.ndarray, title: str, path: str, cmap_name: str):
-            fig, ax = plt.subplots(figsize=(max(8, env.court_width/1.5), max(6, env.court_height/1.5)))
-            ax.set_aspect('equal')
+            fig, ax = plt.subplots(
+                figsize=(max(8, env.court_width / 1.5), max(6, env.court_height / 1.5))
+            )
+            ax.set_aspect("equal")
 
             # Axial -> cartesian for pointy-topped hexes (match env)
             def axial_to_cartesian(q: int, r: int, size: float = 1.0):
@@ -105,29 +127,63 @@ def main(args):
                     val = int(arr[r, c])
                     color = cmap(norm(val)) if val > 0 else (0.92, 0.92, 0.92, 0.4)
                     hexagon = RegularPolygon(
-                        (x, y), numVertices=6, radius=hex_radius, orientation=0,
-                        facecolor=color, edgecolor='white', linewidth=1.0, alpha=1.0
+                        (x, y),
+                        numVertices=6,
+                        radius=hex_radius,
+                        orientation=0,
+                        facecolor=color,
+                        edgecolor="white",
+                        linewidth=1.0,
+                        alpha=1.0,
                     )
                     ax.add_patch(hexagon)
 
                     # Count label at center
-                    label_color = 'white' if val > 0 else '#666666'
-                    ax.text(x, y, str(val), color=label_color, ha='center', va='center', fontsize=7.0, zorder=7)
+                    label_color = "white" if val > 0 else "#666666"
+                    ax.text(
+                        x,
+                        y,
+                        str(val),
+                        color=label_color,
+                        ha="center",
+                        va="center",
+                        fontsize=7.0,
+                        zorder=7,
+                    )
 
                     # Draw 3pt outline
                     cell_distance = env._hex_distance((q, r_ax), env.basket_position)
                     if cell_distance == env.three_point_distance:
-                        tp_outline = RegularPolygon((x, y), numVertices=6, radius=hex_radius,
-                                                    orientation=0, facecolor='none', edgecolor='red', linewidth=3, zorder=5)
+                        tp_outline = RegularPolygon(
+                            (x, y),
+                            numVertices=6,
+                            radius=hex_radius,
+                            orientation=0,
+                            facecolor="none",
+                            edgecolor="red",
+                            linewidth=3,
+                            zorder=5,
+                        )
                         ax.add_patch(tp_outline)
 
                     # Basket ring
                     if (q, r_ax) == env.basket_position:
-                        basket_ring = plt.Circle((x, y), hex_radius * 1.05, fill=False, edgecolor='red', linewidth=3, zorder=6)
+                        basket_ring = plt.Circle(
+                            (x, y),
+                            hex_radius * 1.05,
+                            fill=False,
+                            edgecolor="red",
+                            linewidth=3,
+                            zorder=6,
+                        )
                         ax.add_patch(basket_ring)
 
             # Axis limits
-            coords = [axial_to_cartesian(*env._offset_to_axial(c, r)) for r in range(env.court_height) for c in range(env.court_width)]
+            coords = [
+                axial_to_cartesian(*env._offset_to_axial(c, r))
+                for r in range(env.court_height)
+                for c in range(env.court_width)
+            ]
             xs = [p[0] for p in coords]
             ys = [p[1] for p in coords]
             margin = 2.0
@@ -141,7 +197,7 @@ def main(args):
             sm = ScalarMappable(norm=norm, cmap=cmap)
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label('counts')
+            cbar.set_label("counts")
 
             plt.tight_layout()
             plt.savefig(path, dpi=220)
@@ -153,8 +209,12 @@ def main(args):
         # Unified-only: iterate through alternations
         for uni_alt_req in unified_alts:
             unified_art_path = _select_unified_artifact(artifacts, uni_alt_req)
-            unified_policy_path = client.download_artifacts(args.run_id, unified_art_path, temp_dir)
-            print(f"  - Unified policy: {os.path.basename(unified_policy_path)} (alt={_alt_of(unified_policy_path)})")
+            unified_policy_path = client.download_artifacts(
+                args.run_id, unified_art_path, temp_dir
+            )
+            print(
+                f"  - Unified policy: {os.path.basename(unified_policy_path)} (alt={_alt_of(unified_policy_path)})"
+            )
 
             policy = PPO.load(unified_policy_path)
 
@@ -176,23 +236,116 @@ def main(args):
                         defense_heat[row, col] += 1
 
             # Run episodes
-            for _ in tqdm(range(args.episodes), total=args.episodes, desc="Heatmap episodes"):
+            for _ in _tqdm(
+                range(args.episodes), total=args.episodes, desc="Heatmap episodes"
+            ):
                 obs, _ = env.reset()
                 done = False
                 accumulate_positions()
                 while not done:
-                    full_action, _ = policy.predict(obs, deterministic=args.deterministic)
+                    # Build role-conditioned observations for unified policy
+                    action_mask = obs.get("action_mask")
+                    # Offense-conditioned observation
+                    try:
+                        offense_obs = {
+                            "obs": np.copy(obs["obs"]),
+                            "action_mask": action_mask,
+                            "role_flag": np.array([1.0], dtype=np.float32),
+                            "skills": (
+                                np.copy(obs.get("skills"))
+                                if obs.get("skills") is not None
+                                else obs.get("skills")
+                            ),
+                        }
+                    except Exception:
+                        offense_obs = obs
+                    # Defense-conditioned observation (flip role flag)
+                    try:
+                        defense_obs = {
+                            "obs": np.copy(obs["obs"]),
+                            "action_mask": action_mask,
+                            "role_flag": np.array([0.0], dtype=np.float32),
+                            "skills": (
+                                np.copy(obs.get("skills"))
+                                if obs.get("skills") is not None
+                                else obs.get("skills")
+                            ),
+                        }
+                    except Exception:
+                        defense_obs = obs
+
+                    # Predict raw actions under each role condition
+                    off_predicted, _ = policy.predict(
+                        offense_obs, deterministic=args.deterministic
+                    )
+                    def_predicted, _ = policy.predict(
+                        defense_obs, deterministic=args.deterministic
+                    )
+
+                    # Resolve illegal actions using shared utilities
+                    # Strategy mirrors training/backend options
+                    strat = {
+                        "noop": IllegalActionStrategy.NOOP,
+                        "best": IllegalActionStrategy.BEST_PROB,
+                        "sample": IllegalActionStrategy.SAMPLE_PROB,
+                    }.get(
+                        str(
+                            getattr(args, "unified_illegal_strategy", "sample")
+                        ).lower(),
+                        IllegalActionStrategy.NOOP,
+                    )
+
+                    off_probs = get_policy_action_probabilities(policy, offense_obs)
+                    def_probs = get_policy_action_probabilities(policy, defense_obs)
+
+                    off_resolved = resolve_illegal_actions(
+                        np.array(off_predicted),
+                        action_mask,
+                        strat,
+                        args.deterministic,
+                        off_probs,
+                    )
+                    def_resolved = resolve_illegal_actions(
+                        np.array(def_predicted),
+                        action_mask,
+                        strat,
+                        args.deterministic,
+                        def_probs,
+                    )
+
+                    # Combine into one full action vector: offense from offense-conditioned, defense from defense-conditioned
+                    full_action = np.zeros(env.n_players, dtype=int)
+                    for pid in range(env.n_players):
+                        if pid in env.offense_ids:
+                            full_action[pid] = int(off_resolved[pid])
+                        else:
+                            full_action[pid] = int(def_resolved[pid])
+
                     obs, _, done, _, _ = env.step(full_action)
                     accumulate_positions()
             # Plot with unified label
             os.makedirs(args.output_dir, exist_ok=True)
             uni_alt = _alt_of(unified_policy_path)
             uni_alt_label = str(uni_alt) if uni_alt is not None else "latest"
-            offense_path = os.path.join(args.output_dir, f"heatmap_offense_unified_{uni_alt_label}.png")
-            defense_path = os.path.join(args.output_dir, f"heatmap_defense_unified_{uni_alt_label}.png")
+            offense_path = os.path.join(
+                args.output_dir, f"heatmap_offense_unified_{uni_alt_label}.png"
+            )
+            defense_path = os.path.join(
+                args.output_dir, f"heatmap_defense_unified_{uni_alt_label}.png"
+            )
             cmap_uni = args.cmap_name
-            _plot_hex_heat(offense_heat, f"Offense Heatmap: Unified {uni_alt_label}", offense_path, cmap_name=cmap_uni)
-            _plot_hex_heat(defense_heat, f"Defense Heatmap: Unified {uni_alt_label}", defense_path, cmap_name=cmap_uni)
+            _plot_hex_heat(
+                offense_heat,
+                f"Offense Heatmap: Unified {uni_alt_label}",
+                offense_path,
+                cmap_name=cmap_uni,
+            )
+            _plot_hex_heat(
+                defense_heat,
+                f"Defense Heatmap: Unified {uni_alt_label}",
+                defense_path,
+                cmap_name=cmap_uni,
+            )
             print(f"Saved: {offense_path}\nSaved: {defense_path}")
             all_saved_paths.extend([offense_path, defense_path])
             offense_paths.append(offense_path)
@@ -211,7 +364,9 @@ def main(args):
         if getattr(args, "make_gif", False):
             try:
                 if len(offense_paths) > 0:
-                    offense_gif = os.path.join(args.output_dir, "heatmap_offense_anim.gif")
+                    offense_gif = os.path.join(
+                        args.output_dir, "heatmap_offense_anim.gif"
+                    )
                     offense_frames = [Image.open(p) for p in offense_paths]
                     offense_frames[0].save(
                         offense_gif,
@@ -222,7 +377,9 @@ def main(args):
                         optimize=False,
                     )
                 if len(defense_paths) > 0:
-                    defense_gif = os.path.join(args.output_dir, "heatmap_defense_anim.gif")
+                    defense_gif = os.path.join(
+                        args.output_dir, "heatmap_defense_anim.gif"
+                    )
                     defense_frames = [Image.open(p) for p in defense_paths]
                     defense_frames[0].save(
                         defense_gif,
@@ -244,24 +401,62 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate heatmaps from a BasketWorld MLflow run (unified-only).")
+    parser = argparse.ArgumentParser(
+        description="Generate heatmaps from a BasketWorld MLflow run (unified-only)."
+    )
     parser.add_argument("--run-id", type=str, required=True, help="MLflow Run ID")
-    parser.add_argument("--episodes", type=int, default=200, help="Number of self-play episodes")
-    parser.add_argument("--deterministic", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=False)
-    parser.add_argument("--unified-alt", type=int, default=None, help="Use specific alternation for unified policy")
-    parser.add_argument("--unified-alts", type=str, default=None, help="Comma/space separated list of unified alternations")
-    parser.add_argument("--output-dir", type=str, default=".", help="Directory to save heatmaps")
-    parser.add_argument("--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow")
+    parser.add_argument(
+        "--episodes", type=int, default=200, help="Number of self-play episodes"
+    )
+    parser.add_argument(
+        "--deterministic",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+    )
+    parser.add_argument(
+        "--unified-alt",
+        type=int,
+        default=None,
+        help="Use specific alternation for unified policy",
+    )
+    parser.add_argument(
+        "--unified-alts",
+        type=str,
+        default=None,
+        help="Comma/space separated list of unified alternations",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default=".", help="Directory to save heatmaps"
+    )
+    parser.add_argument(
+        "--no-log-mlflow", action="store_true", help="Do not log artifacts to MLflow"
+    )
     # Optional overrides
-    parser.add_argument("--allow-dunks", type=lambda v: str(v).lower() in ["1","true","yes","y","t"], default=None)
+    parser.add_argument(
+        "--allow-dunks",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=None,
+    )
     parser.add_argument("--dunk-pct", type=float, default=None)
     parser.add_argument("--cmap-name", type=str, default="winter")
-    parser.add_argument("--make-gif", action="store_true", help="Also compile generated images into an animated GIF")
-    parser.add_argument("--gif-duration", type=float, default=0.8, help="Seconds per frame in GIF")
+    parser.add_argument(
+        "--make-gif",
+        action="store_true",
+        help="Also compile generated images into an animated GIF",
+    )
+    parser.add_argument(
+        "--gif-duration", type=float, default=0.8, help="Seconds per frame in GIF"
+    )
+    # Illegal action resolution for unified policy (align with training/backend)
+    parser.add_argument(
+        "--unified-illegal-strategy",
+        type=str,
+        choices=["noop", "sample", "best"],
+        default="noop",
+        help="Strategy to resolve illegal actions for unified policy",
+    )
     # Swallow any stray args to be robust to older invocations
     parser.add_argument("extras", nargs="*", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     main(args)
-
-

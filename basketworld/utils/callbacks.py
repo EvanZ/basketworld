@@ -379,6 +379,8 @@ class EpisodeSampleLogger(BaseCallback):
                             "assisted_dunk": float(info.get("assisted_dunk", 0.0)),
                             "assisted_2pt": float(info.get("assisted_2pt", 0.0)),
                             "assisted_3pt": float(info.get("assisted_3pt", 0.0)),
+                            # pressure-adjusted FG% (from env shot probability after pressure)
+                            "shooter_fg_pct": float(info.get("shooter_fg_pct", -1.0)),
                             "gt_is_three": float(info.get("gt_is_three", 0.0)),
                             "gt_is_dunk": float(info.get("gt_is_dunk", 0.0)),
                             "gt_points": float(info.get("gt_points", 0.0)),
@@ -411,6 +413,7 @@ class EpisodeSampleLogger(BaseCallback):
                     "assisted_dunk",
                     "assisted_2pt",
                     "assisted_3pt",
+                    "shooter_fg_pct",
                     # minimal audit
                     "gt_is_three",
                     "gt_is_dunk",

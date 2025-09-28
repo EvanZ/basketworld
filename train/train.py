@@ -462,6 +462,27 @@ def main(args):
                 target_kl=args.target_kl,
                 device=device,
             )
+        else:
+            # If continuing and user requests a restart of the entropy schedule, reset counters and coef
+            if getattr(args, "restart_entropy_on_continue", False):
+                try:
+                    unified_policy.num_timesteps = 0
+                except Exception:
+                    pass
+                try:
+                    if (args.ent_coef_start is not None) or (
+                        args.ent_coef_end is not None
+                    ):
+                        ent_start = (
+                            args.ent_coef_start
+                            if args.ent_coef_start is not None
+                            else args.ent_coef
+                        )
+                        unified_policy.ent_coef = float(ent_start)
+                    else:
+                        unified_policy.ent_coef = float(args.ent_coef)
+                except Exception:
+                    pass
         temp_env.close()
 
         # --- Log the actual network architecture used ---
@@ -580,7 +601,9 @@ def main(args):
                 offense_callbacks.append(entropy_callback)
             offense_callbacks.append(
                 EpisodeSampleLogger(
-                    team_name="Offense", alternation_id=global_alt, sample_prob=1e-2
+                    team_name="Offense",
+                    alternation_id=global_alt,
+                    sample_prob=args.episode_sample_prob,
                 )
             )
             unified_policy.learn(
@@ -637,7 +660,9 @@ def main(args):
                 defense_callbacks.append(entropy_callback)
             defense_callbacks.append(
                 EpisodeSampleLogger(
-                    team_name="Defense", alternation_id=global_alt, sample_prob=1e-2
+                    team_name="Defense",
+                    alternation_id=global_alt,
+                    sample_prob=args.episode_sample_prob,
                 )
             )
             unified_policy.learn(
@@ -996,6 +1021,13 @@ if __name__ == "__main__":
         help="If set, load latest offense/defense policies from this MLflow run and continue training. Also appends new artifacts using continued alternation indices.",
     )
     parser.add_argument(
+        "--restart-entropy-on-continue",
+        dest="restart_entropy_on_continue",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="When continuing from a run, reset num_timesteps and reinitialize ent_coef to the schedule start.",
+    )
+    parser.add_argument(
         "--eval-freq",
         type=int,
         default=2,
@@ -1229,6 +1261,13 @@ if __name__ == "__main__":
         type=float,
         default=0.05,
         help="Chance of a steal.",
+    )
+    parser.add_argument(
+        "--episode-sample-prob",
+        dest="episode_sample_prob",
+        type=float,
+        default=1e-2,
+        help="Probability of sampling an episode for logging.",
     )
     args = parser.parse_args()
 

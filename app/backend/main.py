@@ -431,6 +431,8 @@ def take_step(request: ActionRequest):
                     "pressure_multiplier": float(
                         shot_res.get("pressure_multiplier", -1.0)
                     ),
+                    # Adjusted FG% at time of shot (pressure applied and clamped)
+                    "shooter_fg_pct": float(shot_res.get("probability", 0.0)),
                 }
             )
 
