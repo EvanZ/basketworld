@@ -43,6 +43,7 @@ class GameState:
         self.reward_history = []  # Track rewards for each step
         self.episode_rewards = {"offense": 0.0, "defense": 0.0}  # Running totals
         self.shot_log = []  # Per-step shot attempts with probability and result
+        self.phi_log = []  # Per-step Phi diagnostics and EPs
         # Track which policies are currently loaded so we can persist logs across episodes
         self.offense_policy_key: str | None = None
         self.defense_policy_key: str | None = None
@@ -245,9 +246,10 @@ async def init_game(request: InitGameRequest):
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
-        # Clear any prior replay buffers
+        # Clear any prior replay buffers and phi logs
         game_state.actions_log = []
         game_state.episode_states = []
+        game_state.phi_log = []
 
         # Capture and keep the initial frame so saved episodes include the starting court state
         try:
@@ -257,8 +259,8 @@ async def init_game(request: InitGameRequest):
         except Exception:
             pass
 
-        # Record initial state for replay (manual or self-play)
-        initial_state = get_full_game_state()
+        # Record initial state for replay (manual or self-play) with policy probs
+        initial_state = get_full_game_state(include_policy_probs=True)
         game_state.episode_states.append(initial_state)
 
         return {"status": "success", "state": initial_state}
@@ -531,6 +533,9 @@ def take_step(request: ActionRequest):
             else:
                 defense_reasons.append("None")
 
+    # Get phi shaping reward for this step (per team member)
+    phi_r_shape_per_team = float(info.get("phi_r_shape", 0.0)) if info else 0.0
+
     game_state.reward_history.append(
         {
             "step": len(game_state.reward_history) + 1,
@@ -538,8 +543,39 @@ def take_step(request: ActionRequest):
             "defense": float(step_rewards["defense"]),
             "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
             "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None",
+            "phi_r_shape": phi_r_shape_per_team,
         }
     )
+
+    # Record Phi shaping diagnostics and per-player EPs for this step (if available)
+    try:
+        entry = {
+            "step": int(len(game_state.reward_history)),
+            "phi_prev": float(info.get("phi_prev", -1.0)) if info else -1.0,
+            "phi_next": float(info.get("phi_next", -1.0)) if info else -1.0,
+            "phi_beta": float(info.get("phi_beta", -1.0)) if info else -1.0,
+            "phi_r_shape": float(info.get("phi_r_shape", 0.0)) if info else 0.0,
+            "ball_handler": (
+                int(game_state.env.ball_holder)
+                if game_state.env.ball_holder is not None
+                else -1
+            ),
+            "offense_ids": list(game_state.env.offense_ids),
+            "defense_ids": list(game_state.env.defense_ids),
+        }
+        if info and "phi_ep_by_player" in info:
+            try:
+                ep_list = list(info.get("phi_ep_by_player", []))
+                entry["ep_by_player"] = [float(x) for x in ep_list]
+            except Exception:
+                entry["ep_by_player"] = []
+        if info and "phi_team_best_ep" in info:
+            entry["team_best_ep"] = float(info.get("phi_team_best_ep", -1.0))
+        if info and "phi_ball_handler_ep" in info:
+            entry["ball_handler_ep"] = float(info.get("phi_ball_handler_ep", -1.0))
+        game_state.phi_log.append(entry)
+    except Exception:
+        pass
 
     # Capture frame after step
     try:
@@ -548,9 +584,9 @@ def take_step(request: ActionRequest):
             game_state.frames.append(frame)
     except Exception:
         pass
-    # Record resulting state for replay
+    # Record resulting state for replay with policy probs
     try:
-        game_state.episode_states.append(get_full_game_state())
+        game_state.episode_states.append(get_full_game_state(include_policy_probs=True))
     except Exception:
         pass
     # End of self-play: mark inactive when episode is done
@@ -569,6 +605,61 @@ def take_step(request: ActionRequest):
             "defense": float(game_state.episode_rewards["defense"]),
         },
     }
+
+
+@app.get("/api/phi_params")
+def get_phi_params():
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    env = game_state.env
+    return {
+        "enable_phi_shaping": bool(getattr(env, "enable_phi_shaping", False)),
+        "phi_beta": float(getattr(env, "phi_beta", 0.0)),
+        "reward_shaping_gamma": float(getattr(env, "reward_shaping_gamma", 1.0)),
+        "phi_use_ball_handler_only": bool(
+            getattr(env, "phi_use_ball_handler_only", False)
+        ),
+        "phi_blend_weight": float(getattr(env, "phi_blend_weight", 0.0)),
+    }
+
+
+class SetPhiParamsRequest(BaseModel):
+    enable_phi_shaping: bool | None = None
+    phi_beta: float | None = None
+    reward_shaping_gamma: float | None = None
+    phi_use_ball_handler_only: bool | None = None
+    phi_blend_weight: float | None = None
+
+
+@app.post("/api/phi_params")
+def set_phi_params(req: SetPhiParamsRequest):
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    try:
+        env = game_state.env
+        if req.enable_phi_shaping is not None:
+            env.enable_phi_shaping = bool(req.enable_phi_shaping)
+        if req.phi_beta is not None:
+            env.phi_beta = float(req.phi_beta)
+        if req.reward_shaping_gamma is not None:
+            env.reward_shaping_gamma = float(req.reward_shaping_gamma)
+        if req.phi_use_ball_handler_only is not None:
+            env.phi_use_ball_handler_only = bool(req.phi_use_ball_handler_only)
+        if req.phi_blend_weight is not None:
+            try:
+                env.phi_blend_weight = float(max(0.0, min(1.0, req.phi_blend_weight)))
+            except Exception:
+                pass
+        return {"status": "success", "params": get_phi_params()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set phi params: {e}")
+
+
+@app.get("/api/phi_log")
+def get_phi_log():
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    return {"phi_log": list(game_state.phi_log)}
 
 
 @app.post("/api/start_self_play")
@@ -850,39 +941,15 @@ def get_policy_probabilities():
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
     try:
-        policy = game_state.unified_policy
-
-        # Convert observation to the format the policy expects
-        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
-
-        # Get the distribution over actions from the policy object
-        distributions = policy.policy.get_distribution(obs_tensor)
-
-        # Extract raw probabilities for each player
-        raw_probs = [
-            dist.probs.detach().cpu().numpy().squeeze()
-            for dist in distributions.distribution
-        ]
-
-        # Apply action mask so illegal actions have probability 0, then renormalize.
-        action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
-        probs_list = []
-        for pid, probs in enumerate(raw_probs):
-            masked = probs * action_mask[pid]
-            total = masked.sum()
-            if total > 0:
-                masked = masked / total
-            probs_list.append(masked.tolist())
-
-        # Return as a dictionary mapping player_id to their list of probabilities
-        response = {
-            player_id: probs
-            for player_id, probs in enumerate(probs_list)
-            if player_id in game_state.env.offense_ids
-            or player_id in game_state.env.defense_ids
-        }
+        response = compute_policy_probabilities()
+        if response is None:
+            raise HTTPException(
+                status_code=500, detail="Failed to compute policy probabilities"
+            )
         return jsonable_encoder(response)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get policy probabilities: {e}"
@@ -1064,7 +1131,48 @@ def get_rewards():
     }
 
 
-def get_full_game_state():
+def compute_policy_probabilities():
+    """
+    Helper function to compute policy probabilities for the current observation.
+    Returns a dict mapping player_id to their action probabilities, or None if error.
+    """
+    if not game_state.env or not game_state.unified_policy or game_state.obs is None:
+        return None
+
+    try:
+        policy = game_state.unified_policy
+        # Convert observation to the format the policy expects
+        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
+        # Get the distribution over actions from the policy object
+        distributions = policy.policy.get_distribution(obs_tensor)
+        # Extract raw probabilities for each player
+        raw_probs = [
+            dist.probs.detach().cpu().numpy().squeeze()
+            for dist in distributions.distribution
+        ]
+        # Apply action mask so illegal actions have probability 0, then renormalize.
+        action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
+        probs_list = []
+        for pid, probs in enumerate(raw_probs):
+            masked = probs * action_mask[pid]
+            total = masked.sum()
+            if total > 0:
+                masked = masked / total
+            probs_list.append(masked.tolist())
+        # Return as a dictionary mapping player_id to their list of probabilities
+        response = {
+            player_id: probs
+            for player_id, probs in enumerate(probs_list)
+            if player_id in game_state.env.offense_ids
+            or player_id in game_state.env.defense_ids
+        }
+        return response
+    except Exception as e:
+        print(f"[compute_policy_probabilities] Error: {e}")
+        return None
+
+
+def get_full_game_state(include_policy_probs=False):
     """Helper function to construct the full game state dictionary."""
     if not game_state.env:
         return {}
@@ -1094,11 +1202,25 @@ def get_full_game_state():
     )
     action_mask_py = game_state.obs["action_mask"].tolist()
 
-    return {
+    # Calculate ball handler's pressure-adjusted shot probability for replay
+    ball_handler_shot_prob = None
+    if ball_holder_py is not None:
+        try:
+            player_pos = game_state.env.positions[ball_holder_py]
+            basket_pos = game_state.env.basket_position
+            distance = game_state.env._hex_distance(player_pos, basket_pos)
+            ball_handler_shot_prob = float(
+                game_state.env._calculate_shot_probability(ball_holder_py, distance)
+            )
+        except Exception:
+            ball_handler_shot_prob = None
+
+    state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
         "positions": positions_py,
         "ball_holder": ball_holder_py,
+        "ball_handler_shot_probability": ball_handler_shot_prob,
         "shot_clock": int(game_state.env.shot_clock),
         "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
         "user_team_name": game_state.user_team.name,
@@ -1136,6 +1258,11 @@ def get_full_game_state():
         ),
         "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
+        "max_spawn_distance": (
+            int(getattr(game_state.env, "max_spawn_distance", None))
+            if getattr(game_state.env, "max_spawn_distance", None) is not None
+            else None
+        ),
         "shot_pressure_enabled": bool(
             getattr(game_state.env, "shot_pressure_enabled", True)
         ),
@@ -1154,6 +1281,24 @@ def get_full_game_state():
         ),
         "illegal_defense_max_steps": int(
             getattr(game_state.env, "illegal_defense_max_steps", 3)
+        ),
+        # Pass parameters
+        "pass_arc_degrees": float(getattr(game_state.env, "pass_arc_degrees", 60.0)),
+        "pass_oob_turnover_prob": float(
+            getattr(game_state.env, "pass_oob_turnover_prob", 1.0)
+        ),
+        # Illegal action policy
+        "illegal_action_policy": (
+            getattr(game_state.env, "illegal_action_policy", None).value
+            if getattr(game_state.env, "illegal_action_policy", None)
+            else "noop"
+        ),
+        # Pass logit bias (policy parameter, not env)
+        "pass_logit_bias": float(
+            getattr(game_state.unified_policy.policy, "pass_logit_bias", 0.0)
+            if game_state.unified_policy
+            and hasattr(game_state.unified_policy, "policy")
+            else 0.0
         ),
         # MLflow metadata for UI display
         "run_id": getattr(game_state, "run_id", None),
@@ -1179,3 +1324,11 @@ def get_full_game_state():
             ],
         },
     }
+
+    # Optionally include policy probabilities
+    if include_policy_probs:
+        policy_probs = compute_policy_probabilities()
+        if policy_probs is not None:
+            state["policy_probabilities"] = policy_probs
+
+    return state

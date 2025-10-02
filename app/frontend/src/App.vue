@@ -3,6 +3,7 @@ import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
 import { resetStatsStorage } from './services/stats';
@@ -19,9 +20,14 @@ const currentSelections = ref(null);
 const isSelfPlaying = ref(false);
 const canReplay = ref(false);
 const isReplaying = ref(false);
+// For manual stepping through replay
+const replayStates = ref([]);
+const currentStepIndex = ref(0);
+const isManualStepping = ref(false);
 // Force remount of PlayerControls to clear internal state between games
 const controlsKey = ref(0);
 const controlsRef = ref(null);
+const phiRef = vueRef(null);
 
 // AI Mode for pre-selecting actions, not automatic play
 const aiMode = ref(true);
@@ -31,20 +37,33 @@ const deterministic = ref(false);
 const moveHistory = ref([]);
 
 // Watch for when episodes end to stop auto-play behavior
-watch(gameState, async (newState) => {
-    if (newState && !newState.done) {
+watch(gameState, async (newState, oldState) => {
+    // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
+    if (newState && !newState.done && !isManualStepping.value) {
         try {
+            console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
             const response = await getPolicyProbs();
             policyProbs.value = response;
         } catch (err) {
             console.error('[App] Failed to fetch policy probs:', err);
         }
+    } else if (newState && !newState.done && isManualStepping.value) {
+        console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
     }
     // When an episode ends, disable AI mode to allow starting a new game
-    if (newState && newState.done) {
+    if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
         // Allow replay after any completed episode (manual or self-play)
         canReplay.value = true;
+        // Automatically load episode for manual stepping (with small delay and error handling)
+        setTimeout(async () => {
+            try {
+                await handleManualReplay();
+            } catch (err) {
+                console.error('[App] Failed to auto-load episode for stepping:', err);
+                // Don't show alert here since it's automatic - just log the error
+            }
+        }, 100);
     }
 });
 
@@ -60,6 +79,10 @@ async function handleGameStarted(setupData) {
   controlsKey.value += 1;
   // Reset replay availability for a fresh episode
   canReplay.value = false;
+  // Reset manual stepping state
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
   
   // Start loading BEFORE clearing state to avoid interim UI flicker
   isLoading.value = true;
@@ -101,6 +124,7 @@ async function handleActionsSubmitted(actions) {
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
+      try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
     } else {
       throw new Error(response.message || 'Failed to process step.');
     }
@@ -225,6 +249,7 @@ async function handleSelfPlay(preselected = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(response.state);
+        try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
         // Small delay to make the progression visible
         await new Promise(resolve => setTimeout(resolve, 100));
       } else {
@@ -257,6 +282,7 @@ async function handleReplay() {
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
       // Animate the replay so it is visible in the UI
       isReplaying.value = true;
+      isManualStepping.value = false;
       gameHistory.value = [];
       for (const s of res.states) {
         gameState.value = s;
@@ -266,11 +292,113 @@ async function handleReplay() {
         await new Promise(resolve => setTimeout(resolve, 300));
       }
       isReplaying.value = false;
+      // After animated replay, reload for manual stepping (keep showing final state)
+      await handleManualReplay(false, true);
     } else {
       throw new Error('Invalid replay response');
     }
   } catch (e) {
     alert(`Failed to replay episode: ${e.message}`);
+  }
+}
+
+async function handleManualReplay(showAlert = false, keepCurrentView = true) {
+  try {
+    const res = await replayLastEpisode();
+    if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
+      // Store states for manual stepping
+      replayStates.value = res.states;
+      isManualStepping.value = true;
+      
+      // Debug: check if policy probs are stored
+      console.log('[handleManualReplay] First state has policy_probabilities:', !!res.states[0].policy_probabilities);
+      console.log('[handleManualReplay] Last state has policy_probabilities:', !!res.states[res.states.length - 1].policy_probabilities);
+      if (res.states[0].policy_probabilities) {
+        console.log('[handleManualReplay] Sample first state probs:', JSON.stringify(res.states[0].policy_probabilities).substring(0, 200));
+      }
+      if (res.states.length > 1 && res.states[1].policy_probabilities) {
+        console.log('[handleManualReplay] Sample second state probs:', JSON.stringify(res.states[1].policy_probabilities).substring(0, 200));
+      }
+      
+      if (keepCurrentView) {
+        // Keep showing current state (usually the final state), start from end
+        currentStepIndex.value = res.states.length - 1;
+        // Load policy probs from the final state
+        if (res.states[res.states.length - 1].policy_probabilities) {
+          policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
+        } else {
+          policyProbs.value = null;
+          console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
+        }
+        // Keep current gameState and gameHistory as-is
+      } else {
+        // Reset to beginning
+        currentStepIndex.value = 0;
+        gameState.value = res.states[0];
+        gameHistory.value = [res.states[0]];
+        // Load policy probs from the first state
+        if (res.states[0].policy_probabilities) {
+          policyProbs.value = res.states[0].policy_probabilities;
+        } else {
+          policyProbs.value = null;
+          console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
+        }
+      }
+    } else {
+      throw new Error('Invalid replay response');
+    }
+  } catch (e) {
+    console.error('[App] Failed to load episode for manual stepping:', e);
+    if (showAlert) {
+      alert(`Failed to load episode for manual stepping: ${e.message}`);
+    }
+    throw e; // Re-throw so caller knows it failed
+  }
+}
+
+function stepForward() {
+  if (!isManualStepping.value || replayStates.value.length === 0) return;
+  if (currentStepIndex.value < replayStates.value.length - 1) {
+    currentStepIndex.value += 1;
+    const currentState = replayStates.value[currentStepIndex.value];
+    
+    // Update policy probabilities BEFORE gameState to avoid race conditions
+    if (currentState.policy_probabilities) {
+      console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
+      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+    } else {
+      console.warn(`[stepForward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
+      policyProbs.value = null;
+    }
+    
+    // Then update gameState and history
+    gameState.value = currentState;
+    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    
+    console.log(`[stepForward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
+  }
+}
+
+function stepBackward() {
+  if (!isManualStepping.value || replayStates.value.length === 0) return;
+  if (currentStepIndex.value > 0) {
+    currentStepIndex.value -= 1;
+    const currentState = replayStates.value[currentStepIndex.value];
+    
+    // Update policy probabilities BEFORE gameState to avoid race conditions
+    if (currentState.policy_probabilities) {
+      console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
+      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+    } else {
+      console.warn(`[stepBackward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
+      policyProbs.value = null;
+    }
+    
+    // Then update gameState and history
+    gameState.value = currentState;
+    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    
+    console.log(`[stepBackward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -282,6 +410,10 @@ function handlePlayAgain() {
   currentSelections.value = null;
   isSelfPlaying.value = false;
   controlsKey.value += 1;
+  // Reset manual stepping state
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
   if (initialSetup.value) {
     handleGameStarted(initialSetup.value);
   }
@@ -326,6 +458,12 @@ function onKeydown(e) {
   } else if (key === 't') {
     // Submit Turn
     try { controlsRef.value?.submitActions?.(); } catch (_) {}
+  } else if (key === 'arrowright') {
+    // Step forward in manual replay
+    if (isManualStepping.value) stepForward();
+  } else if (key === 'arrowleft') {
+    // Step backward in manual replay
+    if (isManualStepping.value) stepBackward();
   }
 }
 
@@ -371,6 +509,7 @@ onBeforeUnmount(() => {
           :game-history="gameHistory" 
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
+          :is-manual-stepping="isManualStepping"
         />
       </div>
       <div class="controls-area">
@@ -380,6 +519,8 @@ onBeforeUnmount(() => {
             v-model:activePlayerId="activePlayerId"
             :disabled="false"
             :is-replaying="isReplaying"
+            :is-manual-stepping="isManualStepping"
+            :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
             :deterministic="deterministic"
             :move-history="moveHistory"
@@ -391,12 +532,27 @@ onBeforeUnmount(() => {
             ref="controlsRef"
         />
 
-        <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">
+        <button v-if="gameState.done || isManualStepping" @click="handleSaveEpisode" class="save-episode-button">
           Save Episode
         </button>
-        <button v-if="gameState.done && canReplay" @click="handleReplay" class="save-episode-button" style="margin-left: 0.5rem;">
-          <font-awesome-icon :icon="['fas', 'redo']" />
-        </button>
+        
+        <div v-if="isManualStepping && canReplay" class="replay-controls">
+          <button @click="handleReplay" class="replay-button" title="Replay (animated)">
+            <font-awesome-icon :icon="['fas', 'redo']" />
+          </button>
+          
+          <div class="step-controls-inline">
+            <button @click="stepBackward" class="step-button" :disabled="currentStepIndex === 0" title="Step back (← arrow)">
+              <font-awesome-icon :icon="['fas', 'chevron-left']" />
+            </button>
+            <span class="step-indicator">
+              {{ currentStepIndex + 1 }} / {{ replayStates.length }}
+            </span>
+            <button @click="stepForward" class="step-button" :disabled="currentStepIndex === replayStates.length - 1" title="Step forward (→ arrow)">
+              <font-awesome-icon :icon="['fas', 'chevron-right']" />
+            </button>
+          </div>
+        </div>
 
         <KeyboardLegend />
       </div>
@@ -474,5 +630,68 @@ header {
 .save-episode-button {
   margin-top: 1rem;
   padding: 0.5rem 1rem;
+}
+
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+}
+
+.replay-button {
+  padding: 0.5rem 1rem;
+  font-size: 1.1rem;
+  background: #4CAF50;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.replay-button:hover {
+  background: #45a049;
+}
+
+.step-controls-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.step-button {
+  padding: 0.5rem 0.75rem;
+  font-size: 1.2rem;
+  background: #2196F3;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+  min-width: 40px;
+}
+
+.step-button:hover:not(:disabled) {
+  background: #1976D2;
+}
+
+.step-button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.step-indicator {
+  font-weight: 600;
+  font-size: 1rem;
+  color: #333;
+  min-width: 60px;
+  text-align: center;
 }
 </style>

@@ -23,8 +23,12 @@ from basketworld.utils.callbacks import (
     MLflowCallback,
     EntropyScheduleCallback,
     EntropyExpScheduleCallback,
+    PotentialBetaExpScheduleCallback,
+    PassLogitBiasExpScheduleCallback,
+    PassCurriculumExpScheduleCallback,
     EpisodeSampleLogger,
 )
+from basketworld.utils.policies import PassBiasMultiInputPolicy
 
 from basketworld.utils.evaluation_helpers import (
     get_outcome_category,
@@ -48,7 +52,11 @@ from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
-from basketworld.utils.wrappers import RewardAggregationWrapper, EpisodeStatsWrapper
+from basketworld.utils.wrappers import (
+    RewardAggregationWrapper,
+    EpisodeStatsWrapper,
+    BetaSetterWrapper,
+)
 import csv
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
@@ -101,9 +109,9 @@ def get_random_policy_from_artifacts(
     run_id,
     model_prefix,
     tmpdir,
-    K: int = 20,
+    K: int = 10,
     beta: float = 0.8,
-    uniform_eps: float = 0.10,
+    uniform_eps: float = 0.0,
 ):
     """Sample an opponent checkpoint using a geometric decay over recent K snapshots.
 
@@ -230,6 +238,8 @@ def setup_environment(args, training_team):
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+        spawn_distance=getattr(args, "spawn_distance", 3),
+        max_spawn_distance=getattr(args, "max_spawn_distance", None),
         # Reward shaping
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -241,6 +251,12 @@ def setup_environment(args, training_team):
         assist_window=getattr(args, "assist_window", getattr(args, "assist_window", 2)),
         potential_assist_pct=getattr(args, "potential_assist_pct", 0.10),
         full_assist_bonus_pct=getattr(args, "full_assist_bonus_pct", 0.05),
+        # Phi shaping config
+        enable_phi_shaping=getattr(args, "enable_phi_shaping", False),
+        reward_shaping_gamma=getattr(args, "reward_shaping_gamma", args.gamma),
+        phi_beta=getattr(args, "phi_beta_start", 0.0),
+        phi_use_ball_handler_only=getattr(args, "phi_use_ball_handler_only", False),
+        phi_blend_weight=getattr(args, "phi_blend_weight", 0.0),
         enable_profiling=args.enable_env_profiling,
         training_team=training_team,  # Critical for correct rewards
         # Observation controls
@@ -255,6 +271,8 @@ def setup_environment(args, training_team):
     # Wrap with episode stats collector then aggregate reward for Monitor/SB3
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
+    # Put BetaSetterWrapper at the top so env_method('set_phi_beta', ...) hits it directly
+    env = BetaSetterWrapper(env)
     return Monitor(
         env,
         info_keywords=(
@@ -271,6 +289,10 @@ def setup_environment(args, training_team):
             "made_2pt",
             "made_3pt",
             "attempts",
+            # Potential-based shaping diagnostics
+            "phi_beta",
+            "phi_prev",
+            "phi_next",
             # minimal audit
             "gt_is_three",
             "gt_is_dunk",
@@ -448,7 +470,7 @@ def main(args):
                 )
                 initial_ent_coef = float(start)
             unified_policy = PPO(
-                "MultiInputPolicy",
+                PassBiasMultiInputPolicy,
                 temp_env,
                 verbose=1,
                 n_steps=args.n_steps,
@@ -506,6 +528,7 @@ def main(args):
 
         # Prepare optional entropy scheduler across the whole run
         entropy_callback = None
+        beta_callback = None
         if (args.ent_coef_start is not None) or (args.ent_coef_end is not None):
             ent_start = (
                 args.ent_coef_start
@@ -534,6 +557,111 @@ def main(args):
                 entropy_callback = EntropyScheduleCallback(
                     ent_start, ent_end, total_planned_ts
                 )
+
+        # Prepare optional Phi beta scheduler across the whole run
+        if (
+            getattr(args, "phi_beta_start", None) is not None
+            or getattr(args, "phi_beta_end", None) is not None
+        ):
+            beta_start = (
+                args.phi_beta_start
+                if getattr(args, "phi_beta_start", None) is not None
+                else 0.0
+            )
+            beta_end = (
+                args.phi_beta_end
+                if getattr(args, "phi_beta_end", None) is not None
+                else 0.0
+            )
+            total_planned_ts = int(
+                2
+                * args.alternations
+                * args.steps_per_alternation
+                * args.num_envs
+                * args.n_steps
+            )
+            if getattr(args, "phi_beta_schedule", "exp") == "exp":
+                beta_callback = PotentialBetaExpScheduleCallback(
+                    beta_start,
+                    beta_end,
+                    total_planned_ts,
+                    bump_updates=getattr(args, "phi_bump_updates", 0),
+                    bump_multiplier=getattr(args, "phi_bump_multiplier", 1.0),
+                )
+        # Optional Pass Logit Bias scheduler across the whole run
+        pass_bias_callback = None
+        if (
+            getattr(args, "pass_logit_bias_start", None) is not None
+            or getattr(args, "pass_logit_bias_end", None) is not None
+        ):
+            p_start = (
+                args.pass_logit_bias_start
+                if getattr(args, "pass_logit_bias_start", None) is not None
+                else 0.0
+            )
+            p_end = (
+                args.pass_logit_bias_end
+                if getattr(args, "pass_logit_bias_end", None) is not None
+                else 0.0
+            )
+            total_planned_ts = int(
+                2
+                * args.alternations
+                * args.steps_per_alternation
+                * args.num_envs
+                * args.n_steps
+            )
+            pass_bias_callback = PassLogitBiasExpScheduleCallback(
+                p_start, p_end, total_planned_ts
+            )
+
+        # Optional passing curriculum (arc degrees, OOB turnover probability)
+        pass_curriculum_callback = None
+        if (
+            getattr(args, "pass_arc_start", None) is not None
+            or getattr(args, "pass_arc_end", None) is not None
+            or getattr(args, "pass_oob_turnover_prob_start", None) is not None
+            or getattr(args, "pass_oob_turnover_prob_end", None) is not None
+        ):
+            arc_start = (
+                args.pass_arc_start
+                if getattr(args, "pass_arc_start", None) is not None
+                else 60.0
+            )
+            arc_end = (
+                args.pass_arc_end
+                if getattr(args, "pass_arc_end", None) is not None
+                else 60.0
+            )
+            oob_start = (
+                args.pass_oob_turnover_prob_start
+                if getattr(args, "pass_oob_turnover_prob_start", None) is not None
+                else 1.0
+            )
+            oob_end = (
+                args.pass_oob_turnover_prob_end
+                if getattr(args, "pass_oob_turnover_prob_end", None) is not None
+                else 1.0
+            )
+            arc_power = (
+                args.pass_arc_power
+                if getattr(args, "pass_arc_power", None) is not None
+                else 2.0
+            )
+            oob_power = (
+                args.pass_oob_power
+                if getattr(args, "pass_oob_power", None) is not None
+                else 2.0
+            )
+            pass_curriculum_callback = PassCurriculumExpScheduleCallback(
+                arc_start,
+                arc_end,
+                oob_start,
+                oob_end,
+                total_planned_ts,
+                arc_power=arc_power,
+                oob_power=oob_power,
+            )
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -599,6 +727,12 @@ def main(args):
             offense_callbacks = [offense_mlflow_callback, offense_timing_callback]
             if entropy_callback is not None:
                 offense_callbacks.append(entropy_callback)
+            if beta_callback is not None:
+                offense_callbacks.append(beta_callback)
+            if pass_bias_callback is not None:
+                offense_callbacks.append(pass_bias_callback)
+            if pass_curriculum_callback is not None:
+                offense_callbacks.append(pass_curriculum_callback)
             offense_callbacks.append(
                 EpisodeSampleLogger(
                     team_name="Offense",
@@ -658,6 +792,12 @@ def main(args):
             defense_callbacks = [defense_mlflow_callback, defense_timing_callback]
             if entropy_callback is not None:
                 defense_callbacks.append(entropy_callback)
+            if beta_callback is not None:
+                defense_callbacks.append(beta_callback)
+            if pass_bias_callback is not None:
+                defense_callbacks.append(pass_bias_callback)
+            if pass_curriculum_callback is not None:
+                defense_callbacks.append(pass_curriculum_callback)
             defense_callbacks.append(
                 EpisodeSampleLogger(
                     team_name="Defense",
@@ -713,6 +853,8 @@ def main(args):
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+                    spawn_distance=getattr(args, "spawn_distance", 3),
+                    max_spawn_distance=getattr(args, "max_spawn_distance", None),
                     # Reward shaping
                     pass_reward=getattr(args, "pass_reward", 0.0),
                     turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -1108,7 +1250,14 @@ if __name__ == "__main__":
         "--spawn-distance",
         type=int,
         default=3,
-        help="minimum distance from 3pt line at which players spawn.",
+        help="minimum distance from basket at which players spawn.",
+    )
+    parser.add_argument(
+        "--max-spawn-distance",
+        dest="max_spawn_distance",
+        type=lambda v: None if v == "" or str(v).lower() == "none" else int(v),
+        default=None,
+        help="maximum distance from basket at which players spawn (None = unlimited). Use with --spawn-distance for curriculum learning.",
     )
     parser.add_argument(
         "--deterministic-opponent",
@@ -1268,6 +1417,120 @@ if __name__ == "__main__":
         type=float,
         default=1e-2,
         help="Probability of sampling an episode for logging.",
+    )
+    # Potential-based shaping CLI
+    parser.add_argument(
+        "--enable-phi-shaping",
+        dest="enable_phi_shaping",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable potential-based reward shaping using best current shot quality.",
+    )
+    parser.add_argument(
+        "--reward-shaping-gamma",
+        dest="reward_shaping_gamma",
+        type=float,
+        default=None,
+        help="Discount gamma used inside shaping term (should match PPO gamma).",
+    )
+    parser.add_argument(
+        "--phi-use-ball-handler-only",
+        dest="phi_use_ball_handler_only",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Use only ball-handler make prob for Phi instead of team best.",
+    )
+    parser.add_argument(
+        "--phi-blend-weight",
+        dest="phi_blend_weight",
+        type=float,
+        default=0.0,
+        help="Blend weight w in [0,1] for Phi=(1-w)*team_best_EP + w*ball_EP (ignored if ball-handler-only).",
+    )
+    parser.add_argument(
+        "--phi-beta-start",
+        dest="phi_beta_start",
+        type=float,
+        default=0.0,
+        help="Initial beta multiplier for Phi shaping.",
+    )
+    parser.add_argument(
+        "--phi-beta-end",
+        dest="phi_beta_end",
+        type=float,
+        default=0.0,
+        help="Final beta multiplier for Phi shaping (decays to this).",
+    )
+    parser.add_argument(
+        "--phi-bump-updates",
+        dest="phi_bump_updates",
+        type=int,
+        default=0,
+        help="Number of PPO updates to bump phi_beta at start of each segment.",
+    )
+    parser.add_argument(
+        "--phi-bump-multiplier",
+        dest="phi_bump_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to phi_beta during bump updates (>=1.0).",
+    )
+    # Passing curriculum CLI
+    parser.add_argument(
+        "--pass-arc-start",
+        dest="pass_arc_start",
+        type=float,
+        default=None,
+        help="Initial passing arc degrees (e.g., 120).",
+    )
+    parser.add_argument(
+        "--pass-arc-end",
+        dest="pass_arc_end",
+        type=float,
+        default=None,
+        help="Final passing arc degrees (e.g., 60).",
+    )
+    parser.add_argument(
+        "--pass-oob-turnover-prob-start",
+        dest="pass_oob_turnover_prob_start",
+        type=float,
+        default=None,
+        help="Initial probability that pass without receiver is OOB turnover (e.g., 0.1).",
+    )
+    parser.add_argument(
+        "--pass-oob-turnover-prob-end",
+        dest="pass_oob_turnover_prob_end",
+        type=float,
+        default=None,
+        help="Final OOB turnover probability when no receiver (e.g., 1.0).",
+    )
+    parser.add_argument(
+        "--pass-arc-power",
+        dest="pass_arc_power",
+        type=float,
+        default=2.0,
+        help="Power applied to arc curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--pass-oob-power",
+        dest="pass_oob_power",
+        type=float,
+        default=2.0,
+        help="Power applied to OOB curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--pass-logit-bias-start",
+        dest="pass_logit_bias_start",
+        type=float,
+        default=None,
+        help="Initial additive bias added to PASS action logits (e.g., 0.8).",
+    )
+    parser.add_argument(
+        "--pass-logit-bias-end",
+        dest="pass_logit_bias_end",
+        type=float,
+        default=None,
+        help="Final additive bias (0 to disable at end).",
     )
     args = parser.parse_args()
 

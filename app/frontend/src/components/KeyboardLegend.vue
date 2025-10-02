@@ -8,6 +8,8 @@ const shortcuts = [
   { key: 'R', label: 'Reset Stats' },
   { key: 'C', label: 'Copy Stats to Clipboard' },
   { key: '0-9', label: 'Select Player (by ID)' },
+  { key: '←', label: 'Step Back (manual replay)', isArrow: true },
+  { key: '→', label: 'Step Forward (manual replay)', isArrow: true },
 ];
 </script>
 
@@ -22,6 +24,9 @@ const shortcuts = [
           <span class="keycap small" aria-hidden="true">0</span>
           <span class="keycap-sep" aria-hidden="true">–</span>
           <span class="keycap small" aria-hidden="true">9</span>
+        </template>
+        <template v-else-if="item.isArrow">
+          <span class="keycap arrow-key" aria-hidden="true">{{ item.key }}</span>
         </template>
         <template v-else>
           <span class="keycap" aria-hidden="true">{{ item.key }}</span>
@@ -79,6 +84,7 @@ const shortcuts = [
   font-weight: 700;
 }
 .keycap.small { min-width: 18px; height: 20px; padding: 0 4px; font-size: 11px; }
+.keycap.arrow-key { font-size: 14px; min-width: 24px; }
 .keycap-sep { margin: 0 4px; color: #666; }
 </style>
 

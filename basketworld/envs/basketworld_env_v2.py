@@ -100,8 +100,12 @@ class HexagonBasketballEnv(gym.Env):
         shot_pressure_max: float = 0.5,  # max reduction at distance=1 (multiplier = 1 - max)
         shot_pressure_lambda: float = 1.0,  # decay rate per hex away from shooter
         shot_pressure_arc_degrees: float = 60.0,  # arc width centered toward basket
+        # Pass/OOB curriculum controls
+        pass_arc_degrees: float = 60.0,
+        pass_oob_turnover_prob: float = 1.0,
         enable_profiling: bool = False,
         spawn_distance: int = 3,
+        max_spawn_distance: Optional[int] = None,
         # Reward shaping parameters
         pass_reward: float = 0.0,
         turnover_penalty: float = 0.0,
@@ -110,6 +114,12 @@ class HexagonBasketballEnv(gym.Env):
         missed_shot_penalty: float = 0.0,
         potential_assist_reward: float = 0.1,
         full_assist_bonus: float = 0.2,
+        # Potential-based shaping (Phi) controls
+        enable_phi_shaping: bool = False,
+        reward_shaping_gamma: Optional[float] = None,
+        phi_beta: float = 0.0,
+        phi_use_ball_handler_only: bool = False,
+        phi_blend_weight: float = 0.0,
         # Preferred: percentage-based assist shaping
         potential_assist_pct: float = 0.10,
         full_assist_bonus_pct: float = 0.05,
@@ -153,12 +163,22 @@ class HexagonBasketballEnv(gym.Env):
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
         self.steal_chance = steal_chance
         self.spawn_distance = spawn_distance
+        self.max_spawn_distance = max_spawn_distance
         self.use_egocentric_obs = bool(use_egocentric_obs)
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
         self.normalize_obs = bool(normalize_obs)
         # Movement mask behavior
         self.mask_occupied_moves = bool(mask_occupied_moves)
+        # Illegal action handling configuration/state
+        try:
+            self.illegal_action_policy = IllegalActionPolicy(illegal_action_policy)
+        except Exception:
+            self.illegal_action_policy = IllegalActionPolicy.NOOP
+        # Optional per-step action probabilities provided by caller
+        self._pending_action_probs: Optional[np.ndarray] = None
+        # Honor constructor flag for strict illegal action handling
+        self.raise_on_illegal_action = bool(raise_on_illegal_action)
         # Three-point configuration and shot model parameters
         self.three_point_distance = three_point_distance
         self.layup_pct = float(layup_pct)
@@ -176,6 +196,11 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_pressure_lambda = float(shot_pressure_lambda)
         self.shot_pressure_arc_degrees = float(shot_pressure_arc_degrees)
         self.shot_pressure_arc_rad = math.radians(shot_pressure_arc_degrees)
+        # Passing arc (degrees) centered on chosen pass direction; schedulable
+        self.pass_arc_degrees = float(max(1.0, min(360.0, pass_arc_degrees)))
+        # Probability an attempted pass with no receiver in arc is ruled OOB turnover
+        # (1.0 retains prior behavior). Can be annealed by scheduler.
+        self.pass_oob_turnover_prob = float(max(0.0, min(1.0, pass_oob_turnover_prob)))
         # Profiling
         self.enable_profiling = bool(enable_profiling)
         self._profile_ns: Dict[str, int] = {}
@@ -301,11 +326,28 @@ class HexagonBasketballEnv(gym.Env):
         self.potential_assist_pct: float = float(potential_assist_pct)
         self.full_assist_bonus_pct: float = float(full_assist_bonus_pct)
 
+        # --- Potential-based shaping (Phi) configuration ---
+        self.enable_phi_shaping: bool = bool(enable_phi_shaping)
+        # Must match the agent's discount to preserve policy invariance
+        self.reward_shaping_gamma: float = (
+            float(reward_shaping_gamma) if reward_shaping_gamma is not None else 1.0
+        )
+        # Beta can be scheduled during training via VecEnv.set_attr
+        self.phi_beta: float = float(phi_beta)
+        # If True, use only the ball handler's make prob; else best among offense
+        self.phi_use_ball_handler_only: bool = bool(phi_use_ball_handler_only)
+        try:
+            self.phi_blend_weight: float = float(max(0.0, min(1.0, phi_blend_weight)))
+        except Exception:
+            self.phi_blend_weight = 0.0
+
         # Optional deterministic start overrides
         self._initial_positions_override: Optional[List[Tuple[int, int]]] = None
         if initial_positions is not None:
             # Shallow copy to avoid accidental external mutation
-            self._initial_positions_override = [tuple(p) for p in initial_positions]
+            self._initial_positions_override = [
+                (int(p[0]), int(p[1])) for p in initial_positions
+            ]
         self._initial_ball_holder_override: Optional[int] = initial_ball_holder
         self._fixed_shot_clock: Optional[int] = fixed_shot_clock
 
@@ -399,13 +441,6 @@ class HexagonBasketballEnv(gym.Env):
         self.last_action_results = {}
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         self._assist_candidate = None
-        # --- Illegal action handling configuration/state ---
-        try:
-            self.illegal_action_policy = IllegalActionPolicy(illegal_action_policy)
-        except Exception:
-            self.illegal_action_policy = IllegalActionPolicy.NOOP
-        # Optional per-step action probabilities provided by caller
-        self._pending_action_probs: Optional[np.ndarray] = None
         # Clear any pending external probabilities on reset
         self._pending_action_probs = None
 
@@ -470,6 +505,13 @@ class HexagonBasketballEnv(gym.Env):
 
         self.step_count += 1
 
+        # Compute Phi(s) at start of step (for logs and optional shaping)
+        phi_prev: Optional[float] = None
+        try:
+            phi_prev = float(self._phi_shot_quality())
+        except Exception:
+            phi_prev = 0.0
+
         # --- Defender Pressure Mechanic ---
         if self.ball_holder in self.offense_ids:
             ball_handler_pos = self.positions[self.ball_holder]
@@ -512,9 +554,40 @@ class HexagonBasketballEnv(gym.Env):
                             "shot_clock": self.shot_clock,
                         }
 
+                        # Phi diagnostics and optional shaping on early turnover path
+                        # Terminal step → define Phi(s')=0 to preserve policy invariance
+                        phi_next_term = 0.0
+
+                        # Always calculate phi shaping reward for display/logging purposes
+                        r_shape = float(self.reward_shaping_gamma) * float(
+                            phi_next_term
+                        ) - float(phi_prev if phi_prev is not None else 0.0)
+                        shaped = float(self.phi_beta) * float(r_shape)
+                        per_team = shaped / self.players_per_side
+
+                        # Only apply to actual rewards if enabled
+                        if self.enable_phi_shaping:
+                            rewards[self.offense_ids] += per_team
+                            rewards[self.defense_ids] -= per_team
+
+                        # Always report the calculated value (for UI/logging)
+                        info["phi_r_shape"] = float(per_team)
+                        info["phi_prev"] = float(
+                            phi_prev if phi_prev is not None else 0.0
+                        )
+                        info["phi_next"] = float(phi_next_term)
+                        info["phi_beta"] = float(self.phi_beta)
+                        # Per-player EP breakdown for UI
+                        try:
+                            team_best, ball_ep = self._phi_ep_breakdown()
+                            info["phi_team_best_ep"] = float(team_best)
+                            info["phi_ball_handler_ep"] = float(ball_ep)
+                        except Exception:
+                            pass
+
                         return obs, rewards, done, False, info
 
-                    break  # Only check the first defender applying pressure each step
+                    # break  # Only check the first defender applying pressure each step
 
         actions = np.array(actions)
         # Resolve illegal actions according to configured policy
@@ -627,6 +700,40 @@ class HexagonBasketballEnv(gym.Env):
             "shot_clock": self.shot_clock,
         }
 
+        # Phi diagnostics; always calculate for UI display, but only apply if enabled.
+        # If this is a terminal step, force Phi(s')=0 to preserve policy invariance.
+        phi_next = 0.0 if done else 0.0
+        if not done:
+            try:
+                phi_next = float(self._phi_shot_quality())
+            except Exception:
+                phi_next = 0.0
+
+        # Always calculate phi shaping reward for display/logging purposes
+        r_shape = float(self.reward_shaping_gamma) * float(phi_next) - float(
+            phi_prev if phi_prev is not None else 0.0
+        )
+        shaped = float(self.phi_beta) * float(r_shape)
+        per_team = shaped / self.players_per_side
+
+        # Only apply to actual rewards if enabled
+        if self.enable_phi_shaping:
+            rewards[self.offense_ids] += per_team
+            rewards[self.defense_ids] -= per_team
+
+        # Always report the calculated value (for UI/logging)
+        info["phi_r_shape"] = float(per_team)
+        info["phi_prev"] = float(phi_prev if phi_prev is not None else 0.0)
+        info["phi_next"] = float(phi_next)
+        info["phi_beta"] = float(self.phi_beta)
+        # Per-player EP breakdown for UI
+        try:
+            team_best, ball_ep = self._phi_ep_breakdown()
+            info["phi_team_best_ep"] = float(team_best)
+            info["phi_ball_handler_ep"] = float(ball_ep)
+        except Exception:
+            pass
+
         return obs, rewards, done, False, info
 
     def set_illegal_action_probs(self, probs: Optional[np.ndarray]) -> None:
@@ -692,7 +799,9 @@ class HexagonBasketballEnv(gym.Env):
         """
         Generate initial positions with distances defined RELATIVE to the basket:
         - Offense: any valid cell with distance >= spawn_distance (negative => 0)
+                   and distance <= max_spawn_distance (if set)
         - Defense: closer to basket than the matched offense and distance >= spawn_distance (negative => 0)
+                   and distance <= max_spawn_distance (if set)
           If no such cells, broaden progressively to avoid spawn failures.
         """
         taken_positions: set[Tuple[int, int]] = set()
@@ -704,8 +813,14 @@ class HexagonBasketballEnv(gym.Env):
                 all_cells.append(self._offset_to_axial(col, row))
 
         # Minimum distance from basket (negative means no minimum)
-        min_spawn_dist = max(0, self.spawn_distance)
-        # Offense candidates: any valid cell at least min_spawn_dist from basket
+        min_spawn_dist_offense = max(0, self.spawn_distance)
+        # Defenders can spawn 1 unit closer than offense minimum
+        min_spawn_dist_defense = max(0, self.spawn_distance - 1)
+        # Maximum distance from basket (None means no maximum)
+        max_spawn_dist = self.max_spawn_distance
+
+        # Offense candidates: any valid cell at least min_spawn_dist_offense from basket
+        # and at most max_spawn_dist (if set)
         offense_candidates = []
         for cell in all_cells:
             if cell == self.basket_position:
@@ -713,8 +828,10 @@ class HexagonBasketballEnv(gym.Env):
             if not self._is_valid_position(*cell):
                 continue
             dist = self._hex_distance(cell, self.basket_position)
-            if dist >= min_spawn_dist:
-                offense_candidates.append(cell)
+            if dist >= min_spawn_dist_offense:
+                # Apply max distance constraint if set
+                if max_spawn_dist is None or dist <= max_spawn_dist:
+                    offense_candidates.append(cell)
 
         if len(offense_candidates) < self.players_per_side:
             # Fallback to any valid non-basket cell
@@ -737,7 +854,9 @@ class HexagonBasketballEnv(gym.Env):
 
         # Defense candidates: closer to basket than the offense counterpart, with a
         # minimum distance from the basket defined RELATIVE to the basket.
+        # Defenders can spawn 1 unit closer than the offense minimum.
         # A negative spawn_distance means no minimum (allow anywhere on court).
+        # Also enforce max_spawn_distance if set.
         defense_positions: List[Tuple[int, int]] = []
         for off_pos in offense_positions:
             off_dist = self._hex_distance(off_pos, self.basket_position)
@@ -748,18 +867,29 @@ class HexagonBasketballEnv(gym.Env):
                 and cell not in taken_positions
                 and self._is_valid_position(*cell)
                 and self._hex_distance(cell, self.basket_position) < off_dist
-                and self._hex_distance(cell, self.basket_position) >= min_spawn_dist
+                and self._hex_distance(cell, self.basket_position)
+                >= min_spawn_dist_defense
+                and (
+                    max_spawn_dist is None
+                    or self._hex_distance(cell, self.basket_position) <= max_spawn_dist
+                )
             ]
 
             if not candidates:
-                # Fallback: pick any valid empty cell meeting only the minimum spawn distance
+                # Fallback: pick any valid empty cell meeting min/max spawn distance constraints
                 candidates = [
                     cell
                     for cell in all_cells
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
-                    and self._hex_distance(cell, self.basket_position) >= min_spawn_dist
+                    and self._hex_distance(cell, self.basket_position)
+                    >= min_spawn_dist_defense
+                    and (
+                        max_spawn_dist is None
+                        or self._hex_distance(cell, self.basket_position)
+                        <= max_spawn_dist
+                    )
                 ]
 
             if not candidates:
@@ -983,8 +1113,12 @@ class HexagonBasketballEnv(gym.Env):
         # Compute angles in cartesian space
         dir_x, dir_y = self._axial_to_cartesian(dir_dq, dir_dr)
         dir_norm = math.hypot(dir_x, dir_y) or 1.0
-        # 60-degree arc total -> 30-degree half-angle
-        cos_threshold = math.cos(math.pi / 6)
+        # Arc total in degrees -> half-angle in radians
+        half_angle_rad = (
+            math.radians(max(1.0, min(360.0, getattr(self, "pass_arc_degrees", 60.0))))
+            / 2.0
+        )
+        cos_threshold = math.cos(half_angle_rad)
 
         def in_arc(to_q: int, to_r: int) -> bool:
             vx, vy = self._axial_to_cartesian(
@@ -1014,25 +1148,38 @@ class HexagonBasketballEnv(gym.Env):
                 recv_dist = d
 
         if recv_id is None:
-            # No teammate in arc: pass sails out of bounds in that direction
-            step = 1
-            while True:
-                target = (passer_pos[0] + dir_dq * step, passer_pos[1] + dir_dr * step)
-                if not self._is_valid_position(*target):
-                    self.ball_holder = None
-                    results["turnovers"].append(
-                        {
-                            "player_id": passer_id,
-                            "reason": "pass_out_of_bounds",
-                            "turnover_pos": target,
-                        }
+            # No teammate in arc: roll for OOB turnover; on non-turnover, treat as NOOP
+            if self._rng.random() < float(getattr(self, "pass_oob_turnover_prob", 1.0)):
+                # Determine first out-of-bounds cell along direction for logging
+                step = 1
+                target = passer_pos
+                while True:
+                    target = (
+                        passer_pos[0] + dir_dq * step,
+                        passer_pos[1] + dir_dr * step,
                     )
-                    results["passes"][passer_id] = {
-                        "success": False,
-                        "reason": "out_of_bounds",
+                    if not self._is_valid_position(*target):
+                        break
+                    step += 1
+                self.ball_holder = None
+                results["turnovers"].append(
+                    {
+                        "player_id": passer_id,
+                        "reason": "pass_out_of_bounds",
+                        "turnover_pos": target,
                     }
-                    return
-                step += 1
+                )
+                results["passes"][passer_id] = {
+                    "success": False,
+                    "reason": "out_of_bounds",
+                }
+            else:
+                # No turnover -> fallback to NOOP (ball handler keeps the ball)
+                results["passes"][passer_id] = {
+                    "success": False,
+                    "reason": "no_receiver_noop",
+                }
+            return
 
         # Possible interception by defender in same arc who is closer than receiver
         opp_ids = (
@@ -1285,7 +1432,7 @@ class HexagonBasketballEnv(gym.Env):
         for player_id, shot_result in action_results.get("shots", {}).items():
             done = True  # Episode ends after any shot attempt
 
-            # Compute distance to basket for both made/missed cases
+            # Compute distance to basket and value of the attempted shot
             shooter_pos = self.positions[player_id]
             dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
 
@@ -1374,6 +1521,99 @@ class HexagonBasketballEnv(gym.Env):
             self._assist_candidate = None
 
         return done, rewards
+
+    # -------------------- Potential Function Phi(s) --------------------
+    def _phi_shot_quality(self) -> float:
+        """Potential function Phi(s): team's current best expected points.
+
+        Computes expected points using pressure-adjusted make probability times
+        shot value (3 for beyond the arc, otherwise 2; dunk treated as 2).
+        If `phi_use_ball_handler_only` is True, returns only the current ball
+        handler's expected points; otherwise returns the best expected points
+        among players on the team currently in possession.
+        """
+        # If no ball holder (e.g., post-shot terminal before reset), fall back to 0
+        if self.ball_holder is None:
+            return 0.0
+        # Determine which team's opportunities to evaluate: the team in possession
+        team_ids = (
+            self.offense_ids
+            if (self.ball_holder in self.offense_ids)
+            else self.defense_ids
+        )
+
+        # If using only the ball handler
+        def expected_points_for(player_id: int) -> float:
+            player_pos = self.positions[player_id]
+            dist = self._hex_distance(player_pos, self.basket_position)
+            # Shot value: 3 if at/behind arc and not a dunk; else 2
+            if self.allow_dunks and dist == 0:
+                shot_value = 2.0
+            else:
+                shot_value = 3.0 if dist >= self.three_point_distance else 2.0
+            p_make = float(self._calculate_shot_probability(player_id, dist))
+            return float(shot_value * p_make)
+
+        if self.phi_use_ball_handler_only:
+            return expected_points_for(int(self.ball_holder))
+
+        # Compute team-best and ball-handler EP, then blend with phi_blend_weight
+        ball_ep = expected_points_for(int(self.ball_holder))
+        team_best_ep = ball_ep
+        for pid in team_ids:
+            ep = expected_points_for(int(pid))
+            if ep > team_best_ep:
+                team_best_ep = ep
+        w = float(max(0.0, min(1.0, getattr(self, "phi_blend_weight", 0.0))))
+        blended = (1.0 - w) * float(team_best_ep) + w * float(ball_ep)
+        return float(blended)
+
+    def _phi_ep_breakdown(self) -> Tuple[float, float]:
+        """Return (team_best_ep, ball_handler_ep) for current possession team."""
+        if self.ball_holder is None:
+            return 0.0, 0.0
+        team_ids = (
+            self.offense_ids
+            if (self.ball_holder in self.offense_ids)
+            else self.defense_ids
+        )
+        team_best = 0.0
+        ball_ep = 0.0
+        for pid in team_ids:
+            pos = self.positions[pid]
+            dist = self._hex_distance(pos, self.basket_position)
+            shot_value = (
+                2.0
+                if (self.allow_dunks and dist == 0)
+                else (3.0 if dist >= self.three_point_distance else 2.0)
+            )
+            p = float(self._calculate_shot_probability(pid, dist))
+            ep = float(shot_value * p)
+            if pid == self.ball_holder:
+                ball_ep = ep
+            if ep > team_best:
+                team_best = ep
+        return float(team_best), float(ball_ep)
+
+    # Allow VecEnv.env_method to update phi_beta dynamically
+    def set_phi_beta(self, value: float) -> None:
+        try:
+            self.phi_beta = float(value)
+        except Exception:
+            pass
+
+    # --- Schedulable setters for passing curriculum ---
+    def set_pass_arc_degrees(self, value: float) -> None:
+        try:
+            self.pass_arc_degrees = float(max(1.0, min(360.0, value)))
+        except Exception:
+            pass
+
+    def set_pass_oob_turnover_prob(self, value: float) -> None:
+        try:
+            self.pass_oob_turnover_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
 
     def _get_observation(self) -> np.ndarray:
         """Get current observation of the game state.

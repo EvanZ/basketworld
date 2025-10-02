@@ -240,6 +240,32 @@ class MLflowCallback(BaseCallback):
                     f"{self.team_name} TurnoverPct", turnover_pct, step=global_step
                 )
                 mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
+                # Log current pass logit bias if custom policy exposes it
+                try:
+                    pass_bias = float(
+                        getattr(self.model.policy, "pass_logit_bias", 0.0)
+                    )
+                    mlflow.log_metric(
+                        f"{self.team_name} Pass Logit Bias", pass_bias, step=global_step
+                    )
+                except Exception:
+                    pass
+                # --- Phi diagnostics: averages per episode in buffer (if present) ---
+                try:
+                    phi_beta_avg = mean_key("phi_beta")
+                    phi_prev_avg = mean_key("phi_prev")
+                    phi_next_avg = mean_key("phi_next")
+                    mlflow.log_metric(
+                        f"{self.team_name} Phi Beta", phi_beta_avg, step=global_step
+                    )
+                    mlflow.log_metric(
+                        f"{self.team_name} Phi Prev", phi_prev_avg, step=global_step
+                    )
+                    mlflow.log_metric(
+                        f"{self.team_name} Phi Next", phi_next_avg, step=global_step
+                    )
+                except Exception:
+                    pass
                 # (Reverted) no ground-truth auditing metrics
         return True
 
@@ -317,7 +343,226 @@ class EntropyExpScheduleCallback(BaseCallback):
         self._apply_current()
 
     def _on_step(self) -> bool:
+        # Throttled: avoid per-step cross-process RPC
+        return True
+
+
+# --- Potential-Based Reward Shaping (Phi) Schedules ---
+
+
+class PotentialBetaExpScheduleCallback(BaseCallback):
+    """Exponential decay for phi_beta across the planned training timesteps.
+
+    This callback updates each VecEnv worker's underlying env attribute `phi_beta`
+    so that potential-based shaping can be annealed toward zero during training.
+    Optionally supports a short multiplicative bump at the start of each
+    alternation segment (mirroring the entropy scheduler API).
+    """
+
+    def __init__(
+        self,
+        start: float,
+        end: float,
+        total_planned_timesteps: int,
+        bump_updates: int = 0,
+        bump_multiplier: float = 1.0,
+    ):
+        super().__init__()
+        self.start = float(max(0.0, start))
+        self.end = float(max(0.0, end))
+        self.total = int(max(1, total_planned_timesteps))
+        self.bump_updates = int(max(0, bump_updates))
+        self.bump_multiplier = float(max(1.0, bump_multiplier))
+        self._bump_updates_remaining = 0
+
+    def start_new_alternation(self):
+        self._bump_updates_remaining = self.bump_updates
+
+    def _scheduled_value(self, t: int) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        ratio = (
+            (self.start / max(1e-12, self.end))
+            if self.end > 0
+            else (self.start / 1e-12)
+        )
+        current = self.end * (ratio ** (1.0 - progress))
+        return float(max(0.0, current))
+
+    def _apply_current(self):
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0))
+            current = self._scheduled_value(t)
+            if self._bump_updates_remaining > 0:
+                current = float(current * self.bump_multiplier)
+            # Update all env workers' phi_beta (prefer env_method to hit unwrapped env)
+            vecenv = self.model.get_env()
+            try:
+                if vecenv is not None and hasattr(vecenv, "env_method"):
+                    vecenv.env_method("set_phi_beta", float(current))
+                elif vecenv is not None and hasattr(vecenv, "set_attr"):
+                    vecenv.set_attr("phi_beta", float(current))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
         self._apply_current()
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_end(self) -> None:
+        if self._bump_updates_remaining > 0:
+            self._bump_updates_remaining -= 1
+        self._apply_current()
+
+    def _on_step(self) -> bool:
+        self._apply_current()
+        return True
+
+
+class PassLogitBiasExpScheduleCallback(BaseCallback):
+    """Exponential decay schedule for additive pass-logit bias.
+
+    Updates the current policy via env/policy hooks so pass actions keep
+    non-trivial probability mass early in training.
+    """
+
+    def __init__(
+        self,
+        start: float,
+        end: float,
+        total_planned_timesteps: int,
+    ):
+        super().__init__()
+        self.start = float(start)
+        self.end = float(end)
+        self.total = int(max(1, total_planned_timesteps))
+
+    def _scheduled_value(self, t: int) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        # Handle end==0 by decaying toward a tiny epsilon instead of hard 0,
+        # so we can observe the decay and avoid collapsing to zero immediately.
+        if self.end <= 0.0:
+            eps = 1e-6
+            current = (
+                float(self.start) * (eps / max(1e-12, float(self.start))) ** progress
+            )
+        else:
+            ratio = float(self.start) / float(self.end)
+            current = float(self.end) * (ratio ** (1.0 - progress))
+        return float(current)
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        if self.end <= 0.0:
+            eps = 1e-6
+            current = (
+                float(self.start) * (eps / max(1e-12, float(self.start))) ** progress
+            )
+        else:
+            ratio = float(self.start) / float(self.end)
+            current = float(self.end) * (ratio ** (1.0 - progress))
+        return float(current)
+
+    def _apply_current(self):
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0))
+            current = self._scheduled_value(t)
+            # Update policy hook if available
+            try:
+                # Policy may expose set_pass_logit_bias
+                if hasattr(self.model.policy, "set_pass_logit_bias"):
+                    self.model.policy.set_pass_logit_bias(float(current))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_end(self) -> None:
+        self._apply_current()
+
+    def _on_step(self) -> bool:
+        # Throttled: avoid per-step update
+        return True
+
+
+class PassCurriculumExpScheduleCallback(BaseCallback):
+    """Schedule passing arc (deg) and OOB turnover probability.
+
+    - arc(t): exponential from arc_start -> arc_end over total timesteps
+    - oob_prob(t): exponential from p_start -> p_end over total timesteps
+    Applies via VecEnv.env_method to avoid wrapper forwarding warnings.
+    Logs both to MLflow.
+    """
+
+    def __init__(
+        self,
+        arc_start: float,
+        arc_end: float,
+        oob_start: float,
+        oob_end: float,
+        total_planned_timesteps: int,
+        arc_power: float = 2.0,
+        oob_power: float = 2.0,
+    ):
+        super().__init__()
+        self.arc_start = float(arc_start)
+        self.arc_end = float(arc_end)
+        self.oob_start = float(oob_start)
+        self.oob_end = float(oob_end)
+        self.total = int(max(1, total_planned_timesteps))
+        self.arc_power = float(arc_power)
+        self.oob_power = float(oob_power)
+
+    def _exp_sched(self, start: float, end: float, t: int, power: float) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        # epsilon handling for exact zero targets
+        if end == 0.0:
+            eps = 1e-6
+            return float(start) * (eps / max(1e-12, float(start))) ** progress
+        ratio = float(start) / float(end)
+        # Apply power to (1-progress) to make decay steeper initially
+        # power > 1 gives steeper initial decay, power = 1 is linear progress
+        return float(end) * (ratio ** ((1.0 - progress) ** power))
+
+    def _apply_current(self):
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0))
+            arc = self._exp_sched(self.arc_start, self.arc_end, t, self.arc_power)
+            oob = self._exp_sched(self.oob_start, self.oob_end, t, self.oob_power)
+            vecenv = self.model.get_env()
+            try:
+                if vecenv is not None and hasattr(vecenv, "env_method"):
+                    vecenv.env_method("set_pass_arc_degrees", float(arc))
+                    vecenv.env_method("set_pass_oob_turnover_prob", float(oob))
+            except Exception:
+                pass
+            # Log to MLflow
+            try:
+                mlflow.log_metric("Passing Arc Degrees", float(arc), step=t)
+                mlflow.log_metric("Pass OOB Turnover Prob", float(oob), step=t)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current()
+
+    def _on_rollout_end(self) -> None:
+        self._apply_current()
+
+    def _on_step(self) -> bool:
+        # Throttled: avoid per-step update/logging
         return True
 
 
@@ -333,7 +578,7 @@ class EpisodeSampleLogger(BaseCallback):
         self.alternation_id = int(alternation_id)
         self.sample_prob = float(sample_prob)
         self.update_index = 0
-        self._records = []
+        self._records: list[dict] = []
 
     def _on_rollout_start(self) -> None:
         self._records = []
@@ -390,6 +635,10 @@ class EpisodeSampleLogger(BaseCallback):
                             "gt_distance": float(info.get("gt_distance", 0.0)),
                             "basket_q": float(info.get("basket_q", 0.0)),
                             "basket_r": float(info.get("basket_r", 0.0)),
+                            # phi diagnostics if present
+                            "phi_beta": float(info.get("phi_beta", -1.0)),
+                            "phi_prev": float(info.get("phi_prev", -1.0)),
+                            "phi_next": float(info.get("phi_next", -1.0)),
                         }
                         self._records.append(row)
         except Exception:
@@ -424,6 +673,10 @@ class EpisodeSampleLogger(BaseCallback):
                     "gt_distance",
                     "basket_q",
                     "basket_r",
+                    # phi
+                    "phi_beta",
+                    "phi_prev",
+                    "phi_next",
                 ]
                 with open(csv_path, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)

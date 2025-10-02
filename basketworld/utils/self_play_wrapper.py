@@ -120,3 +120,28 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         # (Reverted) do not mutate info here
         self._last_obs = obs
         return obs, reward, done, truncated, info
+
+    # Provide a top-level hook so VecEnv.env_method('set_phi_beta', ...) does not
+    # trigger Gymnasium's deprecated attribute forwarding warnings. This forwards
+    # directly to the unwrapped environment implementation.
+    def set_phi_beta(self, value: float) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_phi_beta(float(value))
+        except Exception:
+            pass
+
+    def set_pass_arc_degrees(
+        self, value: float
+    ) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_pass_arc_degrees(float(value))
+        except Exception:
+            pass
+
+    def set_pass_oob_turnover_prob(
+        self, value: float
+    ) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_pass_oob_turnover_prob(float(value))
+        except Exception:
+            pass

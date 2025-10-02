@@ -15,6 +15,10 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  isManualStepping: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId']);
@@ -184,6 +188,15 @@ async function fetchBallHandlerMakeProb() {
     ballHandlerMakeProb.value = null;
     return;
   }
+  
+  // During manual stepping (replay), use the stored shot probability from the state
+  if (props.isManualStepping && typeof gs.ball_handler_shot_probability === 'number') {
+    ballHandlerMakeProb.value = gs.ball_handler_shot_probability;
+    console.log('[GameBoard] Using stored shot probability from replay state:', gs.ball_handler_shot_probability);
+    return;
+  }
+  
+  // Otherwise, fetch from API (live gameplay)
   try {
     const resp = await getShotProbability(gs.ball_holder);
     const p = resp?.shot_probability_final ?? resp?.shot_probability ?? null;
@@ -203,6 +216,7 @@ watch(
     ball_holder: currentGameState.value?.ball_holder,
     positions: currentGameState.value?.positions,
     shot_clock: currentGameState.value?.shot_clock,
+    isManualStepping: props.isManualStepping,
   }),
   () => {
     fetchBallHandlerMakeProb();

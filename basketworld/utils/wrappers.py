@@ -162,3 +162,33 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["shooter_fg_pct"] = self._shooter_fg_pct
             # (Reverted) keep only the original episode summary fields
         return obs, reward, done, truncated, info
+
+
+class BetaSetterWrapper(gym.Wrapper):
+    """Shim wrapper to expose set_phi_beta at the top level to avoid Gym warnings.
+
+    Gymnasium warns when attribute forwarding traverses wrappers. By defining
+    set_phi_beta here, VecEnv.env_method("set_phi_beta", value) will call this
+    method directly on the top-most wrapper without deprecated forwarding.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+
+    def set_phi_beta(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_phi_beta(float(value))
+        except Exception:
+            pass
+
+    def set_pass_arc_degrees(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_pass_arc_degrees(float(value))
+        except Exception:
+            pass
+
+    def set_pass_oob_turnover_prob(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_pass_oob_turnover_prob(float(value))
+        except Exception:
+            pass

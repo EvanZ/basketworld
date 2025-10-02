@@ -137,3 +137,29 @@ export async function listPolicies(runId) {
     }
     return response.json();
 } 
+
+// --- Phi Shaping API ---
+export async function getPhiParams() {
+  const response = await fetch(`${API_BASE_URL}/api/phi_params`);
+  if (!response.ok) throw new Error('Failed to get phi params');
+  return response.json();
+}
+
+export async function setPhiParams(payload) {
+  const response = await fetch(`${API_BASE_URL}/api/phi_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set phi params');
+  }
+  return response.json();
+}
+
+export async function getPhiLog() {
+  const response = await fetch(`${API_BASE_URL}/api/phi_log`);
+  if (!response.ok) throw new Error('Failed to get phi log');
+  return response.json();
+}
