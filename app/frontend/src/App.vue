@@ -5,7 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -70,6 +70,17 @@ watch(gameState, async (newState, oldState) => {
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
   
+  // Preserve phi shaping parameters from current game (if any)
+  let savedPhiParams = null;
+  if (gameState.value) {
+    try {
+      savedPhiParams = await getPhiParams();
+      console.log('[App] Saved phi shaping params for new game:', savedPhiParams);
+    } catch (err) {
+      console.warn('[App] Could not save phi params:', err);
+    }
+  }
+  
   // Clear move history for new game
   moveHistory.value = [];
   // Clear any self-play selections state
@@ -102,6 +113,16 @@ async function handleGameStarted(setupData) {
       setupData.unifiedPolicyName ?? null,
       setupData.opponentUnifiedPolicyName ?? null,
     );
+    
+    // Restore phi shaping parameters if we had them
+    if (savedPhiParams && response.status === 'success') {
+      try {
+        await setPhiParams(savedPhiParams);
+        console.log('[App] Restored phi shaping params:', savedPhiParams);
+      } catch (err) {
+        console.warn('[App] Could not restore phi params:', err);
+      }
+    }
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
