@@ -344,6 +344,9 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             self.phi_blend_weight = 0.0
 
+        # Cache for phi value to avoid redundant calculations (telescoping)
+        self._cached_phi: Optional[float] = None
+
         # Optional deterministic start overrides
         self._initial_positions_override: Optional[List[Tuple[int, int]]] = None
         if initial_positions is not None:
@@ -448,6 +451,8 @@ class HexagonBasketballEnv(gym.Env):
         self._pending_action_probs = None
         # Track first step after reset for phi shaping (Φ(s₀) = 0)
         self._first_step_after_reset = True
+        # Initialize cached phi value (Φ(s₀) = 0 for PBRS)
+        self._cached_phi = 0.0
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
@@ -511,16 +516,14 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count += 1
 
         # Compute Phi(s) at start of step (for logs and optional shaping)
-        # For proper PBRS, Φ(s₀) = 0 to ensure shaping sums to zero over episode
+        # Use cached value from previous step to avoid redundant calculation (telescoping)
         phi_prev: Optional[float] = None
+        if self.enable_phi_shaping:
+            phi_prev = self._cached_phi  # Use cached value from end of previous step
+
+        # Clear the flag regardless of whether phi shaping is enabled
         if self._first_step_after_reset:
-            phi_prev = 0.0
             self._first_step_after_reset = False
-        else:
-            try:
-                phi_prev = float(self._phi_shot_quality())
-            except Exception:
-                phi_prev = 0.0
 
         # --- Defender Pressure Mechanic ---
         if self.ball_holder in self.offense_ids:
@@ -565,52 +568,57 @@ class HexagonBasketballEnv(gym.Env):
                         }
 
                         # Phi diagnostics and optional shaping on early turnover path
-                        # Terminal step → define Phi(s')=0 to preserve policy invariance
-                        phi_next_term = 0.0
-
-                        # Always calculate phi shaping reward for display/logging purposes
-                        r_shape = float(self.reward_shaping_gamma) * float(
-                            phi_next_term
-                        ) - float(phi_prev if phi_prev is not None else 0.0)
-                        shaped = float(self.phi_beta) * float(r_shape)
-                        per_team = shaped / self.players_per_side
-
-                        # Only apply to actual rewards if enabled
                         if self.enable_phi_shaping:
+                            # Terminal step → define Phi(s')=0 to preserve policy invariance
+                            phi_next_term = 0.0
+
+                            # Calculate phi shaping reward
+                            r_shape = float(self.reward_shaping_gamma) * float(
+                                phi_next_term
+                            ) - float(phi_prev if phi_prev is not None else 0.0)
+                            shaped = float(self.phi_beta) * float(r_shape)
+                            per_team = shaped / self.players_per_side
+
+                            # Apply to actual rewards
                             rewards[self.offense_ids] += per_team
                             rewards[self.defense_ids] -= per_team
 
-                        # Always report the calculated value (for UI/logging)
-                        info["phi_r_shape"] = float(per_team)
-                        info["phi_prev"] = float(
-                            phi_prev if phi_prev is not None else 0.0
-                        )
-                        info["phi_next"] = float(phi_next_term)
-                        info["phi_beta"] = float(self.phi_beta)
-                        # Per-player EP breakdown for UI
-                        try:
-                            team_best, ball_ep = self._phi_ep_breakdown()
-                            info["phi_team_best_ep"] = float(team_best)
-                            info["phi_ball_handler_ep"] = float(ball_ep)
-                            # Add per-player EPs for accurate UI recalculation
-                            ep_by_player = []
-                            for pid in range(self.n_players):
-                                pos = self.positions[pid]
-                                dist = self._hex_distance(pos, self.basket_position)
-                                shot_value = (
-                                    2.0
-                                    if (self.allow_dunks and dist == 0)
-                                    else (
-                                        3.0
-                                        if dist >= self.three_point_distance
-                                        else 2.0
+                            # Cache phi_next for next step (terminal, so it's 0.0)
+                            self._cached_phi = phi_next_term
+
+                            # Report the calculated value (for UI/logging)
+                            info["phi_r_shape"] = float(per_team)
+                            info["phi_prev"] = float(
+                                phi_prev if phi_prev is not None else 0.0
+                            )
+                            info["phi_next"] = float(phi_next_term)
+                            info["phi_beta"] = float(self.phi_beta)
+                            # Per-player EP breakdown for UI
+                            try:
+                                team_best, ball_ep = self._phi_ep_breakdown()
+                                info["phi_team_best_ep"] = float(team_best)
+                                info["phi_ball_handler_ep"] = float(ball_ep)
+                                # Add per-player EPs for accurate UI recalculation
+                                ep_by_player = []
+                                for pid in range(self.n_players):
+                                    pos = self.positions[pid]
+                                    dist = self._hex_distance(pos, self.basket_position)
+                                    shot_value = (
+                                        2.0
+                                        if (self.allow_dunks and dist == 0)
+                                        else (
+                                            3.0
+                                            if dist >= self.three_point_distance
+                                            else 2.0
+                                        )
                                     )
-                                )
-                                p = float(self._calculate_shot_probability(pid, dist))
-                                ep_by_player.append(float(shot_value * p))
-                            info["phi_ep_by_player"] = ep_by_player
-                        except Exception:
-                            pass
+                                    p = float(
+                                        self._calculate_shot_probability(pid, dist)
+                                    )
+                                    ep_by_player.append(float(shot_value * p))
+                                info["phi_ep_by_player"] = ep_by_player
+                            except Exception:
+                                pass
 
                         return obs, rewards, done, False, info
 
@@ -727,52 +735,55 @@ class HexagonBasketballEnv(gym.Env):
             "shot_clock": self.shot_clock,
         }
 
-        # Phi diagnostics; always calculate for UI display, but only apply if enabled.
-        # If this is a terminal step, force Phi(s')=0 to preserve policy invariance.
-        phi_next = 0.0 if done else 0.0
-        if not done:
-            try:
-                phi_next = float(self._phi_shot_quality())
-            except Exception:
-                phi_next = 0.0
-
-        # Always calculate phi shaping reward for display/logging purposes
-        r_shape = float(self.reward_shaping_gamma) * float(phi_next) - float(
-            phi_prev if phi_prev is not None else 0.0
-        )
-        shaped = float(self.phi_beta) * float(r_shape)
-        per_team = shaped / self.players_per_side
-
-        # Only apply to actual rewards if enabled
+        # Phi diagnostics and shaping (only if enabled)
         if self.enable_phi_shaping:
+            # If this is a terminal step, force Phi(s')=0 to preserve policy invariance.
+            phi_next = 0.0 if done else 0.0
+            if not done:
+                try:
+                    phi_next = float(self._phi_shot_quality())
+                except Exception:
+                    phi_next = 0.0
+
+            # Calculate phi shaping reward
+            r_shape = float(self.reward_shaping_gamma) * float(phi_next) - float(
+                phi_prev if phi_prev is not None else 0.0
+            )
+            shaped = float(self.phi_beta) * float(r_shape)
+            per_team = shaped / self.players_per_side
+
+            # Apply to actual rewards
             rewards[self.offense_ids] += per_team
             rewards[self.defense_ids] -= per_team
 
-        # Always report the calculated value (for UI/logging)
-        info["phi_r_shape"] = float(per_team)
-        info["phi_prev"] = float(phi_prev if phi_prev is not None else 0.0)
-        info["phi_next"] = float(phi_next)
-        info["phi_beta"] = float(self.phi_beta)
-        # Per-player EP breakdown for UI
-        try:
-            team_best, ball_ep = self._phi_ep_breakdown()
-            info["phi_team_best_ep"] = float(team_best)
-            info["phi_ball_handler_ep"] = float(ball_ep)
-            # Add per-player EPs for accurate UI recalculation
-            ep_by_player = []
-            for pid in range(self.n_players):
-                pos = self.positions[pid]
-                dist = self._hex_distance(pos, self.basket_position)
-                shot_value = (
-                    2.0
-                    if (self.allow_dunks and dist == 0)
-                    else (3.0 if dist >= self.three_point_distance else 2.0)
-                )
-                p = float(self._calculate_shot_probability(pid, dist))
-                ep_by_player.append(float(shot_value * p))
-            info["phi_ep_by_player"] = ep_by_player
-        except Exception:
-            pass
+            # Cache phi_next for next step (to avoid redundant calculation)
+            self._cached_phi = phi_next
+
+            # Report the calculated value (for UI/logging)
+            info["phi_r_shape"] = float(per_team)
+            info["phi_prev"] = float(phi_prev if phi_prev is not None else 0.0)
+            info["phi_next"] = float(phi_next)
+            info["phi_beta"] = float(self.phi_beta)
+            # Per-player EP breakdown for UI
+            try:
+                team_best, ball_ep = self._phi_ep_breakdown()
+                info["phi_team_best_ep"] = float(team_best)
+                info["phi_ball_handler_ep"] = float(ball_ep)
+                # Add per-player EPs for accurate UI recalculation
+                ep_by_player = []
+                for pid in range(self.n_players):
+                    pos = self.positions[pid]
+                    dist = self._hex_distance(pos, self.basket_position)
+                    shot_value = (
+                        2.0
+                        if (self.allow_dunks and dist == 0)
+                        else (3.0 if dist >= self.three_point_distance else 2.0)
+                    )
+                    p = float(self._calculate_shot_probability(pid, dist))
+                    ep_by_player.append(float(shot_value * p))
+                info["phi_ep_by_player"] = ep_by_player
+            except Exception:
+                pass
 
         return obs, rewards, done, False, info
 

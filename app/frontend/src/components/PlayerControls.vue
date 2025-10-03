@@ -23,6 +23,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  isEvaluating: {
+    type: Boolean,
+    default: false,
+  },
   aiMode: {
     type: Boolean,
     default: false,
@@ -77,6 +81,7 @@ const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.m
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 
 async function recordEpisodeStats(finalState) {
+  console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
   const shots = results?.shots || {};
@@ -125,6 +130,7 @@ async function recordEpisodeStats(finalState) {
 
   // Increment episode count last
   statsState.value.episodes += 1;
+  console.log('[Stats] recordEpisodeStats completed - new episodes:', statsState.value.episodes);
   saveStats(statsState.value);
 }
 
@@ -182,7 +188,7 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown, submitActions });
+defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -644,9 +650,11 @@ onMounted(() => {
   fetchRewards();
 });
 
-// Record stats once on episode completion
+// Record stats once on episode completion (but skip during evaluation mode)
 watch(() => props.gameState?.done, async (done, prevDone) => {
-  if (done && !prevDone && props.gameState && !props.isReplaying) {
+  console.log('[Stats] Watch triggered - done:', done, 'prevDone:', prevDone, 'isReplaying:', props.isReplaying, 'isEvaluating:', props.isEvaluating);
+  if (done && !prevDone && props.gameState && !props.isReplaying && !props.isEvaluating) {
+    console.log('[Stats] Watch conditions met - recording stats from watch');
     try { await recordEpisodeStats(props.gameState); } catch (e) { console.warn('[Stats] record failed', e); }
   }
 });

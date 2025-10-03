@@ -807,6 +807,132 @@ def start_self_play():
     return {"status": "success", "state": get_full_game_state(), "seed": episode_seed}
 
 
+class EvaluationRequest(BaseModel):
+    num_episodes: int = 100
+    deterministic: bool = True
+
+
+@app.post("/api/run_evaluation")
+def run_evaluation(request: EvaluationRequest):
+    """Run N episodes of self-play for evaluation purposes.
+
+    Returns final state of each episode for stats tracking.
+    Runs in deterministic mode using the unified policy.
+    """
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    if not game_state.unified_policy:
+        raise HTTPException(
+            status_code=400, detail="Unified policy required for evaluation."
+        )
+
+    num_episodes = max(1, min(request.num_episodes, 1000))  # Cap at 1000 for safety
+    deterministic = request.deterministic
+
+    episode_results = []
+
+    for ep_idx in range(num_episodes):
+        # Reset environment for new episode
+        episode_seed = int(np.random.SeedSequence().entropy % (2**32 - 1))
+        obs, _ = game_state.env.reset(seed=episode_seed)
+        game_state.obs = obs
+
+        done = False
+        step_count = 0
+
+        # Run episode until done
+        while not done and step_count < 1000:  # Safety limit
+            # Get AI actions for both teams
+            full_action_ai, _ = game_state.unified_policy.predict(
+                obs, deterministic=deterministic
+            )
+
+            opponent_obs = obs
+            if game_state.defense_policy is not None:
+                try:
+                    # Flip role flag for opponent
+                    opponent_obs = {
+                        "obs": np.copy(obs["obs"]),
+                        "action_mask": obs["action_mask"],
+                        "role_flag": np.copy(obs.get("role_flag")),
+                        "skills": np.copy(obs.get("skills")),
+                    }
+                    if opponent_obs.get("role_flag") is not None:
+                        opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
+                    full_action_ai_opponent, _ = game_state.defense_policy.predict(
+                        opponent_obs, deterministic=True
+                    )
+                except Exception:
+                    full_action_ai_opponent = None
+            else:
+                full_action_ai_opponent = None
+
+            # Resolve actions using the same logic as step endpoint
+            action_mask = obs["action_mask"]
+            unified_probs = get_policy_action_probabilities(
+                game_state.unified_policy, obs
+            )
+            opponent_probs = (
+                get_policy_action_probabilities(game_state.defense_policy, opponent_obs)
+                if full_action_ai_opponent is not None
+                else None
+            )
+
+            player_team_strategy = (
+                IllegalActionStrategy.BEST_PROB
+                if deterministic
+                else IllegalActionStrategy.SAMPLE_PROB
+            )
+
+            resolved_unified = resolve_illegal_actions(
+                np.array(full_action_ai),
+                action_mask,
+                player_team_strategy,
+                deterministic,
+                unified_probs,
+            )
+
+            if full_action_ai_opponent is not None:
+                resolved_opponent = resolve_illegal_actions(
+                    np.array(full_action_ai_opponent),
+                    action_mask,
+                    IllegalActionStrategy.BEST_PROB,
+                    True,
+                    opponent_probs,
+                )
+            else:
+                resolved_opponent = np.array(full_action_ai)
+
+            # Combine actions based on team roles
+            final_action = np.array(resolved_unified, dtype=np.int32)
+            for idx in game_state.env.defense_ids:
+                final_action[idx] = resolved_opponent[idx]
+
+            # Execute step
+            obs, reward, terminated, truncated, info = game_state.env.step(final_action)
+            done = terminated or truncated
+            step_count += 1
+
+        # Capture final state
+        game_state.obs = obs
+        final_state = get_full_game_state()
+
+        episode_results.append(
+            {
+                "episode": ep_idx + 1,
+                "final_state": final_state,
+                "steps": step_count,
+            }
+        )
+
+    return {
+        "status": "success",
+        "num_episodes": len(episode_results),
+        "results": episode_results,
+    }
+
+
 @app.post("/api/replay_last_episode")
 def replay_last_episode():
     """Return the recorded sequence of states for the last episode (manual or self-play).

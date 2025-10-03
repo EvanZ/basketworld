@@ -163,3 +163,16 @@ export async function getPhiLog() {
   if (!response.ok) throw new Error('Failed to get phi log');
   return response.json();
 }
+
+export async function runEvaluation(numEpisodes = 100, deterministic = true) {
+  const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ num_episodes: numEpisodes, deterministic }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to run evaluation');
+  }
+  return response.json();
+}

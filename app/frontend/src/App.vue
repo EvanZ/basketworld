@@ -1,11 +1,11 @@
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -35,6 +35,12 @@ const deterministic = ref(false);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
+
+// Evaluation mode state
+const isEvaluating = ref(false);
+const evalNumEpisodes = ref(100);
+const evalProgress = ref(0);
+const evalCurrentEpisode = ref(0);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
@@ -288,6 +294,83 @@ async function handleSelfPlay(preselected = null) {
   canReplay.value = true;
 }
 
+async function handleEvaluation() {
+  if (!gameState.value || isEvaluating.value) return;
+  
+  const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000));
+  
+  // Reset stats at the beginning
+  console.log('[App] Resetting stats before evaluation');
+  if (controlsRef.value?.resetStats) {
+    controlsRef.value.resetStats();
+  }
+  
+  isEvaluating.value = true;
+  evalProgress.value = 0;
+  evalCurrentEpisode.value = 0;
+  error.value = null;
+  
+  try {
+    console.log(`[App] Starting evaluation: ${numEpisodes} episodes, deterministic=${deterministic.value}`);
+    
+    // Run evaluation on backend
+    const response = await runEvaluation(numEpisodes, deterministic.value);
+    
+    if (response.status === 'success' && Array.isArray(response.results)) {
+      console.log(`[App] Evaluation completed: ${response.results.length} episodes`);
+      
+      // Store the last episode state to show after recording all stats
+      let lastEpisodeState = null;
+      
+      // Process each episode result and update stats
+      for (let i = 0; i < response.results.length; i++) {
+        const result = response.results[i];
+        evalCurrentEpisode.value = result.episode;
+        evalProgress.value = (result.episode / numEpisodes) * 100;
+        
+        // Save the last episode state for later
+        if (i === response.results.length - 1) {
+          lastEpisodeState = result.final_state;
+        }
+        
+        // Record stats for this episode
+        if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
+          console.log(`[App] Recording stats for evaluation episode ${result.episode}`);
+          await controlsRef.value.recordEpisodeStats(result.final_state);
+        }
+        
+        // Small delay to allow UI updates every 10 episodes
+        if (i % 10 === 0 || i === response.results.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }
+      
+      console.log('[App] Stats updated for all episodes');
+      
+      // Now update the game state AFTER recording all stats
+      if (lastEpisodeState) {
+        console.log('[App] Updating gameState to show last episode (isEvaluating still true)');
+        gameState.value = lastEpisodeState;
+        gameHistory.value = [lastEpisodeState];
+        
+        // Wait for Vue to process all reactive updates (including watchers) before setting isEvaluating to false
+        await nextTick();
+        console.log('[App] nextTick completed, watchers should have run with isEvaluating=true');
+      }
+    } else {
+      throw new Error('Invalid evaluation response');
+    }
+  } catch (err) {
+    error.value = `Evaluation failed: ${err.message}`;
+    console.error('[App] Evaluation error:', err);
+  } finally {
+    console.log('[App] Setting isEvaluating to false');
+    isEvaluating.value = false;
+    evalProgress.value = 0;
+    evalCurrentEpisode.value = 0;
+  }
+}
+
 async function handleSaveEpisode() {
   try {
     const res = await saveEpisode();
@@ -523,6 +606,28 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
+    <div v-if="gameState && !gameState.done && !isSelfPlaying" class="eval-controls">
+      <input 
+        type="number" 
+        v-model.number="evalNumEpisodes" 
+        min="1" 
+        max="1000" 
+        class="eval-input"
+        :disabled="isEvaluating"
+        placeholder="Num episodes"
+      />
+      <button 
+        @click="handleEvaluation" 
+        class="eval-button"
+        :disabled="isEvaluating || isSelfPlaying"
+      >
+        {{ isEvaluating ? 'Evaluating...' : 'Eval' }}
+      </button>
+      <span v-if="isEvaluating" class="eval-status">
+        Episode {{ evalCurrentEpisode }} / {{ evalNumEpisodes }}
+      </span>
+    </div>
+
     <div v-if="gameState" class="game-container">
       <div class="board-area">
         <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
@@ -531,6 +636,8 @@ onBeforeUnmount(() => {
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
+          :is-evaluating="isEvaluating"
+          :eval-progress="evalProgress"
         />
         <KeyboardLegend />
       </div>
@@ -542,6 +649,7 @@ onBeforeUnmount(() => {
             :disabled="false"
             :is-replaying="isReplaying"
             :is-manual-stepping="isManualStepping"
+            :is-evaluating="isEvaluating"
             :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
             :deterministic="deterministic"
@@ -619,6 +727,51 @@ header {
 }
 .toggle-label {
   font-weight: 500;
+}
+
+.eval-controls {
+  text-align: center;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.eval-input {
+  width: 100px;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 1rem;
+}
+
+.eval-button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #4CAF50;
+  color: white;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.eval-button:hover:not(:disabled) {
+  background: #45a049;
+}
+
+.eval-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: #999;
+}
+
+.eval-status {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #333;
 }
 .game-container {
   display: flex;

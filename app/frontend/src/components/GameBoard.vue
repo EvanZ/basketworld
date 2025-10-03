@@ -19,6 +19,14 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  isEvaluating: {
+    type: Boolean,
+    default: false,
+  },
+  evalProgress: {
+    type: Number,
+    default: 0,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId']);
@@ -527,6 +535,9 @@ const playerTransitions = computed(() => {
     <div class="shot-clock-overlay">
       {{ currentGameState ? currentGameState.shot_clock : '' }}
     </div>
+    <div v-if="isEvaluating" class="eval-progress-bar">
+      <div class="eval-progress-fill" :style="{ width: evalProgress + '%' }"></div>
+    </div>
   </div>
 </template>
 
@@ -563,6 +574,25 @@ const playerTransitions = computed(() => {
   border: 1px solid #333;
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d; /* Glowing effect */
   pointer-events: none; /* Make it non-interactive */
+}
+
+.eval-progress-bar {
+  position: absolute;
+  bottom: -65px; /* Position below shot clock */
+  left: 50%;
+  transform: translateX(-50%);
+  width: 200px;
+  height: 8px;
+  background-color: #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid #999;
+}
+
+.eval-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50 0%, #45a049 100%);
+  transition: width 0.3s ease;
 }
 
 /* Removed rotation; court now renders in original orientation */

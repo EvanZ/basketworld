@@ -28,6 +28,11 @@ from basketworld.utils.callbacks import (
     PassCurriculumExpScheduleCallback,
     EpisodeSampleLogger,
 )
+from basketworld.utils.schedule_state import (
+    save_schedule_metadata,
+    load_schedule_metadata,
+    calculate_continued_total_timesteps,
+)
 from basketworld.utils.policies import PassBiasMultiInputPolicy
 
 from basketworld.utils.evaluation_helpers import (
@@ -530,24 +535,110 @@ def main(args):
         opponent_cache_dir = os.path.join(".opponent_cache", run.info.run_id)
         os.makedirs(opponent_cache_dir, exist_ok=True)
 
+        # --- Load schedule metadata from previous run if continuing ---
+        # Handle backward compatibility with --restart-entropy-on-continue
+        if getattr(args, "restart_entropy_on_continue", False):
+            print(
+                "Warning: --restart-entropy-on-continue is deprecated. Using --continue-schedule-mode=restart"
+            )
+            schedule_mode = "restart"
+        else:
+            schedule_mode = getattr(args, "continue_schedule_mode", "extend")
+        previous_schedule_meta = None
+        if args.continue_run_id and schedule_mode != "restart":
+            try:
+                client = mlflow.tracking.MlflowClient()
+                previous_schedule_meta = load_schedule_metadata(
+                    client, args.continue_run_id
+                )
+                print(f"Loaded schedule metadata from run {args.continue_run_id}")
+                print(
+                    f"  Previous total timesteps: {previous_schedule_meta.get('total_planned_timesteps', 0)}"
+                )
+                print(
+                    f"  Previous current timesteps: {previous_schedule_meta.get('current_timesteps', 0)}"
+                )
+            except Exception as e:
+                print(f"Warning: Could not load schedule metadata: {e}")
+                print("Schedules will be initialized from scratch.")
+                previous_schedule_meta = None
+
         # Prepare optional entropy scheduler across the whole run
         entropy_callback = None
         beta_callback = None
-        if (args.ent_coef_start is not None) or (args.ent_coef_end is not None):
-            ent_start = (
-                args.ent_coef_start
-                if args.ent_coef_start is not None
-                else args.ent_coef
+
+        # Calculate total planned timesteps for this training session
+        new_training_timesteps = int(
+            2
+            * args.alternations
+            * args.steps_per_alternation
+            * args.num_envs
+            * args.n_steps
+        )
+
+        # Determine schedule parameters based on continuation mode
+        if (
+            args.continue_run_id
+            and schedule_mode == "extend"
+            and previous_schedule_meta
+        ):
+            # Extend mode: continue the schedule from where it left off
+            print(f"Schedule mode: EXTEND - continuing schedules from previous run")
+
+            # Use previous schedule parameters if they exist, otherwise fall back to args
+            ent_start = previous_schedule_meta.get(
+                "ent_coef_start", args.ent_coef_start
             )
+            ent_end = previous_schedule_meta.get(
+                "ent_coef_end",
+                args.ent_coef_end if args.ent_coef_end is not None else 0.0,
+            )
+            ent_schedule_type = previous_schedule_meta.get(
+                "ent_schedule", getattr(args, "ent_schedule", "linear")
+            )
+
+            # Calculate extended total timesteps
+            original_total = previous_schedule_meta.get("total_planned_timesteps", 0)
+            original_current = previous_schedule_meta.get("current_timesteps", 0)
+            total_planned_ts = calculate_continued_total_timesteps(
+                original_total,
+                original_current,
+                args.alternations,
+                args.steps_per_alternation,
+                args.num_envs,
+                args.n_steps,
+            )
+            print(f"  Extended total timesteps: {total_planned_ts}")
+        elif (
+            args.continue_run_id
+            and schedule_mode == "constant"
+            and previous_schedule_meta
+        ):
+            # Constant mode: use the final schedule values as constants
+            print(f"Schedule mode: CONSTANT - using final schedule values as constants")
+            # We'll set the callbacks to None and just use constant values
+            ent_start = None
+            ent_end = None
+            ent_schedule_type = "linear"
+            total_planned_ts = new_training_timesteps
+        else:
+            # Fresh start or restart mode
+            if args.continue_run_id and schedule_mode == "restart":
+                print(f"Schedule mode: RESTART - reinitializing schedules from scratch")
+            ent_start = args.ent_coef_start if args.ent_coef_start is not None else None
             ent_end = args.ent_coef_end if args.ent_coef_end is not None else 0.0
-            total_planned_ts = int(
-                2
-                * args.alternations
-                * args.steps_per_alternation
-                * args.num_envs
-                * args.n_steps
-            )
-            if getattr(args, "ent_schedule", "linear") == "exp":
+            ent_schedule_type = getattr(args, "ent_schedule", "linear")
+            total_planned_ts = new_training_timesteps
+
+        # Create entropy callback if we have a schedule
+        if ent_start is not None or (args.ent_coef_start is not None):
+            if ent_start is None:
+                ent_start = (
+                    args.ent_coef
+                    if args.ent_coef_start is None
+                    else args.ent_coef_start
+                )
+            if ent_schedule_type == "exp":
                 entropy_callback = EntropyExpScheduleCallback(
                     ent_start,
                     ent_end,
@@ -563,34 +654,50 @@ def main(args):
                 )
 
         # Prepare optional Phi beta scheduler across the whole run
+        # Determine phi beta schedule parameters based on continuation mode
         if (
-            getattr(args, "phi_beta_start", None) is not None
-            or getattr(args, "phi_beta_end", None) is not None
+            args.continue_run_id
+            and schedule_mode == "extend"
+            and previous_schedule_meta
         ):
-            beta_start = (
-                args.phi_beta_start
-                if getattr(args, "phi_beta_start", None) is not None
-                else 0.0
+            # Use previous phi beta schedule if it exists
+            phi_beta_start = previous_schedule_meta.get("phi_beta_start")
+            phi_beta_end = previous_schedule_meta.get("phi_beta_end")
+            phi_beta_schedule_type = previous_schedule_meta.get(
+                "phi_beta_schedule", "exp"
             )
-            beta_end = (
-                args.phi_beta_end
-                if getattr(args, "phi_beta_end", None) is not None
-                else 0.0
+            phi_beta_bump_updates = previous_schedule_meta.get("phi_bump_updates", 0)
+            phi_beta_bump_multiplier = previous_schedule_meta.get(
+                "phi_bump_multiplier", 1.0
             )
-            total_planned_ts = int(
-                2
-                * args.alternations
-                * args.steps_per_alternation
-                * args.num_envs
-                * args.n_steps
-            )
-            if getattr(args, "phi_beta_schedule", "exp") == "exp":
+            # Use extended total timesteps calculated above
+        elif args.continue_run_id and schedule_mode == "constant":
+            # In constant mode, disable phi beta schedule
+            phi_beta_start = None
+            phi_beta_end = None
+            phi_beta_schedule_type = "exp"
+            phi_beta_bump_updates = 0
+            phi_beta_bump_multiplier = 1.0
+        else:
+            # Fresh start or restart mode
+            phi_beta_start = getattr(args, "phi_beta_start", None)
+            phi_beta_end = getattr(args, "phi_beta_end", None)
+            phi_beta_schedule_type = getattr(args, "phi_beta_schedule", "exp")
+            phi_beta_bump_updates = getattr(args, "phi_bump_updates", 0)
+            phi_beta_bump_multiplier = getattr(args, "phi_bump_multiplier", 1.0)
+
+        if phi_beta_start is not None or phi_beta_end is not None:
+            if phi_beta_start is None:
+                phi_beta_start = 0.0
+            if phi_beta_end is None:
+                phi_beta_end = 0.0
+            if phi_beta_schedule_type == "exp":
                 beta_callback = PotentialBetaExpScheduleCallback(
-                    beta_start,
-                    beta_end,
+                    phi_beta_start,
+                    phi_beta_end,
                     total_planned_ts,
-                    bump_updates=getattr(args, "phi_bump_updates", 0),
-                    bump_multiplier=getattr(args, "phi_bump_multiplier", 1.0),
+                    bump_updates=phi_beta_bump_updates,
+                    bump_multiplier=phi_beta_bump_multiplier,
                 )
         # Optional Pass Logit Bias scheduler across the whole run
         pass_bias_callback = None
@@ -947,34 +1054,55 @@ def main(args):
                 eval_env.close()
                 print(f"--- Evaluation for Alternation {global_alt} Complete ---")
 
-            # Log environment profiling if enabled
-            if args.enable_env_profiling:
-                try:
-                    prof = offense_env.envs[0].unwrapped.get_profile_stats()
-                    for k, v in prof.items():
-                        mlflow.log_metric(
-                            f"env_prof_{k}_avg_us_offense",
-                            v.get("avg_us", 0.0),
-                            step=global_alt,
-                        )
-                    offense_env.envs[0].unwrapped.reset_profile_stats()
-                except Exception:
-                    pass
-                try:
-                    prof = defense_env.envs[0].unwrapped.get_profile_stats()
-                    for k, v in prof.items():
-                        mlflow.log_metric(
-                            f"env_prof_{k}_avg_us_defense",
-                            v.get("avg_us", 0.0),
-                            step=global_alt,
-                        )
-                    defense_env.envs[0].unwrapped.reset_profile_stats()
-                except Exception:
-                    pass
+            # Note: Environment profiling code removed as envs are closed by this point
 
             # --- 4. Optional GIF Evaluation ---
 
         print("\n--- Training Complete ---")
+
+        # --- Save schedule metadata for continuation ---
+        try:
+            save_schedule_metadata(
+                ent_coef_start=ent_start if "ent_start" in locals() else None,
+                ent_coef_end=ent_end if "ent_end" in locals() else None,
+                ent_schedule=(
+                    ent_schedule_type if "ent_schedule_type" in locals() else "linear"
+                ),
+                ent_bump_updates=getattr(args, "ent_bump_updates", 0),
+                ent_bump_multiplier=getattr(args, "ent_bump_multiplier", 1.0),
+                phi_beta_start=phi_beta_start if "phi_beta_start" in locals() else None,
+                phi_beta_end=phi_beta_end if "phi_beta_end" in locals() else None,
+                phi_beta_schedule=(
+                    phi_beta_schedule_type
+                    if "phi_beta_schedule_type" in locals()
+                    else "exp"
+                ),
+                phi_bump_updates=(
+                    phi_beta_bump_updates if "phi_beta_bump_updates" in locals() else 0
+                ),
+                phi_bump_multiplier=(
+                    phi_beta_bump_multiplier
+                    if "phi_beta_bump_multiplier" in locals()
+                    else 1.0
+                ),
+                pass_logit_bias_start=getattr(args, "pass_logit_bias_start", None),
+                pass_logit_bias_end=getattr(args, "pass_logit_bias_end", None),
+                pass_arc_start=getattr(args, "pass_arc_start", None),
+                pass_arc_end=getattr(args, "pass_arc_end", None),
+                pass_oob_turnover_prob_start=getattr(
+                    args, "pass_oob_turnover_prob_start", None
+                ),
+                pass_oob_turnover_prob_end=getattr(
+                    args, "pass_oob_turnover_prob_end", None
+                ),
+                total_planned_timesteps=(
+                    total_planned_ts if "total_planned_ts" in locals() else 0
+                ),
+                current_timesteps=unified_policy.num_timesteps,
+            )
+            print("Saved schedule metadata for future continuation")
+        except Exception as e:
+            print(f"Warning: Could not save schedule metadata: {e}")
 
         # --- Log final performance metrics ---
         if offense_timing_callback.rollout_times:
@@ -1167,11 +1295,23 @@ if __name__ == "__main__":
         help="If set, load latest offense/defense policies from this MLflow run and continue training. Also appends new artifacts using continued alternation indices.",
     )
     parser.add_argument(
+        "--continue-schedule-mode",
+        type=str,
+        choices=["extend", "constant", "restart"],
+        default="extend",
+        help=(
+            "How to handle schedules when continuing training: "
+            "'extend' (default) - continue schedules from where they left off, adding more training to the original total; "
+            "'constant' - use the final schedule values (where the previous run ended) as constants; "
+            "'restart' - restart schedules from scratch using new parameters."
+        ),
+    )
+    parser.add_argument(
         "--restart-entropy-on-continue",
         dest="restart_entropy_on_continue",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
-        help="When continuing from a run, reset num_timesteps and reinitialize ent_coef to the schedule start.",
+        help="DEPRECATED: Use --continue-schedule-mode=restart instead. When continuing from a run, reset num_timesteps and reinitialize ent_coef to the schedule start.",
     )
     parser.add_argument(
         "--eval-freq",
