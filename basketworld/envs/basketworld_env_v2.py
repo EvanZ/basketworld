@@ -120,6 +120,7 @@ class HexagonBasketballEnv(gym.Env):
         phi_beta: float = 0.0,
         phi_use_ball_handler_only: bool = False,
         phi_blend_weight: float = 0.0,
+        phi_aggregation_mode: str = "team_best",  # "team_best", "teammates_best", "teammates_avg", "team_avg"
         # Preferred: percentage-based assist shaping
         potential_assist_pct: float = 0.10,
         full_assist_bonus_pct: float = 0.05,
@@ -336,6 +337,8 @@ class HexagonBasketballEnv(gym.Env):
         self.phi_beta: float = float(phi_beta)
         # If True, use only the ball handler's make prob; else best among offense
         self.phi_use_ball_handler_only: bool = bool(phi_use_ball_handler_only)
+        # How to aggregate teammate EPs when not using ball-handler-only mode
+        self.phi_aggregation_mode: str = str(phi_aggregation_mode)
         try:
             self.phi_blend_weight: float = float(max(0.0, min(1.0, phi_blend_weight)))
         except Exception:
@@ -443,6 +446,8 @@ class HexagonBasketballEnv(gym.Env):
         self._assist_candidate = None
         # Clear any pending external probabilities on reset
         self._pending_action_probs = None
+        # Track first step after reset for phi shaping (Φ(s₀) = 0)
+        self._first_step_after_reset = True
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
@@ -506,11 +511,16 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count += 1
 
         # Compute Phi(s) at start of step (for logs and optional shaping)
+        # For proper PBRS, Φ(s₀) = 0 to ensure shaping sums to zero over episode
         phi_prev: Optional[float] = None
-        try:
-            phi_prev = float(self._phi_shot_quality())
-        except Exception:
+        if self._first_step_after_reset:
             phi_prev = 0.0
+            self._first_step_after_reset = False
+        else:
+            try:
+                phi_prev = float(self._phi_shot_quality())
+            except Exception:
+                phi_prev = 0.0
 
         # --- Defender Pressure Mechanic ---
         if self.ball_holder in self.offense_ids:
@@ -582,6 +592,23 @@ class HexagonBasketballEnv(gym.Env):
                             team_best, ball_ep = self._phi_ep_breakdown()
                             info["phi_team_best_ep"] = float(team_best)
                             info["phi_ball_handler_ep"] = float(ball_ep)
+                            # Add per-player EPs for accurate UI recalculation
+                            ep_by_player = []
+                            for pid in range(self.n_players):
+                                pos = self.positions[pid]
+                                dist = self._hex_distance(pos, self.basket_position)
+                                shot_value = (
+                                    2.0
+                                    if (self.allow_dunks and dist == 0)
+                                    else (
+                                        3.0
+                                        if dist >= self.three_point_distance
+                                        else 2.0
+                                    )
+                                )
+                                p = float(self._calculate_shot_probability(pid, dist))
+                                ep_by_player.append(float(shot_value * p))
+                            info["phi_ep_by_player"] = ep_by_player
                         except Exception:
                             pass
 
@@ -731,6 +758,19 @@ class HexagonBasketballEnv(gym.Env):
             team_best, ball_ep = self._phi_ep_breakdown()
             info["phi_team_best_ep"] = float(team_best)
             info["phi_ball_handler_ep"] = float(ball_ep)
+            # Add per-player EPs for accurate UI recalculation
+            ep_by_player = []
+            for pid in range(self.n_players):
+                pos = self.positions[pid]
+                dist = self._hex_distance(pos, self.basket_position)
+                shot_value = (
+                    2.0
+                    if (self.allow_dunks and dist == 0)
+                    else (3.0 if dist >= self.three_point_distance else 2.0)
+                )
+                p = float(self._calculate_shot_probability(pid, dist))
+                ep_by_player.append(float(shot_value * p))
+            info["phi_ep_by_player"] = ep_by_player
         except Exception:
             pass
 
@@ -1251,7 +1291,9 @@ class HexagonBasketballEnv(gym.Env):
             self.defense_ids if shooter_id in self.offense_ids else self.offense_ids
         )
 
-        closest_d: Optional[int] = None
+        # Track the defender that applies the most pressure (considering both distance and alignment)
+        best_pressure_reduction: Optional[float] = None
+
         for did in opp_ids:
             dq = self.positions[did][0] - shooter_pos[0]
             dr = self.positions[did][1] - shooter_pos[1]
@@ -1266,18 +1308,35 @@ class HexagonBasketballEnv(gym.Env):
             d_def = self._hex_distance(shooter_pos, self.positions[did])
             # Defender must be at or closer than the basket along this direction
             if in_arc and d_def <= distance_to_basket:
-                if closest_d is None or d_def < closest_d:
-                    closest_d = d_def
+                # Calculate pressure for this defender using both distance and angle alignment
+                # cosang ranges from cos_threshold to 1.0, where 1.0 = perfectly aligned
+                # Normalize to [0, 1] where 1.0 = perfectly aligned, 0 = at arc edge
+                angle_factor = (
+                    (cosang - cos_threshold) / (1.0 - cos_threshold)
+                    if cos_threshold < 1.0
+                    else 1.0
+                )
 
-        if closest_d is None:
+                # Base pressure from distance: stronger when closer
+                exponent_arg = d_def - 1
+                distance_reduction = self.shot_pressure_max * math.exp(
+                    -self.shot_pressure_lambda * exponent_arg
+                )
+
+                # Scale by angle alignment - more aligned = more pressure
+                # Use a power to make alignment matter more (e.g., angle_factor^2)
+                pressure_reduction = distance_reduction * (angle_factor**2)
+
+                if (
+                    best_pressure_reduction is None
+                    or pressure_reduction > best_pressure_reduction
+                ):
+                    best_pressure_reduction = pressure_reduction
+
+        if best_pressure_reduction is None:
             return 1.0
 
-        # Pressure multiplier: 1 - A * exp(-lambda * (d-1))
-        exponent_arg = max(0, closest_d - 1)
-        reduction = self.shot_pressure_max * math.exp(
-            -self.shot_pressure_lambda * exponent_arg
-        )
-        return max(0.0, 1.0 - reduction)
+        return max(0.0, 1.0 - best_pressure_reduction)
 
     @profile_section("attempt_shot")
     def _attempt_shot(self, shooter_id: int) -> Dict:
@@ -1557,15 +1616,38 @@ class HexagonBasketballEnv(gym.Env):
         if self.phi_use_ball_handler_only:
             return expected_points_for(int(self.ball_holder))
 
-        # Compute team-best and ball-handler EP, then blend with phi_blend_weight
+        # Compute ball-handler EP and aggregate teammate EPs based on mode
         ball_ep = expected_points_for(int(self.ball_holder))
-        team_best_ep = ball_ep
-        for pid in team_ids:
-            ep = expected_points_for(int(pid))
-            if ep > team_best_ep:
-                team_best_ep = ep
+        ball_holder_id = int(self.ball_holder)
+
+        # Collect teammate EPs (may or may not exclude ball handler depending on mode)
+        mode = getattr(self, "phi_aggregation_mode", "team_best")
+
+        if mode == "team_avg":
+            # Simple average of all players (including ball handler)
+            eps = [expected_points_for(int(pid)) for pid in team_ids]
+            return float(sum(eps) / max(1, len(eps)))
+
+        # For other modes, separate ball handler from teammates
+        teammate_eps = [
+            expected_points_for(int(pid)) for pid in team_ids if pid != ball_holder_id
+        ]
+
+        if not teammate_eps:  # No teammates (1v1 or edge case)
+            return ball_ep
+
+        # Aggregate teammate EPs based on mode
+        if mode == "teammates_best":
+            teammate_aggregate = max(teammate_eps)
+        elif mode == "teammates_avg":
+            teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+        else:  # "team_best" (default/legacy behavior)
+            # Include ball handler in the "best" calculation
+            teammate_aggregate = max(max(teammate_eps), ball_ep)
+
+        # Blend teammate aggregate with ball handler EP
         w = float(max(0.0, min(1.0, getattr(self, "phi_blend_weight", 0.0))))
-        blended = (1.0 - w) * float(team_best_ep) + w * float(ball_ep)
+        blended = (1.0 - w) * float(teammate_aggregate) + w * float(ball_ep)
         return float(blended)
 
     def _phi_ep_breakdown(self) -> Tuple[float, float]:

@@ -256,6 +256,7 @@ def setup_environment(args, training_team):
         reward_shaping_gamma=getattr(args, "reward_shaping_gamma", args.gamma),
         phi_beta=getattr(args, "phi_beta_start", 0.0),
         phi_use_ball_handler_only=getattr(args, "phi_use_ball_handler_only", False),
+        phi_aggregation_mode=getattr(args, "phi_aggregation_mode", "team_best"),
         phi_blend_weight=getattr(args, "phi_blend_weight", 0.0),
         enable_profiling=args.enable_env_profiling,
         training_team=training_team,  # Critical for correct rewards
@@ -284,6 +285,9 @@ def setup_environment(args, training_team):
             "assisted_3pt",
             "passes",
             "turnover",
+            "turnover_pass_oob",
+            "turnover_intercepted",
+            "turnover_pressure",
             # Keys required for PPP calculation
             "made_dunk",
             "made_2pt",
@@ -1445,7 +1449,15 @@ if __name__ == "__main__":
         dest="phi_blend_weight",
         type=float,
         default=0.0,
-        help="Blend weight w in [0,1] for Phi=(1-w)*team_best_EP + w*ball_EP (ignored if ball-handler-only).",
+        help="Blend weight w in [0,1] for Phi=(1-w)*aggregate_EP + w*ball_EP (ignored if ball-handler-only).",
+    )
+    parser.add_argument(
+        "--phi-aggregation-mode",
+        dest="phi_aggregation_mode",
+        type=str,
+        choices=["team_best", "teammates_best", "teammates_avg", "team_avg"],
+        default="team_best",
+        help="How to aggregate teammate EPs: 'team_best' (max including ball), 'teammates_best' (max excluding ball), 'teammates_avg' (mean excluding ball), 'team_avg' (mean including ball).",
     )
     parser.add_argument(
         "--phi-beta-start",

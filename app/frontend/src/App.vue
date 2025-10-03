@@ -511,6 +511,7 @@ onBeforeUnmount(() => {
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
         />
+        <KeyboardLegend />
       </div>
       <div class="controls-area">
         <PlayerControls 
@@ -554,7 +555,6 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <KeyboardLegend />
       </div>
     </div>
   </main>
@@ -612,7 +612,7 @@ header {
   flex-direction: column;
   align-items: center;
   flex: 1;
-  min-width: 0; /* allow flex child to shrink properly */
+  min-width: 640; /* allow flex child to shrink properly */
 }
 
 .run-title {
@@ -623,8 +623,10 @@ header {
 }
 
 .controls-area {
-  width: 400px; /* Give the controls area a fixed width */
-  flex-shrink: 0; /* Prevent the controls area from shrinking */
+  min-width: 400px; /* Give the controls area a fixed width */
+  display: flex;
+  flex: 1.5;
+  flex-direction: column;
 }
 
 .save-episode-button {

@@ -31,7 +31,8 @@ class EpisodeStatsWrapper(gym.Wrapper):
 
     Exposes keys consumed by Monitor(info_keywords=...):
       shot_dunk, shot_2pt, shot_3pt, assisted_dunk, assisted_2pt, assisted_3pt,
-      passes, turnover, made_dunk, made_2pt, made_3pt, attempts
+      passes, turnover, turnover_pass_oob, turnover_intercepted, turnover_pressure,
+      made_dunk, made_2pt, made_3pt, attempts
     """
 
     def __init__(self, env: gym.Env):
@@ -47,6 +48,9 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._asst_2pt = 0.0
         self._asst_3pt = 0.0
         self._turnover = 0.0
+        self._turnover_pass_oob = 0.0
+        self._turnover_intercepted = 0.0
+        self._turnover_pressure = 0.0
         self._made_dunk = 0.0
         self._made_2pt = 0.0
         self._made_3pt = 0.0
@@ -134,6 +138,15 @@ class EpisodeStatsWrapper(gym.Wrapper):
                         self._asst_2pt = 1.0
             elif ar.get("turnovers"):
                 self._turnover = 1.0
+                # Track specific turnover types
+                for turnover in ar["turnovers"]:
+                    reason = turnover.get("reason", "")
+                    if reason == "pass_out_of_bounds":
+                        self._turnover_pass_oob = 1.0
+                    elif reason == "intercepted":
+                        self._turnover_intercepted = 1.0
+                    elif reason == "defender_pressure":
+                        self._turnover_pressure = 1.0
         except Exception:
             pass
 
@@ -146,6 +159,9 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["assisted_3pt"] = self._asst_3pt
             info["passes"] = float(self._passes)
             info["turnover"] = self._turnover
+            info["turnover_pass_oob"] = self._turnover_pass_oob
+            info["turnover_intercepted"] = self._turnover_intercepted
+            info["turnover_pressure"] = self._turnover_pressure
             info["made_dunk"] = self._made_dunk
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt

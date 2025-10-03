@@ -263,6 +263,85 @@ async def init_game(request: InitGameRequest):
         initial_state = get_full_game_state(include_policy_probs=True)
         game_state.episode_states.append(initial_state)
 
+        # Record initial phi values (step 0) by computing EP for all players
+        try:
+            env = game_state.env
+            ep_by_player = []
+            for pid in range(env.n_players):
+                pos = env.positions[pid]
+                dist = env._hex_distance(pos, env.basket_position)
+                shot_value = (
+                    2.0
+                    if (getattr(env, "allow_dunks", True) and dist == 0)
+                    else (3.0 if dist >= env.three_point_distance else 2.0)
+                )
+                p = float(env._calculate_shot_probability(pid, dist))
+                ep = float(shot_value * p)
+                ep_by_player.append(ep)
+
+            # Calculate phi_next for initial state using the same logic as in the env
+            ball_holder_id = int(env.ball_holder) if env.ball_holder is not None else -1
+            offense_ids = list(env.offense_ids)
+
+            # Compute phi based on aggregation mode
+            if ball_holder_id >= 0 and len(offense_ids) > 0:
+                ball_ep = ep_by_player[ball_holder_id]
+                mode = getattr(env, "phi_aggregation_mode", "team_best")
+
+                if mode == "team_avg":
+                    phi_next = sum(ep_by_player[int(pid)] for pid in offense_ids) / max(
+                        1, len(offense_ids)
+                    )
+                else:
+                    teammate_eps = [
+                        ep_by_player[int(pid)]
+                        for pid in offense_ids
+                        if int(pid) != ball_holder_id
+                    ]
+                    if not teammate_eps:
+                        teammate_aggregate = ball_ep
+                    elif mode == "teammates_best":
+                        teammate_aggregate = max(teammate_eps)
+                    elif mode == "teammates_avg":
+                        teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+                    else:  # "team_best"
+                        teammate_aggregate = max(max(teammate_eps), ball_ep)
+
+                    # Blend
+                    w = float(max(0.0, min(1.0, getattr(env, "phi_blend_weight", 0.0))))
+                    phi_next = (1.0 - w) * float(teammate_aggregate) + w * float(
+                        ball_ep
+                    )
+
+                team_best_ep = max(ep_by_player[int(pid)] for pid in offense_ids)
+                ball_handler_ep = ball_ep
+            else:
+                phi_next = 0.0
+                team_best_ep = 0.0
+                ball_handler_ep = 0.0
+
+            initial_phi_entry = {
+                "step": 0,
+                "phi_prev": 0.0,  # No previous state
+                "phi_next": float(phi_next),
+                "phi_beta": float(getattr(env, "phi_beta", 0.0)),
+                "phi_r_shape": 0.0,  # No shaping reward for initial state
+                "ball_handler": ball_holder_id,
+                "offense_ids": offense_ids,
+                "defense_ids": list(env.defense_ids),
+                "shot_clock": int(env.shot_clock) if hasattr(env, "shot_clock") else -1,
+                "ep_by_player": ep_by_player,
+                "team_best_ep": float(team_best_ep),
+                "ball_handler_ep": float(ball_handler_ep),
+                "is_terminal": False,  # Initial state is never terminal
+                # Note: best_ep_player is calculated on the frontend from ep_by_player
+            }
+            game_state.phi_log.append(initial_phi_entry)
+        except Exception as e:
+            # If we fail to compute initial phi, just skip it
+            print(f"Failed to compute initial phi: {e}")
+            pass
+
         return {"status": "success", "state": initial_state}
 
     except Exception as e:
@@ -562,6 +641,12 @@ def take_step(request: ActionRequest):
             ),
             "offense_ids": list(game_state.env.offense_ids),
             "defense_ids": list(game_state.env.defense_ids),
+            "shot_clock": (
+                int(game_state.env.shot_clock)
+                if hasattr(game_state.env, "shot_clock")
+                else -1
+            ),
+            "is_terminal": bool(done),  # Flag for terminal states
         }
         if info and "phi_ep_by_player" in info:
             try:
@@ -573,6 +658,7 @@ def take_step(request: ActionRequest):
             entry["team_best_ep"] = float(info.get("phi_team_best_ep", -1.0))
         if info and "phi_ball_handler_ep" in info:
             entry["ball_handler_ep"] = float(info.get("phi_ball_handler_ep", -1.0))
+        # Note: best_ep_player is calculated on the frontend from ep_by_player
         game_state.phi_log.append(entry)
     except Exception:
         pass
@@ -620,6 +706,7 @@ def get_phi_params():
             getattr(env, "phi_use_ball_handler_only", False)
         ),
         "phi_blend_weight": float(getattr(env, "phi_blend_weight", 0.0)),
+        "phi_aggregation_mode": str(getattr(env, "phi_aggregation_mode", "team_best")),
     }
 
 
@@ -629,6 +716,7 @@ class SetPhiParamsRequest(BaseModel):
     reward_shaping_gamma: float | None = None
     phi_use_ball_handler_only: bool | None = None
     phi_blend_weight: float | None = None
+    phi_aggregation_mode: str | None = None
 
 
 @app.post("/api/phi_params")
@@ -650,6 +738,10 @@ def set_phi_params(req: SetPhiParamsRequest):
                 env.phi_blend_weight = float(max(0.0, min(1.0, req.phi_blend_weight)))
             except Exception:
                 pass
+        if req.phi_aggregation_mode is not None:
+            valid_modes = ["team_best", "teammates_best", "teammates_avg", "team_avg"]
+            if str(req.phi_aggregation_mode) in valid_modes:
+                env.phi_aggregation_mode = str(req.phi_aggregation_mode)
         return {"status": "success", "params": get_phi_params()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set phi params: {e}")

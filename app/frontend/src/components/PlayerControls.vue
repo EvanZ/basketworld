@@ -1100,7 +1100,7 @@ const phiRef = vueRef(null);
 
     <!-- Phi Shaping Tab -->
     <div v-if="activeTab === 'phi'" class="tab-content">
-      <PhiShaping ref="phiRef" />
+      <PhiShaping ref="phiRef" :game-state="props.gameState" />
     </div>
   </div>
 </template>

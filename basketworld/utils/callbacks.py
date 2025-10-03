@@ -156,6 +156,9 @@ class MLflowCallback(BaseCallback):
                 asst_3pt_pct = mean_key("assisted_3pt")
                 passes_avg = mean_key("passes")
                 turnover_pct = mean_key("turnover")
+                turnover_pass_oob_pct = mean_key("turnover_pass_oob")
+                turnover_intercepted_pct = mean_key("turnover_intercepted")
+                turnover_pressure_pct = mean_key("turnover_pressure")
 
                 def mean_ppp(default: float = 0.0):
                     numer = []
@@ -238,6 +241,21 @@ class MLflowCallback(BaseCallback):
                 )
                 mlflow.log_metric(
                     f"{self.team_name} TurnoverPct", turnover_pct, step=global_step
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Turnover Pass OOB",
+                    turnover_pass_oob_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Turnover Intercepted",
+                    turnover_intercepted_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Turnover Pressure",
+                    turnover_pressure_pct,
+                    step=global_step,
                 )
                 mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
                 # Log current pass logit bias if custom policy exposes it
@@ -611,6 +629,11 @@ class EpisodeSampleLogger(BaseCallback):
                             else 0.0
                         )
                         turnover = float(info.get("turnover", 0.0))
+                        turnover_pass_oob = float(info.get("turnover_pass_oob", 0.0))
+                        turnover_intercepted = float(
+                            info.get("turnover_intercepted", 0.0)
+                        )
+                        turnover_pressure = float(info.get("turnover_pressure", 0.0))
                         row = {
                             "team": self.team_name,
                             "alternation": self.alternation_id,
@@ -620,6 +643,9 @@ class EpisodeSampleLogger(BaseCallback):
                             "shot_type": shot_type,
                             "made": made,
                             "turnover": turnover,
+                            "turnover_pass_oob": turnover_pass_oob,
+                            "turnover_intercepted": turnover_intercepted,
+                            "turnover_pressure": turnover_pressure,
                             "passes": float(info.get("passes", 0.0)),
                             "assisted_dunk": float(info.get("assisted_dunk", 0.0)),
                             "assisted_2pt": float(info.get("assisted_2pt", 0.0)),
@@ -658,6 +684,9 @@ class EpisodeSampleLogger(BaseCallback):
                     "shot_type",
                     "made",
                     "turnover",
+                    "turnover_pass_oob",
+                    "turnover_intercepted",
+                    "turnover_pressure",
                     "passes",
                     "assisted_dunk",
                     "assisted_2pt",
