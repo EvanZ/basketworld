@@ -39,8 +39,6 @@ const moveHistory = ref([]);
 // Evaluation mode state
 const isEvaluating = ref(false);
 const evalNumEpisodes = ref(100);
-const evalProgress = ref(0);
-const evalCurrentEpisode = ref(0);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
@@ -164,6 +162,13 @@ async function handleActionsSubmitted(actions) {
 function handleMoveRecorded(moveData) {
     console.log('[App] Recording move:', moveData);
     moveHistory.value.push(moveData);
+}
+
+// Handler for Self-Play button click
+function handleSelfPlayButton() {
+  // Get current selections from PlayerControls
+  const preselected = controlsRef.value?.getSelectedActions?.() || null;
+  handleSelfPlay(preselected);
 }
 
 // New function for self-play mode (runs full episode)
@@ -297,7 +302,7 @@ async function handleSelfPlay(preselected = null) {
 async function handleEvaluation() {
   if (!gameState.value || isEvaluating.value) return;
   
-  const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000));
+  const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 10000));
   
   // Reset stats at the beginning
   console.log('[App] Resetting stats before evaluation');
@@ -305,47 +310,36 @@ async function handleEvaluation() {
     controlsRef.value.resetStats();
   }
   
+  // Set UI state immediately to show we're evaluating
   isEvaluating.value = true;
-  evalProgress.value = 0;
-  evalCurrentEpisode.value = 0;
   error.value = null;
+  
+  // Give UI a chance to update before blocking on API call
+  await nextTick();
   
   try {
     console.log(`[App] Starting evaluation: ${numEpisodes} episodes, deterministic=${deterministic.value}`);
     
-    // Run evaluation on backend
+    // Run evaluation on backend (this will block until all episodes complete)
     const response = await runEvaluation(numEpisodes, deterministic.value);
     
     if (response.status === 'success' && Array.isArray(response.results)) {
-      console.log(`[App] Evaluation completed: ${response.results.length} episodes`);
+      console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
       
-      // Store the last episode state to show after recording all stats
+      // Process all episode results and update stats immediately
       let lastEpisodeState = null;
       
-      // Process each episode result and update stats
-      for (let i = 0; i < response.results.length; i++) {
-        const result = response.results[i];
-        evalCurrentEpisode.value = result.episode;
-        evalProgress.value = (result.episode / numEpisodes) * 100;
+      for (const result of response.results) {
+        // Save the last episode state for display
+        lastEpisodeState = result.final_state;
         
-        // Save the last episode state for later
-        if (i === response.results.length - 1) {
-          lastEpisodeState = result.final_state;
-        }
-        
-        // Record stats for this episode
+        // Record stats for this episode (skip API calls for speed)
         if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
-          console.log(`[App] Recording stats for evaluation episode ${result.episode}`);
-          await controlsRef.value.recordEpisodeStats(result.final_state);
-        }
-        
-        // Small delay to allow UI updates every 10 episodes
-        if (i % 10 === 0 || i === response.results.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 10));
+          await controlsRef.value.recordEpisodeStats(result.final_state, true);
         }
       }
       
-      console.log('[App] Stats updated for all episodes');
+      console.log('[App] All stats recorded');
       
       // Now update the game state AFTER recording all stats
       if (lastEpisodeState) {
@@ -366,8 +360,6 @@ async function handleEvaluation() {
   } finally {
     console.log('[App] Setting isEvaluating to false');
     isEvaluating.value = false;
-    evalProgress.value = 0;
-    evalCurrentEpisode.value = 0;
   }
 }
 
@@ -546,7 +538,7 @@ function onKeydown(e) {
     if (initialSetup.value) handleGameStarted(initialSetup.value);
   } else if (key === 'p') {
     // Self-Play
-    if (gameState.value && !gameState.value.done) handleSelfPlay();
+    if (gameState.value && !gameState.value.done) handleSelfPlayButton();
   } else if (key === 's') {
     // Save Episode
     if (gameState.value?.done) handleSaveEpisode();
@@ -607,25 +599,30 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="gameState && !gameState.done && !isSelfPlaying" class="eval-controls">
-      <input 
-        type="number" 
-        v-model.number="evalNumEpisodes" 
-        min="1" 
-        max="1000" 
-        class="eval-input"
-        :disabled="isEvaluating"
-        placeholder="Num episodes"
-      />
-      <button 
-        @click="handleEvaluation" 
-        class="eval-button"
-        :disabled="isEvaluating || isSelfPlaying"
-      >
-        {{ isEvaluating ? 'Evaluating...' : 'Eval' }}
-      </button>
-      <span v-if="isEvaluating" class="eval-status">
-        Episode {{ evalCurrentEpisode }} / {{ evalNumEpisodes }}
-      </span>
+      <div class="eval-controls-row">
+        <input 
+          type="number" 
+          v-model.number="evalNumEpisodes" 
+          min="1" 
+          max="10000" 
+          class="eval-input"
+          :disabled="isEvaluating"
+          placeholder="Num episodes"
+        />
+        <button 
+          @click="handleEvaluation" 
+          class="eval-button"
+          :disabled="isEvaluating || isSelfPlaying"
+        >
+          {{ isEvaluating ? 'Evaluating...' : 'Eval' }}
+        </button>
+        <span v-if="isEvaluating" class="eval-status">
+          Running {{ evalNumEpisodes }} episodes...
+        </span>
+      </div>
+      <div v-if="isEvaluating" class="eval-progress-bar">
+        <div class="eval-progress-fill indeterminate"></div>
+      </div>
     </div>
 
     <div v-if="gameState" class="game-container">
@@ -636,8 +633,6 @@ onBeforeUnmount(() => {
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
-          :is-evaluating="isEvaluating"
-          :eval-progress="evalProgress"
         />
         <KeyboardLegend />
       </div>
@@ -656,11 +651,34 @@ onBeforeUnmount(() => {
             :move-history="moveHistory"
             :external-selections="isSelfPlaying ? currentSelections : null"
             @actions-submitted="handleActionsSubmitted" 
-            @play-again="handlePlayAgain"
-            @self-play="handleSelfPlay"
             @move-recorded="handleMoveRecorded"
             ref="controlsRef"
         />
+
+        <div class="action-buttons">
+          <button 
+            @click="controlsRef?.submitActions?.()" 
+            class="action-button submit-button" 
+            :disabled="gameState.done"
+          >
+            {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
+          </button>
+          
+          <button 
+            @click="handleSelfPlayButton" 
+            class="action-button self-play-button"
+            :disabled="!aiMode || gameState.done"
+          >
+            Self-Play
+          </button>
+          
+          <button 
+            @click="handlePlayAgain" 
+            class="action-button new-game-button"
+          >
+            New Game
+          </button>
+        </div>
 
         <button v-if="gameState.done || isManualStepping" @click="handleSaveEpisode" class="save-episode-button">
           Save Episode
@@ -733,6 +751,13 @@ header {
   text-align: center;
   margin-bottom: 1rem;
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.eval-controls-row {
+  display: flex;
   align-items: center;
   justify-content: center;
   gap: 0.75rem;
@@ -773,6 +798,39 @@ header {
   font-weight: 500;
   color: #333;
 }
+
+.eval-progress-bar {
+  width: 300px;
+  height: 8px;
+  background-color: #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid #999;
+}
+
+.eval-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50 0%, #45a049 100%);
+  transition: width 0.3s ease;
+}
+
+.eval-progress-fill.indeterminate {
+  animation: indeterminate-progress 1.5s ease-in-out infinite;
+}
+
+@keyframes indeterminate-progress {
+  0% {
+    transform: translateX(-100%);
+    width: 30%;
+  }
+  50% {
+    transform: translateX(250%);
+  }
+  100% {
+    transform: translateX(-100%);
+    width: 30%;
+  }
+}
 .game-container {
   display: flex;
   flex-direction: row; /* Changed to row */
@@ -801,6 +859,55 @@ header {
   display: flex;
   flex: 1.5;
   flex-direction: column;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.action-button {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.action-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.submit-button {
+  background: #007bff;
+  color: white;
+}
+
+.submit-button:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.self-play-button {
+  background: #28a745;
+  color: white;
+}
+
+.self-play-button:hover:not(:disabled) {
+  background: #218838;
+}
+
+.new-game-button {
+  background: orange;
+  color: white;
+}
+
+.new-game-button:hover {
+  background: #5a6268;
 }
 
 .save-episode-button {

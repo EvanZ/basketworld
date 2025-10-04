@@ -149,8 +149,8 @@ def play_episode(
             pass
 
         # Get actions (deterministic for consistency)
-        offense_action, _ = policy_a.predict(offense_obs, deterministic=True)
-        defense_action, _ = policy_b.predict(defense_obs, deterministic=True)
+        offense_action, _ = policy_a.predict(offense_obs, deterministic=args.deterministic_opponent)
+        defense_action, _ = policy_b.predict(defense_obs, deterministic=args.deterministic_opponent)
 
         # Resolve illegal actions
         action_mask = obs.get("action_mask")
@@ -161,14 +161,14 @@ def play_episode(
             np.array(offense_action),
             action_mask,
             illegal_strategy,
-            deterministic=True,
+            deterministic=args.deterministic_opponent,
             probs_per_player=offense_probs,
         )
         defense_resolved = resolve_illegal_actions(
             np.array(defense_action),
             action_mask,
             illegal_strategy,
-            deterministic=True,
+            deterministic=args.deterministic_opponent,
             probs_per_player=defense_probs,
         )
 
@@ -220,6 +220,7 @@ def play_matchup(
     env_config: Dict,
     illegal_strategy: IllegalActionStrategy,
     verbose: bool = False,
+    deterministic_opponent: bool = False,
 ) -> Dict:
     """
     Play a matchup between two models.
@@ -367,6 +368,7 @@ def run_tournament(
             env_config,
             illegal_strategy,
             verbose=args.verbose,
+            deterministic_opponent=args.deterministic_opponent,
         )
 
         # Update ELO ratings
@@ -772,6 +774,12 @@ if __name__ == "__main__":
         "--output-heatmap",
         action="store_true",
         help="Generate a win-rate heatmap showing all pairwise matchups",
+    )
+
+    parser.add_argument(
+        "--deterministic-opponent",
+        action="store_true",
+        help="Use deterministic opponent actions.",
     )
 
     args = parser.parse_args()

@@ -827,7 +827,7 @@ def run_evaluation(request: EvaluationRequest):
             status_code=400, detail="Unified policy required for evaluation."
         )
 
-    num_episodes = max(1, min(request.num_episodes, 1000))  # Cap at 1000 for safety
+    num_episodes = max(1, min(request.num_episodes, 10000))  # Cap at 10000 for safety
     deterministic = request.deterministic
 
     episode_results = []

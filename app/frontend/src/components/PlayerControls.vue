@@ -51,7 +51,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play', 'move-recorded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded']);
 
 const selectedActions = ref({});
 
@@ -80,7 +80,7 @@ const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsSta
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 
-async function recordEpisodeStats(finalState) {
+async function recordEpisodeStats(finalState, skipApiCall = false) {
   console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
@@ -118,15 +118,17 @@ async function recordEpisodeStats(finalState) {
   const tovCount = Array.isArray(results?.turnovers) ? results.turnovers.length : 0;
   statsState.value.turnovers += Number(tovCount || 0);
 
-  // Add episode reward for user's team
-  try {
-    const data = await getRewards();
-    const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
-    const userTeam = finalState?.user_team_name || 'OFFENSE';
-    statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
-    const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
-    statsState.value.episodeStepsSum += Number(steps || 0);
-  } catch (_) { /* ignore */ }
+  // Add episode reward for user's team (skip API call during batch evaluation)
+  if (!skipApiCall) {
+    try {
+      const data = await getRewards();
+      const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
+      const userTeam = finalState?.user_team_name || 'OFFENSE';
+      statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+      const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
+      statsState.value.episodeStepsSum += Number(steps || 0);
+    } catch (_) { /* ignore */ }
+  }
 
   // Increment episode count last
   statsState.value.episodes += 1;
@@ -188,7 +190,7 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats });
+defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats, getSelectedActions });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -451,10 +453,9 @@ function submitActions() {
   }
 }
 
-function triggerSelfPlay() {
-  // Emit current selections so the parent can use them for the first self-play step
-  const snapshot = { ...selectedActions.value };
-  emit('self-play', snapshot);
+function getSelectedActions() {
+  // Return current selections for parent to use
+  return { ...selectedActions.value };
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
@@ -763,22 +764,6 @@ const phiRef = vueRef(null);
               Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
           </p>
       </div>
-
-      <button @click="submitActions" class="submit-button" :disabled="gameState.done">
-        {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
-      </button>
-      
-      <button 
-        @click="triggerSelfPlay" 
-        class="self-play-button"
-        :disabled="!aiMode || gameState.done"
-      >
-        Self-Play
-      </button>
-      
-      <button @click="$emit('play-again')" class="new-game-button">
-        New Game
-      </button>
     </div>
 
     <!-- Rewards Tab -->
@@ -1301,63 +1286,6 @@ const phiRef = vueRef(null);
   gap: 1rem;
 }
 
-.submit-button, .new-game-button {
-  padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  font-weight: bold;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s ease;
-  min-width: 120px;
-}
-
-.submit-button {
-  background-color: #28a745;
-  color: white;
-}
-
-.submit-button:disabled {
-  background-color: #6c757d;
-  cursor: not-allowed;
-}
-
-.submit-button:hover:not(:disabled) {
-  background-color: #218838;
-}
-
-.new-game-button {
-  background-color: #007bff;
-  color: white;
-}
-
-.new-game-button:hover {
-  background-color: #0056b3;
-}
-
-.self-play-button {
-  background-color: #6c757d;
-  color: white;
-  padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  font-weight: bold;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s ease;
-  min-width: 120px;
-}
-
-.self-play-button:hover:not(:disabled) {
-  background-color: #5a6268;
-}
-
-.self-play-button:disabled {
-  background-color: #e9ecef;
-  color: #6c757d;
-  cursor: not-allowed;
-  opacity: 0.6;
-}
 
 .disabled {
   opacity: 0.7;

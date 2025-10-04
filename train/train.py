@@ -167,6 +167,89 @@ def get_random_policy_from_artifacts(
     return local_path
 
 
+def get_opponent_policy_pool_for_envs(
+    client,
+    run_id,
+    model_prefix,
+    tmpdir,
+    num_envs: int,
+    K: int = 10,
+    beta: float = 0.7,
+    uniform_eps: float = 0.15,
+):
+    """Sample opponent policies for each environment using geometric distribution.
+
+    Args:
+        client: MLflow client
+        run_id: experiment run
+        model_prefix: "unified", "offense", or "defense"
+        tmpdir: temp dir to download artifacts
+        num_envs: number of parallel environments (samples this many opponents)
+        K: reservoir size (keep last K policies)
+        beta: geometric decay factor (0<beta<1, higher = more recent bias)
+        uniform_eps: probability of sampling uniformly from ALL history
+
+    Returns:
+        List of local paths to policy checkpoints (length = num_envs)
+    """
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+
+    # Extract paths for prefix
+    team_policies = [
+        f.path
+        for f in all_artifacts
+        if f.path.startswith(f"{artifact_path}/{model_prefix}")
+        and f.path.endswith(".zip")
+    ]
+
+    if not team_policies:
+        return []
+
+    # Sort chronologically
+    def sort_key(p):
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
+
+    team_policies.sort(key=sort_key)
+
+    # Keep last K policies as the main pool
+    recent_pols = team_policies[-K:] if len(team_policies) > K else team_policies
+
+    # Sample one opponent per environment using geometric distribution
+    sampled_policies = []
+    print(
+        f"  - Sampling {num_envs} opponents using geometric distribution (K={K}, beta={beta}, eps={uniform_eps})..."
+    )
+
+    for env_idx in range(num_envs):
+        # With small probability, sample uniformly from all history for coverage
+        if random.random() < uniform_eps and len(team_policies) > len(recent_pols):
+            chosen = random.choice(team_policies)
+        else:
+            # Geometric sampling over recent_pols
+            # Higher indices = more recent = higher probability with beta close to 1
+            idx = sample_geometric(list(range(len(recent_pols))), beta)
+            chosen = recent_pols[idx]
+
+        sampled_policies.append(chosen)
+
+    # Download all unique sampled policies
+    unique_policies = list(set(sampled_policies))
+    print(
+        f"  - {len(unique_policies)} unique policies selected from {len(sampled_policies)} samples"
+    )
+
+    policy_paths = {}
+    for policy_path in unique_policies:
+        local_path = client.download_artifacts(run_id, policy_path, tmpdir)
+        policy_paths[policy_path] = local_path
+        print(f"    • {os.path.basename(policy_path)}")
+
+    # Return list of local paths in same order as sampled
+    return [policy_paths[p] for p in sampled_policies]
+
+
 # --- Continuation helpers ---
 
 
@@ -332,24 +415,52 @@ def make_vector_env(
 
     Each copy is wrapped with `SelfPlayEnvWrapper` so that the opponent's
     behaviour is provided by the frozen `opponent_policy`.
+
+    Args:
+        opponent_policy: Can be:
+            - Single policy path/object: all envs use same opponent
+            - List of policy paths: each env gets different opponent (cycled if needed)
     """
 
-    def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
-        # We capture the current parameters via default args so that each lambda
-        # has its own bound values (important inside list comprehension).
-        base_env = setup_environment(args, training_team)
-        return SelfPlayEnvWrapper(
-            base_env,
-            opponent_policy=opponent_policy,
-            training_strategy=IllegalActionStrategy.NOOP,
-            opponent_strategy=IllegalActionStrategy.NOOP,
-            deterministic_opponent=deterministic_opponent,
-        )
+    # If opponent_policy is a list, assign different opponents to each environment
+    if isinstance(opponent_policy, list):
 
-    # Use subprocesses for parallelism.
-    return SubprocVecEnv(
-        [_single_env_factory for _ in range(num_envs)], start_method="spawn"
-    )
+        def _single_env_factory(env_idx: int, opp_policy) -> gym.Env:  # type: ignore[name-defined]
+            base_env = setup_environment(args, training_team)
+            return SelfPlayEnvWrapper(
+                base_env,
+                opponent_policy=opp_policy,
+                training_strategy=IllegalActionStrategy.NOOP,
+                opponent_strategy=IllegalActionStrategy.NOOP,
+                deterministic_opponent=deterministic_opponent,
+            )
+
+        # Distribute opponents across environments (cycle if fewer opponents than envs)
+        return SubprocVecEnv(
+            [
+                lambda idx=i, opp=opponent_policy[
+                    i % len(opponent_policy)
+                ]: _single_env_factory(idx, opp)
+                for i in range(num_envs)
+            ],
+            start_method="spawn",
+        )
+    else:
+        # Original behavior: all envs use same opponent
+        def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
+            base_env = setup_environment(args, training_team)
+            return SelfPlayEnvWrapper(
+                base_env,
+                opponent_policy=opponent_policy,
+                training_strategy=IllegalActionStrategy.NOOP,
+                opponent_strategy=IllegalActionStrategy.NOOP,
+                deterministic_opponent=deterministic_opponent,
+            )
+
+        # Use subprocesses for parallelism.
+        return SubprocVecEnv(
+            [_single_env_factory for _ in range(num_envs)], start_method="spawn"
+        )
 
 
 def main(args):
@@ -780,27 +891,102 @@ def main(args):
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             print("-" * 50)
 
-            # --- Load a random historical opponent for this alternation ---
-            print("\nLoading historical opponent policy...")
-            opponent_for_offense = get_random_policy_from_artifacts(
-                mlflow.tracking.MlflowClient(),
-                run.info.run_id,
-                "unified",
-                opponent_cache_dir,
-            )
-            if opponent_for_offense is None:
-                # Fallback: save current unified policy to a stable path
-                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
-                unified_policy.save(fallback_path)
-                opponent_for_offense = fallback_path
-            # Log which opponent checkpoint is used this alternation
+            # --- Load opponent(s) for this alternation ---
+            if args.per_env_opponent_sampling:
+                # Sample opponent for each parallel environment using geometric distribution
+                print("\nSampling opponents for each parallel environment...")
+                opponent_for_offense = get_opponent_policy_pool_for_envs(
+                    mlflow.tracking.MlflowClient(),
+                    run.info.run_id,
+                    "unified",
+                    opponent_cache_dir,
+                    num_envs=args.num_envs,
+                    K=args.opponent_pool_size,
+                    beta=args.opponent_pool_beta,
+                    uniform_eps=args.opponent_pool_exploration,
+                )
+                if not opponent_for_offense:
+                    # Fallback: create list with current policy for all envs
+                    fallback_path = os.path.join(
+                        opponent_cache_dir, "unified_latest.zip"
+                    )
+                    unified_policy.save(fallback_path)
+                    opponent_for_offense = [fallback_path] * args.num_envs
+                    print(
+                        f"  - Using fallback: all {args.num_envs} envs get current policy"
+                    )
+                else:
+                    print(
+                        f"  - Assigned {len(opponent_for_offense)} opponents to {args.num_envs} parallel environments"
+                    )
+            else:
+                # Original behavior: sample one opponent for entire alternation
+                print(
+                    "\nLoading historical opponent policy (single policy for entire alternation)..."
+                )
+                opponent_for_offense = get_random_policy_from_artifacts(
+                    mlflow.tracking.MlflowClient(),
+                    run.info.run_id,
+                    "unified",
+                    opponent_cache_dir,
+                    K=args.opponent_pool_size,
+                    beta=args.opponent_pool_beta,
+                    uniform_eps=args.opponent_pool_exploration,
+                )
+                if opponent_for_offense is None:
+                    # Fallback: save current unified policy to a stable path
+                    fallback_path = os.path.join(
+                        opponent_cache_dir, "unified_latest.zip"
+                    )
+                    unified_policy.save(fallback_path)
+                    opponent_for_offense = fallback_path
+            # Log which opponent checkpoint(s) used this alternation
             try:
                 with tempfile.TemporaryDirectory() as _tmp_note_dir:
                     note_path = os.path.join(
                         _tmp_note_dir, f"opponent_alt_{global_alt}.txt"
                     )
                     with open(note_path, "w") as f:
-                        f.write(os.path.basename(str(opponent_for_offense)))
+                        if isinstance(opponent_for_offense, list):
+                            # Per-environment sampling mode
+                            f.write(
+                                f"Per-environment opponent sampling (geometric distribution):\n"
+                            )
+                            f.write(
+                                f"Parameters: K={args.opponent_pool_size}, beta={args.opponent_pool_beta}, eps={args.opponent_pool_exploration}\n"
+                            )
+                            f.write(f"\nEnvironment-to-Opponent Mapping:\n")
+
+                            # Count occurrences of each policy
+                            from collections import Counter
+
+                            policy_counts = Counter(
+                                os.path.basename(str(p)) for p in opponent_for_offense
+                            )
+
+                            # Log mapping
+                            for env_idx, policy_path in enumerate(opponent_for_offense):
+                                f.write(
+                                    f"  Env {env_idx:2d}: {os.path.basename(str(policy_path))}\n"
+                                )
+
+                            # Summary statistics
+                            f.write(f"\nSummary:\n")
+                            f.write(
+                                f"  Total environments: {len(opponent_for_offense)}\n"
+                            )
+                            f.write(f"  Unique policies: {len(policy_counts)}\n")
+                            f.write(f"\nPolicy Usage Counts:\n")
+                            for policy_name, count in sorted(
+                                policy_counts.items(), key=lambda x: x[1], reverse=True
+                            ):
+                                f.write(f"  {policy_name}: used by {count} env(s)\n")
+                        else:
+                            # Single opponent mode
+                            f.write(f"Single policy for all environments:\n")
+                            f.write(
+                                f"  {os.path.basename(str(opponent_for_offense))}\n"
+                            )
                     mlflow.log_artifact(note_path, artifact_path=f"opponents")
             except Exception:
                 pass
@@ -1408,6 +1594,29 @@ if __name__ == "__main__":
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
         help="Use deterministic opponent actions.",
+    )
+    parser.add_argument(
+        "--opponent-pool-size",
+        type=int,
+        default=10,
+        help="Number of recent checkpoints to keep in opponent pool (K parameter).",
+    )
+    parser.add_argument(
+        "--opponent-pool-beta",
+        type=float,
+        default=0.7,
+        help="Geometric decay factor for opponent sampling (0=uniform, 1=most recent only).",
+    )
+    parser.add_argument(
+        "--opponent-pool-exploration",
+        type=float,
+        default=0.15,
+        help="Probability of sampling from ALL history instead of just recent pool (0-1).",
+    )
+    parser.add_argument(
+        "--per-env-opponent-sampling",
+        action="store_true",
+        help="Sample different opponents for each parallel environment using geometric distribution (prevents forgetting). Each of the --num-envs workers independently samples from last K checkpoints with recency bias. Default: single opponent per alternation.",
     )
     # Dunk controls
     parser.add_argument(

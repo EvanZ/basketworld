@@ -19,14 +19,6 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
-  isEvaluating: {
-    type: Boolean,
-    default: false,
-  },
-  evalProgress: {
-    type: Number,
-    default: 0,
-  },
 });
 
 const emit = defineEmits(['update:activePlayerId']);
@@ -293,7 +285,7 @@ const playerTransitions = computed(() => {
     const previousGameState = props.gameHistory[step - 1];
     const currentGameState = props.gameHistory[step];
     // Opacity should match the destination ghost cell's opacity.
-    const opacity = 0.1 + (0.9 * (step - 1) / (props.gameHistory.length - 1));
+    const opacity = 0.1 + (0.2 * (step - 1) / (props.gameHistory.length - 1));
 
     for (let playerId = 0; playerId < currentGameState.positions.length; playerId++) {
       const prevPos = previousGameState.positions[playerId];
@@ -389,14 +381,14 @@ const playerTransitions = computed(() => {
         <g 
           v-for="(gameState, step) in gameHistory" 
           :key="`step-${step}`" 
-          :style="{ opacity: 0.1 + (0.9 * step / (gameHistory.length - 1)) }"
+          :style="{ opacity: 0.1 + (0.2 * step / (gameHistory.length - 1)) }"
         >
           <g v-for="player in getRenderablePlayers(gameState)" :key="player.id">
             <circle 
               v-if="step < gameHistory.length - 1"
               :cx="player.x" 
               :cy="player.y" 
-              :r="HEX_RADIUS * 0.6" 
+              :r="HEX_RADIUS * 0.8" 
               :class="player.isOffense ? 'player-offense' : 'player-defense'"
               class="ghost"
             />
@@ -432,7 +424,7 @@ const playerTransitions = computed(() => {
             <circle 
               :cx="player.x" 
               :cy="player.y" 
-              :r="HEX_RADIUS * 0.6" 
+              :r="HEX_RADIUS * 0.8" 
               :class="[
                 player.isOffense ? 'player-offense' : 'player-defense',
                 { 'active-player-hex': player.id === activePlayerId }
@@ -476,7 +468,7 @@ const playerTransitions = computed(() => {
               {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
             <!-- Ball handler indicator -->
-            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
+            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.9" class="ball-indicator" />
           </g>
         </g>
         
@@ -535,9 +527,6 @@ const playerTransitions = computed(() => {
     <div class="shot-clock-overlay">
       {{ currentGameState ? currentGameState.shot_clock : '' }}
     </div>
-    <div v-if="isEvaluating" class="eval-progress-bar">
-      <div class="eval-progress-fill" :style="{ width: evalProgress + '%' }"></div>
-    </div>
   </div>
 </template>
 
@@ -574,25 +563,6 @@ const playerTransitions = computed(() => {
   border: 1px solid #333;
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d; /* Glowing effect */
   pointer-events: none; /* Make it non-interactive */
-}
-
-.eval-progress-bar {
-  position: absolute;
-  bottom: -65px; /* Position below shot clock */
-  left: 50%;
-  transform: translateX(-50%);
-  width: 200px;
-  height: 8px;
-  background-color: #ddd;
-  border-radius: 4px;
-  overflow: hidden;
-  border: 1px solid #999;
-}
-
-.eval-progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #4CAF50 0%, #45a049 100%);
-  transition: width 0.3s ease;
 }
 
 /* Removed rotation; court now renders in original orientation */
