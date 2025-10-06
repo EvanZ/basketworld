@@ -67,6 +67,12 @@ def get_mlflow_params(
     optional["spawn_distance"] = _get_param(
         params, ["spawn_distance", "spawn-distance"], int, 3
     )
+    optional["max_spawn_distance"] = _get_param(
+        params,
+        ["max_spawn_distance", "max-spawn-distance"],
+        lambda v: None if v == "" or v == "None" else int(v),
+        None,
+    )
     optional["allow_dunks"] = _get_param(
         params,
         ["allow_dunks", "allow-dunks"],
@@ -185,5 +191,16 @@ def get_mlflow_params(
     )
     optional["steal_chance"] = _get_param(
         params, ["steal_chance", "steal-chance"], float, 0.05
+    )
+    # Pass parameters
+    optional["pass_arc_degrees"] = _get_param(
+        params, ["pass_arc_degrees", "pass-arc-degrees"], float, 60.0
+    )
+    optional["pass_oob_turnover_prob"] = _get_param(
+        params, ["pass_oob_turnover_prob", "pass-oob-turnover-prob"], float, 1.0
+    )
+    # Illegal action policy
+    optional["illegal_action_policy"] = _get_param(
+        params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
     )
     return required, optional

@@ -19,6 +19,14 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  isManualStepping: {
+    type: Boolean,
+    default: false,
+  },
+  isEvaluating: {
+    type: Boolean,
+    default: false,
+  },
   aiMode: {
     type: Boolean,
     default: false,
@@ -36,9 +44,14 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  // When provided (during manual stepping), use these stored policy probs instead of fetching
+  storedPolicyProbs: {
+    type: Object,
+    default: null,
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'play-again', 'self-play', 'move-recorded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded']);
 
 const selectedActions = ref({});
 
@@ -67,7 +80,8 @@ const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsSta
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 
-async function recordEpisodeStats(finalState) {
+async function recordEpisodeStats(finalState, skipApiCall = false) {
+  console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
   const shots = results?.shots || {};
@@ -104,18 +118,21 @@ async function recordEpisodeStats(finalState) {
   const tovCount = Array.isArray(results?.turnovers) ? results.turnovers.length : 0;
   statsState.value.turnovers += Number(tovCount || 0);
 
-  // Add episode reward for user's team
-  try {
-    const data = await getRewards();
-    const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
-    const userTeam = finalState?.user_team_name || 'OFFENSE';
-    statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
-    const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
-    statsState.value.episodeStepsSum += Number(steps || 0);
-  } catch (_) { /* ignore */ }
+  // Add episode reward for user's team (skip API call during batch evaluation)
+  if (!skipApiCall) {
+    try {
+      const data = await getRewards();
+      const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
+      const userTeam = finalState?.user_team_name || 'OFFENSE';
+      statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+      const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
+      statsState.value.episodeStepsSum += Number(steps || 0);
+    } catch (_) { /* ignore */ }
+  }
 
   // Increment episode count last
   statsState.value.episodes += 1;
+  console.log('[Stats] recordEpisodeStats completed - new episodes:', statsState.value.episodes);
   saveStats(statsState.value);
 }
 
@@ -173,7 +190,7 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown, submitActions });
+defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats, getSelectedActions });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -292,23 +309,41 @@ async function fetchAllActionValues() {
 
 // Watch for game state changes to fetch all action values when needed
 watch(() => props.gameState, async (newGameState) => {
-  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder);
+  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping);
+  
   if (newGameState && !newGameState.done) {
     // Fetch both action values and policy probabilities for AI mode
     try {
       console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
       await fetchAllActionValues();
-      console.log('[PlayerControls] Action values fetched, now fetching policy probabilities for ball holder:', newGameState.ball_holder);
-      await fetchPolicyProbabilities();
-      console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
+      
+      // Only fetch policy probabilities from API if NOT in manual stepping mode
+      if (!props.isManualStepping) {
+        console.log('[PlayerControls] Fetching policy probabilities from API for ball holder:', newGameState.ball_holder);
+        await fetchPolicyProbabilities();
+        console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
+      } else {
+        console.log('[PlayerControls] Skipping API fetch - in manual stepping mode, will use stored probs');
+      }
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
     }
   } else {
     console.log('[PlayerControls] Clearing AI data - no game state or game done');
     actionValues.value = null;
-    policyProbabilities.value = null;
+    // Don't clear policyProbabilities if in manual stepping mode (we're using stored ones)
+    if (!props.isManualStepping) {
+      policyProbabilities.value = null;
+    }
     valueRange.value = { min: 0, max: 0 };
+  }
+}, { immediate: true });
+
+// Watch for stored policy probs from parent (during manual stepping)
+watch(() => props.storedPolicyProbs, (newStoredProbs) => {
+  if (props.isManualStepping && newStoredProbs) {
+    console.log('[PlayerControls] Using stored policy probabilities from replay state:', JSON.stringify(newStoredProbs).substring(0, 150));
+    policyProbabilities.value = newStoredProbs;
   }
 }, { immediate: true });
 
@@ -418,10 +453,9 @@ function submitActions() {
   }
 }
 
-function triggerSelfPlay() {
-  // Emit current selections so the parent can use them for the first self-play step
-  const snapshot = { ...selectedActions.value };
-  emit('self-play', snapshot);
+function getSelectedActions() {
+  // Return current selections for parent to use
+  return { ...selectedActions.value };
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
@@ -617,9 +651,11 @@ onMounted(() => {
   fetchRewards();
 });
 
-// Record stats once on episode completion
+// Record stats once on episode completion (but skip during evaluation mode)
 watch(() => props.gameState?.done, async (done, prevDone) => {
-  if (done && !prevDone && props.gameState && !props.isReplaying) {
+  console.log('[Stats] Watch triggered - done:', done, 'prevDone:', prevDone, 'isReplaying:', props.isReplaying, 'isEvaluating:', props.isEvaluating);
+  if (done && !prevDone && props.gameState && !props.isReplaying && !props.isEvaluating) {
+    console.log('[Stats] Watch conditions met - recording stats from watch');
     try { await recordEpisodeStats(props.gameState); } catch (e) { console.warn('[Stats] record failed', e); }
   }
 });
@@ -648,6 +684,9 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
   }
 });
 
+import PhiShaping from './PhiShaping.vue';
+import { ref as vueRef } from 'vue';
+const phiRef = vueRef(null);
 </script>
 
 <template>
@@ -686,6 +725,12 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
       >
         Parameters
       </button>
+      <button 
+        :class="{ active: activeTab === 'phi' }"
+        @click="activeTab = 'phi'"
+      >
+        Phi Shaping
+      </button>
     </div>
 
     <!-- Controls Tab -->
@@ -719,22 +764,6 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
               Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
           </p>
       </div>
-
-      <button @click="submitActions" class="submit-button" :disabled="gameState.done">
-        {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
-      </button>
-      
-      <button 
-        @click="triggerSelfPlay" 
-        class="self-play-button"
-        :disabled="!aiMode || gameState.done"
-      >
-        Self-Play
-      </button>
-      
-      <button @click="$emit('play-again')" class="new-game-button">
-        New Game
-      </button>
     </div>
 
     <!-- Rewards Tab -->
@@ -786,6 +815,7 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
               <span>Off. Reason</span>
               <span>Defense</span>
               <span>Def. Reason</span>
+              <span>Φ Shape</span>
             </div>
             <div 
               v-for="reward in rewardHistory" 
@@ -801,6 +831,9 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
                 {{ reward.defense.toFixed(2) }}
               </span>
               <span class="reason-text">{{ reward.defense_reason }}</span>
+              <span :class="{ positive: (reward.phi_r_shape || 0) > 0, negative: (reward.phi_r_shape || 0) < 0 }">
+                {{ (reward.phi_r_shape || 0).toFixed(4) }}
+              </span>
             </div>
           </div>
         </div>
@@ -991,8 +1024,12 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
           <div class="param-category">
             <h5>Spawn Distance</h5>
             <div class="param-item">
-              <span class="param-name">Spawn distance:</span>
+              <span class="param-name">Min spawn distance:</span>
               <span class="param-value">{{ props.gameState.spawn_distance || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Max spawn distance:</span>
+              <span class="param-value">{{ props.gameState.max_spawn_distance ?? 'Unlimited' }}</span>
             </div>
           </div>
           <div class="param-category">
@@ -1016,6 +1053,26 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
           </div>
 
           <div class="param-category">
+            <h5>Pass & Action Policy</h5>
+            <div class="param-item">
+              <span class="param-name">Pass arc degrees:</span>
+              <span class="param-value">{{ props.gameState.pass_arc_degrees || 'N/A' }}°</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Pass OOB turnover prob:</span>
+              <span class="param-value">{{ props.gameState.pass_oob_turnover_prob != null ? (props.gameState.pass_oob_turnover_prob * 100).toFixed(0) + '%' : 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Pass logit bias:</span>
+              <span class="param-value">{{ props.gameState.pass_logit_bias != null ? props.gameState.pass_logit_bias.toFixed(2) : 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Illegal action policy:</span>
+              <span class="param-value">{{ props.gameState.illegal_action_policy || 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
             <h5>Team Configuration</h5>
             <div class="param-item">
               <span class="param-name">User team:</span>
@@ -1032,6 +1089,11 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- Phi Shaping Tab -->
+    <div v-if="activeTab === 'phi'" class="tab-content">
+      <PhiShaping ref="phiRef" :game-state="props.gameState" />
     </div>
   </div>
 </template>
@@ -1176,7 +1238,7 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
 
 .reward-header {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr;
+  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr 1fr;
   padding: 0.75rem;
   background-color: #f8f9fa;
   font-weight: bold;
@@ -1186,7 +1248,7 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
 
 .reward-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr;
+  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr 1fr;
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid #f1f3f4;
   text-align: center;
@@ -1224,63 +1286,6 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
   gap: 1rem;
 }
 
-.submit-button, .new-game-button {
-  padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  font-weight: bold;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s ease;
-  min-width: 120px;
-}
-
-.submit-button {
-  background-color: #28a745;
-  color: white;
-}
-
-.submit-button:disabled {
-  background-color: #6c757d;
-  cursor: not-allowed;
-}
-
-.submit-button:hover:not(:disabled) {
-  background-color: #218838;
-}
-
-.new-game-button {
-  background-color: #007bff;
-  color: white;
-}
-
-.new-game-button:hover {
-  background-color: #0056b3;
-}
-
-.self-play-button {
-  background-color: #6c757d;
-  color: white;
-  padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  font-weight: bold;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s ease;
-  min-width: 120px;
-}
-
-.self-play-button:hover:not(:disabled) {
-  background-color: #5a6268;
-}
-
-.self-play-button:disabled {
-  background-color: #e9ecef;
-  color: #6c757d;
-  cursor: not-allowed;
-  opacity: 0.6;
-}
 
 .disabled {
   opacity: 0.7;

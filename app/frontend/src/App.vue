@@ -1,10 +1,11 @@
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -19,9 +20,14 @@ const currentSelections = ref(null);
 const isSelfPlaying = ref(false);
 const canReplay = ref(false);
 const isReplaying = ref(false);
+// For manual stepping through replay
+const replayStates = ref([]);
+const currentStepIndex = ref(0);
+const isManualStepping = ref(false);
 // Force remount of PlayerControls to clear internal state between games
 const controlsKey = ref(0);
 const controlsRef = ref(null);
+const phiRef = vueRef(null);
 
 // AI Mode for pre-selecting actions, not automatic play
 const aiMode = ref(true);
@@ -30,26 +36,52 @@ const deterministic = ref(false);
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
 
+// Evaluation mode state
+const isEvaluating = ref(false);
+const evalNumEpisodes = ref(100);
+
 // Watch for when episodes end to stop auto-play behavior
-watch(gameState, async (newState) => {
-    if (newState && !newState.done) {
+watch(gameState, async (newState, oldState) => {
+    // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
+    if (newState && !newState.done && !isManualStepping.value) {
         try {
+            console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
             const response = await getPolicyProbs();
             policyProbs.value = response;
         } catch (err) {
             console.error('[App] Failed to fetch policy probs:', err);
         }
+    } else if (newState && !newState.done && isManualStepping.value) {
+        console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
     }
     // When an episode ends, disable AI mode to allow starting a new game
-    if (newState && newState.done) {
+    if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
         // Allow replay after any completed episode (manual or self-play)
         canReplay.value = true;
+        // Automatically load episode for manual stepping (with small delay and error handling)
+        setTimeout(async () => {
+            try {
+                await handleManualReplay();
+            } catch (err) {
+                console.error('[App] Failed to auto-load episode for stepping:', err);
+                // Don't show alert here since it's automatic - just log the error
+            }
+        }, 100);
     }
 });
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
+  
+  // Preserve phi shaping parameters (always try to save them, not just when gameState exists)
+  let savedPhiParams = null;
+  try {
+    savedPhiParams = await getPhiParams();
+    console.log('[App] Saved phi shaping params for new game:', savedPhiParams);
+  } catch (err) {
+    console.warn('[App] Could not save phi params:', err);
+  }
   
   // Clear move history for new game
   moveHistory.value = [];
@@ -60,6 +92,10 @@ async function handleGameStarted(setupData) {
   controlsKey.value += 1;
   // Reset replay availability for a fresh episode
   canReplay.value = false;
+  // Reset manual stepping state
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
   
   // Start loading BEFORE clearing state to avoid interim UI flicker
   isLoading.value = true;
@@ -79,6 +115,16 @@ async function handleGameStarted(setupData) {
       setupData.unifiedPolicyName ?? null,
       setupData.opponentUnifiedPolicyName ?? null,
     );
+    
+    // Restore phi shaping parameters if we had them
+    if (savedPhiParams && response.status === 'success') {
+      try {
+        await setPhiParams(savedPhiParams);
+        console.log('[App] Restored phi shaping params:', savedPhiParams);
+      } catch (err) {
+        console.warn('[App] Could not restore phi params:', err);
+      }
+    }
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
@@ -101,6 +147,7 @@ async function handleActionsSubmitted(actions) {
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
+      try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
     } else {
       throw new Error(response.message || 'Failed to process step.');
     }
@@ -113,6 +160,13 @@ async function handleActionsSubmitted(actions) {
 function handleMoveRecorded(moveData) {
     console.log('[App] Recording move:', moveData);
     moveHistory.value.push(moveData);
+}
+
+// Handler for Self-Play button click
+function handleSelfPlayButton() {
+  // Get current selections from PlayerControls
+  const preselected = controlsRef.value?.getSelectedActions?.() || null;
+  handleSelfPlay(preselected);
 }
 
 // New function for self-play mode (runs full episode)
@@ -225,6 +279,7 @@ async function handleSelfPlay(preselected = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(response.state);
+        try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
         // Small delay to make the progression visible
         await new Promise(resolve => setTimeout(resolve, 100));
       } else {
@@ -242,6 +297,70 @@ async function handleSelfPlay(preselected = null) {
   canReplay.value = true;
 }
 
+async function handleEvaluation() {
+  if (!gameState.value || isEvaluating.value) return;
+  
+  const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 10000));
+  
+  // Reset stats at the beginning
+  console.log('[App] Resetting stats before evaluation');
+  if (controlsRef.value?.resetStats) {
+    controlsRef.value.resetStats();
+  }
+  
+  // Set UI state immediately to show we're evaluating
+  isEvaluating.value = true;
+  error.value = null;
+  
+  // Give UI a chance to update before blocking on API call
+  await nextTick();
+  
+  try {
+    console.log(`[App] Starting evaluation: ${numEpisodes} episodes, deterministic=${deterministic.value}`);
+    
+    // Run evaluation on backend (this will block until all episodes complete)
+    const response = await runEvaluation(numEpisodes, deterministic.value);
+    
+    if (response.status === 'success' && Array.isArray(response.results)) {
+      console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
+      
+      // Process all episode results and update stats immediately
+      let lastEpisodeState = null;
+      
+      for (const result of response.results) {
+        // Save the last episode state for display
+        lastEpisodeState = result.final_state;
+        
+        // Record stats for this episode (skip API calls for speed)
+        if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
+          await controlsRef.value.recordEpisodeStats(result.final_state, true);
+        }
+      }
+      
+      console.log('[App] All stats recorded');
+      
+      // Now update the game state AFTER recording all stats
+      if (lastEpisodeState) {
+        console.log('[App] Updating gameState to show last episode (isEvaluating still true)');
+        gameState.value = lastEpisodeState;
+        gameHistory.value = [lastEpisodeState];
+        
+        // Wait for Vue to process all reactive updates (including watchers) before setting isEvaluating to false
+        await nextTick();
+        console.log('[App] nextTick completed, watchers should have run with isEvaluating=true');
+      }
+    } else {
+      throw new Error('Invalid evaluation response');
+    }
+  } catch (err) {
+    error.value = `Evaluation failed: ${err.message}`;
+    console.error('[App] Evaluation error:', err);
+  } finally {
+    console.log('[App] Setting isEvaluating to false');
+    isEvaluating.value = false;
+  }
+}
+
 async function handleSaveEpisode() {
   try {
     const res = await saveEpisode();
@@ -257,6 +376,7 @@ async function handleReplay() {
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
       // Animate the replay so it is visible in the UI
       isReplaying.value = true;
+      isManualStepping.value = false;
       gameHistory.value = [];
       for (const s of res.states) {
         gameState.value = s;
@@ -266,11 +386,113 @@ async function handleReplay() {
         await new Promise(resolve => setTimeout(resolve, 300));
       }
       isReplaying.value = false;
+      // After animated replay, reload for manual stepping (keep showing final state)
+      await handleManualReplay(false, true);
     } else {
       throw new Error('Invalid replay response');
     }
   } catch (e) {
     alert(`Failed to replay episode: ${e.message}`);
+  }
+}
+
+async function handleManualReplay(showAlert = false, keepCurrentView = true) {
+  try {
+    const res = await replayLastEpisode();
+    if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
+      // Store states for manual stepping
+      replayStates.value = res.states;
+      isManualStepping.value = true;
+      
+      // Debug: check if policy probs are stored
+      console.log('[handleManualReplay] First state has policy_probabilities:', !!res.states[0].policy_probabilities);
+      console.log('[handleManualReplay] Last state has policy_probabilities:', !!res.states[res.states.length - 1].policy_probabilities);
+      if (res.states[0].policy_probabilities) {
+        console.log('[handleManualReplay] Sample first state probs:', JSON.stringify(res.states[0].policy_probabilities).substring(0, 200));
+      }
+      if (res.states.length > 1 && res.states[1].policy_probabilities) {
+        console.log('[handleManualReplay] Sample second state probs:', JSON.stringify(res.states[1].policy_probabilities).substring(0, 200));
+      }
+      
+      if (keepCurrentView) {
+        // Keep showing current state (usually the final state), start from end
+        currentStepIndex.value = res.states.length - 1;
+        // Load policy probs from the final state
+        if (res.states[res.states.length - 1].policy_probabilities) {
+          policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
+        } else {
+          policyProbs.value = null;
+          console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
+        }
+        // Keep current gameState and gameHistory as-is
+      } else {
+        // Reset to beginning
+        currentStepIndex.value = 0;
+        gameState.value = res.states[0];
+        gameHistory.value = [res.states[0]];
+        // Load policy probs from the first state
+        if (res.states[0].policy_probabilities) {
+          policyProbs.value = res.states[0].policy_probabilities;
+        } else {
+          policyProbs.value = null;
+          console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
+        }
+      }
+    } else {
+      throw new Error('Invalid replay response');
+    }
+  } catch (e) {
+    console.error('[App] Failed to load episode for manual stepping:', e);
+    if (showAlert) {
+      alert(`Failed to load episode for manual stepping: ${e.message}`);
+    }
+    throw e; // Re-throw so caller knows it failed
+  }
+}
+
+function stepForward() {
+  if (!isManualStepping.value || replayStates.value.length === 0) return;
+  if (currentStepIndex.value < replayStates.value.length - 1) {
+    currentStepIndex.value += 1;
+    const currentState = replayStates.value[currentStepIndex.value];
+    
+    // Update policy probabilities BEFORE gameState to avoid race conditions
+    if (currentState.policy_probabilities) {
+      console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
+      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+    } else {
+      console.warn(`[stepForward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
+      policyProbs.value = null;
+    }
+    
+    // Then update gameState and history
+    gameState.value = currentState;
+    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    
+    console.log(`[stepForward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
+  }
+}
+
+function stepBackward() {
+  if (!isManualStepping.value || replayStates.value.length === 0) return;
+  if (currentStepIndex.value > 0) {
+    currentStepIndex.value -= 1;
+    const currentState = replayStates.value[currentStepIndex.value];
+    
+    // Update policy probabilities BEFORE gameState to avoid race conditions
+    if (currentState.policy_probabilities) {
+      console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
+      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+    } else {
+      console.warn(`[stepBackward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
+      policyProbs.value = null;
+    }
+    
+    // Then update gameState and history
+    gameState.value = currentState;
+    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    
+    console.log(`[stepBackward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -282,6 +504,10 @@ function handlePlayAgain() {
   currentSelections.value = null;
   isSelfPlaying.value = false;
   controlsKey.value += 1;
+  // Reset manual stepping state
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
   if (initialSetup.value) {
     handleGameStarted(initialSetup.value);
   }
@@ -310,7 +536,7 @@ function onKeydown(e) {
     if (initialSetup.value) handleGameStarted(initialSetup.value);
   } else if (key === 'p') {
     // Self-Play
-    if (gameState.value && !gameState.value.done) handleSelfPlay();
+    if (gameState.value && !gameState.value.done) handleSelfPlayButton();
   } else if (key === 's') {
     // Save Episode
     if (gameState.value?.done) handleSaveEpisode();
@@ -326,6 +552,12 @@ function onKeydown(e) {
   } else if (key === 't') {
     // Submit Turn
     try { controlsRef.value?.submitActions?.(); } catch (_) {}
+  } else if (key === 'arrowright') {
+    // Step forward in manual replay
+    if (isManualStepping.value) stepForward();
+  } else if (key === 'arrowleft') {
+    // Step backward in manual replay
+    if (isManualStepping.value) stepBackward();
   }
 }
 
@@ -364,6 +596,33 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
+    <div v-if="gameState && !gameState.done && !isSelfPlaying" class="eval-controls">
+      <div class="eval-controls-row">
+        <input 
+          type="number" 
+          v-model.number="evalNumEpisodes" 
+          min="1" 
+          max="10000" 
+          class="eval-input"
+          :disabled="isEvaluating"
+          placeholder="Num episodes"
+        />
+        <button 
+          @click="handleEvaluation" 
+          class="eval-button"
+          :disabled="isEvaluating || isSelfPlaying"
+        >
+          {{ isEvaluating ? 'Evaluating...' : 'Eval' }}
+        </button>
+        <span v-if="isEvaluating" class="eval-status">
+          Running {{ evalNumEpisodes }} episodes...
+        </span>
+      </div>
+      <div v-if="isEvaluating" class="eval-progress-bar">
+        <div class="eval-progress-fill indeterminate"></div>
+      </div>
+    </div>
+
     <div v-if="gameState" class="game-container">
       <div class="board-area">
         <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
@@ -371,7 +630,9 @@ onBeforeUnmount(() => {
           :game-history="gameHistory" 
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
+          :is-manual-stepping="isManualStepping"
         />
+        <KeyboardLegend />
       </div>
       <div class="controls-area">
         <PlayerControls 
@@ -380,25 +641,65 @@ onBeforeUnmount(() => {
             v-model:activePlayerId="activePlayerId"
             :disabled="false"
             :is-replaying="isReplaying"
+            :is-manual-stepping="isManualStepping"
+            :is-evaluating="isEvaluating"
+            :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
             :deterministic="deterministic"
             :move-history="moveHistory"
             :external-selections="isSelfPlaying ? currentSelections : null"
             @actions-submitted="handleActionsSubmitted" 
-            @play-again="handlePlayAgain"
-            @self-play="handleSelfPlay"
             @move-recorded="handleMoveRecorded"
             ref="controlsRef"
         />
 
-        <button v-if="gameState.done" @click="handleSaveEpisode" class="save-episode-button">
+        <div class="action-buttons">
+          <button 
+            @click="controlsRef?.submitActions?.()" 
+            class="action-button submit-button" 
+            :disabled="gameState.done"
+          >
+            {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
+          </button>
+          
+          <button 
+            @click="handleSelfPlayButton" 
+            class="action-button self-play-button"
+            :disabled="!aiMode || gameState.done"
+          >
+            Self-Play
+          </button>
+          
+          <button 
+            @click="handlePlayAgain" 
+            class="action-button new-game-button"
+          >
+            New Game
+          </button>
+        </div>
+
+        <button v-if="gameState.done || isManualStepping" @click="handleSaveEpisode" class="save-episode-button">
           Save Episode
         </button>
-        <button v-if="gameState.done && canReplay" @click="handleReplay" class="save-episode-button" style="margin-left: 0.5rem;">
-          <font-awesome-icon :icon="['fas', 'redo']" />
-        </button>
+        
+        <div v-if="isManualStepping && canReplay" class="replay-controls">
+          <button @click="handleReplay" class="replay-button" title="Replay (animated)">
+            <font-awesome-icon :icon="['fas', 'redo']" />
+          </button>
+          
+          <div class="step-controls-inline">
+            <button @click="stepBackward" class="step-button" :disabled="currentStepIndex === 0" title="Step back (← arrow)">
+              <font-awesome-icon :icon="['fas', 'chevron-left']" />
+            </button>
+            <span class="step-indicator">
+              {{ currentStepIndex + 1 }} / {{ replayStates.length }}
+            </span>
+            <button @click="stepForward" class="step-button" :disabled="currentStepIndex === replayStates.length - 1" title="Step forward (→ arrow)">
+              <font-awesome-icon :icon="['fas', 'chevron-right']" />
+            </button>
+          </div>
+        </div>
 
-        <KeyboardLegend />
       </div>
     </div>
   </main>
@@ -443,6 +744,91 @@ header {
 .toggle-label {
   font-weight: 500;
 }
+
+.eval-controls {
+  text-align: center;
+  margin-bottom: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.eval-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.eval-input {
+  width: 100px;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 1rem;
+}
+
+.eval-button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #4CAF50;
+  color: white;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.eval-button:hover:not(:disabled) {
+  background: #45a049;
+}
+
+.eval-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: #999;
+}
+
+.eval-status {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #333;
+}
+
+.eval-progress-bar {
+  width: 300px;
+  height: 8px;
+  background-color: #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid #999;
+}
+
+.eval-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50 0%, #45a049 100%);
+  transition: width 0.3s ease;
+}
+
+.eval-progress-fill.indeterminate {
+  animation: indeterminate-progress 1.5s ease-in-out infinite;
+}
+
+@keyframes indeterminate-progress {
+  0% {
+    transform: translateX(-100%);
+    width: 30%;
+  }
+  50% {
+    transform: translateX(250%);
+  }
+  100% {
+    transform: translateX(-100%);
+    width: 30%;
+  }
+}
 .game-container {
   display: flex;
   flex-direction: row; /* Changed to row */
@@ -456,7 +842,7 @@ header {
   flex-direction: column;
   align-items: center;
   flex: 1;
-  min-width: 0; /* allow flex child to shrink properly */
+  min-width: 640; /* allow flex child to shrink properly */
 }
 
 .run-title {
@@ -467,12 +853,126 @@ header {
 }
 
 .controls-area {
-  width: 400px; /* Give the controls area a fixed width */
-  flex-shrink: 0; /* Prevent the controls area from shrinking */
+  min-width: 400px; /* Give the controls area a fixed width */
+  display: flex;
+  flex: 1.5;
+  flex-direction: column;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.action-button {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.action-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.submit-button {
+  background: #007bff;
+  color: white;
+}
+
+.submit-button:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.self-play-button {
+  background: #28a745;
+  color: white;
+}
+
+.self-play-button:hover:not(:disabled) {
+  background: #218838;
+}
+
+.new-game-button {
+  background: orange;
+  color: white;
+}
+
+.new-game-button:hover {
+  background: #5a6268;
 }
 
 .save-episode-button {
   margin-top: 1rem;
   padding: 0.5rem 1rem;
+}
+
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+}
+
+.replay-button {
+  padding: 0.5rem 1rem;
+  font-size: 1.1rem;
+  background: #4CAF50;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.replay-button:hover {
+  background: #45a049;
+}
+
+.step-controls-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.step-button {
+  padding: 0.5rem 0.75rem;
+  font-size: 1.2rem;
+  background: #2196F3;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+  min-width: 40px;
+}
+
+.step-button:hover:not(:disabled) {
+  background: #1976D2;
+}
+
+.step-button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.step-indicator {
+  font-weight: 600;
+  font-size: 1rem;
+  color: #333;
+  min-width: 60px;
+  text-align: center;
 }
 </style>

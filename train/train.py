@@ -18,7 +18,22 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.mlflow_logger import MLflowWriter
-from basketworld.utils.callbacks import RolloutUpdateTimingCallback
+from basketworld.utils.callbacks import (
+    RolloutUpdateTimingCallback,
+    MLflowCallback,
+    EntropyScheduleCallback,
+    EntropyExpScheduleCallback,
+    PotentialBetaExpScheduleCallback,
+    PassLogitBiasExpScheduleCallback,
+    PassCurriculumExpScheduleCallback,
+    EpisodeSampleLogger,
+)
+from basketworld.utils.schedule_state import (
+    save_schedule_metadata,
+    load_schedule_metadata,
+    calculate_continued_total_timesteps,
+)
+from basketworld.utils.policies import PassBiasMultiInputPolicy
 
 from basketworld.utils.evaluation_helpers import (
     get_outcome_category,
@@ -34,10 +49,20 @@ import tempfile
 import random
 from typing import Optional
 import torch
+import gc
+import time
 
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
+from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
+from basketworld.utils.action_resolution import IllegalActionStrategy
+from basketworld.utils.wrappers import (
+    RewardAggregationWrapper,
+    EpisodeStatsWrapper,
+    BetaSetterWrapper,
+)
+import csv
 
 # --- CPU thread caps to avoid oversubscription in parallel env workers ---
 # These defaults can be overridden by user environment.
@@ -67,485 +92,11 @@ def get_device(device_arg):
         return torch.device(device_arg)
 
 
-# Device will be set in main() after parsing args
-
-
 def linear_schedule(start, end):
     def f(progress_remaining: float):
         return end + (start - end) * progress_remaining
 
     return f
-
-
-# --- Custom MLflow Callback ---
-
-
-class MLflowCallback(BaseCallback):
-    """
-    A custom callback for logging metrics to MLflow.
-    This callback logs the mean reward and episode length periodically.
-    """
-
-    def __init__(self, team_name: str, log_freq: int = 2048, verbose=0):
-        super(MLflowCallback, self).__init__(verbose)
-        self.team_name = team_name
-        self.log_freq = log_freq
-
-    def _on_step(self) -> bool:
-        # Log metrics periodically to avoid performance overhead
-        if self.n_calls % self.log_freq == 0:
-            # The ep_info_buffer contains info from the last 100 episodes
-            if self.model.ep_info_buffer:
-                # Use the current model's timesteps as global step
-                global_step = self.model.num_timesteps
-
-                # Calculate the mean reward and length
-                ep_rew_mean = np.mean(
-                    [ep_info.get("r", 0.0) for ep_info in self.model.ep_info_buffer]
-                )
-                ep_len_mean = np.mean(
-                    [ep_info.get("l", 0.0) for ep_info in self.model.ep_info_buffer]
-                )
-
-                # Optional shot/pass metrics if present in episode infos
-                def mean_key(key: str, default: float = 0.0):
-                    vals = [
-                        ep.get(key) for ep in self.model.ep_info_buffer if key in ep
-                    ]
-                    return float(np.mean(vals)) if vals else default
-
-                shot_dunk_pct = mean_key("shot_dunk")
-                shot_2pt_pct = mean_key("shot_2pt")
-                shot_3pt_pct = mean_key("shot_3pt")
-                asst_dunk_pct = mean_key("assisted_dunk")
-                asst_2pt_pct = mean_key("assisted_2pt")
-                asst_3pt_pct = mean_key("assisted_3pt")
-                passes_avg = mean_key("passes")
-                turnover_pct = mean_key("turnover")
-
-                # PPP per episode: (2*made_2pt + 3*made_3pt + 2*made_dunk) / (attempts + turnovers)
-                def mean_ppp(default: float = 0.0):
-                    numer = []
-                    denom = []
-                    for ep in self.model.ep_info_buffer:
-                        m2 = float(ep.get("made_2pt", 0.0))
-                        m3 = float(ep.get("made_3pt", 0.0))
-                        md = float(ep.get("made_dunk", 0.0))
-                        att = float(ep.get("attempts", 0.0))
-                        tov = float(ep.get("turnover", 0.0))
-                        n = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
-                        d = max(
-                            1.0, att + tov
-                        )  # avoid div-by-zero; count turnovers as possessions
-                        numer.append(n / d)
-                        denom.append(1.0)
-                    return float(np.mean(numer)) if numer else default
-
-                ppp_avg = mean_ppp()
-
-                # Log to MLflow
-                mlflow.log_metric(
-                    f"{self.team_name} Mean Episode Reward",
-                    ep_rew_mean,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Mean Episode Length",
-                    ep_len_mean,
-                    step=global_step,
-                )
-                # Entropy coefficient (supports constant or schedule)
-                try:
-                    total_ts = getattr(self.model, "_total_timesteps", None)
-                    if callable(getattr(self.model, "ent_coef", None)):
-                        # Approximate current progress remaining consistent with SB3 definition
-                        progress_remaining = 1.0
-                        if total_ts and total_ts > 0:
-                            progress_remaining = max(
-                                0.0,
-                                min(
-                                    1.0,
-                                    1.0 - (self.model.num_timesteps / float(total_ts)),
-                                ),
-                            )
-                        current_ent_coef = float(
-                            self.model.ent_coef(progress_remaining)
-                        )
-                    else:
-                        current_ent_coef = float(getattr(self.model, "ent_coef", 0.0))
-                    mlflow.log_metric(
-                        f"{self.team_name} Entropy Coef",
-                        current_ent_coef,
-                        step=global_step,
-                    )
-                except Exception:
-                    pass
-                # Distributions
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct Dunk", shot_dunk_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct 2PT", shot_2pt_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} ShotPct 3PT", shot_3pt_pct, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct Dunk",
-                    asst_dunk_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct 2PT",
-                    asst_2pt_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Assist ShotPct 3PT",
-                    asst_3pt_pct,
-                    step=global_step,
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} Passes / Episode", passes_avg, step=global_step
-                )
-                mlflow.log_metric(
-                    f"{self.team_name} TurnoverPct", turnover_pct, step=global_step
-                )
-                mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
-        return True
-
-
-# --- Entropy Schedule Callback ---
-
-
-class EntropyScheduleCallback(BaseCallback):
-    """Linearly decay entropy coefficient from start to end across the entire run.
-
-    This uses the cumulative `self.model.num_timesteps` and a provided
-    `total_planned_timesteps` to compute global progress, then updates
-    `self.model.ent_coef` in-place so the change persists across segments.
-    """
-
-    def __init__(self, start: float, end: float, total_planned_timesteps: int):
-        super().__init__()
-        self.start = float(start)
-        self.end = float(end)
-        self.total = int(max(1, total_planned_timesteps))
-
-    def _on_step(self) -> bool:
-        try:
-            t = int(getattr(self.model, "num_timesteps", 0))
-            progress = min(1.0, max(0.0, t / float(self.total)))
-            current = self.end + (self.start - self.end) * (1.0 - progress)
-            # Update the algorithm's entropy coefficient
-            self.model.ent_coef = float(current)
-        except Exception:
-            pass
-        return True
-
-
-class EntropyExpScheduleCallback(BaseCallback):
-    """Exponential (log-linear) decay of entropy coef with optional per-alternation bump.
-
-    Schedule: ent(progress) = end * (start / end) ** (1 - progress)
-    where progress = timesteps / total_planned_timesteps in [0,1].
-
-    Bump: At the start of each alternation segment, call `start_new_alternation()`
-    to apply a temporary multiplier to the scheduled entropy for the next
-    `bump_updates` PPO updates (one update per rollout segment).
-    """
-
-    def __init__(
-        self,
-        start: float,
-        end: float,
-        total_planned_timesteps: int,
-        bump_updates: int = 0,
-        bump_multiplier: float = 1.0,
-    ):
-        super().__init__()
-        self.start = float(max(1e-12, start))
-        self.end = float(max(1e-12, end))
-        self.total = int(max(1, total_planned_timesteps))
-        self.bump_updates = int(max(0, bump_updates))
-        self.bump_multiplier = float(max(1.0, bump_multiplier))
-        self._bump_updates_remaining = 0
-
-    def start_new_alternation(self):
-        self._bump_updates_remaining = self.bump_updates
-
-    def _scheduled_value(self, t: int) -> float:
-        progress = min(1.0, max(0.0, t / float(self.total)))
-        # Log-linear interpolation between start and end hitting end at progress=1 exactly
-        ratio = self.start / self.end
-        current = self.end * (ratio ** (1.0 - progress))
-        return float(current)
-
-    def _apply_current(self):
-        try:
-            t = int(getattr(self.model, "num_timesteps", 0))
-            current = self._scheduled_value(t)
-            if self._bump_updates_remaining > 0:
-                current = float(current * self.bump_multiplier)
-            self.model.ent_coef = float(current)
-        except Exception:
-            pass
-
-    def _on_training_start(self) -> None:
-        self._apply_current()
-
-    def _on_rollout_start(self) -> None:
-        # Ensure ent coef is set before update happens after rollout
-        self._apply_current()
-
-    def _on_rollout_end(self) -> None:
-        # One rollout finished -> one PPO update will follow; reduce bump if active
-        if self._bump_updates_remaining > 0:
-            self._bump_updates_remaining -= 1
-        # Also refresh current value after potential bump decrement
-        self._apply_current()
-
-    def _on_step(self) -> bool:
-        # Keep it updated during collection too (harmless)
-        self._apply_current()
-        return True
-
-
-# --- Custom Reward Wrapper for Multi-Agent Aggregation ---
-
-
-class RewardAggregationWrapper(gym.Wrapper):
-    """
-    A wrapper to aggregate multi-agent rewards for the Monitor wrapper.
-    It sums the rewards of the team currently being trained.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-
-    def step(self, action):
-        obs, rewards, done, truncated, info = self.env.step(action)
-
-        # Determine which player IDs belong to the training team
-        if self.env.unwrapped.training_team == Team.OFFENSE:
-            training_player_ids = self.env.unwrapped.offense_ids
-        else:
-            training_player_ids = self.env.unwrapped.defense_ids
-
-        # Sum the rewards for only the players on the training team
-        aggregated_reward = sum(rewards[i] for i in training_player_ids)
-
-        return obs, aggregated_reward, done, truncated, info
-
-
-# --- Episode Statistics Wrapper ---
-class EpisodeStatsWrapper(gym.Wrapper):
-    """Track per-episode shot/pass distributions and expose via info['episode'].
-
-    - shot_dunk/shot_2pt/shot_3pt: 1.0 if that shot type occurred in the episode, else 0.0
-    - assisted_dunk/assisted_2pt/assisted_3pt: 1.0 if the made shot in that type was assisted
-    - passes: total number of pass attempts in the episode
-    """
-
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-        self._reset_stats()
-
-    def _reset_stats(self):
-        self._passes = 0
-        self._shot_dunk = 0.0
-        self._shot_2pt = 0.0
-        self._shot_3pt = 0.0
-        self._asst_dunk = 0.0
-        self._asst_2pt = 0.0
-        self._asst_3pt = 0.0
-        self._turnover = 0.0
-        # For PPP computation: made buckets and attempts
-        self._made_dunk = 0.0
-        self._made_2pt = 0.0
-        self._made_3pt = 0.0
-        self._attempts = 0.0
-
-    def reset(self, **kwargs):  # type: ignore[override]
-        self._reset_stats()
-        return self.env.reset(**kwargs)
-
-    def step(self, action):  # type: ignore[override]
-        obs, reward, done, truncated, info = self.env.step(action)
-        try:
-            ar = info.get("action_results", {}) if info else {}
-            # Pass attempts
-            if ar.get("passes"):
-                self._passes += int(len(ar["passes"]))
-
-            # Shots happen at episode end in this env
-            if ar.get("shots"):
-                # Assume single shot per episode
-                shot_res = list(ar["shots"].values())[0]
-                # Determine distance category using env to avoid stale data
-                shooter_id = int(list(ar["shots"].keys())[0])
-                shooter_pos = self.env.unwrapped.positions[shooter_id]
-                dist = self.env.unwrapped._hex_distance(
-                    shooter_pos, self.env.unwrapped.basket_position
-                )
-                is_dunk = dist == 0
-                is_three = dist >= getattr(
-                    self.env.unwrapped, "three_point_distance", 4
-                )
-                self._attempts = 1.0
-                if is_dunk:
-                    self._shot_dunk = 1.0
-                    if shot_res.get("success"):
-                        self._made_dunk = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_dunk = 1.0
-                elif is_three:
-                    self._shot_3pt = 1.0
-                    if shot_res.get("success"):
-                        self._made_3pt = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_3pt = 1.0
-                else:
-                    self._shot_2pt = 1.0
-                    if shot_res.get("success"):
-                        self._made_2pt = 1.0
-                    if shot_res.get("assist_full") and shot_res.get("success"):
-                        self._asst_2pt = 1.0
-            elif ar.get("turnovers"):
-                # Episode ends via turnover
-                self._turnover = 1.0
-        except Exception:
-            pass
-
-        if done and info is not None:
-            # Expose stats as top-level info keys; Monitor(info_keywords=...) will include them in episode info
-            info["shot_dunk"] = self._shot_dunk
-            info["shot_2pt"] = self._shot_2pt
-            info["shot_3pt"] = self._shot_3pt
-            info["assisted_dunk"] = self._asst_dunk
-            info["assisted_2pt"] = self._asst_2pt
-            info["assisted_3pt"] = self._asst_3pt
-            info["passes"] = float(self._passes)
-            info["turnover"] = self._turnover
-            info["made_dunk"] = self._made_dunk
-            info["made_2pt"] = self._made_2pt
-            info["made_3pt"] = self._made_3pt
-            info["attempts"] = self._attempts
-        return obs, reward, done, truncated, info
-
-
-# --- Custom Environment Wrapper for Self-Play ---
-
-
-class SelfPlayEnvWrapper(gym.Wrapper):
-    """
-    A wrapper that manages the opponent's policy in a self-play setup.
-
-    When the learning agent takes a step, this wrapper intercepts the action,
-    gets an action from the frozen opponent policy, combines them, and passes
-    the full action to the underlying environment.
-    """
-
-    def __init__(self, env, opponent_policy, deterministic_opponent: bool = False):
-        super().__init__(env)
-        self.opponent_policy = opponent_policy
-        self.deterministic_opponent = bool(deterministic_opponent)
-        self._set_team_ids()
-
-    def _set_team_ids(self):
-        """Determine which player IDs belong to the training team and opponent."""
-        if self.env.unwrapped.training_team == Team.OFFENSE:
-            self.training_player_ids = self.env.unwrapped.offense_ids
-            self.opponent_player_ids = self.env.unwrapped.defense_ids
-        else:
-            self.training_player_ids = self.env.unwrapped.defense_ids
-            self.opponent_player_ids = self.env.unwrapped.offense_ids
-
-    def reset(self, **kwargs):
-        """Reset the environment and store the initial observation."""
-        obs, info = self.env.reset(**kwargs)
-        self.last_obs = obs
-        return obs, info
-
-    def step(self, action):
-        """
-        Take a step in the environment.
-        'action' comes from the learning agent and is for ALL players.
-        We replace the opponent's actions with predictions from the frozen policy.
-        """
-        # Get action from the frozen opponent policy using the last observation
-        # IMPORTANT: Flip the unified role flag for the opponent, so it
-        # conditions on the opposite role (defense vs offense). The role flag
-        # is now provided as a separate observation key `role_flag` (shape (1,)).
-        opponent_obs = self.last_obs
-        try:
-            # Create a shallow copy of the dict to avoid mutating self.last_obs
-            opponent_obs = {
-                "obs": np.copy(self.last_obs["obs"]),
-                "action_mask": self.last_obs["action_mask"],
-                "role_flag": np.copy(self.last_obs.get("role_flag")),
-                "skills": np.copy(self.last_obs.get("skills")),
-            }
-            # Flip role flag 1.0 <-> 0.0
-            if opponent_obs.get("role_flag") is not None:
-                opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
-        except Exception:
-            # If anything goes wrong, fall back to original observation
-            opponent_obs = self.last_obs
-
-        opponent_action_raw, _ = self.opponent_policy.predict(
-            opponent_obs, deterministic=self.deterministic_opponent
-        )
-        action_mask = self.last_obs["action_mask"]
-
-        # Combine the actions, ensuring the opponent's actions are legal
-        full_action = np.zeros(self.env.unwrapped.n_players, dtype=int)
-        for i in range(self.env.unwrapped.n_players):
-            if i in self.training_player_ids:
-                full_action[i] = action[i]
-            else:  # This is an opponent player
-                predicted_action = opponent_action_raw[i]
-                # Enforce the action mask for the opponent
-                if action_mask[i][predicted_action] == 1:
-                    full_action[i] = predicted_action
-                else:
-                    # Fallback: pick the first legal action for this player
-                    legal_indices = np.where(action_mask[i] == 1)[0]
-                    full_action[i] = (
-                        int(legal_indices[0]) if len(legal_indices) > 0 else 0
-                    )
-
-        # Step the underlying environment with the combined action
-        obs, reward, done, truncated, info = self.env.step(full_action)
-
-        # Store the latest observation for the opponent's next decision
-        self.last_obs = obs
-
-        return obs, reward, done, truncated, info
-
-
-class FrozenPolicyProxy:
-    """Picklable proxy that loads a PPO policy from a local .zip path on first use.
-
-    This avoids passing non-picklable PPO instances into subprocess workers.
-    """
-
-    def __init__(self, policy_path: str, device: torch.device | str = "cpu"):
-        self.policy_path = str(policy_path)
-        # Store a string for device to keep picklable
-        self.device = str(device) if isinstance(device, torch.device) else device
-        self._policy = None
-
-    def _ensure_loaded(self):
-        if self._policy is None:
-            self._policy = PPO.load(self.policy_path, device=self.device)
-
-    def predict(self, obs, deterministic: bool = False):
-        self._ensure_loaded()
-        return self._policy.predict(obs, deterministic=deterministic)
-
-
-# --- Main Training Logic ---
 
 
 def sample_geometric(indices: list[int], beta: float) -> int:
@@ -563,9 +114,9 @@ def get_random_policy_from_artifacts(
     run_id,
     model_prefix,
     tmpdir,
-    K: int = 20,
+    K: int = 10,
     beta: float = 0.8,
-    uniform_eps: float = 0.10,
+    uniform_eps: float = 0.0,
 ):
     """Sample an opponent checkpoint using a geometric decay over recent K snapshots.
 
@@ -614,6 +165,89 @@ def get_random_policy_from_artifacts(
     print(f"  - Selected opponent policy: {os.path.basename(chosen)}")
     local_path = client.download_artifacts(run_id, chosen, tmpdir)
     return local_path
+
+
+def get_opponent_policy_pool_for_envs(
+    client,
+    run_id,
+    model_prefix,
+    tmpdir,
+    num_envs: int,
+    K: int = 10,
+    beta: float = 0.7,
+    uniform_eps: float = 0.15,
+):
+    """Sample opponent policies for each environment using geometric distribution.
+
+    Args:
+        client: MLflow client
+        run_id: experiment run
+        model_prefix: "unified", "offense", or "defense"
+        tmpdir: temp dir to download artifacts
+        num_envs: number of parallel environments (samples this many opponents)
+        K: reservoir size (keep last K policies)
+        beta: geometric decay factor (0<beta<1, higher = more recent bias)
+        uniform_eps: probability of sampling uniformly from ALL history
+
+    Returns:
+        List of local paths to policy checkpoints (length = num_envs)
+    """
+    artifact_path = "models"
+    all_artifacts = client.list_artifacts(run_id, artifact_path)
+
+    # Extract paths for prefix
+    team_policies = [
+        f.path
+        for f in all_artifacts
+        if f.path.startswith(f"{artifact_path}/{model_prefix}")
+        and f.path.endswith(".zip")
+    ]
+
+    if not team_policies:
+        return []
+
+    # Sort chronologically
+    def sort_key(p):
+        m = re.search(r"_(\d+)\.zip$", p)
+        return int(m.group(1)) if m else 0
+
+    team_policies.sort(key=sort_key)
+
+    # Keep last K policies as the main pool
+    recent_pols = team_policies[-K:] if len(team_policies) > K else team_policies
+
+    # Sample one opponent per environment using geometric distribution
+    sampled_policies = []
+    print(
+        f"  - Sampling {num_envs} opponents using geometric distribution (K={K}, beta={beta}, eps={uniform_eps})..."
+    )
+
+    for env_idx in range(num_envs):
+        # With small probability, sample uniformly from all history for coverage
+        if random.random() < uniform_eps and len(team_policies) > len(recent_pols):
+            chosen = random.choice(team_policies)
+        else:
+            # Geometric sampling over recent_pols
+            # Higher indices = more recent = higher probability with beta close to 1
+            idx = sample_geometric(list(range(len(recent_pols))), beta)
+            chosen = recent_pols[idx]
+
+        sampled_policies.append(chosen)
+
+    # Download all unique sampled policies
+    unique_policies = list(set(sampled_policies))
+    print(
+        f"  - {len(unique_policies)} unique policies selected from {len(sampled_policies)} samples"
+    )
+
+    policy_paths = {}
+    for policy_path in unique_policies:
+        local_path = client.download_artifacts(run_id, policy_path, tmpdir)
+        policy_paths[policy_path] = local_path
+        print(f"    • {os.path.basename(policy_path)}")
+
+    # Return list of local paths in same order as sampled
+    return [policy_paths[p] for p in sampled_policies]
 
 
 # --- Continuation helpers ---
@@ -692,6 +326,8 @@ def setup_environment(args, training_team):
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+        spawn_distance=getattr(args, "spawn_distance", 3),
+        max_spawn_distance=getattr(args, "max_spawn_distance", None),
         # Reward shaping
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -703,6 +339,13 @@ def setup_environment(args, training_team):
         assist_window=getattr(args, "assist_window", getattr(args, "assist_window", 2)),
         potential_assist_pct=getattr(args, "potential_assist_pct", 0.10),
         full_assist_bonus_pct=getattr(args, "full_assist_bonus_pct", 0.05),
+        # Phi shaping config
+        enable_phi_shaping=getattr(args, "enable_phi_shaping", False),
+        reward_shaping_gamma=getattr(args, "reward_shaping_gamma", args.gamma),
+        phi_beta=getattr(args, "phi_beta_start", 0.0),
+        phi_use_ball_handler_only=getattr(args, "phi_use_ball_handler_only", False),
+        phi_aggregation_mode=getattr(args, "phi_aggregation_mode", "team_best"),
+        phi_blend_weight=getattr(args, "phi_blend_weight", 0.0),
         enable_profiling=args.enable_env_profiling,
         training_team=training_team,  # Critical for correct rewards
         # Observation controls
@@ -717,6 +360,8 @@ def setup_environment(args, training_team):
     # Wrap with episode stats collector then aggregate reward for Monitor/SB3
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
+    # Put BetaSetterWrapper at the top so env_method('set_phi_beta', ...) hits it directly
+    env = BetaSetterWrapper(env)
     return Monitor(
         env,
         info_keywords=(
@@ -728,11 +373,28 @@ def setup_environment(args, training_team):
             "assisted_3pt",
             "passes",
             "turnover",
+            "turnover_pass_oob",
+            "turnover_intercepted",
+            "turnover_pressure",
             # Keys required for PPP calculation
             "made_dunk",
             "made_2pt",
             "made_3pt",
             "attempts",
+            # Potential-based shaping diagnostics
+            "phi_beta",
+            "phi_prev",
+            "phi_next",
+            # minimal audit
+            "gt_is_three",
+            "gt_is_dunk",
+            "gt_points",
+            "gt_shooter_off",
+            "gt_shooter_q",
+            "gt_shooter_r",
+            "gt_distance",
+            "basket_q",
+            "basket_r",
         ),
     )
 
@@ -753,21 +415,52 @@ def make_vector_env(
 
     Each copy is wrapped with `SelfPlayEnvWrapper` so that the opponent's
     behaviour is provided by the frozen `opponent_policy`.
+
+    Args:
+        opponent_policy: Can be:
+            - Single policy path/object: all envs use same opponent
+            - List of policy paths: each env gets different opponent (cycled if needed)
     """
 
-    def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
-        # We capture the current parameters via default args so that each lambda
-        # has its own bound values (important inside list comprehension).
-        return SelfPlayEnvWrapper(
-            setup_environment(args, training_team),
-            opponent_policy=opponent_policy,
-            deterministic_opponent=deterministic_opponent,
-        )
+    # If opponent_policy is a list, assign different opponents to each environment
+    if isinstance(opponent_policy, list):
 
-    # Use subprocesses for parallelism.
-    return SubprocVecEnv(
-        [_single_env_factory for _ in range(num_envs)], start_method="spawn"
-    )
+        def _single_env_factory(env_idx: int, opp_policy) -> gym.Env:  # type: ignore[name-defined]
+            base_env = setup_environment(args, training_team)
+            return SelfPlayEnvWrapper(
+                base_env,
+                opponent_policy=opp_policy,
+                training_strategy=IllegalActionStrategy.NOOP,
+                opponent_strategy=IllegalActionStrategy.NOOP,
+                deterministic_opponent=deterministic_opponent,
+            )
+
+        # Distribute opponents across environments (cycle if fewer opponents than envs)
+        return SubprocVecEnv(
+            [
+                lambda idx=i, opp=opponent_policy[
+                    i % len(opponent_policy)
+                ]: _single_env_factory(idx, opp)
+                for i in range(num_envs)
+            ],
+            start_method="spawn",
+        )
+    else:
+        # Original behavior: all envs use same opponent
+        def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
+            base_env = setup_environment(args, training_team)
+            return SelfPlayEnvWrapper(
+                base_env,
+                opponent_policy=opponent_policy,
+                training_strategy=IllegalActionStrategy.NOOP,
+                opponent_strategy=IllegalActionStrategy.NOOP,
+                deterministic_opponent=deterministic_opponent,
+            )
+
+        # Use subprocesses for parallelism.
+        return SubprocVecEnv(
+            [_single_env_factory for _ in range(num_envs)], start_method="spawn"
+        )
 
 
 def main(args):
@@ -897,7 +590,7 @@ def main(args):
                 )
                 initial_ent_coef = float(start)
             unified_policy = PPO(
-                "MultiInputPolicy",
+                PassBiasMultiInputPolicy,
                 temp_env,
                 verbose=1,
                 n_steps=args.n_steps,
@@ -911,6 +604,27 @@ def main(args):
                 target_kl=args.target_kl,
                 device=device,
             )
+        else:
+            # If continuing and user requests a restart of the entropy schedule, reset counters and coef
+            if getattr(args, "restart_entropy_on_continue", False):
+                try:
+                    unified_policy.num_timesteps = 0
+                except Exception:
+                    pass
+                try:
+                    if (args.ent_coef_start is not None) or (
+                        args.ent_coef_end is not None
+                    ):
+                        ent_start = (
+                            args.ent_coef_start
+                            if args.ent_coef_start is not None
+                            else args.ent_coef
+                        )
+                        unified_policy.ent_coef = float(ent_start)
+                    else:
+                        unified_policy.ent_coef = float(args.ent_coef)
+                except Exception:
+                    pass
         temp_env.close()
 
         # --- Log the actual network architecture used ---
@@ -932,23 +646,120 @@ def main(args):
         opponent_cache_dir = os.path.join(".opponent_cache", run.info.run_id)
         os.makedirs(opponent_cache_dir, exist_ok=True)
 
+        # --- Load schedule metadata from previous run if continuing ---
+        # Handle backward compatibility with --restart-entropy-on-continue
+        if getattr(args, "restart_entropy_on_continue", False):
+            print(
+                "Warning: --restart-entropy-on-continue is deprecated. Using --continue-schedule-mode=restart"
+            )
+            schedule_mode = "restart"
+        else:
+            schedule_mode = getattr(args, "continue_schedule_mode", "extend")
+        previous_schedule_meta = None
+        if args.continue_run_id and schedule_mode != "restart":
+            try:
+                client = mlflow.tracking.MlflowClient()
+                previous_schedule_meta = load_schedule_metadata(
+                    client, args.continue_run_id
+                )
+                print(f"Loaded schedule metadata from run {args.continue_run_id}")
+                print(
+                    f"  Previous total timesteps: {previous_schedule_meta.get('total_planned_timesteps', 0)}"
+                )
+                print(
+                    f"  Previous current timesteps: {previous_schedule_meta.get('current_timesteps', 0)}"
+                )
+            except Exception as e:
+                print(f"Warning: Could not load schedule metadata: {e}")
+                print("Schedules will be initialized from scratch.")
+                previous_schedule_meta = None
+
         # Prepare optional entropy scheduler across the whole run
         entropy_callback = None
-        if (args.ent_coef_start is not None) or (args.ent_coef_end is not None):
-            ent_start = (
-                args.ent_coef_start
-                if args.ent_coef_start is not None
-                else args.ent_coef
+        beta_callback = None
+
+        # Calculate total planned timesteps for this training session
+        new_training_timesteps = int(
+            2
+            * args.alternations
+            * args.steps_per_alternation
+            * args.num_envs
+            * args.n_steps
+        )
+
+        # Determine schedule parameters based on continuation mode
+        if (
+            args.continue_run_id
+            and schedule_mode == "extend"
+            and previous_schedule_meta
+        ):
+            # Extend mode: continue the schedule from where it left off
+            print(f"Schedule mode: EXTEND - continuing schedules from previous run")
+
+            # Use previous schedule parameters if they exist, otherwise fall back to args
+            ent_start = previous_schedule_meta.get(
+                "ent_coef_start", args.ent_coef_start
             )
+            ent_end = previous_schedule_meta.get(
+                "ent_coef_end",
+                args.ent_coef_end if args.ent_coef_end is not None else 0.0,
+            )
+            ent_schedule_type = previous_schedule_meta.get(
+                "ent_schedule", getattr(args, "ent_schedule", "linear")
+            )
+
+            # Calculate extended total timesteps
+            original_total = previous_schedule_meta.get("total_planned_timesteps", 0)
+            original_current = previous_schedule_meta.get("current_timesteps", 0)
+            total_planned_ts = calculate_continued_total_timesteps(
+                original_total,
+                original_current,
+                args.alternations,
+                args.steps_per_alternation,
+                args.num_envs,
+                args.n_steps,
+            )
+            print(f"  Extended total timesteps: {total_planned_ts}")
+        elif (
+            args.continue_run_id
+            and schedule_mode == "constant"
+            and previous_schedule_meta
+        ):
+            # Constant mode: use the final schedule values as constants
+            print(f"Schedule mode: CONSTANT - using final schedule values as constants")
+            # We'll set the callbacks to None and just use constant values
+            ent_start = None
+            ent_end = None
+            ent_schedule_type = "linear"
+            total_planned_ts = new_training_timesteps
+        else:
+            # Fresh start or restart mode
+            if args.continue_run_id and schedule_mode == "restart":
+                print(f"Schedule mode: RESTART - reinitializing schedules from scratch")
+            ent_start = args.ent_coef_start if args.ent_coef_start is not None else None
             ent_end = args.ent_coef_end if args.ent_coef_end is not None else 0.0
-            total_planned_ts = int(
-                2
-                * args.alternations
-                * args.steps_per_alternation
-                * args.num_envs
-                * args.n_steps
+            ent_schedule_type = getattr(args, "ent_schedule", "linear")
+            total_planned_ts = new_training_timesteps
+
+        # Determine timestep offset for restart mode
+        # In restart mode with a continued run, we need to offset by the current timesteps
+        # so the schedule starts fresh from 0 instead of using the model's accumulated timesteps
+        timestep_offset = 0
+        if args.continue_run_id and schedule_mode == "restart":
+            timestep_offset = unified_policy.num_timesteps
+            print(
+                f"  Using timestep offset: {timestep_offset} (current model timesteps)"
             )
-            if getattr(args, "ent_schedule", "linear") == "exp":
+
+        # Create entropy callback if we have a schedule
+        if ent_start is not None or (args.ent_coef_start is not None):
+            if ent_start is None:
+                ent_start = (
+                    args.ent_coef
+                    if args.ent_coef_start is None
+                    else args.ent_coef_start
+                )
+            if ent_schedule_type == "exp":
                 entropy_callback = EntropyExpScheduleCallback(
                     ent_start,
                     ent_end,
@@ -957,11 +768,141 @@ def main(args):
                         args, "ent_bump_updates", getattr(args, "ent_bump_rollouts", 0)
                     ),
                     bump_multiplier=getattr(args, "ent_bump_multiplier", 1.0),
+                    timestep_offset=timestep_offset,
                 )
             else:
                 entropy_callback = EntropyScheduleCallback(
-                    ent_start, ent_end, total_planned_ts
+                    ent_start,
+                    ent_end,
+                    total_planned_ts,
+                    timestep_offset=timestep_offset,
                 )
+
+        # Prepare optional Phi beta scheduler across the whole run
+        # Determine phi beta schedule parameters based on continuation mode
+        if (
+            args.continue_run_id
+            and schedule_mode == "extend"
+            and previous_schedule_meta
+        ):
+            # Use previous phi beta schedule if it exists
+            phi_beta_start = previous_schedule_meta.get("phi_beta_start")
+            phi_beta_end = previous_schedule_meta.get("phi_beta_end")
+            phi_beta_schedule_type = previous_schedule_meta.get(
+                "phi_beta_schedule", "exp"
+            )
+            phi_beta_bump_updates = previous_schedule_meta.get("phi_bump_updates", 0)
+            phi_beta_bump_multiplier = previous_schedule_meta.get(
+                "phi_bump_multiplier", 1.0
+            )
+            # Use extended total timesteps calculated above
+        elif args.continue_run_id and schedule_mode == "constant":
+            # In constant mode, disable phi beta schedule
+            phi_beta_start = None
+            phi_beta_end = None
+            phi_beta_schedule_type = "exp"
+            phi_beta_bump_updates = 0
+            phi_beta_bump_multiplier = 1.0
+        else:
+            # Fresh start or restart mode
+            phi_beta_start = getattr(args, "phi_beta_start", None)
+            phi_beta_end = getattr(args, "phi_beta_end", None)
+            phi_beta_schedule_type = getattr(args, "phi_beta_schedule", "exp")
+            phi_beta_bump_updates = getattr(args, "phi_bump_updates", 0)
+            phi_beta_bump_multiplier = getattr(args, "phi_bump_multiplier", 1.0)
+
+        if phi_beta_start is not None or phi_beta_end is not None:
+            if phi_beta_start is None:
+                phi_beta_start = 0.0
+            if phi_beta_end is None:
+                phi_beta_end = 0.0
+            if phi_beta_schedule_type == "exp":
+                beta_callback = PotentialBetaExpScheduleCallback(
+                    phi_beta_start,
+                    phi_beta_end,
+                    total_planned_ts,
+                    bump_updates=phi_beta_bump_updates,
+                    bump_multiplier=phi_beta_bump_multiplier,
+                    timestep_offset=timestep_offset,
+                )
+        # Optional Pass Logit Bias scheduler across the whole run
+        pass_bias_callback = None
+        if (
+            getattr(args, "pass_logit_bias_start", None) is not None
+            or getattr(args, "pass_logit_bias_end", None) is not None
+        ):
+            p_start = (
+                args.pass_logit_bias_start
+                if getattr(args, "pass_logit_bias_start", None) is not None
+                else 0.0
+            )
+            p_end = (
+                args.pass_logit_bias_end
+                if getattr(args, "pass_logit_bias_end", None) is not None
+                else 0.0
+            )
+            # Use new_training_timesteps to match the restart logic
+            pass_bias_total_ts = int(
+                2
+                * args.alternations
+                * args.steps_per_alternation
+                * args.num_envs
+                * args.n_steps
+            )
+            pass_bias_callback = PassLogitBiasExpScheduleCallback(
+                p_start, p_end, pass_bias_total_ts, timestep_offset=timestep_offset
+            )
+
+        # Optional passing curriculum (arc degrees, OOB turnover probability)
+        pass_curriculum_callback = None
+        if (
+            getattr(args, "pass_arc_start", None) is not None
+            or getattr(args, "pass_arc_end", None) is not None
+            or getattr(args, "pass_oob_turnover_prob_start", None) is not None
+            or getattr(args, "pass_oob_turnover_prob_end", None) is not None
+        ):
+            arc_start = (
+                args.pass_arc_start
+                if getattr(args, "pass_arc_start", None) is not None
+                else 60.0
+            )
+            arc_end = (
+                args.pass_arc_end
+                if getattr(args, "pass_arc_end", None) is not None
+                else 60.0
+            )
+            oob_start = (
+                args.pass_oob_turnover_prob_start
+                if getattr(args, "pass_oob_turnover_prob_start", None) is not None
+                else 1.0
+            )
+            oob_end = (
+                args.pass_oob_turnover_prob_end
+                if getattr(args, "pass_oob_turnover_prob_end", None) is not None
+                else 1.0
+            )
+            arc_power = (
+                args.pass_arc_power
+                if getattr(args, "pass_arc_power", None) is not None
+                else 2.0
+            )
+            oob_power = (
+                args.pass_oob_power
+                if getattr(args, "pass_oob_power", None) is not None
+                else 2.0
+            )
+            # Use total_planned_ts which is calculated based on schedule mode
+            # For pass curriculum, we use the same total timesteps as other schedules
+            pass_curriculum_callback = PassCurriculumExpScheduleCallback(
+                arc_start,
+                arc_end,
+                oob_start,
+                oob_end,
+                total_planned_ts,
+                arc_power=arc_power,
+                oob_power=oob_power,
+                timestep_offset=timestep_offset,
+            )
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -969,26 +910,112 @@ def main(args):
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             print("-" * 50)
 
-            # --- Load a random historical opponent for this alternation ---
-            print("\nLoading historical opponent policy...")
-            opponent_for_offense = get_random_policy_from_artifacts(
-                mlflow.tracking.MlflowClient(),
-                run.info.run_id,
-                "unified",
-                opponent_cache_dir,
-            )
-            if opponent_for_offense is None:
-                # Fallback: save current unified policy to a stable path
-                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
-                unified_policy.save(fallback_path)
-                opponent_for_offense = fallback_path
+            # --- Load opponent(s) for this alternation ---
+            if args.per_env_opponent_sampling:
+                # Sample opponent for each parallel environment using geometric distribution
+                print("\nSampling opponents for each parallel environment...")
+                opponent_for_offense = get_opponent_policy_pool_for_envs(
+                    mlflow.tracking.MlflowClient(),
+                    run.info.run_id,
+                    "unified",
+                    opponent_cache_dir,
+                    num_envs=args.num_envs,
+                    K=args.opponent_pool_size,
+                    beta=args.opponent_pool_beta,
+                    uniform_eps=args.opponent_pool_exploration,
+                )
+                if not opponent_for_offense:
+                    # Fallback: create list with current policy for all envs
+                    fallback_path = os.path.join(
+                        opponent_cache_dir, "unified_latest.zip"
+                    )
+                    unified_policy.save(fallback_path)
+                    opponent_for_offense = [fallback_path] * args.num_envs
+                    print(
+                        f"  - Using fallback: all {args.num_envs} envs get current policy"
+                    )
+                else:
+                    print(
+                        f"  - Assigned {len(opponent_for_offense)} opponents to {args.num_envs} parallel environments"
+                    )
+            else:
+                # Original behavior: sample one opponent for entire alternation
+                print(
+                    "\nLoading historical opponent policy (single policy for entire alternation)..."
+                )
+                opponent_for_offense = get_random_policy_from_artifacts(
+                    mlflow.tracking.MlflowClient(),
+                    run.info.run_id,
+                    "unified",
+                    opponent_cache_dir,
+                    K=args.opponent_pool_size,
+                    beta=args.opponent_pool_beta,
+                    uniform_eps=args.opponent_pool_exploration,
+                )
+                if opponent_for_offense is None:
+                    # Fallback: save current unified policy to a stable path
+                    fallback_path = os.path.join(
+                        opponent_cache_dir, "unified_latest.zip"
+                    )
+                    unified_policy.save(fallback_path)
+                    opponent_for_offense = fallback_path
+            # Log which opponent checkpoint(s) used this alternation
+            try:
+                with tempfile.TemporaryDirectory() as _tmp_note_dir:
+                    note_path = os.path.join(
+                        _tmp_note_dir, f"opponent_alt_{global_alt}.txt"
+                    )
+                    with open(note_path, "w") as f:
+                        if isinstance(opponent_for_offense, list):
+                            # Per-environment sampling mode
+                            f.write(
+                                f"Per-environment opponent sampling (geometric distribution):\n"
+                            )
+                            f.write(
+                                f"Parameters: K={args.opponent_pool_size}, beta={args.opponent_pool_beta}, eps={args.opponent_pool_exploration}\n"
+                            )
+                            f.write(f"\nEnvironment-to-Opponent Mapping:\n")
+
+                            # Count occurrences of each policy
+                            from collections import Counter
+
+                            policy_counts = Counter(
+                                os.path.basename(str(p)) for p in opponent_for_offense
+                            )
+
+                            # Log mapping
+                            for env_idx, policy_path in enumerate(opponent_for_offense):
+                                f.write(
+                                    f"  Env {env_idx:2d}: {os.path.basename(str(policy_path))}\n"
+                                )
+
+                            # Summary statistics
+                            f.write(f"\nSummary:\n")
+                            f.write(
+                                f"  Total environments: {len(opponent_for_offense)}\n"
+                            )
+                            f.write(f"  Unique policies: {len(policy_counts)}\n")
+                            f.write(f"\nPolicy Usage Counts:\n")
+                            for policy_name, count in sorted(
+                                policy_counts.items(), key=lambda x: x[1], reverse=True
+                            ):
+                                f.write(f"  {policy_name}: used by {count} env(s)\n")
+                        else:
+                            # Single opponent mode
+                            f.write(f"Single policy for all environments:\n")
+                            f.write(
+                                f"  {os.path.basename(str(opponent_for_offense))}\n"
+                            )
+                    mlflow.log_artifact(note_path, artifact_path=f"opponents")
+            except Exception:
+                pass
 
             # --- 1. Train Offense against frozen Defense ---
             print(f"\nTraining Offense...")
             offense_env = make_vector_env(
                 args,
                 training_team=Team.OFFENSE,
-                opponent_policy=FrozenPolicyProxy(opponent_for_offense, device),
+                opponent_policy=opponent_for_offense,
                 num_envs=args.num_envs,
                 deterministic_opponent=bool(args.deterministic_opponent),
             )
@@ -1016,6 +1043,19 @@ def main(args):
             offense_callbacks = [offense_mlflow_callback, offense_timing_callback]
             if entropy_callback is not None:
                 offense_callbacks.append(entropy_callback)
+            if beta_callback is not None:
+                offense_callbacks.append(beta_callback)
+            if pass_bias_callback is not None:
+                offense_callbacks.append(pass_bias_callback)
+            if pass_curriculum_callback is not None:
+                offense_callbacks.append(pass_curriculum_callback)
+            offense_callbacks.append(
+                EpisodeSampleLogger(
+                    team_name="Offense",
+                    alternation_id=global_alt,
+                    sample_prob=args.episode_sample_prob,
+                )
+            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
@@ -1025,25 +1065,22 @@ def main(args):
                 progress_bar=True,
             )
             offense_env.close()
+            try:
+                del offense_env
+            except Exception:
+                pass
+            gc.collect()
+            time.sleep(0.05)
 
-            print("\nLoading historical opponent policy...")
-            opponent_for_defense = get_random_policy_from_artifacts(
-                mlflow.tracking.MlflowClient(),
-                run.info.run_id,
-                "unified",
-                opponent_cache_dir,
-            )
-            if opponent_for_defense is None:
-                fallback_path = os.path.join(opponent_cache_dir, "unified_latest.zip")
-                unified_policy.save(fallback_path)
-                opponent_for_defense = fallback_path
+            # Reuse the same frozen opponent for defense segment to keep distributions comparable
+            opponent_for_defense = opponent_for_offense
 
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
             defense_env = make_vector_env(
                 args,
                 training_team=Team.DEFENSE,
-                opponent_policy=FrozenPolicyProxy(opponent_for_defense, device),
+                opponent_policy=opponent_for_defense,
                 num_envs=args.num_envs,
                 deterministic_opponent=bool(args.deterministic_opponent),
             )
@@ -1071,6 +1108,19 @@ def main(args):
             defense_callbacks = [defense_mlflow_callback, defense_timing_callback]
             if entropy_callback is not None:
                 defense_callbacks.append(entropy_callback)
+            if beta_callback is not None:
+                defense_callbacks.append(beta_callback)
+            if pass_bias_callback is not None:
+                defense_callbacks.append(pass_bias_callback)
+            if pass_curriculum_callback is not None:
+                defense_callbacks.append(pass_curriculum_callback)
+            defense_callbacks.append(
+                EpisodeSampleLogger(
+                    team_name="Defense",
+                    alternation_id=global_alt,
+                    sample_prob=args.episode_sample_prob,
+                )
+            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
@@ -1080,6 +1130,12 @@ def main(args):
                 progress_bar=True,
             )
             defense_env.close()
+            try:
+                del defense_env
+            except Exception:
+                pass
+            gc.collect()
+            time.sleep(0.05)
 
             # Save one unified checkpoint per alternation
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -1113,6 +1169,8 @@ def main(args):
                     shot_pressure_max=args.shot_pressure_max,
                     shot_pressure_lambda=args.shot_pressure_lambda,
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+                    spawn_distance=getattr(args, "spawn_distance", 3),
+                    max_spawn_distance=getattr(args, "max_spawn_distance", None),
                     # Reward shaping
                     pass_reward=getattr(args, "pass_reward", 0.0),
                     turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -1201,34 +1259,55 @@ def main(args):
                 eval_env.close()
                 print(f"--- Evaluation for Alternation {global_alt} Complete ---")
 
-            # Log environment profiling if enabled
-            if args.enable_env_profiling:
-                try:
-                    prof = offense_env.envs[0].unwrapped.get_profile_stats()
-                    for k, v in prof.items():
-                        mlflow.log_metric(
-                            f"env_prof_{k}_avg_us_offense",
-                            v.get("avg_us", 0.0),
-                            step=global_alt,
-                        )
-                    offense_env.envs[0].unwrapped.reset_profile_stats()
-                except Exception:
-                    pass
-                try:
-                    prof = defense_env.envs[0].unwrapped.get_profile_stats()
-                    for k, v in prof.items():
-                        mlflow.log_metric(
-                            f"env_prof_{k}_avg_us_defense",
-                            v.get("avg_us", 0.0),
-                            step=global_alt,
-                        )
-                    defense_env.envs[0].unwrapped.reset_profile_stats()
-                except Exception:
-                    pass
+            # Note: Environment profiling code removed as envs are closed by this point
 
             # --- 4. Optional GIF Evaluation ---
 
         print("\n--- Training Complete ---")
+
+        # --- Save schedule metadata for continuation ---
+        try:
+            save_schedule_metadata(
+                ent_coef_start=ent_start if "ent_start" in locals() else None,
+                ent_coef_end=ent_end if "ent_end" in locals() else None,
+                ent_schedule=(
+                    ent_schedule_type if "ent_schedule_type" in locals() else "linear"
+                ),
+                ent_bump_updates=getattr(args, "ent_bump_updates", 0),
+                ent_bump_multiplier=getattr(args, "ent_bump_multiplier", 1.0),
+                phi_beta_start=phi_beta_start if "phi_beta_start" in locals() else None,
+                phi_beta_end=phi_beta_end if "phi_beta_end" in locals() else None,
+                phi_beta_schedule=(
+                    phi_beta_schedule_type
+                    if "phi_beta_schedule_type" in locals()
+                    else "exp"
+                ),
+                phi_bump_updates=(
+                    phi_beta_bump_updates if "phi_beta_bump_updates" in locals() else 0
+                ),
+                phi_bump_multiplier=(
+                    phi_beta_bump_multiplier
+                    if "phi_beta_bump_multiplier" in locals()
+                    else 1.0
+                ),
+                pass_logit_bias_start=getattr(args, "pass_logit_bias_start", None),
+                pass_logit_bias_end=getattr(args, "pass_logit_bias_end", None),
+                pass_arc_start=getattr(args, "pass_arc_start", None),
+                pass_arc_end=getattr(args, "pass_arc_end", None),
+                pass_oob_turnover_prob_start=getattr(
+                    args, "pass_oob_turnover_prob_start", None
+                ),
+                pass_oob_turnover_prob_end=getattr(
+                    args, "pass_oob_turnover_prob_end", None
+                ),
+                total_planned_timesteps=(
+                    total_planned_ts if "total_planned_ts" in locals() else 0
+                ),
+                current_timesteps=unified_policy.num_timesteps,
+            )
+            print("Saved schedule metadata for future continuation")
+        except Exception as e:
+            print(f"Warning: Could not save schedule metadata: {e}")
 
         # --- Log final performance metrics ---
         if offense_timing_callback.rollout_times:
@@ -1421,6 +1500,25 @@ if __name__ == "__main__":
         help="If set, load latest offense/defense policies from this MLflow run and continue training. Also appends new artifacts using continued alternation indices.",
     )
     parser.add_argument(
+        "--continue-schedule-mode",
+        type=str,
+        choices=["extend", "constant", "restart"],
+        default="extend",
+        help=(
+            "How to handle schedules when continuing training: "
+            "'extend' (default) - continue schedules from where they left off, adding more training to the original total; "
+            "'constant' - use the final schedule values (where the previous run ended) as constants; "
+            "'restart' - restart schedules from scratch using new parameters."
+        ),
+    )
+    parser.add_argument(
+        "--restart-entropy-on-continue",
+        dest="restart_entropy_on_continue",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="DEPRECATED: Use --continue-schedule-mode=restart instead. When continuing from a run, reset num_timesteps and reinitialize ent_coef to the schedule start.",
+    )
+    parser.add_argument(
         "--eval-freq",
         type=int,
         default=2,
@@ -1501,13 +1599,43 @@ if __name__ == "__main__":
         "--spawn-distance",
         type=int,
         default=3,
-        help="minimum distance from 3pt line at which players spawn.",
+        help="minimum distance from basket at which players spawn.",
+    )
+    parser.add_argument(
+        "--max-spawn-distance",
+        dest="max_spawn_distance",
+        type=lambda v: None if v == "" or str(v).lower() == "none" else int(v),
+        default=None,
+        help="maximum distance from basket at which players spawn (None = unlimited). Use with --spawn-distance for curriculum learning.",
     )
     parser.add_argument(
         "--deterministic-opponent",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
         help="Use deterministic opponent actions.",
+    )
+    parser.add_argument(
+        "--opponent-pool-size",
+        type=int,
+        default=10,
+        help="Number of recent checkpoints to keep in opponent pool (K parameter).",
+    )
+    parser.add_argument(
+        "--opponent-pool-beta",
+        type=float,
+        default=0.7,
+        help="Geometric decay factor for opponent sampling (0=uniform, 1=most recent only).",
+    )
+    parser.add_argument(
+        "--opponent-pool-exploration",
+        type=float,
+        default=0.15,
+        help="Probability of sampling from ALL history instead of just recent pool (0-1).",
+    )
+    parser.add_argument(
+        "--per-env-opponent-sampling",
+        action="store_true",
+        help="Sample different opponents for each parallel environment using geometric distribution (prevents forgetting). Each of the --num-envs workers independently samples from last K checkpoints with recency bias. Default: single opponent per alternation.",
     )
     # Dunk controls
     parser.add_argument(
@@ -1654,6 +1782,142 @@ if __name__ == "__main__":
         type=float,
         default=0.05,
         help="Chance of a steal.",
+    )
+    parser.add_argument(
+        "--episode-sample-prob",
+        dest="episode_sample_prob",
+        type=float,
+        default=1e-2,
+        help="Probability of sampling an episode for logging.",
+    )
+    # Potential-based shaping CLI
+    parser.add_argument(
+        "--enable-phi-shaping",
+        dest="enable_phi_shaping",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable potential-based reward shaping using best current shot quality.",
+    )
+    parser.add_argument(
+        "--reward-shaping-gamma",
+        dest="reward_shaping_gamma",
+        type=float,
+        default=None,
+        help="Discount gamma used inside shaping term (should match PPO gamma).",
+    )
+    parser.add_argument(
+        "--phi-use-ball-handler-only",
+        dest="phi_use_ball_handler_only",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Use only ball-handler make prob for Phi instead of team best.",
+    )
+    parser.add_argument(
+        "--phi-blend-weight",
+        dest="phi_blend_weight",
+        type=float,
+        default=0.0,
+        help="Blend weight w in [0,1] for Phi=(1-w)*aggregate_EP + w*ball_EP (ignored if ball-handler-only).",
+    )
+    parser.add_argument(
+        "--phi-aggregation-mode",
+        dest="phi_aggregation_mode",
+        type=str,
+        choices=[
+            "team_best",
+            "teammates_best",
+            "teammates_avg",
+            "team_avg",
+            "team_worst",
+            "teammates_worst",
+        ],
+        default="team_best",
+        help="How to aggregate teammate EPs: 'team_best' (max including ball), 'teammates_best' (max excluding ball), 'teammates_avg' (mean excluding ball), 'team_avg' (mean including ball), 'team_worst' (min including ball), 'teammates_worst' (min excluding ball).",
+    )
+    parser.add_argument(
+        "--phi-beta-start",
+        dest="phi_beta_start",
+        type=float,
+        default=0.0,
+        help="Initial beta multiplier for Phi shaping.",
+    )
+    parser.add_argument(
+        "--phi-beta-end",
+        dest="phi_beta_end",
+        type=float,
+        default=0.0,
+        help="Final beta multiplier for Phi shaping (decays to this).",
+    )
+    parser.add_argument(
+        "--phi-bump-updates",
+        dest="phi_bump_updates",
+        type=int,
+        default=0,
+        help="Number of PPO updates to bump phi_beta at start of each segment.",
+    )
+    parser.add_argument(
+        "--phi-bump-multiplier",
+        dest="phi_bump_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to phi_beta during bump updates (>=1.0).",
+    )
+    # Passing curriculum CLI
+    parser.add_argument(
+        "--pass-arc-start",
+        dest="pass_arc_start",
+        type=float,
+        default=None,
+        help="Initial passing arc degrees (e.g., 120).",
+    )
+    parser.add_argument(
+        "--pass-arc-end",
+        dest="pass_arc_end",
+        type=float,
+        default=None,
+        help="Final passing arc degrees (e.g., 60).",
+    )
+    parser.add_argument(
+        "--pass-oob-turnover-prob-start",
+        dest="pass_oob_turnover_prob_start",
+        type=float,
+        default=None,
+        help="Initial probability that pass without receiver is OOB turnover (e.g., 0.1).",
+    )
+    parser.add_argument(
+        "--pass-oob-turnover-prob-end",
+        dest="pass_oob_turnover_prob_end",
+        type=float,
+        default=None,
+        help="Final OOB turnover probability when no receiver (e.g., 1.0).",
+    )
+    parser.add_argument(
+        "--pass-arc-power",
+        dest="pass_arc_power",
+        type=float,
+        default=2.0,
+        help="Power applied to arc curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--pass-oob-power",
+        dest="pass_oob_power",
+        type=float,
+        default=2.0,
+        help="Power applied to OOB curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--pass-logit-bias-start",
+        dest="pass_logit_bias_start",
+        type=float,
+        default=None,
+        help="Initial additive bias added to PASS action logits (e.g., 0.8).",
+    )
+    parser.add_argument(
+        "--pass-logit-bias-end",
+        dest="pass_logit_bias_end",
+        type=float,
+        default=None,
+        help="Final additive bias (0 to disable at end).",
     )
     args = parser.parse_args()
 

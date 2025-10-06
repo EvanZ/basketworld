@@ -15,6 +15,10 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  isManualStepping: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId']);
@@ -184,6 +188,15 @@ async function fetchBallHandlerMakeProb() {
     ballHandlerMakeProb.value = null;
     return;
   }
+  
+  // During manual stepping (replay), use the stored shot probability from the state
+  if (props.isManualStepping && typeof gs.ball_handler_shot_probability === 'number') {
+    ballHandlerMakeProb.value = gs.ball_handler_shot_probability;
+    console.log('[GameBoard] Using stored shot probability from replay state:', gs.ball_handler_shot_probability);
+    return;
+  }
+  
+  // Otherwise, fetch from API (live gameplay)
   try {
     const resp = await getShotProbability(gs.ball_holder);
     const p = resp?.shot_probability_final ?? resp?.shot_probability ?? null;
@@ -203,6 +216,7 @@ watch(
     ball_holder: currentGameState.value?.ball_holder,
     positions: currentGameState.value?.positions,
     shot_clock: currentGameState.value?.shot_clock,
+    isManualStepping: props.isManualStepping,
   }),
   () => {
     fetchBallHandlerMakeProb();
@@ -271,7 +285,7 @@ const playerTransitions = computed(() => {
     const previousGameState = props.gameHistory[step - 1];
     const currentGameState = props.gameHistory[step];
     // Opacity should match the destination ghost cell's opacity.
-    const opacity = 0.1 + (0.9 * (step - 1) / (props.gameHistory.length - 1));
+    const opacity = 0.1 + (0.2 * (step - 1) / (props.gameHistory.length - 1));
 
     for (let playerId = 0; playerId < currentGameState.positions.length; playerId++) {
       const prevPos = previousGameState.positions[playerId];
@@ -367,14 +381,14 @@ const playerTransitions = computed(() => {
         <g 
           v-for="(gameState, step) in gameHistory" 
           :key="`step-${step}`" 
-          :style="{ opacity: 0.1 + (0.9 * step / (gameHistory.length - 1)) }"
+          :style="{ opacity: 0.1 + (0.2 * step / (gameHistory.length - 1)) }"
         >
           <g v-for="player in getRenderablePlayers(gameState)" :key="player.id">
             <circle 
               v-if="step < gameHistory.length - 1"
               :cx="player.x" 
               :cy="player.y" 
-              :r="HEX_RADIUS * 0.6" 
+              :r="HEX_RADIUS * 0.8" 
               :class="player.isOffense ? 'player-offense' : 'player-defense'"
               class="ghost"
             />
@@ -410,7 +424,7 @@ const playerTransitions = computed(() => {
             <circle 
               :cx="player.x" 
               :cy="player.y" 
-              :r="HEX_RADIUS * 0.6" 
+              :r="HEX_RADIUS * 0.8" 
               :class="[
                 player.isOffense ? 'player-offense' : 'player-defense',
                 { 'active-player-hex': player.id === activePlayerId }
@@ -418,6 +432,28 @@ const playerTransitions = computed(() => {
               @click="onPlayerClick(player)"
             />
             <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text" @click="onPlayerClick(player)">{{ player.id }}</text>
+            <!-- EP (Expected Points) label above player ID for offensive players -->
+            <text
+              v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined"
+              :x="player.x"
+              :y="player.y"
+              dy="-1.0em"
+              text-anchor="middle"
+              class="noop-prob-text"
+            >
+              {{ Number(currentGameState.ep_by_player[player.id]).toFixed(2) }}
+            </text>
+            <!-- NOOP probability label (index 0) for the player -->
+            <text
+              v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined"
+              :x="player.x"
+              :y="player.y"
+              dy="1.2em"
+              text-anchor="middle"
+              class="noop-prob-text"
+            >
+              {{ Number(policyProbabilities[player.id][0]).toFixed(2) }}
+            </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
               v-if="player.hasBall && ballHandlerShotProb !== null"
@@ -443,7 +479,7 @@ const playerTransitions = computed(() => {
               {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
             <!-- Ball handler indicator -->
-            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.8" class="ball-indicator" />
+            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.9" class="ball-indicator" />
           </g>
         </g>
         
@@ -608,6 +644,15 @@ svg {
   paint-order: stroke;
   stroke: #fff;
   stroke-width: 0.5px;
+}
+
+.noop-prob-text {
+  font-size: 10px;
+  font-weight: 700;
+  fill: #111;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 0.6px;
 }
 
 /* --- Outcome Indicator Styles --- */

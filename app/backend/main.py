@@ -15,6 +15,16 @@ import copy
 from datetime import datetime
 import imageio
 from basketworld.utils.evaluation_helpers import get_outcome_category
+from basketworld.utils.action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
+from basketworld.utils.action_resolution import (
+    IllegalActionStrategy,
+    get_policy_action_probabilities,
+    resolve_illegal_actions,
+)
 from basketworld.utils.mlflow_params import get_mlflow_params
 
 
@@ -33,6 +43,7 @@ class GameState:
         self.reward_history = []  # Track rewards for each step
         self.episode_rewards = {"offense": 0.0, "defense": 0.0}  # Running totals
         self.shot_log = []  # Per-step shot attempts with probability and result
+        self.phi_log = []  # Per-step Phi diagnostics and EPs
         # Track which policies are currently loaded so we can persist logs across episodes
         self.offense_policy_key: str | None = None
         self.defense_policy_key: str | None = None
@@ -235,9 +246,10 @@ async def init_game(request: InitGameRequest):
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
-        # Clear any prior replay buffers
+        # Clear any prior replay buffers and phi logs
         game_state.actions_log = []
         game_state.episode_states = []
+        game_state.phi_log = []
 
         # Capture and keep the initial frame so saved episodes include the starting court state
         try:
@@ -247,9 +259,92 @@ async def init_game(request: InitGameRequest):
         except Exception:
             pass
 
-        # Record initial state for replay (manual or self-play)
-        initial_state = get_full_game_state()
+        # Record initial state for replay (manual or self-play) with policy probs
+        initial_state = get_full_game_state(include_policy_probs=True)
         game_state.episode_states.append(initial_state)
+
+        # Record initial phi values (step 0) by computing EP for all players
+        try:
+            env = game_state.env
+            ep_by_player = []
+            for pid in range(env.n_players):
+                pos = env.positions[pid]
+                dist = env._hex_distance(pos, env.basket_position)
+                shot_value = (
+                    2.0
+                    if (getattr(env, "allow_dunks", True) and dist == 0)
+                    else (3.0 if dist >= env.three_point_distance else 2.0)
+                )
+                p = float(env._calculate_shot_probability(pid, dist))
+                ep = float(shot_value * p)
+                ep_by_player.append(ep)
+
+            # Calculate phi_next for initial state using the same logic as in the env
+            ball_holder_id = int(env.ball_holder) if env.ball_holder is not None else -1
+            offense_ids = list(env.offense_ids)
+
+            # Compute phi based on aggregation mode (same as during steps)
+            if ball_holder_id >= 0 and len(offense_ids) > 0:
+                ball_ep = ep_by_player[ball_holder_id]
+                mode = getattr(env, "phi_aggregation_mode", "team_best")
+
+                if mode == "team_avg":
+                    phi_next = sum(ep_by_player[int(pid)] for pid in offense_ids) / max(
+                        1, len(offense_ids)
+                    )
+                else:
+                    teammate_eps = [
+                        ep_by_player[int(pid)]
+                        for pid in offense_ids
+                        if int(pid) != ball_holder_id
+                    ]
+                    if not teammate_eps:
+                        teammate_aggregate = ball_ep
+                    elif mode == "teammates_best":
+                        teammate_aggregate = max(teammate_eps)
+                    elif mode == "teammates_avg":
+                        teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+                    elif mode == "teammates_worst":
+                        teammate_aggregate = min(teammate_eps)
+                    elif mode == "team_worst":
+                        teammate_aggregate = min(min(teammate_eps), ball_ep)
+                    else:  # "team_best"
+                        teammate_aggregate = max(max(teammate_eps), ball_ep)
+
+                    # Blend
+                    w = float(max(0.0, min(1.0, getattr(env, "phi_blend_weight", 0.0))))
+                    phi_next = (1.0 - w) * float(teammate_aggregate) + w * float(
+                        ball_ep
+                    )
+
+                team_best_ep = max(ep_by_player[int(pid)] for pid in offense_ids)
+                ball_handler_ep = ball_ep
+            else:
+                phi_next = 0.0
+                team_best_ep = 0.0
+                ball_handler_ep = 0.0
+
+            initial_phi_entry = {
+                "step": 0,
+                "phi_prev": 0.0,  # No previous state
+                "phi_next": float(phi_next),
+                "phi_beta": float(getattr(env, "phi_beta", 0.0)),
+                "phi_r_shape": 0.0,  # No shaping reward for initial state
+                "ball_handler": ball_holder_id,
+                "offense_ids": offense_ids,
+                "defense_ids": list(env.defense_ids),
+                "shot_clock": int(env.shot_clock) if hasattr(env, "shot_clock") else -1,
+                "ep_by_player": ep_by_player,
+                "team_best_ep": float(team_best_ep),
+                "ball_handler_ep": float(ball_handler_ep),
+                "is_terminal": False,  # Initial state is never terminal
+                # Note: best_ep_player is calculated on the frontend from ep_by_player
+            }
+            game_state.phi_log.append(initial_phi_entry)
+        except Exception as e:
+            # If we fail to compute initial phi, just skip it
+            print(f"Failed to compute initial phi: {e}")
+            pass
 
         return {"status": "success", "state": initial_state}
 
@@ -289,27 +384,45 @@ def take_step(request: ActionRequest):
             except Exception:
                 opp_obs = ai_obs
             full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                opp_obs, deterministic=pred_deterministic
+                opp_obs, deterministic=True
             )
         except Exception:
             full_action_ai_opponent = None
 
-    # If deterministic, precompute policy probabilities to choose best-legal fallback
-    unified_probs = None
-    if pred_deterministic:
-        try:
-            obs_tensor = game_state.unified_policy.policy.obs_to_tensor(ai_obs)[0]
-            dists = game_state.unified_policy.policy.get_distribution(obs_tensor)
-            unified_probs = [
-                dist.probs.detach().cpu().numpy().squeeze()
-                for dist in dists.distribution
-            ]
-        except Exception:
-            unified_probs = None
+    # Prepare action masks and probability vectors
+    action_mask = ai_obs["action_mask"]
+    unified_probs = get_policy_action_probabilities(game_state.unified_policy, ai_obs)
+    opponent_probs = (
+        get_policy_action_probabilities(game_state.defense_policy, opp_obs)
+        if full_action_ai_opponent is not None
+        else None
+    )
+    player_team_strategy = (
+        IllegalActionStrategy.BEST_PROB
+        if pred_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    resolved_unified = resolve_illegal_actions(
+        np.array(full_action_ai),
+        action_mask,
+        player_team_strategy,
+        pred_deterministic,
+        unified_probs,
+    )
+    resolved_opponent = (
+        resolve_illegal_actions(
+            np.array(full_action_ai_opponent),
+            action_mask,
+            IllegalActionStrategy.BEST_PROB,
+            True,
+            opponent_probs,
+        )
+        if full_action_ai_opponent is not None
+        else None
+    )
 
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
-    action_mask = ai_obs["action_mask"]
 
     for i in range(game_state.env.n_players):
         is_user_player = (
@@ -326,44 +439,16 @@ def take_step(request: ActionRequest):
             else:
                 full_action[i] = 0
         else:
-            # Action comes from the AI policy; if opponent policy present use it for non-user team
-            predicted_action = full_action_ai[i]
-            if full_action_ai_opponent is not None:
-                is_user_offense = game_state.user_team == Team.OFFENSE
-                if (is_user_offense and i in game_state.env.defense_ids) or (
-                    (not is_user_offense) and i in game_state.env.offense_ids
-                ):
-                    predicted_action = full_action_ai_opponent[i]
+            is_user_offense = game_state.user_team == Team.OFFENSE
+            use_opponent = (
+                (is_user_offense and i in game_state.env.defense_ids)
+                or ((not is_user_offense) and i in game_state.env.offense_ids)
+            ) and (resolved_opponent is not None)
 
-            # Enforce action mask and add logging
-            if action_mask[i][predicted_action] == 1:
-                print(
-                    f"[AI] Player {i} taking legal action: {ActionType(predicted_action).name}"
-                )
-                full_action[i] = predicted_action
+            if use_opponent:
+                full_action[i] = int(resolved_opponent[i])
             else:
-                # Fallback: if deterministic, choose best legal by policy prob; else first legal
-                legal = np.where(action_mask[i] == 1)[0]
-                if pred_deterministic and unified_probs is not None and len(legal) > 0:
-                    probs_vec = unified_probs[i] if i < len(unified_probs) else None
-                    if probs_vec is not None and len(probs_vec) >= int(max(legal)) + 1:
-                        best_idx = int(legal[np.argmax(probs_vec[legal])])
-                        print(
-                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, choosing best-legal {ActionType(best_idx).name} by policy prob."
-                        )
-                        full_action[i] = best_idx
-                    else:
-                        fallback = int(legal[0])
-                        print(
-                            f"[AI] Player {i} tried illegal {ActionType(predicted_action).name}, fallback {ActionType(fallback).name}."
-                        )
-                        full_action[i] = fallback
-                else:
-                    fallback = int(legal[0]) if len(legal) > 0 else 0
-                    print(
-                        f"[AI] Player {i} tried illegal action {ActionType(predicted_action).name}, taking {ActionType(fallback).name} instead."
-                    )
-                    full_action[i] = fallback
+                full_action[i] = int(resolved_unified[i])
 
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
@@ -431,6 +516,8 @@ def take_step(request: ActionRequest):
                     "pressure_multiplier": float(
                         shot_res.get("pressure_multiplier", -1.0)
                     ),
+                    # Adjusted FG% at time of shot (pressure applied and clamped)
+                    "shooter_fg_pct": float(shot_res.get("probability", 0.0)),
                 }
             )
 
@@ -529,6 +616,9 @@ def take_step(request: ActionRequest):
             else:
                 defense_reasons.append("None")
 
+    # Get phi shaping reward for this step (per team member)
+    phi_r_shape_per_team = float(info.get("phi_r_shape", 0.0)) if info else 0.0
+
     game_state.reward_history.append(
         {
             "step": len(game_state.reward_history) + 1,
@@ -536,8 +626,46 @@ def take_step(request: ActionRequest):
             "defense": float(step_rewards["defense"]),
             "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
             "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None",
+            "phi_r_shape": phi_r_shape_per_team,
         }
     )
+
+    # Record Phi shaping diagnostics and per-player EPs for this step (if available)
+    try:
+        entry = {
+            "step": int(len(game_state.reward_history)),
+            "phi_prev": float(info.get("phi_prev", -1.0)) if info else -1.0,
+            "phi_next": float(info.get("phi_next", -1.0)) if info else -1.0,
+            "phi_beta": float(info.get("phi_beta", -1.0)) if info else -1.0,
+            "phi_r_shape": float(info.get("phi_r_shape", 0.0)) if info else 0.0,
+            "ball_handler": (
+                int(game_state.env.ball_holder)
+                if game_state.env.ball_holder is not None
+                else -1
+            ),
+            "offense_ids": list(game_state.env.offense_ids),
+            "defense_ids": list(game_state.env.defense_ids),
+            "shot_clock": (
+                int(game_state.env.shot_clock)
+                if hasattr(game_state.env, "shot_clock")
+                else -1
+            ),
+            "is_terminal": bool(done),  # Flag for terminal states
+        }
+        if info and "phi_ep_by_player" in info:
+            try:
+                ep_list = list(info.get("phi_ep_by_player", []))
+                entry["ep_by_player"] = [float(x) for x in ep_list]
+            except Exception:
+                entry["ep_by_player"] = []
+        if info and "phi_team_best_ep" in info:
+            entry["team_best_ep"] = float(info.get("phi_team_best_ep", -1.0))
+        if info and "phi_ball_handler_ep" in info:
+            entry["ball_handler_ep"] = float(info.get("phi_ball_handler_ep", -1.0))
+        # Note: best_ep_player is calculated on the frontend from ep_by_player
+        game_state.phi_log.append(entry)
+    except Exception:
+        pass
 
     # Capture frame after step
     try:
@@ -546,9 +674,9 @@ def take_step(request: ActionRequest):
             game_state.frames.append(frame)
     except Exception:
         pass
-    # Record resulting state for replay
+    # Record resulting state for replay with policy probs
     try:
-        game_state.episode_states.append(get_full_game_state())
+        game_state.episode_states.append(get_full_game_state(include_policy_probs=True))
     except Exception:
         pass
     # End of self-play: mark inactive when episode is done
@@ -567,6 +695,67 @@ def take_step(request: ActionRequest):
             "defense": float(game_state.episode_rewards["defense"]),
         },
     }
+
+
+@app.get("/api/phi_params")
+def get_phi_params():
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    env = game_state.env
+    return {
+        "enable_phi_shaping": bool(getattr(env, "enable_phi_shaping", False)),
+        "phi_beta": float(getattr(env, "phi_beta", 0.0)),
+        "reward_shaping_gamma": float(getattr(env, "reward_shaping_gamma", 1.0)),
+        "phi_use_ball_handler_only": bool(
+            getattr(env, "phi_use_ball_handler_only", False)
+        ),
+        "phi_blend_weight": float(getattr(env, "phi_blend_weight", 0.0)),
+        "phi_aggregation_mode": str(getattr(env, "phi_aggregation_mode", "team_best")),
+    }
+
+
+class SetPhiParamsRequest(BaseModel):
+    enable_phi_shaping: bool | None = None
+    phi_beta: float | None = None
+    reward_shaping_gamma: float | None = None
+    phi_use_ball_handler_only: bool | None = None
+    phi_blend_weight: float | None = None
+    phi_aggregation_mode: str | None = None
+
+
+@app.post("/api/phi_params")
+def set_phi_params(req: SetPhiParamsRequest):
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    try:
+        env = game_state.env
+        if req.enable_phi_shaping is not None:
+            env.enable_phi_shaping = bool(req.enable_phi_shaping)
+        if req.phi_beta is not None:
+            env.phi_beta = float(req.phi_beta)
+        if req.reward_shaping_gamma is not None:
+            env.reward_shaping_gamma = float(req.reward_shaping_gamma)
+        if req.phi_use_ball_handler_only is not None:
+            env.phi_use_ball_handler_only = bool(req.phi_use_ball_handler_only)
+        if req.phi_blend_weight is not None:
+            try:
+                env.phi_blend_weight = float(max(0.0, min(1.0, req.phi_blend_weight)))
+            except Exception:
+                pass
+        if req.phi_aggregation_mode is not None:
+            valid_modes = ["team_best", "teammates_best", "teammates_avg", "team_avg"]
+            if str(req.phi_aggregation_mode) in valid_modes:
+                env.phi_aggregation_mode = str(req.phi_aggregation_mode)
+        return {"status": "success", "params": get_phi_params()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set phi params: {e}")
+
+
+@app.get("/api/phi_log")
+def get_phi_log():
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    return {"phi_log": list(game_state.phi_log)}
 
 
 @app.post("/api/start_self_play")
@@ -620,6 +809,132 @@ def start_self_play():
         pass
 
     return {"status": "success", "state": get_full_game_state(), "seed": episode_seed}
+
+
+class EvaluationRequest(BaseModel):
+    num_episodes: int = 100
+    deterministic: bool = True
+
+
+@app.post("/api/run_evaluation")
+def run_evaluation(request: EvaluationRequest):
+    """Run N episodes of self-play for evaluation purposes.
+
+    Returns final state of each episode for stats tracking.
+    Runs in deterministic mode using the unified policy.
+    """
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    if not game_state.unified_policy:
+        raise HTTPException(
+            status_code=400, detail="Unified policy required for evaluation."
+        )
+
+    num_episodes = max(1, min(request.num_episodes, 10000))  # Cap at 10000 for safety
+    deterministic = request.deterministic
+
+    episode_results = []
+
+    for ep_idx in range(num_episodes):
+        # Reset environment for new episode
+        episode_seed = int(np.random.SeedSequence().entropy % (2**32 - 1))
+        obs, _ = game_state.env.reset(seed=episode_seed)
+        game_state.obs = obs
+
+        done = False
+        step_count = 0
+
+        # Run episode until done
+        while not done and step_count < 1000:  # Safety limit
+            # Get AI actions for both teams
+            full_action_ai, _ = game_state.unified_policy.predict(
+                obs, deterministic=deterministic
+            )
+
+            opponent_obs = obs
+            if game_state.defense_policy is not None:
+                try:
+                    # Flip role flag for opponent
+                    opponent_obs = {
+                        "obs": np.copy(obs["obs"]),
+                        "action_mask": obs["action_mask"],
+                        "role_flag": np.copy(obs.get("role_flag")),
+                        "skills": np.copy(obs.get("skills")),
+                    }
+                    if opponent_obs.get("role_flag") is not None:
+                        opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
+                    full_action_ai_opponent, _ = game_state.defense_policy.predict(
+                        opponent_obs, deterministic=True
+                    )
+                except Exception:
+                    full_action_ai_opponent = None
+            else:
+                full_action_ai_opponent = None
+
+            # Resolve actions using the same logic as step endpoint
+            action_mask = obs["action_mask"]
+            unified_probs = get_policy_action_probabilities(
+                game_state.unified_policy, obs
+            )
+            opponent_probs = (
+                get_policy_action_probabilities(game_state.defense_policy, opponent_obs)
+                if full_action_ai_opponent is not None
+                else None
+            )
+
+            player_team_strategy = (
+                IllegalActionStrategy.BEST_PROB
+                if deterministic
+                else IllegalActionStrategy.SAMPLE_PROB
+            )
+
+            resolved_unified = resolve_illegal_actions(
+                np.array(full_action_ai),
+                action_mask,
+                player_team_strategy,
+                deterministic,
+                unified_probs,
+            )
+
+            if full_action_ai_opponent is not None:
+                resolved_opponent = resolve_illegal_actions(
+                    np.array(full_action_ai_opponent),
+                    action_mask,
+                    IllegalActionStrategy.BEST_PROB,
+                    True,
+                    opponent_probs,
+                )
+            else:
+                resolved_opponent = np.array(full_action_ai)
+
+            # Combine actions based on team roles
+            final_action = np.array(resolved_unified, dtype=np.int32)
+            for idx in game_state.env.defense_ids:
+                final_action[idx] = resolved_opponent[idx]
+
+            # Execute step
+            obs, reward, terminated, truncated, info = game_state.env.step(final_action)
+            done = terminated or truncated
+            step_count += 1
+
+        # Capture final state
+        game_state.obs = obs
+        final_state = get_full_game_state()
+
+        episode_results.append(
+            {
+                "episode": ep_idx + 1,
+                "final_state": final_state,
+                "steps": step_count,
+            }
+        )
+
+    return {
+        "status": "success",
+        "num_episodes": len(episode_results),
+        "results": episode_results,
+    }
 
 
 @app.post("/api/replay_last_episode")
@@ -848,39 +1163,15 @@ def get_policy_probabilities():
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
     try:
-        policy = game_state.unified_policy
-
-        # Convert observation to the format the policy expects
-        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
-
-        # Get the distribution over actions from the policy object
-        distributions = policy.policy.get_distribution(obs_tensor)
-
-        # Extract raw probabilities for each player
-        raw_probs = [
-            dist.probs.detach().cpu().numpy().squeeze()
-            for dist in distributions.distribution
-        ]
-
-        # Apply action mask so illegal actions have probability 0, then renormalize.
-        action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
-        probs_list = []
-        for pid, probs in enumerate(raw_probs):
-            masked = probs * action_mask[pid]
-            total = masked.sum()
-            if total > 0:
-                masked = masked / total
-            probs_list.append(masked.tolist())
-
-        # Return as a dictionary mapping player_id to their list of probabilities
-        response = {
-            player_id: probs
-            for player_id, probs in enumerate(probs_list)
-            if player_id in game_state.env.offense_ids
-            or player_id in game_state.env.defense_ids
-        }
+        response = compute_policy_probabilities()
+        if response is None:
+            raise HTTPException(
+                status_code=500, detail="Failed to compute policy probabilities"
+            )
         return jsonable_encoder(response)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get policy probabilities: {e}"
@@ -1062,7 +1353,48 @@ def get_rewards():
     }
 
 
-def get_full_game_state():
+def compute_policy_probabilities():
+    """
+    Helper function to compute policy probabilities for the current observation.
+    Returns a dict mapping player_id to their action probabilities, or None if error.
+    """
+    if not game_state.env or not game_state.unified_policy or game_state.obs is None:
+        return None
+
+    try:
+        policy = game_state.unified_policy
+        # Convert observation to the format the policy expects
+        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
+        # Get the distribution over actions from the policy object
+        distributions = policy.policy.get_distribution(obs_tensor)
+        # Extract raw probabilities for each player
+        raw_probs = [
+            dist.probs.detach().cpu().numpy().squeeze()
+            for dist in distributions.distribution
+        ]
+        # Apply action mask so illegal actions have probability 0, then renormalize.
+        action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
+        probs_list = []
+        for pid, probs in enumerate(raw_probs):
+            masked = probs * action_mask[pid]
+            total = masked.sum()
+            if total > 0:
+                masked = masked / total
+            probs_list.append(masked.tolist())
+        # Return as a dictionary mapping player_id to their list of probabilities
+        response = {
+            player_id: probs
+            for player_id, probs in enumerate(probs_list)
+            if player_id in game_state.env.offense_ids
+            or player_id in game_state.env.defense_ids
+        }
+        return response
+    except Exception as e:
+        print(f"[compute_policy_probabilities] Error: {e}")
+        return None
+
+
+def get_full_game_state(include_policy_probs=False):
     """Helper function to construct the full game state dictionary."""
     if not game_state.env:
         return {}
@@ -1092,11 +1424,44 @@ def get_full_game_state():
     )
     action_mask_py = game_state.obs["action_mask"].tolist()
 
-    return {
+    # Calculate ball handler's pressure-adjusted shot probability for replay
+    ball_handler_shot_prob = None
+    if ball_holder_py is not None:
+        try:
+            player_pos = game_state.env.positions[ball_holder_py]
+            basket_pos = game_state.env.basket_position
+            distance = game_state.env._hex_distance(player_pos, basket_pos)
+            ball_handler_shot_prob = float(
+                game_state.env._calculate_shot_probability(ball_holder_py, distance)
+            )
+        except Exception:
+            ball_handler_shot_prob = None
+
+    # Calculate EP (expected points) for all players
+    ep_by_player = []
+    try:
+        env = game_state.env
+        for pid in range(env.n_players):
+            pos = env.positions[pid]
+            dist = env._hex_distance(pos, env.basket_position)
+            shot_value = (
+                2.0
+                if (getattr(env, "allow_dunks", True) and dist == 0)
+                else (3.0 if dist >= env.three_point_distance else 2.0)
+            )
+            p = float(env._calculate_shot_probability(pid, dist))
+            ep = float(shot_value * p)
+            ep_by_player.append(ep)
+    except Exception:
+        # If EP calculation fails, use empty list
+        ep_by_player = []
+
+    state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
         "positions": positions_py,
         "ball_holder": ball_holder_py,
+        "ball_handler_shot_probability": ball_handler_shot_prob,
         "shot_clock": int(game_state.env.shot_clock),
         "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
         "user_team_name": game_state.user_team.name,
@@ -1134,6 +1499,11 @@ def get_full_game_state():
         ),
         "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
+        "max_spawn_distance": (
+            int(getattr(game_state.env, "max_spawn_distance", None))
+            if getattr(game_state.env, "max_spawn_distance", None) is not None
+            else None
+        ),
         "shot_pressure_enabled": bool(
             getattr(game_state.env, "shot_pressure_enabled", True)
         ),
@@ -1152,6 +1522,24 @@ def get_full_game_state():
         ),
         "illegal_defense_max_steps": int(
             getattr(game_state.env, "illegal_defense_max_steps", 3)
+        ),
+        # Pass parameters
+        "pass_arc_degrees": float(getattr(game_state.env, "pass_arc_degrees", 60.0)),
+        "pass_oob_turnover_prob": float(
+            getattr(game_state.env, "pass_oob_turnover_prob", 1.0)
+        ),
+        # Illegal action policy
+        "illegal_action_policy": (
+            getattr(game_state.env, "illegal_action_policy", None).value
+            if getattr(game_state.env, "illegal_action_policy", None)
+            else "noop"
+        ),
+        # Pass logit bias (policy parameter, not env)
+        "pass_logit_bias": float(
+            getattr(game_state.unified_policy.policy, "pass_logit_bias", 0.0)
+            if game_state.unified_policy
+            and hasattr(game_state.unified_policy, "policy")
+            else 0.0
         ),
         # MLflow metadata for UI display
         "run_id": getattr(game_state, "run_id", None),
@@ -1176,4 +1564,14 @@ def get_full_game_state():
                 for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])
             ],
         },
+        # Expected points for all players (indexed by player ID)
+        "ep_by_player": ep_by_player,
     }
+
+    # Optionally include policy probabilities
+    if include_policy_probs:
+        policy_probs = compute_policy_probabilities()
+        if policy_probs is not None:
+            state["policy_probabilities"] = policy_probs
+
+    return state
