@@ -1652,6 +1652,11 @@ class HexagonBasketballEnv(gym.Env):
             teammate_aggregate = max(teammate_eps)
         elif mode == "teammates_avg":
             teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+        elif mode == "teammates_worst":
+            teammate_aggregate = min(teammate_eps)
+        elif mode == "team_worst":
+            # Include ball handler in the "worst" calculation
+            teammate_aggregate = min(min(teammate_eps), ball_ep)
         else:  # "team_best" (default/legacy behavior)
             # Include ball handler in the "best" calculation
             teammate_aggregate = max(max(teammate_eps), ball_ep)

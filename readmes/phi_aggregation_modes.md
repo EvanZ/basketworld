@@ -82,6 +82,38 @@ With w=0.5, penalty would be even stronger: -0.024 per team.
 - With 3 players, ball handler is only 33% of Φ
 - Might need higher β to get sufficient signal
 
+### 5. **teammates_worst** (NEW)
+```
+Φ = (1-w) × min(teammates_excluding_ball_handler) + w × ball_handler_EP
+```
+
+**Use case:** Raise the floor - encourage behaviors that help the worst-positioned teammate.
+
+**Advantages:**
+- Encourages team coordination to improve weakest player's position
+- Rewards actions that prevent any teammate from being left in a bad spot
+- Clean separation of individual vs team "floor" accountability
+- Can create hybrid with ball handler for balanced incentives
+
+**Trade-offs:**
+- May lead to overly cautious play focused on worst-case scenarios
+- Might not encourage taking advantage of the best scoring opportunities
+
+### 6. **team_worst**
+```
+Φ = (1-w) × min(all_teammates_including_ball_handler) + w × ball_handler_EP
+```
+
+**Use case:** Similar to `teammates_worst` but includes ball handler in the minimum calculation.
+
+**Advantages:**
+- Simplest "floor-raising" approach
+- Strongly penalizes leaving anyone (including self) in poor position
+
+**Trade-offs:**
+- Ball handler appears in both terms when they have the worst EP
+- May dampen individual accountability similar to `team_best` issue
+
 ## Recommended Configurations
 
 ### For Learning Shot Selection (Current Issue)
@@ -112,6 +144,15 @@ With w=0.5, penalty would be even stronger: -0.024 per team.
 
 **Why:** No need to tune blend weight, natural 1/N weighting.
 
+### For Raising the Floor (Helping Worst Teammate)
+```bash
+--phi-aggregation-mode teammates_worst \
+--phi-blend-weight 0.3 \  # Balance floor-raising and individual accountability
+--phi-beta-start 0.15
+```
+
+**Why:** Encourages behaviors that prevent any teammate from being left in a terrible position, promoting inclusive team play.
+
 ## Mathematical Comparison
 
 Given a 3v3 scenario:
@@ -125,8 +166,10 @@ Given a 3v3 scenario:
 | `teammates_best` | 0.7×1.151 + 0.3×0.870 = 1.067 | 0.5×1.151 + 0.5×0.870 = 1.011 |
 | `teammates_avg` | 0.7×1.001 + 0.3×0.870 = 0.962 | 0.5×1.001 + 0.5×0.870 = 0.936 |
 | `team_avg` | (0.870+1.151+0.850)/3 = 0.957 | N/A (no blend) |
+| `teammates_worst` | 0.7×0.850 + 0.3×0.870 = 0.856 | 0.5×0.850 + 0.5×0.870 = 0.860 |
+| `team_worst` | 0.7×0.850 + 0.3×0.870 = 0.856 | 0.5×0.850 + 0.5×0.870 = 0.860 |
 
-**Note:** `team_best` and `teammates_best` give same result in this state because ball handler doesn't have the max. The difference appears when ball handler *does* have the max.
+**Note:** `team_best` and `teammates_best` give same result in this state because ball handler doesn't have the max. The difference appears when ball handler *does* have the max. Similarly, `team_worst` and `teammates_worst` give same result here because ball handler doesn't have the min.
 
 ## When Each Mode Shines
 
@@ -150,12 +193,25 @@ Given a 3v3 scenario:
 - You need backward compatibility with existing runs
 - You've already tuned w for this mode
 
+### Use `teammates_worst` when:
+- You want to encourage "no one left behind" team dynamics
+- Learning to help struggling teammates is important
+- You want to raise the floor of team performance
+- Can be hybridized with ball handler EP for balanced incentives
+
+### Use `team_worst` when:
+- Similar to `teammates_worst` but with simpler inclusion of ball handler
+- Good for ensuring minimum team quality standards
+
 ## Implementation Details
 
 The aggregation mode is set via CLI:
 ```bash
 --phi-aggregation-mode teammates_best
+# or teammates_worst, team_worst, etc.
 ```
+
+Available modes: `team_best`, `teammates_best`, `teammates_avg`, `team_avg`, `teammates_worst`, `team_worst`
 
 And stored in the environment:
 ```python

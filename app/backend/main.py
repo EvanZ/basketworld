@@ -283,7 +283,7 @@ async def init_game(request: InitGameRequest):
             ball_holder_id = int(env.ball_holder) if env.ball_holder is not None else -1
             offense_ids = list(env.offense_ids)
 
-            # Compute phi based on aggregation mode
+            # Compute phi based on aggregation mode (same as during steps)
             if ball_holder_id >= 0 and len(offense_ids) > 0:
                 ball_ep = ep_by_player[ball_holder_id]
                 mode = getattr(env, "phi_aggregation_mode", "team_best")
@@ -304,6 +304,10 @@ async def init_game(request: InitGameRequest):
                         teammate_aggregate = max(teammate_eps)
                     elif mode == "teammates_avg":
                         teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+                    elif mode == "teammates_worst":
+                        teammate_aggregate = min(teammate_eps)
+                    elif mode == "team_worst":
+                        teammate_aggregate = min(min(teammate_eps), ball_ep)
                     else:  # "team_best"
                         teammate_aggregate = max(max(teammate_eps), ball_ep)
 
@@ -1433,6 +1437,25 @@ def get_full_game_state(include_policy_probs=False):
         except Exception:
             ball_handler_shot_prob = None
 
+    # Calculate EP (expected points) for all players
+    ep_by_player = []
+    try:
+        env = game_state.env
+        for pid in range(env.n_players):
+            pos = env.positions[pid]
+            dist = env._hex_distance(pos, env.basket_position)
+            shot_value = (
+                2.0
+                if (getattr(env, "allow_dunks", True) and dist == 0)
+                else (3.0 if dist >= env.three_point_distance else 2.0)
+            )
+            p = float(env._calculate_shot_probability(pid, dist))
+            ep = float(shot_value * p)
+            ep_by_player.append(ep)
+    except Exception:
+        # If EP calculation fails, use empty list
+        ep_by_player = []
+
     state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
@@ -1541,6 +1564,8 @@ def get_full_game_state(include_policy_probs=False):
                 for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])
             ],
         },
+        # Expected points for all players (indexed by player ID)
+        "ep_by_player": ep_by_player,
     }
 
     # Optionally include policy probabilities

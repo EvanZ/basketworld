@@ -432,6 +432,17 @@ const playerTransitions = computed(() => {
               @click="onPlayerClick(player)"
             />
             <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text" @click="onPlayerClick(player)">{{ player.id }}</text>
+            <!-- EP (Expected Points) label above player ID for offensive players -->
+            <text
+              v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined"
+              :x="player.x"
+              :y="player.y"
+              dy="-1.0em"
+              text-anchor="middle"
+              class="noop-prob-text"
+            >
+              {{ Number(currentGameState.ep_by_player[player.id]).toFixed(2) }}
+            </text>
             <!-- NOOP probability label (index 0) for the player -->
             <text
               v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined"

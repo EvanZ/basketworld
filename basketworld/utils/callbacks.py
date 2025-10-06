@@ -294,15 +294,22 @@ class MLflowCallback(BaseCallback):
 class EntropyScheduleCallback(BaseCallback):
     """Linear decay of entropy coefficient across the run."""
 
-    def __init__(self, start: float, end: float, total_planned_timesteps: int):
+    def __init__(
+        self,
+        start: float,
+        end: float,
+        total_planned_timesteps: int,
+        timestep_offset: int = 0,
+    ):
         super().__init__()
         self.start = float(start)
         self.end = float(end)
         self.total = int(max(1, total_planned_timesteps))
+        self.timestep_offset = int(timestep_offset)
 
     def _on_step(self) -> bool:
         try:
-            t = int(getattr(self.model, "num_timesteps", 0))
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             progress = min(1.0, max(0.0, t / float(self.total)))
             current = self.end + (self.start - self.end) * (1.0 - progress)
             self.model.ent_coef = float(current)
@@ -321,6 +328,7 @@ class EntropyExpScheduleCallback(BaseCallback):
         total_planned_timesteps: int,
         bump_updates: int = 0,
         bump_multiplier: float = 1.0,
+        timestep_offset: int = 0,
     ):
         super().__init__()
         self.start = float(max(1e-12, start))
@@ -328,6 +336,7 @@ class EntropyExpScheduleCallback(BaseCallback):
         self.total = int(max(1, total_planned_timesteps))
         self.bump_updates = int(max(0, bump_updates))
         self.bump_multiplier = float(max(1.0, bump_multiplier))
+        self.timestep_offset = int(timestep_offset)
         self._bump_updates_remaining = 0
 
     def start_new_alternation(self):
@@ -341,7 +350,7 @@ class EntropyExpScheduleCallback(BaseCallback):
 
     def _apply_current(self):
         try:
-            t = int(getattr(self.model, "num_timesteps", 0))
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             current = self._scheduled_value(t)
             if self._bump_updates_remaining > 0:
                 current = float(current * self.bump_multiplier)
@@ -384,6 +393,7 @@ class PotentialBetaExpScheduleCallback(BaseCallback):
         total_planned_timesteps: int,
         bump_updates: int = 0,
         bump_multiplier: float = 1.0,
+        timestep_offset: int = 0,
     ):
         super().__init__()
         self.start = float(max(0.0, start))
@@ -391,6 +401,7 @@ class PotentialBetaExpScheduleCallback(BaseCallback):
         self.total = int(max(1, total_planned_timesteps))
         self.bump_updates = int(max(0, bump_updates))
         self.bump_multiplier = float(max(1.0, bump_multiplier))
+        self.timestep_offset = int(timestep_offset)
         self._bump_updates_remaining = 0
 
     def start_new_alternation(self):
@@ -408,7 +419,7 @@ class PotentialBetaExpScheduleCallback(BaseCallback):
 
     def _apply_current(self):
         try:
-            t = int(getattr(self.model, "num_timesteps", 0))
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             current = self._scheduled_value(t)
             if self._bump_updates_remaining > 0:
                 current = float(current * self.bump_multiplier)
@@ -452,11 +463,13 @@ class PassLogitBiasExpScheduleCallback(BaseCallback):
         start: float,
         end: float,
         total_planned_timesteps: int,
+        timestep_offset: int = 0,
     ):
         super().__init__()
         self.start = float(start)
         self.end = float(end)
         self.total = int(max(1, total_planned_timesteps))
+        self.timestep_offset = int(timestep_offset)
 
     def _scheduled_value(self, t: int) -> float:
         progress = min(1.0, max(0.0, t / float(self.total)))
@@ -484,7 +497,7 @@ class PassLogitBiasExpScheduleCallback(BaseCallback):
 
     def _apply_current(self):
         try:
-            t = int(getattr(self.model, "num_timesteps", 0))
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             current = self._scheduled_value(t)
             # Update policy hook if available
             try:
@@ -528,6 +541,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
         total_planned_timesteps: int,
         arc_power: float = 2.0,
         oob_power: float = 2.0,
+        timestep_offset: int = 0,
     ):
         super().__init__()
         self.arc_start = float(arc_start)
@@ -537,6 +551,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
         self.total = int(max(1, total_planned_timesteps))
         self.arc_power = float(arc_power)
         self.oob_power = float(oob_power)
+        self.timestep_offset = int(timestep_offset)
 
     def _exp_sched(self, start: float, end: float, t: int, power: float) -> float:
         progress = min(1.0, max(0.0, t / float(self.total)))
@@ -551,7 +566,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
 
     def _apply_current(self):
         try:
-            t = int(getattr(self.model, "num_timesteps", 0))
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             arc = self._exp_sched(self.arc_start, self.arc_end, t, self.arc_power)
             oob = self._exp_sched(self.oob_start, self.oob_end, t, self.oob_power)
             vecenv = self.model.get_env()
@@ -563,8 +578,13 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
                 pass
             # Log to MLflow
             try:
-                mlflow.log_metric("Passing Arc Degrees", float(arc), step=t)
-                mlflow.log_metric("Pass OOB Turnover Prob", float(oob), step=t)
+                # Use model.num_timesteps (with offset) for the metric step
+                mlflow.log_metric(
+                    "Passing Arc Degrees", float(arc), step=t + self.timestep_offset
+                )
+                mlflow.log_metric(
+                    "Pass OOB Turnover Prob", float(oob), step=t + self.timestep_offset
+                )
             except Exception:
                 pass
         except Exception:

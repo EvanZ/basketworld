@@ -741,6 +741,16 @@ def main(args):
             ent_schedule_type = getattr(args, "ent_schedule", "linear")
             total_planned_ts = new_training_timesteps
 
+        # Determine timestep offset for restart mode
+        # In restart mode with a continued run, we need to offset by the current timesteps
+        # so the schedule starts fresh from 0 instead of using the model's accumulated timesteps
+        timestep_offset = 0
+        if args.continue_run_id and schedule_mode == "restart":
+            timestep_offset = unified_policy.num_timesteps
+            print(
+                f"  Using timestep offset: {timestep_offset} (current model timesteps)"
+            )
+
         # Create entropy callback if we have a schedule
         if ent_start is not None or (args.ent_coef_start is not None):
             if ent_start is None:
@@ -758,10 +768,14 @@ def main(args):
                         args, "ent_bump_updates", getattr(args, "ent_bump_rollouts", 0)
                     ),
                     bump_multiplier=getattr(args, "ent_bump_multiplier", 1.0),
+                    timestep_offset=timestep_offset,
                 )
             else:
                 entropy_callback = EntropyScheduleCallback(
-                    ent_start, ent_end, total_planned_ts
+                    ent_start,
+                    ent_end,
+                    total_planned_ts,
+                    timestep_offset=timestep_offset,
                 )
 
         # Prepare optional Phi beta scheduler across the whole run
@@ -809,6 +823,7 @@ def main(args):
                     total_planned_ts,
                     bump_updates=phi_beta_bump_updates,
                     bump_multiplier=phi_beta_bump_multiplier,
+                    timestep_offset=timestep_offset,
                 )
         # Optional Pass Logit Bias scheduler across the whole run
         pass_bias_callback = None
@@ -826,7 +841,8 @@ def main(args):
                 if getattr(args, "pass_logit_bias_end", None) is not None
                 else 0.0
             )
-            total_planned_ts = int(
+            # Use new_training_timesteps to match the restart logic
+            pass_bias_total_ts = int(
                 2
                 * args.alternations
                 * args.steps_per_alternation
@@ -834,7 +850,7 @@ def main(args):
                 * args.n_steps
             )
             pass_bias_callback = PassLogitBiasExpScheduleCallback(
-                p_start, p_end, total_planned_ts
+                p_start, p_end, pass_bias_total_ts, timestep_offset=timestep_offset
             )
 
         # Optional passing curriculum (arc degrees, OOB turnover probability)
@@ -875,6 +891,8 @@ def main(args):
                 if getattr(args, "pass_oob_power", None) is not None
                 else 2.0
             )
+            # Use total_planned_ts which is calculated based on schedule mode
+            # For pass curriculum, we use the same total timesteps as other schedules
             pass_curriculum_callback = PassCurriculumExpScheduleCallback(
                 arc_start,
                 arc_end,
@@ -883,6 +901,7 @@ def main(args):
                 total_planned_ts,
                 arc_power=arc_power,
                 oob_power=oob_power,
+                timestep_offset=timestep_offset,
             )
 
         for i in range(args.alternations):
@@ -1804,9 +1823,16 @@ if __name__ == "__main__":
         "--phi-aggregation-mode",
         dest="phi_aggregation_mode",
         type=str,
-        choices=["team_best", "teammates_best", "teammates_avg", "team_avg"],
+        choices=[
+            "team_best",
+            "teammates_best",
+            "teammates_avg",
+            "team_avg",
+            "team_worst",
+            "teammates_worst",
+        ],
         default="team_best",
-        help="How to aggregate teammate EPs: 'team_best' (max including ball), 'teammates_best' (max excluding ball), 'teammates_avg' (mean excluding ball), 'team_avg' (mean including ball).",
+        help="How to aggregate teammate EPs: 'team_best' (max including ball), 'teammates_best' (max excluding ball), 'teammates_avg' (mean excluding ball), 'team_avg' (mean including ball), 'team_worst' (min including ball), 'teammates_worst' (min excluding ball).",
     )
     parser.add_argument(
         "--phi-beta-start",

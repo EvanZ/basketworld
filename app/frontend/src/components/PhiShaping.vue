@@ -98,6 +98,12 @@ function calculatePhi(row, mode, blendWeight, useBallHandlerOnly) {
   } else if (mode === 'teammates_avg') {
     // Average of teammates excluding ball handler
     aggregateEP = teammateEPs.reduce((sum, ep) => sum + ep, 0) / teammateEPs.length;
+  } else if (mode === 'teammates_worst') {
+    // Min of teammates excluding ball handler
+    aggregateEP = Math.min(...teammateEPs);
+  } else if (mode === 'team_worst') {
+    // Min including ball handler
+    aggregateEP = Math.min(...offenseEPs);
   } else {
     // 'team_best': Max including ball handler
     aggregateEP = Math.max(...offenseEPs);
@@ -118,15 +124,14 @@ const displayRows = computed(() => {
   
   return rawLogData.value.map((row, idx) => {
     // Recalculate Φ values with current parameters
-    // For terminal states, phi_next must be 0 to maintain policy invariance
+    // Terminal states must be 0 for policy invariance, but initial state can be non-zero
     const phi_next = row.is_terminal ? 0.0 : calculatePhi(row, mode, blendWeight, useBallHandlerOnly);
     
     // For phi_prev:
     // - Step 0 (initial state): phi_prev = 0 (no previous state)
-    // - Step 1 (first transition): phi_prev = 0 (Φ(s₀) = 0 by definition for proper PBRS)
-    // - Step 2+: phi_prev = previous state's phi_next
+    // - Step 1+: phi_prev = previous state's phi_next (ensures continuity)
     let phi_prev = 0;
-    if (row.step > 1 && idx > 0) {
+    if (idx > 0) {
       const prevRow = rawLogData.value[idx - 1];
       phi_prev = prevRow.is_terminal ? 0.0 : calculatePhi(prevRow, mode, blendWeight, useBallHandlerOnly);
     }
@@ -222,6 +227,8 @@ defineExpose({ refresh: refreshLog });
           <option value="teammates_best">Teammates Best (excludes ball handler)</option>
           <option value="teammates_avg">Teammates Avg (excludes ball handler)</option>
           <option value="team_avg">Team Avg (no blend)</option>
+          <option value="teammates_worst">Teammates Worst (excludes ball handler)</option>
+          <option value="team_worst">Team Worst (includes ball handler)</option>
         </select>
       </div>
       <div class="blend" v-if="params.phi_aggregation_mode !== 'team_avg'">

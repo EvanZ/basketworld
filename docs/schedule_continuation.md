@@ -277,3 +277,5 @@ Check MLflow UI → Run → Parameters → search for "schedule_" to see all sav
 | `constant` | Train more with fixed hyperparameters | Uses final schedule values as constants |
 | `restart` | Try different schedule parameters | Ignores previous run, uses new parameters |
 
+
+

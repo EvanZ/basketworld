@@ -74,15 +74,13 @@ watch(gameState, async (newState, oldState) => {
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
   
-  // Preserve phi shaping parameters from current game (if any)
+  // Preserve phi shaping parameters (always try to save them, not just when gameState exists)
   let savedPhiParams = null;
-  if (gameState.value) {
-    try {
-      savedPhiParams = await getPhiParams();
-      console.log('[App] Saved phi shaping params for new game:', savedPhiParams);
-    } catch (err) {
-      console.warn('[App] Could not save phi params:', err);
-    }
+  try {
+    savedPhiParams = await getPhiParams();
+    console.log('[App] Saved phi shaping params for new game:', savedPhiParams);
+  } catch (err) {
+    console.warn('[App] Could not save phi params:', err);
   }
   
   // Clear move history for new game
