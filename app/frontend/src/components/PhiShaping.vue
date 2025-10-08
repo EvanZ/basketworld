@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue';
-import { getPhiParams, setPhiParams, getPhiLog } from '../services/api';
+import { getPhiParams, setPhiParams, getPhiLog, getRewards } from '../services/api';
 
 const props = defineProps({
   gameState: Object
@@ -20,10 +20,19 @@ const rawLogData = ref([]); // Store raw data from backend
 
 async function loadParams() {
   try {
-    const p = await getPhiParams();
-    params.value = { ...params.value, ...p };
+    // Try to load MLflow params first (from training run)
+    const rewardsData = await getRewards();
+    if (rewardsData.mlflow_phi_params && rewardsData.mlflow_phi_params.enable_phi_shaping) {
+      params.value = { ...params.value, ...rewardsData.mlflow_phi_params };
+      console.log('[PhiShaping] Initialized with MLflow params:', rewardsData.mlflow_phi_params);
+    } else {
+      // Fall back to environment params if no MLflow params
+      const p = await getPhiParams();
+      params.value = { ...params.value, ...p };
+    }
   } catch (e) {
     // ignore param fetch errors in isolation
+    console.warn('[PhiShaping] Failed to load params:', e);
   }
 }
 
@@ -138,6 +147,7 @@ const displayRows = computed(() => {
     
     // Recalculate r_shape with current beta and gamma
     // Step 0 (initial state) has no transition yet, so r_shape = 0
+    // This is the total team shaping reward (matching Rewards tab team totals)
     const r_shape = row.step === 0 ? 0 : beta * (gamma * phi_next - phi_prev);
     
     // Calculate best EP player from ep_by_player array
@@ -253,7 +263,7 @@ defineExpose({ refresh: refreshLog });
             <th>TeamBestEP</th>
             <th>BallEP</th>
             <th>BestP</th>
-            <th>r_shape/team</th>
+            <th>r_shape</th>
           </tr>
         </thead>
         <tbody>
@@ -266,7 +276,7 @@ defineExpose({ refresh: refreshLog });
             <td>{{ (row.team_best_ep ?? -1).toFixed(3) }}</td>
             <td>{{ (row.ball_handler_ep ?? -1).toFixed(3) }}</td>
             <td>{{ row.best_ep_player >= 0 ? row.best_ep_player : '-' }}</td>
-            <td>{{ (row.phi_r_shape ?? 0).toFixed(4) }}</td>
+            <td>{{ (row.phi_r_shape ?? 0).toFixed(3) }}</td>
           </tr>
           <tr v-if="displayRows.length > 0">
             <td><strong>Total</strong></td>
@@ -277,7 +287,7 @@ defineExpose({ refresh: refreshLog });
             <td></td>
             <td></td>
             <td></td>
-            <td><strong>{{ displayRows.reduce((s, r) => s + (Number(r?.phi_r_shape) || 0), 0).toFixed(4) }}</strong></td>
+            <td><strong>{{ displayRows.reduce((s, r) => s + (Number(r?.phi_r_shape) || 0), 0).toFixed(3) }}</strong></td>
           </tr>
         </tbody>
       </table>

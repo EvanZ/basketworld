@@ -1745,35 +1745,35 @@ if __name__ == "__main__":
         "--potential-assist-reward",
         dest="potential_assist_reward",
         type=float,
-        default=0.1,
+        default=0,
         help="Reward for potential assist within window (team-averaged).",
     )
     parser.add_argument(
         "--full-assist-bonus",
         dest="full_assist_bonus",
         type=float,
-        default=0.2,
+        default=0,
         help="Additional reward for made shot within assist window (team-averaged).",
     )
     parser.add_argument(
         "--assist-window",
         dest="assist_window",
         type=int,
-        default=2,
+        default=3,
         help="Steps after pass that count toward assist window.",
     )
     parser.add_argument(
         "--potential-assist-pct",
         dest="potential_assist_pct",
         type=float,
-        default=0.10,
+        default=0,
         help="Potential assist reward as % of shot reward.",
     )
     parser.add_argument(
         "--full-assist-bonus-pct",
         dest="full_assist_bonus_pct",
         type=float,
-        default=0.05,
+        default=0,
         help="Full assist bonus as % of shot reward.",
     )
     parser.add_argument(

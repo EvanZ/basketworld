@@ -204,3 +204,85 @@ def get_mlflow_params(
         params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
     )
     return required, optional
+
+
+def get_mlflow_phi_shaping_params(
+    client: mlflow.tracking.MlflowClient, run_id: str
+) -> dict:
+    """Fetch phi shaping parameters from an MLflow run.
+
+    These are returned separately so they can be used for reward calculation
+    independently from the Phi Shaping tab (which is for experimentation).
+
+    Returns a dict with:
+      - enable_phi_shaping: bool
+      - phi_beta: float (uses phi_beta_end if available, else phi_beta_start)
+      - reward_shaping_gamma: float
+      - phi_use_ball_handler_only: bool
+      - phi_blend_weight: float
+      - phi_aggregation_mode: str
+    """
+    run = client.get_run(run_id)
+    params = run.data.params
+
+    phi_params = {}
+
+    # Enable phi shaping
+    phi_params["enable_phi_shaping"] = _get_param(
+        params,
+        ["enable_phi_shaping", "enable-phi-shaping"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+
+    # Phi beta - prefer phi_beta_end (final value) over phi_beta_start
+    # This is what the model was trained with at the end of training
+    phi_beta_end = _get_param(
+        params,
+        ["phi_beta_end", "phi-beta-end"],
+        float,
+        None,
+    )
+    phi_beta_start = _get_param(
+        params,
+        ["phi_beta_start", "phi-beta-start", "phi_beta", "phi-beta"],
+        float,
+        0.0,
+    )
+    phi_params["phi_beta"] = (
+        phi_beta_end if phi_beta_end is not None else phi_beta_start
+    )
+
+    # Reward shaping gamma (should match training gamma)
+    phi_params["reward_shaping_gamma"] = _get_param(
+        params,
+        ["reward_shaping_gamma", "reward-shaping-gamma"],
+        float,
+        1.0,
+    )
+
+    # Ball handler only mode
+    phi_params["phi_use_ball_handler_only"] = _get_param(
+        params,
+        ["phi_use_ball_handler_only", "phi-use-ball-handler-only"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+
+    # Blend weight
+    phi_params["phi_blend_weight"] = _get_param(
+        params,
+        ["phi_blend_weight", "phi-blend-weight"],
+        float,
+        0.0,
+    )
+
+    # Aggregation mode
+    phi_params["phi_aggregation_mode"] = _get_param(
+        params,
+        ["phi_aggregation_mode", "phi-aggregation-mode"],
+        str,
+        "team_best",
+    )
+
+    return phi_params

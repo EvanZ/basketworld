@@ -69,6 +69,7 @@ const activeTab = ref('controls');
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
+const mlflowPhiParams = ref(null);
 
 // Move tracking is now handled by parent component
 
@@ -631,7 +632,8 @@ const fetchRewards = async () => {
     rewardHistory.value = data.reward_history || [];
     episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
     rewardParams.value = data.reward_params || null;
-    console.log('[Rewards] Fetched rewards. History length:', rewardHistory.value.length, 'Episode totals:', episodeRewards.value);
+    mlflowPhiParams.value = data.mlflow_phi_params || null;
+    console.log('[Rewards] Fetched rewards. History length:', rewardHistory.value.length, 'Episode totals:', episodeRewards.value, 'MLflow phi params:', mlflowPhiParams.value);
   } catch (error) {
     console.error('Failed to fetch rewards:', error);
   }
@@ -646,6 +648,14 @@ watch(() => props.gameState, (newState, oldState) => {
     // Move history clearing is now handled by parent component
   }
 }, { deep: true });
+
+// Watch for when user switches to Rewards tab
+watch(() => activeTab.value, (newTab) => {
+  if (newTab === 'rewards') {
+    console.log('[Rewards] Switched to Rewards tab, fetching rewards');
+    fetchRewards();
+  }
+});
 
 onMounted(() => {
   fetchRewards();
@@ -788,6 +798,13 @@ const phiRef = vueRef(null);
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
             <div class="param-item"><span class="param-name">Turnover penalty:</span><span class="param-value">{{ rewardParams.turnover_penalty }}</span></div>
           </div>
+          <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
+            <h5>Phi Shaping (from MLflow)</h5>
+            <div class="param-item"><span class="param-name">Beta (β):</span><span class="param-value">{{ mlflowPhiParams.phi_beta }}</span></div>
+            <div class="param-item"><span class="param-name">Gamma (γ):</span><span class="param-value">{{ mlflowPhiParams.reward_shaping_gamma }}</span></div>
+            <div class="param-item"><span class="param-name">Aggregation mode:</span><span class="param-value">{{ mlflowPhiParams.phi_aggregation_mode }}</span></div>
+            <div class="param-item" v-if="mlflowPhiParams.phi_blend_weight > 0"><span class="param-name">Blend weight:</span><span class="param-value">{{ mlflowPhiParams.phi_blend_weight.toFixed(2) }}</span></div>
+          </div>
         </div>
         <div v-else class="no-rewards">No reward parameters available.</div>
 
@@ -815,7 +832,7 @@ const phiRef = vueRef(null);
               <span>Off. Reason</span>
               <span>Defense</span>
               <span>Def. Reason</span>
-              <span>Φ Shape</span>
+              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">Φ</span>
             </div>
             <div 
               v-for="reward in rewardHistory" 
@@ -824,15 +841,15 @@ const phiRef = vueRef(null);
             >
               <span>{{ reward.step }}</span>
               <span :class="{ positive: reward.offense > 0, negative: reward.offense < 0 }">
-                {{ reward.offense.toFixed(2) }}
+                {{ reward.offense.toFixed(3) }}
               </span>
               <span class="reason-text">{{ reward.offense_reason }}</span>
               <span :class="{ positive: reward.defense > 0, negative: reward.defense < 0 }">
-                {{ reward.defense.toFixed(2) }}
+                {{ reward.defense.toFixed(3) }}
               </span>
               <span class="reason-text">{{ reward.defense_reason }}</span>
-              <span :class="{ positive: (reward.phi_r_shape || 0) > 0, negative: (reward.phi_r_shape || 0) < 0 }">
-                {{ (reward.phi_r_shape || 0).toFixed(4) }}
+              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
+                {{ (reward.mlflow_phi_potential || 0).toFixed(3) }}
               </span>
             </div>
           </div>

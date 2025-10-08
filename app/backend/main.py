@@ -25,7 +25,10 @@ from basketworld.utils.action_resolution import (
     get_policy_action_probabilities,
     resolve_illegal_actions,
 )
-from basketworld.utils.mlflow_params import get_mlflow_params
+from basketworld.utils.mlflow_params import (
+    get_mlflow_params,
+    get_mlflow_phi_shaping_params,
+)
 
 
 # --- Globals ---
@@ -64,6 +67,9 @@ class GameState:
         # MLflow run metadata
         self.run_id: str | None = None
         self.run_name: str | None = None
+        # MLflow phi shaping parameters (used for Rewards tab calculations)
+        # This is separate from env.phi_beta etc which can be modified in Phi Shaping tab
+        self.mlflow_phi_shaping_params: dict | None = None
 
 
 game_state = GameState()
@@ -204,6 +210,10 @@ async def init_game(request: InitGameRequest):
         run = client.get_run(request.run_id)
         run_name = run.data.tags.get("mlflow.runName") if run and run.data else None
 
+        # Load phi shaping parameters from MLflow
+        # These will be used for Rewards tab calculations (independent of Phi Shaping tab)
+        mlflow_phi_params = get_mlflow_phi_shaping_params(client, request.run_id)
+
         # Unified-only
         unified_path = get_unified_policy_path(
             client, request.run_id, request.unified_policy_name
@@ -243,6 +253,7 @@ async def init_game(request: InitGameRequest):
         # Store MLflow run metadata on game state for later use (saving, UI)
         game_state.run_id = request.run_id
         game_state.run_name = run_name or request.run_id
+        game_state.mlflow_phi_shaping_params = mlflow_phi_params
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
@@ -350,6 +361,70 @@ async def init_game(request: InitGameRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize game: {e}")
+
+
+def calculate_phi_from_ep_data(
+    ep_by_player: list[float],
+    ball_handler_id: int,
+    offense_ids: list[int],
+    phi_params: dict,
+) -> float:
+    """Calculate phi value from EP data using specified parameters.
+
+    This allows us to recalculate phi with different parameters (e.g., MLflow params)
+    independently of the environment's current phi settings.
+    """
+    if not ep_by_player or ball_handler_id < 0 or not offense_ids:
+        return 0.0
+
+    ball_ep = (
+        ep_by_player[ball_handler_id] if ball_handler_id < len(ep_by_player) else 0.0
+    )
+
+    if phi_params.get("phi_use_ball_handler_only", False):
+        return ball_ep
+
+    mode = phi_params.get("phi_aggregation_mode", "team_best")
+    blend_weight = phi_params.get("phi_blend_weight", 0.0)
+
+    # Get EPs for offensive team
+    offense_eps = [ep_by_player[pid] for pid in offense_ids if pid < len(ep_by_player)]
+
+    if not offense_eps:
+        return ball_ep
+
+    if mode == "team_avg":
+        # Simple average of all players (including ball handler)
+        return sum(offense_eps) / len(offense_eps)
+
+    # For other modes, separate ball handler from teammates
+    teammate_eps = [
+        ep_by_player[pid]
+        for pid in offense_ids
+        if pid != ball_handler_id and pid < len(ep_by_player)
+    ]
+
+    if not teammate_eps:
+        # No teammates (1v1 or edge case)
+        return ball_ep
+
+    # Aggregate teammate EPs based on mode
+    if mode == "teammates_best":
+        teammate_aggregate = max(teammate_eps)
+    elif mode == "teammates_avg":
+        teammate_aggregate = sum(teammate_eps) / len(teammate_eps)
+    elif mode == "teammates_worst":
+        teammate_aggregate = min(teammate_eps)
+    elif mode == "team_worst":
+        # Include ball handler in the "worst" calculation
+        teammate_aggregate = min(min(teammate_eps), ball_ep)
+    else:  # "team_best" (default/legacy behavior)
+        # Include ball handler in the "best" calculation
+        teammate_aggregate = max(max(teammate_eps), ball_ep)
+
+    # Blend teammate aggregate with ball handler EP
+    w = max(0.0, min(1.0, blend_weight))
+    return (1.0 - w) * teammate_aggregate + w * ball_ep
 
 
 @app.post("/api/step")
@@ -617,7 +692,36 @@ def take_step(request: ActionRequest):
                 defense_reasons.append("None")
 
     # Get phi shaping reward for this step (per team member)
+    # This is from the environment's phi shaping (using env params)
     phi_r_shape_per_team = float(info.get("phi_r_shape", 0.0)) if info else 0.0
+
+    # Store EP data for MLflow-based phi calculation in Rewards tab
+    # Calculate it directly from environment state if not provided
+    ep_by_player = []
+    if info and "phi_ep_by_player" in info:
+        try:
+            ep_by_player = [float(x) for x in info.get("phi_ep_by_player", [])]
+        except Exception:
+            pass
+
+    # If EP data not provided (phi shaping disabled in env), calculate it ourselves
+    if not ep_by_player and game_state.env:
+        try:
+            env = game_state.env
+            for pid in range(env.n_players):
+                pos = env.positions[pid]
+                dist = env._hex_distance(pos, env.basket_position)
+                shot_value = (
+                    2.0
+                    if (getattr(env, "allow_dunks", False) and dist == 0)
+                    else (3.0 if dist >= env.three_point_distance else 2.0)
+                )
+                p = float(env._calculate_shot_probability(pid, dist))
+                ep_by_player.append(float(shot_value * p))
+        except Exception as e:
+            # If calculation fails, log and continue with empty list
+            print(f"[WARNING] Failed to calculate EP data: {e}")
+            ep_by_player = []
 
     game_state.reward_history.append(
         {
@@ -626,7 +730,15 @@ def take_step(request: ActionRequest):
             "defense": float(step_rewards["defense"]),
             "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
             "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None",
-            "phi_r_shape": phi_r_shape_per_team,
+            "phi_r_shape": phi_r_shape_per_team,  # From env (for debugging)
+            "ep_by_player": ep_by_player,  # For MLflow phi calculation
+            "ball_handler": (
+                int(game_state.env.ball_holder)
+                if game_state.env.ball_holder is not None
+                else -1
+            ),
+            "offense_ids": list(game_state.env.offense_ids),
+            "is_terminal": bool(done),
         }
     )
 
@@ -1307,16 +1419,170 @@ def get_shot_probability(player_id: int):
 @app.get("/api/rewards")
 def get_rewards():
     """Get the current reward history and episode totals."""
+    import sys
+
+    print("=" * 80, flush=True)
+    print("[DEBUG] /api/rewards endpoint called", flush=True)
+    sys.stdout.flush()
+
+    # Calculate phi shaping rewards using MLflow parameters (if available)
+    # This is separate from the Phi Shaping tab which is for experimentation
+    mlflow_phi_params = game_state.mlflow_phi_shaping_params
+    print(f"[DEBUG] mlflow_phi_params = {mlflow_phi_params}", flush=True)
+    sys.stdout.flush()
+
+    # Calculate MLflow-based phi shaping rewards
+    mlflow_phi_r_shape_values = []
+    if mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False):
+        beta = mlflow_phi_params.get("phi_beta", 0.0)
+        gamma = mlflow_phi_params.get("reward_shaping_gamma", 1.0)
+
+        print(
+            f"[MLflow Phi] Calculating rewards with beta={beta}, gamma={gamma}, mode={mlflow_phi_params.get('phi_aggregation_mode')}, history_length={len(game_state.reward_history)}"
+        )
+
+        # Calculate phi for initial state (step 0) from phi_log if available
+        phi_prev = 0.0
+        if game_state.phi_log and len(game_state.phi_log) > 0:
+            initial_entry = game_state.phi_log[0]
+            if initial_entry.get("step") == 0:
+                # Recalculate initial phi using MLflow params
+                initial_ep = initial_entry.get("ep_by_player", [])
+                initial_ball = initial_entry.get("ball_handler", -1)
+                initial_offense = initial_entry.get("offense_ids", [])
+                print(
+                    f"[MLflow Phi] Initial state: ep_by_player={initial_ep}, ball={initial_ball}, offense={initial_offense}"
+                )
+                if initial_ep and initial_ball >= 0 and initial_offense:
+                    phi_prev = calculate_phi_from_ep_data(
+                        initial_ep, initial_ball, initial_offense, mlflow_phi_params
+                    )
+                    print(
+                        f"[MLflow Phi] Initial state phi_prev = {phi_prev} (expected from Phi Shaping tab)"
+                    )
+                else:
+                    print(
+                        f"[MLflow Phi] WARNING: Could not calculate initial phi - missing data"
+                    )
+
+        for i, reward in enumerate(game_state.reward_history):
+            ep_by_player = reward.get("ep_by_player", [])
+            ball_handler = reward.get("ball_handler", -1)
+            offense_ids = reward.get("offense_ids", [])
+            is_terminal = reward.get("is_terminal", False)
+
+            # Calculate phi_next using MLflow params
+            phi_next = 0.0  # Terminal states have phi_next = 0
+            if not is_terminal and ep_by_player:
+                phi_next = calculate_phi_from_ep_data(
+                    ep_by_player, ball_handler, offense_ids, mlflow_phi_params
+                )
+            elif not is_terminal and not ep_by_player:
+                print(
+                    f"[MLflow Phi] WARNING: No EP data for step {i+1}, cannot calculate phi"
+                )
+
+            # Calculate shaping reward: beta * (gamma * phi_next - phi_prev)
+            # This is the TOTAL team shaping reward
+            r_shape = beta * (gamma * phi_next - phi_prev)
+
+            mlflow_phi_r_shape_values.append(r_shape)
+
+            # Update phi_prev for next step
+            phi_prev = phi_next
+    else:
+        # No MLflow phi shaping - all values are 0
+        if mlflow_phi_params:
+            print(
+                f"[MLflow Phi] Phi shaping disabled in MLflow params: {mlflow_phi_params}"
+            )
+        else:
+            print("[MLflow Phi] No MLflow phi params loaded")
+        mlflow_phi_r_shape_values = [0.0] * len(game_state.reward_history)
+
+    # Calculate phi potential values for display
+    mlflow_phi_potential_values = []
+    if mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False):
+        for i, reward in enumerate(game_state.reward_history):
+            ep_by_player = reward.get("ep_by_player", [])
+            ball_handler = reward.get("ball_handler", -1)
+            offense_ids = reward.get("offense_ids", [])
+            is_terminal = reward.get("is_terminal", False)
+
+            # Calculate phi potential using MLflow params
+            phi_potential = 0.0  # Terminal states have phi = 0
+            if not is_terminal and ep_by_player:
+                phi_potential = calculate_phi_from_ep_data(
+                    ep_by_player, ball_handler, offense_ids, mlflow_phi_params
+                )
+            mlflow_phi_potential_values.append(phi_potential)
+    else:
+        mlflow_phi_potential_values = [0.0] * len(game_state.reward_history)
+
     # Ensure all values are JSON serializable
     serialized_history = []
-    for reward in game_state.reward_history:
+
+    # Add initial state (step 0) to show starting phi potential
+    if mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False):
+        initial_phi = 0.0
+        if game_state.phi_log and len(game_state.phi_log) > 0:
+            initial_entry = game_state.phi_log[0]
+            if initial_entry.get("step") == 0:
+                initial_ep = initial_entry.get("ep_by_player", [])
+                initial_ball = initial_entry.get("ball_handler", -1)
+                initial_offense = initial_entry.get("offense_ids", [])
+                if initial_ep and initial_ball >= 0 and initial_offense:
+                    initial_phi = calculate_phi_from_ep_data(
+                        initial_ep, initial_ball, initial_offense, mlflow_phi_params
+                    )
+
+        serialized_history.append(
+            {
+                "step": 0,
+                "offense": 0.0,
+                "defense": 0.0,
+                "offense_reason": "Initial State",
+                "defense_reason": "Initial State",
+                "mlflow_phi_potential": float(initial_phi),
+            }
+        )
+
+    for i, reward in enumerate(game_state.reward_history):
+        mlflow_phi_r_shape = (
+            mlflow_phi_r_shape_values[i] if i < len(mlflow_phi_r_shape_values) else 0.0
+        )
+        mlflow_phi_potential = (
+            mlflow_phi_potential_values[i]
+            if i < len(mlflow_phi_potential_values)
+            else 0.0
+        )
+
+        # Get environment's phi shaping (per-player) and number of players
+        env_phi_r_shape_per_player = reward.get("phi_r_shape", 0.0)
+        offense_ids = reward.get("offense_ids", [])
+        num_offensive_players = len(offense_ids) if offense_ids else 3  # Default to 3
+
+        # Remove environment's phi shaping and add MLflow's phi shaping
+        # mlflow_phi_r_shape is now the TOTAL team reward (not per-player)
+        # env_phi_r_shape_per_player is per-player, so multiply by num_players for total
+        env_phi_r_shape_total = env_phi_r_shape_per_player * num_offensive_players
+
+        base_offense = float(reward["offense"]) - env_phi_r_shape_total
+        base_defense = float(reward["defense"]) + env_phi_r_shape_total
+
+        offense_with_mlflow = base_offense + mlflow_phi_r_shape
+        defense_with_mlflow = base_defense - mlflow_phi_r_shape
+
         serialized_history.append(
             {
                 "step": int(reward["step"]),
-                "offense": float(reward["offense"]),
-                "defense": float(reward["defense"]),
+                "offense": float(offense_with_mlflow),  # With MLflow phi shaping
+                "defense": float(defense_with_mlflow),  # With MLflow phi shaping
                 "offense_reason": reward.get("offense_reason", "Unknown"),
                 "defense_reason": reward.get("defense_reason", "Unknown"),
+                "mlflow_phi_potential": float(
+                    mlflow_phi_potential
+                ),  # Phi potential (Φ_next) for reference
             }
         )
 
@@ -1343,6 +1609,31 @@ def get_rewards():
     except Exception:
         reward_params = {}
 
+    # Include MLflow phi shaping parameters
+    mlflow_phi_params_serialized = {}
+    if mlflow_phi_params:
+        try:
+            mlflow_phi_params_serialized = {
+                "enable_phi_shaping": bool(
+                    mlflow_phi_params.get("enable_phi_shaping", False)
+                ),
+                "phi_beta": float(mlflow_phi_params.get("phi_beta", 0.0)),
+                "reward_shaping_gamma": float(
+                    mlflow_phi_params.get("reward_shaping_gamma", 1.0)
+                ),
+                "phi_aggregation_mode": str(
+                    mlflow_phi_params.get("phi_aggregation_mode", "team_best")
+                ),
+                "phi_use_ball_handler_only": bool(
+                    mlflow_phi_params.get("phi_use_ball_handler_only", False)
+                ),
+                "phi_blend_weight": float(
+                    mlflow_phi_params.get("phi_blend_weight", 0.0)
+                ),
+            }
+        except Exception:
+            pass
+
     return {
         "reward_history": serialized_history,
         "episode_rewards": {
@@ -1350,6 +1641,7 @@ def get_rewards():
             "defense": float(game_state.episode_rewards["defense"]),
         },
         "reward_params": reward_params,
+        "mlflow_phi_params": mlflow_phi_params_serialized,
     }
 
 
