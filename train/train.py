@@ -55,6 +55,8 @@ import time
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
+from basketworld.utils.cnn_feature_extractor import HexCNNFeatureExtractor
+from basketworld.utils.pure_cnn_feature_extractor import PureCNNFeatureExtractor
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.utils.wrappers import (
@@ -356,6 +358,9 @@ def setup_environment(args, training_team):
         mask_occupied_moves=args.mask_occupied_moves,
         illegal_defense_enabled=args.illegal_defense_enabled,
         illegal_defense_max_steps=args.illegal_defense_max_steps,
+        # CNN/Spatial observation controls
+        use_spatial_obs=getattr(args, "use_spatial_obs", False),
+        use_pure_cnn=getattr(args, "use_pure_cnn", False),
     )
     # Wrap with episode stats collector then aggregate reward for Monitor/SB3
     env = EpisodeStatsWrapper(env)
@@ -540,8 +545,29 @@ def main(args):
             pi_arch = getattr(args, "net_arch_pi", [64, 64])
             vf_arch = getattr(args, "net_arch_vf", [64, 64])
             policy_kwargs["net_arch"] = dict(pi=pi_arch, vf=vf_arch)
-        # Prevent the policy from learning directly from action_mask
-        policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
+        
+        # Choose feature extractor based on CNN mode
+        if getattr(args, "use_pure_cnn", False):
+            # Pure CNN: processes ONLY spatial observation (all features encoded spatially)
+            policy_kwargs["features_extractor_class"] = PureCNNFeatureExtractor
+            policy_kwargs["features_extractor_kwargs"] = dict(
+                features_dim=getattr(args, "cnn_features_dim", 512),
+                cnn_channels=tuple(getattr(args, "cnn_channels", [32, 64, 128, 128])),
+            )
+            print("Using Pure CNN feature extractor (8 spatial channels)")
+        elif getattr(args, "use_spatial_obs", False):
+            # Hybrid CNN+MLP: CNN for spatial, MLP for vector features
+            policy_kwargs["features_extractor_class"] = HexCNNFeatureExtractor
+            policy_kwargs["features_extractor_kwargs"] = dict(
+                cnn_features_dim=getattr(args, "cnn_features_dim", 256),
+                mlp_features_dim=getattr(args, "mlp_features_dim", 128),
+                cnn_channels=tuple(getattr(args, "cnn_channels", [32, 64, 64])),
+            )
+            print("Using Hybrid CNN+MLP feature extractor (5 spatial + vector features)")
+        else:
+            # Pure MLP: traditional approach (existing behavior)
+            policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
+            print("Using Pure MLP feature extractor (vector features only)")
 
         # The save_path is no longer needed as models are saved to a temp dir
         # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1918,6 +1944,36 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Final additive bias (0 to disable at end).",
+    )
+    # CNN/Spatial observation arguments
+    parser.add_argument(
+        "--use-spatial-obs",
+        action="store_true",
+        help="Enable Hybrid CNN+MLP mode: 5 spatial channels + vector features processed by MLP.",
+    )
+    parser.add_argument(
+        "--use-pure-cnn",
+        action="store_true",
+        help="Enable Pure CNN mode: 8 spatial channels (includes shot clock, role, skills), no MLP branch.",
+    )
+    parser.add_argument(
+        "--cnn-features-dim",
+        type=int,
+        default=256,
+        help="Output dimension of CNN feature extractor (default: 256).",
+    )
+    parser.add_argument(
+        "--mlp-features-dim",
+        type=int,
+        default=128,
+        help="Output dimension of MLP feature extractor for vector features (default: 128).",
+    )
+    parser.add_argument(
+        "--cnn-channels",
+        type=int,
+        nargs="+",
+        default=[32, 64, 64],
+        help="CNN channel dimensions for conv layers (e.g., 32 64 64). Default: [32, 64, 64]",
     )
     args = parser.parse_args()
 

@@ -129,6 +129,9 @@ class HexagonBasketballEnv(gym.Env):
         egocentric_rotate_to_hoop: bool = True,
         include_hoop_vector: bool = True,
         normalize_obs: bool = True,
+        # Spatial/CNN observation controls
+        use_spatial_obs: bool = False,
+        use_pure_cnn: bool = False,  # Encode ALL features spatially (no MLP)
         # Movement mask controls
         mask_occupied_moves: bool = False,
         # Deterministic overrides (optional)
@@ -169,6 +172,9 @@ class HexagonBasketballEnv(gym.Env):
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
         self.normalize_obs = bool(normalize_obs)
+        # Spatial/CNN observation controls
+        self.use_spatial_obs = bool(use_spatial_obs)
+        self.use_pure_cnn = bool(use_pure_cnn)
         # Movement mask behavior
         self.mask_occupied_moves = bool(mask_occupied_moves)
         # Illegal action handling configuration/state
@@ -250,14 +256,33 @@ class HexagonBasketballEnv(gym.Env):
             shape=(self.players_per_side * 3,),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Dict(
-            {
-                "obs": state_space,
-                "action_mask": action_mask_space,
-                "role_flag": role_flag_space,
-                "skills": skills_space,
-            }
-        )
+        obs_dict = {
+            "obs": state_space,
+            "action_mask": action_mask_space,
+            "role_flag": role_flag_space,
+            "skills": skills_space,
+        }
+        
+        # Add spatial observation space if CNN is enabled
+        if self.use_spatial_obs:
+            # Determine number of channels based on pure_cnn mode
+            if self.use_pure_cnn:
+                # Base channels (5) + shot_clock + role_flag + per-player skill heatmaps
+                # For N players per side: 5 + 1 + 1 + N = 7 + N channels
+                n_spatial_channels = 7 + self.players_per_side
+            else:
+                # 5 channels: players, ball, basket, expected_points, three_pt_arc
+                n_spatial_channels = 5
+            
+            spatial_space = spaces.Box(
+                low=-1.0,  # Allow negative values for player channel
+                high=3.0,   # Max expected points would be ~3.0 (shot clock could be higher)
+                shape=(n_spatial_channels, self.court_height, self.court_width),
+                dtype=np.float32,
+            )
+            obs_dict["spatial"] = spatial_space
+        
+        self.observation_space = spaces.Dict(obs_dict)
 
         # --- Hexagonal Grid Directions ---
         # These are the 6 axial direction vectors for a pointy-topped hexagonal grid.
@@ -368,6 +393,10 @@ class HexagonBasketballEnv(gym.Env):
         self.offense_dunk_pct_by_player: List[float] = [
             float(self.dunk_pct)
         ] * self.players_per_side
+        
+        # Cache for per-player skill heatmaps (computed once per episode)
+        # Shape: (players_per_side, court_height, court_width)
+        self._cached_skill_heatmaps: Optional[np.ndarray] = None
 
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
@@ -472,6 +501,11 @@ class HexagonBasketballEnv(gym.Env):
             self.offense_dunk_pct_by_player[i] = _sample_prob(
                 self.dunk_pct, self.dunk_std
             )
+        
+        # Compute per-player skill heatmaps (for Pure CNN mode)
+        # This shows each player's unpressured shooting probability from each position
+        if self.use_pure_cnn and self.use_spatial_obs:
+            self._cached_skill_heatmaps = self._compute_skill_heatmaps()
 
         # Initialize positions
         if opt_positions is not None:
@@ -500,6 +534,11 @@ class HexagonBasketballEnv(gym.Env):
             ),
             "skills": self._get_offense_skills_array(),
         }
+        
+        # Add spatial observation if CNN is enabled
+        if self.use_spatial_obs:
+            obs["spatial"] = self._get_spatial_observation()
+        
         info = {"training_team": self.training_team.name}
 
         return obs, info
@@ -561,6 +600,11 @@ class HexagonBasketballEnv(gym.Env):
                             ),
                             "skills": self._get_offense_skills_array(),
                         }
+                        
+                        # Add spatial observation if CNN is enabled
+                        if self.use_spatial_obs:
+                            obs["spatial"] = self._get_spatial_observation()
+                        
                         info = {
                             "training_team": self.training_team.name,
                             "action_results": turnover_results,
@@ -729,6 +773,11 @@ class HexagonBasketballEnv(gym.Env):
             ),
             "skills": self._get_offense_skills_array(),
         }
+        
+        # Add spatial observation if CNN is enabled
+        if self.use_spatial_obs:
+            obs["spatial"] = self._get_spatial_observation()
+        
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
@@ -1813,6 +1862,173 @@ class HexagonBasketballEnv(gym.Env):
                 float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct)
             )
         return np.array(skills, dtype=np.float32)
+
+    def _compute_skill_heatmaps(self) -> np.ndarray:
+        """
+        Compute per-player skill heatmaps showing unpressured shooting probability from each position.
+        
+        For each offensive player, creates a (court_height, court_width) grid where each cell
+        contains that player's base shooting probability from that position (without defender pressure).
+        
+        Returns:
+            np.ndarray of shape (players_per_side, court_height, court_width)
+        """
+        heatmaps = np.zeros(
+            (self.players_per_side, self.court_height, self.court_width), 
+            dtype=np.float32
+        )
+        
+        # For each offensive player
+        for player_idx in range(self.players_per_side):
+            # For each position on the court
+            for row in range(self.court_height):
+                for col in range(self.court_width):
+                    q, r = self._offset_to_axial(col, row)
+                    if self._is_valid_position(q, r):
+                        dist = self._hex_distance((q, r), self.basket_position)
+                        # Calculate base probability WITHOUT pressure (use distance-based formula)
+                        # This is the "unpressured" shooting skill
+                        prob = self._calculate_base_shot_probability(player_idx, dist)
+                        heatmaps[player_idx, row, col] = prob
+        
+        return heatmaps
+    
+    def _calculate_base_shot_probability(self, player_id: int, distance: int) -> float:
+        """
+        Calculate base shooting probability WITHOUT defender pressure.
+        Used for skill heatmap generation.
+        
+        Args:
+            player_id: Offensive player index (0 to players_per_side-1)
+            distance: Hex distance to basket
+            
+        Returns:
+            Base shooting probability (0-1) without pressure effects
+        """
+        # Anchors
+        d0 = 1
+        d1 = max(self.three_point_distance, d0 + 1)
+        
+        # Get per-player skill values
+        p0 = float(self.offense_layup_pct_by_player[player_id])
+        p1 = float(self.offense_three_pt_pct_by_player[player_id])
+        dunk_p = float(self.offense_dunk_pct_by_player[player_id])
+        
+        # Calculate base probability using linear interpolation
+        if self.allow_dunks and distance == 0:
+            prob = dunk_p
+        elif distance <= d0:
+            prob = p0
+        else:
+            t = (distance - d0) / (d1 - d0)
+            prob = p0 + (p1 - p0) * t
+        
+        # Clamp to sensible bounds (no pressure applied here)
+        prob = max(0.01, min(0.99, prob))
+        return float(prob)
+
+    def _get_spatial_observation(self) -> np.ndarray:
+        """
+        Generate a grid-based spatial observation for CNN processing.
+        
+        Standard Channels (5 total, use_pure_cnn=False):
+        0: Players (offense=+1.0, defense=-1.0, empty=0.0)
+        1: Ball holder (binary: 1.0 at ball holder position, 0.0 elsewhere)
+        2: Basket position (binary: 1.0 at basket, 0.0 elsewhere)
+        3: Expected points heatmap (shot_value * probability for current ball holder)
+        4: Three-point arc (binary: 0.0 inside arc, 1.0 at/outside arc)
+        
+        Pure CNN Channels (7 + N, use_pure_cnn=True) where N = players_per_side - adds:
+        5: Shot clock (uniform value across all cells, normalized 0-1)
+        6: Role flag (uniform: 1.0 if training offense, 0.0 if defense)
+        7 to 7+N-1: Per-player skill heatmaps (each player's unpressured shooting probability from each position)
+        
+        Returns:
+            np.ndarray of shape (n_channels, court_height, court_width)
+        """
+        n_channels = (7 + self.players_per_side) if self.use_pure_cnn else 5
+        grid = np.zeros((n_channels, self.court_height, self.court_width), dtype=np.float32)
+        
+        # Helper to convert axial to grid indices
+        def pos_to_grid_idx(q: int, r: int) -> Optional[Tuple[int, int]]:
+            col, row = self._axial_to_offset(q, r)
+            if 0 <= row < self.court_height and 0 <= col < self.court_width:
+                return (row, col)
+            return None
+        
+        # Channel 0: Players with team encoding (offense=+1, defense=-1)
+        for pid in self.offense_ids:
+            idx = pos_to_grid_idx(*self.positions[pid])
+            if idx:
+                grid[0, idx[0], idx[1]] = 1.0  # Offense = +1
+        
+        for pid in self.defense_ids:
+            idx = pos_to_grid_idx(*self.positions[pid])
+            if idx:
+                grid[0, idx[0], idx[1]] = -1.0  # Defense = -1
+        
+        # Channel 1: Ball holder
+        if self.ball_holder is not None:
+            idx = pos_to_grid_idx(*self.positions[self.ball_holder])
+            if idx:
+                grid[1, idx[0], idx[1]] = 1.0
+        
+        # Channel 2: Basket position
+        basket_idx = pos_to_grid_idx(*self.basket_position)
+        if basket_idx:
+            grid[2, basket_idx[0], basket_idx[1]] = 1.0
+        
+        # Channel 3: Expected points heatmap
+        # Shows expected points (shot_value * probability) for current ball holder from each position
+        if self.ball_holder is not None and self.ball_holder in self.offense_ids:
+            for row in range(self.court_height):
+                for col in range(self.court_width):
+                    q, r = self._offset_to_axial(col, row)
+                    if self._is_valid_position(q, r):
+                        dist = self._hex_distance((q, r), self.basket_position)
+                        # Determine shot value at this position
+                        if self.allow_dunks and dist == 0:
+                            shot_value = 2.0
+                        elif dist >= self.three_point_distance:
+                            shot_value = 3.0
+                        else:
+                            shot_value = 2.0
+                        # Calculate make probability
+                        prob = self._calculate_shot_probability(self.ball_holder, dist)
+                        # Expected points = value * probability
+                        grid[3, row, col] = shot_value * prob
+        
+        # Channel 4: Three-point arc (0=inside, 1=at/outside)
+        for row in range(self.court_height):
+            for col in range(self.court_width):
+                q, r = self._offset_to_axial(col, row)
+                if self._is_valid_position(q, r):
+                    dist = self._hex_distance((q, r), self.basket_position)
+                    if dist >= self.three_point_distance:
+                        grid[4, row, col] = 1.0
+        
+        # Additional channels for pure CNN mode
+        if self.use_pure_cnn:
+            # Channel 5: Shot clock (normalized to 0-1)
+            shot_clock_normalized = float(self.shot_clock) / float(self.shot_clock_steps)
+            grid[5, :, :] = shot_clock_normalized
+            
+            # Channel 6: Role flag (1.0 if training offense, 0.0 if defense)
+            role_value = 1.0 if self.training_team == Team.OFFENSE else 0.0
+            grid[6, :, :] = role_value
+            
+            # Channels 7+: Per-player skill heatmaps (unpressured shooting probability)
+            # Each offensive player gets their own channel showing their shooting ability from each position
+            if self._cached_skill_heatmaps is not None:
+                for player_idx in range(self.players_per_side):
+                    grid[7 + player_idx, :, :] = self._cached_skill_heatmaps[player_idx]
+            else:
+                # Fallback: should not happen if reset() was called properly
+                # Fill with zeros
+                for player_idx in range(self.players_per_side):
+                    grid[7 + player_idx, :, :] = 0.0
+        
+        return grid
 
     def render(self):
         """Render the current state of the environment."""

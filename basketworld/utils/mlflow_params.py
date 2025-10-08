@@ -203,4 +203,19 @@ def get_mlflow_params(
     optional["illegal_action_policy"] = _get_param(
         params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
     )
+    
+    # CNN observation mode (critical for model compatibility)
+    optional["use_spatial_obs"] = _get_param(
+        params,
+        ["use_spatial_obs", "use-spatial-obs"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["use_pure_cnn"] = _get_param(
+        params,
+        ["use_pure_cnn", "use-pure-cnn"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    
     return required, optional
