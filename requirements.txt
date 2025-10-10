@@ -5,6 +5,7 @@ anyio==4.9.0
 -e .
 black==25.1.0
 blinker==1.9.0
+boto3==1.37.3
 cachetools==5.5.2
 certifi==2025.7.14
 charset-normalizer==3.4.2

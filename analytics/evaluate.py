@@ -791,8 +791,9 @@ def main(args):
     """Main evaluation function."""
 
     # --- Set up MLflow Tracking ---
-    tracking_uri = "http://localhost:5000"
-    mlflow.set_tracking_uri(tracking_uri)
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    setup_mlflow(verbose=False)
     client = mlflow.tracking.MlflowClient()
 
     try:

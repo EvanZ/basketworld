@@ -68,8 +68,9 @@ def _select_unified_artifact(artifacts, alternation: Optional[int]) -> str:
 
 
 def main(args):
-    tracking_uri = "http://localhost:5000"
-    mlflow.set_tracking_uri(tracking_uri)
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    setup_mlflow(verbose=False)
     client = MlflowClient()
 
     required, optional = get_mlflow_params(client, args.run_id)

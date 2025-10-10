@@ -149,8 +149,12 @@ def play_episode(
             pass
 
         # Get actions (deterministic for consistency)
-        offense_action, _ = policy_a.predict(offense_obs, deterministic=args.deterministic_opponent)
-        defense_action, _ = policy_b.predict(defense_obs, deterministic=args.deterministic_opponent)
+        offense_action, _ = policy_a.predict(
+            offense_obs, deterministic=args.deterministic_opponent
+        )
+        defense_action, _ = policy_b.predict(
+            defense_obs, deterministic=args.deterministic_opponent
+        )
 
         # Resolve illegal actions
         action_mask = obs.get("action_mask")
@@ -584,8 +588,9 @@ def main(args):
     """Main function."""
 
     # Set up MLflow
-    tracking_uri = "http://localhost:5000"
-    mlflow.set_tracking_uri(tracking_uri)
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    setup_mlflow(verbose=False)
     client = mlflow.tracking.MlflowClient()
 
     try:

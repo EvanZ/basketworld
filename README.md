@@ -100,6 +100,44 @@ In the web UI enter an **MLflow run_id** from the training you just executed.  T
 
 ---
 
+## ☁️  Remote Storage (S3)
+
+MLflow can store experiments and artifacts in your personal S3 bucket instead of local storage.
+
+**Quick Setup (Project-Specific Credentials - No Conflicts!):**
+
+```bash
+# 1. Install boto3
+pip install boto3
+
+# 2. Create .env file with project-specific credentials (won't affect other projects)
+cat > .env << 'EOF'
+MLFLOW_ARTIFACT_ROOT=s3://your-bucket/mlflow-artifacts
+MLFLOW_AWS_ACCESS_KEY_ID=your-mlflow-key
+MLFLOW_AWS_SECRET_ACCESS_KEY=your-mlflow-secret
+MLFLOW_AWS_DEFAULT_REGION=us-east-1
+EOF
+
+# 3. Start MLflow server with S3 backend
+mlflow server \
+  --backend-store-uri sqlite:///mlflow.db \
+  --default-artifact-root s3://your-bucket/mlflow-artifacts \
+  --port 5000
+
+# 4. Run training - automatically uses project-specific S3 credentials!
+python train/train.py --mlflow-experiment-name my-experiment
+```
+
+**Key Features:**
+- ✅ `.env` file automatically loaded - no manual sourcing
+- ✅ Project-specific `MLFLOW_AWS_*` credentials won't conflict with other AWS projects
+- ✅ All scripts automatically detect and use S3 when configured
+- ✅ Secure - `.env` is already in `.gitignore`
+
+📖 **Documentation**: [S3 Setup](docs/mlflow_s3_setup.md) | [Quick Start](docs/mlflow_s3_quickstart.md) | [Project Credentials](docs/mlflow_project_credentials.md)
+
+---
+
 ## 🤖 Reinforcement Learning Ready
 
 BasketWorld is designed to work with single-policy RL algorithms like PPO, A2C, or DQN by:

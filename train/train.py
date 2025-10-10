@@ -482,8 +482,14 @@ def main(args):
 
     # --- Set up MLflow Tracking ---
     # MLflow requires a running server to log artifacts correctly.
-    tracking_uri = "http://localhost:5000"
-    mlflow.set_tracking_uri(tracking_uri)
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    try:
+        mlflow_config = setup_mlflow(verbose=True)
+        tracking_uri = mlflow_config.tracking_uri
+    except (ImportError, ValueError) as e:
+        print(f"Error setting up MLflow: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Set the experiment name. This will create it if it doesn't exist.
     mlflow.set_experiment(args.mlflow_experiment_name)
@@ -491,7 +497,7 @@ def main(args):
     try:
         # Check if the server is reachable by trying to get the current experiment
         mlflow.get_experiment_by_name(args.mlflow_experiment_name)
-    except mlflow.exceptions.MlflowException as e:
+    except mlflow.exceptions.MlflowException:
         print(
             f"Could not connect to MLflow tracking server at {tracking_uri}.",
             file=sys.stderr,
@@ -500,6 +506,11 @@ def main(args):
             "Please ensure the MLflow UI server is running in a separate terminal with `mlflow ui`.",
             file=sys.stderr,
         )
+        if mlflow_config.use_s3:
+            print(
+                "When using S3 storage, start the server with: mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root s3://YOUR-BUCKET/mlflow-artifacts",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     with mlflow.start_run(run_name=args.mlflow_run_name) as run:

@@ -200,7 +200,13 @@ async def init_game(request: InitGameRequest):
     """
     global game_state
 
-    mlflow.set_tracking_uri("http://localhost:5000")
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    try:
+        setup_mlflow(verbose=False)
+    except (ImportError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set up MLflow: {e}")
+
     client = mlflow.tracking.MlflowClient()
 
     try:
