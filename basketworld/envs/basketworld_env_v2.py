@@ -1050,6 +1050,11 @@ class HexagonBasketballEnv(gym.Env):
                 direction_idx = action.value - ActionType.PASS_E.value
                 self._attempt_pass(player_id, direction_idx, results)
 
+        # If a shot was taken or a turnover occurred, the episode will end.
+        # Skip movement processing to avoid spurious state changes in terminal observations.
+        if results.get("shots") or results.get("turnovers"):
+            return results
+
         # 2. Determine intended moves for all players
         intended_moves = {}
         for player_id, action_val in enumerate(actions):
