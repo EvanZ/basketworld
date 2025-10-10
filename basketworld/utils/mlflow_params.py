@@ -203,6 +203,13 @@ def get_mlflow_params(
     optional["illegal_action_policy"] = _get_param(
         params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
     )
+    # VecNormalize usage (for future support)
+    optional["use_vec_normalize"] = _get_param(
+        params,
+        ["use_vec_normalize", "use-vec-normalize"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
     return required, optional
 
 

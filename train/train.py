@@ -314,6 +314,7 @@ def setup_environment(args, training_team):
         min_shot_clock=getattr(args, "min_shot_clock", 10),
         defender_pressure_distance=args.defender_pressure_distance,
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
+        steal_chance=args.steal_chance,
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
         layup_std=getattr(args, "layup_std", 0.0),
@@ -326,6 +327,8 @@ def setup_environment(args, training_team):
         shot_pressure_max=args.shot_pressure_max,
         shot_pressure_lambda=args.shot_pressure_lambda,
         shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
+        pass_arc_degrees=getattr(args, "pass_arc_start", 60.0),
+        pass_oob_turnover_prob=getattr(args, "pass_oob_turnover_prob_start", 1.0),
         spawn_distance=getattr(args, "spawn_distance", 3),
         max_spawn_distance=getattr(args, "max_spawn_distance", None),
         # Reward shaping
@@ -354,6 +357,7 @@ def setup_environment(args, training_team):
         include_hoop_vector=args.include_hoop_vector,
         normalize_obs=args.normalize_obs,
         mask_occupied_moves=args.mask_occupied_moves,
+        enable_pass_gating=getattr(args, "enable_pass_gating", True),
         illegal_defense_enabled=args.illegal_defense_enabled,
         illegal_defense_max_steps=args.illegal_defense_max_steps,
     )
@@ -827,7 +831,7 @@ def main(args):
                 )
         # Optional Pass Logit Bias scheduler across the whole run
         pass_bias_callback = None
-        if (
+        if getattr(args, "pass_logit_bias_enabled", False) and (
             getattr(args, "pass_logit_bias_start", None) is not None
             or getattr(args, "pass_logit_bias_end", None) is not None
         ):
@@ -1129,6 +1133,7 @@ def main(args):
                 callback=defense_callbacks,
                 progress_bar=True,
             )
+            # Close defense env and clean up
             defense_env.close()
             try:
                 del defense_env
@@ -1193,6 +1198,7 @@ def main(args):
                     include_hoop_vector=args.include_hoop_vector,
                     normalize_obs=args.normalize_obs,
                     mask_occupied_moves=args.mask_occupied_moves,
+                    enable_pass_gating=getattr(args, "enable_pass_gating", True),
                 )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -1290,8 +1296,16 @@ def main(args):
                     if "phi_beta_bump_multiplier" in locals()
                     else 1.0
                 ),
-                pass_logit_bias_start=getattr(args, "pass_logit_bias_start", None),
-                pass_logit_bias_end=getattr(args, "pass_logit_bias_end", None),
+                pass_logit_bias_start=(
+                    getattr(args, "pass_logit_bias_start", None)
+                    if getattr(args, "pass_logit_bias_enabled", False)
+                    else None
+                ),
+                pass_logit_bias_end=(
+                    getattr(args, "pass_logit_bias_end", None)
+                    if getattr(args, "pass_logit_bias_enabled", False)
+                    else None
+                ),
                 pass_arc_start=getattr(args, "pass_arc_start", None),
                 pass_arc_end=getattr(args, "pass_arc_end", None),
                 pass_oob_turnover_prob_start=getattr(
@@ -1566,6 +1580,13 @@ if __name__ == "__main__":
         help="Number of parallel environments to run for each policy during training.",
     )
     parser.add_argument(
+        "--use-vec-normalize",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="(DEPRECATED - no longer used) Previously used VecNormalize wrapper. "
+        "Kept for MLflow compatibility.",
+    )
+    parser.add_argument(
         "--shot-pressure-enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,
@@ -1686,6 +1707,14 @@ if __name__ == "__main__":
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
         help="Disallow moves into currently occupied neighboring hexes.",
+    )
+    parser.add_argument(
+        "--enable-pass-gating",
+        dest="enable_pass_gating",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Mask out pass actions that don't have a teammate in the arc. "
+        "This prevents learning to avoid passing due to OOB turnovers.",
     )
     parser.add_argument(
         "--device",
@@ -1904,6 +1933,13 @@ if __name__ == "__main__":
         type=float,
         default=2.0,
         help="Power applied to OOB curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--pass-logit-bias-enabled",
+        dest="pass_logit_bias_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable additive pass-logit bias.",
     )
     parser.add_argument(
         "--pass-logit-bias-start",

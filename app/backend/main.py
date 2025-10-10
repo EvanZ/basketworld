@@ -248,6 +248,21 @@ async def init_game(request: InitGameRequest):
         )
         game_state.obs, _ = game_state.env.reset()
 
+        # Log shot clock configuration for debugging
+        print(
+            f"[Environment Config] Shot clock settings (loaded from MLflow run {request.run_id}):"
+        )
+        print(
+            f"  - shot_clock (max): {required.get('shot_clock', 24)} (from MLflow param 'shot_clock')"
+        )
+        print(
+            f"  - min_shot_clock: {optional.get('min_shot_clock', 10)} (from MLflow param 'min_shot_clock')"
+        )
+        print(f"  - Initial shot clock for this episode: {game_state.env.shot_clock}")
+        print(
+            f"  - Episode length range: [{game_state.env.min_shot_clock}, {game_state.env.shot_clock_steps}] steps"
+        )
+
         # Set user team and ensure tracking containers start empty for the episode
         game_state.user_team = Team[request.user_team_name.upper()]
         # Store MLflow run metadata on game state for later use (saving, UI)
@@ -934,9 +949,14 @@ def run_evaluation(request: EvaluationRequest):
 
     Returns final state of each episode for stats tracking.
     Runs in deterministic mode using the unified policy.
+
+    Note: Uses the environment initialized in /api/init_game which loads
+    all parameters (including min_shot_clock and shot_clock) from MLflow.
     """
     if not game_state.env:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
+        raise HTTPException(
+            status_code=400, detail="Game not initialized. Call /api/init_game first."
+        )
 
     if not game_state.unified_policy:
         raise HTTPException(
@@ -948,14 +968,38 @@ def run_evaluation(request: EvaluationRequest):
 
     episode_results = []
 
+    # Track entropy for diagnosis (to compare with training entropy)
+    episode_entropies = []
+
+    # Log shot clock configuration before evaluation
+    # These values come from the environment initialized with MLflow parameters
+    print(f"[Evaluation] Starting {num_episodes} episodes")
+    print(f"[Evaluation] Configuration:")
+    print(f"  - Deterministic policy: {deterministic}")
+    print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
+    print(f"  - shot_clock (max): {game_state.env.shot_clock_steps}")
+    print(f"  - min_shot_clock: {game_state.env.min_shot_clock}")
+    print(
+        f"  - Each episode starts with random shot clock in range: [{game_state.env.min_shot_clock}, {game_state.env.shot_clock_steps}] steps"
+    )
+
     for ep_idx in range(num_episodes):
         # Reset environment for new episode
-        episode_seed = int(np.random.SeedSequence().entropy % (2**32 - 1))
+        episode_seed = int(np.random.randint(0, 2**31 - 1))
         obs, _ = game_state.env.reset(seed=episode_seed)
         game_state.obs = obs
 
+        # Log shot clock for first few episodes to verify randomization
+        if ep_idx < 5:
+            print(
+                f"  Episode {ep_idx + 1} starting shot clock: {game_state.env.shot_clock}"
+            )
+
         done = False
         step_count = 0
+        episode_rewards = {"offense": 0.0, "defense": 0.0}
+        episode_entropy_sum = 0.0
+        episode_entropy_count = 0
 
         # Run episode until done
         while not done and step_count < 1000:  # Safety limit
@@ -963,6 +1007,20 @@ def run_evaluation(request: EvaluationRequest):
             full_action_ai, _ = game_state.unified_policy.predict(
                 obs, deterministic=deterministic
             )
+
+            # Calculate policy entropy for diagnostics
+            try:
+                obs_tensor = game_state.unified_policy.policy.obs_to_tensor(obs)[0]
+                distributions = game_state.unified_policy.policy.get_distribution(
+                    obs_tensor
+                )
+                # Calculate entropy across all players
+                for dist in distributions.distribution:
+                    entropy = dist.entropy().mean().item()
+                    episode_entropy_sum += entropy
+                    episode_entropy_count += 1
+            except Exception:
+                pass
 
             opponent_obs = obs
             if game_state.defense_policy is not None:
@@ -1030,16 +1088,105 @@ def run_evaluation(request: EvaluationRequest):
             done = terminated or truncated
             step_count += 1
 
+            # Track rewards by team
+            if isinstance(reward, np.ndarray):
+                rewards_list = reward.tolist()
+            elif isinstance(reward, (list, tuple)):
+                rewards_list = list(reward)
+            else:
+                rewards_list = [reward]
+
+            if len(rewards_list) > 1:
+                for i, r in enumerate(rewards_list):
+                    if i in game_state.env.offense_ids:
+                        episode_rewards["offense"] += float(r)
+                    elif i in game_state.env.defense_ids:
+                        episode_rewards["defense"] += float(r)
+            else:
+                episode_rewards["offense"] += float(rewards_list[0])
+
         # Capture final state
         game_state.obs = obs
         final_state = get_full_game_state()
+
+        # Calculate average entropy for this episode
+        avg_entropy = (
+            episode_entropy_sum / episode_entropy_count
+            if episode_entropy_count > 0
+            else 0.0
+        )
+        episode_entropies.append(avg_entropy)
 
         episode_results.append(
             {
                 "episode": ep_idx + 1,
                 "final_state": final_state,
                 "steps": step_count,
+                "episode_rewards": episode_rewards,
             }
+        )
+
+    # Log evaluation summary statistics with outcome analysis
+    if episode_results:
+        episode_lengths = [r["steps"] for r in episode_results]
+        avg_length = sum(episode_lengths) / len(episode_lengths)
+        min_length = min(episode_lengths)
+        max_length = max(episode_lengths)
+
+        # Analyze how episodes ended
+        outcomes = {
+            "made_shot": 0,
+            "turnover": 0,
+            "shot_clock_violation": 0,
+            "other": 0,
+        }
+        for r in episode_results:
+            final_state = r.get("final_state", {})
+            last_action_results = final_state.get("last_action_results", {})
+            shot_clock = final_state.get("shot_clock", 0)
+
+            if last_action_results.get("shots"):
+                # Check if shot was made
+                shots = last_action_results["shots"]
+                if shots:
+                    first_shot = list(shots.values())[0]
+                    if first_shot.get("success"):
+                        outcomes["made_shot"] += 1
+                    else:
+                        outcomes["turnover"] += 1  # Missed shot counts as end
+            elif last_action_results.get("turnovers"):
+                outcomes["turnover"] += 1
+            elif shot_clock <= 0:
+                outcomes["shot_clock_violation"] += 1
+            else:
+                outcomes["other"] += 1
+
+        print(f"[Evaluation Complete] Episode length statistics:")
+        print(f"  - Average: {avg_length:.1f} steps")
+        print(f"  - Min: {min_length} steps")
+        print(f"  - Max: {max_length} steps")
+        print(f"  - Total episodes: {len(episode_results)}")
+
+        # Log average policy entropy (to compare with training)
+        if episode_entropies:
+            avg_entropy = sum(episode_entropies) / len(episode_entropies)
+            print(f"[Evaluation Complete] Policy entropy:")
+            print(f"  - Average entropy: {avg_entropy:.3f}")
+            print(
+                f"  - NOTE: Compare with training 'train/entropy_loss' metric in MLflow"
+            )
+        print(f"[Evaluation Complete] Episode outcomes:")
+        print(
+            f"  - Made shots: {outcomes['made_shot']} ({100*outcomes['made_shot']/len(episode_results):.1f}%)"
+        )
+        print(
+            f"  - Turnovers: {outcomes['turnover']} ({100*outcomes['turnover']/len(episode_results):.1f}%)"
+        )
+        print(
+            f"  - Shot clock violations: {outcomes['shot_clock_violation']} ({100*outcomes['shot_clock_violation']/len(episode_results):.1f}%)"
+        )
+        print(
+            f"  - Other: {outcomes['other']} ({100*outcomes['other']/len(episode_results):.1f}%)"
         )
 
     return {

@@ -81,7 +81,7 @@ const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsSta
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 
-async function recordEpisodeStats(finalState, skipApiCall = false) {
+async function recordEpisodeStats(finalState, skipApiCall = false, episodeData = null) {
   console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
@@ -119,8 +119,16 @@ async function recordEpisodeStats(finalState, skipApiCall = false) {
   const tovCount = Array.isArray(results?.turnovers) ? results.turnovers.length : 0;
   statsState.value.turnovers += Number(tovCount || 0);
 
-  // Add episode reward for user's team (skip API call during batch evaluation)
-  if (!skipApiCall) {
+  // Add episode reward for user's team
+  // If episodeData is provided (from evaluation), use it directly
+  // Otherwise, fetch from API if not skipping
+  if (episodeData && episodeData.episode_rewards && episodeData.steps !== undefined) {
+    const ep = episodeData.episode_rewards;
+    const userTeam = finalState?.user_team_name || 'OFFENSE';
+    statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+    statsState.value.episodeStepsSum += Number(episodeData.steps || 0);
+    console.log('[Stats] Using episodeData - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', episodeData.steps);
+  } else if (!skipApiCall) {
     try {
       const data = await getRewards();
       const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
@@ -128,6 +136,7 @@ async function recordEpisodeStats(finalState, skipApiCall = false) {
       statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
       const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
       statsState.value.episodeStepsSum += Number(steps || 0);
+      console.log('[Stats] Using API data - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', steps);
     } catch (_) { /* ignore */ }
   }
 

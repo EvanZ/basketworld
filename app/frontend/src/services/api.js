@@ -164,7 +164,7 @@ export async function getPhiLog() {
   return response.json();
 }
 
-export async function runEvaluation(numEpisodes = 100, deterministic = true) {
+export async function runEvaluation(numEpisodes = 100, deterministic = false) {
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

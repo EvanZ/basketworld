@@ -131,6 +131,8 @@ class HexagonBasketballEnv(gym.Env):
         normalize_obs: bool = True,
         # Movement mask controls
         mask_occupied_moves: bool = False,
+        # Pass gating: mask out passes without teammates in arc
+        enable_pass_gating: bool = True,
         # Deterministic overrides (optional)
         initial_positions: Optional[List[Tuple[int, int]]] = None,
         initial_ball_holder: Optional[int] = None,
@@ -171,6 +173,8 @@ class HexagonBasketballEnv(gym.Env):
         self.normalize_obs = bool(normalize_obs)
         # Movement mask behavior
         self.mask_occupied_moves = bool(mask_occupied_moves)
+        # Pass gating: mask out passes without teammates in arc
+        self.enable_pass_gating = bool(enable_pass_gating)
         # Illegal action handling configuration/state
         try:
             self.illegal_action_policy = IllegalActionPolicy(illegal_action_policy)
@@ -593,6 +597,12 @@ class HexagonBasketballEnv(gym.Env):
                             )
                             info["phi_next"] = float(phi_next_term)
                             info["phi_beta"] = float(self.phi_beta)
+                        else:
+                            # Phi shaping disabled - provide zero values for Monitor compatibility
+                            info["phi_r_shape"] = 0.0
+                            info["phi_prev"] = 0.0
+                            info["phi_next"] = 0.0
+                            info["phi_beta"] = 0.0
                             # Per-player EP breakdown for UI
                             try:
                                 team_best, ball_ep = self._phi_ep_breakdown()
@@ -784,6 +794,12 @@ class HexagonBasketballEnv(gym.Env):
                 info["phi_ep_by_player"] = ep_by_player
             except Exception:
                 pass
+        else:
+            # Phi shaping disabled - provide zero values for Monitor compatibility
+            info["phi_r_shape"] = 0.0
+            info["phi_prev"] = 0.0
+            info["phi_next"] = 0.0
+            info["phi_beta"] = 0.0
 
         return obs, rewards, done, False, info
 
@@ -833,6 +849,14 @@ class HexagonBasketballEnv(gym.Env):
                     nbr = (curr_q + dq, curr_r + dr)
                     if nbr in occupied:
                         masks[i, action_idx] = 0
+
+        # Pass gating: mask out passes that don't have a teammate in the arc
+        # This prevents the policy from learning to avoid passing due to OOB turnovers
+        if self.enable_pass_gating and self.ball_holder is not None:
+            for dir_idx in range(6):
+                pass_action_idx = ActionType.PASS_E.value + dir_idx
+                if not self._has_teammate_in_pass_arc(self.ball_holder, dir_idx):
+                    masks[self.ball_holder, pass_action_idx] = 0
 
         # Enforce illegal defense: after max steps in basket, mask NOOP so defender must move
         if self.illegal_defense_enabled and self.illegal_defense_max_steps > 0:
@@ -1146,6 +1170,46 @@ class HexagonBasketballEnv(gym.Env):
         q, r = pos
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
+
+    def _has_teammate_in_pass_arc(self, passer_id: int, direction_idx: int) -> bool:
+        """
+        Check if there is at least one teammate within the pass arc for the given direction.
+
+        Args:
+            passer_id: ID of the player attempting to pass
+            direction_idx: Direction index (0-5 for the 6 hex directions)
+
+        Returns:
+            True if at least one teammate is in the arc, False otherwise
+        """
+        passer_pos = self.positions[passer_id]
+        dir_dq, dir_dr = self.hex_directions[direction_idx]
+
+        # Compute angles in cartesian space
+        dir_x, dir_y = self._axial_to_cartesian(dir_dq, dir_dr)
+        dir_norm = math.hypot(dir_x, dir_y) or 1.0
+        # Arc total in degrees -> half-angle in radians
+        half_angle_rad = math.radians(max(1.0, min(360.0, self.pass_arc_degrees))) / 2.0
+        cos_threshold = math.cos(half_angle_rad)
+
+        # Check if any teammate is in arc
+        team_ids = (
+            self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        )
+        for pid in team_ids:
+            if pid == passer_id:
+                continue
+            tq, tr = self.positions[pid]
+            # Check if this teammate is in the arc
+            vx, vy = self._axial_to_cartesian(tq - passer_pos[0], tr - passer_pos[1])
+            vnorm = math.hypot(vx, vy)
+            if vnorm == 0:
+                continue
+            cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+            if cosang >= cos_threshold:
+                return True
+
+        return False
 
     @profile_section("pass_logic")
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:

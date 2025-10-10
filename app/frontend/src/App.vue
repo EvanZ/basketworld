@@ -229,20 +229,52 @@ async function handleSelfPlay(preselected = null) {
           }
           
           if (Array.isArray(probs) && Array.isArray(actionMask)) {
-            // Pick action with highest probability (argmax) among LEGAL actions only
-            let bestActionIndex = 0;
-            let bestProb = -1;
+            let selectedActionIndex = 0;
             
-            for (let i = 0; i < probs.length && i < actionMask.length; i++) {
-              // Only consider legal actions (action_mask[i] === 1)
-              if (actionMask[i] === 1 && probs[i] > bestProb) {
-                bestProb = probs[i];
-                bestActionIndex = i;
+            if (deterministic.value) {
+              // Deterministic: Pick action with highest probability (argmax) among LEGAL actions only
+              let bestProb = -1;
+              
+              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
+                // Only consider legal actions (action_mask[i] === 1)
+                if (actionMask[i] === 1 && probs[i] > bestProb) {
+                  bestProb = probs[i];
+                  selectedActionIndex = i;
+                }
+              }
+              console.log(`[App] Self-play DETERMINISTIC action ${selectedActionIndex} for player ${playerId} (prob: ${bestProb.toFixed(3)})`);
+            } else {
+              // Stochastic: Sample from probability distribution over LEGAL actions
+              const legalIndices = [];
+              const legalProbs = [];
+              
+              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
+                if (actionMask[i] === 1) {
+                  legalIndices.push(i);
+                  legalProbs.push(probs[i]);
+                }
+              }
+              
+              if (legalProbs.length > 0) {
+                // Normalize probabilities
+                const sum = legalProbs.reduce((a, b) => a + b, 0);
+                const normalizedProbs = legalProbs.map(p => p / sum);
+                
+                // Sample from distribution
+                const rand = Math.random();
+                let cumulative = 0;
+                for (let i = 0; i < normalizedProbs.length; i++) {
+                  cumulative += normalizedProbs[i];
+                  if (rand < cumulative) {
+                    selectedActionIndex = legalIndices[i];
+                    break;
+                  }
+                }
+                console.log(`[App] Self-play STOCHASTIC action ${selectedActionIndex} for player ${playerId} (prob: ${probs[selectedActionIndex].toFixed(3)})`);
               }
             }
             
-            console.log(`[App] Self-play selected action ${bestActionIndex} for player ${playerId} (legal: ${actionMask[bestActionIndex] === 1}, prob: ${bestProb})`);
-            aiActions[playerId] = bestActionIndex;
+            aiActions[playerId] = selectedActionIndex;
           }
         }
       }
@@ -333,7 +365,7 @@ async function handleEvaluation() {
         
         // Record stats for this episode (skip API calls for speed)
         if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
-          await controlsRef.value.recordEpisodeStats(result.final_state, true);
+          await controlsRef.value.recordEpisodeStats(result.final_state, true, result);
         }
       }
       
