@@ -53,9 +53,28 @@ class HexCNNFeatureExtractor(BaseFeaturesExtractor):
         if spatial_space is not None:
             n_input_channels = spatial_space.shape[0]
             
+            # Build CNN layers with safety check for grid size
+            height, width = spatial_space.shape[1], spatial_space.shape[2]
+            min_spatial_dim = min(height, width)
+            
+            # Calculate max safe pooling layers (each pool divides by 2)
+            # Need at least 1×1 after all pooling
+            max_pools = 0
+            temp_dim = min_spatial_dim
+            while temp_dim > 1:
+                temp_dim = temp_dim // 2
+                max_pools += 1
+            
+            # Limit cnn_channels to safe number of layers
+            safe_channels = cnn_channels[:max_pools] if len(cnn_channels) > max_pools else cnn_channels
+            
+            if len(safe_channels) < len(cnn_channels):
+                print(f"Warning: Grid size {height}×{width} only supports {max_pools} pooling layers.")
+                print(f"         Reduced CNN layers from {len(cnn_channels)} to {len(safe_channels)}: {safe_channels}")
+            
             cnn_layers = []
             in_channels = n_input_channels
-            for out_channels in cnn_channels:
+            for out_channels in safe_channels:
                 cnn_layers.extend([
                     nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
                     nn.ReLU(),
