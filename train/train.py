@@ -7,8 +7,35 @@ This script implements a self-play loop where two policies, one for offense
 and one for defense, are trained against each other in an alternating fashion.
 A custom gym.Wrapper is used to manage the opponent's actions during training.
 """
-import argparse
+
+# === CRITICAL: Set AWS profile BEFORE any mlflow/boto3 imports ===
+# boto3 caches credentials on first import, so we must set the profile early!
 import os
+import sys
+
+# Clear any partial AWS env vars that Cursor/VS Code might have set
+# This prevents conflicts with our AWS profile
+aws_vars_to_clear = [
+    'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+    'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE'
+]
+for var in aws_vars_to_clear:
+    if var in os.environ:
+        del os.environ[var]
+
+# Use the basketworld AWS profile if available
+# Only needed when accessing S3 artifacts (old runs with s3:// URIs)
+# If MLflow server uses local storage, this won't affect anything
+if os.path.exists(os.path.expanduser('~/.aws/credentials')):
+    os.environ['AWS_PROFILE'] = 'basketworld'
+    os.environ['AWS_DEFAULT_REGION'] = 'us-west-1'
+    
+    # Import boto3 early to ensure it uses the profile
+    import boto3
+    boto3.setup_default_session()
+# === END CRITICAL SECTION ===
+
+import argparse
 from datetime import datetime
 import gymnasium as gym
 import numpy as np

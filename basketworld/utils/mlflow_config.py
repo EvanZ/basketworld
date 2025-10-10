@@ -18,9 +18,10 @@ Environment Variables (in order of precedence):
     MLFLOW_S3_ENDPOINT_URL: S3 endpoint URL (optional, for custom S3 endpoints)
     MLFLOW_ARTIFACT_ROOT: S3 artifact root URI (e.g., s3://my-bucket/mlflow-artifacts)
 
-.env File Support:
-    If a .env file exists in the project root, it will be automatically loaded.
+.env.aws File Support:
+    If a .env.aws file exists in the project root, it will be automatically loaded.
     This allows project-specific credentials without conflicting with global AWS config.
+    (Named .env.aws to avoid conflict with virtual environment directories.)
 
 Usage:
     from basketworld.utils.mlflow_config import get_mlflow_config
@@ -37,18 +38,18 @@ from typing import Optional
 
 def _load_env_file(env_path: Optional[Path] = None) -> None:
     """
-    Load environment variables from .env file if it exists.
+    Load environment variables from .env.aws file if it exists.
 
     Args:
-        env_path: Path to .env file. If None, looks for .env in project root.
+        env_path: Path to .env.aws file. If None, looks for .env.aws in project root.
     """
     if env_path is None:
-        # Try to find project root (where .env would be)
+        # Try to find project root (where .env.aws would be)
         current_file = Path(__file__).resolve()
         project_root = (
             current_file.parent.parent.parent
         )  # basketworld/utils/mlflow_config.py -> project root
-        env_path = project_root / ".env"
+        env_path = project_root / ".env.aws"
 
     if not env_path.exists() or not env_path.is_file():
         return
@@ -159,7 +160,7 @@ def get_mlflow_config(load_env: bool = True) -> MLflowConfig:
     Get MLflow configuration from environment variables.
 
     Args:
-        load_env: Whether to automatically load .env file if it exists.
+        load_env: Whether to automatically load .env.aws file if it exists.
 
     Returns:
         MLflowConfig: Configuration object with tracking URI and artifact settings.
@@ -168,8 +169,8 @@ def get_mlflow_config(load_env: bool = True) -> MLflowConfig:
         Local storage (default):
             No environment variables needed.
 
-        S3 storage (project-specific credentials in .env):
-            Create .env file:
+        S3 storage (project-specific credentials in .env.aws):
+            Create .env.aws file:
                 MLFLOW_ARTIFACT_ROOT=s3://my-bucket/mlflow-artifacts
                 MLFLOW_AWS_ACCESS_KEY_ID=your-access-key
                 MLFLOW_AWS_SECRET_ACCESS_KEY=your-secret-key
@@ -181,7 +182,7 @@ def get_mlflow_config(load_env: bool = True) -> MLflowConfig:
             export AWS_SECRET_ACCESS_KEY=your-secret-key
             export AWS_DEFAULT_REGION=us-east-1
     """
-    # Load .env file if requested
+    # Load .env.aws file if requested
     if load_env:
         _load_env_file()
 
@@ -252,14 +253,14 @@ def setup_mlflow(verbose: bool = True) -> MLflowConfig:
                 "AWS credentials not found. Set either:\n"
                 "  - MLFLOW_AWS_ACCESS_KEY_ID (project-specific), or\n"
                 "  - AWS_ACCESS_KEY_ID (global)\n"
-                "You can also add them to a .env file in the project root."
+                "You can also add them to a .env.aws file in the project root."
             )
         if not config.aws_secret_access_key:
             raise ValueError(
                 "AWS secret key not found. Set either:\n"
                 "  - MLFLOW_AWS_SECRET_ACCESS_KEY (project-specific), or\n"
                 "  - AWS_SECRET_ACCESS_KEY (global)\n"
-                "You can also add them to a .env file in the project root."
+                "You can also add them to a .env.aws file in the project root."
             )
 
         # Ensure boto3 uses the configured credentials

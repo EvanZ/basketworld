@@ -3,6 +3,12 @@ env/
 
 # .env
 .env
+.env.aws
+
+# MLflow local database files
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
 
 # images
 images/
