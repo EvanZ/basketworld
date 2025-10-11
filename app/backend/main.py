@@ -983,11 +983,30 @@ def run_evaluation(request: EvaluationRequest):
     print(f"[Evaluation] Configuration:")
     print(f"  - Deterministic policy: {deterministic}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
+    print(f"  - User team: {game_state.user_team.name}")
+    print(f"  - Unified policy (user): {game_state.unified_policy_key}")
+    print(
+        f"  - Opponent policy: {game_state.opponent_unified_policy_key or 'same as unified'}"
+    )
     print(f"  - shot_clock (max): {game_state.env.shot_clock_steps}")
     print(f"  - min_shot_clock: {game_state.env.min_shot_clock}")
     print(
         f"  - Each episode starts with random shot clock in range: [{game_state.env.min_shot_clock}, {game_state.env.shot_clock_steps}] steps"
     )
+
+    # Log policy assignment to teams
+    if game_state.user_team == Team.OFFENSE:
+        print(f"\n[Policy Assignment]")
+        print(f"  - OFFENSE: {game_state.unified_policy_key} (user policy)")
+        print(
+            f"  - DEFENSE: {game_state.opponent_unified_policy_key or game_state.unified_policy_key} (opponent policy)"
+        )
+    else:
+        print(f"\n[Policy Assignment]")
+        print(
+            f"  - OFFENSE: {game_state.opponent_unified_policy_key or game_state.unified_policy_key} (opponent policy)"
+        )
+        print(f"  - DEFENSE: {game_state.unified_policy_key} (user policy)")
 
     for ep_idx in range(num_episodes):
         # Reset environment for new episode
@@ -1085,9 +1104,23 @@ def run_evaluation(request: EvaluationRequest):
                 resolved_opponent = np.array(full_action_ai)
 
             # Combine actions based on team roles
-            final_action = np.array(resolved_unified, dtype=np.int32)
-            for idx in game_state.env.defense_ids:
-                final_action[idx] = resolved_opponent[idx]
+            # IMPORTANT: unified_policy represents the USER's policy (game_state.user_team)
+            # and defense_policy represents the OPPONENT's policy
+            # We need to assign them to the correct team based on game_state.user_team
+            final_action = np.zeros(game_state.env.n_players, dtype=np.int32)
+
+            if game_state.user_team == Team.OFFENSE:
+                # User is offense, opponent is defense
+                for idx in game_state.env.offense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in game_state.env.defense_ids:
+                    final_action[idx] = resolved_opponent[idx]
+            else:
+                # User is defense, opponent is offense
+                for idx in game_state.env.defense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in game_state.env.offense_ids:
+                    final_action[idx] = resolved_opponent[idx]
 
             # Execute step
             obs, reward, terminated, truncated, info = game_state.env.step(final_action)
@@ -1451,56 +1484,74 @@ def get_action_masks_debug():
     """
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    
+
     try:
         action_mask = game_state.obs["action_mask"]
-        
+
         # Get pass-related parameters
         debug_info = {
             "enable_pass_gating": getattr(game_state.env, "enable_pass_gating", None),
             "pass_arc_degrees": getattr(game_state.env, "pass_arc_degrees", None),
-            "ball_holder": int(game_state.env.ball_holder) if game_state.env.ball_holder is not None else None,
+            "ball_holder": (
+                int(game_state.env.ball_holder)
+                if game_state.env.ball_holder is not None
+                else None
+            ),
             "positions": [(int(q), int(r)) for q, r in game_state.env.positions],
             "offense_ids": list(game_state.env.offense_ids),
             "defense_ids": list(game_state.env.defense_ids),
             "action_masks": {},
         }
-        
+
         # For each player, show their action mask
         action_names = [
-            "NOOP", "MOVE_E", "MOVE_NE", "MOVE_NW", "MOVE_W", "MOVE_SW", "MOVE_SE",
-            "SHOOT", "PASS_E", "PASS_NE", "PASS_NW", "PASS_W", "PASS_SW", "PASS_SE"
+            "NOOP",
+            "MOVE_E",
+            "MOVE_NE",
+            "MOVE_NW",
+            "MOVE_W",
+            "MOVE_SW",
+            "MOVE_SE",
+            "SHOOT",
+            "PASS_E",
+            "PASS_NE",
+            "PASS_NW",
+            "PASS_W",
+            "PASS_SW",
+            "PASS_SE",
         ]
-        
+
         for player_id in range(game_state.env.n_players):
             mask = action_mask[player_id].tolist()
             debug_info["action_masks"][player_id] = {
                 "mask": mask,
-                "legal_actions": [action_names[i] for i, m in enumerate(mask) if m == 1],
+                "legal_actions": [
+                    action_names[i] for i, m in enumerate(mask) if m == 1
+                ],
                 "pass_mask": mask[8:14],  # Pass actions
                 "num_legal_passes": sum(mask[8:14]),
             }
-        
+
         # If pass gating is enabled and ball holder exists, debug the arc logic
         if debug_info["enable_pass_gating"] and debug_info["ball_holder"] is not None:
             ball_holder = debug_info["ball_holder"]
             debug_info["pass_gating_debug"] = {}
-            
+
             # Check each pass direction
             for dir_idx in range(6):
-                has_teammate = game_state.env._has_teammate_in_pass_arc(ball_holder, dir_idx)
+                has_teammate = game_state.env._has_teammate_in_pass_arc(
+                    ball_holder, dir_idx
+                )
                 debug_info["pass_gating_debug"][f"direction_{dir_idx}"] = {
                     "has_teammate_in_arc": has_teammate,
                     "pass_action": action_names[8 + dir_idx],
                     "is_legal": bool(action_mask[ball_holder][8 + dir_idx] == 1),
                 }
-        
+
         return jsonable_encoder(debug_info)
-        
+
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to get action masks: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to get action masks: {e}")
 
 
 @app.get("/api/action_values/{player_id}")
