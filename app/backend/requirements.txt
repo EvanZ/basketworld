@@ -7,4 +7,5 @@ pillow
 mlflow
 stable-baselines3
 torch
+boto3
 -e ../.. 
