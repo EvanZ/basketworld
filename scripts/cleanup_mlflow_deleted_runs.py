@@ -195,7 +195,13 @@ def main():
         print()
 
     # Connect to MLflow
-    mlflow.set_tracking_uri(args.tracking_uri)
+    if args.tracking_uri == "http://localhost:5000":
+        # Use the default config if not explicitly overridden
+        from basketworld.utils.mlflow_config import setup_mlflow
+
+        setup_mlflow(verbose=False)
+    else:
+        mlflow.set_tracking_uri(args.tracking_uri)
     client = MlflowClient()
 
     try:
@@ -244,6 +250,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

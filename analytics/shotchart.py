@@ -123,8 +123,9 @@ supported values are 'Accent', 'Accent_r', 'Blues', 'Blues_r', 'BrBG', 'BrBG_r',
 
 
 def main(args):
-    tracking_uri = "http://localhost:5000"
-    mlflow.set_tracking_uri(tracking_uri)
+    from basketworld.utils.mlflow_config import setup_mlflow
+
+    setup_mlflow(verbose=False)
     client = MlflowClient()
 
     required, optional = get_mlflow_params(client, args.run_id)

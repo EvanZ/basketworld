@@ -199,6 +199,12 @@ def get_mlflow_params(
     optional["pass_oob_turnover_prob"] = _get_param(
         params, ["pass_oob_turnover_prob", "pass-oob-turnover-prob"], float, 1.0
     )
+    optional["enable_pass_gating"] = _get_param(
+        params,
+        ["enable_pass_gating", "enable-pass-gating"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        True,
+    )
     # Illegal action policy
     optional["illegal_action_policy"] = _get_param(
         params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
