@@ -19,5 +19,5 @@ AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION" \
 mlflow server \
     --backend-store-uri sqlite:///mlflow.db \
     --artifacts-destination s3://basketworld/mlflow-artifacts \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 5000

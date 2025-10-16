@@ -39,7 +39,7 @@ if [ "$USE_S3" = true ]; then
     mlflow server \
         --backend-store-uri sqlite:///mlflow.db \
         --artifacts-destination s3://basketworld/mlflow-artifacts \
-        --host 0.0.0.0 \
+        --host 127.0.0.1 \
         --port 5000
 else
     echo "Mode: Local Storage"
@@ -53,7 +53,7 @@ else
     mlflow server \
         --backend-store-uri sqlite:///mlflow.db \
         --default-artifact-root file://$(pwd)/mlartifacts \
-        --host 0.0.0.0 \
+        --host 127.0.0.1 \
         --port 5000
 fi
 
