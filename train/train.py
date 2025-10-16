@@ -341,7 +341,9 @@ def setup_environment(args, training_team):
         min_shot_clock=getattr(args, "min_shot_clock", 10),
         defender_pressure_distance=args.defender_pressure_distance,
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
-        steal_chance=args.steal_chance,
+        base_steal_rate=getattr(args, "base_steal_rate", 0.35),
+        steal_perp_decay=getattr(args, "steal_perp_decay", 1.5),
+        steal_distance_factor=getattr(args, "steal_distance_factor", 0.08),
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
         layup_std=getattr(args, "layup_std", 0.0),
@@ -1844,11 +1846,25 @@ if __name__ == "__main__":
         help="Full assist bonus as % of shot reward.",
     )
     parser.add_argument(
-        "--steal-chance",
-        dest="steal_chance",
+        "--base-steal-rate",
+        dest="base_steal_rate",
         type=float,
-        default=0.05,
-        help="Chance of a steal.",
+        default=0.35,
+        help="Base steal rate when defender is directly on pass line.",
+    )
+    parser.add_argument(
+        "--steal-perp-decay",
+        dest="steal_perp_decay",
+        type=float,
+        default=1.5,
+        help="Exponential decay rate for steal chance perpendicular to pass line.",
+    )
+    parser.add_argument(
+        "--steal-distance-factor",
+        dest="steal_distance_factor",
+        type=float,
+        default=0.08,
+        help="Factor by which pass distance increases steal chance.",
     )
     parser.add_argument(
         "--episode-sample-prob",

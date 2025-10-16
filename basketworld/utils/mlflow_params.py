@@ -189,8 +189,15 @@ def get_mlflow_params(
     optional["full_assist_bonus_pct"] = _get_param(
         params, ["full_assist_bonus_pct", "full-assist-bonus-pct"], float, 0.05
     )
-    optional["steal_chance"] = _get_param(
-        params, ["steal_chance", "steal-chance"], float, 0.05
+    # Realistic passing steal parameters
+    optional["base_steal_rate"] = _get_param(
+        params, ["base_steal_rate", "base-steal-rate"], float, 0.35
+    )
+    optional["steal_perp_decay"] = _get_param(
+        params, ["steal_perp_decay", "steal-perp-decay"], float, 1.5
+    )
+    optional["steal_distance_factor"] = _get_param(
+        params, ["steal_distance_factor", "steal-distance-factor"], float, 0.08
     )
     # Pass parameters
     optional["pass_arc_degrees"] = _get_param(

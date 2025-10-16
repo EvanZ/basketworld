@@ -1041,10 +1041,18 @@ const phiRef = vueRef(null);
             </div>
           </div>
           <div class="param-category">
-            <h5>Pass Interception</h5>
+            <h5>Pass Interception (Line-of-Sight)</h5>
             <div class="param-item">
-              <span class="param-name">Steal chance:</span>
-              <span class="param-value">{{ props.gameState.steal_chance ?? 'N/A' }}</span>
+              <span class="param-name">Base steal rate:</span>
+              <span class="param-value">{{ props.gameState.base_steal_rate ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Perpendicular decay:</span>
+              <span class="param-value">{{ props.gameState.steal_perp_decay ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Distance factor:</span>
+              <span class="param-value">{{ props.gameState.steal_distance_factor ?? 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">

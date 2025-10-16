@@ -81,7 +81,10 @@ class HexagonBasketballEnv(gym.Env):
         render_mode: Optional[str] = None,
         defender_pressure_distance: int = 1,
         defender_pressure_turnover_chance: float = 0.05,
-        steal_chance: float = 0.05,
+        # Realistic passing steal parameters
+        base_steal_rate: float = 0.35,
+        steal_perp_decay: float = 1.5,
+        steal_distance_factor: float = 0.08,
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
@@ -164,7 +167,10 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
-        self.steal_chance = steal_chance
+        # Realistic passing steal parameters
+        self.base_steal_rate = base_steal_rate
+        self.steal_perp_decay = steal_perp_decay
+        self.steal_distance_factor = steal_distance_factor
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
         self.use_egocentric_obs = bool(use_egocentric_obs)
@@ -418,6 +424,85 @@ class HexagonBasketballEnv(gym.Env):
         q1, r1 = pos1
         q2, r2 = pos2
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
+
+    def _point_to_line_distance(
+        self,
+        point: Tuple[int, int],
+        line_start: Tuple[int, int],
+        line_end: Tuple[int, int]
+    ) -> float:
+        """
+        Calculate perpendicular distance from a point to a line segment.
+        
+        Args:
+            point: The point to measure distance from (axial coords)
+            line_start: Start of line segment (axial coords)
+            line_end: End of line segment (axial coords)
+            
+        Returns:
+            Perpendicular distance in Cartesian space
+        """
+        # Convert all positions to Cartesian coordinates
+        px, py = self._axial_to_cartesian(point[0], point[1])
+        sx, sy = self._axial_to_cartesian(line_start[0], line_start[1])
+        ex, ey = self._axial_to_cartesian(line_end[0], line_end[1])
+        
+        # Vector from start to end
+        dx = ex - sx
+        dy = ey - sy
+        line_length_sq = dx * dx + dy * dy
+        
+        if line_length_sq == 0:
+            # Line start and end are the same point
+            return math.hypot(px - sx, py - sy)
+        
+        # Project point onto line: t = [(P-S) · (E-S)] / |E-S|²
+        t = ((px - sx) * dx + (py - sy) * dy) / line_length_sq
+        
+        # Find closest point on line segment (clamped to [0, 1])
+        t = max(0.0, min(1.0, t))
+        closest_x = sx + t * dx
+        closest_y = sy + t * dy
+        
+        # Return distance from point to closest point on line
+        return math.hypot(px - closest_x, py - closest_y)
+
+    def _is_between_points(
+        self,
+        point: Tuple[int, int],
+        line_start: Tuple[int, int],
+        line_end: Tuple[int, int]
+    ) -> bool:
+        """
+        Check if a point's projection onto the line falls between start and end.
+        
+        Args:
+            point: The point to check (axial coords)
+            line_start: Start of line segment (axial coords)
+            line_end: End of line segment (axial coords)
+            
+        Returns:
+            True if point projects onto the line segment (not just the infinite line)
+        """
+        # Convert to Cartesian
+        px, py = self._axial_to_cartesian(point[0], point[1])
+        sx, sy = self._axial_to_cartesian(line_start[0], line_start[1])
+        ex, ey = self._axial_to_cartesian(line_end[0], line_end[1])
+        
+        # Vector from start to end
+        dx = ex - sx
+        dy = ey - sy
+        line_length_sq = dx * dx + dy * dy
+        
+        if line_length_sq == 0:
+            # Line has no length - point is only "between" if it's at the same position
+            return False
+        
+        # Project point onto line: t = [(P-S) · (E-S)] / |E-S|²
+        t = ((px - sx) * dx + (py - sy) * dy) / line_length_sq
+        
+        # Point is between start and end if 0 < t < 1
+        return 0.0 < t < 1.0
 
     @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -1219,13 +1304,21 @@ class HexagonBasketballEnv(gym.Env):
     @profile_section("pass_logic")
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
         """
-        Arc-based passing:
-        - Determine a 60-degree arc centered on the chosen direction.
-        - Eligible receivers are same-team players whose angle from passer lies within the arc;
-          choose the nearest such teammate as target.
-        - If no eligible teammate, treat as pass out of bounds in that direction.
-        - If at least one defender lies in the same arc and is closer than the receiver,
-          a fixed 25% chance of interception applies (closest defender steals).
+        Arc-based passing with line-of-sight steal mechanics:
+        
+        1. Determine arc centered on chosen direction (configurable, default 60 degrees)
+        2. Find nearest teammate in arc as the target receiver
+        3. If no eligible teammate, treat as pass out of bounds (configurable turnover probability)
+        4. Line-of-sight steal evaluation:
+           - Only defenders in 180° forward hemisphere (chosen direction ± adjacent directions) are considered
+           - Of those, only defenders between passer and receiver (along the pass line) are evaluated
+           - Each defender's steal contribution depends on:
+             * Perpendicular distance from the pass line (closer = higher chance)
+             * Total pass distance (longer passes = higher chance)
+           - Formula: steal_i = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist)
+           - Multiple defender contributions are compounded: total_steal = 1 - ∏(1 - steal_i)
+           - Defender with highest contribution gets the ball if interception occurs
+        5. If no defenders in forward hemisphere between passer and receiver, pass always succeeds
         """
         passer_pos = self.positions[passer_id]
         dir_dq, dir_dr = self.hex_directions[direction_idx]
@@ -1249,6 +1342,18 @@ class HexagonBasketballEnv(gym.Env):
                 return False
             cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
             return cosang >= cos_threshold
+
+        def in_defender_arc(to_q: int, to_r: int) -> bool:
+            """Check if position is within 180° arc (chosen direction ± 1 adjacent direction)."""
+            vx, vy = self._axial_to_cartesian(
+                to_q - passer_pos[0], to_r - passer_pos[1]
+            )
+            vnorm = math.hypot(vx, vy)
+            if vnorm == 0:
+                return False
+            cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+            # 180° arc means cos >= 0 (angles from -90° to +90°)
+            return cosang >= 0.0
 
         # Pick closest teammate in arc
         team_ids = (
@@ -1301,44 +1406,98 @@ class HexagonBasketballEnv(gym.Env):
                 }
             return
 
-        # Possible interception by defender in same arc who is closer than receiver
+        # Line-of-sight based interception: defenders between passer and receiver
         opp_ids = (
             self.defense_ids if passer_id in self.offense_ids else self.offense_ids
         )
-        intercept_candidates: List[Tuple[int, int]] = []  # (defender_id, distance)
+        recv_pos = self.positions[recv_id]
+        pass_distance = self._hex_distance(passer_pos, recv_pos)
+        
+        # Evaluate each defender's steal contribution
+        defender_contributions: List[Tuple[int, float, float]] = []  # (defender_id, steal_contrib, perp_dist)
         for did in opp_ids:
-            dq, dr = self.positions[did]
-            if not in_arc(dq, dr):
+            defender_pos = self.positions[did]
+            
+            # Only consider defenders in the 180° arc (forward hemisphere)
+            if not in_defender_arc(defender_pos[0], defender_pos[1]):
                 continue
-            dist_d = self._hex_distance(passer_pos, (dq, dr))
-            if recv_dist is not None and dist_d < recv_dist:
-                intercept_candidates.append((did, dist_d))
-
-        if intercept_candidates:
-            # Closest defender in arc
-            intercept_candidates.sort(key=lambda t: t[1])
-            thief_id = intercept_candidates[0][0]
-            if self._rng.random() < self.steal_chance:
-                # Interception occurs
-                self.ball_holder = thief_id
-                results["turnovers"].append(
-                    {
-                        "player_id": passer_id,
-                        "reason": "intercepted",
-                        "stolen_by": thief_id,
-                        "turnover_pos": self.positions[thief_id],
-                    }
-                )
-                results["passes"][passer_id] = {
-                    "success": False,
+            
+            # Only consider defenders between passer and receiver
+            if not self._is_between_points(defender_pos, passer_pos, recv_pos):
+                continue
+            
+            # Calculate perpendicular distance from pass line
+            perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
+            
+            # Calculate steal contribution for this defender
+            # steal = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist)
+            steal_contrib = (
+                self.base_steal_rate *
+                math.exp(-self.steal_perp_decay * perp_distance) *
+                (1.0 + self.steal_distance_factor * pass_distance)
+            )
+            
+            # Clamp to [0, 1] for safety
+            steal_contrib = max(0.0, min(1.0, steal_contrib))
+            
+            defender_contributions.append((did, steal_contrib, perp_distance))
+        
+        # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
+        total_steal_prob = 0.0
+        if defender_contributions:
+            complement_product = 1.0
+            for _, steal_contrib, _ in defender_contributions:
+                complement_product *= (1.0 - steal_contrib)
+            total_steal_prob = 1.0 - complement_product
+        
+        # Roll for interception
+        if total_steal_prob > 0 and self._rng.random() < total_steal_prob:
+            # Interception occurs - defender with highest steal contribution gets ball
+            defender_contributions.sort(key=lambda t: t[1], reverse=True)
+            thief_id = defender_contributions[0][0]
+            
+            self.ball_holder = thief_id
+            results["turnovers"].append(
+                {
+                    "player_id": passer_id,
                     "reason": "intercepted",
-                    "interceptor_id": thief_id,
+                    "stolen_by": thief_id,
+                    "turnover_pos": self.positions[thief_id],
                 }
-                return
+            )
+            results["passes"][passer_id] = {
+                "success": False,
+                "reason": "intercepted",
+                "interceptor_id": thief_id,
+                "pass_distance": pass_distance,
+                "total_steal_prob": total_steal_prob,
+                "defenders_evaluated": [
+                    {
+                        "id": did,
+                        "steal_contribution": contrib,
+                        "perp_distance": perp_dist,
+                    }
+                    for did, contrib, perp_dist in defender_contributions
+                ],
+            }
+            return
 
         # Successful pass to receiver in arc
         self.ball_holder = recv_id
-        results["passes"][passer_id] = {"success": True, "target": recv_id}
+        results["passes"][passer_id] = {
+            "success": True,
+            "target": recv_id,
+            "pass_distance": pass_distance,
+            "total_steal_prob": total_steal_prob,
+            "defenders_evaluated": [
+                {
+                    "id": did,
+                    "steal_contribution": contrib,
+                    "perp_distance": perp_dist,
+                }
+                for did, contrib, perp_dist in defender_contributions
+            ],
+        }
         # Start/refresh assist window (configurable steps including current step)
         self._assist_candidate = {
             "passer_id": int(passer_id),

@@ -2053,7 +2053,9 @@ def get_full_game_state(include_policy_probs=False):
         "defender_pressure_turnover_chance": float(
             getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)
         ),
-        "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
+        "base_steal_rate": float(getattr(game_state.env, "base_steal_rate", 0.35)),
+        "steal_perp_decay": float(getattr(game_state.env, "steal_perp_decay", 1.5)),
+        "steal_distance_factor": float(getattr(game_state.env, "steal_distance_factor", 0.08)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
         "max_spawn_distance": (
             int(getattr(game_state.env, "max_spawn_distance", None))
