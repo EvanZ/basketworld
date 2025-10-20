@@ -74,7 +74,7 @@ import mlflow
 import sys
 import tempfile
 import random
-from typing import Optional
+from typing import Callable, Optional
 import torch
 import gc
 import time
@@ -458,42 +458,43 @@ def make_vector_env(
     # If opponent_policy is a list, assign different opponents to each environment
     if isinstance(opponent_policy, list):
 
-        def _single_env_factory(env_idx: int, opp_policy) -> gym.Env:  # type: ignore[name-defined]
-            base_env = setup_environment(args, training_team)
-            return SelfPlayEnvWrapper(
-                base_env,
-                opponent_policy=opp_policy,
-                training_strategy=IllegalActionStrategy.NOOP,
-                opponent_strategy=IllegalActionStrategy.NOOP,
-                deterministic_opponent=deterministic_opponent,
-            )
+        def _make_env_with_opponent(env_idx: int, opp_policy_path) -> Callable[[], gym.Env]:  # type: ignore[name-defined]
+            """Create a factory function for a single environment with a specific opponent."""
+            def _thunk():
+                base_env = setup_environment(args, training_team)
+                return SelfPlayEnvWrapper(
+                    base_env,
+                    opponent_policy=opp_policy_path,
+                    training_strategy=IllegalActionStrategy.NOOP,
+                    opponent_strategy=IllegalActionStrategy.NOOP,
+                    deterministic_opponent=deterministic_opponent,
+                )
+            return _thunk
 
         # Distribute opponents across environments (cycle if fewer opponents than envs)
-        return SubprocVecEnv(
-            [
-                lambda idx=i, opp=opponent_policy[
-                    i % len(opponent_policy)
-                ]: _single_env_factory(idx, opp)
-                for i in range(num_envs)
-            ],
-            start_method="spawn",
-        )
+        env_fns = [
+            _make_env_with_opponent(i, opponent_policy[i % len(opponent_policy)])
+            for i in range(num_envs)
+        ]
+        return SubprocVecEnv(env_fns, start_method="spawn")
     else:
         # Original behavior: all envs use same opponent
-        def _single_env_factory() -> gym.Env:  # type: ignore[name-defined]
-            base_env = setup_environment(args, training_team)
-            return SelfPlayEnvWrapper(
-                base_env,
-                opponent_policy=opponent_policy,
-                training_strategy=IllegalActionStrategy.NOOP,
-                opponent_strategy=IllegalActionStrategy.NOOP,
-                deterministic_opponent=deterministic_opponent,
-            )
+        def _make_env() -> Callable[[], gym.Env]:  # type: ignore[name-defined]
+            """Create a factory function for a single environment."""
+            def _thunk():
+                base_env = setup_environment(args, training_team)
+                return SelfPlayEnvWrapper(
+                    base_env,
+                    opponent_policy=opponent_policy,
+                    training_strategy=IllegalActionStrategy.NOOP,
+                    opponent_strategy=IllegalActionStrategy.NOOP,
+                    deterministic_opponent=deterministic_opponent,
+                )
+            return _thunk
 
         # Use subprocesses for parallelism.
-        return SubprocVecEnv(
-            [_single_env_factory for _ in range(num_envs)], start_method="spawn"
-        )
+        env_fns = [_make_env() for _ in range(num_envs)]
+        return SubprocVecEnv(env_fns, start_method="spawn")
 
 
 def main(args):
