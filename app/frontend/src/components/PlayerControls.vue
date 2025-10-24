@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue';
+import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import { getActionValues, getRewards } from '@/services/api';
@@ -39,6 +39,12 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  // Current shot clock value (for highlighting in moves table)
+  currentShotClock: {
+    type: Number,
+    default: null,
+    required: false,
+  },
   // When provided, overrides internal selections to reflect actual applied actions
   externalSelections: {
     type: Object,
@@ -59,6 +65,7 @@ const selectedActions = ref({});
 watch(selectedActions, (newActions, oldActions) => {
   console.log('[PlayerControls] 🔍 selectedActions changed from:', oldActions, 'to:', newActions);
 }, { deep: true });
+
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
 // shot probability is displayed on the board, not in controls
@@ -70,6 +77,52 @@ const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
+
+// Auto-scroll to current shot clock in moves table
+const isMounted = ref(false);
+
+watch(() => props.currentShotClock, async (newShotClock) => {
+  try {
+    if (isMounted.value && newShotClock !== null) {
+      await nextTick();
+      if (activeTab.value === 'moves') {
+        const currentRow = document.querySelector('.current-shot-clock-row');
+        if (currentRow) {
+          currentRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      } else if (activeTab.value === 'rewards') {
+        const currentRow = document.querySelector('.current-reward-row');
+        if (currentRow) {
+          currentRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to scroll to current shot clock:', err);
+  }
+}, { flush: 'post' });
+
+// Also scroll when switching tabs
+watch(activeTab, async (newTab) => {
+  try {
+    if (isMounted.value && props.currentShotClock !== null) {
+      await nextTick();
+      if (newTab === 'moves') {
+        const currentRow = document.querySelector('.current-shot-clock-row');
+        if (currentRow) {
+          currentRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      } else if (newTab === 'rewards') {
+        const currentRow = document.querySelector('.current-reward-row');
+        if (currentRow) {
+          currentRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to scroll to current shot clock on tab change:', err);
+  }
+}, { flush: 'post' });
 
 // Move tracking is now handled by parent component
 
@@ -396,6 +449,30 @@ function getLegalActions(playerId) {
   return legalActions;
 }
 
+function getPassStealProbability(move, playerId) {
+  // Check if pass steal probabilities were calculated for this move
+  // This shows the risk of passing TO this teammate (if they're in the dict)
+  if (move.passStealProbabilities && move.passStealProbabilities[playerId] !== undefined) {
+    return move.passStealProbabilities[playerId];
+  }
+  
+  return null;
+}
+
+function getDefenderPressureProbability(move, playerId) {
+  // Check if this player has defender pressure info
+  if (!move.actionResults || !move.actionResults.defender_pressure) {
+    return null;
+  }
+  
+  const pressureInfo = move.actionResults.defender_pressure[playerId];
+  if (!pressureInfo || pressureInfo.total_pressure_prob === undefined) {
+    return null;
+  }
+  
+  return pressureInfo.total_pressure_prob;
+}
+
 function handleActionSelected(action) {
   if (props.disabled) return; // ignore clicks when disabled
   if (props.activePlayerId !== null) {
@@ -667,6 +744,7 @@ watch(() => activeTab.value, (newTab) => {
 });
 
 onMounted(() => {
+  isMounted.value = true;
   fetchRewards();
 });
 
@@ -834,9 +912,10 @@ const phiRef = vueRef(null);
           <div v-if="rewardHistory.length === 0" class="no-rewards">
             No rewards recorded yet.
           </div>
-          <div v-else class="reward-table">
+          <div v-else class="reward-table" :class="{ 'with-phi': mlflowPhiParams && mlflowPhiParams.enable_phi_shaping }">
             <div class="reward-header">
               <span>Turn</span>
+              <span>Shot Clock</span>
               <span>Offense</span>
               <span>Off. Reason</span>
               <span>Defense</span>
@@ -847,8 +926,10 @@ const phiRef = vueRef(null);
               v-for="reward in rewardHistory" 
               :key="reward.step"
               class="reward-row"
+              :class="{ 'current-reward-row': reward.shot_clock === props.currentShotClock }"
             >
               <span>{{ reward.step }}</span>
+              <span class="shot-clock-cell">{{ reward.shot_clock !== undefined ? reward.shot_clock : '-' }}</span>
               <span :class="{ positive: reward.offense > 0, negative: reward.offense < 0 }">
                 {{ reward.offense.toFixed(3) }}
               </span>
@@ -920,16 +1001,26 @@ const phiRef = vueRef(null);
           <thead>
             <tr>
               <th>Turn</th>
+              <th>Shot Clock</th>
               <th v-for="playerId in userControlledPlayerIds" :key="playerId">
                 Player {{ playerId }}
               </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="move in props.moveHistory" :key="move.turn">
+            <tr v-for="move in props.moveHistory" :key="move.turn" :class="{ 'current-shot-clock-row': move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done) }">
               <td>{{ move.turn }}</td>
-              <td v-for="playerId in userControlledPlayerIds" :key="playerId">
-                {{ move.moves[`Player ${playerId}`] || 'NOOP' }}
+              <td class="shot-clock-cell">{{ move.shotClock !== undefined ? move.shotClock : '-' }}</td>
+              <td v-for="playerId in userControlledPlayerIds" :key="playerId" class="move-cell">
+                <div class="move-action">
+                  <span v-if="move.ballHolder === playerId" class="ball-holder-icon">🏀 </span>{{ move.moves[`Player ${playerId}`] || 'NOOP' }}
+                </div>
+                <div v-if="getPassStealProbability(move, playerId) !== null" class="pass-steal-info">
+                  ({{ (getPassStealProbability(move, playerId) * 100).toFixed(1) }}% steal risk)
+                </div>
+                <div v-if="getDefenderPressureProbability(move, playerId) !== null" class="defender-pressure-info">
+                  ({{ (getDefenderPressureProbability(move, playerId) * 100).toFixed(1) }}% turnover risk)
+                </div>
               </td>
             </tr>
           </tbody>
@@ -1039,6 +1130,10 @@ const phiRef = vueRef(null);
               <span class="param-name">Turnover chance:</span>
               <span class="param-value">{{ props.gameState.defender_pressure_turnover_chance || 'N/A' }}</span>
             </div>
+            <div class="param-item">
+              <span class="param-name">Decay lambda:</span>
+              <span class="param-value">{{ props.gameState.defender_pressure_decay_lambda || 'N/A' }}</span>
+            </div>
           </div>
           <div class="param-category">
             <h5>Pass Interception (Line-of-Sight)</h5>
@@ -1053,6 +1148,10 @@ const phiRef = vueRef(null);
             <div class="param-item">
               <span class="param-name">Distance factor:</span>
               <span class="param-value">{{ props.gameState.steal_distance_factor ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Position weight min:</span>
+              <span class="param-value">{{ props.gameState.steal_position_weight_min ?? 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">
@@ -1119,6 +1218,30 @@ const phiRef = vueRef(null);
             <div class="param-item">
               <span class="param-name">Defense IDs:</span>
               <span class="param-value">{{ props.gameState.defense_ids?.join(', ') || 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>3-Second Violation Rules</h5>
+            <div class="param-item">
+              <span class="param-name">Lane width (hexes):</span>
+              <span class="param-value">{{ props.gameState.three_second_lane_width ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Max steps in lane:</span>
+              <span class="param-value">{{ props.gameState.three_second_max_steps ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Offensive 3-sec enabled:</span>
+              <span class="param-value">{{ props.gameState.offensive_three_seconds_enabled ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Illegal defense enabled:</span>
+              <span class="param-value">{{ props.gameState.illegal_defense_enabled ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.offensive_lane_hexes">
+              <span class="param-name">Lane hexes count:</span>
+              <span class="param-value">{{ props.gameState.offensive_lane_hexes?.length || 0 }} hexes</span>
             </div>
           </div>
         </div>
@@ -1272,7 +1395,7 @@ const phiRef = vueRef(null);
 
 .reward-header {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr;
   padding: 0.75rem;
   background-color: #f8f9fa;
   font-weight: bold;
@@ -1280,12 +1403,20 @@ const phiRef = vueRef(null);
   text-align: center;
 }
 
+.reward-table.with-phi .reward-header {
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
+}
+
 .reward-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr;
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid #f1f3f4;
   text-align: center;
+}
+
+.reward-table.with-phi .reward-row {
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
 }
 
 .reward-row:last-child {
@@ -1294,6 +1425,17 @@ const phiRef = vueRef(null);
 
 .reward-row:hover {
   background-color: #f8f9fa;
+}
+
+.reward-row.current-reward-row {
+  background-color: #fff3cd !important;
+  font-weight: 600;
+  border-top: 2px solid #ffc107;
+  border-bottom: 2px solid #ffc107;
+}
+
+.reward-row.current-reward-row:hover {
+  background-color: #ffe69c !important;
 }
 
 .positive {
@@ -1351,6 +1493,59 @@ const phiRef = vueRef(null);
 
 .moves-table tr:nth-child(even) {
   background-color: #f9f9f9;
+}
+
+.moves-table tr.current-shot-clock-row {
+  background-color: #fff3cd !important;
+  font-weight: 600;
+}
+
+.moves-table tr.current-shot-clock-row:hover {
+  background-color: #ffe69c !important;
+}
+
+.moves-table tr.current-shot-clock-row td {
+  border-top: 2px solid #ffc107;
+  border-bottom: 2px solid #ffc107;
+}
+
+.moves-table tr.current-shot-clock-row td:first-child {
+  border-left: 2px solid #ffc107;
+}
+
+.moves-table tr.current-shot-clock-row td:last-child {
+  border-right: 2px solid #ffc107;
+}
+
+.move-cell {
+  padding: 6px 8px;
+}
+
+.move-action {
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+.ball-holder-icon {
+  font-size: 1em;
+}
+
+.pass-steal-info {
+  font-size: 0.8em;
+  color: #dc3545;
+  font-style: italic;
+}
+
+.defender-pressure-info {
+  font-size: 0.8em;
+  color: #ff6b35;
+  font-style: italic;
+}
+
+.shot-clock-cell {
+  font-weight: 600;
+  color: #495057;
+  background-color: #f8f9fa;
 }
 
 .no-moves {

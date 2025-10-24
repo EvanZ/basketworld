@@ -29,14 +29,18 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
     return response.json();
 }
 
-export async function stepGame(actions, deterministic = null) {
-    console.log('[API] Sending step request with actions:', actions);
+export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null) {
+    console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic);
     const response = await fetch(`${API_BASE_URL}/api/step`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ actions, deterministic }),
+        body: JSON.stringify({ 
+            actions, 
+            player_deterministic: playerDeterministic,
+            opponent_deterministic: opponentDeterministic 
+        }),
     });
     if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to take step' }));
@@ -77,6 +81,20 @@ export const getShotProbability = async (playerId) => {
   }
   const json = await response.json();
   console.log('[API] getShotProbability ←', json);
+  return json;
+};
+
+export const getPassStealProbabilities = async () => {
+  const url = `${API_BASE_URL}/api/pass_steal_probabilities`;
+  console.log('[API] getPassStealProbabilities →', url);
+  const response = await fetch(url);
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    console.error('[API] getPassStealProbabilities failed:', response.status, response.statusText, text);
+    throw new Error(`Failed to get pass steal probabilities: ${response.statusText}`);
+  }
+  const json = await response.json();
+  console.log('[API] getPassStealProbabilities ←', json);
   return json;
 };
 
@@ -164,11 +182,15 @@ export async function getPhiLog() {
   return response.json();
 }
 
-export async function runEvaluation(numEpisodes = 100, deterministic = false) {
+export async function runEvaluation(numEpisodes = 100, playerDeterministic = false, opponentDeterministic = true) {
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ num_episodes: numEpisodes, deterministic }),
+    body: JSON.stringify({ 
+      num_episodes: numEpisodes, 
+      player_deterministic: playerDeterministic,
+      opponent_deterministic: opponentDeterministic
+    }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));

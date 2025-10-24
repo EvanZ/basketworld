@@ -1,11 +1,11 @@
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -31,10 +31,22 @@ const phiRef = vueRef(null);
 
 // AI Mode for pre-selecting actions, not automatic play
 const aiMode = ref(true);
-const deterministic = ref(false);
+const playerDeterministic = ref(false);
+const opponentDeterministic = ref(true);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
+
+// Current shot clock for highlighting in moves table
+const currentShotClock = computed(() => {
+  if (!gameState.value || gameState.value.shot_clock === undefined) {
+    return null;
+  }
+  // Highlight the row with actions for the CURRENT board state
+  // Board shows post-action, so highlight matching board value
+  // (which represents the next actions to be taken)
+  return gameState.value.shot_clock;
+});
 
 // Evaluation mode state
 const isEvaluating = ref(false);
@@ -128,6 +140,7 @@ async function handleGameStarted(setupData) {
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
+      // Don't create an initial row - wait for first actions
     } else {
       throw new Error(response.message || 'Failed to start game.');
     }
@@ -143,10 +156,40 @@ async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
   // No loading indicator for steps, feels more responsive
   try {
-    const response = await stepGame(actions, deterministic.value);
+    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value);
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
+      
+      // Update the last move with action results and shot clock BEFORE action
+      if (moveHistory.value.length > 0) {
+        const lastMove = moveHistory.value[moveHistory.value.length - 1];
+        if (response.state.last_action_results) {
+          lastMove.actionResults = response.state.last_action_results;
+        }
+        // Store shot clock when action was decided (before execution): board + 1
+        if (response.state.shot_clock !== undefined) {
+          lastMove.shotClock = response.state.shot_clock + 1;
+        }
+      }
+      
+      // If game is done, add an END row
+      if (response.state.done && moveHistory.value.length > 0) {
+        const userTeamIds = response.state.offense_ids?.includes(0) 
+          ? response.state.offense_ids 
+          : response.state.defense_ids;
+        const endMoves = {};
+        userTeamIds.forEach(pid => {
+          endMoves[`Player ${pid}`] = 'END';
+        });
+        moveHistory.value.push({
+          turn: moveHistory.value.length + 1,
+          moves: endMoves,
+          shotClock: response.state.shot_clock,
+          isEndRow: true
+        });
+      }
+      
       try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
     } else {
       throw new Error(response.message || 'Failed to process step.');
@@ -157,8 +200,24 @@ async function handleActionsSubmitted(actions) {
   }
 }
 
-function handleMoveRecorded(moveData) {
+async function handleMoveRecorded(moveData) {
     console.log('[App] Recording move:', moveData);
+    
+    // Capture ball holder before the action is taken
+    if (gameState.value && gameState.value.ball_holder !== undefined) {
+        moveData.ballHolder = gameState.value.ball_holder;
+    }
+    
+    // Fetch pass steal probabilities before the action is taken
+    try {
+        const passStealProbs = await getPassStealProbabilities();
+        moveData.passStealProbabilities = passStealProbs;
+        console.log('[App] Added pass steal probs to move:', passStealProbs);
+    } catch (err) {
+        console.warn('[App] Failed to fetch pass steal probs for move:', err);
+        moveData.passStealProbabilities = {};
+    }
+    
     moveHistory.value.push(moveData);
 }
 
@@ -231,7 +290,7 @@ async function handleSelfPlay(preselected = null) {
           if (Array.isArray(probs) && Array.isArray(actionMask)) {
             let selectedActionIndex = 0;
             
-            if (deterministic.value) {
+            if (playerDeterministic.value) {
               // Deterministic: Pick action with highest probability (argmax) among LEGAL actions only
               let bestProb = -1;
               
@@ -301,16 +360,58 @@ async function handleSelfPlay(preselected = null) {
         // Update UI tabs to mirror applied actions
         currentSelections.value = appliedSelections;
         
+        // Capture ball holder before the action is taken
+        const ballHolder = gameState.value?.ball_holder;
+        
+        // Fetch pass steal probabilities before the action is taken
+        let passStealProbs = {};
+        try {
+          passStealProbs = await getPassStealProbabilities();
+        } catch (err) {
+          console.warn('[App Self-play] Failed to fetch pass steal probs:', err);
+        }
+        
         moveHistory.value.push({
           turn: currentTurn,
-          moves: teamMoves
+          moves: teamMoves,
+          ballHolder: ballHolder,
+          passStealProbabilities: passStealProbs
         });
       }
       
-      const response = await stepGame(aiActions, deterministic.value);
+      const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value);
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(response.state);
+        
+        // Update the last move with action results and shot clock BEFORE action
+        if (moveHistory.value.length > 0) {
+          const lastMove = moveHistory.value[moveHistory.value.length - 1];
+          if (response.state.last_action_results) {
+            lastMove.actionResults = response.state.last_action_results;
+          }
+          // Store shot clock when action was decided (before execution): board + 1
+          if (response.state.shot_clock !== undefined) {
+            lastMove.shotClock = response.state.shot_clock + 1;
+          }
+        }
+        
+        // If game is done, add an END row
+        if (response.state.done && moveHistory.value.length > 0) {
+          const userTeamIds = response.state.offense_ids?.includes(0) 
+            ? response.state.offense_ids 
+            : response.state.defense_ids;
+          const endMoves = {};
+          userTeamIds.forEach(pid => {
+            endMoves[`Player ${pid}`] = 'END';
+          });
+          moveHistory.value.push({
+            turn: moveHistory.value.length + 1,
+            moves: endMoves,
+            shotClock: response.state.shot_clock,
+            isEndRow: true
+          });
+        }
         try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
         // Small delay to make the progression visible
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -348,10 +449,10 @@ async function handleEvaluation() {
   await nextTick();
   
   try {
-    console.log(`[App] Starting evaluation: ${numEpisodes} episodes, deterministic=${deterministic.value}`);
+    console.log(`[App] Starting evaluation: ${numEpisodes} episodes, playerDeterministic=${playerDeterministic.value}, opponentDeterministic=${opponentDeterministic.value}`);
     
     // Run evaluation on backend (this will block until all episodes complete)
-    const response = await runEvaluation(numEpisodes, deterministic.value);
+    const response = await runEvaluation(numEpisodes, playerDeterministic.value, opponentDeterministic.value);
     
     if (response.status === 'success' && Array.isArray(response.results)) {
       console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
@@ -622,9 +723,13 @@ onBeforeUnmount(() => {
         <font-awesome-icon :icon="aiMode ? ['fas','toggle-on'] : ['fas','toggle-off']" />
         <span class="toggle-label">AI Mode</span>
       </button>
-      <button class="toggle-btn" @click="deterministic = !deterministic" :disabled="!aiMode">
-        <font-awesome-icon :icon="deterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-        <span class="toggle-label">Deterministic</span>
+      <button class="toggle-btn" @click="playerDeterministic = !playerDeterministic" :disabled="!aiMode">
+        <font-awesome-icon :icon="playerDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+        <span class="toggle-label">Player Deterministic</span>
+      </button>
+      <button class="toggle-btn" @click="opponentDeterministic = !opponentDeterministic" :disabled="!aiMode">
+        <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+        <span class="toggle-label">Opponent Deterministic</span>
       </button>
     </div>
 
@@ -677,8 +782,9 @@ onBeforeUnmount(() => {
             :is-evaluating="isEvaluating"
             :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
-            :deterministic="deterministic"
+            :deterministic="playerDeterministic"
             :move-history="moveHistory"
+            :current-shot-clock="currentShotClock"
             :external-selections="isSelfPlaying ? currentSelections : null"
             @actions-submitted="handleActionsSubmitted" 
             @move-recorded="handleMoveRecorded"

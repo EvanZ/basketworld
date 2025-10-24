@@ -87,6 +87,11 @@ const basketPosition = computed(() => {
     return axialToCartesian(q, r);
 });
 
+// Board transform - no flip needed, render as-is
+const boardTransform = computed(() => {
+  return '';
+});
+
 const threePointSegments = computed(() => {
   const segs = [];
   const gs = currentGameState.value;
@@ -106,6 +111,16 @@ const threePointSegments = computed(() => {
     }
   }
   return segs;
+});
+
+const offensiveLaneHexes = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || !gs.offensive_three_seconds_enabled || !gs.offensive_lane_hexes) return [];
+  
+  return gs.offensive_lane_hexes.map(([q, r]) => {
+    const { x, y } = axialToCartesian(q, r);
+    return { x, y, key: `lane-${q},${r}` };
+  });
 });
 
 const viewBox = computed(() => {
@@ -252,6 +267,16 @@ const episodeOutcome = computed(() => {
         };
     }
 
+    // Check for defensive lane violations
+    if (results.defensive_lane_violations && results.defensive_lane_violations.length > 0) {
+        const violation = results.defensive_lane_violations[0];
+        if (violation.position) {
+            const { x, y } = axialToCartesian(violation.position[0], violation.position[1]);
+            return { type: 'DEFENSIVE_VIOLATION', x, y, playerId: violation.player_id };
+        }
+        return { type: 'DEFENSIVE_VIOLATION' };
+    }
+
     // Check for turnover results
     let allTurnovers = results.turnovers ? [...results.turnovers] : [];
     if (results.passes) {
@@ -356,6 +381,23 @@ const playerTransitions = computed(() => {
             return `${xPoint},${yPoint}`;
           }).join(' ')"
           class="court-hex"
+        />
+
+        <!-- Offensive Lane (painted area) -->
+        <polygon
+          v-for="hex in offensiveLaneHexes"
+          :key="hex.key"
+          :points="[...Array(6)].map((_, i) => {
+            const angle_deg = 60 * i + 30;
+            const angle_rad = Math.PI / 180 * angle_deg;
+            const xPoint = hex.x + HEX_RADIUS * Math.cos(angle_rad);
+            const yPoint = hex.y + HEX_RADIUS * Math.sin(angle_rad);
+            return `${xPoint},${yPoint}`;
+          }).join(' ')"
+          fill="rgba(255, 100, 100, 0.15)"
+          stroke="rgba(255, 100, 100, 0.3)"
+          stroke-width="1"
+          class="offensive-lane"
         />
 
         <!-- 3PT line: red outlines on hexes at exactly the 3PT distance -->
@@ -506,6 +548,9 @@ const playerTransitions = computed(() => {
 
             <!-- Turnover 'X' -->
             <text v-if="episodeOutcome.type === 'TURNOVER'" :x="episodeOutcome.x" :y="episodeOutcome.y" class="turnover-x">X</text>
+            
+            <!-- Defensive Violation indicator -->
+            <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker">!</text>
         </g>
       </g>
 
@@ -521,6 +566,10 @@ const playerTransitions = computed(() => {
           </text>
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
           <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>
+          <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation long-outcome-text">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan x="50%" dy="1.2em">Violation - Defense!</tspan>
+          </text>
       </g>
 
       <!-- MLflow Run ID label (top-left) -->
@@ -672,6 +721,14 @@ svg {
     dominant-baseline: central;
     transform: scale(1, -1); /* Counteract the group flip */
 }
+.violation-marker {
+    font-size: 48px;
+    fill: orange;
+    font-weight: bold;
+    text-anchor: middle;
+    dominant-baseline: central;
+    transform: scale(1, -1); /* Counteract the group flip */
+}
 .outcome-text-group {
     pointer-events: none; /* Make it non-interactive */
 }
@@ -692,6 +749,7 @@ svg {
 .made { fill: lightgreen; }
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
+.violation { fill: orange; }
 </style>
 
 <style scoped>

@@ -159,6 +159,8 @@ class MLflowCallback(BaseCallback):
                 turnover_pass_oob_pct = mean_key("turnover_pass_oob")
                 turnover_intercepted_pct = mean_key("turnover_intercepted")
                 turnover_pressure_pct = mean_key("turnover_pressure")
+                turnover_offensive_lane_pct = mean_key("turnover_offensive_lane")
+                defensive_lane_violation_pct = mean_key("defensive_lane_violation")
 
                 def mean_ppp(default: float = 0.0):
                     numer = []
@@ -255,6 +257,16 @@ class MLflowCallback(BaseCallback):
                 mlflow.log_metric(
                     f"{self.team_name} Turnover Pressure",
                     turnover_pressure_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} 3-Second Violation",
+                    turnover_offensive_lane_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Illegal Defense Violation",
+                    defensive_lane_violation_pct,
                     step=global_step,
                 )
                 mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)

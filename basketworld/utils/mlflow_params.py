@@ -105,6 +105,12 @@ def get_mlflow_params(
         float,
         0.05,
     )
+    optional["defender_pressure_decay_lambda"] = _get_param(
+        params,
+        ["defender_pressure_decay_lambda", "defender-pressure-decay-lambda"],
+        float,
+        1.0,
+    )
     # Minimum randomized shot clock at reset
     optional["min_shot_clock"] = _get_param(params, ["min_shot_clock"], int, 10)
     optional["mask_occupied_moves"] = _get_param(
@@ -113,14 +119,47 @@ def get_mlflow_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
+    # 3-second violation parameters (shared between offense and defense)
+    optional["three_second_lane_width"] = _get_param(
+        params,
+        [
+            "three_second_lane_width",
+            "three-second-lane-width",
+            "offensive_three_second_lane_width",  # old name for backward compat
+            "offensive-three-second-lane-width",
+        ],
+        int,
+        1,
+    )
+    optional["three_second_max_steps"] = _get_param(
+        params,
+        [
+            "three_second_max_steps",
+            "three-second-max-steps",
+            "illegal_defense_max_steps",  # old name for backward compat
+            "illegal-defense-max-steps",
+            "offensive_three_second_max_steps",  # old name for backward compat
+            "offensive-three-second-max-steps",
+        ],
+        int,
+        3,
+    )
     optional["illegal_defense_enabled"] = _get_param(
         params,
         ["illegal_defense_enabled", "illegal-defense-enabled"],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
-    optional["illegal_defense_max_steps"] = _get_param(
-        params, ["illegal_defense_max_steps", "illegal-defense-max-steps"], int, 3
+    optional["offensive_three_seconds_enabled"] = _get_param(
+        params,
+        [
+            "offensive_three_seconds_enabled",
+            "offensive-three-seconds-enabled",
+            "offensive_three_seconds",  # CLI flag name
+            "offensive-three-seconds",
+        ],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
     )
 
     # Observation controls (optional; used by backend/main.py)
@@ -198,6 +237,9 @@ def get_mlflow_params(
     )
     optional["steal_distance_factor"] = _get_param(
         params, ["steal_distance_factor", "steal-distance-factor"], float, 0.08
+    )
+    optional["steal_position_weight_min"] = _get_param(
+        params, ["steal_position_weight_min", "steal-position-weight-min"], float, 0.3
     )
     # Pass parameters
     optional["pass_arc_degrees"] = _get_param(

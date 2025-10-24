@@ -43,7 +43,12 @@ Only defenders that meet ALL of these criteria are evaluated:
 For each eligible defender, the steal contribution is calculated using:
 
 ```
-steal_contribution = base_steal_rate × exp(-steal_perp_decay × perp_distance) × (1 + steal_distance_factor × pass_distance)
+steal_contribution = base_steal_rate × 
+                     exp(-steal_perp_decay × perp_distance) × 
+                     (1 + steal_distance_factor × pass_distance) ×
+                     position_weight
+
+where position_weight = steal_position_weight_min + (1 - steal_position_weight_min) × position_t
 ```
 
 Where:
@@ -52,10 +57,14 @@ Where:
 - `steal_perp_decay` - Exponential decay rate (default: 1.5)
 - `pass_distance` - Total distance between passer and receiver in hex units
 - `steal_distance_factor` - Linear factor for distance effect (default: 0.08)
+- `position_t` - Position along pass line where 0.0 = at passer, 1.0 = at receiver
+- `steal_position_weight_min` - Minimum weight for defenders near passer (default: 0.3)
 
 **Key insights**: 
 - The 180° arc filter ensures only defenders in the forward hemisphere are considered (defenders behind cannot intercept)
 - The exponential decay with perpendicular distance means defenders far from the pass line contribute negligibly
+- Position weighting makes defenders near the receiver more dangerous than those near the passer
+- With default `steal_position_weight_min=0.3`, defenders near the passer have 30% effectiveness while those near the receiver have 100%
 - This creates realistic passing lanes where positioning matters strategically
 
 #### Compounding Multiple Defenders
@@ -92,6 +101,7 @@ Otherwise:
 | `base_steal_rate` | 0.35 | Maximum steal probability when defender is directly on the pass line (perpendicular distance = 0) |
 | `steal_perp_decay` | 1.5 | Controls how quickly steal probability decays as defender moves perpendicular to pass line. Higher values = faster decay. |
 | `steal_distance_factor` | 0.08 | Linear increase in steal chance per hex of pass distance. e.g., 0.08 means 8% additional chance per hex. |
+| `steal_position_weight_min` | 0.3 | Minimum steal effectiveness for defenders near the passer. Defenders near receiver have 100% effectiveness. Creates position-dependent danger. |
 
 ### Existing Pass Parameters (Unchanged)
 
@@ -182,35 +192,64 @@ Defender: (4, 0) [on line, pass_distance = 8]
 
 Calculation:
 - perp_distance = 0
-- steal_contrib = 0.35 × exp(0) × (1 + 0.08 × 8)
-                = 0.35 × 1.0 × 1.64
-                = 0.574 (57.4%)
+- position_t = 4/8 = 0.5 (midpoint)
+- position_weight = 0.3 + (1 - 0.3) × 0.5 = 0.65
+- steal_contrib = 0.35 × exp(0) × (1 + 0.08 × 8) × 0.65
+                = 0.35 × 1.0 × 1.64 × 0.65
+                = 0.373 (37.3%)
 
-Result: 57.4% chance of interception (vs 46% for distance 4)
+Result: 37.3% chance of interception (reduced from 57% without position weighting)
+```
+
+### Scenario 6: Position Weight Effect
+```
+Same setup: Passer (0,0), Receiver (6,0), Defender on line
+
+Defender at (1, 0): [near passer]
+- position_t = 1/6 ≈ 0.17
+- position_weight = 0.3 + 0.7 × 0.17 = 0.42 (42% effectiveness)
+- steal_contrib ≈ 20%
+
+Defender at (3, 0): [midpoint]  
+- position_t = 3/6 = 0.50
+- position_weight = 0.3 + 0.7 × 0.50 = 0.65 (65% effectiveness)
+- steal_contrib ≈ 30%
+
+Defender at (5, 0): [near receiver]
+- position_t = 5/6 ≈ 0.83
+- position_weight = 0.3 + 0.7 × 0.83 = 0.88 (88% effectiveness)
+- steal_contrib ≈ 41%
+
+Result: Defenders closer to receiver are significantly more dangerous
 ```
 
 ## Steal Probability Reference Table
 
-With default parameters (`base_steal_rate=0.35`, `steal_perp_decay=1.5`, `steal_distance_factor=0.08`):
+With default parameters (`base_steal_rate=0.35`, `steal_perp_decay=1.5`, `steal_distance_factor=0.08`, `steal_position_weight_min=0.3`):
+
+**Note**: These values assume defender at midpoint (position_t=0.5, position_weight=0.65). Multiply by ~0.65 for defenders near passer, or by ~1.5 for defenders near receiver.
 
 | Perpendicular Distance | Pass Distance 2 | Pass Distance 4 | Pass Distance 6 | Pass Distance 8 |
 |------------------------|-----------------|-----------------|-----------------|-----------------|
-| 0.0 (on line)          | 40.9%           | 46.2%           | 51.5%           | 57.4%           |
-| 0.5                    | 26.9%           | 30.4%           | 33.9%           | 37.8%           |
-| 1.0                    | 9.1%            | 10.3%           | 11.5%           | 12.8%           |
-| 1.5                    | 3.1%            | 3.5%            | 3.9%            | 4.3%            |
-| 2.0                    | 1.0%            | 1.2%            | 1.3%            | 1.5%            |
+| 0.0 (on line)          | 26.4%           | 30.0%           | 33.7%           | 37.3%           |
+| 0.5                    | 17.4%           | 19.8%           | 22.2%           | 24.6%           |
+| 1.0                    | 5.9%            | 6.7%            | 7.5%            | 8.3%            |
+| 1.5                    | 2.0%            | 2.3%            | 2.5%            | 2.8%            |
+| 2.0                    | 0.7%            | 0.8%            | 0.8%            | 0.9%            |
 
 **Key observations**:
+- Values shown for defender at midpoint (position_weight=0.65)
+- For defenders near passer: multiply by ~0.65 (e.g., 30% → 20%)
+- For defenders near receiver: multiply by ~1.35 (e.g., 30% → 41%)
 - Steal probability drops dramatically as defenders move away from the pass line
 - Longer passes are consistently riskier
-- Defenders more than 2 hexes from the line have minimal impact (<2%)
+- Defenders more than 2 hexes from the line have minimal impact (<1%)
 
 ## Implementation Details
 
 ### Geometry Helper Methods
 
-Two new helper methods handle the geometric calculations:
+Three helper methods handle the geometric calculations:
 
 #### `_point_to_line_distance(point, line_start, line_end) -> float`
 Calculates the perpendicular distance from a point to a line segment in Cartesian space.
@@ -222,6 +261,20 @@ Calculates the perpendicular distance from a point to a line segment in Cartesia
 4. Calculate distance from point to closest point on segment
 
 **Returns**: Distance in Cartesian units (corresponding to hexagon geometry)
+
+#### `_get_position_on_line(point, line_start, line_end) -> float`
+Calculates the position parameter t of a point's projection onto a line.
+
+**Algorithm**:
+1. Convert axial coordinates to Cartesian
+2. Project point onto line: `t = [(P-S) · (E-S)] / |E-S|²`
+3. Return t without clamping
+
+**Returns**: Position parameter where:
+- `t = 0.0` means projection is at line_start (passer)
+- `t = 1.0` means projection is at line_end (receiver)
+- `0 < t < 1` means projection is between start and end
+- Used for position weighting in steal calculations
 
 #### `_is_between_points(point, line_start, line_end) -> bool`
 Checks if a point's projection onto the line falls between the start and end points.
@@ -247,7 +300,8 @@ The `results["passes"][passer_id]` dictionary now includes:
         {
             "id": int,                  # Defender ID
             "steal_contribution": float, # Individual steal probability
-            "perp_distance": float      # Distance from pass line
+            "perp_distance": float,     # Distance from pass line
+            "position_on_line": float   # Position along line (0=passer, 1=receiver)
         },
         ...
     ],
@@ -532,6 +586,13 @@ However, we **recommend using the new defaults** for more realistic gameplay.
   - `readmes/observation_space.md` - How pass results affect observations
 
 ## Changelog
+
+- **2025-10-23**: Added position-based steal weighting
+  - Added `steal_position_weight_min` parameter (default: 0.3)
+  - Defenders closer to receiver are now more dangerous than those near passer
+  - Added `_get_position_on_line()` helper method to calculate defender position
+  - Updated pass results tracking to include `position_on_line` field
+  - Updated all integration points and documentation
 
 - **2025-10-16**: Initial implementation of line-of-sight based passing
   - Added `base_steal_rate`, `steal_perp_decay`, `steal_distance_factor` parameters

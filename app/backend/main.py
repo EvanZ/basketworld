@@ -95,7 +95,8 @@ class ActionRequest(BaseModel):
     actions: dict[
         str, int
     ]  # JSON keys are strings, so we accept strings and convert later.
-    deterministic: bool | None = None
+    player_deterministic: bool | None = None
+    opponent_deterministic: bool | None = None
 
 
 # --- FastAPI App ---
@@ -288,8 +289,10 @@ async def init_game(request: InitGameRequest):
             frame = game_state.env.render()
             if frame is not None:
                 game_state.frames.append(frame)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to capture initial frame: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Record initial state for replay (manual or self-play) with policy probs
         initial_state = get_full_game_state(include_policy_probs=True)
@@ -457,11 +460,15 @@ def take_step(request: ActionRequest):
     # Get AI actions (unified-only)
     ai_obs = game_state.obs
     # Default to deterministic=True if not provided to preserve previous behavior
-    pred_deterministic = (
-        True if request.deterministic is None else bool(request.deterministic)
+    player_deterministic = (
+        True if request.player_deterministic is None else bool(request.player_deterministic)
     )
+    opponent_deterministic = (
+        True if request.opponent_deterministic is None else bool(request.opponent_deterministic)
+    )
+    
     full_action_ai, _ = game_state.unified_policy.predict(
-        ai_obs, deterministic=pred_deterministic
+        ai_obs, deterministic=player_deterministic
     )
     full_action_ai_opponent = None
     if game_state.defense_policy is not None:
@@ -480,7 +487,7 @@ def take_step(request: ActionRequest):
             except Exception:
                 opp_obs = ai_obs
             full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                opp_obs, deterministic=True
+                opp_obs, deterministic=opponent_deterministic
             )
         except Exception:
             full_action_ai_opponent = None
@@ -495,22 +502,27 @@ def take_step(request: ActionRequest):
     )
     player_team_strategy = (
         IllegalActionStrategy.BEST_PROB
-        if pred_deterministic
+        if player_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    opponent_team_strategy = (
+        IllegalActionStrategy.BEST_PROB
+        if opponent_deterministic
         else IllegalActionStrategy.SAMPLE_PROB
     )
     resolved_unified = resolve_illegal_actions(
         np.array(full_action_ai),
         action_mask,
         player_team_strategy,
-        pred_deterministic,
+        player_deterministic,
         unified_probs,
     )
     resolved_opponent = (
         resolve_illegal_actions(
             np.array(full_action_ai_opponent),
             action_mask,
-            IllegalActionStrategy.BEST_PROB,
-            True,
+            opponent_team_strategy,
+            opponent_deterministic,
             opponent_probs,
         )
         if full_action_ai_opponent is not None
@@ -760,6 +772,7 @@ def take_step(request: ActionRequest):
             ),
             "offense_ids": list(game_state.env.offense_ids),
             "is_terminal": bool(done),
+            "shot_clock": int(game_state.env.shot_clock),  # Shot clock after action executed (when reward received)
         }
     )
 
@@ -805,8 +818,10 @@ def take_step(request: ActionRequest):
         frame = game_state.env.render()
         if frame is not None:
             game_state.frames.append(frame)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to capture frame at step {len(game_state.frames)}: {e}")
+        import traceback
+        traceback.print_exc()
     # Record resulting state for replay with policy probs
     try:
         game_state.episode_states.append(get_full_game_state(include_policy_probs=True))
@@ -946,7 +961,8 @@ def start_self_play():
 
 class EvaluationRequest(BaseModel):
     num_episodes: int = 100
-    deterministic: bool = True
+    player_deterministic: bool = True
+    opponent_deterministic: bool = True
 
 
 @app.post("/api/run_evaluation")
@@ -970,7 +986,8 @@ def run_evaluation(request: EvaluationRequest):
         )
 
     num_episodes = max(1, min(request.num_episodes, 10000))  # Cap at 10000 for safety
-    deterministic = request.deterministic
+    player_deterministic = request.player_deterministic
+    opponent_deterministic = request.opponent_deterministic
 
     episode_results = []
 
@@ -981,7 +998,8 @@ def run_evaluation(request: EvaluationRequest):
     # These values come from the environment initialized with MLflow parameters
     print(f"[Evaluation] Starting {num_episodes} episodes")
     print(f"[Evaluation] Configuration:")
-    print(f"  - Deterministic policy: {deterministic}")
+    print(f"  - Player deterministic: {player_deterministic}")
+    print(f"  - Opponent deterministic: {opponent_deterministic}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
     print(f"  - User team: {game_state.user_team.name}")
     print(f"  - Unified policy (user): {game_state.unified_policy_key}")
@@ -1030,7 +1048,7 @@ def run_evaluation(request: EvaluationRequest):
         while not done and step_count < 1000:  # Safety limit
             # Get AI actions for both teams
             full_action_ai, _ = game_state.unified_policy.predict(
-                obs, deterministic=deterministic
+                obs, deterministic=player_deterministic
             )
 
             # Calculate policy entropy for diagnostics
@@ -1060,7 +1078,7 @@ def run_evaluation(request: EvaluationRequest):
                     if opponent_obs.get("role_flag") is not None:
                         opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
                     full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                        opponent_obs, deterministic=True
+                        opponent_obs, deterministic=opponent_deterministic
                     )
                 except Exception:
                     full_action_ai_opponent = None
@@ -1080,7 +1098,12 @@ def run_evaluation(request: EvaluationRequest):
 
             player_team_strategy = (
                 IllegalActionStrategy.BEST_PROB
-                if deterministic
+                if player_deterministic
+                else IllegalActionStrategy.SAMPLE_PROB
+            )
+            opponent_team_strategy = (
+                IllegalActionStrategy.BEST_PROB
+                if opponent_deterministic
                 else IllegalActionStrategy.SAMPLE_PROB
             )
 
@@ -1088,7 +1111,7 @@ def run_evaluation(request: EvaluationRequest):
                 np.array(full_action_ai),
                 action_mask,
                 player_team_strategy,
-                deterministic,
+                player_deterministic,
                 unified_probs,
             )
 
@@ -1096,8 +1119,8 @@ def run_evaluation(request: EvaluationRequest):
                 resolved_opponent = resolve_illegal_actions(
                     np.array(full_action_ai_opponent),
                     action_mask,
-                    IllegalActionStrategy.BEST_PROB,
-                    True,
+                    opponent_team_strategy,
+                    opponent_deterministic,
                     opponent_probs,
                 )
             else:
@@ -1368,11 +1391,24 @@ def get_shot_stats():
     }
 
 
+@app.get("/api/debug/frames")
+def debug_frames():
+    """Debug endpoint to check frame capture status."""
+    return {
+        "frames_count": len(game_state.frames) if game_state.frames else 0,
+        "env_exists": game_state.env is not None,
+        "render_mode": getattr(game_state.env, "render_mode", None) if game_state.env else None,
+        "has_offensive_lane_hexes": hasattr(game_state.env, "offensive_lane_hexes") if game_state.env else False,
+    }
+
 @app.post("/api/save_episode")
 def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
+    print(f"[SAVE_EPISODE] Frames count: {len(game_state.frames)}")
+    print(f"[SAVE_EPISODE] Env exists: {game_state.env is not None}")
+    
     if not game_state.frames:
-        raise HTTPException(status_code=400, detail="No episode frames to save.")
+        raise HTTPException(status_code=400, detail=f"No episode frames to save. Frames list is empty (length: {len(game_state.frames) if game_state.frames else 0}).")
     # Determine directory using MLflow run_id if available
     base_dir = "episodes"
     if getattr(game_state, "run_id", None):
@@ -1563,6 +1599,11 @@ def get_action_values(player_id: int):
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
+    # Check if the episode has ended - if so, return empty values
+    if game_state.env.episode_ended:
+        print(f"[API] Episode has ended, returning empty action values for player {player_id}")
+        return jsonable_encoder({})
+
     print(f"\n[API] Received request for Q-values for player {player_id}")
     action_values = {}
 
@@ -1678,6 +1719,27 @@ def get_shot_probability(player_id: int):
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
+
+
+@app.get("/api/pass_steal_probabilities")
+def get_pass_steal_probabilities():
+    """Get steal probabilities for passes from ball handler to each teammate."""
+    if game_state.env is None:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    
+    # Check if there is a ball handler
+    if game_state.env.ball_holder is None:
+        return {}
+    
+    try:
+        steal_probs = game_state.env.calculate_pass_steal_probabilities(game_state.env.ball_holder)
+        # Convert numpy types to standard Python types
+        return {int(k): float(v) for k, v in steal_probs.items()}
+    except Exception as e:
+        print(f"[ERROR] Failed to calculate pass steal probabilities: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
 
 
 @app.get("/api/rewards")
@@ -1803,6 +1865,7 @@ def get_rewards():
         serialized_history.append(
             {
                 "step": 0,
+                "shot_clock": 24,  # Initial shot clock
                 "offense": 0.0,
                 "defense": 0.0,
                 "offense_reason": "Initial State",
@@ -1840,6 +1903,7 @@ def get_rewards():
         serialized_history.append(
             {
                 "step": int(reward["step"]),
+                "shot_clock": int(reward.get("shot_clock", 0)),  # Shot clock after action executed
                 "offense": float(offense_with_mlflow),  # With MLflow phi shaping
                 "defense": float(defense_with_mlflow),  # With MLflow phi shaping
                 "offense_reason": reward.get("offense_reason", "Unknown"),
@@ -2053,9 +2117,13 @@ def get_full_game_state(include_policy_probs=False):
         "defender_pressure_turnover_chance": float(
             getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)
         ),
+        "defender_pressure_decay_lambda": float(
+            getattr(game_state.env, "defender_pressure_decay_lambda", 1.0)
+        ),
         "base_steal_rate": float(getattr(game_state.env, "base_steal_rate", 0.35)),
         "steal_perp_decay": float(getattr(game_state.env, "steal_perp_decay", 1.5)),
         "steal_distance_factor": float(getattr(game_state.env, "steal_distance_factor", 0.08)),
+        "steal_position_weight_min": float(getattr(game_state.env, "steal_position_weight_min", 0.3)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
         "max_spawn_distance": (
             int(getattr(game_state.env, "max_spawn_distance", None))
@@ -2075,12 +2143,37 @@ def get_full_game_state(include_policy_probs=False):
         "mask_occupied_moves": bool(
             getattr(game_state.env, "mask_occupied_moves", False)
         ),
+        # 3-second violation rules (shared configuration)
+        "three_second_lane_width": int(
+            getattr(game_state.env, "three_second_lane_width", 1)
+        ),
+        "three_second_max_steps": int(
+            getattr(game_state.env, "three_second_max_steps", 3)
+        ),
         "illegal_defense_enabled": bool(
             getattr(game_state.env, "illegal_defense_enabled", False)
         ),
-        "illegal_defense_max_steps": int(
-            getattr(game_state.env, "illegal_defense_max_steps", 3)
+        "offensive_three_seconds_enabled": bool(
+            getattr(game_state.env, "offensive_three_seconds_enabled", False)
         ),
+        # Lane hexes for visualization (convert set to list of tuples)
+        "offensive_lane_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "offensive_lane_hexes", set())
+        ],
+        "defensive_lane_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "defensive_lane_hexes", set())
+        ],
+        # Lane step counts for all players
+        "offensive_lane_steps": {
+            int(pid): int(steps)
+            for pid, steps in getattr(game_state.env, "_offensive_lane_steps", {}).items()
+        },
+        "defensive_lane_steps": {
+            int(pid): int(steps)
+            for pid, steps in getattr(game_state.env, "_defender_in_key_steps", {}).items()
+        },
         # Pass parameters
         "pass_arc_degrees": float(getattr(game_state.env, "pass_arc_degrees", 60.0)),
         "pass_oob_turnover_prob": float(

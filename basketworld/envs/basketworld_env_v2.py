@@ -81,10 +81,12 @@ class HexagonBasketballEnv(gym.Env):
         render_mode: Optional[str] = None,
         defender_pressure_distance: int = 1,
         defender_pressure_turnover_chance: float = 0.05,
+        defender_pressure_decay_lambda: float = 1.0,  # Exponential decay rate for pressure
         # Realistic passing steal parameters
         base_steal_rate: float = 0.35,
         steal_perp_decay: float = 1.5,
         steal_distance_factor: float = 0.08,
+        steal_position_weight_min: float = 0.3,
         three_point_distance: int = 4,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
@@ -95,9 +97,13 @@ class HexagonBasketballEnv(gym.Env):
         allow_dunks: bool = False,
         dunk_pct: float = 0.90,
         dunk_std: float = 0.0,
+        # 3-second violation controls (shared lane configuration)
+        three_second_lane_width: int = 1,
+        three_second_max_steps: int = 3,
         # Illegal defense (3-in-the-key) controls
         illegal_defense_enabled: bool = True,
-        illegal_defense_max_steps: int = 3,
+        # Offensive 3-second violation controls
+        offensive_three_seconds_enabled: bool = False,
         # Shot pressure parameters
         shot_pressure_enabled: bool = True,
         shot_pressure_max: float = 0.5,  # max reduction at distance=1 (multiplier = 1 - max)
@@ -167,10 +173,12 @@ class HexagonBasketballEnv(gym.Env):
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
+        self.defender_pressure_decay_lambda = defender_pressure_decay_lambda
         # Realistic passing steal parameters
         self.base_steal_rate = base_steal_rate
         self.steal_perp_decay = steal_perp_decay
         self.steal_distance_factor = steal_distance_factor
+        self.steal_position_weight_min = steal_position_weight_min
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
         self.use_egocentric_obs = bool(use_egocentric_obs)
@@ -220,10 +228,16 @@ class HexagonBasketballEnv(gym.Env):
         basket_col = 0
         basket_row = self.court_height // 2
         self.basket_position = self._offset_to_axial(basket_col, basket_row)
-        # Illegal defense configuration
+        # Shared 3-second violation configuration (used by both offense and defense)
+        self.three_second_lane_width = int(three_second_lane_width)
+        self.three_second_max_steps = int(three_second_max_steps)
+        
+        # Illegal defense (defensive 3-second) configuration
         self.illegal_defense_enabled = bool(illegal_defense_enabled)
-        self.illegal_defense_max_steps = int(illegal_defense_max_steps)
-
+        
+        # Offensive 3-second violation configuration
+        self.offensive_three_seconds_enabled = bool(offensive_three_seconds_enabled)
+        
         # Total players
         self.n_players = self.players_per_side * 2
         self.offense_ids = list(range(self.players_per_side))
@@ -239,8 +253,9 @@ class HexagonBasketballEnv(gym.Env):
         # Observation length depends on configuration flags
         # Role flag moved to separate observation key `role_flag` (Box shape=(1,))
         # +players_per_side for per-offense nearest-defender distances
+        # +n_players for lane step counts (both offensive and defensive players)
         # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
-        base_len = (self.n_players * 2) + self.n_players + 1 + self.players_per_side
+        base_len = (self.n_players * 2) + self.n_players + 1 + self.players_per_side + self.n_players
         hoop_extra = 2 if self.include_hoop_vector else 0
         state_space = spaces.Box(
             low=-np.inf,
@@ -323,6 +338,17 @@ class HexagonBasketballEnv(gym.Env):
         self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [
             a.value for a in ActionType if "PASS" in a.name
         ]
+        
+        # Calculate lane hexes for offensive and defensive 3-second rules
+        if self.offensive_three_seconds_enabled:
+            self.offensive_lane_hexes = self._calculate_offensive_lane_hexes()
+        else:
+            self.offensive_lane_hexes = set()
+        
+        if self.illegal_defense_enabled:
+            self.defensive_lane_hexes = self._calculate_defensive_lane_hexes()
+        else:
+            self.defensive_lane_hexes = set()
 
         # --- Reward parameters (stored on env for evaluation compatibility) ---
         self.pass_reward: float = float(pass_reward)
@@ -467,6 +493,44 @@ class HexagonBasketballEnv(gym.Env):
         # Return distance from point to closest point on line
         return math.hypot(px - closest_x, py - closest_y)
 
+    def _get_position_on_line(
+        self,
+        point: Tuple[int, int],
+        line_start: Tuple[int, int],
+        line_end: Tuple[int, int]
+    ) -> float:
+        """
+        Get the position parameter t of a point's projection onto a line.
+        
+        Args:
+            point: The point to project (axial coords)
+            line_start: Start of line segment (axial coords)
+            line_end: End of line segment (axial coords)
+            
+        Returns:
+            Position parameter t where:
+            - t = 0.0 means projection is at line_start
+            - t = 1.0 means projection is at line_end
+            - 0 < t < 1 means projection is between start and end
+        """
+        # Convert to Cartesian
+        px, py = self._axial_to_cartesian(point[0], point[1])
+        sx, sy = self._axial_to_cartesian(line_start[0], line_start[1])
+        ex, ey = self._axial_to_cartesian(line_end[0], line_end[1])
+        
+        # Vector from start to end
+        dx = ex - sx
+        dy = ey - sy
+        line_length_sq = dx * dx + dy * dy
+        
+        if line_length_sq == 0:
+            # Line has no length
+            return 0.0
+        
+        # Project point onto line: t = [(P-S) · (E-S)] / |E-S|²
+        t = ((px - sx) * dx + (py - sy) * dy) / line_length_sq
+        return t
+
     def _is_between_points(
         self,
         point: Tuple[int, int],
@@ -484,23 +548,7 @@ class HexagonBasketballEnv(gym.Env):
         Returns:
             True if point projects onto the line segment (not just the infinite line)
         """
-        # Convert to Cartesian
-        px, py = self._axial_to_cartesian(point[0], point[1])
-        sx, sy = self._axial_to_cartesian(line_start[0], line_start[1])
-        ex, ey = self._axial_to_cartesian(line_end[0], line_end[1])
-        
-        # Vector from start to end
-        dx = ex - sx
-        dy = ey - sy
-        line_length_sq = dx * dx + dy * dy
-        
-        if line_length_sq == 0:
-            # Line has no length - point is only "between" if it's at the same position
-            return False
-        
-        # Project point onto line: t = [(P-S) · (E-S)] / |E-S|²
-        t = ((px - sx) * dx + (py - sy) * dy) / line_length_sq
-        
+        t = self._get_position_on_line(point, line_start, line_end)
         # Point is between start and end if 0 < t < 1
         return 0.0 < t < 1.0
 
@@ -534,7 +582,12 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
+        # Track steps in lane for both offensive and defensive players
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
+        self._offensive_lane_steps = {pid: 0 for pid in range(self.n_players)}
+        # Initialize scores (for tracking defensive violations that award points)
+        self.offense_score = 0
+        self.defense_score = 0
         self._assist_candidate = None
         # Clear any pending external probabilities on reset
         self._pending_action_probs = None
@@ -615,109 +668,158 @@ class HexagonBasketballEnv(gym.Env):
             self._first_step_after_reset = False
 
         # --- Defender Pressure Mechanic ---
+        defender_pressure_info = []  # Track pressure info for display
         if self.ball_holder in self.offense_ids:
             ball_handler_pos = self.positions[self.ball_holder]
+            
+            # Calculate direction from ball handler to basket (assumed facing direction)
+            basket_dq = self.basket_position[0] - ball_handler_pos[0]
+            basket_dr = self.basket_position[1] - ball_handler_pos[1]
+            basket_x, basket_y = self._axial_to_cartesian(basket_dq, basket_dr)
+            basket_norm = math.hypot(basket_x, basket_y) or 1.0
+            
+            # First pass: calculate all defender pressures
             for defender_id in self.defense_ids:
                 defender_pos = self.positions[defender_id]
                 distance = self._hex_distance(ball_handler_pos, defender_pos)
 
+                # Only consider defenders within a reasonable pressure range
                 if distance <= self.defender_pressure_distance:
-                    # This defender is applying pressure. Roll for a turnover.
-                    if self._rng.random() < self.defender_pressure_turnover_chance:
-                        # Turnover occurs!
-                        turnover_results = {
-                            "turnovers": [
-                                {
-                                    "player_id": self.ball_holder,
-                                    "reason": "defender_pressure",
-                                    "stolen_by": defender_id,
-                                    "turnover_pos": ball_handler_pos,
-                                }
-                            ]
-                        }
-                        self.last_action_results = turnover_results
-                        self.ball_holder = defender_id  # Defender gets the ball
+                    # Check if defender is in front (180° arc toward basket)
+                    defender_dq = defender_pos[0] - ball_handler_pos[0]
+                    defender_dr = defender_pos[1] - ball_handler_pos[1]
+                    defender_x, defender_y = self._axial_to_cartesian(defender_dq, defender_dr)
+                    defender_vec_norm = math.hypot(defender_x, defender_y)
+                    
+                    if defender_vec_norm == 0:
+                        continue  # Defender at same position (shouldn't happen)
+                    
+                    # Dot product to check if defender is in front
+                    # cos(angle) >= 0 means angle is within [-90°, 90°] (180° arc)
+                    cos_angle = (defender_x * basket_x + defender_y * basket_y) / (defender_vec_norm * basket_norm)
+                    
+                    if cos_angle >= 0:  # Defender is in front
+                        # Calculate turnover probability with exponential decay
+                        # At distance=1 (adjacent), probability = baseline
+                        # As distance increases beyond 1, probability decays exponentially
+                        # Use (distance - 1) so that adjacent defenders get full baseline probability
+                        turnover_prob = self.defender_pressure_turnover_chance * math.exp(
+                            -self.defender_pressure_decay_lambda * max(0, distance - 1)
+                        )
+                        
+                        # Store pressure info for display
+                        defender_pressure_info.append({
+                            "defender_id": int(defender_id),
+                            "distance": int(distance),
+                            "turnover_prob": float(turnover_prob),
+                        })
+            
+            # Calculate total turnover probability (compound probability)
+            total_pressure_prob = 0.0
+            if defender_pressure_info:
+                complement_product = 1.0
+                for pressure in defender_pressure_info:
+                    complement_product *= (1.0 - pressure["turnover_prob"])
+                total_pressure_prob = 1.0 - complement_product
+            
+            # Second pass: check for turnovers
+            for pressure in defender_pressure_info:
+                if self._rng.random() < pressure["turnover_prob"]:
+                    # Turnover occurs!
+                    defender_id = pressure["defender_id"]
+                    turnover_results = {
+                        "turnovers": [
+                            {
+                                "player_id": self.ball_holder,
+                                "reason": "defender_pressure",
+                                "stolen_by": defender_id,
+                                "turnover_pos": ball_handler_pos,
+                            }
+                        ]
+                    }
+                    self.last_action_results = turnover_results
+                    self.ball_holder = defender_id  # Defender gets the ball
 
-                        done = True
-                        self.episode_ended = done
+                    done = True
+                    self.episode_ended = done
 
-                        obs = {
-                            "obs": self._get_observation(),
-                            "action_mask": self._get_action_masks(),
-                            "role_flag": np.array(
-                                [1.0 if self.training_team == Team.OFFENSE else 0.0],
-                                dtype=np.float32,
-                            ),
-                            "skills": self._get_offense_skills_array(),
-                        }
-                        info = {
-                            "training_team": self.training_team.name,
-                            "action_results": turnover_results,
-                            "shot_clock": self.shot_clock,
-                        }
+                    obs = {
+                        "obs": self._get_observation(),
+                        "action_mask": self._get_action_masks(),
+                        "role_flag": np.array(
+                            [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                            dtype=np.float32,
+                        ),
+                        "skills": self._get_offense_skills_array(),
+                    }
+                    info = {
+                        "training_team": self.training_team.name,
+                        "action_results": turnover_results,
+                        "shot_clock": self.shot_clock,
+                    }
 
-                        # Phi diagnostics and optional shaping on early turnover path
-                        if self.enable_phi_shaping:
-                            # Terminal step → define Phi(s')=0 to preserve policy invariance
-                            phi_next_term = 0.0
+                    # Phi diagnostics and optional shaping on early turnover path
+                    if self.enable_phi_shaping:
+                        # Terminal step → define Phi(s')=0 to preserve policy invariance
+                        phi_next_term = 0.0
 
-                            # Calculate phi shaping reward
-                            r_shape = float(self.reward_shaping_gamma) * float(
-                                phi_next_term
-                            ) - float(phi_prev if phi_prev is not None else 0.0)
-                            shaped = float(self.phi_beta) * float(r_shape)
-                            per_team = shaped / self.players_per_side
+                        # Calculate phi shaping reward
+                        r_shape = float(self.reward_shaping_gamma) * float(
+                            phi_next_term
+                        ) - float(phi_prev if phi_prev is not None else 0.0)
+                        shaped = float(self.phi_beta) * float(r_shape)
+                        per_team = shaped / self.players_per_side
 
-                            # Apply to actual rewards
-                            rewards[self.offense_ids] += per_team
-                            rewards[self.defense_ids] -= per_team
+                        # Apply to actual rewards
+                        rewards[self.offense_ids] += per_team
+                        rewards[self.defense_ids] -= per_team
 
-                            # Cache phi_next for next step (terminal, so it's 0.0)
-                            self._cached_phi = phi_next_term
+                        # Cache phi_next for next step (terminal, so it's 0.0)
+                        self._cached_phi = phi_next_term
 
-                            # Report the calculated value (for UI/logging)
-                            info["phi_r_shape"] = float(per_team)
-                            info["phi_prev"] = float(
-                                phi_prev if phi_prev is not None else 0.0
-                            )
-                            info["phi_next"] = float(phi_next_term)
-                            info["phi_beta"] = float(self.phi_beta)
-                        else:
-                            # Phi shaping disabled - provide zero values for Monitor compatibility
-                            info["phi_r_shape"] = 0.0
-                            info["phi_prev"] = 0.0
-                            info["phi_next"] = 0.0
-                            info["phi_beta"] = 0.0
-                            # Per-player EP breakdown for UI
-                            try:
-                                team_best, ball_ep = self._phi_ep_breakdown()
-                                info["phi_team_best_ep"] = float(team_best)
-                                info["phi_ball_handler_ep"] = float(ball_ep)
-                                # Add per-player EPs for accurate UI recalculation
-                                ep_by_player = []
-                                for pid in range(self.n_players):
-                                    pos = self.positions[pid]
-                                    dist = self._hex_distance(pos, self.basket_position)
-                                    shot_value = (
-                                        2.0
-                                        if (self.allow_dunks and dist == 0)
-                                        else (
-                                            3.0
-                                            if dist >= self.three_point_distance
-                                            else 2.0
-                                        )
+                        # Report the calculated value (for UI/logging)
+                        info["phi_r_shape"] = float(per_team)
+                        info["phi_prev"] = float(
+                            phi_prev if phi_prev is not None else 0.0
+                        )
+                        info["phi_next"] = float(phi_next_term)
+                        info["phi_beta"] = float(self.phi_beta)
+                    else:
+                        # Phi shaping disabled - provide zero values for Monitor compatibility
+                        info["phi_r_shape"] = 0.0
+                        info["phi_prev"] = 0.0
+                        info["phi_next"] = 0.0
+                        info["phi_beta"] = 0.0
+                        # Per-player EP breakdown for UI
+                        try:
+                            team_best, ball_ep = self._phi_ep_breakdown()
+                            info["phi_team_best_ep"] = float(team_best)
+                            info["phi_ball_handler_ep"] = float(ball_ep)
+                            # Add per-player EPs for accurate UI recalculation
+                            ep_by_player = []
+                            for pid in range(self.n_players):
+                                pos = self.positions[pid]
+                                dist = self._hex_distance(pos, self.basket_position)
+                                shot_value = (
+                                    2.0
+                                    if (self.allow_dunks and dist == 0)
+                                    else (
+                                        3.0
+                                        if dist >= self.three_point_distance
+                                        else 2.0
                                     )
-                                    p = float(
-                                        self._calculate_shot_probability(pid, dist)
-                                    )
-                                    ep_by_player.append(float(shot_value * p))
-                                info["phi_ep_by_player"] = ep_by_player
-                            except Exception:
-                                pass
+                                )
+                                p = float(
+                                    self._calculate_shot_probability(pid, dist)
+                                )
+                                ep_by_player.append(float(shot_value * p))
+                            info["phi_ep_by_player"] = ep_by_player
+                        except Exception:
+                            pass
 
-                        return obs, rewards, done, False, info
+                    return obs, rewards, done, False, info
 
-                    # break  # Only check the first defender applying pressure each step
+                # break  # Only check the first defender applying pressure each step
 
         actions = np.array(actions)
         # Resolve illegal actions according to configured policy
@@ -789,8 +891,39 @@ class HexagonBasketballEnv(gym.Env):
         # Process all actions simultaneously
         action_results = self._process_simultaneous_actions(actions)
         self.last_action_results = action_results
+        
+        # Add defender pressure info to action results
+        if defender_pressure_info and self.ball_holder in self.offense_ids:
+            action_results["defender_pressure"][self.ball_holder] = {
+                "defenders": defender_pressure_info,
+                "total_pressure_prob": total_pressure_prob,
+            }
 
-        # Check for episode termination and calculate rewards
+        # Update illegal defense counters based on resulting positions
+        # Defenders cannot camp in the full lane area (not just basket)
+        # Check for defensive 3-second violations BEFORE calculating rewards
+        if self.illegal_defense_enabled:
+            for did in self.defense_ids:
+                if self.positions and tuple(self.positions[did]) in self.defensive_lane_hexes:
+                    steps = self._defender_in_key_steps.get(did, 0) + 1
+                    self._defender_in_key_steps[did] = steps
+                    
+                    # If defender exceeds max steps, it's a violation
+                    if steps > self.three_second_max_steps:
+                        action_results["defensive_lane_violations"].append({
+                            "player_id": did,
+                            "steps": steps,
+                            "position": tuple(self.positions[did]),
+                        })
+                        # Award offense 1 point (like a technical free throw)
+                        self.offense_score += 1
+                        # Reset the counter to avoid repeated violations
+                        self._defender_in_key_steps[did] = 0
+                        break  # Only one violation per step
+                else:
+                    self._defender_in_key_steps[did] = 0
+
+        # Check for episode termination and calculate rewards (after checking violations)
         done, episode_rewards = self._check_termination_and_rewards(action_results)
         rewards += episode_rewards
 
@@ -799,18 +932,16 @@ class HexagonBasketballEnv(gym.Env):
             done = True
 
         self.episode_ended = done
-
-        # Update illegal defense counters based on resulting positions
-        if self.illegal_defense_enabled:
-            for did in self.defense_ids:
-                if self.positions and tuple(self.positions[did]) == tuple(
-                    self.basket_position
-                ):
-                    self._defender_in_key_steps[did] = (
-                        self._defender_in_key_steps.get(did, 0) + 1
+        
+        # Track offensive lane occupancy for offensive 3-second violations
+        if self.offensive_three_seconds_enabled:
+            for oid in self.offense_ids:
+                if self.positions and tuple(self.positions[oid]) in self.offensive_lane_hexes:
+                    self._offensive_lane_steps[oid] = (
+                        self._offensive_lane_steps.get(oid, 0) + 1
                     )
                 else:
-                    self._defender_in_key_steps[did] = 0
+                    self._offensive_lane_steps[oid] = 0
 
         # Clear per-step external probabilities after use to avoid reuse
         self._pending_action_probs = None
@@ -943,15 +1074,33 @@ class HexagonBasketballEnv(gym.Env):
                 if not self._has_teammate_in_pass_arc(self.ball_holder, dir_idx):
                     masks[self.ball_holder, pass_action_idx] = 0
 
-        # Enforce illegal defense: after max steps in basket, mask NOOP so defender must move
-        if self.illegal_defense_enabled and self.illegal_defense_max_steps > 0:
+        # Enforce illegal defense: after max steps in lane, mask NOOP so defender must move
+        # This now applies to the full lane area, not just the basket hex
+        if self.illegal_defense_enabled and self.three_second_max_steps > 0:
             for did in self.defense_ids:
                 if (
                     self._defender_in_key_steps.get(did, 0)
-                    >= self.illegal_defense_max_steps
+                    >= self.three_second_max_steps
                 ):
-                    if tuple(self.positions[did]) == tuple(self.basket_position):
+                    if tuple(self.positions[did]) in self.defensive_lane_hexes:
                         masks[did, ActionType.NOOP.value] = 0
+        
+        # Enforce offensive 3-second rule: after max steps in lane, must leave or shoot
+        if self.offensive_three_seconds_enabled and self.three_second_max_steps > 0:
+            for oid in self.offense_ids:
+                steps_in_lane = self._offensive_lane_steps.get(oid, 0)
+                in_lane = tuple(self.positions[oid]) in self.offensive_lane_hexes
+                has_ball = (oid == self.ball_holder)
+                
+                if in_lane and steps_in_lane >= self.three_second_max_steps:
+                    if not has_ball:
+                        # Must leave the lane (mask NOOP)
+                        masks[oid, ActionType.NOOP.value] = 0
+                    elif steps_in_lane > self.three_second_max_steps:
+                        # Ball handler at max_steps+1: can ONLY shoot
+                        # Mask everything except SHOOT
+                        masks[oid, :] = 0
+                        masks[oid, ActionType.SHOOT.value] = 1
 
         return masks
 
@@ -1111,6 +1260,49 @@ class HexagonBasketballEnv(gym.Env):
         """Check if a hexagon position is within the rectangular court bounds."""
         col, row = self._axial_to_offset(q, r)
         return 0 <= col < self.court_width and 0 <= row < self.court_height
+    
+    def _calculate_offensive_lane_hexes(self) -> set:
+        """Calculate the hexes that make up the offensive lane (painted area).
+        
+        The lane extends from the basket along the +q axis (toward offensive side)
+        up to (but not including) the 3-point line distance.
+        The lane has symmetric width on both sides.
+        
+        Returns:
+            Set of (q, r) tuples representing lane hexes
+        """
+        lane_hexes = set()
+        basket_q, basket_r = self.basket_position
+        lane_width = self.three_second_lane_width
+        
+        # Lane extends from distance 0 (basket) to just before 3pt line
+        for dist in range(0, self.three_point_distance):
+            # For each distance, add hexes within lane_width perpendicular distance
+            # We'll explore in the +q direction from basket
+            # At each step along q-axis, check r offsets within lane_width
+            for q_offset in range(dist + 1):
+                for r_offset in range(-dist, dist + 1):
+                    q = basket_q + q_offset
+                    r = basket_r + r_offset
+                    
+                    # Check if this hex is within the lane width and at the right distance
+                    if self._hex_distance((q, r), self.basket_position) == dist:
+                        # Calculate perpendicular distance from center line
+                        # Center line is along +q axis from basket
+                        # For simplicity, check if r_offset is within bounds
+                        if abs(r - basket_r) <= lane_width and self._is_valid_position(q, r):
+                            lane_hexes.add((q, r))
+        
+        return lane_hexes
+    
+    def _calculate_defensive_lane_hexes(self) -> set:
+        """Calculate the defensive lane (full painted area, same as offensive lane).
+        
+        Defenders cannot camp in the lane for more than max_steps, enforcing 
+        the defensive 3-second violation rule across the entire lane area.
+        """
+        # Defensive lane is the same area as offensive lane
+        return self._calculate_offensive_lane_hexes()
 
     @profile_section("process_actions")
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
@@ -1121,6 +1313,8 @@ class HexagonBasketballEnv(gym.Env):
             "shots": {},
             "collisions": [],
             "turnovers": [],
+            "defensive_lane_violations": [],
+            "defender_pressure": {},  # Track defender pressure on ball handler
         }
 
         current_positions = self.positions
@@ -1251,6 +1445,47 @@ class HexagonBasketballEnv(gym.Env):
                 results["moves"][player_id] = {"success": True, "new_position": dest}
 
         self.positions = final_positions
+        
+        # Check for offensive 3-second violations BEFORE updating step counts
+        # This check happens here (before lane steps are incremented in step())
+        if self.offensive_three_seconds_enabled:
+            for oid in self.offense_ids:
+                steps_in_lane = self._offensive_lane_steps.get(oid, 0)
+                in_lane = tuple(self.positions[oid]) in self.offensive_lane_hexes
+                has_ball = (oid == self.ball_holder)
+                
+                # Violation occurs if:
+                # 1. Player has been in lane for max_steps
+                # 2. Player is still in lane or just entered
+                # 3. Player doesn't have the ball (exception for ball handler)
+                # 4. If player has ball and at max_steps+1, they MUST shoot
+                
+                if in_lane:
+                    if steps_in_lane >= self.three_second_max_steps:
+                        if not has_ball:
+                            # Violation: been in lane too long without ball
+                            results["turnovers"].append({
+                                "player_id": oid,
+                                "reason": "offensive_three_seconds",
+                                "turnover_pos": self.positions[oid],
+                            })
+                            # Transfer possession to defense
+                            if self.ball_holder is not None:
+                                self._turnover_to_defense(self.ball_holder)
+                            break  # Only one violation per step
+                        elif has_ball and steps_in_lane > self.three_second_max_steps:
+                            # Ball handler at max_steps+1: if they didn't shoot, it's a violation
+                            # Check if they took a shot action
+                            action_taken = ActionType(actions[oid])
+                            if action_taken != ActionType.SHOOT:
+                                results["turnovers"].append({
+                                    "player_id": oid,
+                                    "reason": "offensive_three_seconds",
+                                    "turnover_pos": self.positions[oid],
+                                })
+                                self._turnover_to_defense(oid)
+                                break
+        
         return results
 
     def _get_adjacent_position(
@@ -1315,7 +1550,9 @@ class HexagonBasketballEnv(gym.Env):
            - Each defender's steal contribution depends on:
              * Perpendicular distance from the pass line (closer = higher chance)
              * Total pass distance (longer passes = higher chance)
-           - Formula: steal_i = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist)
+             * Position along pass line (defenders closer to receiver are more dangerous)
+           - Formula: steal_i = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist) * position_weight
+           - Position weight: position_weight = min_weight + (1 - min_weight) * t, where t ∈ [0,1] (0=passer, 1=receiver)
            - Multiple defender contributions are compounded: total_steal = 1 - ∏(1 - steal_i)
            - Defender with highest contribution gets the ball if interception occurs
         5. If no defenders in forward hemisphere between passer and receiver, pass always succeeds
@@ -1414,7 +1651,7 @@ class HexagonBasketballEnv(gym.Env):
         pass_distance = self._hex_distance(passer_pos, recv_pos)
         
         # Evaluate each defender's steal contribution
-        defender_contributions: List[Tuple[int, float, float]] = []  # (defender_id, steal_contrib, perp_dist)
+        defender_contributions: List[Tuple[int, float, float, float]] = []  # (defender_id, steal_contrib, perp_dist, position)
         for did in opp_ids:
             defender_pos = self.positions[did]
             
@@ -1429,24 +1666,32 @@ class HexagonBasketballEnv(gym.Env):
             # Calculate perpendicular distance from pass line
             perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
             
+            # Calculate position along pass line (0 = at passer, 1 = at receiver)
+            position_t = self._get_position_on_line(defender_pos, passer_pos, recv_pos)
+            
+            # Position weight: defenders closer to receiver are more dangerous
+            # position_weight = min_weight + (1 - min_weight) * t
+            position_weight = self.steal_position_weight_min + (1.0 - self.steal_position_weight_min) * position_t
+            
             # Calculate steal contribution for this defender
-            # steal = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist)
+            # steal = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist) * position_weight
             steal_contrib = (
                 self.base_steal_rate *
                 math.exp(-self.steal_perp_decay * perp_distance) *
-                (1.0 + self.steal_distance_factor * pass_distance)
+                (1.0 + self.steal_distance_factor * pass_distance) *
+                position_weight
             )
             
             # Clamp to [0, 1] for safety
             steal_contrib = max(0.0, min(1.0, steal_contrib))
             
-            defender_contributions.append((did, steal_contrib, perp_distance))
+            defender_contributions.append((did, steal_contrib, perp_distance, position_t))
         
         # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
         total_steal_prob = 0.0
         if defender_contributions:
             complement_product = 1.0
-            for _, steal_contrib, _ in defender_contributions:
+            for _, steal_contrib, _, _ in defender_contributions:
                 complement_product *= (1.0 - steal_contrib)
             total_steal_prob = 1.0 - complement_product
         
@@ -1476,8 +1721,9 @@ class HexagonBasketballEnv(gym.Env):
                         "id": did,
                         "steal_contribution": contrib,
                         "perp_distance": perp_dist,
+                        "position_on_line": pos_t,
                     }
-                    for did, contrib, perp_dist in defender_contributions
+                    for did, contrib, perp_dist, pos_t in defender_contributions
                 ],
             }
             return
@@ -1494,8 +1740,9 @@ class HexagonBasketballEnv(gym.Env):
                     "id": did,
                     "steal_contribution": contrib,
                     "perp_distance": perp_dist,
+                    "position_on_line": pos_t,
                 }
-                for did, contrib, perp_dist in defender_contributions
+                for did, contrib, perp_dist, pos_t in defender_contributions
             ],
         }
         # Start/refresh assist window (configurable steps including current step)
@@ -1725,6 +1972,15 @@ class HexagonBasketballEnv(gym.Env):
             # We assume only one turnover can happen per step
             rewards[self.offense_ids] -= turnover_penalty / self.players_per_side
             rewards[self.defense_ids] += turnover_penalty / self.players_per_side
+
+        # --- Handle defensive lane violations (illegal defense) ---
+        if action_results.get("defensive_lane_violations"):
+            done = True
+            # Defense committed a violation, offense gets a point (like a technical free throw)
+            # Reward offense with 1 point, penalize defense
+            violation_reward = 1.0
+            rewards[self.offense_ids] += violation_reward / self.players_per_side
+            rewards[self.defense_ids] -= violation_reward / self.players_per_side
 
         # Check for shots
         for player_id, shot_result in action_results.get("shots", {}).items():
@@ -2021,6 +2277,16 @@ class HexagonBasketballEnv(gym.Env):
                 obs.append(float(nearest_defender_distance) / norm_den)
             else:
                 obs.append(float(nearest_defender_distance))
+        
+        # Lane step counts for all players (offensive and defensive)
+        # This allows agents to learn to manage their time in the lane
+        # Offensive players track time in offensive lane, defensive players track time in defensive lane (basket)
+        for pid in range(self.n_players):
+            if pid in self.offense_ids:
+                lane_steps = self._offensive_lane_steps.get(pid, 0)
+            else:
+                lane_steps = self._defender_in_key_steps.get(pid, 0)
+            obs.append(float(lane_steps))
 
         return np.array(obs, dtype=np.float32)
 
@@ -2153,6 +2419,26 @@ class HexagonBasketballEnv(gym.Env):
                     linewidth=1,
                 )
                 ax.add_patch(hexagon)
+
+                # Paint the lane area with light red if violations are enabled
+                # Check if lane hexes exist (for backward compatibility with old environments)
+                if hasattr(self, 'offensive_lane_hexes') and self.offensive_lane_hexes:
+                    is_in_lane = (q, r_ax) in self.offensive_lane_hexes
+                    offense_enabled = getattr(self, 'offensive_three_seconds_enabled', False)
+                    defense_enabled = getattr(self, 'illegal_defense_enabled', False)
+                    
+                    if is_in_lane and (offense_enabled or defense_enabled):
+                        lane_hexagon = RegularPolygon(
+                            (x, y),
+                            numVertices=6,
+                            radius=hex_radius,
+                            orientation=0,
+                            facecolor=(1.0, 0.39, 0.39, 0.15),  # Light red with alpha
+                            edgecolor=(1.0, 0.39, 0.39, 0.3),   # Light red edge
+                            linewidth=1.5,
+                            zorder=2,
+                        )
+                        ax.add_patch(lane_hexagon)
 
                 # For the basket, add a thick red ring around it
                 if (q, r_ax) == self.basket_position:
@@ -2515,6 +2801,145 @@ class HexagonBasketballEnv(gym.Env):
         self.training_team = (
             Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
         )
+
+    def calculate_pass_steal_probabilities(self, passer_id: int) -> Dict[int, float]:
+        """
+        Calculate hypothetical steal probabilities for passes to each teammate.
+        Returns a dict mapping teammate_id -> steal_probability.
+        """
+        if self.ball_holder != passer_id:
+            return {}
+        
+        passer_pos = self.positions[passer_id]
+        team_ids = (
+            self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        )
+        opp_ids = (
+            self.defense_ids if passer_id in self.offense_ids else self.offense_ids
+        )
+        
+        steal_probs = {}
+        
+        for teammate_id in team_ids:
+            if teammate_id == passer_id:
+                continue
+            
+            recv_pos = self.positions[teammate_id]
+            pass_distance = self._hex_distance(passer_pos, recv_pos)
+            
+            # Evaluate each defender's steal contribution
+            defender_contributions: List[Tuple[int, float]] = []
+            
+            for did in opp_ids:
+                defender_pos = self.positions[did]
+                
+                # Calculate vector from passer to receiver
+                recv_dx = recv_pos[0] - passer_pos[0]
+                recv_dy = recv_pos[1] - passer_pos[1]
+                recv_norm = math.hypot(
+                    *self._axial_to_cartesian(recv_dx, recv_dy)
+                )
+                
+                if recv_norm < 1e-6:
+                    continue
+                
+                # Check if defender is in forward hemisphere (toward receiver)
+                def_dx = defender_pos[0] - passer_pos[0]
+                def_dy = defender_pos[1] - passer_pos[1]
+                
+                def_cart = self._axial_to_cartesian(def_dx, def_dy)
+                recv_cart = self._axial_to_cartesian(recv_dx, recv_dy)
+                
+                def_norm = math.hypot(*def_cart)
+                if def_norm < 1e-6:
+                    continue
+                
+                cosang = (def_cart[0] * recv_cart[0] + def_cart[1] * recv_cart[1]) / (def_norm * recv_norm)
+                
+                # Only consider defenders in forward hemisphere (cosine >= 0)
+                if cosang < 0.0:
+                    continue
+                
+                # Only consider defenders between passer and receiver
+                if not self._is_between_points(defender_pos, passer_pos, recv_pos):
+                    continue
+                
+                # Calculate perpendicular distance from pass line
+                perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
+                
+                # Calculate position along pass line (0 = at passer, 1 = at receiver)
+                position_t = self._get_position_on_line(defender_pos, passer_pos, recv_pos)
+                
+                # Position weight: defenders closer to receiver are more dangerous
+                position_weight = self.steal_position_weight_min + (1.0 - self.steal_position_weight_min) * position_t
+                
+                # Calculate steal contribution for this defender
+                steal_contrib = (
+                    self.base_steal_rate *
+                    math.exp(-self.steal_perp_decay * perp_distance) *
+                    (1.0 + self.steal_distance_factor * pass_distance) *
+                    position_weight
+                )
+                
+                # Clamp to [0, 1] for safety
+                steal_contrib = max(0.0, min(1.0, steal_contrib))
+                
+                defender_contributions.append((did, steal_contrib))
+            
+            # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
+            total_steal_prob = 0.0
+            if defender_contributions:
+                complement_product = 1.0
+                for _, steal_contrib in defender_contributions:
+                    complement_product *= (1.0 - steal_contrib)
+                total_steal_prob = 1.0 - complement_product
+            
+            steal_probs[teammate_id] = total_steal_prob
+        
+        return steal_probs
+
+    def calculate_defender_pressure_turnover_probability(self) -> float:
+        """
+        Calculate the total turnover probability from defender pressure on the ball handler.
+        Returns the compound probability of turnover from all nearby defenders.
+        """
+        if self.ball_holder is None:
+            return 0.0
+        
+        ball_handler_pos = self.positions[self.ball_holder]
+        opp_ids = (
+            self.defense_ids if self.ball_holder in self.offense_ids else self.offense_ids
+        )
+        
+        defender_pressure_info = []
+        
+        for defender_id in opp_ids:
+            defender_pos = self.positions[defender_id]
+            distance = self._hex_distance(ball_handler_pos, defender_pos)
+            
+            if distance <= self.defender_pressure_distance:
+                # Calculate turnover probability for this defender
+                # At distance=1 (adjacent), probability = baseline
+                # As distance increases beyond 1, probability decays exponentially
+                turnover_prob = self.defender_pressure_turnover_chance * math.exp(
+                    -self.defender_pressure_decay_lambda * max(0, distance - 1)
+                )
+                
+                defender_pressure_info.append({
+                    "defender_id": int(defender_id),
+                    "distance": int(distance),
+                    "turnover_prob": float(turnover_prob),
+                })
+        
+        # Calculate total turnover probability (compound probability)
+        total_pressure_prob = 0.0
+        if defender_pressure_info:
+            complement_product = 1.0
+            for pressure in defender_pressure_info:
+                complement_product *= (1.0 - pressure["turnover_prob"])
+            total_pressure_prob = 1.0 - complement_product
+        
+        return total_pressure_prob
 
     # --- Profiling helpers ---
     def get_profile_stats(self) -> Dict[str, Dict[str, float]]:

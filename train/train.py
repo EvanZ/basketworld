@@ -12,6 +12,7 @@ A custom gym.Wrapper is used to manage the opponent's actions during training.
 # boto3 caches credentials on first import, so we must set the profile early!
 import os
 import sys
+import shlex
 
 # Clear any partial AWS env vars that Cursor/VS Code might have set
 # This prevents conflicts with our AWS profile
@@ -341,9 +342,11 @@ def setup_environment(args, training_team):
         min_shot_clock=getattr(args, "min_shot_clock", 10),
         defender_pressure_distance=args.defender_pressure_distance,
         defender_pressure_turnover_chance=args.defender_pressure_turnover_chance,
+        defender_pressure_decay_lambda=getattr(args, "defender_pressure_decay_lambda", 1.0),
         base_steal_rate=getattr(args, "base_steal_rate", 0.35),
         steal_perp_decay=getattr(args, "steal_perp_decay", 1.5),
         steal_distance_factor=getattr(args, "steal_distance_factor", 0.08),
+        steal_position_weight_min=getattr(args, "steal_position_weight_min", 0.3),
         three_point_distance=args.three_point_distance,
         layup_pct=args.layup_pct,
         layup_std=getattr(args, "layup_std", 0.0),
@@ -387,8 +390,11 @@ def setup_environment(args, training_team):
         normalize_obs=args.normalize_obs,
         mask_occupied_moves=args.mask_occupied_moves,
         enable_pass_gating=getattr(args, "enable_pass_gating", True),
+        # 3-second violation (shared configuration)
+        three_second_lane_width=getattr(args, "three_second_lane_width", 1),
+        three_second_max_steps=getattr(args, "three_second_max_steps", 3),
         illegal_defense_enabled=args.illegal_defense_enabled,
-        illegal_defense_max_steps=args.illegal_defense_max_steps,
+        offensive_three_seconds_enabled=getattr(args, "offensive_three_seconds", False),
     )
     # Wrap with episode stats collector then aggregate reward for Monitor/SB3
     env = EpisodeStatsWrapper(env)
@@ -409,6 +415,8 @@ def setup_environment(args, training_team):
             "turnover_pass_oob",
             "turnover_intercepted",
             "turnover_pressure",
+            "turnover_offensive_lane",
+            "defensive_lane_violation",
             # Keys required for PPP calculation
             "made_dunk",
             "made_2pt",
@@ -1600,6 +1608,12 @@ if __name__ == "__main__":
         help="Chance of a defender pressure turnover.",
     )
     parser.add_argument(
+        "--defender-pressure-decay-lambda",
+        type=float,
+        default=1.0,
+        help="Exponential decay rate for defender pressure.",
+    )
+    parser.add_argument(
         "--tensorboard-path",
         type=str,
         default=None,
@@ -1763,17 +1777,31 @@ if __name__ == "__main__":
         default="auto",
         help="Device to use for training ('cuda', 'cpu', or 'auto').",
     )
+    # 3-second violation shared configuration
+    parser.add_argument(
+        "--three-second-lane-width",
+        type=int,
+        default=1,
+        help="Width of the lane in hexes (shared by offense and defense). 1 = 1 hex on each side of center line.",
+    )
+    parser.add_argument(
+        "--three-second-max-steps",
+        type=int,
+        default=3,
+        help="Maximum steps a player can stay in the lane (shared by offense and defense).",
+    )
+    # Individual enable flags
     parser.add_argument(
         "--illegal-defense-enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
-        help="Enable illegal defense mode.",
+        help="Enable illegal defense (defensive 3-second) rule.",
     )
     parser.add_argument(
-        "--illegal-defense-max-steps",
-        type=int,
-        default=3,
-        help="Maximum number of steps to allow illegal defense.",
+        "--offensive-three-seconds",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable offensive 3-second violation rule.",
     )
     # Reward shaping CLI (also logged to MLflow)
     parser.add_argument(
@@ -1866,6 +1894,13 @@ if __name__ == "__main__":
         type=float,
         default=0.08,
         help="Factor by which pass distance increases steal chance.",
+    )
+    parser.add_argument(
+        "--steal-position-weight-min",
+        dest="steal_position_weight_min",
+        type=float,
+        default=0.3,
+        help="Minimum steal weight for defenders near passer (1.0 at receiver). Defenders closer to receiver are more dangerous.",
     )
     parser.add_argument(
         "--episode-sample-prob",
@@ -2011,5 +2046,5 @@ if __name__ == "__main__":
         help="Final additive bias (0 to disable at end).",
     )
     args = parser.parse_args()
-
+    print(' '.join(shlex.quote(arg) for arg in sys.argv))
     main(args)
