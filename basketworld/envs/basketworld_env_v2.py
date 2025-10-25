@@ -254,13 +254,21 @@ class HexagonBasketballEnv(gym.Env):
         # Role flag moved to separate observation key `role_flag` (Box shape=(1,))
         # +players_per_side for per-offense nearest-defender distances
         # +n_players for lane step counts (both offensive and defensive players)
+        # +players_per_side for expected points (EP) for each offensive player
+        # +players_per_side for turnover probability (one per offensive player, 0 if not ball holder)
+        # +players_per_side for steal risks (one per offensive player, 0 for ball holder)
         # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
+        # Note: Using fixed-position encoding (one slot per player) instead of dynamic ordering
+        # for better learning - position i always corresponds to offensive player i
         base_len = (self.n_players * 2) + self.n_players + 1 + self.players_per_side + self.n_players
         hoop_extra = 2 if self.include_hoop_vector else 0
+        ep_extra = self.players_per_side  # EP for each offensive player
+        turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
+        steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
         state_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(base_len + hoop_extra,),
+            shape=(base_len + hoop_extra + ep_extra + turnover_risk_extra + steal_risk_extra,),
             dtype=np.float32,
         )
         action_mask_space = spaces.Box(
@@ -668,61 +676,15 @@ class HexagonBasketballEnv(gym.Env):
             self._first_step_after_reset = False
 
         # --- Defender Pressure Mechanic ---
-        defender_pressure_info = []  # Track pressure info for display
-        if self.ball_holder in self.offense_ids:
-            ball_handler_pos = self.positions[self.ball_holder]
-            
-            # Calculate direction from ball handler to basket (assumed facing direction)
-            basket_dq = self.basket_position[0] - ball_handler_pos[0]
-            basket_dr = self.basket_position[1] - ball_handler_pos[1]
-            basket_x, basket_y = self._axial_to_cartesian(basket_dq, basket_dr)
-            basket_norm = math.hypot(basket_x, basket_y) or 1.0
-            
-            # First pass: calculate all defender pressures
-            for defender_id in self.defense_ids:
-                defender_pos = self.positions[defender_id]
-                distance = self._hex_distance(ball_handler_pos, defender_pos)
-
-                # Only consider defenders within a reasonable pressure range
-                if distance <= self.defender_pressure_distance:
-                    # Check if defender is in front (180° arc toward basket)
-                    defender_dq = defender_pos[0] - ball_handler_pos[0]
-                    defender_dr = defender_pos[1] - ball_handler_pos[1]
-                    defender_x, defender_y = self._axial_to_cartesian(defender_dq, defender_dr)
-                    defender_vec_norm = math.hypot(defender_x, defender_y)
-                    
-                    if defender_vec_norm == 0:
-                        continue  # Defender at same position (shouldn't happen)
-                    
-                    # Dot product to check if defender is in front
-                    # cos(angle) >= 0 means angle is within [-90°, 90°] (180° arc)
-                    cos_angle = (defender_x * basket_x + defender_y * basket_y) / (defender_vec_norm * basket_norm)
-                    
-                    if cos_angle >= 0:  # Defender is in front
-                        # Calculate turnover probability with exponential decay
-                        # At distance=1 (adjacent), probability = baseline
-                        # As distance increases beyond 1, probability decays exponentially
-                        # Use (distance - 1) so that adjacent defenders get full baseline probability
-                        turnover_prob = self.defender_pressure_turnover_chance * math.exp(
-                            -self.defender_pressure_decay_lambda * max(0, distance - 1)
-                        )
-                        
-                        # Store pressure info for display
-                        defender_pressure_info.append({
-                            "defender_id": int(defender_id),
-                            "distance": int(distance),
-                            "turnover_prob": float(turnover_prob),
-                        })
-            
-            # Calculate total turnover probability (compound probability)
-            total_pressure_prob = 0.0
-            if defender_pressure_info:
-                complement_product = 1.0
-                for pressure in defender_pressure_info:
-                    complement_product *= (1.0 - pressure["turnover_prob"])
-                total_pressure_prob = 1.0 - complement_product
-            
-            # Second pass: check for turnovers
+        # Use shared calculation for consistency between gameplay and observations
+        defender_pressure_info = self._calculate_defender_pressure_info()
+        
+        # Variables needed for action results and turnover logging
+        ball_handler_pos = self.positions[self.ball_holder] if self.ball_holder is not None else (0, 0)
+        total_pressure_prob = self.calculate_defender_pressure_turnover_probability()
+        
+        if defender_pressure_info:
+            # Check for turnovers
             for pressure in defender_pressure_info:
                 if self._rng.random() < pressure["turnover_prob"]:
                     # Turnover occurs!
@@ -1644,56 +1606,13 @@ class HexagonBasketballEnv(gym.Env):
             return
 
         # Line-of-sight based interception: defenders between passer and receiver
-        opp_ids = (
-            self.defense_ids if passer_id in self.offense_ids else self.offense_ids
-        )
+        # Use shared calculation for consistency between gameplay and observations
         recv_pos = self.positions[recv_id]
         pass_distance = self._hex_distance(passer_pos, recv_pos)
         
-        # Evaluate each defender's steal contribution
-        defender_contributions: List[Tuple[int, float, float, float]] = []  # (defender_id, steal_contrib, perp_dist, position)
-        for did in opp_ids:
-            defender_pos = self.positions[did]
-            
-            # Only consider defenders in the 180° arc (forward hemisphere)
-            if not in_defender_arc(defender_pos[0], defender_pos[1]):
-                continue
-            
-            # Only consider defenders between passer and receiver
-            if not self._is_between_points(defender_pos, passer_pos, recv_pos):
-                continue
-            
-            # Calculate perpendicular distance from pass line
-            perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
-            
-            # Calculate position along pass line (0 = at passer, 1 = at receiver)
-            position_t = self._get_position_on_line(defender_pos, passer_pos, recv_pos)
-            
-            # Position weight: defenders closer to receiver are more dangerous
-            # position_weight = min_weight + (1 - min_weight) * t
-            position_weight = self.steal_position_weight_min + (1.0 - self.steal_position_weight_min) * position_t
-            
-            # Calculate steal contribution for this defender
-            # steal = base_rate * exp(-perp_decay * perp_dist) * (1 + dist_factor * pass_dist) * position_weight
-            steal_contrib = (
-                self.base_steal_rate *
-                math.exp(-self.steal_perp_decay * perp_distance) *
-                (1.0 + self.steal_distance_factor * pass_distance) *
-                position_weight
-            )
-            
-            # Clamp to [0, 1] for safety
-            steal_contrib = max(0.0, min(1.0, steal_contrib))
-            
-            defender_contributions.append((did, steal_contrib, perp_distance, position_t))
-        
-        # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
-        total_steal_prob = 0.0
-        if defender_contributions:
-            complement_product = 1.0
-            for _, steal_contrib, _, _ in defender_contributions:
-                complement_product *= (1.0 - steal_contrib)
-            total_steal_prob = 1.0 - complement_product
+        total_steal_prob, defender_contributions = self._calculate_steal_probability_for_pass(
+            passer_pos, recv_pos, passer_id
+        )
         
         # Roll for interception
         if total_steal_prob > 0 and self._rng.random() < total_steal_prob:
@@ -2076,6 +1995,29 @@ class HexagonBasketballEnv(gym.Env):
 
         return done, rewards
 
+    # -------------------- Expected Points Calculation --------------------
+    def _calculate_expected_points_for_player(self, player_id: int) -> float:
+        """Calculate expected points for a single player.
+        
+        Computes expected points using pressure-adjusted make probability times
+        shot value (3 for beyond the arc, otherwise 2; dunk treated as 2).
+        
+        Args:
+            player_id: ID of the player to calculate EP for
+            
+        Returns:
+            Expected points value (shot_value × pressure_adjusted_probability)
+        """
+        player_pos = self.positions[player_id]
+        dist = self._hex_distance(player_pos, self.basket_position)
+        # Shot value: 3 if at/behind arc and not a dunk; else 2
+        if self.allow_dunks and dist == 0:
+            shot_value = 2.0
+        else:
+            shot_value = 3.0 if dist >= self.three_point_distance else 2.0
+        p_make = float(self._calculate_shot_probability(player_id, dist))
+        return float(shot_value * p_make)
+
     # -------------------- Potential Function Phi(s) --------------------
     def _phi_shot_quality(self) -> float:
         """Potential function Phi(s): team's current best expected points.
@@ -2096,23 +2038,11 @@ class HexagonBasketballEnv(gym.Env):
             else self.defense_ids
         )
 
-        # If using only the ball handler
-        def expected_points_for(player_id: int) -> float:
-            player_pos = self.positions[player_id]
-            dist = self._hex_distance(player_pos, self.basket_position)
-            # Shot value: 3 if at/behind arc and not a dunk; else 2
-            if self.allow_dunks and dist == 0:
-                shot_value = 2.0
-            else:
-                shot_value = 3.0 if dist >= self.three_point_distance else 2.0
-            p_make = float(self._calculate_shot_probability(player_id, dist))
-            return float(shot_value * p_make)
-
         if self.phi_use_ball_handler_only:
-            return expected_points_for(int(self.ball_holder))
+            return self._calculate_expected_points_for_player(int(self.ball_holder))
 
         # Compute ball-handler EP and aggregate teammate EPs based on mode
-        ball_ep = expected_points_for(int(self.ball_holder))
+        ball_ep = self._calculate_expected_points_for_player(int(self.ball_holder))
         ball_holder_id = int(self.ball_holder)
 
         # Collect teammate EPs (may or may not exclude ball handler depending on mode)
@@ -2120,12 +2050,12 @@ class HexagonBasketballEnv(gym.Env):
 
         if mode == "team_avg":
             # Simple average of all players (including ball handler)
-            eps = [expected_points_for(int(pid)) for pid in team_ids]
+            eps = [self._calculate_expected_points_for_player(int(pid)) for pid in team_ids]
             return float(sum(eps) / max(1, len(eps)))
 
         # For other modes, separate ball handler from teammates
         teammate_eps = [
-            expected_points_for(int(pid)) for pid in team_ids if pid != ball_holder_id
+            self._calculate_expected_points_for_player(int(pid)) for pid in team_ids if pid != ball_holder_id
         ]
 
         if not teammate_eps:  # No teammates (1v1 or edge case)
@@ -2162,15 +2092,7 @@ class HexagonBasketballEnv(gym.Env):
         team_best = 0.0
         ball_ep = 0.0
         for pid in team_ids:
-            pos = self.positions[pid]
-            dist = self._hex_distance(pos, self.basket_position)
-            shot_value = (
-                2.0
-                if (self.allow_dunks and dist == 0)
-                else (3.0 if dist >= self.three_point_distance else 2.0)
-            )
-            p = float(self._calculate_shot_probability(pid, dist))
-            ep = float(shot_value * p)
+            ep = self._calculate_expected_points_for_player(pid)
             if pid == self.ball_holder:
                 ball_ep = ep
             if ep > team_best:
@@ -2287,6 +2209,35 @@ class HexagonBasketballEnv(gym.Env):
             else:
                 lane_steps = self._defender_in_key_steps.get(pid, 0)
             obs.append(float(lane_steps))
+        
+        # Expected Points (EP) for each offensive player
+        # Pressure-adjusted expected value of a shot from their current position
+        # Only offensive players have EP since they're the ones who can score
+        ep_values = self.calculate_expected_points_all_players()
+        obs.extend(ep_values.tolist())
+        
+        # Turnover probability for each offensive player (fixed-position encoding)
+        # Position i corresponds to offensive player i
+        # Non-zero only for the current ball handler
+        turnover_probs = np.zeros(self.players_per_side, dtype=np.float32)
+        if self.ball_holder is not None and self.ball_holder in self.offense_ids:
+            ball_holder_idx = self.offense_ids.index(self.ball_holder)
+            turnover_prob = self.calculate_defender_pressure_turnover_probability()
+            turnover_probs[ball_holder_idx] = float(turnover_prob)
+        obs.extend(turnover_probs.tolist())
+        
+        # Steal risks for each offensive player (fixed-position encoding)
+        # Position i corresponds to offensive player i
+        # Non-zero for potential pass receivers, 0 for ball holder and if no ball
+        steal_risks = np.zeros(self.players_per_side, dtype=np.float32)
+        if self.ball_holder is not None and self.ball_holder in self.offense_ids:
+            steal_probs_dict = self.calculate_pass_steal_probabilities(self.ball_holder)
+            for offense_id in self.offense_ids:
+                if offense_id != self.ball_holder:
+                    offense_idx = self.offense_ids.index(offense_id)
+                    steal_prob = steal_probs_dict.get(offense_id, 0.0)
+                    steal_risks[offense_idx] = float(steal_prob)
+        obs.extend(steal_risks.tolist())
 
         return np.array(obs, dtype=np.float32)
 
@@ -2802,6 +2753,97 @@ class HexagonBasketballEnv(gym.Env):
             Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
         )
 
+    def _calculate_steal_probability_for_pass(
+        self, 
+        passer_pos: Tuple[int, int], 
+        recv_pos: Tuple[int, int],
+        passer_id: int
+    ) -> Tuple[float, List[Tuple[int, float, float, float]]]:
+        """
+        Calculate steal probability for a specific pass from passer to receiver.
+        
+        Returns:
+            (total_steal_prob, defender_contributions)
+            where defender_contributions is a list of (defender_id, steal_contrib, perp_dist, position_t)
+        
+        This is the core calculation used both for:
+        1. Actual steal resolution during gameplay  
+        2. Observation features for agents to see steal risk
+        """
+        opp_ids = (
+            self.defense_ids if passer_id in self.offense_ids else self.offense_ids
+        )
+        
+        pass_distance = self._hex_distance(passer_pos, recv_pos)
+        
+        # Calculate vector from passer to receiver for arc checking
+        recv_dx = recv_pos[0] - passer_pos[0]
+        recv_dy = recv_pos[1] - passer_pos[1]
+        recv_norm = math.hypot(*self._axial_to_cartesian(recv_dx, recv_dy))
+        
+        if recv_norm < 1e-6:
+            return 0.0, []
+        
+        recv_cart = self._axial_to_cartesian(recv_dx, recv_dy)
+        
+        # Evaluate each defender's steal contribution
+        defender_contributions: List[Tuple[int, float, float, float]] = []
+        
+        for did in opp_ids:
+            defender_pos = self.positions[did]
+            
+            # Check if defender is in forward hemisphere (toward receiver)
+            def_dx = defender_pos[0] - passer_pos[0]
+            def_dy = defender_pos[1] - passer_pos[1]
+            
+            def_cart = self._axial_to_cartesian(def_dx, def_dy)
+            def_norm = math.hypot(*def_cart)
+            
+            if def_norm < 1e-6:
+                continue
+            
+            # Dot product: only consider defenders in forward hemisphere (cosine >= 0)
+            cosang = (def_cart[0] * recv_cart[0] + def_cart[1] * recv_cart[1]) / (def_norm * recv_norm)
+            
+            if cosang < 0.0:
+                continue
+            
+            # Only consider defenders between passer and receiver
+            if not self._is_between_points(defender_pos, passer_pos, recv_pos):
+                continue
+            
+            # Calculate perpendicular distance from pass line
+            perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
+            
+            # Calculate position along pass line (0 = at passer, 1 = at receiver)
+            position_t = self._get_position_on_line(defender_pos, passer_pos, recv_pos)
+            
+            # Position weight: defenders closer to receiver are more dangerous
+            position_weight = self.steal_position_weight_min + (1.0 - self.steal_position_weight_min) * position_t
+            
+            # Calculate steal contribution for this defender
+            steal_contrib = (
+                self.base_steal_rate *
+                math.exp(-self.steal_perp_decay * perp_distance) *
+                (1.0 + self.steal_distance_factor * pass_distance) *
+                position_weight
+            )
+            
+            # Clamp to [0, 1] for safety
+            steal_contrib = max(0.0, min(1.0, steal_contrib))
+            
+            defender_contributions.append((did, steal_contrib, perp_distance, position_t))
+        
+        # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
+        total_steal_prob = 0.0
+        if defender_contributions:
+            complement_product = 1.0
+            for _, steal_contrib, _, _ in defender_contributions:
+                complement_product *= (1.0 - steal_contrib)
+            total_steal_prob = 1.0 - complement_product
+        
+        return total_steal_prob, defender_contributions
+
     def calculate_pass_steal_probabilities(self, passer_id: int) -> Dict[int, float]:
         """
         Calculate hypothetical steal probabilities for passes to each teammate.
@@ -2814,9 +2856,6 @@ class HexagonBasketballEnv(gym.Env):
         team_ids = (
             self.offense_ids if passer_id in self.offense_ids else self.defense_ids
         )
-        opp_ids = (
-            self.defense_ids if passer_id in self.offense_ids else self.offense_ids
-        )
         
         steal_probs = {}
         
@@ -2825,121 +2864,110 @@ class HexagonBasketballEnv(gym.Env):
                 continue
             
             recv_pos = self.positions[teammate_id]
-            pass_distance = self._hex_distance(passer_pos, recv_pos)
-            
-            # Evaluate each defender's steal contribution
-            defender_contributions: List[Tuple[int, float]] = []
-            
-            for did in opp_ids:
-                defender_pos = self.positions[did]
-                
-                # Calculate vector from passer to receiver
-                recv_dx = recv_pos[0] - passer_pos[0]
-                recv_dy = recv_pos[1] - passer_pos[1]
-                recv_norm = math.hypot(
-                    *self._axial_to_cartesian(recv_dx, recv_dy)
-                )
-                
-                if recv_norm < 1e-6:
-                    continue
-                
-                # Check if defender is in forward hemisphere (toward receiver)
-                def_dx = defender_pos[0] - passer_pos[0]
-                def_dy = defender_pos[1] - passer_pos[1]
-                
-                def_cart = self._axial_to_cartesian(def_dx, def_dy)
-                recv_cart = self._axial_to_cartesian(recv_dx, recv_dy)
-                
-                def_norm = math.hypot(*def_cart)
-                if def_norm < 1e-6:
-                    continue
-                
-                cosang = (def_cart[0] * recv_cart[0] + def_cart[1] * recv_cart[1]) / (def_norm * recv_norm)
-                
-                # Only consider defenders in forward hemisphere (cosine >= 0)
-                if cosang < 0.0:
-                    continue
-                
-                # Only consider defenders between passer and receiver
-                if not self._is_between_points(defender_pos, passer_pos, recv_pos):
-                    continue
-                
-                # Calculate perpendicular distance from pass line
-                perp_distance = self._point_to_line_distance(defender_pos, passer_pos, recv_pos)
-                
-                # Calculate position along pass line (0 = at passer, 1 = at receiver)
-                position_t = self._get_position_on_line(defender_pos, passer_pos, recv_pos)
-                
-                # Position weight: defenders closer to receiver are more dangerous
-                position_weight = self.steal_position_weight_min + (1.0 - self.steal_position_weight_min) * position_t
-                
-                # Calculate steal contribution for this defender
-                steal_contrib = (
-                    self.base_steal_rate *
-                    math.exp(-self.steal_perp_decay * perp_distance) *
-                    (1.0 + self.steal_distance_factor * pass_distance) *
-                    position_weight
-                )
-                
-                # Clamp to [0, 1] for safety
-                steal_contrib = max(0.0, min(1.0, steal_contrib))
-                
-                defender_contributions.append((did, steal_contrib))
-            
-            # Compound steal probabilities: total = 1 - ∏(1 - steal_i)
-            total_steal_prob = 0.0
-            if defender_contributions:
-                complement_product = 1.0
-                for _, steal_contrib in defender_contributions:
-                    complement_product *= (1.0 - steal_contrib)
-                total_steal_prob = 1.0 - complement_product
-            
+            # Use shared calculation for consistency between gameplay and observations
+            total_steal_prob, _ = self._calculate_steal_probability_for_pass(
+                passer_pos, recv_pos, passer_id
+            )
             steal_probs[teammate_id] = total_steal_prob
         
         return steal_probs
+
+    def _calculate_defender_pressure_info(self) -> List[Dict]:
+        """
+        Calculate defender pressure information for the current ball handler.
+        Returns list of dicts with defender_id, distance, and turnover_prob.
+        
+        This is the core calculation used both for:
+        1. Actual turnover resolution during gameplay
+        2. Observation features for agents to see turnover risk
+        
+        Only considers defenders in front (180° arc toward basket).
+        """
+        if self.ball_holder is None:
+            return []
+        
+        if self.ball_holder not in self.offense_ids:
+            return []  # Only offensive ball handlers face defender pressure
+        
+        ball_handler_pos = self.positions[self.ball_holder]
+        
+        # Calculate direction from ball handler to basket (assumed facing direction)
+        basket_dq = self.basket_position[0] - ball_handler_pos[0]
+        basket_dr = self.basket_position[1] - ball_handler_pos[1]
+        basket_x, basket_y = self._axial_to_cartesian(basket_dq, basket_dr)
+        basket_norm = math.hypot(basket_x, basket_y) or 1.0
+        
+        defender_pressure_info = []
+        
+        for defender_id in self.defense_ids:
+            defender_pos = self.positions[defender_id]
+            distance = self._hex_distance(ball_handler_pos, defender_pos)
+            
+            # Only consider defenders within pressure range
+            if distance <= self.defender_pressure_distance:
+                # Check if defender is in front (180° arc toward basket)
+                defender_dq = defender_pos[0] - ball_handler_pos[0]
+                defender_dr = defender_pos[1] - ball_handler_pos[1]
+                defender_x, defender_y = self._axial_to_cartesian(defender_dq, defender_dr)
+                defender_vec_norm = math.hypot(defender_x, defender_y)
+                
+                if defender_vec_norm == 0:
+                    continue  # Defender at same position (shouldn't happen)
+                
+                # Dot product to check if defender is in front
+                # cos(angle) >= 0 means angle is within [-90°, 90°] (180° arc)
+                cos_angle = (defender_x * basket_x + defender_y * basket_y) / (defender_vec_norm * basket_norm)
+                
+                if cos_angle >= 0:  # Defender is in front
+                    # Calculate turnover probability with exponential decay
+                    # At distance=1 (adjacent), probability = baseline
+                    # As distance increases beyond 1, probability decays exponentially
+                    turnover_prob = self.defender_pressure_turnover_chance * math.exp(
+                        -self.defender_pressure_decay_lambda * max(0, distance - 1)
+                    )
+                    
+                    defender_pressure_info.append({
+                        "defender_id": int(defender_id),
+                        "distance": int(distance),
+                        "turnover_prob": float(turnover_prob),
+                    })
+        
+        return defender_pressure_info
 
     def calculate_defender_pressure_turnover_probability(self) -> float:
         """
         Calculate the total turnover probability from defender pressure on the ball handler.
         Returns the compound probability of turnover from all nearby defenders.
         """
-        if self.ball_holder is None:
-            return 0.0
-        
-        ball_handler_pos = self.positions[self.ball_holder]
-        opp_ids = (
-            self.defense_ids if self.ball_holder in self.offense_ids else self.offense_ids
-        )
-        
-        defender_pressure_info = []
-        
-        for defender_id in opp_ids:
-            defender_pos = self.positions[defender_id]
-            distance = self._hex_distance(ball_handler_pos, defender_pos)
-            
-            if distance <= self.defender_pressure_distance:
-                # Calculate turnover probability for this defender
-                # At distance=1 (adjacent), probability = baseline
-                # As distance increases beyond 1, probability decays exponentially
-                turnover_prob = self.defender_pressure_turnover_chance * math.exp(
-                    -self.defender_pressure_decay_lambda * max(0, distance - 1)
-                )
-                
-                defender_pressure_info.append({
-                    "defender_id": int(defender_id),
-                    "distance": int(distance),
-                    "turnover_prob": float(turnover_prob),
-                })
+        defender_pressure_info = self._calculate_defender_pressure_info()
         
         # Calculate total turnover probability (compound probability)
-        total_pressure_prob = 0.0
-        if defender_pressure_info:
-            complement_product = 1.0
-            for pressure in defender_pressure_info:
-                complement_product *= (1.0 - pressure["turnover_prob"])
-            total_pressure_prob = 1.0 - complement_product
+        if not defender_pressure_info:
+            return 0.0
+        
+        complement_product = 1.0
+        for pressure in defender_pressure_info:
+            complement_product *= (1.0 - pressure["turnover_prob"])
+        total_pressure_prob = 1.0 - complement_product
         
         return total_pressure_prob
+
+    def calculate_expected_points_all_players(self) -> np.ndarray:
+        """
+        Calculate expected points for offensive players based on their current position
+        and defender pressure. Uses pressure-adjusted shot probability.
+        
+        EP only makes sense for the team that can score (offense), so we only calculate
+        it for offensive players.
+        
+        Returns array of shape (players_per_side,) with EP for each offensive player.
+        """
+        eps = np.zeros(self.players_per_side, dtype=np.float32)
+        
+        for idx, player_id in enumerate(self.offense_ids):
+            eps[idx] = self._calculate_expected_points_for_player(player_id)
+        
+        return eps
 
     # --- Profiling helpers ---
     def get_profile_stats(self) -> Dict[str, Dict[str, float]]:
