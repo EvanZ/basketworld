@@ -9,6 +9,8 @@ import numpy as np
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team, ActionType
 from stable_baselines3 import PPO
+# Import custom policies so they're available when loading saved models
+from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
 import mlflow
 import torch
 import copy
@@ -260,10 +262,16 @@ async def init_game(request: InitGameRequest):
         )
 
         # (Re)load policies from the selected paths
-        game_state.unified_policy = PPO.load(unified_path)
+        # Provide custom_objects so SB3 can deserialize custom policy classes
+        custom_objects = {
+            "policy_class": PassBiasDualCriticPolicy,
+            "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+            "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        }
+        game_state.unified_policy = PPO.load(unified_path, custom_objects=custom_objects)
         game_state.offense_policy = None
         game_state.defense_policy = (
-            PPO.load(opponent_unified_path) if opponent_unified_path else None
+            PPO.load(opponent_unified_path, custom_objects=custom_objects) if opponent_unified_path else None
         )
 
         game_state.env = basketworld.HexagonBasketballEnv(

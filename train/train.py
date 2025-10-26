@@ -61,7 +61,7 @@ from basketworld.utils.schedule_state import (
     load_schedule_metadata,
     calculate_continued_total_timesteps,
 )
-from basketworld.utils.policies import PassBiasMultiInputPolicy
+from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
 
 from basketworld.utils.evaluation_helpers import (
     get_outcome_category,
@@ -562,6 +562,10 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
+        # Log policy architecture (single vs dual critic)
+        mlflow.log_param("use_dual_critic", args.use_dual_critic)
+        mlflow.log_param("policy_class", "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy")
+        
         print(f"MLflow Run ID: {run.info.run_id}")
 
         # --- If continuing from a prior run, copy over prior model artifacts ---
@@ -649,8 +653,12 @@ def main(args):
                     else args.ent_coef
                 )
                 initial_ent_coef = float(start)
+            
+            # Choose policy class based on --use-dual-critic flag
+            policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
+            
             unified_policy = PPO(
-                PassBiasMultiInputPolicy,
+                policy_class,
                 temp_env,
                 verbose=1,
                 n_steps=args.n_steps,
@@ -1562,6 +1570,12 @@ if __name__ == "__main__":
         nargs="+",
         default=[64, 64],
         help="Critic (value) MLP hidden sizes, e.g. 64 64. Ignored if --net-arch is set.",
+    )
+    parser.add_argument(
+        "--use-dual-critic",
+        action="store_true",
+        default=False,
+        help="Use separate value networks for offense and defense (recommended for zero-sum self-play).",
     )
     parser.add_argument(
         "--continue-run-id",
