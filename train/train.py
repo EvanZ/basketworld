@@ -555,6 +555,13 @@ def main(args):
         print("MLflow tracking URI:", mlflow.get_tracking_uri())
         # Log hyperparameters
         mlflow.log_params(vars(args))
+        
+        # Log observation encoding version for backward compatibility
+        # role_flag encoding: -1/+1 (new) vs 0/1 (old)
+        mlflow.log_param("role_flag_offense_value", 1.0)
+        mlflow.log_param("role_flag_defense_value", -1.0)
+        mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
+        
         print(f"MLflow Run ID: {run.info.run_id}")
 
         # --- If continuing from a prior run, copy over prior model artifacts ---

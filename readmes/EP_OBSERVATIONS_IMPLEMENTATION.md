@@ -148,7 +148,7 @@ The observation vector now contains (in order):
 
 - `obs`: Main observation vector (described above)
 - `action_mask`: Valid actions for each player
-- `role_flag`: 0 = offense, 1 = defense
+- `role_flag`: +1 = offense, -1 = defense
 - `skills`: Per-player shooting skill deltas (layup, 3pt, dunk)
 
 ## Design Decision: Fixed-Position Encoding

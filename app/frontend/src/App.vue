@@ -5,7 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 const gameState = ref(null);      // For current state and UI logic
@@ -161,7 +161,7 @@ async function handleActionsSubmitted(actions) {
       gameState.value = response.state;
       gameHistory.value.push(response.state);
       
-      // Update the last move with action results and shot clock BEFORE action
+      // Update the last move with action results, shot clock, and state values BEFORE action
       if (moveHistory.value.length > 0) {
         const lastMove = moveHistory.value[moveHistory.value.length - 1];
         if (response.state.last_action_results) {
@@ -170,6 +170,11 @@ async function handleActionsSubmitted(actions) {
         // Store shot clock when action was decided (before execution): board + 1
         if (response.state.shot_clock !== undefined) {
           lastMove.shotClock = response.state.shot_clock + 1;
+        }
+        // Store pre-step state values (values BEFORE this action was taken)
+        if (response.pre_step_state_values) {
+          lastMove.offensiveValue = response.pre_step_state_values.offensive_value;
+          lastMove.defensiveValue = response.pre_step_state_values.defensive_value;
         }
       }
       
@@ -217,6 +222,9 @@ async function handleMoveRecorded(moveData) {
         console.warn('[App] Failed to fetch pass steal probs for move:', err);
         moveData.passStealProbabilities = {};
     }
+    
+    // Note: State values are now added in handleActionsSubmitted from the step response
+    // This eliminates the race condition where step could complete before state values are fetched
     
     moveHistory.value.push(moveData);
 }
@@ -371,11 +379,14 @@ async function handleSelfPlay(preselected = null) {
           console.warn('[App Self-play] Failed to fetch pass steal probs:', err);
         }
         
+        // Push move to history (state values will be added after step response)
         moveHistory.value.push({
           turn: currentTurn,
           moves: teamMoves,
           ballHolder: ballHolder,
-          passStealProbabilities: passStealProbs
+          passStealProbabilities: passStealProbs,
+          offensiveValue: null,  // Will be filled from step response
+          defensiveValue: null   // Will be filled from step response
         });
       }
       
@@ -384,7 +395,7 @@ async function handleSelfPlay(preselected = null) {
         gameState.value = response.state;
         gameHistory.value.push(response.state);
         
-        // Update the last move with action results and shot clock BEFORE action
+        // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
           const lastMove = moveHistory.value[moveHistory.value.length - 1];
           if (response.state.last_action_results) {
@@ -393,6 +404,11 @@ async function handleSelfPlay(preselected = null) {
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {
             lastMove.shotClock = response.state.shot_clock + 1;
+          }
+          // Store pre-step state values (values BEFORE this action was taken)
+          if (response.pre_step_state_values) {
+            lastMove.offensiveValue = response.pre_step_state_values.offensive_value;
+            lastMove.defensiveValue = response.pre_step_state_values.defensive_value;
           }
         }
         

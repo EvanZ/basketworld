@@ -70,6 +70,11 @@ class GameState:
         # MLflow phi shaping parameters (used for Rewards tab calculations)
         # This is separate from env.phi_beta etc which can be modified in Phi Shaping tab
         self.mlflow_phi_shaping_params: dict | None = None
+        # Role flag encoding (for backward compatibility with old models)
+        self.role_flag_offense: float = 1.0  # Default to new encoding
+        self.role_flag_defense: float = -1.0  # Default to new encoding
+        # Cache previous observation to handle race condition between move-recorded and step
+        self.prev_obs: dict | None = None
 
 
 game_state = GameState()
@@ -220,6 +225,19 @@ async def init_game(request: InitGameRequest):
         # Load phi shaping parameters from MLflow
         # These will be used for Rewards tab calculations (independent of Phi Shaping tab)
         mlflow_phi_params = get_mlflow_phi_shaping_params(client, request.run_id)
+        
+        # Load environment parameters including role_flag encoding
+        required, optional = get_mlflow_params(client, request.run_id)
+        
+        # Extract role_flag encoding for backward compatibility (not passed to env)
+        game_state.role_flag_offense = optional.pop("role_flag_offense_value")
+        game_state.role_flag_defense = optional.pop("role_flag_defense_value")
+        encoding_version = optional.pop("role_flag_encoding_version")
+        
+        if encoding_version == "symmetric":
+            print(f"[INIT] Using SYMMETRIC role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
+        else:
+            print(f"[INIT] Using LEGACY role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
 
         # Unified-only
         unified_path = get_unified_policy_path(
@@ -254,6 +272,7 @@ async def init_game(request: InitGameRequest):
             render_mode="rgb_array",
         )
         game_state.obs, _ = game_state.env.reset()
+        game_state.prev_obs = None  # No previous observation at start
 
         # Log shot clock configuration for debugging
         print(
@@ -451,6 +470,110 @@ def calculate_phi_from_ep_data(
     return (1.0 - w) * teammate_aggregate + w * ball_ep
 
 
+def _compute_q_values_for_player(player_id: int, game_state: GameState) -> dict:
+    """Helper function to compute Q-values for all actions for a given player."""
+    action_values = {}
+    
+    if not game_state.env or game_state.obs is None:
+        return action_values
+    
+    value_policy = game_state.unified_policy
+    gamma = value_policy.gamma
+    
+    # Get the list of all possible action names from the enum
+    possible_actions = [action.name for action in ActionType]
+    
+    for action_name in possible_actions:
+        action_id = ActionType[action_name].value
+        
+        # --- Simulate one step forward ---
+        temp_env = copy.deepcopy(game_state.env)
+        
+        # Construct the full action array for the simulation
+        # Need to use correct policy for each player (main vs opponent)
+        sim_action = np.zeros(temp_env.n_players, dtype=int)
+        
+        # Get actions from main policy
+        full_actions_main, _ = game_state.unified_policy.predict(
+            game_state.obs, deterministic=True
+        )
+        
+        # Get actions from opponent policy if available
+        full_actions_opponent = None
+        if game_state.defense_policy is not None:
+            try:
+                # Flip role flag for opponent
+                opp_obs = {
+                    "obs": np.copy(game_state.obs["obs"]),
+                    "action_mask": game_state.obs["action_mask"],
+                    "role_flag": np.copy(game_state.obs.get("role_flag")),
+                    "skills": np.copy(game_state.obs.get("skills")),
+                }
+                if opp_obs.get("role_flag") is not None:
+                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
+                full_actions_opponent, _ = game_state.defense_policy.predict(
+                    opp_obs, deterministic=True
+                )
+            except Exception:
+                full_actions_opponent = None
+        
+        # Determine which team the evaluating player is on
+        is_player_on_user_team = (
+            (player_id in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or
+            (player_id in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+        )
+        
+        for i in range(temp_env.n_players):
+            if i == player_id:
+                # The player we're evaluating takes the specific action
+                sim_action[i] = action_id
+            else:
+                # Other players: use appropriate policy based on their team
+                is_i_on_user_team = (
+                    (i in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or
+                    (i in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+                )
+                
+                if is_i_on_user_team:
+                    sim_action[i] = full_actions_main[i]
+                elif full_actions_opponent is not None:
+                    sim_action[i] = full_actions_opponent[i]
+                else:
+                    sim_action[i] = full_actions_main[i]
+        
+        # Step the temporary environment
+        next_obs, reward, _, _, _ = temp_env.step(sim_action)
+        
+        # Get the value of the resulting state with proper role_flag conditioning
+        # Determine which role_flag to use based on which team the player is on
+        is_offense = player_id in game_state.env.offense_ids
+        role_flag_value = game_state.role_flag_offense if is_offense else game_state.role_flag_defense
+        
+        # Create role-conditioned observation for value prediction
+        conditioned_next_obs = {
+            "obs": np.copy(next_obs["obs"]),
+            "action_mask": next_obs["action_mask"],
+            "role_flag": np.array([role_flag_value], dtype=np.float32),
+            "skills": np.copy(next_obs.get("skills")) if next_obs.get("skills") is not None else None,
+        }
+        
+        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
+        with torch.no_grad():
+            next_value = value_policy.policy.predict_values(next_obs_tensor)
+        
+        # Calculate the Q-value
+        team_reward = reward[player_id]
+        q_value = team_reward + gamma * next_value.item()
+        
+        # Debug: log if Q-value seems anomalous
+        if abs(q_value) > 2.5:
+            print(f"[Q-VALUE WARNING] Player {player_id} action {action_name}: Q={q_value:.3f}, r={team_reward:.3f}, V(s')={next_value.item():.3f}, role_flag={role_flag_value}, gamma={gamma}")
+        
+        action_values[action_name] = q_value
+    
+    return action_values
+
+
 @app.post("/api/step")
 def take_step(request: ActionRequest):
     """Takes a single step in the environment."""
@@ -483,7 +606,7 @@ def take_step(request: ActionRequest):
                     "skills": np.copy(ai_obs.get("skills")),
                 }
                 if opp_obs.get("role_flag") is not None:
-                    opp_obs["role_flag"] = 1.0 - opp_obs["role_flag"]
+                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
             except Exception:
                 opp_obs = ai_obs
             full_action_ai_opponent, _ = game_state.defense_policy.predict(
@@ -558,6 +681,47 @@ def take_step(request: ActionRequest):
             else:
                 full_action[i] = int(resolved_unified[i])
 
+    # Calculate state values BEFORE the step using Q-values: V(s) = Σ π(a|s) * Q(s,a)
+    # This is more reliable than calling the critic directly
+    pre_step_offensive_value = None
+    pre_step_defensive_value = None
+    try:
+        # Get Q-values and policy probs for offensive team's active player (ball handler or representative)
+        offense_player_ids = list(game_state.env.offense_ids)
+        defense_player_ids = list(game_state.env.defense_ids)
+        
+        if offense_player_ids:
+            # Use ball handler if available, otherwise first offensive player
+            offense_rep = game_state.env.ball_holder if game_state.env.ball_holder in offense_player_ids else offense_player_ids[0]
+            offense_q_values = _compute_q_values_for_player(offense_rep, game_state)
+            offense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            # V(s) = Σ π(a|s) * Q(s,a)
+            pre_step_offensive_value = sum(
+                offense_probs[offense_rep][i] * offense_q_values.get(ActionType(i).name, 0.0)
+                for i in range(len(offense_probs[offense_rep]))
+            )
+        
+        if defense_player_ids:
+            # Use first defensive player as representative
+            defense_rep = defense_player_ids[0]
+            defense_q_values = _compute_q_values_for_player(defense_rep, game_state)
+            defense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            # V(s) = Σ π(a|s) * Q(s,a)
+            pre_step_defensive_value = sum(
+                defense_probs[defense_rep][i] * defense_q_values.get(ActionType(i).name, 0.0)
+                for i in range(len(defense_probs[defense_rep]))
+            )
+        
+        print(f"[STATE_VALUES] Offensive V(s) = {pre_step_offensive_value:.3f} (from Q-values)")
+        print(f"[STATE_VALUES] Defensive V(s) = {pre_step_defensive_value:.3f} (from Q-values)")
+    except Exception as e:
+        print(f"[WARNING] Failed to calculate pre-step state values: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Cache the current observation before stepping (for backward compat with /api/state_values)
+    game_state.prev_obs = game_state.obs
+    
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
     # Record the full action array for replay (both manual and self-play)
@@ -842,6 +1006,10 @@ def take_step(request: ActionRequest):
             "offense": float(game_state.episode_rewards["offense"]),
             "defense": float(game_state.episode_rewards["defense"]),
         },
+        "pre_step_state_values": {
+            "offensive_value": float(pre_step_offensive_value) if pre_step_offensive_value is not None else None,
+            "defensive_value": float(pre_step_defensive_value) if pre_step_defensive_value is not None else None,
+        },
     }
 
 
@@ -947,6 +1115,7 @@ def start_self_play():
         "shot_clock": init_shot_clock,
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
+    game_state.prev_obs = None  # No previous observation at start
 
     # Capture initial frame
     try:
@@ -1605,63 +1774,85 @@ def get_action_values(player_id: int):
         return jsonable_encoder({})
 
     print(f"\n[API] Received request for Q-values for player {player_id}")
-    action_values = {}
-
-    # Unified-only
-    value_policy = game_state.unified_policy
-    gamma = value_policy.gamma
-
-    # Get the list of all possible action names from the enum
-    possible_actions = [action.name for action in ActionType]
-
-    for action_name in possible_actions:
-        action_id = ActionType[action_name].value
-
-        # --- Simulate one step forward ---
-        temp_env = copy.deepcopy(game_state.env)
-
-        # Construct the full action array for the simulation
-        # The target player takes the action, others act based on their policy
-        sim_action = np.zeros(temp_env.n_players, dtype=int)
-
-        full_actions, _ = game_state.unified_policy.predict(
-            game_state.obs, deterministic=True
-        )
-
-        for i in range(temp_env.n_players):
-            if i == player_id:
-                sim_action[i] = action_id
-            else:
-                sim_action[i] = full_actions[i]
-
-        # Step the temporary environment
-        next_obs, reward, _, _, _ = temp_env.step(sim_action)
-
-        # Get the value of the resulting state
-        # Convert the next observation to a tensor for the policy
-        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(next_obs)
-        with torch.no_grad():
-            next_value = value_policy.policy.predict_values(next_obs_tensor)
-
-        # Calculate the Q-value
-        # We need the specific reward for the team being evaluated
-        team_reward = reward[player_id]
-        q_value = team_reward + gamma * next_value.item()
-
-        print(
-            f"  - Simulating '{action_name}': "
-            f"Immediate Reward = {team_reward:.3f}, "
-            f"Next State Value = {next_value.item():.3f}, "
-            f"Q-Value = {q_value:.3f}"
-        )
-
-        action_values[action_name] = q_value
+    action_values = _compute_q_values_for_player(player_id, game_state)
 
     print(f"[API] Sending action values for player {player_id}:")
     import json
 
     print(json.dumps(action_values, indent=2))
     return jsonable_encoder(action_values)
+
+
+@app.get("/api/state_values")
+def get_state_values():
+    """Get the value function estimates for the PRE-STEP state from both perspectives.
+    
+    Uses the learned value function with role_flag conditioning.
+    Uses prev_obs (cached before step) to avoid race condition where step completes first.
+    
+    Returns:
+        offensive_value: Value function estimate for offensive team
+        defensive_value: Value function estimate for defensive team
+    """
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    
+    if game_state.env.episode_ended:
+        return {
+            "offensive_value": 0.0,
+            "defensive_value": 0.0
+        }
+    
+    try:
+        value_policy = game_state.unified_policy
+        
+        # Use prev_obs if available (set right before step), otherwise current obs
+        # This handles race condition where step completes before this API call
+        obs_to_use = game_state.prev_obs if game_state.prev_obs is not None else game_state.obs
+        
+        # Get offensive value (using loaded encoding)
+        obs_offense = {
+            "obs": np.copy(obs_to_use["obs"]),
+            "action_mask": obs_to_use["action_mask"],
+            "role_flag": np.array([game_state.role_flag_offense], dtype=np.float32),
+            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
+        }
+        
+        obs_tensor_offense, _ = value_policy.policy.obs_to_tensor(obs_offense)
+        with torch.no_grad():
+            value_offense = value_policy.policy.predict_values(obs_tensor_offense).item()
+        
+        # Get defensive value (using loaded encoding)
+        obs_defense = {
+            "obs": np.copy(obs_to_use["obs"]),
+            "action_mask": obs_to_use["action_mask"],
+            "role_flag": np.array([game_state.role_flag_defense], dtype=np.float32),
+            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
+        }
+        
+        obs_tensor_defense, _ = value_policy.policy.obs_to_tensor(obs_defense)
+        with torch.no_grad():
+            value_defense = value_policy.policy.predict_values(obs_tensor_defense).item()
+        
+        # Clear prev_obs after using it (consumed)
+        game_state.prev_obs = None
+        
+        print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {value_offense:.3f}")
+        print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {value_defense:.3f}")
+        
+        return {
+            "offensive_value": float(value_offense),
+            "defensive_value": float(value_defense)
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to calculate state values: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "offensive_value": 0.0,
+            "defensive_value": 0.0,
+            "error": str(e)
+        }
 
 
 @app.get("/api/shot_probability/{player_id}")

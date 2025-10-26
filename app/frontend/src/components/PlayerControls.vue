@@ -1005,6 +1005,8 @@ const phiRef = vueRef(null);
               <th v-for="playerId in userControlledPlayerIds" :key="playerId">
                 Player {{ playerId }}
               </th>
+              <th>Off Value</th>
+              <th>Def Value</th>
             </tr>
           </thead>
           <tbody>
@@ -1021,6 +1023,12 @@ const phiRef = vueRef(null);
                 <div v-if="getDefenderPressureProbability(move, playerId) !== null" class="defender-pressure-info">
                   ({{ (getDefenderPressureProbability(move, playerId) * 100).toFixed(1) }}% turnover risk)
                 </div>
+              </td>
+              <td class="value-cell">
+                {{ move.offensiveValue !== null && move.offensiveValue !== undefined ? move.offensiveValue.toFixed(3) : '-' }}
+              </td>
+              <td class="value-cell">
+                {{ move.defensiveValue !== null && move.defensiveValue !== undefined ? move.defensiveValue.toFixed(3) : '-' }}
               </td>
             </tr>
           </tbody>
@@ -1489,6 +1497,13 @@ const phiRef = vueRef(null);
 .moves-table th {
   background-color: #f5f5f5;
   font-weight: bold;
+}
+
+.value-cell {
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+  color: #333;
+  font-weight: 500;
 }
 
 .moves-table tr:nth-child(even) {

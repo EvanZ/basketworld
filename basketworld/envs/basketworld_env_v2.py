@@ -276,7 +276,8 @@ class HexagonBasketballEnv(gym.Env):
         )
 
         # The full observation space is a dictionary containing the state and the mask
-        role_flag_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        # role_flag: -1.0 = defense, +1.0 = offense (symmetric encoding)
+        role_flag_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         skills_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -645,7 +646,7 @@ class HexagonBasketballEnv(gym.Env):
             "obs": self._get_observation(),
             "action_mask": self._get_action_masks(),
             "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                [1.0 if self.training_team == Team.OFFENSE else -1.0],
                 dtype=np.float32,
             ),
             "skills": self._get_offense_skills_array(),
@@ -912,7 +913,7 @@ class HexagonBasketballEnv(gym.Env):
             "obs": self._get_observation(),
             "action_mask": self._get_action_masks(),
             "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                [1.0 if self.training_team == Team.OFFENSE else -1.0],
                 dtype=np.float32,
             ),
             "skills": self._get_offense_skills_array(),

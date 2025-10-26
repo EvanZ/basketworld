@@ -98,6 +98,20 @@ export const getPassStealProbabilities = async () => {
   return json;
 };
 
+export const getStateValues = async () => {
+  const url = `${API_BASE_URL}/api/state_values`;
+  console.log('[API] getStateValues →', url);
+  const response = await fetch(url);
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    console.error('[API] getStateValues failed:', response.status, response.statusText, text);
+    throw new Error(`Failed to get state values: ${response.statusText}`);
+  }
+  const json = await response.json();
+  console.log('[API] getStateValues ←', json);
+  return json;
+};
+
 export const getRewards = async () => {
   const response = await fetch(`${API_BASE_URL}/api/rewards`);
   if (!response.ok) {

@@ -258,6 +258,27 @@ def get_mlflow_params(
     optional["illegal_action_policy"] = _get_param(
         params, ["illegal_action_policy", "illegal-action-policy"], str, "noop"
     )
+    
+    # Role flag encoding (for backward compatibility with old models)
+    optional["role_flag_offense_value"] = _get_param(
+        params,
+        ["role_flag_offense_value", "role-flag-offense-value"],
+        float,
+        1.0,  # Default to legacy encoding
+    )
+    optional["role_flag_defense_value"] = _get_param(
+        params,
+        ["role_flag_defense_value", "role-flag-defense-value"],
+        float,
+        0.0,  # Default to legacy encoding
+    )
+    optional["role_flag_encoding_version"] = _get_param(
+        params,
+        ["role_flag_encoding_version", "role-flag-encoding-version"],
+        str,
+        "legacy",  # Default to legacy encoding
+    )
+    
     # Note: use_vec_normalize is deprecated and not passed to environment
     # (kept in train.py for MLflow compatibility only)
     return required, optional

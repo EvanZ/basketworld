@@ -234,6 +234,8 @@ def run_eval_for_pair(
     client,
     run_id: str,
     temp_dir: str,
+    role_flag_offense: float = 1.0,
+    role_flag_defense: float = 0.0,
 ):
     env = HexagonBasketballEnv(
         **required,
@@ -287,8 +289,8 @@ def run_eval_for_pair(
             offense_obs = dict(obs)
             defense_obs = dict(obs)
             try:
-                offense_obs["role_flag"] = np.array([1.0], dtype=np.float32)
-                defense_obs["role_flag"] = np.array([0.0], dtype=np.float32)
+                offense_obs["role_flag"] = np.array([role_flag_offense], dtype=np.float32)
+                defense_obs["role_flag"] = np.array([role_flag_defense], dtype=np.float32)
             except Exception:
                 pass
 
@@ -814,6 +816,12 @@ def main(args):
         print(f"Error: Run {args.run_id} is missing a required parameter: {e}")
         return
 
+    # Extract role_flag encoding for backward compatibility (not passed to env)
+    role_flag_offense = optional.pop("role_flag_offense_value")
+    role_flag_defense = optional.pop("role_flag_defense_value")
+    encoding_version = optional.pop("role_flag_encoding_version")
+    print(f"[EVALUATE] Using role_flag encoding ({encoding_version}): offense={role_flag_offense}, defense={role_flag_defense}")
+
     # Re-open the original run context to log new artifacts to the correct run
     with mlflow.start_run(run_id=args.run_id):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -861,6 +869,8 @@ def main(args):
                             client,
                             args.run_id,
                             temp_dir,
+                            role_flag_offense,
+                            role_flag_defense,
                         )
                         row = summarize_to_row(results, alt_idx)
                         rows.append(row)
@@ -928,6 +938,8 @@ def main(args):
                         client,
                         args.run_id,
                         temp_dir,
+                        role_flag_offense,
+                        role_flag_defense,
                     )
                     analyze_results(results, args.episodes)
                 else:
