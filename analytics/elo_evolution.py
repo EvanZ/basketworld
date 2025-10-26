@@ -143,8 +143,8 @@ def play_episode(
         offense_obs = dict(obs)
         defense_obs = dict(obs)
         try:
-            offense_obs["role_flag"] = np.array([1.0], dtype=np.float32)
-            defense_obs["role_flag"] = np.array([0.0], dtype=np.float32)
+            offense_obs["role_flag"] = np.array([role_flag_offense], dtype=np.float32)
+            defense_obs["role_flag"] = np.array([role_flag_defense], dtype=np.float32)
         except Exception:
             pass
 
@@ -603,10 +603,18 @@ def main(args):
     print("Fetching environment configuration from MLflow run...")
     try:
         required, optional = get_mlflow_params(client, args.run_id)
-        env_config = {**required, **optional}
     except KeyError as e:
         print(f"Error: Run {args.run_id} is missing required parameter: {e}")
         return
+
+    # Extract role_flag encoding for backward compatibility (not passed to env)
+    role_flag_offense = optional.pop("role_flag_offense_value")
+    role_flag_defense = optional.pop("role_flag_defense_value")
+    encoding_version = optional.pop("role_flag_encoding_version")
+    print(f"[ELO_EVOLUTION] Using role_flag encoding ({encoding_version}): offense={role_flag_offense}, defense={role_flag_defense}")
+    
+    # Combine required and optional for env creation (after popping role_flag params)
+    env_config = {**required, **optional}
 
     # List all unified models
     models = list_unified_by_alternation(client, args.run_id)

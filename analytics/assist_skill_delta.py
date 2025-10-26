@@ -129,6 +129,12 @@ def run_episodes_and_log_csv(args):
 
     # Fetch env params from run
     required, optional = get_mlflow_params(client, args.run_id)
+    
+    # Extract role_flag encoding parameters (not passed to env)
+    optional.pop("role_flag_offense_value", None)
+    optional.pop("role_flag_defense_value", None)
+    optional.pop("role_flag_encoding_version", None)
+    
     # Inject std params from run if present
     optional.update(_extract_std_params_from_run(client, args.run_id))
 

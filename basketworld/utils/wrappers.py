@@ -32,6 +32,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
     Exposes keys consumed by Monitor(info_keywords=...):
       shot_dunk, shot_2pt, shot_3pt, assisted_dunk, assisted_2pt, assisted_3pt,
       passes, turnover, turnover_pass_oob, turnover_intercepted, turnover_pressure,
+      turnover_offensive_lane, defensive_lane_violation,
       made_dunk, made_2pt, made_3pt, attempts
     """
 
@@ -51,6 +52,8 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._turnover_pass_oob = 0.0
         self._turnover_intercepted = 0.0
         self._turnover_pressure = 0.0
+        self._turnover_offensive_lane = 0.0
+        self._defensive_lane_violation = 0.0
         self._made_dunk = 0.0
         self._made_2pt = 0.0
         self._made_3pt = 0.0
@@ -147,6 +150,12 @@ class EpisodeStatsWrapper(gym.Wrapper):
                         self._turnover_intercepted = 1.0
                     elif reason == "defender_pressure":
                         self._turnover_pressure = 1.0
+                    elif reason == "offensive_three_seconds":
+                        self._turnover_offensive_lane = 1.0
+            
+            # Track defensive lane violations (separate from turnovers)
+            if ar.get("defensive_lane_violations"):
+                self._defensive_lane_violation = float(len(ar["defensive_lane_violations"]))
         except Exception:
             pass
 
@@ -162,6 +171,8 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["turnover_pass_oob"] = self._turnover_pass_oob
             info["turnover_intercepted"] = self._turnover_intercepted
             info["turnover_pressure"] = self._turnover_pressure
+            info["turnover_offensive_lane"] = self._turnover_offensive_lane
+            info["defensive_lane_violation"] = self._defensive_lane_violation
             info["made_dunk"] = self._made_dunk
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt

@@ -71,7 +71,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             opponent_obs["role_flag"] = (
                 np.array([1.0], dtype=np.float32)
                 if opponent_is_offense
-                else np.array([0.0], dtype=np.float32)
+                else np.array([-1.0], dtype=np.float32)
             )
         except Exception:
             pass

@@ -130,6 +130,12 @@ def main(args):
 
     required, optional = get_mlflow_params(client, args.run_id)
 
+    # Extract role_flag encoding for backward compatibility (not passed to env)
+    role_flag_offense = optional.pop("role_flag_offense_value")
+    role_flag_defense = optional.pop("role_flag_defense_value")
+    encoding_version = optional.pop("role_flag_encoding_version")
+    print(f"[SHOTCHART] Using role_flag encoding ({encoding_version}): offense={role_flag_offense}, defense={role_flag_defense}")
+
     # Download models and support unified alternation list
     artifacts = client.list_artifacts(args.run_id, "models")
 
@@ -323,7 +329,7 @@ def main(args):
                         offense_obs = {
                             "obs": np.copy(obs["obs"]),
                             "action_mask": action_mask,
-                            "role_flag": np.array([1.0], dtype=np.float32),
+                            "role_flag": np.array([role_flag_offense], dtype=np.float32),
                             "skills": (
                                 np.copy(obs.get("skills"))
                                 if obs.get("skills") is not None
@@ -336,7 +342,7 @@ def main(args):
                         defense_obs = {
                             "obs": np.copy(obs["obs"]),
                             "action_mask": action_mask,
-                            "role_flag": np.array([0.0], dtype=np.float32),
+                            "role_flag": np.array([role_flag_defense], dtype=np.float32),
                             "skills": (
                                 np.copy(obs.get("skills"))
                                 if obs.get("skills") is not None

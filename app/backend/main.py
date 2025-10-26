@@ -70,6 +70,11 @@ class GameState:
         # MLflow phi shaping parameters (used for Rewards tab calculations)
         # This is separate from env.phi_beta etc which can be modified in Phi Shaping tab
         self.mlflow_phi_shaping_params: dict | None = None
+        # Role flag encoding (for backward compatibility with old models)
+        self.role_flag_offense: float = 1.0  # Default to new encoding
+        self.role_flag_defense: float = -1.0  # Default to new encoding
+        # Cache previous observation to handle race condition between move-recorded and step
+        self.prev_obs: dict | None = None
 
 
 game_state = GameState()
@@ -95,7 +100,8 @@ class ActionRequest(BaseModel):
     actions: dict[
         str, int
     ]  # JSON keys are strings, so we accept strings and convert later.
-    deterministic: bool | None = None
+    player_deterministic: bool | None = None
+    opponent_deterministic: bool | None = None
 
 
 # --- FastAPI App ---
@@ -219,6 +225,19 @@ async def init_game(request: InitGameRequest):
         # Load phi shaping parameters from MLflow
         # These will be used for Rewards tab calculations (independent of Phi Shaping tab)
         mlflow_phi_params = get_mlflow_phi_shaping_params(client, request.run_id)
+        
+        # Load environment parameters including role_flag encoding
+        required, optional = get_mlflow_params(client, request.run_id)
+        
+        # Extract role_flag encoding for backward compatibility (not passed to env)
+        game_state.role_flag_offense = optional.pop("role_flag_offense_value")
+        game_state.role_flag_defense = optional.pop("role_flag_defense_value")
+        encoding_version = optional.pop("role_flag_encoding_version")
+        
+        if encoding_version == "symmetric":
+            print(f"[INIT] Using SYMMETRIC role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
+        else:
+            print(f"[INIT] Using LEGACY role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
 
         # Unified-only
         unified_path = get_unified_policy_path(
@@ -253,6 +272,7 @@ async def init_game(request: InitGameRequest):
             render_mode="rgb_array",
         )
         game_state.obs, _ = game_state.env.reset()
+        game_state.prev_obs = None  # No previous observation at start
 
         # Log shot clock configuration for debugging
         print(
@@ -288,8 +308,10 @@ async def init_game(request: InitGameRequest):
             frame = game_state.env.render()
             if frame is not None:
                 game_state.frames.append(frame)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to capture initial frame: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Record initial state for replay (manual or self-play) with policy probs
         initial_state = get_full_game_state(include_policy_probs=True)
@@ -448,6 +470,110 @@ def calculate_phi_from_ep_data(
     return (1.0 - w) * teammate_aggregate + w * ball_ep
 
 
+def _compute_q_values_for_player(player_id: int, game_state: GameState) -> dict:
+    """Helper function to compute Q-values for all actions for a given player."""
+    action_values = {}
+    
+    if not game_state.env or game_state.obs is None:
+        return action_values
+    
+    value_policy = game_state.unified_policy
+    gamma = value_policy.gamma
+    
+    # Get the list of all possible action names from the enum
+    possible_actions = [action.name for action in ActionType]
+    
+    for action_name in possible_actions:
+        action_id = ActionType[action_name].value
+        
+        # --- Simulate one step forward ---
+        temp_env = copy.deepcopy(game_state.env)
+        
+        # Construct the full action array for the simulation
+        # Need to use correct policy for each player (main vs opponent)
+        sim_action = np.zeros(temp_env.n_players, dtype=int)
+        
+        # Get actions from main policy
+        full_actions_main, _ = game_state.unified_policy.predict(
+            game_state.obs, deterministic=True
+        )
+        
+        # Get actions from opponent policy if available
+        full_actions_opponent = None
+        if game_state.defense_policy is not None:
+            try:
+                # Flip role flag for opponent
+                opp_obs = {
+                    "obs": np.copy(game_state.obs["obs"]),
+                    "action_mask": game_state.obs["action_mask"],
+                    "role_flag": np.copy(game_state.obs.get("role_flag")),
+                    "skills": np.copy(game_state.obs.get("skills")),
+                }
+                if opp_obs.get("role_flag") is not None:
+                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
+                full_actions_opponent, _ = game_state.defense_policy.predict(
+                    opp_obs, deterministic=True
+                )
+            except Exception:
+                full_actions_opponent = None
+        
+        # Determine which team the evaluating player is on
+        is_player_on_user_team = (
+            (player_id in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or
+            (player_id in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+        )
+        
+        for i in range(temp_env.n_players):
+            if i == player_id:
+                # The player we're evaluating takes the specific action
+                sim_action[i] = action_id
+            else:
+                # Other players: use appropriate policy based on their team
+                is_i_on_user_team = (
+                    (i in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or
+                    (i in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+                )
+                
+                if is_i_on_user_team:
+                    sim_action[i] = full_actions_main[i]
+                elif full_actions_opponent is not None:
+                    sim_action[i] = full_actions_opponent[i]
+                else:
+                    sim_action[i] = full_actions_main[i]
+        
+        # Step the temporary environment
+        next_obs, reward, _, _, _ = temp_env.step(sim_action)
+        
+        # Get the value of the resulting state with proper role_flag conditioning
+        # Determine which role_flag to use based on which team the player is on
+        is_offense = player_id in game_state.env.offense_ids
+        role_flag_value = game_state.role_flag_offense if is_offense else game_state.role_flag_defense
+        
+        # Create role-conditioned observation for value prediction
+        conditioned_next_obs = {
+            "obs": np.copy(next_obs["obs"]),
+            "action_mask": next_obs["action_mask"],
+            "role_flag": np.array([role_flag_value], dtype=np.float32),
+            "skills": np.copy(next_obs.get("skills")) if next_obs.get("skills") is not None else None,
+        }
+        
+        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
+        with torch.no_grad():
+            next_value = value_policy.policy.predict_values(next_obs_tensor)
+        
+        # Calculate the Q-value
+        team_reward = reward[player_id]
+        q_value = team_reward + gamma * next_value.item()
+        
+        # Debug: log if Q-value seems anomalous
+        if abs(q_value) > 2.5:
+            print(f"[Q-VALUE WARNING] Player {player_id} action {action_name}: Q={q_value:.3f}, r={team_reward:.3f}, V(s')={next_value.item():.3f}, role_flag={role_flag_value}, gamma={gamma}")
+        
+        action_values[action_name] = q_value
+    
+    return action_values
+
+
 @app.post("/api/step")
 def take_step(request: ActionRequest):
     """Takes a single step in the environment."""
@@ -457,11 +583,15 @@ def take_step(request: ActionRequest):
     # Get AI actions (unified-only)
     ai_obs = game_state.obs
     # Default to deterministic=True if not provided to preserve previous behavior
-    pred_deterministic = (
-        True if request.deterministic is None else bool(request.deterministic)
+    player_deterministic = (
+        True if request.player_deterministic is None else bool(request.player_deterministic)
     )
+    opponent_deterministic = (
+        True if request.opponent_deterministic is None else bool(request.opponent_deterministic)
+    )
+    
     full_action_ai, _ = game_state.unified_policy.predict(
-        ai_obs, deterministic=pred_deterministic
+        ai_obs, deterministic=player_deterministic
     )
     full_action_ai_opponent = None
     if game_state.defense_policy is not None:
@@ -476,11 +606,11 @@ def take_step(request: ActionRequest):
                     "skills": np.copy(ai_obs.get("skills")),
                 }
                 if opp_obs.get("role_flag") is not None:
-                    opp_obs["role_flag"] = 1.0 - opp_obs["role_flag"]
+                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
             except Exception:
                 opp_obs = ai_obs
             full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                opp_obs, deterministic=True
+                opp_obs, deterministic=opponent_deterministic
             )
         except Exception:
             full_action_ai_opponent = None
@@ -495,22 +625,27 @@ def take_step(request: ActionRequest):
     )
     player_team_strategy = (
         IllegalActionStrategy.BEST_PROB
-        if pred_deterministic
+        if player_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    opponent_team_strategy = (
+        IllegalActionStrategy.BEST_PROB
+        if opponent_deterministic
         else IllegalActionStrategy.SAMPLE_PROB
     )
     resolved_unified = resolve_illegal_actions(
         np.array(full_action_ai),
         action_mask,
         player_team_strategy,
-        pred_deterministic,
+        player_deterministic,
         unified_probs,
     )
     resolved_opponent = (
         resolve_illegal_actions(
             np.array(full_action_ai_opponent),
             action_mask,
-            IllegalActionStrategy.BEST_PROB,
-            True,
+            opponent_team_strategy,
+            opponent_deterministic,
             opponent_probs,
         )
         if full_action_ai_opponent is not None
@@ -546,6 +681,47 @@ def take_step(request: ActionRequest):
             else:
                 full_action[i] = int(resolved_unified[i])
 
+    # Calculate state values BEFORE the step using Q-values: V(s) = Σ π(a|s) * Q(s,a)
+    # This is more reliable than calling the critic directly
+    pre_step_offensive_value = None
+    pre_step_defensive_value = None
+    try:
+        # Get Q-values and policy probs for offensive team's active player (ball handler or representative)
+        offense_player_ids = list(game_state.env.offense_ids)
+        defense_player_ids = list(game_state.env.defense_ids)
+        
+        if offense_player_ids:
+            # Use ball handler if available, otherwise first offensive player
+            offense_rep = game_state.env.ball_holder if game_state.env.ball_holder in offense_player_ids else offense_player_ids[0]
+            offense_q_values = _compute_q_values_for_player(offense_rep, game_state)
+            offense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            # V(s) = Σ π(a|s) * Q(s,a)
+            pre_step_offensive_value = sum(
+                offense_probs[offense_rep][i] * offense_q_values.get(ActionType(i).name, 0.0)
+                for i in range(len(offense_probs[offense_rep]))
+            )
+        
+        if defense_player_ids:
+            # Use first defensive player as representative
+            defense_rep = defense_player_ids[0]
+            defense_q_values = _compute_q_values_for_player(defense_rep, game_state)
+            defense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            # V(s) = Σ π(a|s) * Q(s,a)
+            pre_step_defensive_value = sum(
+                defense_probs[defense_rep][i] * defense_q_values.get(ActionType(i).name, 0.0)
+                for i in range(len(defense_probs[defense_rep]))
+            )
+        
+        print(f"[STATE_VALUES] Offensive V(s) = {pre_step_offensive_value:.3f} (from Q-values)")
+        print(f"[STATE_VALUES] Defensive V(s) = {pre_step_defensive_value:.3f} (from Q-values)")
+    except Exception as e:
+        print(f"[WARNING] Failed to calculate pre-step state values: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Cache the current observation before stepping (for backward compat with /api/state_values)
+    game_state.prev_obs = game_state.obs
+    
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
 
     # Record the full action array for replay (both manual and self-play)
@@ -760,6 +936,7 @@ def take_step(request: ActionRequest):
             ),
             "offense_ids": list(game_state.env.offense_ids),
             "is_terminal": bool(done),
+            "shot_clock": int(game_state.env.shot_clock),  # Shot clock after action executed (when reward received)
         }
     )
 
@@ -805,8 +982,10 @@ def take_step(request: ActionRequest):
         frame = game_state.env.render()
         if frame is not None:
             game_state.frames.append(frame)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to capture frame at step {len(game_state.frames)}: {e}")
+        import traceback
+        traceback.print_exc()
     # Record resulting state for replay with policy probs
     try:
         game_state.episode_states.append(get_full_game_state(include_policy_probs=True))
@@ -826,6 +1005,10 @@ def take_step(request: ActionRequest):
         "episode_rewards": {
             "offense": float(game_state.episode_rewards["offense"]),
             "defense": float(game_state.episode_rewards["defense"]),
+        },
+        "pre_step_state_values": {
+            "offensive_value": float(pre_step_offensive_value) if pre_step_offensive_value is not None else None,
+            "defensive_value": float(pre_step_defensive_value) if pre_step_defensive_value is not None else None,
         },
     }
 
@@ -932,6 +1115,7 @@ def start_self_play():
         "shot_clock": init_shot_clock,
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
+    game_state.prev_obs = None  # No previous observation at start
 
     # Capture initial frame
     try:
@@ -946,7 +1130,8 @@ def start_self_play():
 
 class EvaluationRequest(BaseModel):
     num_episodes: int = 100
-    deterministic: bool = True
+    player_deterministic: bool = True
+    opponent_deterministic: bool = True
 
 
 @app.post("/api/run_evaluation")
@@ -970,7 +1155,8 @@ def run_evaluation(request: EvaluationRequest):
         )
 
     num_episodes = max(1, min(request.num_episodes, 10000))  # Cap at 10000 for safety
-    deterministic = request.deterministic
+    player_deterministic = request.player_deterministic
+    opponent_deterministic = request.opponent_deterministic
 
     episode_results = []
 
@@ -981,7 +1167,8 @@ def run_evaluation(request: EvaluationRequest):
     # These values come from the environment initialized with MLflow parameters
     print(f"[Evaluation] Starting {num_episodes} episodes")
     print(f"[Evaluation] Configuration:")
-    print(f"  - Deterministic policy: {deterministic}")
+    print(f"  - Player deterministic: {player_deterministic}")
+    print(f"  - Opponent deterministic: {opponent_deterministic}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
     print(f"  - User team: {game_state.user_team.name}")
     print(f"  - Unified policy (user): {game_state.unified_policy_key}")
@@ -1030,7 +1217,7 @@ def run_evaluation(request: EvaluationRequest):
         while not done and step_count < 1000:  # Safety limit
             # Get AI actions for both teams
             full_action_ai, _ = game_state.unified_policy.predict(
-                obs, deterministic=deterministic
+                obs, deterministic=player_deterministic
             )
 
             # Calculate policy entropy for diagnostics
@@ -1060,7 +1247,7 @@ def run_evaluation(request: EvaluationRequest):
                     if opponent_obs.get("role_flag") is not None:
                         opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
                     full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                        opponent_obs, deterministic=True
+                        opponent_obs, deterministic=opponent_deterministic
                     )
                 except Exception:
                     full_action_ai_opponent = None
@@ -1080,7 +1267,12 @@ def run_evaluation(request: EvaluationRequest):
 
             player_team_strategy = (
                 IllegalActionStrategy.BEST_PROB
-                if deterministic
+                if player_deterministic
+                else IllegalActionStrategy.SAMPLE_PROB
+            )
+            opponent_team_strategy = (
+                IllegalActionStrategy.BEST_PROB
+                if opponent_deterministic
                 else IllegalActionStrategy.SAMPLE_PROB
             )
 
@@ -1088,7 +1280,7 @@ def run_evaluation(request: EvaluationRequest):
                 np.array(full_action_ai),
                 action_mask,
                 player_team_strategy,
-                deterministic,
+                player_deterministic,
                 unified_probs,
             )
 
@@ -1096,8 +1288,8 @@ def run_evaluation(request: EvaluationRequest):
                 resolved_opponent = resolve_illegal_actions(
                     np.array(full_action_ai_opponent),
                     action_mask,
-                    IllegalActionStrategy.BEST_PROB,
-                    True,
+                    opponent_team_strategy,
+                    opponent_deterministic,
                     opponent_probs,
                 )
             else:
@@ -1368,11 +1560,24 @@ def get_shot_stats():
     }
 
 
+@app.get("/api/debug/frames")
+def debug_frames():
+    """Debug endpoint to check frame capture status."""
+    return {
+        "frames_count": len(game_state.frames) if game_state.frames else 0,
+        "env_exists": game_state.env is not None,
+        "render_mode": getattr(game_state.env, "render_mode", None) if game_state.env else None,
+        "has_offensive_lane_hexes": hasattr(game_state.env, "offensive_lane_hexes") if game_state.env else False,
+    }
+
 @app.post("/api/save_episode")
 def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
+    print(f"[SAVE_EPISODE] Frames count: {len(game_state.frames)}")
+    print(f"[SAVE_EPISODE] Env exists: {game_state.env is not None}")
+    
     if not game_state.frames:
-        raise HTTPException(status_code=400, detail="No episode frames to save.")
+        raise HTTPException(status_code=400, detail=f"No episode frames to save. Frames list is empty (length: {len(game_state.frames) if game_state.frames else 0}).")
     # Determine directory using MLflow run_id if available
     base_dir = "episodes"
     if getattr(game_state, "run_id", None):
@@ -1563,64 +1768,91 @@ def get_action_values(player_id: int):
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
+    # Check if the episode has ended - if so, return empty values
+    if game_state.env.episode_ended:
+        print(f"[API] Episode has ended, returning empty action values for player {player_id}")
+        return jsonable_encoder({})
+
     print(f"\n[API] Received request for Q-values for player {player_id}")
-    action_values = {}
-
-    # Unified-only
-    value_policy = game_state.unified_policy
-    gamma = value_policy.gamma
-
-    # Get the list of all possible action names from the enum
-    possible_actions = [action.name for action in ActionType]
-
-    for action_name in possible_actions:
-        action_id = ActionType[action_name].value
-
-        # --- Simulate one step forward ---
-        temp_env = copy.deepcopy(game_state.env)
-
-        # Construct the full action array for the simulation
-        # The target player takes the action, others act based on their policy
-        sim_action = np.zeros(temp_env.n_players, dtype=int)
-
-        full_actions, _ = game_state.unified_policy.predict(
-            game_state.obs, deterministic=True
-        )
-
-        for i in range(temp_env.n_players):
-            if i == player_id:
-                sim_action[i] = action_id
-            else:
-                sim_action[i] = full_actions[i]
-
-        # Step the temporary environment
-        next_obs, reward, _, _, _ = temp_env.step(sim_action)
-
-        # Get the value of the resulting state
-        # Convert the next observation to a tensor for the policy
-        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(next_obs)
-        with torch.no_grad():
-            next_value = value_policy.policy.predict_values(next_obs_tensor)
-
-        # Calculate the Q-value
-        # We need the specific reward for the team being evaluated
-        team_reward = reward[player_id]
-        q_value = team_reward + gamma * next_value.item()
-
-        print(
-            f"  - Simulating '{action_name}': "
-            f"Immediate Reward = {team_reward:.3f}, "
-            f"Next State Value = {next_value.item():.3f}, "
-            f"Q-Value = {q_value:.3f}"
-        )
-
-        action_values[action_name] = q_value
+    action_values = _compute_q_values_for_player(player_id, game_state)
 
     print(f"[API] Sending action values for player {player_id}:")
     import json
 
     print(json.dumps(action_values, indent=2))
     return jsonable_encoder(action_values)
+
+
+@app.get("/api/state_values")
+def get_state_values():
+    """Get the value function estimates for the PRE-STEP state from both perspectives.
+    
+    Uses the learned value function with role_flag conditioning.
+    Uses prev_obs (cached before step) to avoid race condition where step completes first.
+    
+    Returns:
+        offensive_value: Value function estimate for offensive team
+        defensive_value: Value function estimate for defensive team
+    """
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    
+    if game_state.env.episode_ended:
+        return {
+            "offensive_value": 0.0,
+            "defensive_value": 0.0
+        }
+    
+    try:
+        value_policy = game_state.unified_policy
+        
+        # Use prev_obs if available (set right before step), otherwise current obs
+        # This handles race condition where step completes before this API call
+        obs_to_use = game_state.prev_obs if game_state.prev_obs is not None else game_state.obs
+        
+        # Get offensive value (using loaded encoding)
+        obs_offense = {
+            "obs": np.copy(obs_to_use["obs"]),
+            "action_mask": obs_to_use["action_mask"],
+            "role_flag": np.array([game_state.role_flag_offense], dtype=np.float32),
+            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
+        }
+        
+        obs_tensor_offense, _ = value_policy.policy.obs_to_tensor(obs_offense)
+        with torch.no_grad():
+            value_offense = value_policy.policy.predict_values(obs_tensor_offense).item()
+        
+        # Get defensive value (using loaded encoding)
+        obs_defense = {
+            "obs": np.copy(obs_to_use["obs"]),
+            "action_mask": obs_to_use["action_mask"],
+            "role_flag": np.array([game_state.role_flag_defense], dtype=np.float32),
+            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
+        }
+        
+        obs_tensor_defense, _ = value_policy.policy.obs_to_tensor(obs_defense)
+        with torch.no_grad():
+            value_defense = value_policy.policy.predict_values(obs_tensor_defense).item()
+        
+        # Clear prev_obs after using it (consumed)
+        game_state.prev_obs = None
+        
+        print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {value_offense:.3f}")
+        print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {value_defense:.3f}")
+        
+        return {
+            "offensive_value": float(value_offense),
+            "defensive_value": float(value_defense)
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to calculate state values: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "offensive_value": 0.0,
+            "defensive_value": 0.0,
+            "error": str(e)
+        }
 
 
 @app.get("/api/shot_probability/{player_id}")
@@ -1678,6 +1910,27 @@ def get_shot_probability(player_id: int):
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
+
+
+@app.get("/api/pass_steal_probabilities")
+def get_pass_steal_probabilities():
+    """Get steal probabilities for passes from ball handler to each teammate."""
+    if game_state.env is None:
+        raise HTTPException(status_code=400, detail="Game not initialized")
+    
+    # Check if there is a ball handler
+    if game_state.env.ball_holder is None:
+        return {}
+    
+    try:
+        steal_probs = game_state.env.calculate_pass_steal_probabilities(game_state.env.ball_holder)
+        # Convert numpy types to standard Python types
+        return {int(k): float(v) for k, v in steal_probs.items()}
+    except Exception as e:
+        print(f"[ERROR] Failed to calculate pass steal probabilities: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
 
 
 @app.get("/api/rewards")
@@ -1803,6 +2056,7 @@ def get_rewards():
         serialized_history.append(
             {
                 "step": 0,
+                "shot_clock": 24,  # Initial shot clock
                 "offense": 0.0,
                 "defense": 0.0,
                 "offense_reason": "Initial State",
@@ -1840,6 +2094,7 @@ def get_rewards():
         serialized_history.append(
             {
                 "step": int(reward["step"]),
+                "shot_clock": int(reward.get("shot_clock", 0)),  # Shot clock after action executed
                 "offense": float(offense_with_mlflow),  # With MLflow phi shaping
                 "defense": float(defense_with_mlflow),  # With MLflow phi shaping
                 "offense_reason": reward.get("offense_reason", "Unknown"),
@@ -2053,7 +2308,13 @@ def get_full_game_state(include_policy_probs=False):
         "defender_pressure_turnover_chance": float(
             getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)
         ),
-        "steal_chance": float(getattr(game_state.env, "steal_chance", 0.05)),
+        "defender_pressure_decay_lambda": float(
+            getattr(game_state.env, "defender_pressure_decay_lambda", 1.0)
+        ),
+        "base_steal_rate": float(getattr(game_state.env, "base_steal_rate", 0.35)),
+        "steal_perp_decay": float(getattr(game_state.env, "steal_perp_decay", 1.5)),
+        "steal_distance_factor": float(getattr(game_state.env, "steal_distance_factor", 0.08)),
+        "steal_position_weight_min": float(getattr(game_state.env, "steal_position_weight_min", 0.3)),
         "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
         "max_spawn_distance": (
             int(getattr(game_state.env, "max_spawn_distance", None))
@@ -2073,12 +2334,37 @@ def get_full_game_state(include_policy_probs=False):
         "mask_occupied_moves": bool(
             getattr(game_state.env, "mask_occupied_moves", False)
         ),
+        # 3-second violation rules (shared configuration)
+        "three_second_lane_width": int(
+            getattr(game_state.env, "three_second_lane_width", 1)
+        ),
+        "three_second_max_steps": int(
+            getattr(game_state.env, "three_second_max_steps", 3)
+        ),
         "illegal_defense_enabled": bool(
             getattr(game_state.env, "illegal_defense_enabled", False)
         ),
-        "illegal_defense_max_steps": int(
-            getattr(game_state.env, "illegal_defense_max_steps", 3)
+        "offensive_three_seconds_enabled": bool(
+            getattr(game_state.env, "offensive_three_seconds_enabled", False)
         ),
+        # Lane hexes for visualization (convert set to list of tuples)
+        "offensive_lane_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "offensive_lane_hexes", set())
+        ],
+        "defensive_lane_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "defensive_lane_hexes", set())
+        ],
+        # Lane step counts for all players
+        "offensive_lane_steps": {
+            int(pid): int(steps)
+            for pid, steps in getattr(game_state.env, "_offensive_lane_steps", {}).items()
+        },
+        "defensive_lane_steps": {
+            int(pid): int(steps)
+            for pid, steps in getattr(game_state.env, "_defender_in_key_steps", {}).items()
+        },
         # Pass parameters
         "pass_arc_degrees": float(getattr(game_state.env, "pass_arc_degrees", 60.0)),
         "pass_oob_turnover_prob": float(
