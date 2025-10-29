@@ -710,7 +710,7 @@ class HexagonBasketballEnv(gym.Env):
                         "obs": self._get_observation(),
                         "action_mask": self._get_action_masks(),
                         "role_flag": np.array(
-                            [1.0 if self.training_team == Team.OFFENSE else 0.0],
+                            [1.0 if self.training_team == Team.OFFENSE else -1.0],
                             dtype=np.float32,
                         ),
                         "skills": self._get_offense_skills_array(),
@@ -1894,7 +1894,9 @@ class HexagonBasketballEnv(gym.Env):
             rewards[self.defense_ids] += turnover_penalty / self.players_per_side
 
         # --- Handle defensive lane violations (illegal defense) ---
-        if action_results.get("defensive_lane_violations"):
+        # Only apply violation reward if there's no shot on this step
+        # (to avoid double-rewarding offense when episode ends anyway)
+        if action_results.get("defensive_lane_violations") and not action_results.get("shots"):
             done = True
             # Defense committed a violation, offense gets a point (like a technical free throw)
             # Reward offense with 1 point, penalize defense

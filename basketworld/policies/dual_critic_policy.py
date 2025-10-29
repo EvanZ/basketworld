@@ -87,14 +87,19 @@ class DualCriticActorCriticPolicy(ActorCriticPolicy):
         
         # Initialize with orthogonal initialization if requested
         if self.ortho_init:
-            module_gains = {
-                self.value_net_offense: 1.0,
-                self.value_net_defense: 1.0,
-            }
-            for module, gain in module_gains.items():
-                if isinstance(module, nn.Linear):
-                    nn.init.orthogonal_(module.weight, gain=gain)
-                    nn.init.constant_(module.bias, 0)
+            # Robustly initialize all Linear layers in each value network
+            # Works for both single Linear and Sequential/multi-layer networks
+            for net, gain in [(self.value_net_offense, 1.0), (self.value_net_defense, 1.0)]:
+                # If it's a single Linear layer
+                if isinstance(net, nn.Linear):
+                    nn.init.orthogonal_(net.weight, gain=gain)
+                    nn.init.constant_(net.bias, 0)
+                # If it's a Sequential or Module with submodules, recursively init all Linear layers
+                else:
+                    for module in net.modules():
+                        if isinstance(module, nn.Linear):
+                            nn.init.orthogonal_(module.weight, gain=gain)
+                            nn.init.constant_(module.bias, 0)
 
     def forward(
         self, obs: torch.Tensor, deterministic: bool = False
