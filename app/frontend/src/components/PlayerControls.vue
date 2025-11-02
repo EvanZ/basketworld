@@ -884,6 +884,10 @@ const phiRef = vueRef(null);
             <h5>Other</h5>
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
             <div class="param-item"><span class="param-name">Turnover penalty:</span><span class="param-value">{{ rewardParams.turnover_penalty }}</span></div>
+            <div class="param-item"><span class="param-name">Violation reward:</span><span class="param-value">{{ rewardParams.violation_reward }}</span></div>
+            <div class="param-item"><span class="param-name">Made shot reward inside:</span><span class="param-value">{{ rewardParams.made_shot_reward_inside }}</span></div>
+            <div class="param-item"><span class="param-name">Made shot reward three:</span><span class="param-value">{{ rewardParams.made_shot_reward_three }}</span></div>
+            <div class="param-item"><span class="param-name">Missed shot penalty:</span><span class="param-value">{{ rewardParams.missed_shot_penalty }}</span></div>
           </div>
           <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
             <h5>Phi Shaping (from MLflow)</h5>
@@ -1234,6 +1238,10 @@ const phiRef = vueRef(null);
             <div class="param-item">
               <span class="param-name">Lane width (hexes):</span>
               <span class="param-value">{{ props.gameState.three_second_lane_width ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Lane height (hexes):</span>
+              <span class="param-value">{{ props.gameState.three_second_lane_height ?? 'N/A' }}</span>
             </div>
             <div class="param-item">
               <span class="param-name">Max steps in lane:</span>

@@ -366,6 +366,7 @@ def setup_environment(args, training_team):
         # Reward shaping
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
+        violation_reward=getattr(args, "violation_reward", 1.0),
         made_shot_reward_inside=getattr(args, "made_shot_reward_inside", 2.0),
         made_shot_reward_three=getattr(args, "made_shot_reward_three", 3.0),
         missed_shot_penalty=getattr(args, "missed_shot_penalty", 0.0),
@@ -382,6 +383,7 @@ def setup_environment(args, training_team):
         phi_aggregation_mode=getattr(args, "phi_aggregation_mode", "team_best"),
         phi_blend_weight=getattr(args, "phi_blend_weight", 0.0),
         enable_profiling=args.enable_env_profiling,
+        profiling_sample_rate=getattr(args, "profiling_sample_rate", 1.0),
         training_team=training_team,  # Critical for correct rewards
         # Observation controls
         use_egocentric_obs=args.use_egocentric_obs,
@@ -392,6 +394,7 @@ def setup_environment(args, training_team):
         enable_pass_gating=getattr(args, "enable_pass_gating", True),
         # 3-second violation (shared configuration)
         three_second_lane_width=getattr(args, "three_second_lane_width", 1),
+        three_second_lane_height=getattr(args, "three_second_lane_height", 1),
         three_second_max_steps=getattr(args, "three_second_max_steps", 3),
         illegal_defense_enabled=args.illegal_defense_enabled,
         offensive_three_seconds_enabled=getattr(args, "offensive_three_seconds", False),
@@ -507,6 +510,12 @@ def make_vector_env(
 
 def main(args):
     """Main training function."""
+    
+    # --- Auto-enable dual critic if transfer learning is requested ---
+    if args.init_critic_from_run is not None:
+        if not args.use_dual_critic:
+            print(f"[Config] Auto-enabling --use-dual-critic due to --init-critic-from-run")
+            args.use_dual_critic = True
 
     # --- Set up Device ---
     device = get_device(args.device)
@@ -672,6 +681,220 @@ def main(args):
                 target_kl=args.target_kl,
                 device=device,
             )
+            
+            # --- Transfer critic weights if requested ---
+            if args.init_critic_from_run is not None:
+                print(f"\n{'='*80}")
+                print(f"[Critic Transfer] Loading critic weights from run: {args.init_critic_from_run}")
+                print(f"{'='*80}")
+                
+                try:
+                    # Get source run metadata
+                    source_run = mlflow.get_run(args.init_critic_from_run)
+                    
+                    # Download source model artifacts to a temporary directory
+                    client = mlflow.tracking.MlflowClient()
+                    with tempfile.TemporaryDirectory() as tmpd:
+                        # Find the latest alternation model from the source run
+                        max_alt_idx = get_max_alternation_index(client, args.init_critic_from_run)
+                        if max_alt_idx == 0:
+                            # No alternation models found, try unified_policy_final
+                            artifact_path = "unified_policy_final"
+                            print(f"[Critic Transfer] No alternation models found, trying unified_policy_final...")
+                        else:
+                            artifact_path = f"models/unified_policy_alt_{max_alt_idx}.zip"
+                            print(f"[Critic Transfer] Found latest alternation: {max_alt_idx}")
+                        
+                        print(f"[Critic Transfer] Downloading artifacts from run {args.init_critic_from_run}...")
+                        print(f"[Critic Transfer] Artifact path: {artifact_path}")
+                        local_path = client.download_artifacts(
+                            args.init_critic_from_run, artifact_path, tmpd
+                        )
+                        
+                        print(f"[Critic Transfer] Loading source model from: {local_path}")
+                        
+                        # Load with custom_objects to handle custom policy classes
+                        custom_objects = {
+                            "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+                            "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                        }
+                        source_policy = PPO.load(local_path, custom_objects=custom_objects)
+                        
+                        # Verify source policy is using dual critic
+                        source_use_dual_critic = source_run.data.params.get("use_dual_critic", "false").lower() == "true"
+                        if not source_use_dual_critic:
+                            raise ValueError(
+                                f"Source run {args.init_critic_from_run} does not use dual critic architecture. "
+                                "Cannot transfer single critic to dual critic."
+                            )
+                        
+                        # Verify architecture compatibility: check net_arch for value network
+                        source_net_arch_used = source_run.data.params.get("net_arch_used", "unknown")
+                        target_net_arch_used = str(unified_policy.policy.net_arch)
+                        
+                        print(f"[Critic Transfer] Source net_arch: {source_net_arch_used}")
+                        print(f"[Critic Transfer] Target net_arch: {target_net_arch_used}")
+                        
+                        # Extract vf architecture from net_arch
+                        # net_arch format is typically: [dict(pi=[...], vf=[...]), ...] or [int, int, ...]
+                        def extract_vf_arch(net_arch_str):
+                            """Extract value function architecture from net_arch string."""
+                            try:
+                                import ast
+                                net_arch = ast.literal_eval(net_arch_str)
+                                if isinstance(net_arch, list) and len(net_arch) > 0:
+                                    if isinstance(net_arch[0], dict):
+                                        return net_arch[0].get('vf', net_arch)
+                                return net_arch
+                            except:
+                                return net_arch_str
+                        
+                        source_vf_arch = extract_vf_arch(source_net_arch_used)
+                        target_vf_arch = extract_vf_arch(target_net_arch_used)
+                        
+                        if str(source_vf_arch) != str(target_vf_arch):
+                            print(f"[Critic Transfer] WARNING: Value network architectures differ!")
+                            print(f"  Source vf: {source_vf_arch}")
+                            print(f"  Target vf: {target_vf_arch}")
+                            print(f"[Critic Transfer] Attempting transfer anyway - weights will be copied where dimensions match.")
+                        
+                        # Transfer value head weights
+                        source_policy_net = source_policy.policy
+                        target_policy_net = unified_policy.policy
+                        
+                        # Check that both have the dual critic attributes
+                        if not (hasattr(source_policy_net, 'value_net_offense') and 
+                                hasattr(source_policy_net, 'value_net_defense')):
+                            raise ValueError("Source policy does not have value_net_offense/value_net_defense attributes")
+                        
+                        if not (hasattr(target_policy_net, 'value_net_offense') and 
+                                hasattr(target_policy_net, 'value_net_defense')):
+                            raise ValueError("Target policy does not have value_net_offense/value_net_defense attributes")
+                        
+                        # Get pre-transfer weight samples for verification
+                        target_off_before = list(target_policy_net.value_net_offense.parameters())[0].data.clone()
+                        target_def_before = list(target_policy_net.value_net_defense.parameters())[0].data.clone()
+                        source_off_weights = list(source_policy_net.value_net_offense.parameters())[0].data.clone()
+                        source_def_weights = list(source_policy_net.value_net_defense.parameters())[0].data.clone()
+                        
+                        print(f"[Critic Transfer] Pre-transfer target offense critic weight sample: {target_off_before.flatten()[:5].tolist()}")
+                        print(f"[Critic Transfer] Source offense critic weight sample: {source_off_weights.flatten()[:5].tolist()}")
+                        
+                        # Also check value feature extractor
+                        print(f"[Critic Transfer] Checking mlp_extractor.value_net structure...")
+                        target_vf_first_before = None
+                        if hasattr(source_policy_net.mlp_extractor, 'value_net'):
+                            print(f"[Critic Transfer]   Source value_net: {source_policy_net.mlp_extractor.value_net}")
+                            print(f"[Critic Transfer]   Target value_net: {target_policy_net.mlp_extractor.value_net}")
+                            source_vf_params = sum(p.numel() for p in source_policy_net.mlp_extractor.value_net.parameters())
+                            target_vf_params = sum(p.numel() for p in target_policy_net.mlp_extractor.value_net.parameters())
+                            print(f"[Critic Transfer]   Source value_net params: {source_vf_params}")
+                            print(f"[Critic Transfer]   Target value_net params: {target_vf_params}")
+                            
+                            # Sample weights from value feature extractor - MUST CLONE!
+                            source_vf_first = list(source_policy_net.mlp_extractor.value_net.parameters())[0].data.flatten()[:5].clone()
+                            target_vf_first_before = list(target_policy_net.mlp_extractor.value_net.parameters())[0].data.flatten()[:5].clone()
+                            print(f"[Critic Transfer]   Source value_net first layer sample: {source_vf_first.tolist()}")
+                            print(f"[Critic Transfer]   Target value_net first layer (before): {target_vf_first_before.tolist()}")
+                        
+                        # Transfer the value feature extractor from mlp_extractor
+                        # This is critical because the value heads operate on latent features from this extractor
+                        print("[Critic Transfer] Transferring value feature extractor (mlp_extractor.value_net)...")
+                        if hasattr(source_policy_net.mlp_extractor, 'value_net'):
+                            target_policy_net.mlp_extractor.value_net.load_state_dict(
+                                source_policy_net.mlp_extractor.value_net.state_dict()
+                            )
+                            print("[Critic Transfer]   ✓ Value feature extractor transferred")
+                        else:
+                            print("[Critic Transfer]   ⚠️  No separate value_net in mlp_extractor (shared features)")
+                        
+                        # Copy offense critic weights
+                        print("[Critic Transfer] Transferring offense critic value head...")
+                        target_policy_net.value_net_offense.load_state_dict(
+                            source_policy_net.value_net_offense.state_dict()
+                        )
+                        
+                        # Copy defense critic weights
+                        print("[Critic Transfer] Transferring defense critic value head...")
+                        target_policy_net.value_net_defense.load_state_dict(
+                            source_policy_net.value_net_defense.state_dict()
+                        )
+                        
+                        # Verify transfer - check ALL components
+                        target_off_after = list(target_policy_net.value_net_offense.parameters())[0].data
+                        target_def_after = list(target_policy_net.value_net_defense.parameters())[0].data
+                        
+                        print(f"[Critic Transfer] Post-transfer target offense critic weight sample: {target_off_after.flatten()[:5].tolist()}")
+                        
+                        # Check value heads
+                        off_match = torch.allclose(target_off_after, source_off_weights, rtol=1e-5, atol=1e-7)
+                        def_match = torch.allclose(target_def_after, source_def_weights, rtol=1e-5, atol=1e-7)
+                        off_changed = not torch.allclose(target_off_after, target_off_before, rtol=1e-5, atol=1e-7)
+                        def_changed = not torch.allclose(target_def_after, target_def_before, rtol=1e-5, atol=1e-7)
+                        
+                        print(f"[Critic Transfer] Offense head weights match source: {off_match}")
+                        print(f"[Critic Transfer] Defense head weights match source: {def_match}")
+                        print(f"[Critic Transfer] Offense head weights changed from initial: {off_changed}")
+                        print(f"[Critic Transfer] Defense head weights changed from initial: {def_changed}")
+                        
+                        # Check value feature extractor
+                        vf_match = False
+                        vf_changed = False
+                        if hasattr(source_policy_net.mlp_extractor, 'value_net') and target_vf_first_before is not None:
+                            target_vf_first_after = list(target_policy_net.mlp_extractor.value_net.parameters())[0].data.flatten()[:5].clone()
+                            print(f"[Critic Transfer]   Target value_net first layer (after): {target_vf_first_after.tolist()}")
+                            
+                            # Check all parameters in value_net
+                            vf_match = all(
+                                torch.allclose(tp.data, sp.data, rtol=1e-5, atol=1e-7)
+                                for tp, sp in zip(
+                                    target_policy_net.mlp_extractor.value_net.parameters(),
+                                    source_policy_net.mlp_extractor.value_net.parameters()
+                                )
+                            )
+                            vf_changed = not torch.allclose(target_vf_first_after, target_vf_first_before, rtol=1e-5, atol=1e-7)
+                            
+                            print(f"[Critic Transfer] Value feature extractor matches source: {vf_match}")
+                            print(f"[Critic Transfer] Value feature extractor changed from initial: {vf_changed}")
+                        elif hasattr(source_policy_net.mlp_extractor, 'value_net'):
+                            print(f"[Critic Transfer] ⚠️  Could not verify value feature extractor (before sample was None)")
+                        
+                        all_verified = off_match and def_match and off_changed and def_changed
+                        if hasattr(source_policy_net.mlp_extractor, 'value_net'):
+                            all_verified = all_verified and vf_match and vf_changed
+                        
+                        if not all_verified:
+                            print(f"[Critic Transfer] ⚠️  WARNING: Weight transfer verification failed!")
+                            print(f"[Critic Transfer]     Expected all checks to be True, but some failed.")
+                            if not (vf_match and vf_changed):
+                                print(f"[Critic Transfer]     ❌ Value feature extractor transfer failed!")
+                            if not (off_match and off_changed):
+                                print(f"[Critic Transfer]     ❌ Offense head transfer failed!")
+                            if not (def_match and def_changed):
+                                print(f"[Critic Transfer]     ❌ Defense head transfer failed!")
+                        else:
+                            print(f"[Critic Transfer] ✓ All weight transfers verified successfully")
+                        
+                        print(f"[Critic Transfer] ✓ Successfully transferred critic weights from run: {args.init_critic_from_run}")
+                        print(f"[Critic Transfer] Actor network remains randomly initialized for fresh policy learning.")
+                        print(f"{'='*80}\n")
+                        
+                        # Log to MLflow
+                        mlflow.log_param("critic_transfer_source_run", args.init_critic_from_run)
+                        mlflow.log_param("critic_transfer_enabled", True)
+                        mlflow.log_param("critic_transfer_offense_head_verified", off_match and off_changed)
+                        mlflow.log_param("critic_transfer_defense_head_verified", def_match and def_changed)
+                        mlflow.log_param("critic_transfer_value_extractor_verified", vf_match and vf_changed)
+                        mlflow.log_param("critic_transfer_all_verified", all_verified)
+                    
+                except Exception as e:
+                    print(f"[Critic Transfer] ERROR: Failed to transfer critic weights: {e}")
+                    print(f"[Critic Transfer] Continuing with randomly initialized critics.")
+                    print(f"{'='*80}\n")
+                    mlflow.log_param("critic_transfer_enabled", False)
+                    mlflow.log_param("critic_transfer_error", str(e))
+            else:
+                mlflow.log_param("critic_transfer_enabled", False)
         else:
             # If continuing and user requests a restart of the entropy schedule, reset counters and coef
             if getattr(args, "restart_entropy_on_continue", False):
@@ -1117,13 +1340,14 @@ def main(args):
                 offense_callbacks.append(pass_bias_callback)
             if pass_curriculum_callback is not None:
                 offense_callbacks.append(pass_curriculum_callback)
-            offense_callbacks.append(
-                EpisodeSampleLogger(
-                    team_name="Offense",
-                    alternation_id=global_alt,
-                    sample_prob=args.episode_sample_prob,
+            if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
+                offense_callbacks.append(
+                    EpisodeSampleLogger(
+                        team_name="Offense",
+                        alternation_id=global_alt,
+                        sample_prob=args.episode_sample_prob,
+                    )
                 )
-            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
@@ -1132,6 +1356,55 @@ def main(args):
                 callback=offense_callbacks,
                 progress_bar=True,
             )
+            
+            # Collect profiling stats before closing the environment
+            if args.enable_env_profiling:
+                try:
+                    print("\nCollecting Offense environment profiling stats...")
+                    # Get profiling stats from all environments
+                    offense_profile_stats = offense_env.unwrapped.env_method("get_profile_stats")
+                    
+                    # Aggregate stats across all environments
+                    aggregated_stats = {}
+                    for env_idx, stats in enumerate(offense_profile_stats):
+                        for section_name, metrics in stats.items():
+                            if section_name not in aggregated_stats:
+                                aggregated_stats[section_name] = {
+                                    "total_ms": 0.0,
+                                    "total_calls": 0,
+                                    "avg_us_list": []
+                                }
+                            aggregated_stats[section_name]["total_ms"] += metrics["total_ms"]
+                            aggregated_stats[section_name]["total_calls"] += int(metrics["calls"])
+                            aggregated_stats[section_name]["avg_us_list"].append(metrics["avg_us"])
+                    
+                    # Log aggregated stats to MLflow
+                    for section_name, metrics in aggregated_stats.items():
+                        # Average the avg_us across environments
+                        mean_avg_us = np.mean(metrics["avg_us_list"])
+                        mlflow.log_metric(
+                            f"Offense/profile_{section_name}_avg_us",
+                            mean_avg_us,
+                            step=global_alt
+                        )
+                        mlflow.log_metric(
+                            f"Offense/profile_{section_name}_total_ms",
+                            metrics["total_ms"],
+                            step=global_alt
+                        )
+                        mlflow.log_metric(
+                            f"Offense/profile_{section_name}_total_calls",
+                            metrics["total_calls"],
+                            step=global_alt
+                        )
+                    
+                    print(f"Logged profiling stats for {len(aggregated_stats)} sections")
+                    
+                    # Reset profiling stats for next alternation
+                    offense_env.unwrapped.env_method("reset_profile_stats")
+                except Exception as e:
+                    print(f"Warning: Could not collect offense profiling stats: {e}")
+            
             offense_env.close()
             try:
                 del offense_env
@@ -1182,13 +1455,14 @@ def main(args):
                 defense_callbacks.append(pass_bias_callback)
             if pass_curriculum_callback is not None:
                 defense_callbacks.append(pass_curriculum_callback)
-            defense_callbacks.append(
-                EpisodeSampleLogger(
-                    team_name="Defense",
-                    alternation_id=global_alt,
-                    sample_prob=args.episode_sample_prob,
+            if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
+                defense_callbacks.append(
+                    EpisodeSampleLogger(
+                        team_name="Defense",
+                        alternation_id=global_alt,
+                        sample_prob=args.episode_sample_prob,
+                    )
                 )
-            )
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
@@ -1197,6 +1471,55 @@ def main(args):
                 callback=defense_callbacks,
                 progress_bar=True,
             )
+            
+            # Collect profiling stats before closing the environment
+            if args.enable_env_profiling:
+                try:
+                    print("\nCollecting Defense environment profiling stats...")
+                    # Get profiling stats from all environments
+                    defense_profile_stats = defense_env.env_method("get_profile_stats")
+                    
+                    # Aggregate stats across all environments
+                    aggregated_stats = {}
+                    for env_idx, stats in enumerate(defense_profile_stats):
+                        for section_name, metrics in stats.items():
+                            if section_name not in aggregated_stats:
+                                aggregated_stats[section_name] = {
+                                    "total_ms": 0.0,
+                                    "total_calls": 0,
+                                    "avg_us_list": []
+                                }
+                            aggregated_stats[section_name]["total_ms"] += metrics["total_ms"]
+                            aggregated_stats[section_name]["total_calls"] += int(metrics["calls"])
+                            aggregated_stats[section_name]["avg_us_list"].append(metrics["avg_us"])
+                    
+                    # Log aggregated stats to MLflow
+                    for section_name, metrics in aggregated_stats.items():
+                        # Average the avg_us across environments
+                        mean_avg_us = np.mean(metrics["avg_us_list"])
+                        mlflow.log_metric(
+                            f"Defense/profile_{section_name}_avg_us",
+                            mean_avg_us,
+                            step=global_alt
+                        )
+                        mlflow.log_metric(
+                            f"Defense/profile_{section_name}_total_ms",
+                            metrics["total_ms"],
+                            step=global_alt
+                        )
+                        mlflow.log_metric(
+                            f"Defense/profile_{section_name}_total_calls",
+                            metrics["total_calls"],
+                            step=global_alt
+                        )
+                    
+                    print(f"Logged profiling stats for {len(aggregated_stats)} sections")
+                    
+                    # Reset profiling stats for next alternation
+                    defense_env.env_method("reset_profile_stats")
+                except Exception as e:
+                    print(f"Warning: Could not collect defense profiling stats: {e}")
+            
             # Close defense env and clean up
             defense_env.close()
             try:
@@ -1256,6 +1579,7 @@ def main(args):
                     potential_assist_pct=getattr(args, "potential_assist_pct", 0.10),
                     full_assist_bonus_pct=getattr(args, "full_assist_bonus_pct", 0.05),
                     enable_profiling=args.enable_env_profiling,
+                    profiling_sample_rate=getattr(args, "profiling_sample_rate", 1.0),
                     # Observation controls
                     use_egocentric_obs=args.use_egocentric_obs,
                     egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
@@ -1328,8 +1652,6 @@ def main(args):
 
                 eval_env.close()
                 print(f"--- Evaluation for Alternation {global_alt} Complete ---")
-
-            # Note: Environment profiling code removed as envs are closed by this point
 
             # --- 4. Optional GIF Evaluation ---
 
@@ -1578,6 +1900,12 @@ if __name__ == "__main__":
         help="Use separate value networks for offense and defense (recommended for zero-sum self-play).",
     )
     parser.add_argument(
+        "--init-critic-from-run",
+        type=str,
+        default=None,
+        help="MLflow run_id to initialize critic weights from (transfer learning). Only value heads are transferred.",
+    )
+    parser.add_argument(
         "--continue-run-id",
         type=str,
         default=None,
@@ -1693,6 +2021,12 @@ if __name__ == "__main__":
         help="Enable timing instrumentation inside the environment and log averages to MLflow after each alternation.",
     )
     parser.add_argument(
+        "--profiling-sample-rate",
+        type=float,
+        default=1.0,
+        help="Fraction of episodes to profile when profiling is enabled (0.0-1.0). Lower values reduce overhead. Default: 1.0 (profile all episodes).",
+    )
+    parser.add_argument(
         "--spawn-distance",
         type=int,
         default=3,
@@ -1738,7 +2072,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--allow-dunks",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
-        default=False,
+        default=True,
         help="Allow players to enter basket hex and enable dunk shots from basket cell.",
     )
     parser.add_argument(
@@ -1781,7 +2115,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mask-occupied-moves",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
-        default=False,
+        default=True,
         help="Disallow moves into currently occupied neighboring hexes.",
     )
     parser.add_argument(
@@ -1806,6 +2140,12 @@ if __name__ == "__main__":
         help="Width of the lane in hexes (shared by offense and defense). 1 = 1 hex on each side of center line.",
     )
     parser.add_argument(
+        "--three-second-lane-height",
+        type=int,
+        default=3,
+        help="Height of the lane in hexes (shared by offense and defense). 1 = 1 hex on each side of center line.",
+    )
+    parser.add_argument(
         "--three-second-max-steps",
         type=int,
         default=3,
@@ -1815,13 +2155,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--illegal-defense-enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
-        default=False,
+        default=True,
         help="Enable illegal defense (defensive 3-second) rule.",
     )
     parser.add_argument(
         "--offensive-three-seconds",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
-        default=False,
+        default=True,
         help="Enable offensive 3-second violation rule.",
     )
     # Reward shaping CLI (also logged to MLflow)
@@ -1852,6 +2192,13 @@ if __name__ == "__main__":
         type=float,
         default=3.0,
         help="Reward for made 3pt (team-averaged).",
+    )
+    parser.add_argument(
+        "--violation-reward",
+        dest="violation_reward",
+        type=float,
+        default=2.0,
+        help="Reward for violation (team-averaged).",
     )
     parser.add_argument(
         "--missed-shot-penalty",
@@ -1930,12 +2277,17 @@ if __name__ == "__main__":
         default=1e-2,
         help="Probability of sampling an episode for logging.",
     )
-    # Potential-based shaping CLI
+    parser.add_argument(
+        "--log-episode-artifacts",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Log episode CSVs as MLflow artifacts during training. Set to False to reduce I/O overhead and keep timing charts clean. Episodes are still tracked internally.",
+    )
     parser.add_argument(
         "--enable-phi-shaping",
         dest="enable_phi_shaping",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
-        default=False,
+        default=True,
         help="Enable potential-based reward shaping using best current shot quality.",
     )
     parser.add_argument(
@@ -2007,42 +2359,42 @@ if __name__ == "__main__":
         "--pass-arc-start",
         dest="pass_arc_start",
         type=float,
-        default=None,
+        default=60,
         help="Initial passing arc degrees (e.g., 120).",
     )
     parser.add_argument(
         "--pass-arc-end",
         dest="pass_arc_end",
         type=float,
-        default=None,
+        default=60,
         help="Final passing arc degrees (e.g., 60).",
     )
     parser.add_argument(
         "--pass-oob-turnover-prob-start",
         dest="pass_oob_turnover_prob_start",
         type=float,
-        default=None,
+        default=1,
         help="Initial probability that pass without receiver is OOB turnover (e.g., 0.1).",
     )
     parser.add_argument(
         "--pass-oob-turnover-prob-end",
         dest="pass_oob_turnover_prob_end",
         type=float,
-        default=None,
+        default=1,
         help="Final OOB turnover probability when no receiver (e.g., 1.0).",
     )
     parser.add_argument(
         "--pass-arc-power",
         dest="pass_arc_power",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Power applied to arc curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
     )
     parser.add_argument(
         "--pass-oob-power",
         dest="pass_oob_power",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Power applied to OOB curriculum progress for steeper initial decay (default: 2.0, use 1.0 for linear).",
     )
     parser.add_argument(
@@ -2066,6 +2418,7 @@ if __name__ == "__main__":
         default=None,
         help="Final additive bias (0 to disable at end).",
     )
+    
     args = parser.parse_args()
     print(' '.join(shlex.quote(arg) for arg in sys.argv))
     main(args)

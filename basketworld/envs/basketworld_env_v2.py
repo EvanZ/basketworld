@@ -99,6 +99,7 @@ class HexagonBasketballEnv(gym.Env):
         dunk_std: float = 0.0,
         # 3-second violation controls (shared lane configuration)
         three_second_lane_width: int = 1,
+        three_second_lane_height: int = 3,
         three_second_max_steps: int = 3,
         # Illegal defense (3-in-the-key) controls
         illegal_defense_enabled: bool = True,
@@ -113,6 +114,7 @@ class HexagonBasketballEnv(gym.Env):
         pass_arc_degrees: float = 60.0,
         pass_oob_turnover_prob: float = 1.0,
         enable_profiling: bool = False,
+        profiling_sample_rate: float = 1.0,  # Fraction of episodes to profile (0.0-1.0)
         spawn_distance: int = 3,
         max_spawn_distance: Optional[int] = None,
         # Reward shaping parameters
@@ -123,6 +125,7 @@ class HexagonBasketballEnv(gym.Env):
         missed_shot_penalty: float = 0.0,
         potential_assist_reward: float = 0.1,
         full_assist_bonus: float = 0.2,
+        violation_reward: float = 1.0,
         # Potential-based shaping (Phi) controls
         enable_phi_shaping: bool = False,
         reward_shaping_gamma: Optional[float] = None,
@@ -222,6 +225,8 @@ class HexagonBasketballEnv(gym.Env):
         self.pass_oob_turnover_prob = float(max(0.0, min(1.0, pass_oob_turnover_prob)))
         # Profiling
         self.enable_profiling = bool(enable_profiling)
+        self.profiling_sample_rate = float(max(0.0, min(1.0, profiling_sample_rate)))  # Clamp to [0, 1]
+        self._profiling_this_episode: bool = False  # Set per episode in reset()
         self._profile_ns: Dict[str, int] = {}
         self._profile_calls: Dict[str, int] = {}
         # Basket position, using offset coordinates for placement
@@ -230,6 +235,7 @@ class HexagonBasketballEnv(gym.Env):
         self.basket_position = self._offset_to_axial(basket_col, basket_row)
         # Shared 3-second violation configuration (used by both offense and defense)
         self.three_second_lane_width = int(three_second_lane_width)
+        self.three_second_lane_height = int(three_second_lane_height)
         self.three_second_max_steps = int(three_second_max_steps)
         
         # Illegal defense (defensive 3-second) configuration
@@ -362,6 +368,7 @@ class HexagonBasketballEnv(gym.Env):
         # --- Reward parameters (stored on env for evaluation compatibility) ---
         self.pass_reward: float = float(pass_reward)
         self.turnover_penalty: float = float(turnover_penalty)
+        self.violation_reward: float = float(violation_reward)
         self.made_shot_reward_inside: float = float(made_shot_reward_inside)
         self.made_shot_reward_three: float = float(made_shot_reward_three)
         self.missed_shot_penalty: float = float(missed_shot_penalty)
@@ -414,18 +421,21 @@ class HexagonBasketballEnv(gym.Env):
             float(self.dunk_pct)
         ] * self.players_per_side
 
+    @profile_section("_offset_to_axial")
     def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
         """Converts odd-r offset coordinates to axial coordinates."""
         q = col - (row - (row & 1)) // 2
         r = row
         return q, r
 
+    @profile_section("_axial_to_offset")
     def _axial_to_offset(self, q: int, r: int) -> Tuple[int, int]:
         """Converts axial coordinates to odd-r offset coordinates."""
         col = q + (r - (r & 1)) // 2
         row = r
         return col, row
 
+    @profile_section("_axial_to_cartesian")
     def _axial_to_cartesian(self, q: int, r: int) -> Tuple[float, float]:
         """Convert axial (q, r) to cartesian (x, y) matching rendering geometry."""
         size = 1.0
@@ -433,20 +443,24 @@ class HexagonBasketballEnv(gym.Env):
         y = size * (1.5 * r)
         return x, y
 
+    @profile_section("_axial_to_cube")
     def _axial_to_cube(self, q: int, r: int) -> Tuple[int, int, int]:
         """Convert axial (q, r) to cube (x, y, z) coordinates."""
         x, z = q, r
         y = -x - z
         return x, y, z
 
+    @profile_section("_cube_to_axial")
     def _cube_to_axial(self, x: int, y: int, z: int) -> Tuple[int, int]:
         """Convert cube (x, y, z) to axial (q, r) coordinates."""
         return x, z
 
+    @profile_section("_rotate60_cw_cube")
     def _rotate60_cw_cube(self, x: int, y: int, z: int) -> Tuple[int, int, int]:
         """Rotate cube (x, y, z) by 60 degrees clockwise."""
         return -z, -x, -y
 
+    @profile_section("_rotate_k60_axial")
     def _rotate_k60_axial(self, q: int, r: int, k: int) -> Tuple[int, int]:
         """Rotate axial (q, r) by k*60 degrees clockwise."""
         x, y, z = self._axial_to_cube(q, r)
@@ -454,12 +468,14 @@ class HexagonBasketballEnv(gym.Env):
             x, y, z = self._rotate60_cw_cube(x, y, z)
         return self._cube_to_axial(x, y, z)
 
+    @profile_section("_hex_distance")
     def _hex_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
         """Calculate distance between two hexagon positions."""
         q1, r1 = pos1
         q2, r2 = pos2
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
 
+    @profile_section("_point_to_line_distance")
     def _point_to_line_distance(
         self,
         point: Tuple[int, int],
@@ -502,6 +518,7 @@ class HexagonBasketballEnv(gym.Env):
         # Return distance from point to closest point on line
         return math.hypot(px - closest_x, py - closest_y)
 
+    @profile_section("_get_position_on_line")
     def _get_position_on_line(
         self,
         point: Tuple[int, int],
@@ -540,6 +557,7 @@ class HexagonBasketballEnv(gym.Env):
         t = ((px - sx) * dx + (py - sy) * dy) / line_length_sq
         return t
 
+    @profile_section("_is_between_points")
     def _is_between_points(
         self,
         point: Tuple[int, int],
@@ -566,6 +584,13 @@ class HexagonBasketballEnv(gym.Env):
         """Reset the environment to initial state."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        
+        # Decide whether to profile this episode (reduces overhead for large-scale training)
+        if self.enable_profiling:
+            self._profiling_this_episode = (self._rng.random() < self.profiling_sample_rate)
+        else:
+            self._profiling_this_episode = False
+        
         # Resolve overrides from options (takes precedence over ctor overrides)
         opt_positions = None
         opt_ball_holder = None
@@ -982,6 +1007,7 @@ class HexagonBasketballEnv(gym.Env):
 
         return obs, rewards, done, False, info
 
+    @profile_section("set_illegal_action_probs")
     def set_illegal_action_probs(self, probs: Optional[np.ndarray]) -> None:
         """Provide per-player action probabilities for resolving illegal actions.
 
@@ -1067,6 +1093,7 @@ class HexagonBasketballEnv(gym.Env):
 
         return masks
 
+    @profile_section("_generate_initial_positions")
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
         """
         Generate initial positions with distances defined RELATIVE to the basket:
@@ -1183,6 +1210,7 @@ class HexagonBasketballEnv(gym.Env):
         # offense first then defense
         return offense_positions + defense_positions
 
+    @profile_section("_set_initial_positions_from_override")
     def _set_initial_positions_from_override(
         self, positions: List[Tuple[int, int]]
     ) -> None:
@@ -1212,6 +1240,7 @@ class HexagonBasketballEnv(gym.Env):
             seen.add((q, r))
         self.positions = normalized
 
+    @profile_section("_set_initial_ball_holder")
     def _set_initial_ball_holder(self, player_id: int) -> None:
         if not (0 <= player_id < self.n_players):
             raise ValueError(
@@ -1219,11 +1248,13 @@ class HexagonBasketballEnv(gym.Env):
             )
         self.ball_holder = int(player_id)
 
+    @profile_section("_is_valid_position")
     def _is_valid_position(self, q: int, r: int) -> bool:
         """Check if a hexagon position is within the rectangular court bounds."""
         col, row = self._axial_to_offset(q, r)
         return 0 <= col < self.court_width and 0 <= row < self.court_height
     
+    @profile_section("_calculate_offensive_lane_hexes")
     def _calculate_offensive_lane_hexes(self) -> set:
         """Calculate the hexes that make up the offensive lane (painted area).
         
@@ -1237,9 +1268,10 @@ class HexagonBasketballEnv(gym.Env):
         lane_hexes = set()
         basket_q, basket_r = self.basket_position
         lane_width = self.three_second_lane_width
+        lane_height = self.three_second_lane_height
         
         # Lane extends from distance 0 (basket) to just before 3pt line
-        for dist in range(0, self.three_point_distance):
+        for dist in range(0, lane_height):
             # For each distance, add hexes within lane_width perpendicular distance
             # We'll explore in the +q direction from basket
             # At each step along q-axis, check r offsets within lane_width
@@ -1258,6 +1290,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return lane_hexes
     
+    @profile_section("_calculate_defensive_lane_hexes")
     def _calculate_defensive_lane_hexes(self) -> set:
         """Calculate the defensive lane (full painted area, same as offensive lane).
         
@@ -1451,6 +1484,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return results
 
+    @profile_section("_get_adjacent_position")
     def _get_adjacent_position(
         self, pos: Tuple[int, int], direction_idx: int
     ) -> Tuple[int, int]:
@@ -1459,6 +1493,7 @@ class HexagonBasketballEnv(gym.Env):
         dq, dr = self.hex_directions[direction_idx]
         return (q + dq, r + dr)
 
+    @profile_section("_has_teammate_in_pass_arc")
     def _has_teammate_in_pass_arc(self, passer_id: int, direction_idx: int) -> bool:
         """
         Check if there is at least one teammate within the pass arc for the given direction.
@@ -1499,7 +1534,7 @@ class HexagonBasketballEnv(gym.Env):
 
         return False
 
-    @profile_section("pass_logic")
+    @profile_section("_attempt_pass")
     def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
         """
         Arc-based passing with line-of-sight steal mechanics:
@@ -1673,6 +1708,7 @@ class HexagonBasketballEnv(gym.Env):
         }
         return
 
+    @profile_section("_compute_shot_pressure_multiplier")
     def _compute_shot_pressure_multiplier(
         self,
         shooter_id: Optional[int],
@@ -1799,6 +1835,7 @@ class HexagonBasketballEnv(gym.Env):
             "pressure_multiplier": pressure_mult,
         }
 
+    @profile_section("_turnover_to_defense")
     def _turnover_to_defense(self, from_player: int):
         """Handle turnover - ball goes to nearest defender."""
         if from_player in self.offense_ids:
@@ -1820,7 +1857,7 @@ class HexagonBasketballEnv(gym.Env):
 
         self.ball_holder = nearest_defender
 
-    @profile_section("shot_prob")
+    @profile_section("_calculate_shot_probability")
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         """Calculate probability of successful shot using a simple linear model
         anchored at layup (distance 1) and three-point (distance = three_point_distance).
@@ -1862,7 +1899,7 @@ class HexagonBasketballEnv(gym.Env):
         prob = max(0.01, min(0.99, prob))
         return float(prob)
 
-    @profile_section("rewards")
+    @profile_section("_check_termination_and_rewards")
     def _check_termination_and_rewards(
         self, action_results: Dict
     ) -> Tuple[bool, np.ndarray]:
@@ -1870,6 +1907,7 @@ class HexagonBasketballEnv(gym.Env):
         rewards = np.zeros(self.n_players)
         done = False
         pass_reward = self.pass_reward
+        violation_reward = self.violation_reward
         turnover_penalty = self.turnover_penalty
         # Assist shaping
         potential_assist_reward = self.potential_assist_reward
@@ -1899,8 +1937,8 @@ class HexagonBasketballEnv(gym.Env):
         if action_results.get("defensive_lane_violations") and not action_results.get("shots"):
             done = True
             # Defense committed a violation, offense gets a point (like a technical free throw)
-            # Reward offense with 1 point, penalize defense
-            violation_reward = 1.0
+            # Reward offense, penalize defense
+            violation_reward = self.violation_reward
             rewards[self.offense_ids] += violation_reward / self.players_per_side
             rewards[self.defense_ids] -= violation_reward / self.players_per_side
 
@@ -1999,6 +2037,8 @@ class HexagonBasketballEnv(gym.Env):
         return done, rewards
 
     # -------------------- Expected Points Calculation --------------------
+    
+    @profile_section("_calculate_expected_points_for_player")
     def _calculate_expected_points_for_player(self, player_id: int) -> float:
         """Calculate expected points for a single player.
         
@@ -2022,6 +2062,7 @@ class HexagonBasketballEnv(gym.Env):
         return float(shot_value * p_make)
 
     # -------------------- Potential Function Phi(s) --------------------
+    @profile_section("_phi_shot_quality")
     def _phi_shot_quality(self) -> float:
         """Potential function Phi(s): team's current best expected points.
 
@@ -2083,6 +2124,7 @@ class HexagonBasketballEnv(gym.Env):
         blended = (1.0 - w) * float(teammate_aggregate) + w * float(ball_ep)
         return float(blended)
 
+    @profile_section("_phi_ep_breakdown")
     def _phi_ep_breakdown(self) -> Tuple[float, float]:
         """Return (team_best_ep, ball_handler_ep) for current possession team."""
         if self.ball_holder is None:
@@ -2103,6 +2145,7 @@ class HexagonBasketballEnv(gym.Env):
         return float(team_best), float(ball_ep)
 
     # Allow VecEnv.env_method to update phi_beta dynamically
+    @profile_section("set_phi_beta")
     def set_phi_beta(self, value: float) -> None:
         try:
             self.phi_beta = float(value)
@@ -2110,18 +2153,21 @@ class HexagonBasketballEnv(gym.Env):
             pass
 
     # --- Schedulable setters for passing curriculum ---
+    @profile_section("set_pass_arc_degrees")
     def set_pass_arc_degrees(self, value: float) -> None:
         try:
             self.pass_arc_degrees = float(max(1.0, min(360.0, value)))
         except Exception:
             pass
 
+    @profile_section("set_pass_oob_turnover_prob")
     def set_pass_oob_turnover_prob(self, value: float) -> None:
         try:
             self.pass_oob_turnover_prob = float(max(0.0, min(1.0, value)))
         except Exception:
             pass
 
+    @profile_section("_get_observation")
     def _get_observation(self) -> np.ndarray:
         """Get current observation of the game state.
 
@@ -2244,6 +2290,7 @@ class HexagonBasketballEnv(gym.Env):
 
         return np.array(obs, dtype=np.float32)
 
+    @profile_section("_get_offense_skills_array")
     def _get_offense_skills_array(self) -> np.ndarray:
         """Return per-offense-player skill deltas as a flat array of length players_per_side*3.
 
@@ -2262,6 +2309,7 @@ class HexagonBasketballEnv(gym.Env):
             )
         return np.array(skills, dtype=np.float32)
 
+    @profile_section("render")
     def render(self):
         """Render the current state of the environment."""
         if self.render_mode == "human":
@@ -2269,6 +2317,7 @@ class HexagonBasketballEnv(gym.Env):
         elif self.render_mode == "rgb_array":
             return self._render_visual()
 
+    @profile_section("_render_ascii")
     def _render_ascii(self):
         """Simple ASCII rendering for training."""
         print(f"\nShot Clock: {self.shot_clock}")
@@ -2304,6 +2353,7 @@ class HexagonBasketballEnv(gym.Env):
             print(f"\nLast Action Results: {self.last_action_results}")
         print("-" * 40)
 
+    @profile_section("_render_visual")
     def _render_visual(self):
         """Visual rendering using matplotlib."""
         import matplotlib.pyplot as plt
@@ -2750,12 +2800,14 @@ class HexagonBasketballEnv(gym.Env):
 
         return rgb_array
 
+    @profile_section("switch_training_team")
     def switch_training_team(self):
         """Switch which team is currently training (for alternating optimization)."""
         self.training_team = (
             Team.DEFENSE if self.training_team == Team.OFFENSE else Team.OFFENSE
         )
 
+    @profile_section("_calculate_steal_probability_for_pass")
     def _calculate_steal_probability_for_pass(
         self, 
         passer_pos: Tuple[int, int], 
@@ -2847,6 +2899,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return total_steal_prob, defender_contributions
 
+    @profile_section("calculate_pass_steal_probabilities")
     def calculate_pass_steal_probabilities(self, passer_id: int) -> Dict[int, float]:
         """
         Calculate hypothetical steal probabilities for passes to each teammate.
@@ -2875,6 +2928,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return steal_probs
 
+    @profile_section("_calculate_defender_pressure_info")
     def _calculate_defender_pressure_info(self) -> List[Dict]:
         """
         Calculate defender pressure information for the current ball handler.
@@ -2937,6 +2991,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return defender_pressure_info
 
+    @profile_section("calculate_defender_pressure_turnover_probability")
     def calculate_defender_pressure_turnover_probability(self) -> float:
         """
         Calculate the total turnover probability from defender pressure on the ball handler.
@@ -2955,6 +3010,7 @@ class HexagonBasketballEnv(gym.Env):
         
         return total_pressure_prob
 
+    @profile_section("calculate_expected_points_all_players")
     def calculate_expected_points_all_players(self) -> np.ndarray:
         """
         Calculate expected points for offensive players based on their current position
@@ -2973,6 +3029,7 @@ class HexagonBasketballEnv(gym.Env):
         return eps
 
     # --- Profiling helpers ---
+    @profile_section("get_profile_stats")
     def get_profile_stats(self) -> Dict[str, Dict[str, float]]:
         stats: Dict[str, Dict[str, float]] = {}
         for k, total_ns in self._profile_ns.items():
@@ -2984,6 +3041,7 @@ class HexagonBasketballEnv(gym.Env):
             }
         return stats
 
+    @profile_section("reset_profile_stats")
     def reset_profile_stats(self) -> None:
         self._profile_ns.clear()
         self._profile_calls.clear()

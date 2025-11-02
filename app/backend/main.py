@@ -230,7 +230,7 @@ async def init_game(request: InitGameRequest):
         
         # Load environment parameters including role_flag encoding
         required, optional = get_mlflow_params(client, request.run_id)
-        
+
         # Extract role_flag encoding for backward compatibility (not passed to env)
         game_state.role_flag_offense = optional.pop("role_flag_offense_value")
         game_state.role_flag_defense = optional.pop("role_flag_defense_value")
@@ -2127,6 +2127,7 @@ def get_rewards():
             "made_shot_reward_three": float(
                 getattr(env, "made_shot_reward_three", 0.0)
             ),
+            "violation_reward": float(getattr(env, "violation_reward", 0.0)),
             "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
             # Percentage-based assist shaping
             "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
@@ -2345,6 +2346,9 @@ def get_full_game_state(include_policy_probs=False):
         # 3-second violation rules (shared configuration)
         "three_second_lane_width": int(
             getattr(game_state.env, "three_second_lane_width", 1)
+        ),
+        "three_second_lane_height": int(
+            getattr(game_state.env, "three_second_lane_height", 3)
         ),
         "three_second_max_steps": int(
             getattr(game_state.env, "three_second_max_steps", 3)

@@ -1,67 +1,206 @@
-> can you explain the logic behind how you defined the observation space?
+> Can you explain the logic behind how you defined the observation space?
 ---
-Of course. That's an excellent question. The design of the observation space is one of the most critical parts of any reinforcement learning environment. It's the "eyes" of the AI agent, and what you choose to include (and how you format it) directly impacts how well the agent can learn.
 
-Let's break down the logic for this environment's observation space.
+## Overview
 
-### 1. The Goal: A Snapshot of the Game
+The observation space is one of the most critical design decisions in any reinforcement learning environment. It's the "eyes" of the AI agent, and what you choose to include (and how you format it) directly impacts how well the agent can learn.
 
-The goal is to give the AI agent a complete, numerical snapshot of the game state at any given moment. This snapshot must contain all the essential information needed to make a good decision. For our basketball game, the most critical pieces of information are:
-*   Where is every player on the court?
-*   Who has the ball?
-*   How much time is left to shoot?
+Our environment uses a **structured dictionary observation space** with multiple components, each serving a specific purpose for learning basketball strategy.
 
-### 2. The Format: A Flat Vector of Numbers
+---
 
-Standard reinforcement learning algorithms (like PPO, which is common for this type of problem) work best with a fixed-size, one-dimensional array (or vector) of numbers. They feed this vector into a neural network to decide on an action.
+## Observation Space Structure
 
-Our `_get_observation` method builds this vector:
+The observation space is a `gymnasium.spaces.Dict` with four keys:
 
 ```python
-def _get_observation(self) -> np.ndarray:
-    obs = []
-    
-    # Part 1: Player positions (q, r for each player)
-    for q, r in self.positions:
-        obs.extend([q, r])
-    
-    # Part 2: Ball holder ID
-    obs.append(self.ball_holder)
-    
-    # Part 3: Shot clock
-    obs.append(self.shot_clock)
-    
-    return np.array(obs, dtype=np.int32)
+observation_space = spaces.Dict({
+    "obs": state_space,           # Main game state vector
+    "action_mask": action_mask_space,  # Legal actions per player
+    "role_flag": role_flag_space,      # Offense (+1) or Defense (-1)
+    "skills": skills_space,            # Per-player shooting abilities
+})
 ```
 
-So, for a 3v3 game (6 players), the final observation vector would have `(6 players * 2 coordinates) + 1 ball_holder + 1 shot_clock = 14` numbers.
+---
 
-**Example for a 2v2 game (4 players):**
-The vector would look like this:
-`[O0_q, O0_r, O1_q, O1_r, D2_q, D2_r, D3_q, D3_r, ball_holder_id, shot_clock]`
+## 1. Main State Vector (`"obs"`)
 
-### 3. Defining the Boundaries with `gymnasium.spaces.Box`
+This is the primary observation vector containing all dynamic game state information. It's built using **egocentric coordinates** centered on the ball handler with optional rotation to face the hoop.
 
-Now, we need to tell the Gymnasium framework what the valid range of values is for each number in our vector. This is what the `self.observation_space` definition does. We use `spaces.Box` because it's designed for vectors of numbers where each element has a minimum (`low`) and maximum (`high`) value.
+**Note:** This is ONLY the `"obs"` key in the dictionary. Skills, action masks, and role flags are separate dictionary keys (see sections below).
 
-Let's look at the code:
+### Components (in order):
+
+#### **A. Player Positions** (`n_players × 2` floats)
+- **Format:** `(dq, dr)` pairs in axial hex coordinates
+- **Reference Frame:** Relative to the current ball handler (egocentric)
+- **Rotation:** If `egocentric_rotate_to_hoop=True`, coordinates are rotated so the basket is always in a consistent direction
+- **Normalization:** Divided by `max(court_width, court_height)` to keep values roughly in `[-1, 1]`
+- **Fallback:** If no ball holder exists (terminal states), coordinates are relative to the basket position
+
+**Why egocentric?** This provides translation and rotation invariance, helping the network learn policies that work anywhere on the court rather than memorizing specific positions.
+
+#### **B. Ball Holder One-Hot** (`n_players` floats)
+- **Format:** One-hot vector indicating which player has the ball
+- **Example (3v3):** `[0, 0, 1, 0, 0, 0]` means player 2 has the ball
+- **Note:** Technically redundant since the ball handler is the ego-center, but retained for backward compatibility and explicit encoding
+
+#### **C. Shot Clock** (`1` float)
+- **Format:** Raw integer value (unnormalized)
+- **Range:** `[0, shot_clock_steps]` (typically 24)
+- **Purpose:** Encodes time pressure for decision-making
+
+#### **D. Hoop Vector** (`2` floats, optional)
+- **Format:** `(hoop_dq, hoop_dr)` - direction to basket from ball handler
+- **Included if:** `include_hoop_vector=True`
+- **Rotation:** Consistently rotated with player positions
+- **Normalization:** Same as player positions
+- **Purpose:** Explicit encoding of shooting direction (though implicit in egocentric frame)
+
+#### **E. Nearest Defender Distances** (`players_per_side` floats)
+- **Format:** One distance per offensive player (in order of player ID)
+- **Calculation:** Minimum hex distance to any defender
+- **Normalization:** Divided by `max(court_width, court_height)` if `normalize_obs=True`
+- **Purpose:** Helps offensive players understand defensive coverage and open spaces
+
+#### **F. Lane Step Counts** (`n_players` floats)
+- **Format:** One count per player (offensive and defensive)
+- **Offensive Players:** Steps spent in offensive lane (3-second violation tracking)
+- **Defensive Players:** Steps spent in defensive key (illegal defense tracking)
+- **Range:** `[0, three_second_max_steps]` (typically 3)
+- **Purpose:** Enables agents to learn rule compliance (avoid violations)
+
+#### **G. Expected Points (EP)** (`players_per_side` floats)
+- **Format:** One EP value per offensive player (in order of player ID)
+- **Calculation:** Pressure-adjusted expected value of a shot from their current position
+- **Factors:** 
+  - Distance to basket (layup vs three-pointer percentages)
+  - Defender pressure (shot pressure mechanics)
+  - Player's individual shooting skill
+- **Purpose:** Helps agents evaluate shot quality and make better shooting decisions
+
+#### **H. Turnover Probabilities** (`players_per_side` floats)
+- **Format:** One probability per offensive player (fixed-position encoding)
+- **Values:** Non-zero only for the current ball handler, zero for all others
+- **Calculation:** Based on defender proximity using exponential decay
+- **Purpose:** Explicit risk signal for holding the ball under pressure
+
+#### **I. Steal Risks** (`players_per_side` floats)
+- **Format:** One probability per offensive player (fixed-position encoding)
+- **Values:** Non-zero for potential pass receivers, zero for ball holder
+- **Calculation:** Geometric steal probability based on:
+  - Pass distance
+  - Defenders along pass trajectory
+  - Perpendicular distance of defenders from pass line
+- **Purpose:** Helps agent evaluate passing risks and make safer pass decisions
+
+### Size Calculation for `"obs"` Vector (3v3 example):
+
 ```python
-# In __init__
-obs_low = np.array([-grid_size * 2] * (self.n_players * 2) + [-1] + [0])
-obs_high = np.array([grid_size * 2] * (self.n_players * 2) + [self.n_players] + [shot_clock_steps])
-self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.int32)
+n_players = 6
+players_per_side = 3
+
+# Size of observation["obs"] - the main state vector only
+obs_size = (
+    n_players * 2              # Player positions: 12
+    + n_players                # Ball holder one-hot: 6
+    + 1                        # Shot clock: 1
+    + 2                        # Hoop vector (if included): 2
+    + players_per_side         # Nearest defender distances: 3
+    + n_players                # Lane step counts: 6
+    + players_per_side         # Expected Points: 3
+    + players_per_side         # Turnover probabilities: 3
+    + players_per_side         # Steal risks: 3
+) = 39 floats (with hoop vector)
+
+# Additional dictionary keys (separate from "obs"):
+# observation["skills"] = 9 floats (3 per offensive player)
+# observation["action_mask"] = (6, 14) int8 array
+# observation["role_flag"] = 1 float
 ```
 
-This line builds the `low` and `high` boundary arrays that mirror the structure of our observation vector:
+---
 
-*   **Player Positions (`-grid_size * 2` to `grid_size * 2`):**
-    *   `self.n_players * 2`: This creates boundaries for all player coordinates (`q` and `r` for each player).
-    *   **Logic:** The values `-grid_size * 2` and `grid_size * 2` are chosen as a "safe," generous range. While the players will always be within the court, their axial coordinates can sometimes be unpredictable. This large range guarantees that any valid coordinate will fall within the defined space. It's a simple, robust way to define the bounds without calculating the exact minimum and maximum possible axial coordinates.
+## 2. Action Mask (`"action_mask"`)
 
-*   **Ball Holder (`-1` to `self.n_players`):**
-    *   **Logic:** The player IDs are `0, 1, 2, ... n_players-1`. The lower bound is set to `-1` as a conventional way to represent a "no ball holder" state (even though our current rules don't use it, it's good practice). The upper bound is `self.n_players`, which is one value higher than the maximum possible player ID. This is a standard way to define the range for discrete values within a `Box` space.
+- **Shape:** `(n_players, 14)` - one row per player, one column per action type
+- **Format:** Binary mask (0 = illegal, 1 = legal)
+- **Purpose:** Prevents agents from attempting illegal actions (moving off-court, shooting from too far, passing to non-existent teammates, etc.)
+- **Actions:** `NOOP, MOVE_E, MOVE_NE, MOVE_NW, MOVE_W, MOVE_SW, MOVE_SE, SHOOT, PASS_E, PASS_NE, PASS_NW, PASS_W, PASS_SW, PASS_SE`
 
-*   **Shot Clock (`0` to `shot_clock_steps`):**
-    *   **Logic:** This is straightforward. The clock can't go below 0, and its maximum value is the starting value, `shot_clock_steps`.
+**Why important?** Masking illegal actions dramatically accelerates learning by preventing the agent from wasting time exploring invalid moves.
 
-By defining the observation space this way, we provide the reinforcement learning framework with a clear, structured understanding of the game's state, which is the essential first step for training an intelligent agent.
+---
+
+## 3. Role Flag (`"role_flag"`)
+
+- **Shape:** `(1,)` - single float
+- **Values:** `+1.0` for offensive team, `-1.0` for defensive team
+- **Purpose:** Indicates which team the agent is currently controlling
+- **Symmetric Encoding:** Using +1/-1 instead of 0/1 provides better gradient flow and symmetry
+
+**Why separate?** This allows a single shared policy to play both offense and defense by conditioning its behavior on this flag.
+
+---
+
+## 4. Skills (`"skills"`)
+
+- **Shape:** `(players_per_side × 3,)` - three skills per offensive player
+- **Format:** Skill deltas relative to baseline percentages
+- **Order per player:** `(layup_delta, three_pt_delta, dunk_delta)`
+- **Example (3v3):** 9 floats total `[P0_layup_Δ, P0_3pt_Δ, P0_dunk_Δ, P1_layup_Δ, P1_3pt_Δ, P1_dunk_Δ, P2_layup_Δ, P2_3pt_Δ, P2_dunk_Δ]`
+- **Concrete Example:** If player 0 has `layup_pct = 0.65` and baseline is `0.60`, the first value is `+0.05`
+
+**Purpose:** Enables agents to:
+- Make better decisions about who should shoot
+- Learn role specialization (e.g., three-point specialists vs. inside scorers)
+- Adapt strategy to team composition
+
+**Why deltas?** Expressing skills as differences from baseline makes it easier for the network to learn relative strengths.
+
+**Why separate from main `"obs"`?** Skills are sampled once per episode and remain constant, while the main `"obs"` vector changes every step. This separation can help the network architecture process static vs dynamic information differently.
+
+---
+
+## Design Principles
+
+### **1. Egocentric Representation**
+- All spatial information is relative to the ball handler
+- Provides natural translation invariance
+- Reduces state space complexity
+
+### **2. Rotation Normalization**
+- Optional rotation so basket is always in a consistent direction
+- Helps network learn direction-agnostic strategies
+- Reduces variance in observations
+
+### **3. Fixed-Position Encoding**
+- EP, turnover risk, and steal risk use fixed player indices
+- Position `i` always corresponds to offensive player `i`
+- More stable for learning than dynamic ordering
+
+### **4. Explicit Risk Signals**
+- EP, turnover probability, and steal risks are calculated by the environment
+- Provides clear learning signals about decision quality
+- Accelerates learning of risk-aware behavior
+
+### **5. Normalization**
+- Spatial coordinates normalized to `[-1, 1]` range
+- Improves neural network training stability
+- Can be disabled with `normalize_obs=False` for debugging
+
+---
+
+## Configuration Flags
+
+Key environment parameters that affect observation structure:
+
+- `use_egocentric_obs`: Use ball-handler-relative coordinates (default: `True`)
+- `egocentric_rotate_to_hoop`: Rotate observations to face basket (default: `True`)
+- `include_hoop_vector`: Add explicit hoop direction vector (default: `True`)
+- `normalize_obs`: Normalize spatial coordinates (default: `True`)
+
+---
+
+By providing this rich, structured observation space, we give the RL agent all the information needed to learn sophisticated basketball strategies while maintaining computational efficiency through careful normalization and representation choices.

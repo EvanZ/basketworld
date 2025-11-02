@@ -7,11 +7,13 @@ from time import perf_counter_ns
 
 def profile_section(section_name: str):
     """Decorator to measure method wall time in ns when env.enable_profiling is True.
+    Profiling can be sampled per-episode via profiling_sample_rate to reduce overhead.
     Placed before class definition so it's available for method decorators.
     """
     def _decorator(func):
         def _wrapped(self, *args, **kwargs):
-            if not getattr(self, "enable_profiling", False):
+            # Check both global flag and per-episode sampling flag
+            if not getattr(self, "enable_profiling", False) or not getattr(self, "_profiling_this_episode", False):
                 return func(self, *args, **kwargs)
             t0 = perf_counter_ns()
             try:
