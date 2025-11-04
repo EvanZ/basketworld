@@ -266,15 +266,18 @@ class HexagonBasketballEnv(gym.Env):
         # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
         # Note: Using fixed-position encoding (one slot per player) instead of dynamic ordering
         # for better learning - position i always corresponds to offensive player i
-        base_len = (self.n_players * 2) + self.n_players + 1 + self.players_per_side + self.n_players
+        base_len = (self.n_players * 2) + self.n_players + 1 + self.n_players
         hoop_extra = 2 if self.include_hoop_vector else 0
+        # All-pairs offense-defense distances and angles (replaces nearest defender distances)
+        offense_defense_distances = self.players_per_side * self.players_per_side  
+        offense_defense_angles = self.players_per_side * self.players_per_side
         ep_extra = self.players_per_side  # EP for each offensive player
         turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
         steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
         state_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(base_len + hoop_extra + ep_extra + turnover_risk_extra + steal_risk_extra,),
+            shape=(base_len + hoop_extra + offense_defense_distances + offense_defense_angles + ep_extra + turnover_risk_extra + steal_risk_extra,),
             dtype=np.float32,
         )
         action_mask_space = spaces.Box(
@@ -2167,6 +2170,133 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
+    @profile_section("_get_defender_distances_for_offensive_player")
+    def _get_defender_distances_for_offensive_player(self, offense_id: int) -> np.ndarray:
+        """
+        Get distances from a specific offensive player to all defenders.
+        
+        Args:
+            offense_id: The offensive player ID (0, 1, or 2 for 3v3)
+            
+        Returns:
+            Array of shape (players_per_side,) with distances to each defender.
+        """
+        distances = []
+        off_pos = self.positions[offense_id]
+        for def_id in self.defense_ids:
+            def_pos = self.positions[def_id]
+            distance = self._hex_distance(off_pos, def_pos)
+            distances.append(float(distance))
+        return np.array(distances, dtype=np.float32)
+    
+    @profile_section("_get_defender_angles_for_offensive_player")
+    def _get_defender_angles_for_offensive_player(self, offense_id: int) -> np.ndarray:
+        """
+        Get angle cosines from a specific offensive player to all defenders.
+        
+        For each defender, calculates cos(angle) where angle is at the offensive player between:
+        - Vector from offensive player to basket (direction they want to go)
+        - Vector from offensive player to defender (where the defender is)
+        
+        Args:
+            offense_id: The offensive player ID
+            
+        Returns:
+            Array of shape (players_per_side,) with cos(angle) values in [-1, 1].
+            
+        Interpretation:
+            +1.0: Defender directly between offensive player and basket (best defensive position)
+            0.0:  Defender perpendicular (side/help defense)
+            -1.0: Defender directly behind offensive player (beaten/helping from behind)
+        """
+        off_pos = self.positions[offense_id]
+        
+        # Vector from offense to basket
+        to_basket_q = self.basket_position[0] - off_pos[0]
+        to_basket_r = self.basket_position[1] - off_pos[1]
+        
+        # Calculate basket vector magnitude (using hex metric)
+        # In axial coords: |v|² = q² + r² + qr
+        basket_mag_sq = to_basket_q**2 + to_basket_r**2 + to_basket_q * to_basket_r
+        basket_mag = math.sqrt(max(0, basket_mag_sq))
+        
+        angles = []
+        for def_id in self.defense_ids:
+            def_pos = self.positions[def_id]
+            
+            # Vector from offense to defender
+            to_defender_q = def_pos[0] - off_pos[0]
+            to_defender_r = def_pos[1] - off_pos[1]
+            
+            # Calculate defender vector magnitude
+            defender_mag_sq = to_defender_q**2 + to_defender_r**2 + to_defender_q * to_defender_r
+            defender_mag = math.sqrt(max(0, defender_mag_sq))
+            
+            # Handle edge cases
+            if basket_mag < 1e-6 or defender_mag < 1e-6:
+                # Offensive player at basket or defender at same position as offensive player
+                angles.append(0.0)
+                continue
+            
+            # Dot product in axial coordinates
+            # A·B = A.q*B.q + A.r*B.r + 0.5*(A.q*B.r + A.r*B.q)
+            # This accounts for 120° angle between axial coordinate axes
+            dot = (to_basket_q * to_defender_q + 
+                   to_basket_r * to_defender_r + 
+                   0.5 * (to_basket_q * to_defender_r + to_basket_r * to_defender_q))
+            
+            # cos(angle) = (A·B) / (|A| * |B|)
+            cos_angle = dot / (basket_mag * defender_mag)
+            
+            # Clamp to [-1, 1] to handle floating point errors
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            
+            angles.append(float(cos_angle))
+        
+        return np.array(angles, dtype=np.float32)
+    
+    @profile_section("_calculate_offense_defense_distances")
+    def _calculate_offense_defense_distances(self) -> np.ndarray:
+        """
+        Calculate all-pairs distances between offensive and defensive players.
+        
+        Returns:
+            Array of shape (players_per_side * players_per_side,) with distances.
+            For 3v3: [O0→D0, O0→D1, O0→D2, O1→D0, O1→D1, O1→D2, O2→D0, O2→D1, O2→D2]
+            
+        This is ordered as: for each offensive player (outer loop), distance to each defender (inner loop).
+        For defense perspective, this can be interpreted as transposed (defender × offensive player).
+        """
+        all_distances = []
+        for off_id in self.offense_ids:
+            distances = self._get_defender_distances_for_offensive_player(off_id)
+            all_distances.extend(distances.tolist())
+        return np.array(all_distances, dtype=np.float32)
+    
+    @profile_section("_calculate_offense_defense_angles")
+    def _calculate_offense_defense_angles(self) -> np.ndarray:
+        """
+        Calculate angle cosines between offensive players, defenders, and basket.
+        
+        For each (offensive player, defender) pair, calculates cos(angle) where angle is at 
+        the offensive player between:
+        - Vector from offensive player to basket (where they want to go)
+        - Vector from offensive player to defender (where the defender is)
+        
+        Returns:
+            Array of shape (players_per_side * players_per_side,) with cos(angle) values in [-1, 1].
+            
+        Interpretation:
+            +1.0: Defender directly between offensive player and basket (best defensive position)
+            0.0:  Defender perpendicular (side/help defense)
+            -1.0: Defender directly behind offensive player (beaten/helping from behind)
+        """
+        all_angles = []
+        for off_id in self.offense_ids:
+            angles = self._get_defender_angles_for_offensive_player(off_id)
+            all_angles.extend(angles.tolist())
+        return np.array(all_angles, dtype=np.float32)
+
     @profile_section("_get_observation")
     def _get_observation(self) -> np.ndarray:
         """Get current observation of the game state.
@@ -2236,18 +2366,21 @@ class HexagonBasketballEnv(gym.Env):
             hoop_dr /= norm_den
             obs.extend([hoop_dq, hoop_dr])
 
-        # Distances from each offensive player to the nearest defender
-        # Appended in ascending offensive player id order
-        for offense_id in self.offense_ids:
-            offense_pos = self.positions[offense_id]
-            nearest_defender_distance = min(
-                self._hex_distance(offense_pos, self.positions[defender_id])
-                for defender_id in self.defense_ids
-            )
-            if self.normalize_obs:
-                obs.append(float(nearest_defender_distance) / norm_den)
-            else:
-                obs.append(float(nearest_defender_distance))
+        # All-pairs offense-defense distances
+        # For each offensive player, distance to each defender
+        # Shape: (players_per_side * players_per_side,)
+        # For 3v3: [O0→D0, O0→D1, O0→D2, O1→D0, O1→D1, O1→D2, O2→D0, O2→D1, O2→D2]
+        distances = self._calculate_offense_defense_distances()
+        if self.normalize_obs:
+            distances = distances / norm_den
+        obs.extend(distances.tolist())
+        
+        # All-pairs offense-defense angle cosines
+        # For each offensive player, cos(angle) between defender and basket direction
+        # Shape: (players_per_side * players_per_side,)
+        # Values in [-1, 1]: +1 = defender in front, 0 = perpendicular, -1 = behind
+        angles = self._calculate_offense_defense_angles()
+        obs.extend(angles.tolist())
         
         # Lane step counts for all players (offensive and defensive)
         # This allows agents to learn to manage their time in the lane
@@ -2938,7 +3071,9 @@ class HexagonBasketballEnv(gym.Env):
         1. Actual turnover resolution during gameplay
         2. Observation features for agents to see turnover risk
         
-        Only considers defenders in front (180° arc toward basket).
+        Only considers defenders in front (180° arc toward basket, cos(angle) >= 0).
+        
+        Refactored to use the distance and angle calculation methods.
         """
         if self.ball_holder is None:
             return []
@@ -2946,48 +3081,31 @@ class HexagonBasketballEnv(gym.Env):
         if self.ball_holder not in self.offense_ids:
             return []  # Only offensive ball handlers face defender pressure
         
-        ball_handler_pos = self.positions[self.ball_holder]
-        
-        # Calculate direction from ball handler to basket (assumed facing direction)
-        basket_dq = self.basket_position[0] - ball_handler_pos[0]
-        basket_dr = self.basket_position[1] - ball_handler_pos[1]
-        basket_x, basket_y = self._axial_to_cartesian(basket_dq, basket_dr)
-        basket_norm = math.hypot(basket_x, basket_y) or 1.0
+        # Get distances and angles for the ball handler
+        distances = self._get_defender_distances_for_offensive_player(self.ball_holder)
+        angles = self._get_defender_angles_for_offensive_player(self.ball_holder)
         
         defender_pressure_info = []
         
-        for defender_id in self.defense_ids:
-            defender_pos = self.positions[defender_id]
-            distance = self._hex_distance(ball_handler_pos, defender_pos)
+        for i, def_id in enumerate(self.defense_ids):
+            distance = distances[i]
+            cos_angle = angles[i]
             
-            # Only consider defenders within pressure range
-            if distance <= self.defender_pressure_distance:
-                # Check if defender is in front (180° arc toward basket)
-                defender_dq = defender_pos[0] - ball_handler_pos[0]
-                defender_dr = defender_pos[1] - ball_handler_pos[1]
-                defender_x, defender_y = self._axial_to_cartesian(defender_dq, defender_dr)
-                defender_vec_norm = math.hypot(defender_x, defender_y)
+            # Only consider defenders within pressure range and in front (cos_angle >= 0)
+            if distance <= self.defender_pressure_distance and cos_angle >= 0:
+                # Calculate turnover probability with exponential decay
+                # At distance=1 (adjacent), probability = baseline
+                # As distance increases beyond 1, probability decays exponentially
+                turnover_prob = self.defender_pressure_turnover_chance * math.exp(
+                    -self.defender_pressure_decay_lambda * max(0, distance - 1)
+                )
                 
-                if defender_vec_norm == 0:
-                    continue  # Defender at same position (shouldn't happen)
-                
-                # Dot product to check if defender is in front
-                # cos(angle) >= 0 means angle is within [-90°, 90°] (180° arc)
-                cos_angle = (defender_x * basket_x + defender_y * basket_y) / (defender_vec_norm * basket_norm)
-                
-                if cos_angle >= 0:  # Defender is in front
-                    # Calculate turnover probability with exponential decay
-                    # At distance=1 (adjacent), probability = baseline
-                    # As distance increases beyond 1, probability decays exponentially
-                    turnover_prob = self.defender_pressure_turnover_chance * math.exp(
-                        -self.defender_pressure_decay_lambda * max(0, distance - 1)
-                    )
-                    
-                    defender_pressure_info.append({
-                        "defender_id": int(defender_id),
-                        "distance": int(distance),
-                        "turnover_prob": float(turnover_prob),
-                    })
+                defender_pressure_info.append({
+                    "defender_id": int(def_id),
+                    "distance": int(distance),
+                    "turnover_prob": float(turnover_prob),
+                    "cos_angle": float(cos_angle),  # Added for debugging/visualization
+                })
         
         return defender_pressure_info
 

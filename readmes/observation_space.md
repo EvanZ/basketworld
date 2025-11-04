@@ -58,20 +58,41 @@ This is the primary observation vector containing all dynamic game state informa
 - **Normalization:** Same as player positions
 - **Purpose:** Explicit encoding of shooting direction (though implicit in egocentric frame)
 
-#### **E. Nearest Defender Distances** (`players_per_side` floats)
-- **Format:** One distance per offensive player (in order of player ID)
-- **Calculation:** Minimum hex distance to any defender
+#### **E. All-Pairs Offense-Defense Distances** (`players_per_side²` floats)
+- **Format:** For each offensive player, distance to each defender (row-major order)
+- **Example (3v3):** 9 values `[O0→D0, O0→D1, O0→D2, O1→D0, O1→D1, O1→D2, O2→D0, O2→D1, O2→D2]`
+- **Calculation:** Hex distance between each offense-defense pair
 - **Normalization:** Divided by `max(court_width, court_height)` if `normalize_obs=True`
-- **Purpose:** Helps offensive players understand defensive coverage and open spaces
+- **Purpose:** 
+  - Provides complete defensive coverage information
+  - Enables understanding of help defense positioning
+  - Network can learn "nearest defender" (minimum per row) if needed
+  - Reveals double-team situations and defensive rotations
 
-#### **F. Lane Step Counts** (`n_players` floats)
+#### **F. All-Pairs Offense-Defense Angle Cosines** (`players_per_side²` floats)
+- **Format:** For each offensive player, cos(angle) to each defender (same ordering as distances)
+- **Example (3v3):** 9 values matching the distance matrix ordering
+- **Calculation:** For each (offense, defender) pair, cos(angle) where angle is at the offensive player between:
+  - Vector from offensive player to basket (direction they want to go)
+  - Vector from offensive player to defender (where the defender is)
+- **Values:** Range `[-1.0, +1.0]`
+  - `+1.0`: Defender directly between offensive player and basket (optimal defensive position)
+  - `0.0`: Defender perpendicular/to the side (neutral/help defense)
+  - `-1.0`: Defender directly behind offensive player (beaten or weakside help)
+- **Purpose:**
+  - Captures defensive positioning quality, not just distance
+  - "Close but behind" vs "close and in front" have very different meanings
+  - Enables learning about on-ball pressure vs help defense
+  - Combined with distance, provides complete defensive context
+
+#### **G. Lane Step Counts** (`n_players` floats)
 - **Format:** One count per player (offensive and defensive)
 - **Offensive Players:** Steps spent in offensive lane (3-second violation tracking)
 - **Defensive Players:** Steps spent in defensive key (illegal defense tracking)
 - **Range:** `[0, three_second_max_steps]` (typically 3)
 - **Purpose:** Enables agents to learn rule compliance (avoid violations)
 
-#### **G. Expected Points (EP)** (`players_per_side` floats)
+#### **H. Expected Points (EP)** (`players_per_side` floats)
 - **Format:** One EP value per offensive player (in order of player ID)
 - **Calculation:** Pressure-adjusted expected value of a shot from their current position
 - **Factors:** 
@@ -80,13 +101,13 @@ This is the primary observation vector containing all dynamic game state informa
   - Player's individual shooting skill
 - **Purpose:** Helps agents evaluate shot quality and make better shooting decisions
 
-#### **H. Turnover Probabilities** (`players_per_side` floats)
+#### **I. Turnover Probabilities** (`players_per_side` floats)
 - **Format:** One probability per offensive player (fixed-position encoding)
 - **Values:** Non-zero only for the current ball handler, zero for all others
 - **Calculation:** Based on defender proximity using exponential decay
 - **Purpose:** Explicit risk signal for holding the ball under pressure
 
-#### **I. Steal Risks** (`players_per_side` floats)
+#### **J. Steal Risks** (`players_per_side` floats)
 - **Format:** One probability per offensive player (fixed-position encoding)
 - **Values:** Non-zero for potential pass receivers, zero for ball holder
 - **Calculation:** Geometric steal probability based on:
@@ -103,16 +124,17 @@ players_per_side = 3
 
 # Size of observation["obs"] - the main state vector only
 obs_size = (
-    n_players * 2              # Player positions: 12
-    + n_players                # Ball holder one-hot: 6
-    + 1                        # Shot clock: 1
-    + 2                        # Hoop vector (if included): 2
-    + players_per_side         # Nearest defender distances: 3
-    + n_players                # Lane step counts: 6
-    + players_per_side         # Expected Points: 3
-    + players_per_side         # Turnover probabilities: 3
-    + players_per_side         # Steal risks: 3
-) = 39 floats (with hoop vector)
+    n_players * 2                      # Player positions: 12
+    + n_players                        # Ball holder one-hot: 6
+    + 1                                # Shot clock: 1
+    + 2                                # Hoop vector (if included): 2
+    + players_per_side * players_per_side  # All-pairs distances: 9
+    + players_per_side * players_per_side  # All-pairs angles: 9
+    + n_players                        # Lane step counts: 6
+    + players_per_side                 # Expected Points: 3
+    + players_per_side                 # Turnover probabilities: 3
+    + players_per_side                 # Steal risks: 3
+) = 54 floats (with hoop vector)
 
 # Additional dictionary keys (separate from "obs"):
 # observation["skills"] = 9 floats (3 per offensive player)
@@ -180,13 +202,21 @@ obs_size = (
 - Position `i` always corresponds to offensive player `i`
 - More stable for learning than dynamic ordering
 
-### **4. Explicit Risk Signals**
+### **4. Rich Defensive Context**
+- All-pairs distance and angle matrices provide complete defensive information
+- Replaces single "nearest defender" with full defensive coverage picture
+- Angle cosines capture positioning quality: defender "in front" vs "behind" or "helping"
+- Enables learning about help defense, switches, and double-teams
+- Network can derive simpler features (e.g., nearest defender) if useful
+
+### **5. Explicit Risk Signals**
 - EP, turnover probability, and steal risks are calculated by the environment
 - Provides clear learning signals about decision quality
 - Accelerates learning of risk-aware behavior
 
-### **5. Normalization**
+### **6. Normalization**
 - Spatial coordinates normalized to `[-1, 1]` range
+- Angle cosines naturally in `[-1, 1]` range
 - Improves neural network training stability
 - Can be disabled with `normalize_obs=False` for debugging
 
