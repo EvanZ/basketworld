@@ -2293,6 +2293,8 @@ def get_full_game_state(include_policy_probs=False):
         ),
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
+        # Observation vector (main state) - all features the RL agent sees
+        "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],
         "last_action_results": last_action_results_py,
         "offense_ids": game_state.env.offense_ids,
         "defense_ids": game_state.env.defense_ids,

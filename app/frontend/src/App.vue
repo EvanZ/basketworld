@@ -995,7 +995,7 @@ header {
   display: flex;
   flex-direction: column;
   align-items: center;
-  flex: 1;
+  flex: 1.5;
   min-width: 640; /* allow flex child to shrink properly */
 }
 

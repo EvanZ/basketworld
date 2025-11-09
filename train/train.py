@@ -28,7 +28,7 @@ for var in aws_vars_to_clear:
 # Only needed when accessing S3 artifacts (old runs with s3:// URIs)
 # If MLflow server uses local storage, this won't affect anything
 if os.path.exists(os.path.expanduser('~/.aws/credentials')):
-    os.environ['AWS_PROFILE'] = 'basketworld'
+    os.environ['AWS_PROFILE'] = 'default'
     os.environ['AWS_DEFAULT_REGION'] = 'us-west-1'
     
     # Import boto3 early to ensure it uses the profile
@@ -99,7 +99,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+torch.set_num_interop_threads(max(4,(os.cpu_count() or 16 // 2)))
+torch.__config__.show()
 
 
 # --- GPU Configuration ---
@@ -2092,19 +2093,19 @@ if __name__ == "__main__":
         "--use-egocentric-obs",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,
-        help="Use egocentric observations centered at the ball handler.",
+        help="[DEPRECATED] Observations now use absolute coordinates. This flag is ignored.",
     )
     parser.add_argument(
         "--egocentric-rotate-to-hoop",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,
-        help="Rotate egocentric frame so hoop is aligned to +q axis.",
+        help="[DEPRECATED] Rotation is no longer used with absolute coordinates. This flag is ignored.",
     )
     parser.add_argument(
         "--include-hoop-vector",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,
-        help="Append hoop direction vector to observation.",
+        help="Append hoop position vector (absolute coordinates) to observation.",
     )
     parser.add_argument(
         "--normalize-obs",

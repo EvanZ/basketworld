@@ -266,18 +266,22 @@ class HexagonBasketballEnv(gym.Env):
         # Player skills moved to separate observation key `skills` (shape=(players_per_side*3,))
         # Note: Using fixed-position encoding (one slot per player) instead of dynamic ordering
         # for better learning - position i always corresponds to offensive player i
-        base_len = (self.n_players * 2) + self.n_players + 1 + self.n_players
+        # Base components of observation vector
+        base_len = (self.n_players * 2) + self.n_players + 1  # Player positions, ball holder one-hot, shot clock
+        team_encoding_extra = self.n_players  # Per-player team encoding (+1 offense, -1 defense)
+        ball_handler_pos_extra = 2  # Absolute position of ball handler (NEW - helps distinguish court regions)
         hoop_extra = 2 if self.include_hoop_vector else 0
         # All-pairs offense-defense distances and angles (replaces nearest defender distances)
         offense_defense_distances = self.players_per_side * self.players_per_side  
         offense_defense_angles = self.players_per_side * self.players_per_side
+        lane_steps_extra = self.n_players  # Lane violation counters for all players
         ep_extra = self.players_per_side  # EP for each offensive player
         turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
         steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
         state_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(base_len + hoop_extra + offense_defense_distances + offense_defense_angles + ep_extra + turnover_risk_extra + steal_risk_extra,),
+            shape=(base_len + team_encoding_extra + ball_handler_pos_extra + hoop_extra + offense_defense_distances + offense_defense_angles + lane_steps_extra + ep_extra + turnover_risk_extra + steal_risk_extra,),
             dtype=np.float32,
         )
         action_mask_space = spaces.Box(
@@ -2301,52 +2305,24 @@ class HexagonBasketballEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """Get current observation of the game state.
 
-        Ego-centric vector:
-        - For each player i: (dq_i, dr_i) relative to current ball handler, normalized
-        - One-hot ball holder (redundant but retained for compatibility/debugging)
+        Absolute position vector (NOT egocentric):
+        - For each player i: (q_i, r_i) in absolute court coordinates, normalized
+        - One-hot ball holder
         - Shot clock (raw value)
-        - Hoop vector relative to ball handler, normalized
-        - Role flag now provided separately as observation key `role_flag`
-        - For each offensive player: distance to nearest defender (normalized if enabled)
+        - Absolute ball handler position (q, r) - helps distinguish court regions (center vs. sides)
+        - Hoop vector: (q, r) in absolute coordinates, normalized
         """
         obs: List[float] = []
 
-        # Choose the ego-center. If there is no ball holder (e.g., after a missed shot in a terminal state),
-        # fall back to the basket position to avoid undefined relative coordinates.
-        if self.ball_holder is not None:
-            center_q, center_r = self.positions[self.ball_holder]
-        else:
-            center_q, center_r = self.basket_position
-
-        # Normalization factor to put deltas roughly in [-1, 1]
+        # Normalization factor to put coordinates roughly in [-1, 1]
         # Using the larger of width/height bounds axial deltas conservatively
         norm_den: float = float(max(self.court_width, self.court_height)) or 1.0
         if not self.normalize_obs:
             norm_den = 1.0
 
-        # Compute rotation k so that hoop vector is aligned toward +q (if enabled)
-        # Work with unnormalized axial deltas, rotate, then normalize.
-        hoop_dq_raw = self.basket_position[0] - center_q
-        hoop_dr_raw = self.basket_position[1] - center_r
-
-        best_k = 0
-        if self.egocentric_rotate_to_hoop:
-            best_score = None
-            for k in range(6):
-                rq, rr = self._rotate_k60_axial(hoop_dq_raw, hoop_dr_raw, k)
-                # Prefer minimal |rr| (close to +q axis), then prefer rq>=0, then maximize rq
-                score = (abs(rr), 0 if rq >= 0 else 1, -rq)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_k = k
-
-        # Player positions relative to ego-center, rotated if configured, then normalized
+        # Player positions in absolute coordinates, normalized
         for q, r in self.positions:
-            rdq = q - center_q
-            rdr = r - center_r
-            if best_k:
-                rdq, rdr = self._rotate_k60_axial(rdq, rdr, best_k)
-            obs.extend([rdq / norm_den, rdr / norm_den])
+            obs.extend([q / norm_den, r / norm_den])
 
         # One-hot encode the ball holder
         ball_holder_one_hot = np.zeros(self.n_players, dtype=np.float32)
@@ -2357,14 +2333,28 @@ class HexagonBasketballEnv(gym.Env):
         # Shot clock (kept unnormalized)
         obs.append(float(self.shot_clock))
 
-        # Hoop vector relative to ego-center, rotated consistently (optional)
+        # Team encoding: per-player team identification (+1 for offense, -1 for defense)
+        # Format: [team_0, team_1, ..., team_n] where team_i ∈ {+1, -1}
+        # Example (2v2): [+1, +1, -1, -1] means players 0,1 are offense, players 2,3 are defense
+        for pid in range(self.n_players):
+            if pid in self.offense_ids:
+                obs.append(1.0)  # Offense
+            else:
+                obs.append(-1.0)  # Defense
+
+        # Absolute position of the ball handler (allows network to distinguish court regions)
+        # This helps the network learn different strategies for center court vs. sidelines
+        if self.ball_holder is not None:
+            ball_handler_q, ball_handler_r = self.positions[self.ball_holder]
+            obs.extend([ball_handler_q / norm_den, ball_handler_r / norm_den])
+        else:
+            # If no ball holder (terminal state), use basket position as reference
+            obs.extend([self.basket_position[0] / norm_den, self.basket_position[1] / norm_den])
+
+        # Hoop vector in absolute coordinates (optional)
         if self.include_hoop_vector:
-            hoop_dq, hoop_dr = hoop_dq_raw, hoop_dr_raw
-            if best_k:
-                hoop_dq, hoop_dr = self._rotate_k60_axial(hoop_dq, hoop_dr, best_k)
-            hoop_dq /= norm_den
-            hoop_dr /= norm_den
-            obs.extend([hoop_dq, hoop_dr])
+            hoop_q, hoop_r = self.basket_position
+            obs.extend([hoop_q / norm_den, hoop_r / norm_den])
 
         # All-pairs offense-defense distances
         # For each offensive player, distance to each defender

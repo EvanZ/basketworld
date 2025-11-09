@@ -26,39 +26,50 @@ observation_space = spaces.Dict({
 
 ## 1. Main State Vector (`"obs"`)
 
-This is the primary observation vector containing all dynamic game state information. It's built using **egocentric coordinates** centered on the ball handler with optional rotation to face the hoop.
+This is the primary observation vector containing all dynamic game state information. It's built using **absolute court coordinates**, allowing the network to learn location-dependent strategies (e.g., center court vs. sidelines).
 
 **Note:** This is ONLY the `"obs"` key in the dictionary. Skills, action masks, and role flags are separate dictionary keys (see sections below).
 
 ### Components (in order):
 
 #### **A. Player Positions** (`n_players × 2` floats)
-- **Format:** `(dq, dr)` pairs in axial hex coordinates
-- **Reference Frame:** Relative to the current ball handler (egocentric)
-- **Rotation:** If `egocentric_rotate_to_hoop=True`, coordinates are rotated so the basket is always in a consistent direction
+- **Format:** `(q, r)` pairs in absolute axial hex coordinates
+- **Reference Frame:** Absolute court coordinates (NOT relative to ball handler)
 - **Normalization:** Divided by `max(court_width, court_height)` to keep values roughly in `[-1, 1]`
-- **Fallback:** If no ball holder exists (terminal states), coordinates are relative to the basket position
+- **Purpose:** Allows the network to learn strategies that are sensitive to court position (e.g., more space in center, constraints on sidelines)
 
-**Why egocentric?** This provides translation and rotation invariance, helping the network learn policies that work anywhere on the court rather than memorizing specific positions.
+**Why absolute?** This allows the network to distinguish between center court (more space) and sidelines (more constraints), which is crucial for realistic basketball play.
 
-#### **B. Ball Holder One-Hot** (`n_players` floats)
+#### **B. Team Encoding** (`n_players` floats)
+- **Format:** `[team_0, team_1, ..., team_N]` where each value is ±1
+- **Values:** `+1.0` = offense, `-1.0` = defense
+- **Example (3v3):** `[1, 1, 1, -1, -1, -1]` means players 0-2 on offense, 3-5 on defense
+- **Purpose:** Explicit per-player team identification
+- **Why:** Allows network to directly condition strategies on team membership rather than inferring it
+
+#### **C. Ball Holder One-Hot** (`n_players` floats)
 - **Format:** One-hot vector indicating which player has the ball
 - **Example (3v3):** `[0, 0, 1, 0, 0, 0]` means player 2 has the ball
-- **Note:** Technically redundant since the ball handler is the ego-center, but retained for backward compatibility and explicit encoding
+- **Purpose:** Explicit encoding of ball possession state
 
-#### **C. Shot Clock** (`1` float)
+#### **D. Shot Clock** (`1` float)
 - **Format:** Raw integer value (unnormalized)
 - **Range:** `[0, shot_clock_steps]` (typically 24)
 - **Purpose:** Encodes time pressure for decision-making
 
-#### **D. Hoop Vector** (`2` floats, optional)
-- **Format:** `(hoop_dq, hoop_dr)` - direction to basket from ball handler
-- **Included if:** `include_hoop_vector=True`
-- **Rotation:** Consistently rotated with player positions
+#### **E. Ball Handler Position** (`2` floats)
+- **Format:** `(q, r)` - absolute position of the player with the ball
 - **Normalization:** Same as player positions
-- **Purpose:** Explicit encoding of shooting direction (though implicit in egocentric frame)
+- **Purpose:** Explicitly encodes court region information (center vs. sidelines) to help the network learn location-dependent strategies
+- **Fallback:** If no ball holder exists (terminal states), uses basket position
 
-#### **E. All-Pairs Offense-Defense Distances** (`players_per_side²` floats)
+#### **F. Hoop Vector** (`2` floats, optional)
+- **Format:** `(hoop_q, hoop_r)` - absolute position of basket
+- **Included if:** `include_hoop_vector=True`
+- **Normalization:** Same as player positions
+- **Purpose:** Explicit encoding of basket location in absolute coordinates
+
+#### **G. All-Pairs Offense-Defense Distances** (`players_per_side²` floats)
 - **Format:** For each offensive player, distance to each defender (row-major order)
 - **Example (3v3):** 9 values `[O0→D0, O0→D1, O0→D2, O1→D0, O1→D1, O1→D2, O2→D0, O2→D1, O2→D2]`
 - **Calculation:** Hex distance between each offense-defense pair
@@ -69,7 +80,7 @@ This is the primary observation vector containing all dynamic game state informa
   - Network can learn "nearest defender" (minimum per row) if needed
   - Reveals double-team situations and defensive rotations
 
-#### **F. All-Pairs Offense-Defense Angle Cosines** (`players_per_side²` floats)
+#### **H. All-Pairs Offense-Defense Angle Cosines** (`players_per_side²` floats)
 - **Format:** For each offensive player, cos(angle) to each defender (same ordering as distances)
 - **Example (3v3):** 9 values matching the distance matrix ordering
 - **Calculation:** For each (offense, defender) pair, cos(angle) where angle is at the offensive player between:
@@ -85,14 +96,14 @@ This is the primary observation vector containing all dynamic game state informa
   - Enables learning about on-ball pressure vs help defense
   - Combined with distance, provides complete defensive context
 
-#### **G. Lane Step Counts** (`n_players` floats)
+#### **H. Lane Step Counts** (`n_players` floats)
 - **Format:** One count per player (offensive and defensive)
 - **Offensive Players:** Steps spent in offensive lane (3-second violation tracking)
 - **Defensive Players:** Steps spent in defensive key (illegal defense tracking)
 - **Range:** `[0, three_second_max_steps]` (typically 3)
 - **Purpose:** Enables agents to learn rule compliance (avoid violations)
 
-#### **H. Expected Points (EP)** (`players_per_side` floats)
+#### **I. Expected Points (EP)** (`players_per_side` floats)
 - **Format:** One EP value per offensive player (in order of player ID)
 - **Calculation:** Pressure-adjusted expected value of a shot from their current position
 - **Factors:** 
@@ -101,13 +112,13 @@ This is the primary observation vector containing all dynamic game state informa
   - Player's individual shooting skill
 - **Purpose:** Helps agents evaluate shot quality and make better shooting decisions
 
-#### **I. Turnover Probabilities** (`players_per_side` floats)
+#### **J. Turnover Probabilities** (`players_per_side` floats)
 - **Format:** One probability per offensive player (fixed-position encoding)
 - **Values:** Non-zero only for the current ball handler, zero for all others
 - **Calculation:** Based on defender proximity using exponential decay
 - **Purpose:** Explicit risk signal for holding the ball under pressure
 
-#### **J. Steal Risks** (`players_per_side` floats)
+#### **K. Steal Risks** (`players_per_side` floats)
 - **Format:** One probability per offensive player (fixed-position encoding)
 - **Values:** Non-zero for potential pass receivers, zero for ball holder
 - **Calculation:** Geometric steal probability based on:
@@ -124,9 +135,11 @@ players_per_side = 3
 
 # Size of observation["obs"] - the main state vector only
 obs_size = (
-    n_players * 2                      # Player positions: 12
+    n_players * 2                      # Player positions (absolute): 12
     + n_players                        # Ball holder one-hot: 6
     + 1                                # Shot clock: 1
+    + n_players                        # Team encoding (±1 per player): 6 [NEW]
+    + 2                                # Ball handler position (absolute): 2
     + 2                                # Hoop vector (if included): 2
     + players_per_side * players_per_side  # All-pairs distances: 9
     + players_per_side * players_per_side  # All-pairs angles: 9
@@ -134,7 +147,7 @@ obs_size = (
     + players_per_side                 # Expected Points: 3
     + players_per_side                 # Turnover probabilities: 3
     + players_per_side                 # Steal risks: 3
-) = 54 floats (with hoop vector)
+) = 62 floats (with hoop vector) [was 56, +6 for team encoding]
 
 # Additional dictionary keys (separate from "obs"):
 # observation["skills"] = 9 floats (3 per offensive player)
@@ -187,15 +200,16 @@ obs_size = (
 
 ## Design Principles
 
-### **1. Egocentric Representation**
-- All spatial information is relative to the ball handler
-- Provides natural translation invariance
-- Reduces state space complexity
+### **1. Absolute Court Coordinates**
+- All spatial information is in absolute court coordinates (not relative to ball handler)
+- Allows network to learn location-dependent strategies
+- Enables awareness of court regions: center court (more space) vs. sidelines (constrained)
+- Maintains interpretability of positions
 
-### **2. Rotation Normalization**
-- Optional rotation so basket is always in a consistent direction
-- Helps network learn direction-agnostic strategies
-- Reduces variance in observations
+### **2. Explicit Ball Handler Position**
+- Ball handler position is included as a separate feature
+- Helps the network explicitly model court position effects
+- Reduces reliance on implicit positional inference
 
 ### **3. Fixed-Position Encoding**
 - EP, turnover risk, and steal risk use fixed player indices
@@ -226,11 +240,21 @@ obs_size = (
 
 Key environment parameters that affect observation structure:
 
-- `use_egocentric_obs`: Use ball-handler-relative coordinates (default: `True`)
-- `egocentric_rotate_to_hoop`: Rotate observations to face basket (default: `True`)
-- `include_hoop_vector`: Add explicit hoop direction vector (default: `True`)
+- `include_hoop_vector`: Add explicit hoop position vector (default: `True`)
 - `normalize_obs`: Normalize spatial coordinates (default: `True`)
 
 ---
 
-By providing this rich, structured observation space, we give the RL agent all the information needed to learn sophisticated basketball strategies while maintaining computational efficiency through careful normalization and representation choices.
+## Notes on Architecture Change
+
+**As of the latest update, the environment uses absolute coordinates instead of egocentric coordinates.** This change allows the network to:
+- Learn that center court offers more space than sidelines
+- Develop position-aware strategies (e.g., different tactics near basket vs. mid-court)
+- Explicitly condition decisions on court location
+- Better model real basketball dynamics where position matters
+
+The old flags `use_egocentric_obs` and `egocentric_rotate_to_hoop` are deprecated and no longer used.
+
+---
+
+By providing this rich, structured observation space with absolute coordinates, we give the RL agent all the information needed to learn sophisticated, location-aware basketball strategies while maintaining computational efficiency through careful normalization and representation choices.
