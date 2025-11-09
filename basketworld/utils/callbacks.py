@@ -622,7 +622,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
 class EpisodeSampleLogger(BaseCallback):
     """Sample a small fraction of ended episodes during rollout and log to CSV."""
 
-    def __init__(self, team_name: str, alternation_id: int, sample_prob: float = 1e-4):
+    def __init__(self, team_name: str, alternation_id: int, sample_prob: float = 1e-4) -> None:
         super().__init__()
         self.team_name = team_name
         self.alternation_id = int(alternation_id)

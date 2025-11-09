@@ -131,6 +131,15 @@ def get_mlflow_params(
         int,
         1,
     )
+    optional["three_second_lane_height"] = _get_param(
+        params,
+        [
+            "three_second_lane_height",
+            "three-second-lane-height",
+        ],
+        int,
+        3,
+    )
     optional["three_second_max_steps"] = _get_param(
         params,
         [
@@ -194,6 +203,9 @@ def get_mlflow_params(
     )
     optional["turnover_penalty"] = _get_param(
         params, ["turnover_penalty", "turnover-penalty"], float, 0.0
+    )
+    optional["violation_reward"] = _get_param(
+        params, ["violation_reward", "violation-reward"], float, 2.0
     )
     optional["made_shot_reward_inside"] = _get_param(
         params, ["made_shot_reward_inside", "made-shot-reward-inside"], float, 2.0

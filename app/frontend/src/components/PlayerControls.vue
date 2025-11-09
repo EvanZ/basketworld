@@ -784,6 +784,136 @@ watch(() => props.activePlayerId, (newVal, oldVal) => {
 import PhiShaping from './PhiShaping.vue';
 import { ref as vueRef } from 'vue';
 const phiRef = vueRef(null);
+
+// Observation parsing utilities
+function getAngleDescription(cosAngle) {
+  if (cosAngle > 0.9) return '👍 In front (defender blocking)';
+  if (cosAngle > 0.5) return '📍 Somewhat in front';
+  if (cosAngle > -0.5) return '↔️ Side (help defense)';
+  if (cosAngle > -0.9) return '📍 Somewhat behind';
+  return '🔙 Behind (beaten)';
+}
+
+// Computed properties for observation parsing
+const numDefenders = computed(() => {
+  if (!props.gameState) return 0;
+  return props.gameState.defense_ids?.length || 0;
+});
+
+const numOffenders = computed(() => {
+  if (!props.gameState) return 0;
+  return props.gameState.offense_ids?.length || 0;
+});
+
+const playerPositionRows = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  // First nPlayers*2 elements
+  return obs.slice(0, nPlayers * 2);
+});
+
+const ballHolderOHE = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const startIdx = nPlayers * 2;
+  return obs.slice(startIdx, startIdx + nPlayers);
+});
+
+const shotClockValue = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return 0;
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const idx = nPlayers * 2 + nPlayers;
+  return obs[idx] || 0;
+});
+
+const teamEncodingRows = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const idx = nPlayers * 2 + nPlayers + 1;
+  return obs.slice(idx, idx + nPlayers);
+});
+
+const ballHandlerPositionRows = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers; // +nPlayers for team encoding
+  return obs.slice(idx, idx + 2);
+});
+
+const hoopVectorRows = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2;
+  return obs.slice(idx, idx + 2);
+});
+
+const allPairsDistances = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2;
+  const size = nOffense * nDefense;
+  return obs.slice(idx, idx + size);
+});
+
+const allPairsAngles = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense);
+  const size = nOffense * nDefense;
+  return obs.slice(idx, idx + size);
+});
+
+const laneSteps = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense);
+  return obs.slice(idx, idx + nPlayers);
+});
+
+const expectedPoints = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers;
+  return obs.slice(idx, idx + nOffense);
+});
+
+const turnoverProbs = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers + nOffense;
+  return obs.slice(idx, idx + nOffense);
+});
+
+const stealRisks = computed(() => {
+  if (!props.gameState || !props.gameState.obs) return [];
+  const obs = props.gameState.obs;
+  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
+  const nOffense = props.gameState.offense_ids?.length || 0;
+  const nDefense = props.gameState.defense_ids?.length || 0;
+  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers + nOffense + nOffense;
+  return obs.slice(idx, idx + nOffense);
+});
 </script>
 
 <template>
@@ -827,6 +957,12 @@ const phiRef = vueRef(null);
         @click="activeTab = 'phi'"
       >
         Phi Shaping
+      </button>
+      <button 
+        :class="{ active: activeTab === 'observation' }"
+        @click="activeTab = 'observation'"
+      >
+        Observation
       </button>
     </div>
 
@@ -884,6 +1020,10 @@ const phiRef = vueRef(null);
             <h5>Other</h5>
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
             <div class="param-item"><span class="param-name">Turnover penalty:</span><span class="param-value">{{ rewardParams.turnover_penalty }}</span></div>
+            <div class="param-item"><span class="param-name">Violation reward:</span><span class="param-value">{{ rewardParams.violation_reward }}</span></div>
+            <div class="param-item"><span class="param-name">Made shot reward inside:</span><span class="param-value">{{ rewardParams.made_shot_reward_inside }}</span></div>
+            <div class="param-item"><span class="param-name">Made shot reward three:</span><span class="param-value">{{ rewardParams.made_shot_reward_three }}</span></div>
+            <div class="param-item"><span class="param-name">Missed shot penalty:</span><span class="param-value">{{ rewardParams.missed_shot_penalty }}</span></div>
           </div>
           <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
             <h5>Phi Shaping (from MLflow)</h5>
@@ -1236,6 +1376,10 @@ const phiRef = vueRef(null);
               <span class="param-value">{{ props.gameState.three_second_lane_width ?? 'N/A' }}</span>
             </div>
             <div class="param-item">
+              <span class="param-name">Lane height (hexes):</span>
+              <span class="param-value">{{ props.gameState.three_second_lane_height ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item">
               <span class="param-name">Max steps in lane:</span>
               <span class="param-value">{{ props.gameState.three_second_max_steps ?? 'N/A' }}</span>
             </div>
@@ -1259,6 +1403,128 @@ const phiRef = vueRef(null);
     <!-- Phi Shaping Tab -->
     <div v-if="activeTab === 'phi'" class="tab-content">
       <PhiShaping ref="phiRef" :game-state="props.gameState" />
+    </div>
+
+    <!-- Observation Tab -->
+    <div v-if="activeTab === 'observation'" class="tab-content">
+      <div class="observation-section">
+        <h4>Current Observation Features</h4>
+        <div v-if="!props.gameState || !props.gameState.obs" class="no-data">
+          No observation data available.
+        </div>
+        <div v-else class="observation-table-wrapper">
+          <table class="observation-table">
+            <thead>
+              <tr>
+                <th>Feature Group</th>
+                <th>Element</th>
+                <th>Value</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- Player Positions -->
+              <tr v-for="(pos, idx) in playerPositionRows" :key="`pos-${idx}`" class="group-player-pos">
+                <td v-if="idx === 0" :rowspan="playerPositionRows.length" class="group-label">Player Positions (absolute)</td>
+                <td>Player {{ Math.floor(idx / 2) }} - {{ idx % 2 === 0 ? 'Q' : 'R' }}</td>
+                <td class="value-mono">{{ pos.toFixed(4) }}</td>
+                <td class="notes">{{ idx % 2 === 0 ? 'Column' : 'Row' }}</td>
+              </tr>
+
+              <!-- Ball Holder One-Hot -->
+              <tr v-for="(val, idx) in ballHolderOHE" :key="`bh-${idx}`" class="group-ball-holder">
+                <td v-if="idx === 0" :rowspan="ballHolderOHE.length" class="group-label">Ball Holder (one-hot)</td>
+                <td>Player {{ idx }}</td>
+                <td class="value-mono">{{ val }}</td>
+                <td v-if="val === 1" class="notes highlight">🏀 Ball holder</td>
+                <td v-else class="notes"></td>
+              </tr>
+
+              <!-- Shot Clock -->
+              <tr class="group-shot-clock">
+                <td class="group-label">Shot Clock</td>
+                <td>-</td>
+                <td class="value-mono">{{ shotClockValue }}</td>
+                <td class="notes">Current shot clock</td>
+              </tr>
+
+              <!-- Team Encoding -->
+              <tr v-for="(team, idx) in teamEncodingRows" :key="`team-${idx}`" class="group-team-encoding">
+                <td v-if="idx === 0" :rowspan="teamEncodingRows.length" class="group-label">Team Encoding</td>
+                <td>Player {{ idx }}</td>
+                <td class="value-mono">{{ team > 0 ? '+1' : '-1' }}</td>
+                <td class="notes">{{ team > 0 ? '🏀 Offense' : '🛡️ Defense' }}</td>
+              </tr>
+
+              <!-- Ball Handler Position -->
+              <tr v-for="(val, idx) in ballHandlerPositionRows" :key="`bhpos-${idx}`" class="group-ball-handler-pos">
+                <td v-if="idx === 0" :rowspan="ballHandlerPositionRows.length" class="group-label">Ball Handler Position (absolute)</td>
+                <td>{{ idx === 0 ? 'Q' : 'R' }}</td>
+                <td class="value-mono">{{ val.toFixed(4) }}</td>
+                <td class="notes">{{ idx === 0 ? 'Column' : 'Row' }} of ball handler</td>
+              </tr>
+
+              <!-- Hoop Vector -->
+              <tr v-for="(val, idx) in hoopVectorRows" :key="`hoop-${idx}`" class="group-hoop">
+                <td v-if="idx === 0" :rowspan="hoopVectorRows.length" class="group-label">Hoop Vector (absolute)</td>
+                <td>{{ idx === 0 ? 'Q' : 'R' }}</td>
+                <td class="value-mono">{{ val.toFixed(4) }}</td>
+                <td class="notes">Basket position</td>
+              </tr>
+
+              <!-- All-Pairs Distances -->
+              <tr v-for="(dist, idx) in allPairsDistances" :key="`dist-${idx}`" class="group-distances">
+                <td v-if="idx === 0" :rowspan="allPairsDistances.length" class="group-label">All-Pairs Distances</td>
+                <td>O{{ Math.floor(idx / numDefenders) }} → D{{ idx % numDefenders }}</td>
+                <td class="value-mono">{{ dist.toFixed(4) }}</td>
+                <td class="notes">Hex distance</td>
+              </tr>
+
+              <!-- All-Pairs Angles -->
+              <tr v-for="(angle, idx) in allPairsAngles" :key="`angle-${idx}`" class="group-angles">
+                <td v-if="idx === 0" :rowspan="allPairsAngles.length" class="group-label">All-Pairs Angles (cos)</td>
+                <td>O{{ Math.floor(idx / numDefenders) }} → D{{ idx % numDefenders }}</td>
+                <td class="value-mono">{{ angle.toFixed(4) }}</td>
+                <td class="notes">{{ getAngleDescription(angle) }}</td>
+              </tr>
+
+              <!-- Lane Steps -->
+              <tr v-for="(steps, idx) in laneSteps" :key="`lane-${idx}`" class="group-lane-steps">
+                <td v-if="idx === 0" :rowspan="laneSteps.length" class="group-label">Lane Steps</td>
+                <td>Player {{ idx }}</td>
+                <td class="value-mono">{{ steps }}</td>
+                <td class="notes">Time in lane</td>
+              </tr>
+
+              <!-- Expected Points -->
+              <tr v-for="(ep, idx) in expectedPoints" :key="`ep-${idx}`" class="group-ep">
+                <td v-if="idx === 0" :rowspan="expectedPoints.length" class="group-label">Expected Points (EP)</td>
+                <td>O{{ idx }}</td>
+                <td class="value-mono">{{ ep.toFixed(4) }}</td>
+                <td class="notes">Shot quality estimate</td>
+              </tr>
+
+              <!-- Turnover Probabilities -->
+              <tr v-for="(prob, idx) in turnoverProbs" :key="`turnover-${idx}`" class="group-turnover">
+                <td v-if="idx === 0" :rowspan="turnoverProbs.length" class="group-label">Turnover Probs</td>
+                <td>O{{ idx }}</td>
+                <td class="value-mono">{{ prob.toFixed(4) }}</td>
+                <td v-if="prob > 0" class="notes highlight">🚨 Risk</td>
+                <td v-else class="notes">No risk</td>
+              </tr>
+
+              <!-- Steal Risks -->
+              <tr v-for="(risk, idx) in stealRisks" :key="`steal-${idx}`" class="group-steal">
+                <td v-if="idx === 0" :rowspan="stealRisks.length" class="group-label">Steal Risks</td>
+                <td>O{{ idx }}</td>
+                <td class="value-mono">{{ risk.toFixed(4) }}</td>
+                <td v-if="risk > 0" class="notes highlight">⚠️ Risk</td>
+                <td v-else class="notes">Safe</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -1619,5 +1885,93 @@ const phiRef = vueRef(null);
   border-radius: 3px;
   border: 1px solid #ddd;
   font-size: 0.9em;
+}
+
+/* Observation Tab Styles */
+.observation-section {
+  padding: 1rem;
+}
+
+.observation-table-wrapper {
+  max-height: 600px;
+  overflow-y: auto;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+}
+
+.observation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+  background: white;
+}
+
+.observation-table th {
+  position: sticky;
+  top: 0;
+  background-color: #2c3e50;
+  color: white;
+  padding: 0.75rem;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 2px solid #34495e;
+  z-index: 10;
+}
+
+.observation-table td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid #ecf0f1;
+}
+
+.observation-table tbody tr:hover {
+  background-color: #f8f9fa;
+}
+
+.group-label {
+  font-weight: 600;
+  background-color: #ecf0f1;
+  color: #2c3e50;
+  min-width: 140px;
+}
+
+.value-mono {
+  font-family: 'Courier New', monospace;
+  background: #f5f5f5;
+  padding: 0.3rem 0.5rem;
+  border-radius: 3px;
+  font-weight: 500;
+  color: #d35400;
+}
+
+.notes {
+  font-size: 0.85em;
+  color: #7f8c8d;
+  font-style: italic;
+}
+
+.notes.highlight {
+  color: #c0392b;
+  font-weight: 600;
+  font-style: normal;
+}
+
+.group-player-pos td:first-child { background-color: #e8f4f8; }
+.group-ball-holder td:first-child { background-color: #fef5e7; }
+.group-shot-clock td:first-child { background-color: #ebf5fb; }
+.group-team-encoding td:first-child { background-color: #f0e6ff; }
+.group-ball-handler-pos td:first-child { background-color: #fef9e7; }
+.group-hoop td:first-child { background-color: #eafaf1; }
+.group-distances td:first-child { background-color: #fdeef4; }
+.group-angles td:first-child { background-color: #f4ecf7; }
+.group-lane-steps td:first-child { background-color: #fef5e7; }
+.group-ep td:first-child { background-color: #eafaf1; }
+.group-turnover td:first-child { background-color: #fadbd8; }
+.group-steal td:first-child { background-color: #fadbd8; }
+
+.no-data {
+  text-align: center;
+  padding: 2rem;
+  color: #7f8c8d;
+  font-style: italic;
 }
 </style> 

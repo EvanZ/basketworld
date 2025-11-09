@@ -9,6 +9,8 @@ import numpy as np
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team, ActionType
 from stable_baselines3 import PPO
+# Import custom policies so they're available when loading saved models
+from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
 import mlflow
 import torch
 import copy
@@ -228,7 +230,7 @@ async def init_game(request: InitGameRequest):
         
         # Load environment parameters including role_flag encoding
         required, optional = get_mlflow_params(client, request.run_id)
-        
+
         # Extract role_flag encoding for backward compatibility (not passed to env)
         game_state.role_flag_offense = optional.pop("role_flag_offense_value")
         game_state.role_flag_defense = optional.pop("role_flag_defense_value")
@@ -260,10 +262,16 @@ async def init_game(request: InitGameRequest):
         )
 
         # (Re)load policies from the selected paths
-        game_state.unified_policy = PPO.load(unified_path)
+        # Provide custom_objects so SB3 can deserialize custom policy classes
+        custom_objects = {
+            "policy_class": PassBiasDualCriticPolicy,
+            "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+            "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        }
+        game_state.unified_policy = PPO.load(unified_path, custom_objects=custom_objects)
         game_state.offense_policy = None
         game_state.defense_policy = (
-            PPO.load(opponent_unified_path) if opponent_unified_path else None
+            PPO.load(opponent_unified_path, custom_objects=custom_objects) if opponent_unified_path else None
         )
 
         game_state.env = basketworld.HexagonBasketballEnv(
@@ -2119,6 +2127,7 @@ def get_rewards():
             "made_shot_reward_three": float(
                 getattr(env, "made_shot_reward_three", 0.0)
             ),
+            "violation_reward": float(getattr(env, "violation_reward", 0.0)),
             "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
             # Percentage-based assist shaping
             "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
@@ -2284,6 +2293,8 @@ def get_full_game_state(include_policy_probs=False):
         ),
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
+        # Observation vector (main state) - all features the RL agent sees
+        "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],
         "last_action_results": last_action_results_py,
         "offense_ids": game_state.env.offense_ids,
         "defense_ids": game_state.env.defense_ids,
@@ -2337,6 +2348,9 @@ def get_full_game_state(include_policy_probs=False):
         # 3-second violation rules (shared configuration)
         "three_second_lane_width": int(
             getattr(game_state.env, "three_second_lane_width", 1)
+        ),
+        "three_second_lane_height": int(
+            getattr(game_state.env, "three_second_lane_height", 3)
         ),
         "three_second_max_steps": int(
             getattr(game_state.env, "three_second_max_steps", 3)
