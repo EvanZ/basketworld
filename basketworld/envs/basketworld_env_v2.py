@@ -117,6 +117,7 @@ class HexagonBasketballEnv(gym.Env):
         profiling_sample_rate: float = 1.0,  # Fraction of episodes to profile (0.0-1.0)
         spawn_distance: int = 3,
         max_spawn_distance: Optional[int] = None,
+        defender_spawn_distance: int = 0,
         # Reward shaping parameters
         pass_reward: float = 0.0,
         turnover_penalty: float = 0.0,
@@ -184,6 +185,7 @@ class HexagonBasketballEnv(gym.Env):
         self.steal_position_weight_min = steal_position_weight_min
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
+        self.defender_spawn_distance = defender_spawn_distance
         self.use_egocentric_obs = bool(use_egocentric_obs)
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
@@ -1163,23 +1165,40 @@ class HexagonBasketballEnv(gym.Env):
         # Defenders can spawn 1 unit closer than the offense minimum.
         # A negative spawn_distance means no minimum (allow anywhere on court).
         # Also enforce max_spawn_distance if set.
+        # If defender_spawn_distance > 0, defenders spawn with randomized distance from their matched offense
         defense_positions: List[Tuple[int, int]] = []
         for off_pos in offense_positions:
             off_dist = self._hex_distance(off_pos, self.basket_position)
-            candidates = [
-                cell
-                for cell in all_cells
-                if cell != self.basket_position
-                and cell not in taken_positions
-                and self._is_valid_position(*cell)
-                and self._hex_distance(cell, self.basket_position) < off_dist
-                and self._hex_distance(cell, self.basket_position)
-                >= min_spawn_dist_defense
-                and (
-                    max_spawn_dist is None
-                    or self._hex_distance(cell, self.basket_position) <= max_spawn_dist
-                )
-            ]
+            
+            # If defender_spawn_distance is set, use it to randomize spawn distance from offense
+            if self.defender_spawn_distance > 0:
+                # Random distance from matched offense player (1 to defender_spawn_distance hexes away)
+                target_dist_from_offense = self._rng.integers(1, self.defender_spawn_distance + 1)
+                # Find candidates at approximately that distance from the offense player
+                # Allow +/- 1 hex tolerance for flexibility
+                candidates = [
+                    cell
+                    for cell in all_cells
+                    if cell != self.basket_position
+                    and cell not in taken_positions
+                    and self._is_valid_position(*cell)
+                    and self._hex_distance(cell, self.basket_position) < off_dist
+                    and self._hex_distance(cell, self.basket_position) >= min_spawn_dist_defense
+                    and (max_spawn_dist is None or self._hex_distance(cell, self.basket_position) <= max_spawn_dist)
+                    and abs(self._hex_distance(cell, off_pos) - target_dist_from_offense) <= 1
+                ]
+            else:
+                # Original behavior: spawn as close as possible to offense (distance 1)
+                candidates = [
+                    cell
+                    for cell in all_cells
+                    if cell != self.basket_position
+                    and cell not in taken_positions
+                    and self._is_valid_position(*cell)
+                    and self._hex_distance(cell, self.basket_position) < off_dist
+                    and self._hex_distance(cell, self.basket_position) >= min_spawn_dist_defense
+                    and (max_spawn_dist is None or self._hex_distance(cell, self.basket_position) <= max_spawn_dist)
+                ]
 
             if not candidates:
                 # Fallback: pick any valid empty cell meeting min/max spawn distance constraints
@@ -1189,13 +1208,8 @@ class HexagonBasketballEnv(gym.Env):
                     if cell != self.basket_position
                     and cell not in taken_positions
                     and self._is_valid_position(*cell)
-                    and self._hex_distance(cell, self.basket_position)
-                    >= min_spawn_dist_defense
-                    and (
-                        max_spawn_dist is None
-                        or self._hex_distance(cell, self.basket_position)
-                        <= max_spawn_dist
-                    )
+                    and self._hex_distance(cell, self.basket_position) >= min_spawn_dist_defense
+                    and (max_spawn_dist is None or self._hex_distance(cell, self.basket_position) <= max_spawn_dist)
                 ]
 
             if not candidates:
@@ -1208,9 +1222,13 @@ class HexagonBasketballEnv(gym.Env):
                     and self._is_valid_position(*cell)
                 ]
 
-            # Choose the candidate nearest to the offensive player (to simulate marking)
-            candidates.sort(key=lambda c: self._hex_distance(c, off_pos))
-            def_pos = candidates[0]
+            # If using defender_spawn_distance, pick randomly from candidates; otherwise pick nearest
+            if self.defender_spawn_distance > 0:
+                def_pos = candidates[self._rng.integers(0, len(candidates))]
+            else:
+                # Original: choose the candidate nearest to the offensive player (to simulate marking)
+                candidates.sort(key=lambda c: self._hex_distance(c, off_pos))
+                def_pos = candidates[0]
             defense_positions.append(def_pos)
             taken_positions.add(def_pos)
 

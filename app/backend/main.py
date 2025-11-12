@@ -90,6 +90,7 @@ class InitGameRequest(BaseModel):
     opponent_unified_policy_name: str | None = None
     # Optional overrides
     spawn_distance: int | None = None
+    defender_spawn_distance: int | None = None
     allow_dunks: bool | None = None
     dunk_pct: float | None = None
 
@@ -186,16 +187,29 @@ def get_latest_policies_from_run(client, run_id, tmpdir):
 @app.post("/api/list_policies")
 def list_policies(request: ListPoliciesRequest):
     """Return available unified policy filenames for a run."""
-    mlflow.set_tracking_uri("http://localhost:5000")
-    client = mlflow.tracking.MlflowClient()
     try:
+        # Set tracking URI once at startup (avoid race conditions from repeated calls)
+        current_uri = mlflow.get_tracking_uri()
+        if "localhost" not in current_uri:
+            mlflow.set_tracking_uri("http://localhost:5000")
+        
+        client = mlflow.tracking.MlflowClient()
         unified_paths = list_policies_from_run(client, request.run_id)
-        # return only basenames to frontend
+        
+        # Return only basenames to frontend
+        if not unified_paths:
+            return {"unified": []}
+        
         return {
             "unified": [os.path.basename(p) for p in unified_paths],
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list policies: {e}")
+        # Log the error for debugging
+        import traceback
+        print(f"Error listing policies: {e}")
+        traceback.print_exc()
+        # Return empty list instead of 500 error (graceful degradation)
+        return {"unified": []}
 
 
 @app.post("/api/init_game")
@@ -240,6 +254,16 @@ async def init_game(request: InitGameRequest):
             print(f"[INIT] Using SYMMETRIC role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
         else:
             print(f"[INIT] Using LEGACY role_flag encoding: offense={game_state.role_flag_offense}, defense={game_state.role_flag_defense}")
+
+        # Apply request overrides for optional parameters
+        if request.spawn_distance is not None:
+            optional["spawn_distance"] = request.spawn_distance
+        if request.defender_spawn_distance is not None:
+            optional["defender_spawn_distance"] = request.defender_spawn_distance
+        if request.allow_dunks is not None:
+            optional["allow_dunks"] = request.allow_dunks
+        if request.dunk_pct is not None:
+            optional["dunk_pct"] = request.dunk_pct
 
         # Unified-only
         unified_path = get_unified_policy_path(
@@ -1023,8 +1047,16 @@ def take_step(request: ActionRequest):
 
 @app.get("/api/phi_params")
 def get_phi_params():
+    # Return default values if game not initialized (graceful handling)
     if not game_state.env:
-        raise HTTPException(status_code=400, detail="Game not initialized")
+        return {
+            "enable_phi_shaping": False,
+            "phi_beta": 0.0,
+            "reward_shaping_gamma": 1.0,
+            "phi_use_ball_handler_only": False,
+            "phi_blend_weight": 0.0,
+            "phi_aggregation_mode": "team_best",
+        }
     env = game_state.env
     return {
         "enable_phi_shaping": bool(getattr(env, "enable_phi_shaping", False)),
@@ -2332,6 +2364,7 @@ def get_full_game_state(include_policy_probs=False):
             if getattr(game_state.env, "max_spawn_distance", None) is not None
             else None
         ),
+        "defender_spawn_distance": int(getattr(game_state.env, "defender_spawn_distance", 0)),
         "shot_pressure_enabled": bool(
             getattr(game_state.env, "shot_pressure_enabled", True)
         ),

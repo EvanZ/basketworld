@@ -49,6 +49,7 @@ from basketworld.utils.mlflow_logger import MLflowWriter
 from basketworld.utils.callbacks import (
     RolloutUpdateTimingCallback,
     MLflowCallback,
+    AccumulativeMetricsCallback,
     EntropyScheduleCallback,
     EntropyExpScheduleCallback,
     PotentialBetaExpScheduleCallback,
@@ -364,6 +365,7 @@ def setup_environment(args, training_team):
         pass_oob_turnover_prob=getattr(args, "pass_oob_turnover_prob_start", 1.0),
         spawn_distance=getattr(args, "spawn_distance", 3),
         max_spawn_distance=getattr(args, "max_spawn_distance", None),
+        defender_spawn_distance=getattr(args, "defender_spawn_distance", 0),
         # Reward shaping
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -1313,8 +1315,8 @@ def main(args):
             )
             unified_policy.set_env(offense_env)
 
-            offense_mlflow_callback = MLflowCallback(
-                team_name="Offense", log_freq=args.n_steps
+            offense_mlflow_callback = AccumulativeMetricsCallback(
+                team_name="Offense"
             )
 
             offense_logger = Logger(
@@ -1414,8 +1416,45 @@ def main(args):
             gc.collect()
             time.sleep(0.05)
 
-            # Reuse the same frozen opponent for defense segment to keep distributions comparable
-            opponent_for_defense = opponent_for_offense
+            # --- Clear buffers before switching phases ---
+            # Clear accumulated episodes and metrics from offense training
+            # so defense training starts with a clean slate (avoids metric contamination)
+            try:
+                if hasattr(unified_policy, 'ep_info_buffer'):
+                    unified_policy.ep_info_buffer.clear()
+                    print(f"Cleared episode info buffer between offense and defense training")
+            except Exception:
+                pass
+            
+            # Reset offense callback's cache so defense training gets clean metrics
+            try:
+                offense_mlflow_callback.reset()
+                print(f"Reset offense metrics callback for defense phase")
+            except Exception:
+                pass
+
+            # --- Save trained policy as opponent for defense ---
+            # Save the trained unified_policy so defense can load it as opponent
+            # (avoids pickle issues with SubprocVecEnv spawn method)
+            print(f"\nSaving trained policy for Defense opponent...")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                offense_checkpoint_path = os.path.join(
+                    tmpdir, f"unified_alt_{global_alt}.zip"
+                )
+                unified_policy.save(offense_checkpoint_path)
+                # Also save to opponent_cache_dir for reference
+                opponent_cache_checkpoint = os.path.join(
+                    opponent_cache_dir, f"unified_alt_{global_alt}.zip"
+                )
+                unified_policy.save(opponent_cache_checkpoint)
+            
+            # Use the saved checkpoint as opponent for defense
+            if isinstance(opponent_for_offense, list):
+                opponent_for_defense = [opponent_cache_checkpoint] * args.num_envs
+                print(f"  - Using saved policy for all {args.num_envs} parallel environments")
+            else:
+                opponent_for_defense = opponent_cache_checkpoint
+                print(f"  - Using saved policy as single opponent")
 
             # --- 2. Train Defense against frozen Offense ---
             print(f"\nTraining Defense...")
@@ -1428,8 +1467,8 @@ def main(args):
             )
             unified_policy.set_env(defense_env)
 
-            defense_mlflow_callback = MLflowCallback(
-                team_name="Defense", log_freq=args.n_steps
+            defense_mlflow_callback = AccumulativeMetricsCallback(
+                team_name="Defense"
             )
 
             defense_logger = Logger(
@@ -1530,10 +1569,19 @@ def main(args):
             gc.collect()
             time.sleep(0.05)
 
-            # Save one unified checkpoint per alternation
+            # Reset defense callback's cache for next alternation
+            try:
+                defense_mlflow_callback.reset()
+                print(f"Reset defense metrics callback for next alternation")
+            except Exception:
+                pass
+
+            # Save final unified checkpoint per alternation
+            # (overwrites the intermediate one from after offense training)
+            print(f"\nSaving final unified checkpoint for alternation {global_alt}...")
             with tempfile.TemporaryDirectory() as tmpdir:
                 unified_model_path = os.path.join(
-                    tmpdir, f"unified_policy_alt_{global_alt}.zip"
+                    tmpdir, f"unified_alt_{global_alt}.zip"
                 )
                 unified_policy.save(unified_model_path)
                 mlflow.log_artifact(unified_model_path, artifact_path="models")
@@ -1564,6 +1612,7 @@ def main(args):
                     shot_pressure_arc_degrees=args.shot_pressure_arc_degrees,
                     spawn_distance=getattr(args, "spawn_distance", 3),
                     max_spawn_distance=getattr(args, "max_spawn_distance", None),
+                    defender_spawn_distance=getattr(args, "defender_spawn_distance", 0),
                     # Reward shaping
                     pass_reward=getattr(args, "pass_reward", 0.0),
                     turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -2039,6 +2088,13 @@ if __name__ == "__main__":
         type=lambda v: None if v == "" or str(v).lower() == "none" else int(v),
         default=None,
         help="maximum distance from basket at which players spawn (None = unlimited). Use with --spawn-distance for curriculum learning.",
+    )
+    parser.add_argument(
+        "--defender-spawn-distance",
+        dest="defender_spawn_distance",
+        type=int,
+        default=0,
+        help="randomize defender spawn distance from matched offense player (0 = spawn adjacent; N = spawn 1-N hexes away).",
     )
     parser.add_argument(
         "--deterministic-opponent",

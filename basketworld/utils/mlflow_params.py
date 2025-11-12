@@ -73,6 +73,9 @@ def get_mlflow_params(
         lambda v: None if v == "" or v == "None" else int(v),
         None,
     )
+    optional["defender_spawn_distance"] = _get_param(
+        params, ["defender_spawn_distance", "defender-spawn-distance"], int, 0
+    )
     optional["allow_dunks"] = _get_param(
         params,
         ["allow_dunks", "allow-dunks"],
