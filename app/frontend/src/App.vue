@@ -5,7 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -43,6 +43,32 @@ const moveHistory = ref([]);
 
 // Track whether a shot-clock adjustment request is in flight
 const isShotClockUpdating = ref(false);
+const isPolicySwapping = ref(false);
+const policyOptions = ref([]);
+const policiesLoading = ref(false);
+const policyLoadError = ref(null);
+
+async function refreshPolicyOptions(runId) {
+  if (!runId) {
+    policyOptions.value = [];
+    policyLoadError.value = null;
+    policiesLoading.value = false;
+    return;
+  }
+
+  policiesLoading.value = true;
+  policyLoadError.value = null;
+
+  try {
+    const result = await listPolicies(runId);
+    policyOptions.value = Array.isArray(result?.unified) ? result.unified : [];
+  } catch (err) {
+    policyOptions.value = [];
+    policyLoadError.value = err?.message || 'Failed to load policies';
+  } finally {
+    policiesLoading.value = false;
+  }
+}
 
 // Current shot clock for highlighting in moves table
 const currentShotClock = computed(() => {
@@ -147,6 +173,7 @@ async function handleGameStarted(setupData) {
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
+      refreshPolicyOptions(response.state.run_id);
       // Don't create an initial row - wait for first actions
     } else {
       throw new Error(response.message || 'Failed to start game.');
@@ -323,6 +350,59 @@ async function handleShotClockAdjustment(delta) {
     alert(`Failed to adjust shot clock: ${err.message}`);
   } finally {
     isShotClockUpdating.value = false;
+  }
+}
+
+async function handlePolicySwap({ target, policyName }) {
+  if (!gameState.value || !target) return;
+  if (isPolicySwapping.value) {
+    console.log('[App] Policy swap already in progress, ignoring new request.');
+    return;
+  }
+
+  const payload = {};
+  if (target === 'user') {
+    payload.user_policy_name = policyName;
+  } else if (target === 'opponent') {
+    payload.opponent_policy_name = policyName;
+  } else {
+    return;
+  }
+
+  isPolicySwapping.value = true;
+
+  try {
+    const response = await swapPolicies(payload);
+    if (response.status !== 'success' && response.status !== 'no_change') {
+      throw new Error(response.message || 'Failed to swap policies.');
+    }
+
+    const newState = response.state;
+    if (newState) {
+      gameState.value = newState;
+      const clonedState = cloneState(newState);
+      if (gameHistory.value.length > 0) {
+        gameHistory.value[gameHistory.value.length - 1] = clonedState;
+      } else {
+        gameHistory.value = [clonedState];
+      }
+
+      if (newState.policy_probabilities) {
+        policyProbs.value = newState.policy_probabilities;
+      } else {
+        try {
+          const probs = await getPolicyProbs();
+          policyProbs.value = probs;
+        } catch (err) {
+          console.warn('[App] Failed to refresh policy probabilities after swap:', err);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[App] Policy swap failed:', err);
+    alert(`Failed to swap policies: ${err.message}`);
+  } finally {
+    isPolicySwapping.value = false;
   }
 }
 
@@ -932,6 +1012,10 @@ onBeforeUnmount(() => {
             :is-replaying="isReplaying"
             :is-manual-stepping="isManualStepping"
             :is-evaluating="isEvaluating"
+            :is-policy-swapping="isPolicySwapping"
+            :policy-options="policyOptions"
+            :policies-loading="policiesLoading"
+            :policy-load-error="policyLoadError"
             :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
             :deterministic="playerDeterministic"
@@ -941,6 +1025,7 @@ onBeforeUnmount(() => {
             :external-selections="isSelfPlaying ? currentSelections : null"
             @actions-submitted="handleActionsSubmitted" 
             @move-recorded="handleMoveRecorded"
+            @policy-swap-requested="handlePolicySwap"
             ref="controlsRef"
         />
 

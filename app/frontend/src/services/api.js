@@ -263,3 +263,16 @@ export async function resetTurnState() {
   }
   return response.json();
 }
+
+export async function swapPolicies(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/swap_policies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to swap policies');
+  }
+  return response.json();
+}

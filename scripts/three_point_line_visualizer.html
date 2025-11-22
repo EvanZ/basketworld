@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Basketworld 3PT Line Sandbox</title>
+    <meta
+      name="description"
+      content="Quick visualizer for experimenting with three-point arc vs. short corner distances on a hex court."
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #020617;
+        color: #e2e8f0;
+        display: flex;
+        flex-direction: column;
+        gap: 1.5rem;
+        padding: 1.5rem;
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 0.5rem 0;
+        font-weight: 600;
+      }
+
+      main {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.5rem;
+      }
+
+      .panel {
+        background: rgba(15, 23, 42, 0.75);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 1rem;
+        padding: 1.25rem;
+        flex: 1 1 320px;
+        min-width: 280px;
+      }
+
+      .controls {
+        max-width: 360px;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      label {
+        font-size: 0.85rem;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        color: #94a3b8;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+
+      input {
+        border-radius: 0.6rem;
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        padding: 0.55rem 0.75rem;
+        font-size: 1rem;
+        background: rgba(15, 23, 42, 0.35);
+        color: inherit;
+      }
+
+      input:focus {
+        outline: 2px solid #38bdf8;
+        outline-offset: 2px;
+      }
+
+      .note {
+        font-size: 0.9rem;
+        color: #cbd5f5;
+        margin-top: -0.35rem;
+      }
+
+      .warning {
+        color: #fcd34d;
+        min-height: 1.2rem;
+      }
+
+      .canvas {
+        min-height: 520px;
+        display: flex;
+        align-items: stretch;
+        justify-content: center;
+      }
+
+      svg {
+        width: 100%;
+        min-height: 520px;
+        background: radial-gradient(circle at 35% 50%, rgba(15, 23, 42, 0.75), #020617 70%);
+        border-radius: 1rem;
+      }
+
+      .legend {
+        font-size: 0.95rem;
+        line-height: 1.45;
+        color: #cbd5f5;
+      }
+
+      .legend code {
+        background: rgba(148, 163, 184, 0.2);
+        padding: 0.1rem 0.35rem;
+        border-radius: 0.4rem;
+      }
+
+      .court-bg {
+        fill: rgba(148, 163, 184, 0.05);
+        stroke: rgba(148, 163, 184, 0.25);
+        stroke-width: 2;
+      }
+
+      .hex {
+        stroke: rgba(15, 23, 42, 0.6);
+        stroke-width: 1.4;
+        transition: fill 120ms ease;
+      }
+
+      .hex.two {
+        fill: rgba(248, 250, 252, 0.2);
+      }
+
+      .hex.three {
+        fill: rgba(59, 130, 246, 0.3);
+      }
+
+      .hex.line {
+        stroke: #f97316;
+        stroke-width: 2.6;
+      }
+
+      .basket {
+        fill: #fb7185;
+        stroke: #f43f5e;
+        stroke-width: 3;
+      }
+
+      .line-path {
+        stroke: #fb923c;
+        stroke-width: 5;
+        fill: none;
+      }
+
+      .line-path.secondary {
+        stroke-width: 4;
+        stroke-dasharray: 6 8;
+      }
+
+      .hex-qualifier {
+        fill: none;
+        stroke: #fef3c7;
+        stroke-width: 3.4;
+        pointer-events: none;
+      }
+
+      @media (max-width: 980px) {
+        main {
+          flex-direction: column;
+        }
+
+        .canvas {
+          min-height: 420px;
+        }
+
+        svg {
+          min-height: 420px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="panel controls">
+        <h1>3PT Line Sandbox</h1>
+        <p class="note">
+          Distances are expressed in “hex units” (one hex radius). Leave the short distance blank to draw the
+          original single-radius arc.
+        </p>
+        <label>
+          Court Rows
+          <input id="rows" type="number" min="5" max="25" step="1" value="13" />
+        </label>
+        <label>
+          Court Columns
+          <input id="cols" type="number" min="5" max="25" step="1" value="13" />
+        </label>
+        <label>
+          Three Point Distance
+          <input
+            id="threePointDistance"
+            type="number"
+            min="1"
+            max="20"
+            step="0.25"
+            value="5"
+          />
+        </label>
+        <label>
+          Three Point Short Distance
+          <input
+            id="threePointShortDistance"
+            type="number"
+            min="1"
+            max="20"
+            step="0.25"
+            placeholder="None"
+          />
+        </label>
+        <label>
+          Hex Radius (visual only)
+          <input id="hexSize" type="number" min="12" max="48" step="1" value="26" />
+        </label>
+        <p id="warnings" class="warning"></p>
+      </section>
+
+      <section class="panel canvas">
+        <svg id="court" role="img" aria-label="Hex court with 3PT line preview"></svg>
+      </section>
+    </main>
+
+    <section class="panel legend">
+      <h2>How to read this</h2>
+      <p>
+        Blue hexes are counted as three-point attempts. Pale hexes remain two-pointers. When
+        <code>three-point-short-distance</code> is supplied, straight segments anchor to the sidelines until they hit
+        the orange arc defined by <code>three-point-distance</code>. Leave it blank to match the current implementation
+        (one arc everywhere).
+      </p>
+      <p>
+        Because we are working with a discrete hex grid, the line highlight shows which hex centers sit on (or very
+        near) the perimeter. Use the sliders/inputs to explore how different radius combinations would look on the 13×13
+        court—the hoop is on the baseline at the bottom middle, so the arc faces upward just like a standard NBA half
+        court. Hexes outlined in pale gold are the ones where at least half of the polygon lies “behind” the theoretical
+        line, meaning those are the tiles that would count as three-point attempts under a ≥50% coverage rule.
+      </p>
+    </section>
+
+    <script>
+      (() => {
+        const NS = "http://www.w3.org/2000/svg";
+        const SQRT3 = Math.sqrt(3);
+        const inputs = {
+          rows: document.getElementById("rows"),
+          cols: document.getElementById("cols"),
+          threePointDistance: document.getElementById("threePointDistance"),
+          threePointShortDistance: document.getElementById("threePointShortDistance"),
+          hexSize: document.getElementById("hexSize"),
+        };
+        const warningEl = document.getElementById("warnings");
+        const svg = document.getElementById("court");
+
+        const state = {
+          rows: 13,
+          cols: 13,
+          threePointDistance: 5,
+          threePointShortDistance: null,
+          hexSize: 26,
+        };
+
+        const syncInputs = () => {
+          inputs.rows.value = state.rows;
+          inputs.cols.value = state.cols;
+          inputs.hexSize.value = state.hexSize;
+          inputs.threePointDistance.value = state.threePointDistance;
+          inputs.threePointShortDistance.value =
+            state.threePointShortDistance === null || state.threePointShortDistance === undefined
+              ? ""
+              : state.threePointShortDistance;
+        };
+
+        Object.entries(inputs).forEach(([key, el]) => {
+          el.addEventListener("input", () => {
+            const raw = el.value.trim();
+            if (raw === "") {
+              state[key] = null;
+            } else {
+              const parsed = Number(raw);
+              state[key] = Number.isFinite(parsed) ? parsed : state[key];
+            }
+            render();
+          });
+        });
+
+        const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+        const offsetToPixel = (col, row, size) => {
+          const w = SQRT3 * size;
+          const hStep = 1.5 * size;
+          const x = w * (col + (row % 2 ? 0.5 : 0));
+          const y = hStep * row;
+          return { x, y };
+        };
+
+        const hexVertices = (cx, cy, size) => {
+          const pts = [];
+          for (let i = 0; i < 6; i += 1) {
+            const angle = (Math.PI / 180) * (60 * i - 30);
+            const x = cx + size * Math.cos(angle);
+            const y = cy + size * Math.sin(angle);
+            pts.push({ x, y });
+          }
+          return pts;
+        };
+
+        const hexPoints = (cx, cy, size) => {
+          const verts = hexVertices(cx, cy, size);
+          const pts = verts.map((p) => `${p.x},${p.y}`);
+          return pts.join(" ");
+        };
+
+        const pointInPolygon = (x, y, verts) => {
+          let inside = false;
+          for (let i = 0, j = verts.length - 1; i < verts.length; j = i, i += 1) {
+            const xi = verts[i].x;
+            const yi = verts[i].y;
+            const xj = verts[j].x;
+            const yj = verts[j].y;
+
+            const intersect =
+              yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / ((yj - yi) || 1e-9) + xi;
+            if (intersect) inside = !inside;
+          }
+          return inside;
+        };
+
+        const buildArcPath = (hoop, radius, startAngle, endAngle, steps = 160) => {
+          const commands = [];
+          const dir = endAngle >= startAngle ? 1 : -1;
+          const total = Math.abs(endAngle - startAngle);
+          for (let i = 0; i <= steps; i += 1) {
+            const t = startAngle + dir * (i / steps) * total;
+            const x = hoop.x + radius * Math.cos(t);
+            const y = hoop.y - radius * Math.sin(t);
+            commands.push(`${i === 0 ? "M" : "L"} ${x} ${y}`);
+          }
+          return commands.join(" ");
+        };
+
+        const buildCells = (rows, cols, size) => {
+          const cells = [];
+          let bounds = {
+            minX: Infinity,
+            maxX: -Infinity,
+            minY: Infinity,
+            maxY: -Infinity,
+          };
+
+          for (let row = 0; row < rows; row += 1) {
+            for (let col = 0; col < cols; col += 1) {
+              const { x, y } = offsetToPixel(col, row, size);
+              cells.push({ row, col, x, y });
+              bounds.minX = Math.min(bounds.minX, x);
+              bounds.maxX = Math.max(bounds.maxX, x);
+              bounds.minY = Math.min(bounds.minY, y);
+              bounds.maxY = Math.max(bounds.maxY, y);
+            }
+          }
+
+          bounds.width = bounds.maxX - bounds.minX;
+          bounds.height = bounds.maxY - bounds.minY;
+          return { cells, bounds };
+        };
+
+        const classifyCell = (
+          cell,
+          hoop,
+          radius,
+          shortPx,
+          segmentHeight,
+          tolerance,
+          hexSize,
+          pointTest,
+          baselineDepth,
+        ) => {
+          const dx = cell.x - hoop.x;
+          const dy = hoop.y - cell.y; // positive when in front of the hoop (up the court)
+
+          if (dy < -baselineDepth - tolerance) {
+            return { isThree: false, onLine: false, qualifies: false };
+          }
+
+          const dist = Math.hypot(dx, dy);
+          const withinBand =
+            shortPx !== null &&
+            segmentHeight !== null &&
+            dy <= segmentHeight + tolerance * 0.5 &&
+            dy >= -baselineDepth - tolerance;
+          const horizontalDist = Math.abs(dx);
+
+          const isThreeCenter = pointTest(cell.x, cell.y);
+          let isThree = isThreeCenter;
+          let onLine = Math.abs(dist - radius) <= tolerance;
+
+          if (withinBand) {
+            isThree = horizontalDist >= shortPx;
+            onLine = Math.abs(horizontalDist - shortPx) <= tolerance;
+          } else if (segmentHeight !== null) {
+            onLine = onLine && dy >= segmentHeight - tolerance;
+          }
+
+          const verts = hexVertices(cell.x, cell.y, hexSize - 1);
+          const minX = Math.min(...verts.map((v) => v.x));
+          const maxX = Math.max(...verts.map((v) => v.x));
+          const minY = Math.min(...verts.map((v) => v.y));
+          const maxY = Math.max(...verts.map((v) => v.y));
+          const steps = 6;
+          let covered = 0;
+          let total = 0;
+
+          for (let ix = 0; ix <= steps; ix += 1) {
+            for (let iy = 0; iy <= steps; iy += 1) {
+              const px = minX + (ix / steps) * (maxX - minX);
+              const py = minY + (iy / steps) * (maxY - minY);
+              if (!pointInPolygon(px, py, verts)) continue;
+              total += 1;
+              if (pointTest(px, py)) {
+                covered += 1;
+              }
+            }
+          }
+
+          if (pointTest(cell.x, cell.y)) {
+            covered += 1;
+          }
+          total += 1;
+
+          const qualifies = covered / Math.max(total, 1) >= 0.5;
+
+          return { isThree, onLine, qualifies };
+        };
+
+        const render = () => {
+          const rows = clamp(Math.round(state.rows || 13), 5, 25);
+          const cols = clamp(Math.round(state.cols || 13), 5, 25);
+          const hexSize = clamp(state.hexSize || 26, 12, 48);
+          const pxPerHex = hexSize * SQRT3;
+
+          const threePointDistance = Math.max(state.threePointDistance || 1, 0.25);
+          let threePointShortDistance = state.threePointShortDistance;
+
+          state.rows = rows;
+          state.cols = cols;
+          state.hexSize = hexSize;
+          state.threePointDistance = threePointDistance;
+
+          warningEl.textContent = "";
+
+          const { cells, bounds } = buildCells(rows, cols, hexSize);
+          const hoopRow = rows - 1;
+          const hoopCol = Math.floor(cols / 2);
+          const hoopCell =
+            cells.find((c) => c.row === hoopRow && c.col === hoopCol) ||
+            cells.find((c) => c.row === hoopRow) ||
+            cells[cells.length - 1];
+          const hoop = {
+            x: hoopCell.x,
+            y: hoopCell.y,
+          };
+
+          const radiusPx = threePointDistance * pxPerHex;
+          let shortPx = null;
+          let segmentHeight = null;
+          let thetaSwitch = null;
+
+          if (threePointShortDistance !== null && threePointShortDistance !== undefined && threePointShortDistance !== "") {
+            const shortRaw = Number(threePointShortDistance);
+            if (Number.isFinite(shortRaw) && shortRaw > 0) {
+              if (shortRaw >= threePointDistance) {
+                warningEl.textContent = "Short distance must be smaller than the arc distance; falling back to arc only.";
+                threePointShortDistance = null;
+                state.threePointShortDistance = null;
+              } else {
+                shortPx = shortRaw * pxPerHex;
+                const ratio = clamp(shortPx / radiusPx, 0, 0.999);
+                thetaSwitch = Math.acos(ratio);
+                segmentHeight = radiusPx * Math.sin(thetaSwitch);
+                state.threePointShortDistance = shortRaw;
+              }
+            }
+          } else {
+            state.threePointShortDistance = null;
+          }
+
+          const tolerance = pxPerHex * 0.35;
+          const baselineDepth = hexSize;
+          const viewMargin = hexSize * 3;
+          svg.setAttribute(
+            "viewBox",
+            `${bounds.minX - viewMargin} ${bounds.minY - viewMargin} ${bounds.width + viewMargin * 2} ${
+              bounds.height + viewMargin * 2
+            }`,
+          );
+          svg.replaceChildren();
+          syncInputs();
+
+          const pointIsThree = (px, py) => {
+            const dx = px - hoop.x;
+            const dy = hoop.y - py;
+            if (dy < -baselineDepth - tolerance) {
+              return false;
+            }
+            if (
+              shortPx !== null &&
+              segmentHeight !== null &&
+              dy <= segmentHeight + tolerance &&
+              dy >= -baselineDepth - tolerance
+            ) {
+              return Math.abs(dx) >= shortPx;
+            }
+            return Math.hypot(dx, dy) >= radiusPx;
+          };
+
+          // Court background
+          const bg = document.createElementNS(NS, "rect");
+          bg.setAttribute("x", bounds.minX - hexSize);
+          bg.setAttribute("y", bounds.minY - hexSize);
+          bg.setAttribute("width", bounds.width + hexSize * 2);
+          bg.setAttribute("height", bounds.height + hexSize * 2);
+          bg.setAttribute("rx", hexSize);
+          bg.classList.add("court-bg");
+          svg.appendChild(bg);
+
+          // Hexes
+          cells.forEach((cell) => {
+            const polygon = document.createElementNS(NS, "polygon");
+            const pointString = hexPoints(cell.x, cell.y, hexSize - 1);
+            polygon.setAttribute("points", pointString);
+            const { isThree, onLine, qualifies } = classifyCell(
+              cell,
+              hoop,
+              radiusPx,
+              shortPx,
+              segmentHeight,
+              tolerance,
+              hexSize,
+              pointIsThree,
+              baselineDepth,
+            );
+            const classNames = ["hex", isThree ? "three" : "two"];
+            if (onLine) {
+              classNames.push("line");
+            }
+            polygon.setAttribute("class", classNames.join(" "));
+            svg.appendChild(polygon);
+
+            if (qualifies) {
+              const outline = document.createElementNS(NS, "polygon");
+              outline.setAttribute("points", pointString);
+              outline.setAttribute("class", "hex-qualifier");
+              svg.appendChild(outline);
+            }
+          });
+
+          // Three-point path(s)
+          const lineGroup = document.createElementNS(NS, "g");
+          svg.appendChild(lineGroup);
+
+          if (shortPx !== null && segmentHeight !== null && thetaSwitch !== null) {
+            const leftX = hoop.x - shortPx;
+            const rightX = hoop.x + shortPx;
+            const segmentTop = hoop.y - segmentHeight;
+            const segmentBottom = hoop.y + baselineDepth;
+
+            const drawVertical = (x) => {
+              const line = document.createElementNS(NS, "line");
+              line.setAttribute("x1", x);
+              line.setAttribute("x2", x);
+              line.setAttribute("y1", segmentBottom);
+              line.setAttribute("y2", segmentTop);
+              line.setAttribute("class", "line-path secondary");
+              lineGroup.appendChild(line);
+            };
+
+            drawVertical(leftX);
+            drawVertical(rightX);
+
+            const theta = Math.atan2(segmentHeight, shortPx);
+            const arcPath = document.createElementNS(NS, "path");
+            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, Math.PI - theta, theta, 200));
+            arcPath.setAttribute("class", "line-path");
+            lineGroup.appendChild(arcPath);
+          } else {
+            const arcPath = document.createElementNS(NS, "path");
+            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, Math.PI, 0, 240));
+            arcPath.setAttribute("class", "line-path");
+            lineGroup.appendChild(arcPath);
+          }
+
+          // Basket marker
+          const hoopCircle = document.createElementNS(NS, "circle");
+          hoopCircle.setAttribute("cx", hoop.x);
+          hoopCircle.setAttribute("cy", hoop.y);
+          hoopCircle.setAttribute("r", hexSize * 0.45);
+          hoopCircle.setAttribute("class", "basket");
+          svg.appendChild(hoopCircle);
+        };
+
+        render();
+      })();
+    </script>
+  </body>
+</html>
+

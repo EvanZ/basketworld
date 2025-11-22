@@ -155,6 +155,13 @@ const offenseStateValue = computed(() => {
   return typeof val === 'number' ? val : null;
 });
 
+const defenseStateValue = computed(() => {
+  const state = currentGameState.value;
+  if (!state || !state.state_values) return null;
+  const val = state.state_values.defensive_value;
+  return typeof val === 'number' ? val : null;
+});
+
 const sortedPlayers = computed(() => {
   const gs = currentGameState.value;
   if (!gs) return [];
@@ -304,7 +311,10 @@ const viewBox = computed(() => {
 });
 
 const stateValueBoxWidth = HEX_RADIUS * 3;
-const stateValueBoxHeight = HEX_RADIUS * 1.3;
+const stateValueBoxBaseHeight = HEX_RADIUS * 1.3;
+const stateValueBoxHeight = computed(() =>
+  defenseStateValue.value !== null ? stateValueBoxBaseHeight * 2 : stateValueBoxBaseHeight
+);
 
 const stateValueAnchor = computed(() => {
   const vbString = viewBox.value;
@@ -318,7 +328,7 @@ const stateValueAnchor = computed(() => {
   return {
     x: minX + width - stateValueBoxWidth - padding,
     // push it even lower to avoid overlapping the court area
-    y: minY + height - stateValueBoxHeight - padding - HEX_RADIUS * 0.3,
+    y: minY + height - stateValueBoxHeight.value - padding - HEX_RADIUS * 0.3,
   };
 });
 
@@ -897,8 +907,8 @@ async function downloadBoardAsImage() {
             <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker">!</text>
         </g>
 
-        <!-- Offensive state-value overlay -->
-        <g v-if="offenseStateValue !== null" class="state-value-overlay">
+        <!-- State-value overlay -->
+        <g v-if="offenseStateValue !== null || defenseStateValue !== null" class="state-value-overlay">
           <rect
             :x="stateValueAnchor.x"
             :y="stateValueAnchor.y"
@@ -909,12 +919,24 @@ async function downloadBoardAsImage() {
           />
           <text
             :x="stateValueAnchor.x + stateValueBoxWidth / 2"
-            :y="stateValueAnchor.y + stateValueBoxHeight / 2"
+            :y="stateValueAnchor.y + stateValueBoxHeight / 2 - (defenseStateValue !== null ? HEX_RADIUS * 0.35 : 0)"
             text-anchor="middle"
             dominant-baseline="middle"
             class="state-value-text"
           >
-            V(s) {{ offenseStateValue.toFixed(2) }}
+            V<tspan baseline-shift="-35%" font-size="65%">o</tspan>
+            {{ offenseStateValue !== null ? offenseStateValue.toFixed(2) : '—' }}
+          </text>
+          <text
+            v-if="defenseStateValue !== null"
+            :x="stateValueAnchor.x + stateValueBoxWidth / 2"
+            :y="stateValueAnchor.y + stateValueBoxHeight / 2 + HEX_RADIUS * 0.45"
+            text-anchor="middle"
+            dominant-baseline="middle"
+            class="state-value-text"
+          >
+            V<tspan baseline-shift="-35%" font-size="65%">d</tspan>
+            {{ defenseStateValue.toFixed(2) }}
           </text>
         </g>
       </g>

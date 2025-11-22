@@ -59,9 +59,25 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  policyOptions: {
+    type: Array,
+    default: () => [],
+  },
+  policiesLoading: {
+    type: Boolean,
+    default: false,
+  },
+  policyLoadError: {
+    type: String,
+    default: null,
+  },
+  isPolicySwapping: {
+    type: Boolean,
+    default: false,
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested']);
 
 const selectedActions = ref({});
 
@@ -107,6 +123,44 @@ function applyStoredActionValues(storedValues) {
 }
 // shot probability is displayed on the board, not in controls
 const policyProbabilities = ref(null);
+
+const availablePolicies = computed(() => props.policyOptions || []);
+const policiesLoading = computed(() => props.policiesLoading);
+const policyLoadError = computed(() => props.policyLoadError);
+const userPolicySelection = ref('');
+const opponentPolicySelection = ref('');
+
+watch(
+  () => props.gameState?.unified_policy_name,
+  (name) => {
+    userPolicySelection.value = name || '';
+  },
+  { immediate: true }
+);
+
+watch(
+  () => props.gameState?.opponent_unified_policy_name,
+  (name) => {
+    opponentPolicySelection.value = name || '';
+  },
+  { immediate: true }
+);
+
+function handlePolicySelection(type, event) {
+  if (props.isPolicySwapping || props.policiesLoading) return;
+  const value = event?.target?.value ?? '';
+  if (type === 'user') {
+    if (value === (userPolicySelection.value || '')) return;
+    if (!value) return;
+    userPolicySelection.value = value;
+    emit('policy-swap-requested', { target: 'user', policyName: value });
+    return;
+  }
+
+  if (value === (opponentPolicySelection.value || '')) return;
+  opponentPolicySelection.value = value;
+  emit('policy-swap-requested', { target: 'opponent', policyName: value });
+}
 
 // Add rewards tracking
 const activeTab = ref('controls');
@@ -1325,13 +1379,67 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>Policies</h5>
-            <div class="param-item">
-              <span class="param-name">Player 1 team:</span>
-              <span class="param-value">{{ (props.gameState.user_team_name || 'OFFENSE') }} · {{ props.gameState.unified_policy_name || 'Latest unified' }}</span>
+            <div class="param-item policy-select-item">
+              <div class="policy-label">
+                Player ({{ props.gameState.user_team_name || 'OFFENSE' }})
+              </div>
+              <div class="policy-select-wrapper">
+                <select
+                  :value="userPolicySelection || ''"
+                  @change="handlePolicySelection('user', $event)"
+                  :disabled="policiesLoading || props.isPolicySwapping"
+                >
+                  <option v-if="availablePolicies.length === 0 && !userPolicySelection" disabled value="">
+                    No policies available
+                  </option>
+                  <option
+                    v-for="policy in availablePolicies"
+                    :key="`player-policy-${policy}`"
+                    :value="policy"
+                  >
+                    {{ policy }}
+                  </option>
+                  <option
+                    v-if="userPolicySelection && !availablePolicies.includes(userPolicySelection)"
+                    :value="userPolicySelection"
+                  >
+                    {{ userPolicySelection }} (current)
+                  </option>
+                </select>
+              </div>
             </div>
-            <div class="param-item">
-              <span class="param-name">Opponent:</span>
-              <span class="param-value">{{ (props.gameState.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE') }} · {{ props.gameState.opponent_unified_policy_name || props.gameState.unified_policy_name || 'Same as unified' }}</span>
+            <div class="param-item policy-select-item">
+              <div class="policy-label">
+                Opponent ({{ props.gameState.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE' }})
+              </div>
+              <div class="policy-select-wrapper">
+                <select
+                  :value="opponentPolicySelection || ''"
+                  @change="handlePolicySelection('opponent', $event)"
+                  :disabled="policiesLoading || props.isPolicySwapping"
+                >
+                  <option value="">Mirror player policy</option>
+                  <option
+                    v-for="policy in availablePolicies"
+                    :key="`opponent-policy-${policy}`"
+                    :value="policy"
+                  >
+                    {{ policy }}
+                  </option>
+                  <option
+                    v-if="opponentPolicySelection && opponentPolicySelection !== '' && !availablePolicies.includes(opponentPolicySelection)"
+                    :value="opponentPolicySelection"
+                  >
+                    {{ opponentPolicySelection }} (current)
+                  </option>
+                </select>
+              </div>
+            </div>
+            <div class="policy-status" v-if="policiesLoading">
+              Loading policies…
+            </div>
+            <div class="policy-status error" v-else-if="policyLoadError">
+              {{ policyLoadError }}
             </div>
           </div>
 
@@ -2018,6 +2126,46 @@ const stealRisks = computed(() => {
   align-items: center;
   padding: 0.25rem 0;
   border-bottom: 1px solid #eee;
+}
+
+.policy-select-item {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+.policy-label {
+  font-weight: 500;
+  color: #444;
+}
+
+.policy-select-wrapper {
+  width: 100%;
+}
+
+.policy-select-wrapper select {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #cfd3d7;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  background: #fff;
+}
+
+.policy-select-wrapper select:disabled {
+  opacity: 0.6;
+  background: #f1f3f5;
+  cursor: not-allowed;
+}
+
+.policy-status {
+  font-size: 0.85rem;
+  margin-top: 0.35rem;
+  color: #6c757d;
+}
+
+.policy-status.error {
+  color: #c0392b;
 }
 
 .param-item:last-child {

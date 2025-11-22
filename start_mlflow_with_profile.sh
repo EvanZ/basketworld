@@ -5,7 +5,7 @@ cd /Users/evanzamir/projects/basketworld
 source .env/bin/activate
 
 # Use basketworld AWS profile
-export AWS_PROFILE=basketworld
+export AWS_PROFILE=default
 
 echo "Using AWS profile: $AWS_PROFILE"
 echo "Starting MLflow server..."

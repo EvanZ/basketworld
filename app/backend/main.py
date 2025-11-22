@@ -245,6 +245,11 @@ class ListPoliciesRequest(BaseModel):
     run_id: str
 
 
+class SwapPoliciesRequest(BaseModel):
+    user_policy_name: str | None = None
+    opponent_policy_name: str | None = None
+
+
 class ActionRequest(BaseModel):
     actions: dict[
         str, int
@@ -2627,6 +2632,80 @@ def set_shot_clock(req: UpdateShotClockRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to set shot clock: {e}")
+
+
+@app.post("/api/swap_policies")
+def swap_policies(req: SwapPoliciesRequest):
+    """Swap the active PPO policies without resetting the environment."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if not game_state.run_id:
+        raise HTTPException(status_code=400, detail="No MLflow run associated with current game.")
+
+    requested_user_policy = req.user_policy_name
+    requested_opponent_policy = req.opponent_policy_name
+
+    # Ignore no-op requests
+    if requested_user_policy is None and requested_opponent_policy is None:
+        raise HTTPException(status_code=400, detail="No policy requested for swap.")
+
+    client = mlflow.tracking.MlflowClient()
+    custom_objects = {
+        "policy_class": PassBiasDualCriticPolicy,
+        "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+        "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+    }
+
+    policies_changed = False
+
+    if requested_user_policy is not None:
+        # Avoid reloading the same policy
+        if requested_user_policy != game_state.unified_policy_key:
+            try:
+                user_path = get_unified_policy_path(client, game_state.run_id, requested_user_policy)
+                game_state.unified_policy = PPO.load(user_path, custom_objects=custom_objects)
+                game_state.unified_policy_key = os.path.basename(user_path)
+                policies_changed = True
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load user policy '{requested_user_policy}': {e}")
+
+    if requested_opponent_policy is not None:
+        # Empty string indicates "mirror user policy"
+        if requested_opponent_policy == "":
+            if game_state.defense_policy is not None or game_state.opponent_unified_policy_key is not None:
+                game_state.defense_policy = None
+                game_state.opponent_unified_policy_key = None
+                policies_changed = True
+        elif requested_opponent_policy != game_state.opponent_unified_policy_key:
+            try:
+                opp_path = get_unified_policy_path(client, game_state.run_id, requested_opponent_policy)
+                game_state.defense_policy = PPO.load(opp_path, custom_objects=custom_objects)
+                game_state.opponent_unified_policy_key = os.path.basename(opp_path)
+                policies_changed = True
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load opponent policy '{requested_opponent_policy}': {e}")
+
+    if not policies_changed:
+        return {
+            "status": "no_change",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+
+    updated_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+
+    # Update the latest episode snapshot so manual replay reflects new policy context
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
+
+    return {"status": "success", "state": updated_state}
 
 
 @app.post("/api/reset_turn_state")
