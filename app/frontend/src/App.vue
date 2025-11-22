@@ -5,8 +5,12 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState } from './services/api';
 import { resetStatsStorage } from './services/stats';
+
+function cloneState(state) {
+  return state ? JSON.parse(JSON.stringify(state)) : null;
+}
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
@@ -36,6 +40,9 @@ const opponentDeterministic = ref(true);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
+
+// Track whether a shot-clock adjustment request is in flight
+const isShotClockUpdating = ref(false);
 
 // Current shot clock for highlighting in moves table
 const currentShotClock = computed(() => {
@@ -139,7 +146,7 @@ async function handleGameStarted(setupData) {
     }
     if (response.status === 'success') {
       gameState.value = response.state;
-      gameHistory.value.push(response.state);
+      gameHistory.value.push(cloneState(response.state));
       // Don't create an initial row - wait for first actions
     } else {
       throw new Error(response.message || 'Failed to start game.');
@@ -159,41 +166,62 @@ async function handleActionsSubmitted(actions) {
     const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value);
      if (response.status === 'success') {
       gameState.value = response.state;
-      gameHistory.value.push(response.state);
+      gameHistory.value.push(cloneState(response.state));
       
-      // Update the last move with action results, shot clock, and state values BEFORE action
-      if (moveHistory.value.length > 0) {
-        const lastMove = moveHistory.value[moveHistory.value.length - 1];
-        if (response.state.last_action_results) {
-          lastMove.actionResults = response.state.last_action_results;
+        // Update the last move with action results, shot clock, and state values BEFORE action
+        if (moveHistory.value.length > 0) {
+          const lastMove = moveHistory.value[moveHistory.value.length - 1];
+          if (response.state.last_action_results) {
+            lastMove.actionResults = response.state.last_action_results;
+          }
+          // Update moves with actual actions taken (including opponent)
+          if (response.actions_taken) {
+              console.log('[App] Actions taken:', response.actions_taken);
+              // Create a new object for reactivity
+              const newMoves = { ...lastMove.moves };
+              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
+                  newMoves[`Player ${pid}`] = actionName;
+              }
+              // Replace the whole object
+              lastMove.moves = newMoves;
+          }
+          // Store shot clock when action was decided (before execution): board + 1
+          if (response.state.shot_clock !== undefined) {
+            lastMove.shotClock = response.state.shot_clock + 1;
+          }
+          // Store the value of the observation that is now visible on the board
+          const applyStateValues = (values) => {
+            if (!values) return;
+            if (lastMove.offensiveValue === null || lastMove.offensiveValue === undefined) {
+              lastMove.offensiveValue = values.offensive_value;
+            }
+            if (lastMove.defensiveValue === null || lastMove.defensiveValue === undefined) {
+              lastMove.defensiveValue = values.defensive_value;
+            }
+          };
+
+          applyStateValues(response.state?.state_values);
+          if ((lastMove.offensiveValue === null || lastMove.offensiveValue === undefined) && response.pre_step_state_values) {
+            applyStateValues(response.pre_step_state_values);
+          }
         }
-        // Store shot clock when action was decided (before execution): board + 1
-        if (response.state.shot_clock !== undefined) {
-          lastMove.shotClock = response.state.shot_clock + 1;
+        
+        // If game is done, add an END row
+        if (response.state.done && moveHistory.value.length > 0) {
+          const allIds = [...(response.state.offense_ids || []), ...(response.state.defense_ids || [])];
+          const endMoves = {};
+          allIds.forEach(pid => {
+            endMoves[`Player ${pid}`] = 'END';
+          });
+          moveHistory.value.push({
+            turn: moveHistory.value.length + 1,
+            moves: endMoves,
+            shotClock: response.state.shot_clock,
+            isEndRow: true,
+            offensiveValue: response.state?.state_values?.offensive_value ?? null,
+            defensiveValue: response.state?.state_values?.defensive_value ?? null,
+          });
         }
-        // Store pre-step state values (values BEFORE this action was taken)
-        if (response.pre_step_state_values) {
-          lastMove.offensiveValue = response.pre_step_state_values.offensive_value;
-          lastMove.defensiveValue = response.pre_step_state_values.defensive_value;
-        }
-      }
-      
-      // If game is done, add an END row
-      if (response.state.done && moveHistory.value.length > 0) {
-        const userTeamIds = response.state.offense_ids?.includes(0) 
-          ? response.state.offense_ids 
-          : response.state.defense_ids;
-        const endMoves = {};
-        userTeamIds.forEach(pid => {
-          endMoves[`Player ${pid}`] = 'END';
-        });
-        moveHistory.value.push({
-          turn: moveHistory.value.length + 1,
-          moves: endMoves,
-          shotClock: response.state.shot_clock,
-          isEndRow: true
-        });
-      }
       
       try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
     } else {
@@ -202,6 +230,99 @@ async function handleActionsSubmitted(actions) {
   } catch (err) {
     error.value = err.message;
     console.error(err);
+  }
+}
+
+async function handleResetPositions() {
+  if (!gameState.value) return;
+  if (isShotClockUpdating.value) {
+    console.log('[App] Reset already in progress.');
+    return;
+  }
+
+  isShotClockUpdating.value = true;
+
+  try {
+    console.log('[App] Resetting turn via backend snapshot');
+    const response = await resetTurnState();
+    if (response.status !== 'success') {
+      throw new Error(response.message || 'Failed to reset turn.');
+    }
+
+    gameState.value = response.state;
+    if (gameHistory.value.length > 0) {
+      gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
+    }
+
+    const probs = await getPolicyProbs();
+    policyProbs.value = probs;
+  } catch (err) {
+    console.error('[App] Failed to reset turn via backend:', err);
+    alert(`Failed to reset turn: ${err.message}`);
+  } finally {
+    isShotClockUpdating.value = false;
+  }
+}
+
+async function handlePlayerPositionUpdate({ playerId, q, r }) {
+  if (!gameState.value || gameState.value.done) {
+    console.warn('[App] Cannot update position: game not active or done.');
+    return;
+  }
+  
+  try {
+    console.log(`[App] Updating position for Player ${playerId} to (${q}, ${r})`);
+    const response = await updatePlayerPosition(playerId, q, r);
+    if (response.status === 'success') {
+      // Update the current game state
+      gameState.value = response.state;
+      
+      // Update the history for the CURRENT step (so ghost trails and replay show the new position)
+      // Since we haven't stepped yet, we are modifying the state "before" the step.
+      // If we just append, it looks like a step. If we replace, it looks like a correction.
+      // The user intent is "re-calculate... as if the step started with the player in that position".
+      // So we should update the last entry in gameHistory.
+      if (gameHistory.value.length > 0) {
+        gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
+      }
+      
+      // Also refresh policy probs since state changed
+      const probs = await getPolicyProbs();
+      policyProbs.value = probs;
+    }
+  } catch (err) {
+    console.error('[App] Failed to update player position:', err);
+    alert(`Failed to move player: ${err.message}`);
+  }
+}
+
+async function handleShotClockAdjustment(delta) {
+  if (!gameState.value || gameState.value.done) {
+    console.warn('[App] Cannot adjust shot clock after episode has ended.');
+    return;
+  }
+  if (isShotClockUpdating.value) {
+    console.log('[App] Shot-clock adjustment already in progress, ignoring extra request.');
+    return;
+  }
+
+  isShotClockUpdating.value = true;
+
+  try {
+    const response = await setShotClock(delta);
+    if (response.status === 'success') {
+      gameState.value = response.state;
+      if (gameHistory.value.length > 0) {
+        gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
+      }
+      const probs = await getPolicyProbs();
+      policyProbs.value = probs;
+    }
+  } catch (err) {
+    console.error('[App] Failed to adjust shot clock:', err);
+    alert(`Failed to adjust shot clock: ${err.message}`);
+  } finally {
+    isShotClockUpdating.value = false;
   }
 }
 
@@ -223,9 +344,9 @@ async function handleMoveRecorded(moveData) {
         moveData.passStealProbabilities = {};
     }
     
-    // Note: State values are now added in handleActionsSubmitted from the step response
-    // This eliminates the race condition where step could complete before state values are fetched
-    
+    const stateValues = gameState.value?.state_values;
+    moveData.offensiveValue = stateValues?.offensive_value ?? null;
+    moveData.defensiveValue = stateValues?.defensive_value ?? null;
     moveHistory.value.push(moveData);
 }
 
@@ -380,20 +501,21 @@ async function handleSelfPlay(preselected = null) {
         }
         
         // Push move to history (state values will be added after step response)
+        const currentStateValues = gameState.value?.state_values;
         moveHistory.value.push({
           turn: currentTurn,
           moves: teamMoves,
           ballHolder: ballHolder,
           passStealProbabilities: passStealProbs,
-          offensiveValue: null,  // Will be filled from step response
-          defensiveValue: null   // Will be filled from step response
+          offensiveValue: currentStateValues?.offensive_value ?? null,
+          defensiveValue: currentStateValues?.defensive_value ?? null
         });
       }
       
       const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value);
       if (response.status === 'success') {
         gameState.value = response.state;
-        gameHistory.value.push(response.state);
+        gameHistory.value.push(cloneState(response.state));
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -401,12 +523,26 @@ async function handleSelfPlay(preselected = null) {
           if (response.state.last_action_results) {
             lastMove.actionResults = response.state.last_action_results;
           }
+          // Update moves with actual actions taken (including opponent)
+          if (response.actions_taken) {
+              console.log('[App] Actions taken:', response.actions_taken);
+              // Create a new object for reactivity
+              const newMoves = { ...lastMove.moves };
+              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
+                  newMoves[`Player ${pid}`] = actionName;
+              }
+              // Replace the whole object
+              lastMove.moves = newMoves;
+          }
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {
             lastMove.shotClock = response.state.shot_clock + 1;
           }
-          // Store pre-step state values (values BEFORE this action was taken)
-          if (response.pre_step_state_values) {
+          const stateValues = response.state?.state_values;
+          if (stateValues) {
+            lastMove.offensiveValue = stateValues.offensive_value;
+            lastMove.defensiveValue = stateValues.defensive_value;
+          } else if (response.pre_step_state_values) {
             lastMove.offensiveValue = response.pre_step_state_values.offensive_value;
             lastMove.defensiveValue = response.pre_step_state_values.defensive_value;
           }
@@ -414,11 +550,9 @@ async function handleSelfPlay(preselected = null) {
         
         // If game is done, add an END row
         if (response.state.done && moveHistory.value.length > 0) {
-          const userTeamIds = response.state.offense_ids?.includes(0) 
-            ? response.state.offense_ids 
-            : response.state.defense_ids;
+          const allIds = [...(response.state.offense_ids || []), ...(response.state.defense_ids || [])];
           const endMoves = {};
-          userTeamIds.forEach(pid => {
+          allIds.forEach(pid => {
             endMoves[`Player ${pid}`] = 'END';
           });
           moveHistory.value.push({
@@ -671,10 +805,9 @@ function onKeydown(e) {
   if (/^[0-9]$/.test(key)) {
     if (gameState.value) {
       const idx = Number(key);
-      const isOffense = gameState.value.user_team_name === 'OFFENSE';
-      const teamIds = isOffense ? (gameState.value.offense_ids || []) : (gameState.value.defense_ids || []);
-      // Prefer exact player ID match on current team (useful when IDs are 2,3,...)
-      if (teamIds.includes(idx)) {
+      const allIds = [...(gameState.value.offense_ids || []), ...(gameState.value.defense_ids || [])];
+      // Prefer exact player ID match on ANY team (useful when IDs are 2,3,...)
+      if (allIds.includes(idx)) {
         activePlayerId.value = idx;
         return;
       }
@@ -784,6 +917,9 @@ onBeforeUnmount(() => {
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
+          @update-player-position="handlePlayerPositionUpdate"
+          @adjust-shot-clock="handleShotClockAdjustment"
+          :is-shot-clock-updating="isShotClockUpdating"
         />
         <KeyboardLegend />
       </div>
@@ -799,6 +935,7 @@ onBeforeUnmount(() => {
             :stored-policy-probs="policyProbs"
             :ai-mode="aiMode"
             :deterministic="playerDeterministic"
+            :opponent-deterministic="opponentDeterministic"
             :move-history="moveHistory"
             :current-shot-clock="currentShotClock"
             :external-selections="isSelfPlaying ? currentSelections : null"
@@ -829,6 +966,16 @@ onBeforeUnmount(() => {
             class="action-button new-game-button"
           >
             New Game
+          </button>
+        </div>
+
+        <div class="action-buttons" v-if="gameState && !gameState.done">
+           <button 
+            @click="handleResetPositions" 
+            class="action-button reset-button" 
+            title="Reset player positions to start of turn"
+           >
+            Reset Pos
           </button>
         </div>
 
@@ -985,18 +1132,20 @@ header {
 }
 .game-container {
   display: flex;
-  flex-direction: row; /* Changed to row */
-  justify-content: flex-start; /* Left area fills available space */
-  align-items: flex-start; /* Align items to the top */
-  gap: 2rem; /* Increased gap */
+  flex-direction: column; /* Changed to column for vertical stacking */
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: 1rem;
+  width: 100%;
+  max-width: 100vw;
 }
 
 .board-area {
   display: flex;
   flex-direction: column;
   align-items: center;
-  flex: 1.5;
-  min-width: 640; /* allow flex child to shrink properly */
+  width: 100%; /* Full width */
+  padding: 1rem;
 }
 
 .run-title {
@@ -1007,10 +1156,10 @@ header {
 }
 
 .controls-area {
-  min-width: 400px; /* Give the controls area a fixed width */
+  width: 100%; /* Full width */
   display: flex;
-  flex: 1.5;
   flex-direction: column;
+  padding: 0 1rem 1rem 1rem;
 }
 
 .action-buttons {
@@ -1059,6 +1208,15 @@ header {
 }
 
 .new-game-button:hover {
+  background: #5a6268;
+}
+
+.reset-button {
+  background: #6c757d;
+  color: white;
+}
+
+.reset-button:hover {
   background: #5a6268;
 }
 

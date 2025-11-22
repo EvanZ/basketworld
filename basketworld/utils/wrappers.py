@@ -32,7 +32,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
     Exposes keys consumed by Monitor(info_keywords=...):
       shot_dunk, shot_2pt, shot_3pt, assisted_dunk, assisted_2pt, assisted_3pt,
       passes, turnover, turnover_pass_oob, turnover_intercepted, turnover_pressure,
-      turnover_offensive_lane, defensive_lane_violation,
+      turnover_offensive_lane, defensive_lane_violation, move_rejected_occupied,
       made_dunk, made_2pt, made_3pt, attempts
     """
 
@@ -54,6 +54,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._turnover_pressure = 0.0
         self._turnover_offensive_lane = 0.0
         self._defensive_lane_violation = 0.0
+        self._move_rejected_occupied = 0.0
         self._made_dunk = 0.0
         self._made_2pt = 0.0
         self._made_3pt = 0.0
@@ -156,6 +157,13 @@ class EpisodeStatsWrapper(gym.Wrapper):
             # Track defensive lane violations (separate from turnovers)
             if ar.get("defensive_lane_violations"):
                 self._defensive_lane_violation = float(len(ar["defensive_lane_violations"]))
+            if ar.get("moves"):
+                for move_res in ar["moves"].values():
+                    if (
+                        not move_res.get("success", False)
+                        and move_res.get("reason") == "occupied_neighbor"
+                    ):
+                        self._move_rejected_occupied += 1.0
         except Exception:
             pass
 
@@ -173,6 +181,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["turnover_pressure"] = self._turnover_pressure
             info["turnover_offensive_lane"] = self._turnover_offensive_lane
             info["defensive_lane_violation"] = self._defensive_lane_violation
+            info["move_rejected_occupied"] = self._move_rejected_occupied
             info["made_dunk"] = self._made_dunk
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt
@@ -188,6 +197,25 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["basket_r"] = self._basket_r
             info["shooter_fg_pct"] = self._shooter_fg_pct
             # (Reverted) keep only the original episode summary fields
+        return obs, reward, done, truncated, info
+
+
+class EnvIndexWrapper(gym.Wrapper):
+    """Add environment index to episode info for mixed training metrics filtering.
+    
+    When using mixed environments (simultaneous offense/defense training),
+    AccumulativeMetricsCallback needs to filter episodes by environment index.
+    This wrapper adds the env_idx to each episode's info dict.
+    """
+    
+    def __init__(self, env: gym.Env, env_idx: int):
+        super().__init__(env)
+        self.env_idx = env_idx
+    
+    def step(self, action):  # type: ignore[override]
+        obs, reward, done, truncated, info = self.env.step(action)
+        if done and info is not None:
+            info["env_idx"] = self.env_idx
         return obs, reward, done, truncated, info
 
 

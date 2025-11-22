@@ -19,9 +19,13 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  isShotClockUpdating: {
+    type: Boolean,
+    default: false,
+  },
 });
 
-const emit = defineEmits(['update:activePlayerId']);
+const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock']);
 
 // ------------------------------------------------------------
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
@@ -56,13 +60,122 @@ function getRenderablePlayers(gameState) {
 }
 
 function onPlayerClick(player) {
-  // Only allow selecting offensive players from the board
-  if (!player || !player.isOffense) return;
+  // If dragging, don't trigger click
+  if (isDragging.value) return;
+  // Allow selecting any player (offense or defense) from the board
+  if (!player) return;
   emit('update:activePlayerId', player.id);
 }
 
+const svgRef = ref(null);
+const draggedPlayerId = ref(null);
+const draggedPlayerPos = ref({ x: 0, y: 0 });
+const isDragging = ref(false);
+
+function getSvgPoint(clientX, clientY) {
+  if (!svgRef.value) return { x: 0, y: 0 };
+  const pt = svgRef.value.createSVGPoint();
+  pt.x = clientX;
+  pt.y = clientY;
+  return pt.matrixTransform(svgRef.value.getScreenCTM().inverse());
+}
+
+function onMouseDown(event, player) {
+  if (!player) return;
+  event.preventDefault();
+  
+  draggedPlayerId.value = player.id;
+  // Initialize drag position to player's current center
+  draggedPlayerPos.value = { x: player.x, y: player.y };
+  
+  isDragging.value = false; // Not dragging yet until moved
+  
+  // Global listeners for drag/up to handle out-of-element movement
+  window.addEventListener('mousemove', onGlobalMouseMove);
+  window.addEventListener('mouseup', onGlobalMouseUp);
+}
+
+function onGlobalMouseMove(event) {
+  if (draggedPlayerId.value !== null) {
+    if (!isDragging.value) isDragging.value = true;
+    const { x, y } = getSvgPoint(event.clientX, event.clientY);
+    draggedPlayerPos.value = { x, y };
+  }
+}
+
+function onGlobalMouseUp(event) {
+  if (draggedPlayerId.value !== null && isDragging.value) {
+    const { x, y } = getSvgPoint(event.clientX, event.clientY);
+    
+    // Find nearest hex
+    let bestHex = null;
+    let minDist = Infinity;
+    
+    for (const hex of courtLayout.value) {
+      const dist = Math.sqrt((hex.x - x) ** 2 + (hex.y - y) ** 2);
+      if (dist < minDist) {
+        minDist = dist;
+        bestHex = hex;
+      }
+    }
+    
+    if (bestHex && minDist < HEX_RADIUS * 1.5) { // Threshold to snap
+      // Check if valid move
+      const pid = draggedPlayerId.value;
+      const currentPos = currentGameState.value.positions[pid];
+      const newPos = [bestHex.q, bestHex.r];
+      
+      // Check occupancy (except self)
+      const isOccupied = currentGameState.value.positions.some((p, idx) => 
+        idx !== pid && p[0] === newPos[0] && p[1] === newPos[1]
+      );
+      
+      if (!isOccupied && (currentPos[0] !== newPos[0] || currentPos[1] !== newPos[1])) {
+         // Emit update event
+         emit('update-player-position', { playerId: pid, q: newPos[0], r: newPos[1] });
+      }
+    }
+  }
+  
+  draggedPlayerId.value = null;
+  isDragging.value = false;
+  window.removeEventListener('mousemove', onGlobalMouseMove);
+  window.removeEventListener('mouseup', onGlobalMouseUp);
+}
+
+
 const currentGameState = computed(() => {
   return props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
+});
+
+const offenseStateValue = computed(() => {
+  const state = currentGameState.value;
+  if (!state || !state.state_values) return null;
+  const val = state.state_values.offensive_value;
+  return typeof val === 'number' ? val : null;
+});
+
+const sortedPlayers = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs) return [];
+  const players = getRenderablePlayers(gs);
+  const activeId = props.activePlayerId;
+  const ballHolderId = gs.ball_holder;
+
+  const others = players.filter(
+    (p) => p.id !== activeId && p.id !== ballHolderId
+  );
+  const ballHolderPlayer =
+    ballHolderId !== undefined && ballHolderId !== null && ballHolderId !== activeId
+      ? players.find((p) => p.id === ballHolderId)
+      : null;
+  const activePlayer = activeId !== null ? players.find((p) => p.id === activeId) : null;
+
+  return [
+    ...others,
+    ...(ballHolderPlayer ? [ballHolderPlayer] : []),
+    ...(activePlayer ? [activePlayer] : []),
+  ];
 });
 
 // no-op
@@ -123,6 +236,55 @@ const offensiveLaneHexes = computed(() => {
   });
 });
 
+const shotClockValue = computed(() => currentGameState.value?.shot_clock ?? 0);
+const shotClockMax = computed(() => {
+  const state = currentGameState.value;
+  if (!state) return 24;
+  const candidates = [24];
+  const maxParam = Number(state.shot_clock_steps);
+  const current = Number(state.shot_clock);
+  if (!Number.isNaN(maxParam)) candidates.push(maxParam);
+  if (!Number.isNaN(current)) candidates.push(current);
+  return Math.max(...candidates);
+});
+const isShotClockEditable = computed(() => !!currentGameState.value && !currentGameState.value.done);
+const canIncrementShotClock = computed(
+  () => isShotClockEditable.value && !props.isShotClockUpdating && shotClockValue.value < shotClockMax.value
+);
+const canDecrementShotClock = computed(
+  () => isShotClockEditable.value && !props.isShotClockUpdating && shotClockValue.value > 0
+);
+const pendingShotClock = ref(null);
+const displayedShotClockValue = computed(() => {
+  if (props.isShotClockUpdating && pendingShotClock.value !== null) {
+    return pendingShotClock.value;
+  }
+  return shotClockValue.value;
+});
+
+watch(shotClockValue, (newVal) => {
+  if (!props.isShotClockUpdating) {
+    pendingShotClock.value = null;
+  }
+});
+
+watch(() => props.isShotClockUpdating, (updating) => {
+  if (!updating) {
+    pendingShotClock.value = null;
+  }
+});
+
+function adjustShotClock(delta) {
+  if (!isShotClockEditable.value) return;
+  const minClock = 0;
+  const maxClock = shotClockMax.value;
+  const baseValue = pendingShotClock.value !== null ? pendingShotClock.value : shotClockValue.value;
+  const newValue = Math.max(minClock, Math.min(maxClock, baseValue + delta));
+  if (newValue === baseValue) return;
+  pendingShotClock.value = newValue;
+  emit('adjust-shot-clock', delta);
+}
+
 const viewBox = computed(() => {
     if (courtLayout.value.length === 0) return "-100 -100 200 200";
     
@@ -141,6 +303,25 @@ const viewBox = computed(() => {
     return `${minX} ${minY} ${width} ${height}`;
 });
 
+const stateValueBoxWidth = HEX_RADIUS * 3;
+const stateValueBoxHeight = HEX_RADIUS * 1.3;
+
+const stateValueAnchor = computed(() => {
+  const vbString = viewBox.value;
+  if (!vbString) return { x: 0, y: 0 };
+  const parts = vbString.split(' ').map((val) => Number(val));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) {
+    return { x: 0, y: 0 };
+  }
+  const [minX, minY, width, height] = parts;
+  const padding = HEX_RADIUS * 0.75;
+  return {
+    x: minX + width - stateValueBoxWidth - padding,
+    // push it even lower to avoid overlapping the court area
+    y: minY + height - stateValueBoxHeight - padding - HEX_RADIUS * 0.3,
+  };
+});
+
 // This is a direct mapping from our ActionType enum for moves
 const moveActionIndices = {
     MOVE_E: 1, MOVE_NE: 2, MOVE_NW: 3, MOVE_W: 4, MOVE_SW: 5, MOVE_SE: 6
@@ -151,14 +332,29 @@ const hexDirections = [
 ];
 
 const policySuggestions = computed(() => {
-    // Corrected the guard clause to explicitly check for null, fixing the "Player 0" bug.
-    if (props.activePlayerId === null || !props.policyProbabilities || !props.policyProbabilities[props.activePlayerId]) {
-        console.log('[GameBoard] No suggestions to render.');
+    // If we're in manual stepping, use the stored policy probabilities from the snapshot.
+    const gs = currentGameState.value;
+    const activeId = props.activePlayerId;
+    let probsByPlayer = null;
+
+    if (!gs || activeId === null) {
+        console.log('[GameBoard] No suggestions to render - missing game state or active player.');
         return [];
     }
-    console.log(`[GameBoard] Calculating suggestions for Player ${props.activePlayerId}`);
-    const currentPlayerPos = currentGameState.value.positions[props.activePlayerId];
-    const probs = props.policyProbabilities[props.activePlayerId];
+
+    if (props.isManualStepping && gs.policy_probabilities) {
+        probsByPlayer = gs.policy_probabilities;
+    } else {
+        probsByPlayer = props.policyProbabilities;
+    }
+
+    if (!probsByPlayer || !probsByPlayer[activeId]) {
+        console.log('[GameBoard] No suggestions to render - missing probabilities for player', activeId);
+        return [];
+    }
+
+    const probs = probsByPlayer[activeId];
+    const currentPlayerPos = currentGameState.value.positions[activeId];
 
     const suggestions = [];
     for (let i = 0; i < hexDirections.length; i++) {
@@ -338,11 +534,141 @@ const playerTransitions = computed(() => {
   return transitions;
 });
 
+async function downloadBoardAsImage() {
+  if (!svgRef.value) return;
+  
+  try {
+    // Helper to inline computed styles from source to target
+    const inlineStyles = (source, target) => {
+      const computed = window.getComputedStyle(source);
+      const properties = [
+        'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
+        'opacity', 'font-family', 'font-size', 'font-weight',
+        'text-anchor', 'dominant-baseline', 'paint-order'
+      ];
+      properties.forEach(prop => {
+        // Only set if not default/empty to keep it clean, 
+        // but essential for class-based styles to persist
+        const val = computed.getPropertyValue(prop);
+        if (val) target.style[prop] = val;
+      });
+      
+      for (let i = 0; i < source.children.length; i++) {
+        if (target.children[i]) {
+          inlineStyles(source.children[i], target.children[i]);
+        }
+      }
+    };
+
+    // Clone the SVG to avoid modifying the original
+    const svgClone = svgRef.value.cloneNode(true);
+    
+    // Inline styles to ensure they are captured (since classes won't work in standalone SVG)
+    inlineStyles(svgRef.value, svgClone);
+    
+    // Get the viewBox dimensions
+    const viewBox = svgRef.value.getAttribute('viewBox').split(' ').map(Number);
+    const [minX, minY, width, height] = viewBox;
+    
+    // Set explicit width and height for rendering
+    svgClone.setAttribute('width', width);
+    svgClone.setAttribute('height', height);
+    
+    // Serialize the SVG to a string
+    const serializer = new XMLSerializer();
+    let svgString = serializer.serializeToString(svgClone);
+    
+    // Add XML declaration and ensure proper encoding
+    svgString = '<?xml version="1.0" encoding="UTF-8"?>' + svgString;
+    
+    // Create a blob from the SVG string
+    const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    
+    // Create an image element to load the SVG
+    const img = new Image();
+    
+    // Capture state variables before async operations to ensure consistency
+    const shotClock = currentGameState.value?.shot_clock;
+    const hasShotClock = shotClock !== undefined && shotClock !== null;
+    const shotClockVal = String(shotClock);
+
+    img.onload = () => {
+      // Create a canvas with the SVG dimensions
+      const canvas = document.createElement('canvas');
+      const scale = 2; // Higher resolution
+      canvas.width = width * scale;
+      canvas.height = height * scale;
+      
+      const ctx = canvas.getContext('2d');
+      
+      // No background fill - transparent background
+      // Draw the SVG onto the canvas (scaled up)
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      
+      // Draw Shot Clock if available
+      if (hasShotClock) {
+        const fontSize = 48 * scale;
+        const paddingX = 16 * scale;
+        const paddingY = 4 * scale;
+        const margin = 20 * scale;
+        
+        ctx.font = `${fontSize}px "DSEG7 Classic", monospace`;
+        const textMetrics = ctx.measureText(shotClockVal);
+        const textWidth = textMetrics.width;
+        const boxWidth = textWidth + (paddingX * 2);
+        const boxHeight = fontSize + (paddingY * 2);
+        
+        const x = canvas.width - boxWidth - margin;
+        const y = margin;
+        
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(x, y, boxWidth, boxHeight);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 2 * scale;
+        ctx.strokeRect(x, y, boxWidth, boxHeight);
+        
+        ctx.fillStyle = '#ff4d4d';
+        ctx.shadowColor = '#ff4d4d';
+        ctx.shadowBlur = 10 * scale;
+        ctx.textBaseline = 'top';
+        ctx.fillText(shotClockVal, x + paddingX, y + paddingY);
+        ctx.shadowBlur = 0;
+      }
+      
+      // Convert canvas to PNG and download (PNG supports transparency)
+      canvas.toBlob((blob) => {
+        const link = document.createElement('a');
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+        link.download = `basketworld-board-${timestamp}.png`;
+        link.href = URL.createObjectURL(blob);
+        link.click();
+        
+        // Cleanup
+        URL.revokeObjectURL(url);
+        URL.revokeObjectURL(link.href);
+      }, 'image/png');
+    };
+    
+    img.src = url;
+  } catch (err) {
+    console.error('[GameBoard] Failed to download image:', err);
+    alert('Failed to download board image');
+  }
+}
+
 </script>
 
 <template>
   <div class="game-board-container">
-    <svg :viewBox="viewBox" preserveAspectRatio="xMidYMid meet">
+    <button 
+      class="download-button" 
+      @click="downloadBoardAsImage"
+      title="Download board as PNG"
+    >
+      📥
+    </button>
+    <svg :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
       <defs>
         <marker
           id="arrowhead-offense"
@@ -462,21 +788,32 @@ const playerTransitions = computed(() => {
 
         <!-- Draw the current players on top -->
         <g v-if="currentGameState">
-          <g v-for="player in getRenderablePlayers(currentGameState)" :key="player.id">
+        <g v-for="player in sortedPlayers" :key="player.id">
+            <!-- If dragging this player, show it at dragged pos, otherwise at hex pos -->
             <circle 
-              :cx="player.x" 
-              :cy="player.y" 
+              :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
+              :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
               :r="HEX_RADIUS * 0.8" 
               :class="[
                 player.isOffense ? 'player-offense' : 'player-defense',
-                { 'active-player-hex': player.id === activePlayerId }
+                { 'active-player-hex': player.id === activePlayerId },
+                { 'dragging': draggedPlayerId === player.id }
               ]"
+              @mousedown="onMouseDown($event, player)"
               @click="onPlayerClick(player)"
+              style="cursor: grab;"
             />
-            <text :x="player.x" :y="player.y" dy="0.3em" text-anchor="middle" class="player-text" @click="onPlayerClick(player)">{{ player.id }}</text>
+            <text 
+              :x="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
+              :y="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
+              dy="0.3em" 
+              text-anchor="middle" 
+              class="player-text"
+              style="pointer-events: none;" 
+            >{{ player.id }}</text>
             <!-- EP (Expected Points) label above player ID for offensive players -->
             <text
-              v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined"
+              v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
               dy="-1.0em"
@@ -487,7 +824,7 @@ const playerTransitions = computed(() => {
             </text>
             <!-- NOOP probability label (index 0) for the player -->
             <text
-              v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined"
+              v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
               dy="1.2em"
@@ -498,7 +835,7 @@ const playerTransitions = computed(() => {
             </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
-              v-if="player.hasBall && ballHandlerShotProb !== null"
+              v-if="player.hasBall && ballHandlerShotProb !== null && draggedPlayerId !== player.id"
               :x="player.x" 
               :y="player.y" 
               dy="0.4em" 
@@ -510,7 +847,7 @@ const playerTransitions = computed(() => {
             </text>
             <!-- Display conditional make percentage for ball handler -->
             <text 
-              v-if="player.hasBall && ballHandlerMakeProb !== null"
+              v-if="player.hasBall && ballHandlerMakeProb !== null && draggedPlayerId !== player.id"
               :x="player.x" 
               :y="player.y" 
               dy="-0.4em" 
@@ -521,7 +858,14 @@ const playerTransitions = computed(() => {
               {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
             <!-- Ball handler indicator -->
-            <circle v-if="player.hasBall" :cx="player.x" :cy="player.y" :r="HEX_RADIUS * 0.9" class="ball-indicator" />
+            <circle 
+                v-if="player.hasBall" 
+                :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
+                :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
+                :r="HEX_RADIUS * 0.9" 
+                class="ball-indicator" 
+                style="pointer-events: none;"
+            />
           </g>
         </g>
         
@@ -551,6 +895,27 @@ const playerTransitions = computed(() => {
             
             <!-- Defensive Violation indicator -->
             <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker">!</text>
+        </g>
+
+        <!-- Offensive state-value overlay -->
+        <g v-if="offenseStateValue !== null" class="state-value-overlay">
+          <rect
+            :x="stateValueAnchor.x"
+            :y="stateValueAnchor.y"
+            :width="stateValueBoxWidth"
+            :height="stateValueBoxHeight"
+            rx="12"
+            ry="12"
+          />
+          <text
+            :x="stateValueAnchor.x + stateValueBoxWidth / 2"
+            :y="stateValueAnchor.y + stateValueBoxHeight / 2"
+            text-anchor="middle"
+            dominant-baseline="middle"
+            class="state-value-text"
+          >
+            V(s) {{ offenseStateValue.toFixed(2) }}
+          </text>
         </g>
       </g>
 
@@ -584,8 +949,28 @@ const playerTransitions = computed(() => {
         {{ currentGameState.run_id }}
       </text>
     </svg>
-    <div class="shot-clock-overlay">
-      {{ currentGameState ? currentGameState.shot_clock : '' }}
+    <div class="shot-clock-wrapper">
+      <div class="shot-clock-overlay">
+        {{ displayedShotClockValue }}
+      </div>
+      <div class="shot-clock-controls">
+        <button
+          class="shot-clock-button"
+          :disabled="!canIncrementShotClock"
+          @click="adjustShotClock(1)"
+          aria-label="Increase shot clock"
+        >
+          ▲
+        </button>
+        <button
+          class="shot-clock-button"
+          :disabled="!canDecrementShotClock"
+          @click="adjustShotClock(-1)"
+          aria-label="Decrease shot clock"
+        >
+          ▼
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -599,7 +984,6 @@ const playerTransitions = computed(() => {
   margin: 0; /* Remove auto margin which conflicts with flexbox */
   border-radius: 8px;
   overflow: visible; /* Allow the shot clock to be positioned outside */
-  margin-bottom: 60px; /* Add space below the board for the clock */
   /* Parquet-style checkerboard background */
   background-color: #d2b48c; /* Base light wood color */
   background-image: 
@@ -610,10 +994,7 @@ const playerTransitions = computed(() => {
 }
 
 .shot-clock-overlay {
-  position: absolute;
-  bottom: -55px; /* Position it below the container */
-  left: 50%;
-  transform: translateX(-50%); /* Center it horizontally */
+  position: relative;
   font-family: 'DSEG7 Classic', sans-serif;
   font-size: 48px;
   color: #ff4d4d; /* Bright red for the LED color */
@@ -623,6 +1004,82 @@ const playerTransitions = computed(() => {
   border: 1px solid #333;
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d; /* Glowing effect */
   pointer-events: none; /* Make it non-interactive */
+  z-index: 10; /* Ensure it's above the SVG */
+}
+
+.shot-clock-wrapper {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 11;
+}
+
+.shot-clock-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.shot-clock-button {
+  width: 30px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.6);
+  background: rgba(255, 255, 255, 0.9);
+  color: #222;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.shot-clock-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.download-button {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 18px;
+  color: #333;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.download-button:hover {
+  background: white;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+  transform: translateY(-1px);
+}
+
+.download-button:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.state-value-overlay rect {
+  fill: rgba(15, 15, 20, 0.9);
+  stroke: rgba(255, 255, 255, 0.7);
+  stroke-width: 1;
+  filter: drop-shadow(0px 0px 2px rgba(0, 0, 0, 0.6));
+}
+
+.state-value-text {
+  fill: #fffbf2;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
 }
 
 /* Removed rotation; court now renders in original orientation */
@@ -649,6 +1106,11 @@ svg {
 .active-player-hex {
   stroke: #ffeb3b; /* Bright yellow */
   stroke-width: 4; /* Increased width for better visibility */
+}
+.dragging {
+  opacity: 0.8;
+  stroke: white;
+  stroke-dasharray: 4 2;
 }
 .player-text {
   fill: white;

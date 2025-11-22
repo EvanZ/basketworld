@@ -1,6 +1,7 @@
 import tempfile
 import re
 import os
+from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,11 +18,6 @@ import copy
 from datetime import datetime
 import imageio
 from basketworld.utils.evaluation_helpers import get_outcome_category
-from basketworld.utils.action_resolution import (
-    IllegalActionStrategy,
-    get_policy_action_probabilities,
-    resolve_illegal_actions,
-)
 from basketworld.utils.action_resolution import (
     IllegalActionStrategy,
     get_policy_action_probabilities,
@@ -77,9 +73,159 @@ class GameState:
         self.role_flag_defense: float = -1.0  # Default to new encoding
         # Cache previous observation to handle race condition between move-recorded and step
         self.prev_obs: dict | None = None
+        # Turn-start snapshot for frontend resets
+        self.turn_start_positions: list[tuple[int, int]] | None = None
+        self.turn_start_ball_holder: int | None = None
+        self.turn_start_shot_clock: int | None = None
 
 
 game_state = GameState()
+
+
+def _role_flag_value_for_team(team: Team) -> float:
+    if team == Team.OFFENSE:
+        value = getattr(game_state, "role_flag_offense", None)
+        return float(value if value is not None else 1.0)
+    value = getattr(game_state, "role_flag_defense", None)
+    return float(value if value is not None else -1.0)
+
+
+def _capture_turn_start_snapshot():
+    """Store the current environment positions/ball holder/shot clock as the baseline for the turn."""
+    if not game_state.env:
+        return
+    env = game_state.env
+    try:
+        game_state.turn_start_positions = [
+            (int(pos[0]), int(pos[1])) for pos in getattr(env, "positions", [])
+        ]
+    except Exception:
+        game_state.turn_start_positions = None
+    game_state.turn_start_ball_holder = (
+        int(env.ball_holder) if getattr(env, "ball_holder", None) is not None else None
+    )
+    game_state.turn_start_shot_clock = int(getattr(env, "shot_clock", 0))
+
+
+def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
+    cloned = {
+        "obs": np.copy(obs["obs"]),
+        "action_mask": obs["action_mask"],
+        "role_flag": np.array([role_flag_value], dtype=np.float32),
+    }
+    skills = obs.get("skills")
+    if skills is not None:
+        cloned["skills"] = np.copy(skills)
+    else:
+        cloned["skills"] = None
+    return cloned
+
+
+def _team_player_ids(env, team: Team) -> List[int]:
+    if team == Team.OFFENSE:
+        return list(getattr(env, "offense_ids", []))
+    return list(getattr(env, "defense_ids", []))
+
+
+def _predict_actions_for_team(
+    policy: PPO,
+    base_obs: Dict,
+    env,
+    team: Team,
+    deterministic: bool,
+    strategy: IllegalActionStrategy,
+) -> Tuple[Dict[int, int], Dict[int, np.ndarray]]:
+    actions_by_player: Dict[int, int] = {}
+    probs_by_player: Dict[int, np.ndarray] = {}
+
+    if policy is None or base_obs is None or env is None:
+        return actions_by_player, probs_by_player
+
+    team_ids = _team_player_ids(env, team)
+    if not team_ids:
+        return actions_by_player, probs_by_player
+
+    role_flag_value = _role_flag_value_for_team(team)
+    conditioned_obs = _clone_obs_with_role_flag(base_obs, role_flag_value)
+
+    try:
+        raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
+    except Exception:
+        return actions_by_player, probs_by_player
+
+    raw_actions = np.array(raw_actions).reshape(-1)
+    action_len = raw_actions.shape[0]
+    team_mask = base_obs["action_mask"][team_ids]
+
+    # Legacy policies output actions for every player; new policies output players_per_side only.
+    if action_len == len(team_ids):
+        team_pred_actions = raw_actions
+    elif action_len == getattr(env, "n_players", action_len):
+        team_pred_actions = raw_actions[team_ids]
+    else:
+        # Fallback: truncate/pad to team size
+        team_pred_actions = raw_actions[: len(team_ids)]
+
+    probs = get_policy_action_probabilities(policy, conditioned_obs)
+    if probs is not None:
+        probs = [
+            np.asarray(p, dtype=np.float32) for p in probs
+        ]
+        if len(probs) == getattr(env, "n_players", len(probs)):
+            team_probs = [probs[int(pid)] for pid in team_ids]
+        else:
+            team_probs = probs[: len(team_ids)]
+    else:
+        team_probs = None
+
+    resolved_actions = resolve_illegal_actions(
+        np.array(team_pred_actions),
+        team_mask,
+        strategy,
+        deterministic,
+        team_probs,
+    )
+
+    for idx, pid in enumerate(team_ids):
+        actions_by_player[int(pid)] = int(resolved_actions[idx])
+        if team_probs is not None and idx < len(team_probs):
+            probs_by_player[int(pid)] = np.asarray(team_probs[idx], dtype=np.float32)
+
+    return actions_by_player, probs_by_player
+
+
+def _predict_policy_actions(
+    policy: Optional[PPO],
+    base_obs: Dict,
+    env,
+    deterministic: bool,
+    strategy: IllegalActionStrategy,
+) -> Tuple[Optional[np.ndarray], Optional[List[np.ndarray]]]:
+    if policy is None or base_obs is None or env is None:
+        return None, None
+
+    num_players = env.n_players
+    num_actions = len(ActionType)
+    full_actions = np.zeros(num_players, dtype=int)
+    probs_per_player: List[np.ndarray] = [
+        np.zeros(num_actions, dtype=np.float32) for _ in range(num_players)
+    ]
+
+    for team in (Team.OFFENSE, Team.DEFENSE):
+        team_actions, team_probs = _predict_actions_for_team(
+            policy,
+            base_obs,
+            env,
+            team,
+            deterministic,
+            strategy,
+        )
+        for pid, action in team_actions.items():
+            full_actions[int(pid)] = int(action)
+        for pid, prob_vec in team_probs.items():
+            probs_per_player[int(pid)] = prob_vec
+
+    return full_actions, probs_per_player
 
 
 # --- API Models ---
@@ -305,6 +451,7 @@ async def init_game(request: InitGameRequest):
         )
         game_state.obs, _ = game_state.env.reset()
         game_state.prev_obs = None  # No previous observation at start
+        _capture_turn_start_snapshot()
 
         # Log shot clock configuration for debugging
         print(
@@ -346,7 +493,11 @@ async def init_game(request: InitGameRequest):
             traceback.print_exc()
 
         # Record initial state for replay (manual or self-play) with policy probs
-        initial_state = get_full_game_state(include_policy_probs=True)
+        initial_state = get_full_game_state(
+            include_policy_probs=True,
+            include_action_values=True,
+            include_state_values=True,
+        )
         game_state.episode_states.append(initial_state)
 
         # Record initial phi values (step 0) by computing EP for all players
@@ -524,30 +675,26 @@ def _compute_q_values_for_player(player_id: int, game_state: GameState) -> dict:
         # Construct the full action array for the simulation
         # Need to use correct policy for each player (main vs opponent)
         sim_action = np.zeros(temp_env.n_players, dtype=int)
-        
-        # Get actions from main policy
-        full_actions_main, _ = game_state.unified_policy.predict(
-            game_state.obs, deterministic=True
+
+        player_strategy = IllegalActionStrategy.BEST_PROB
+        full_actions_main, _ = _predict_policy_actions(
+            game_state.unified_policy,
+            game_state.obs,
+            game_state.env,
+            deterministic=True,
+            strategy=player_strategy,
         )
-        
-        # Get actions from opponent policy if available
-        full_actions_opponent = None
-        if game_state.defense_policy is not None:
-            try:
-                # Flip role flag for opponent
-                opp_obs = {
-                    "obs": np.copy(game_state.obs["obs"]),
-                    "action_mask": game_state.obs["action_mask"],
-                    "role_flag": np.copy(game_state.obs.get("role_flag")),
-                    "skills": np.copy(game_state.obs.get("skills")),
-                }
-                if opp_obs.get("role_flag") is not None:
-                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
-                full_actions_opponent, _ = game_state.defense_policy.predict(
-                    opp_obs, deterministic=True
-                )
-            except Exception:
-                full_actions_opponent = None
+        if full_actions_main is None:
+            full_actions_main = np.zeros(temp_env.n_players, dtype=int)
+
+        opponent_strategy = IllegalActionStrategy.BEST_PROB
+        full_actions_opponent, _ = _predict_policy_actions(
+            game_state.defense_policy,
+            game_state.obs,
+            game_state.env,
+            deterministic=True,
+            strategy=opponent_strategy,
+        )
         
         # Determine which team the evaluating player is on
         is_player_on_user_team = (
@@ -606,6 +753,51 @@ def _compute_q_values_for_player(player_id: int, game_state: GameState) -> dict:
     return action_values
 
 
+def _build_role_conditioned_obs(base_obs: dict | None, role_flag_value: float):
+    """Prepare an observation payload with a specific role flag for value prediction."""
+    if base_obs is None or "obs" not in base_obs or "action_mask" not in base_obs:
+        return None
+    return {
+        "obs": np.copy(base_obs["obs"]),
+        "action_mask": base_obs["action_mask"],
+        "role_flag": np.array([role_flag_value], dtype=np.float32),
+        "skills": np.copy(base_obs.get("skills")) if base_obs.get("skills") is not None else None,
+    }
+
+
+def _compute_state_values_from_obs(obs_dict: dict | None):
+    """Compute offensive/defensive value estimates for a given observation snapshot."""
+    if not game_state.unified_policy or obs_dict is None:
+        return None
+    
+    value_policy = game_state.unified_policy
+    if not hasattr(value_policy, "policy"):
+        return None
+    
+    try:
+        offense_obs = _build_role_conditioned_obs(obs_dict, game_state.role_flag_offense)
+        defense_obs = _build_role_conditioned_obs(obs_dict, game_state.role_flag_defense)
+        if offense_obs is None or defense_obs is None:
+            return None
+        
+        offense_tensor, _ = value_policy.policy.obs_to_tensor(offense_obs)
+        defense_tensor, _ = value_policy.policy.obs_to_tensor(defense_obs)
+        
+        with torch.no_grad():
+            offense_value = float(value_policy.policy.predict_values(offense_tensor).item())
+            defense_value = float(value_policy.policy.predict_values(defense_tensor).item())
+        
+        return {
+            "offensive_value": offense_value,
+            "defensive_value": defense_value,
+        }
+    except Exception as err:
+        print(f"[STATE_VALUES] Failed to compute state values: {err}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 @app.post("/api/step")
 def take_step(request: ActionRequest):
     """Takes a single step in the environment."""
@@ -621,40 +813,7 @@ def take_step(request: ActionRequest):
     opponent_deterministic = (
         True if request.opponent_deterministic is None else bool(request.opponent_deterministic)
     )
-    
-    full_action_ai, _ = game_state.unified_policy.predict(
-        ai_obs, deterministic=player_deterministic
-    )
-    full_action_ai_opponent = None
-    if game_state.defense_policy is not None:
-        try:
-            # Flip role flag for opponent so it conditions on opposite role
-            opp_obs = ai_obs
-            try:
-                opp_obs = {
-                    "obs": np.copy(ai_obs["obs"]),
-                    "action_mask": ai_obs["action_mask"],
-                    "role_flag": np.copy(ai_obs.get("role_flag")),
-                    "skills": np.copy(ai_obs.get("skills")),
-                }
-                if opp_obs.get("role_flag") is not None:
-                    opp_obs["role_flag"] = -1.0 * opp_obs["role_flag"]
-            except Exception:
-                opp_obs = ai_obs
-            full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                opp_obs, deterministic=opponent_deterministic
-            )
-        except Exception:
-            full_action_ai_opponent = None
 
-    # Prepare action masks and probability vectors
-    action_mask = ai_obs["action_mask"]
-    unified_probs = get_policy_action_probabilities(game_state.unified_policy, ai_obs)
-    opponent_probs = (
-        get_policy_action_probabilities(game_state.defense_policy, opp_obs)
-        if full_action_ai_opponent is not None
-        else None
-    )
     player_team_strategy = (
         IllegalActionStrategy.BEST_PROB
         if player_deterministic
@@ -665,43 +824,51 @@ def take_step(request: ActionRequest):
         if opponent_deterministic
         else IllegalActionStrategy.SAMPLE_PROB
     )
-    resolved_unified = resolve_illegal_actions(
-        np.array(full_action_ai),
-        action_mask,
-        player_team_strategy,
-        player_deterministic,
-        unified_probs,
+
+    resolved_unified, unified_probs = _predict_policy_actions(
+        game_state.unified_policy,
+        ai_obs,
+        game_state.env,
+        deterministic=player_deterministic,
+        strategy=player_team_strategy,
     )
-    resolved_opponent = (
-        resolve_illegal_actions(
-            np.array(full_action_ai_opponent),
-            action_mask,
-            opponent_team_strategy,
-            opponent_deterministic,
-            opponent_probs,
+    if resolved_unified is None:
+        resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
+        unified_probs = [np.zeros(len(ActionType), dtype=np.float32) for _ in range(game_state.env.n_players)]
+
+    resolved_opponent = None
+    opponent_probs = None
+    if game_state.defense_policy is not None:
+        resolved_opponent, opponent_probs = _predict_policy_actions(
+            game_state.defense_policy,
+            ai_obs,
+            game_state.env,
+            deterministic=opponent_deterministic,
+            strategy=opponent_team_strategy,
         )
-        if full_action_ai_opponent is not None
-        else None
-    )
+    
+    action_mask = ai_obs["action_mask"]
 
     # Combine user and AI actions
     full_action = np.zeros(game_state.env.n_players, dtype=int)
 
     for i in range(game_state.env.n_players):
-        is_user_player = (
-            i in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE
-        ) or (i in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+        # Check if action is explicitly provided in the request
+        # We treat the request as the source of truth if an action is present.
+        # This supports manual overrides for ANY player (user or opponent).
+        proposed = request.actions.get(str(i))
 
-        if is_user_player:
-            # Action comes from the user request
-            # Convert player_id (int) to string for dict lookup
-            proposed = request.actions.get(str(i), 0)
-            # Enforce action mask for user as well
+        if proposed is not None:
+             # Validate action against mask (security/rule check)
             if action_mask[i][proposed] == 1:
                 full_action[i] = proposed
             else:
+                # Illegal action defaults to NOOP (0)
                 full_action[i] = 0
         else:
+            # If not in request, fallback to AI logic
+            # This branch is hit if frontend doesn't send moves for everyone (e.g. older client)
+            # or if AI Mode logic on frontend omitted some players.
             is_user_offense = game_state.user_team == Team.OFFENSE
             use_opponent = (
                 (is_user_offense and i in game_state.env.defense_ids)
@@ -722,22 +889,22 @@ def take_step(request: ActionRequest):
         offense_player_ids = list(game_state.env.offense_ids)
         defense_player_ids = list(game_state.env.defense_ids)
         
-        if offense_player_ids:
+        if offense_player_ids and unified_probs is not None:
             # Use ball handler if available, otherwise first offensive player
             offense_rep = game_state.env.ball_holder if game_state.env.ball_holder in offense_player_ids else offense_player_ids[0]
             offense_q_values = _compute_q_values_for_player(offense_rep, game_state)
-            offense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            offense_probs = unified_probs
             # V(s) = Σ π(a|s) * Q(s,a)
             pre_step_offensive_value = sum(
                 offense_probs[offense_rep][i] * offense_q_values.get(ActionType(i).name, 0.0)
                 for i in range(len(offense_probs[offense_rep]))
             )
         
-        if defense_player_ids:
+        if defense_player_ids and unified_probs is not None:
             # Use first defensive player as representative
             defense_rep = defense_player_ids[0]
             defense_q_values = _compute_q_values_for_player(defense_rep, game_state)
-            defense_probs = get_policy_action_probabilities(game_state.unified_policy, game_state.obs)
+            defense_probs = unified_probs
             # V(s) = Σ π(a|s) * Q(s,a)
             pre_step_defensive_value = sum(
                 defense_probs[defense_rep][i] * defense_q_values.get(ActionType(i).name, 0.0)
@@ -1020,16 +1187,31 @@ def take_step(request: ActionRequest):
         traceback.print_exc()
     # Record resulting state for replay with policy probs
     try:
-        game_state.episode_states.append(get_full_game_state(include_policy_probs=True))
+        game_state.episode_states.append(
+            get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            )
+        )
     except Exception:
         pass
+    _capture_turn_start_snapshot()
     # End of self-play: mark inactive when episode is done
     if game_state.self_play_active and done:
         game_state.self_play_active = False
 
+    # Map action indices to names for frontend display
+    action_names = [a.name for a in ActionType]
+    actions_taken = {}
+    for pid, act_idx in enumerate(full_action):
+        if pid < len(full_action): 
+            actions_taken[str(pid)] = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
+
     return {
         "status": "success",
-        "state": get_full_game_state(),
+        "state": get_full_game_state(include_state_values=True),
+        "actions_taken": actions_taken,
         "step_rewards": {
             "offense": float(step_rewards["offense"]),
             "defense": float(step_rewards["defense"]),
@@ -1156,6 +1338,7 @@ def start_self_play():
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
     game_state.prev_obs = None  # No previous observation at start
+    _capture_turn_start_snapshot()
 
     # Capture initial frame
     try:
@@ -1165,7 +1348,11 @@ def start_self_play():
     except Exception:
         pass
 
-    return {"status": "success", "state": get_full_game_state(), "seed": episode_seed}
+    return {
+        "status": "success",
+        "state": get_full_game_state(include_state_values=True),
+        "seed": episode_seed,
+    }
 
 
 class EvaluationRequest(BaseModel):
@@ -1256,54 +1443,17 @@ def run_evaluation(request: EvaluationRequest):
         # Run episode until done
         while not done and step_count < 1000:  # Safety limit
             # Get AI actions for both teams
-            full_action_ai, _ = game_state.unified_policy.predict(
-                obs, deterministic=player_deterministic
-            )
-
-            # Calculate policy entropy for diagnostics
             try:
                 obs_tensor = game_state.unified_policy.policy.obs_to_tensor(obs)[0]
                 distributions = game_state.unified_policy.policy.get_distribution(
                     obs_tensor
                 )
-                # Calculate entropy across all players
                 for dist in distributions.distribution:
                     entropy = dist.entropy().mean().item()
                     episode_entropy_sum += entropy
                     episode_entropy_count += 1
             except Exception:
                 pass
-
-            opponent_obs = obs
-            if game_state.defense_policy is not None:
-                try:
-                    # Flip role flag for opponent
-                    opponent_obs = {
-                        "obs": np.copy(obs["obs"]),
-                        "action_mask": obs["action_mask"],
-                        "role_flag": np.copy(obs.get("role_flag")),
-                        "skills": np.copy(obs.get("skills")),
-                    }
-                    if opponent_obs.get("role_flag") is not None:
-                        opponent_obs["role_flag"] = 1.0 - opponent_obs["role_flag"]
-                    full_action_ai_opponent, _ = game_state.defense_policy.predict(
-                        opponent_obs, deterministic=opponent_deterministic
-                    )
-                except Exception:
-                    full_action_ai_opponent = None
-            else:
-                full_action_ai_opponent = None
-
-            # Resolve actions using the same logic as step endpoint
-            action_mask = obs["action_mask"]
-            unified_probs = get_policy_action_probabilities(
-                game_state.unified_policy, obs
-            )
-            opponent_probs = (
-                get_policy_action_probabilities(game_state.defense_policy, opponent_obs)
-                if full_action_ai_opponent is not None
-                else None
-            )
 
             player_team_strategy = (
                 IllegalActionStrategy.BEST_PROB
@@ -1315,25 +1465,27 @@ def run_evaluation(request: EvaluationRequest):
                 if opponent_deterministic
                 else IllegalActionStrategy.SAMPLE_PROB
             )
-
-            resolved_unified = resolve_illegal_actions(
-                np.array(full_action_ai),
-                action_mask,
-                player_team_strategy,
-                player_deterministic,
-                unified_probs,
+            resolved_unified, _ = _predict_policy_actions(
+                game_state.unified_policy,
+                obs,
+                game_state.env,
+                deterministic=player_deterministic,
+                strategy=player_team_strategy,
             )
+            if resolved_unified is None:
+                resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
 
-            if full_action_ai_opponent is not None:
-                resolved_opponent = resolve_illegal_actions(
-                    np.array(full_action_ai_opponent),
-                    action_mask,
-                    opponent_team_strategy,
-                    opponent_deterministic,
-                    opponent_probs,
+            resolved_opponent = None
+            if game_state.defense_policy is not None:
+                resolved_opponent, _ = _predict_policy_actions(
+                    game_state.defense_policy,
+                    obs,
+                    game_state.env,
+                    deterministic=opponent_deterministic,
+                    strategy=opponent_team_strategy,
                 )
             else:
-                resolved_opponent = np.array(full_action_ai)
+                resolved_opponent = np.array(resolved_unified)
 
             # Combine actions based on team roles
             # IMPORTANT: unified_policy represents the USER's policy (game_state.user_team)
@@ -1378,7 +1530,7 @@ def run_evaluation(request: EvaluationRequest):
 
         # Capture final state
         game_state.obs = obs
-        final_state = get_full_game_state()
+        final_state = get_full_game_state(include_state_values=True)
 
         # Calculate average entropy for this episode
         avg_entropy = (
@@ -1499,7 +1651,7 @@ def replay_last_episode():
     }
     obs, _ = game_state.env.reset(seed=game_state.replay_seed, options=options)
 
-    states = [get_full_game_state()]
+    states = [get_full_game_state(include_state_values=True)]
     for action in game_state.actions_log:
         obs, _, _, _, _ = game_state.env.step(action)
         try:
@@ -1508,7 +1660,7 @@ def replay_last_episode():
                 game_state.frames.append(frame)
         except Exception:
             pass
-        states.append(get_full_game_state())
+        states.append(get_full_game_state(include_state_values=True))
 
     game_state.obs = obs
     return {"status": "success", "states": states}
@@ -1844,46 +1996,24 @@ def get_state_values():
         }
     
     try:
-        value_policy = game_state.unified_policy
-        
         # Use prev_obs if available (set right before step), otherwise current obs
         # This handles race condition where step completes before this API call
         obs_to_use = game_state.prev_obs if game_state.prev_obs is not None else game_state.obs
         
-        # Get offensive value (using loaded encoding)
-        obs_offense = {
-            "obs": np.copy(obs_to_use["obs"]),
-            "action_mask": obs_to_use["action_mask"],
-            "role_flag": np.array([game_state.role_flag_offense], dtype=np.float32),
-            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
-        }
-        
-        obs_tensor_offense, _ = value_policy.policy.obs_to_tensor(obs_offense)
-        with torch.no_grad():
-            value_offense = value_policy.policy.predict_values(obs_tensor_offense).item()
-        
-        # Get defensive value (using loaded encoding)
-        obs_defense = {
-            "obs": np.copy(obs_to_use["obs"]),
-            "action_mask": obs_to_use["action_mask"],
-            "role_flag": np.array([game_state.role_flag_defense], dtype=np.float32),
-            "skills": np.copy(obs_to_use.get("skills")) if obs_to_use.get("skills") is not None else None,
-        }
-        
-        obs_tensor_defense, _ = value_policy.policy.obs_to_tensor(obs_defense)
-        with torch.no_grad():
-            value_defense = value_policy.policy.predict_values(obs_tensor_defense).item()
+        state_values = _compute_state_values_from_obs(obs_to_use)
         
         # Clear prev_obs after using it (consumed)
         game_state.prev_obs = None
         
-        print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {value_offense:.3f}")
-        print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {value_defense:.3f}")
-        
-        return {
-            "offensive_value": float(value_offense),
-            "defensive_value": float(value_defense)
-        }
+        if state_values:
+            print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {state_values['offensive_value']:.3f}")
+            print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {state_values['defensive_value']:.3f}")
+            return state_values
+        else:
+            return {
+                "offensive_value": 0.0,
+                "defensive_value": 0.0
+            }
     except Exception as e:
         print(f"[ERROR] Failed to calculate state values: {e}")
         import traceback
@@ -2214,31 +2344,56 @@ def compute_policy_probabilities():
         return None
 
     try:
-        policy = game_state.unified_policy
-        # Convert observation to the format the policy expects
-        obs_tensor = policy.policy.obs_to_tensor(game_state.obs)[0]
-        # Get the distribution over actions from the policy object
-        distributions = policy.policy.get_distribution(obs_tensor)
-        # Extract raw probabilities for each player
-        raw_probs = [
-            dist.probs.detach().cpu().numpy().squeeze()
-            for dist in distributions.distribution
-        ]
+        # Get probabilities from unified_policy (for user team or both if single policy)
+        _, raw_probs_main = _predict_policy_actions(
+            game_state.unified_policy,
+            game_state.obs,
+            game_state.env,
+            deterministic=False,
+            strategy=IllegalActionStrategy.SAMPLE_PROB,
+        )
+
+        # Get probabilities from defense_policy (for opponent team if available)
+        raw_probs_opponent = None
+        if game_state.defense_policy is not None:
+            _, raw_probs_opponent = _predict_policy_actions(
+                game_state.defense_policy,
+                game_state.obs,
+                game_state.env,
+                deterministic=False,
+                strategy=IllegalActionStrategy.SAMPLE_PROB,
+            )
+
+        if raw_probs_main is None:
+            return None
+
         # Apply action mask so illegal actions have probability 0, then renormalize.
         action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
         probs_list = []
-        for pid, probs in enumerate(raw_probs):
+        
+        for pid in range(game_state.env.n_players):
+            # Determine if this player should use the main policy (user team) or opponent policy
+            is_user_team = (
+                (pid in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE) or
+                (pid in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+            )
+            
+            if is_user_team or raw_probs_opponent is None:
+                probs = raw_probs_main[pid]
+            else:
+                probs = raw_probs_opponent[pid]
+
             masked = probs * action_mask[pid]
             total = masked.sum()
             if total > 0:
                 masked = masked / total
             probs_list.append(masked.tolist())
+
         # Return as a dictionary mapping player_id to their list of probabilities
+        # We now include ALL players (offense and defense)
         response = {
             player_id: probs
             for player_id, probs in enumerate(probs_list)
-            if player_id in game_state.env.offense_ids
-            or player_id in game_state.env.defense_ids
         }
         return response
     except Exception as e:
@@ -2246,7 +2401,290 @@ def compute_policy_probabilities():
         return None
 
 
-def get_full_game_state(include_policy_probs=False):
+class UpdatePositionRequest(BaseModel):
+    player_id: int
+    q: int
+    r: int
+
+
+class UpdateShotClockRequest(BaseModel):
+    delta: int
+
+
+class BatchUpdatePositionRequest(BaseModel):
+    updates: List[UpdatePositionRequest]
+
+
+@app.post("/api/batch_update_player_positions")
+def batch_update_player_positions(req: BatchUpdatePositionRequest):
+    """
+    Updates positions for multiple players at once.
+    Useful for resetting state or bulk moves.
+    """
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
+
+    # Validate all moves first before applying any
+    # Check bounds and duplicate targets
+    target_positions = {}
+    for update in req.updates:
+        pid = update.player_id
+        pos = (update.q, update.r)
+        
+        if pid < 0 or pid >= game_state.env.n_players:
+             raise HTTPException(status_code=400, detail=f"Invalid player ID: {pid}")
+        
+        if not game_state.env._is_valid_position(*pos):
+             raise HTTPException(status_code=400, detail=f"Position {pos} is out of bounds.")
+             
+        if pos in target_positions.values():
+             raise HTTPException(status_code=400, detail=f"Duplicate target position {pos} in batch.")
+        
+        target_positions[pid] = pos
+
+    # Check collisions with players NOT being moved
+    # (If we swap two players, that's fine, but we can't move into a static player's hex)
+    current_positions = game_state.env.positions
+    moving_pids = set(target_positions.keys())
+    
+    for i, pos in enumerate(current_positions):
+        if i not in moving_pids:
+            # This player is static. Check if anyone is moving into their spot.
+            if pos in target_positions.values():
+                raise HTTPException(status_code=400, detail=f"Position {pos} is occupied by static Player {i}.")
+
+    # Apply updates
+    for pid, pos in target_positions.items():
+        game_state.env.positions[pid] = pos
+
+    # Refresh Observation
+    try:
+        obs_vec = game_state.env._get_observation()
+        action_mask = game_state.env._get_action_masks()
+        
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if game_state.env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": game_state.env._get_offense_skills_array(),
+        }
+        
+        game_state.obs = new_obs_dict
+        game_state.prev_obs = None
+        
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to batch update positions: {e}")
+
+
+@app.post("/api/update_player_position")
+def update_player_position(req: UpdatePositionRequest):
+    """
+    Updates a player's position during an ongoing episode.
+    Recalculates observation and policy probabilities.
+    Does NOT advance the simulation step.
+    """
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
+
+    pid = req.player_id
+    new_pos = (req.q, req.r)
+
+    # 1. Validate Player ID
+    if pid < 0 or pid >= game_state.env.n_players:
+        raise HTTPException(status_code=400, detail=f"Invalid player ID: {pid}")
+
+    # 2. Validate Board Bounds
+    if not game_state.env._is_valid_position(*new_pos):
+        raise HTTPException(status_code=400, detail=f"Position {new_pos} is out of bounds.")
+
+    # 3. Validate Occupancy
+    # Check if any OTHER player is at this position
+    for i, pos in enumerate(game_state.env.positions):
+        if i != pid and pos == new_pos:
+             raise HTTPException(status_code=400, detail=f"Position {new_pos} is occupied by Player {i}.")
+
+    # 4. Update Position
+    # Update the list in place
+    game_state.env.positions[pid] = new_pos
+
+    # 5. Refresh Observation
+    # We must regenerate the observation since positions changed
+    # We need to call reset() style logic but without resetting everything?
+    # Actually env._get_obs() is what generates the observation dict from current state.
+    # BasketWorldEnv usually returns (obs, info) from step/reset.
+    # We can just call _get_obs() manually if we access the private method, 
+    # or better, ensure we have a way to refresh `game_state.obs`.
+    
+    try:
+        # Re-generate observation based on new positions
+        # Manually construct the observation dictionary since _get_obs() doesn't exist
+        # (BasketWorldEnv constructs it manually in step/reset)
+        obs_vec = game_state.env._get_observation()
+        action_mask = game_state.env._get_action_masks()
+        
+        # Construct the full dict as expected by the agent/frontend
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if game_state.env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": game_state.env._get_offense_skills_array(),
+        }
+        
+        # Update the game state's observation
+        game_state.obs = new_obs_dict
+        
+        # Clear cached previous observation to avoid staleness in state value calculations
+        game_state.prev_obs = None
+        
+        # 6. Return updated state (including recomputed policy probs)
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except Exception as e:
+        print(f"[update_player_position] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to update position: {e}")
+
+
+@app.post("/api/set_shot_clock")
+def set_shot_clock(req: UpdateShotClockRequest):
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot adjust shot clock after episode has ended.")
+
+    min_clock = 0
+    max_candidate = getattr(game_state.env, "shot_clock_steps", None)
+    raw_value = getattr(game_state.env, "shot_clock", 0)
+    # Allow adjustments up to whichever is larger: configured max, current clock, or turn-start clock
+    candidate_values = [
+        max_candidate,
+        raw_value,
+        getattr(game_state, "turn_start_shot_clock", None),
+    ]
+    max_clock = max(
+        (int(val) for val in candidate_values if val is not None),
+        default=24,
+    )
+    proposed = raw_value + int(req.delta)
+    new_value = max(min_clock, min(max_clock, proposed))
+
+    try:
+        game_state.env.shot_clock = new_value
+
+        obs_vec = game_state.env._get_observation()
+        action_mask = game_state.env._get_action_masks()
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if game_state.env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": game_state.env._get_offense_skills_array(),
+        }
+        game_state.obs = new_obs_dict
+        game_state.prev_obs = None
+
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except Exception as e:
+        print(f"[set_shot_clock] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to set shot clock: {e}")
+
+
+@app.post("/api/reset_turn_state")
+def reset_turn_state():
+    """Restore positions/ball holder/shot clock to the start-of-turn snapshot."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if not game_state.turn_start_positions:
+        raise HTTPException(status_code=400, detail="No turn snapshot available.")
+
+    env = game_state.env
+    try:
+        for idx, pos in enumerate(game_state.turn_start_positions):
+            if idx < len(env.positions):
+                env.positions[idx] = (int(pos[0]), int(pos[1]))
+        env.ball_holder = (
+            int(game_state.turn_start_ball_holder)
+            if game_state.turn_start_ball_holder is not None
+            else None
+        )
+        if game_state.turn_start_shot_clock is not None:
+            env.shot_clock = int(game_state.turn_start_shot_clock)
+
+        obs_vec = env._get_observation()
+        action_mask = env._get_action_masks()
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": env._get_offense_skills_array(),
+        }
+        game_state.obs = new_obs_dict
+        game_state.prev_obs = None
+
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except Exception as e:
+        print(f"[reset_turn_state] Error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to reset turn: {e}")
+
+
+def get_full_game_state(
+    include_policy_probs: bool = False,
+    include_action_values: bool = False,
+    include_state_values: bool = False,
+):
     """Helper function to construct the full game state dictionary."""
     if not game_state.env:
         return {}
@@ -2316,6 +2754,9 @@ def get_full_game_state(include_policy_probs=False):
         "ball_handler_shot_probability": ball_handler_shot_prob,
         "shot_clock": int(game_state.env.shot_clock),
         "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
+        "shot_clock_steps": int(
+            getattr(game_state.env, "shot_clock_steps", getattr(game_state.env, "shot_clock", 24))
+        ),
         "user_team_name": game_state.user_team.name,
         "done": game_state.env.episode_ended,
         "training_team": (
@@ -2394,6 +2835,10 @@ def get_full_game_state(include_policy_probs=False):
         "offensive_three_seconds_enabled": bool(
             getattr(game_state.env, "offensive_three_seconds_enabled", False)
         ),
+        # Observation space configuration
+        "include_hoop_vector": bool(
+            getattr(game_state.env, "include_hoop_vector", False)
+        ),
         # Lane hexes for visualization (convert set to list of tuples)
         "offensive_lane_hexes": [
             (int(q), int(r))
@@ -2462,5 +2907,19 @@ def get_full_game_state(include_policy_probs=False):
         policy_probs = compute_policy_probabilities()
         if policy_probs is not None:
             state["policy_probabilities"] = policy_probs
+
+    if include_action_values:
+        try:
+            action_values_by_player = {}
+            for pid in range(game_state.env.n_players):
+                action_values_by_player[str(pid)] = _compute_q_values_for_player(pid, game_state)
+            state["action_values"] = action_values_by_player
+        except Exception as e:
+            print(f"[get_full_game_state] Failed to compute action values: {e}")
+
+    if include_state_values:
+        state_values = _compute_state_values_from_obs(game_state.obs)
+        if state_values:
+            state["state_values"] = state_values
 
     return state

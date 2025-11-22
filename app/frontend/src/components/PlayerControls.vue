@@ -35,6 +35,10 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  opponentDeterministic: {
+    type: Boolean,
+    default: true,
+  },
   moveHistory: {
     type: Array,
     default: () => [],
@@ -68,6 +72,39 @@ watch(selectedActions, (newActions, oldActions) => {
 
 const actionValues = ref(null);
 const valueRange = ref({ min: 0, max: 0 });
+
+function applyStoredActionValues(storedValues) {
+  if (!storedValues) {
+    actionValues.value = null;
+    valueRange.value = { min: 0, max: 0 };
+    return;
+  }
+
+  const converted = {};
+  const numericValues = [];
+
+  Object.entries(storedValues).forEach(([playerId, actionDict]) => {
+    const playerValues = {};
+    Object.entries(actionDict || {}).forEach(([actionName, value]) => {
+      const numeric = Number(value);
+      if (!Number.isNaN(numeric)) {
+        playerValues[actionName] = numeric;
+        numericValues.push(numeric);
+      }
+    });
+    converted[playerId] = playerValues;
+  });
+
+  actionValues.value = converted;
+  if (numericValues.length > 0) {
+    valueRange.value = {
+      min: Math.min(...numericValues),
+      max: Math.max(...numericValues),
+    };
+  } else {
+    valueRange.value = { min: 0, max: 0 };
+  }
+}
 // shot probability is displayed on the board, not in controls
 const policyProbabilities = ref(null);
 
@@ -281,7 +318,7 @@ const allPlayerIds = computed(() => {
 
 // Fetch policy probabilities for probabilistic action sampling
 async function fetchPolicyProbabilities() {
-  if (!props.gameState || props.gameState.done) {
+  if (!props.gameState || (props.gameState.done && !props.isManualStepping)) {
     console.log('[PlayerControls] Skipping fetchPolicyProbabilities - no game state or game done');
     return;
   }
@@ -327,27 +364,25 @@ function sampleFromProbabilities(probabilities) {
   return 0; // Fallback to NOOP
 }
 
-// Fetch action values for all user-controlled players (needed for AI mode)
+// Fetch action values for all players (needed for AI mode and display)
 async function fetchAllActionValues() {
-  if (!props.gameState || props.gameState.done) {
+  if (!props.gameState || (props.gameState.done && !props.isManualStepping)) {
     console.log('[PlayerControls] Skipping fetchAllActionValues - no game state or game done');
     return;
   }
   
   const allValues = {};
-  const controlledIds = userControlledPlayerIds.value;
+  const allIds = allPlayerIds.value;
   
-  console.log('[PlayerControls] Fetching action values for all players:', controlledIds);
+  console.log('[PlayerControls] Fetching action values for all players:', allIds);
   
   // Also calculate min/max for color scaling
   let allNumericValues = [];
   
-  for (const playerId of controlledIds) {
+  for (const playerId of allIds) {
     try {
       const values = await getActionValues(playerId);
       allValues[playerId] = values;
-      console.log(`[PlayerControls] Fetched action values for player ${playerId}:`, values);
-      
       // Collect numeric values for scaling
       const numericValues = Object.values(values).filter(v => typeof v === 'number');
       allNumericValues.push(...numericValues);
@@ -374,7 +409,17 @@ async function fetchAllActionValues() {
 watch(() => props.gameState, async (newGameState) => {
   console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping);
   
-  if (newGameState && !newGameState.done) {
+  let consumedStoredValues = false;
+  if (newGameState && newGameState.action_values) {
+    console.log('[PlayerControls] Applying stored action values from game state snapshot');
+    applyStoredActionValues(newGameState.action_values);
+    consumedStoredValues = true;
+  }
+
+  const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
+  const shouldSkipFetchBecauseStored = props.isManualStepping && consumedStoredValues;
+
+  if (shouldFetchAIData && !shouldSkipFetchBecauseStored) {
     // Fetch both action values and policy probabilities for AI mode
     try {
       console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
@@ -391,14 +436,15 @@ watch(() => props.gameState, async (newGameState) => {
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
     }
-  } else {
-    console.log('[PlayerControls] Clearing AI data - no game state or game done');
+  } else if (!newGameState) {
+    console.log('[PlayerControls] Clearing AI data - no game state');
     actionValues.value = null;
-    // Don't clear policyProbabilities if in manual stepping mode (we're using stored ones)
     if (!props.isManualStepping) {
       policyProbabilities.value = null;
     }
     valueRange.value = { min: 0, max: 0 };
+  } else if (!consumedStoredValues) {
+    console.log('[PlayerControls] Game ended - retaining last action values and policy probabilities');
   }
 }, { immediate: true });
 
@@ -413,9 +459,11 @@ watch(() => props.storedPolicyProbs, (newStoredProbs) => {
 
 // Watch for the list of players to be populated, then set the first one as active.
 // The `immediate` flag ensures this runs on component creation.
-watch(userControlledPlayerIds, (newPlayerIds) => {
+watch(allPlayerIds, (newPlayerIds) => {
     if (newPlayerIds && newPlayerIds.length > 0 && props.activePlayerId === null) {
-        emit('update:activePlayerId', newPlayerIds[0]);
+        // Prefer first user-controlled player, otherwise just the first player
+        const firstUser = userControlledPlayerIds.value.length > 0 ? userControlledPlayerIds.value[0] : newPlayerIds[0];
+        emit('update:activePlayerId', firstUser);
     }
 }, { immediate: true });
 
@@ -497,20 +545,21 @@ function handleActionSelected(action) {
 function submitActions() {
   let actionsToSubmit = {};
   
-  if (props.aiMode) {
-    // Use AI actions for user-controlled players (selected actions should already be set)
-    for (const playerId of userControlledPlayerIds.value) {
-      const actionName = selectedActions.value[playerId] || 'NOOP';
-      const actionIndex = actionNames.indexOf(actionName);
-      actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
-    }
-  } else {
-    // Use manually selected actions (only for user-controlled players)
-    for (const playerId of userControlledPlayerIds.value) {
-      const actionName = selectedActions.value[playerId] || 'NOOP';
-      const actionIndex = actionNames.indexOf(actionName);
-      actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
-    }
+  // When manually stepping, we want to collect actions for ALL players (user and opponent)
+  // that have been selected manually.
+  
+  // Determine which players to iterate over. 
+  // If manual mode (AI Mode off), we allow controlling everyone.
+  // If AI mode on, we also want to send everyone (including AI pre-selections).
+  const playersToSubmit = allPlayerIds.value; 
+
+  for (const playerId of playersToSubmit) {
+    // If a selection exists, use it. Otherwise send 0 (NOOP).
+    // Note: In AI mode, selections are pre-filled. In Manual mode, they are filled by click.
+    // If unselected in manual mode, it defaults to NOOP (0), which allows manual override of opponents.
+    const actionName = selectedActions.value[playerId] || 'NOOP';
+    const actionIndex = actionNames.indexOf(actionName);
+    actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
   }
   
   console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
@@ -519,7 +568,7 @@ function submitActions() {
   const currentTurn = props.moveHistory.length + 1;
   const teamMoves = {};
   
-  for (const playerId of userControlledPlayerIds.value) {
+  for (const playerId of playersToSubmit) {
     const actionName = selectedActions.value[playerId] || 'NOOP';
     teamMoves[`Player ${playerId}`] = actionName;
   }
@@ -534,8 +583,11 @@ function submitActions() {
   if (!props.aiMode) {
     // Only clear selections in manual mode
     selectedActions.value = {};
+    // Reset to first available player (prefer user team)
     if (userControlledPlayerIds.value.length > 0) {
       emit('update:activePlayerId', userControlledPlayerIds.value[0]);
+    } else if (allPlayerIds.value.length > 0) {
+      emit('update:activePlayerId', allPlayerIds.value[0]);
     }
   }
 }
@@ -546,91 +598,67 @@ function getSelectedActions() {
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
-watch([() => props.aiMode, () => props.deterministic], ([newAiMode, newDeterministic]) => {
+watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterministic], ([newAiMode, newDeterministic, newOpponentDeterministic]) => {
   // If parent is driving selections (self-play), don't override
   if (props.externalSelections) return;
-  console.log('[PlayerControls] 🔄 AI mode watch triggered - AI:', newAiMode, 'Deterministic:', newDeterministic, 'Ball holder:', props.gameState?.ball_holder);
-  console.log('[PlayerControls] actionValues.value:', actionValues.value);
-  console.log('[PlayerControls] policyProbabilities.value:', policyProbabilities.value);
-  console.log('[PlayerControls] userControlledPlayerIds.value:', userControlledPlayerIds.value);
   
   try {
     if (newAiMode) {
-      // Pre-select AI actions for USER-CONTROLLED players only when AI mode is enabled
+      // Pre-select AI actions for ALL players when AI mode is enabled
       const newSelections = {};
-      const controlledIds = userControlledPlayerIds.value;
+      const allIds = allPlayerIds.value;
       
-      for (const playerId of controlledIds) {
+      for (const playerId of allIds) {
         const legalActions = getLegalActions(playerId);
-        
-        // Debug logging for action masking issues
-        console.log(`[PlayerControls] Player ${playerId} - Ball holder: ${props.gameState?.ball_holder}, Legal actions:`, legalActions);
-        if (legalActions.includes('SHOOT') && playerId !== props.gameState?.ball_holder) {
-          console.log(`[PlayerControls] 🚨 BUG: Player ${playerId} can SHOOT but is NOT ball holder (${props.gameState?.ball_holder})`);
-        }
-        if (legalActions.some(action => action.startsWith('PASS_')) && playerId !== props.gameState?.ball_holder) {
-          console.log(`[PlayerControls] 🚨 BUG: Player ${playerId} can PASS but is NOT ball holder (${props.gameState?.ball_holder})`);
-        }
         
         if (legalActions.length > 0) {
           let selectedAction = null;
           
-          if (newDeterministic && policyProbabilities.value && policyProbabilities.value[playerId]) {
-            // Deterministic: mimic policy.predict(..., deterministic=True) → argmax of policy distribution
+          // Determine if this is a user or opponent player to apply correct deterministic setting
+          const isUserPlayer = userControlledPlayerIds.value.includes(playerId);
+          const useDeterministic = isUserPlayer ? newDeterministic : newOpponentDeterministic;
+          
+          if (policyProbabilities.value && policyProbabilities.value[playerId]) {
             const probs = policyProbabilities.value[playerId];
-            let bestIdx = -1;
-            let bestProb = -1;
-            for (let i = 0; i < probs.length && i < actionNames.length; i++) {
-              const name = actionNames[i];
-              if (!legalActions.includes(name)) continue;
-              if (probs[i] > bestProb) {
-                bestProb = probs[i];
-                bestIdx = i;
+            
+            if (useDeterministic) {
+              // Deterministic: mimic policy.predict(..., deterministic=True) → argmax of policy distribution
+              let bestIdx = -1;
+              let bestProb = -1;
+              for (let i = 0; i < probs.length && i < actionNames.length; i++) {
+                const name = actionNames[i];
+                if (!legalActions.includes(name)) continue;
+                if (probs[i] > bestProb) {
+                  bestProb = probs[i];
+                  bestIdx = i;
+                }
               }
-            }
-            if (bestIdx >= 0) {
-              selectedAction = actionNames[bestIdx];
-            }
-          } else if (!newDeterministic && policyProbabilities.value && policyProbabilities.value[playerId]) {
-            // Probabilistic: Sample from policy probabilities
-            const playerProbs = policyProbabilities.value[playerId];
-            console.log(`[PlayerControls] Attempting probabilistic sampling for player ${playerId}`);
-            console.log(`[PlayerControls] Player probs:`, playerProbs);
-            console.log(`[PlayerControls] Legal actions:`, legalActions);
-            
-            // Filter probabilities to only include legal actions
-            const legalActionIndices = [];
-            const legalProbs = [];
-            
-            for (let i = 0; i < playerProbs.length && i < actionNames.length; i++) {
-              if (legalActions.includes(actionNames[i])) {
-                legalActionIndices.push(i);
-                legalProbs.push(playerProbs[i]);
+              if (bestIdx >= 0) {
+                selectedAction = actionNames[bestIdx];
               }
-            }
-            
-            if (legalProbs.length > 0) {
-              const sampledIndex = sampleFromProbabilities(legalProbs);
-              const actionIndex = legalActionIndices[sampledIndex];
-              selectedAction = actionNames[actionIndex];
-              console.log(`[PlayerControls] Selected PROBABILISTIC action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
             } else {
-              console.log(`[PlayerControls] No legal actions with probabilities for player ${playerId}`);
+              // Probabilistic: Sample from policy probabilities
+              const legalActionIndices = [];
+              const legalProbs = [];
+              
+              for (let i = 0; i < probs.length && i < actionNames.length; i++) {
+                if (legalActions.includes(actionNames[i])) {
+                  legalActionIndices.push(i);
+                  legalProbs.push(probs[i]);
+                }
+              }
+              
+              if (legalProbs.length > 0) {
+                const sampledIndex = sampleFromProbabilities(legalProbs);
+                const actionIndex = legalActionIndices[sampledIndex];
+                selectedAction = actionNames[actionIndex];
+              }
             }
-          } else {
-            console.log(`[PlayerControls] Cannot do probabilistic sampling for player ${playerId}:`);
-            console.log(`  - newDeterministic: ${newDeterministic}`);
-            console.log(`  - policyProbabilities.value: ${!!policyProbabilities.value}`);
-            console.log(`  - policyProbabilities.value[${playerId}]: ${!!policyProbabilities.value?.[playerId]}`);
           }
           
           if (selectedAction) {
             newSelections[playerId] = selectedAction;
-          } else {
-            console.log(`[PlayerControls] No valid action selected for player ${playerId}`);
           }
-        } else {
-          console.log(`[PlayerControls] No legal actions for player ${playerId}`);
         }
       }
       
@@ -655,9 +683,9 @@ watch(() => policyProbabilities.value, () => {
     }
 
     const newSelections = {};
-    const controlledIds = userControlledPlayerIds.value;
+    const allIds = allPlayerIds.value;
 
-    for (const playerId of controlledIds) {
+    for (const playerId of allIds) {
       const legalActions = getLegalActions(playerId);
       const playerProbs = policyProbabilities.value?.[playerId];
       if (!playerProbs || legalActions.length === 0) continue;
@@ -674,7 +702,11 @@ watch(() => policyProbabilities.value, () => {
 
       if (legalProbs.length === 0) continue;
 
-      if (props.deterministic) {
+      // Determine if this is a user or opponent player to apply correct deterministic setting
+      const isUserPlayer = userControlledPlayerIds.value.includes(playerId);
+      const useDeterministic = isUserPlayer ? props.deterministic : props.opponentDeterministic;
+
+      if (useDeterministic) {
         // Deterministic: argmax among legal
         let bestIdxLocal = 0;
         let bestProb = -1;
@@ -687,14 +719,12 @@ watch(() => policyProbabilities.value, () => {
         const actionIndex = legalActionIndices[bestIdxLocal];
         const selectedAction = actionNames[actionIndex];
         newSelections[playerId] = selectedAction;
-        console.log(`[PlayerControls] Deterministic argmax action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
       } else {
         // Probabilistic: sample among legal
         const sampledIndex = sampleFromProbabilities(legalProbs);
         const actionIndex = legalActionIndices[sampledIndex];
         const selectedAction = actionNames[actionIndex];
         newSelections[playerId] = selectedAction;
-        console.log(`[PlayerControls] Re-sampled PROB action for player ${playerId}: ${selectedAction} (prob: ${(playerProbs[actionIndex] * 100).toFixed(1)}%)`);
       }
     }
 
@@ -846,73 +876,158 @@ const ballHandlerPositionRows = computed(() => {
 });
 
 const hoopVectorRows = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2;
-  return obs.slice(idx, idx + 2);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.hoopLen === 0) return [];
+  return obs.slice(meta.hoopStart, meta.hoopStart + meta.hoopLen);
+});
+
+const obsMeta = computed(() => {
+  const gs = props.gameState;
+  if (!gs || !gs.obs) return null;
+  const nOffense = gs.offense_ids?.length || 0;
+  const nDefense = gs.defense_ids?.length || 0;
+  const nPlayers = nOffense + nDefense;
+  const allPairsSize = nOffense * nDefense;
+  const teammatePerTeam = Math.max(0, nOffense - 1);
+  const teammateDistanceSize = 2 * teammatePerTeam;
+  let offset = 0;
+  offset += nPlayers * 2; // player positions
+  offset += nPlayers; // ball holder one-hot
+  const shotClockIdx = offset;
+  offset += 1;
+  const teamEncodingStart = offset;
+  offset += nPlayers;
+  const ballHandlerStart = offset;
+  offset += 2;
+  const hoopLen = gs.include_hoop_vector ? 2 : 0;
+  const hoopStart = offset;
+  offset += hoopLen;
+  const allPairsDistancesStart = offset;
+  offset += allPairsSize;
+  const allPairsAnglesStart = offset;
+  offset += allPairsSize;
+  const teammateDistanceStart = offset;
+  offset += teammateDistanceSize;
+  const teammateAngleStart = offset;
+  offset += teammateDistanceSize;
+  const laneStepsStart = offset;
+  const laneStepsLen = nPlayers;
+  offset += laneStepsLen;
+  const expectedPointsStart = offset;
+  const expectedPointsLen = nOffense;
+  offset += expectedPointsLen;
+  const turnoverStart = offset;
+  offset += nOffense;
+  const stealStart = offset;
+  return {
+    shotClockIdx,
+    teamEncodingStart,
+    ballHandlerStart,
+    hoopStart,
+    hoopLen,
+    allPairsDistancesStart,
+    allPairsAnglesStart,
+    allPairsSize,
+    teammateDistanceStart,
+    teammateAngleStart,
+    teammateDistanceSize,
+    laneStepsStart,
+    laneStepsLen,
+    expectedPointsStart,
+    expectedPointsLen,
+    turnoverStart,
+    stealStart,
+    nOffense,
+    perTeamTeammate: teammatePerTeam,
+  };
 });
 
 const allPairsDistances = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2;
-  const size = nOffense * nDefense;
-  return obs.slice(idx, idx + size);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(meta.allPairsDistancesStart, meta.allPairsDistancesStart + meta.allPairsSize);
 });
 
 const allPairsAngles = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense);
-  const size = nOffense * nDefense;
-  return obs.slice(idx, idx + size);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(meta.allPairsAnglesStart, meta.allPairsAnglesStart + meta.allPairsSize);
+});
+
+const teammateDistances = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.teammateDistanceSize === 0) return [];
+  return obs.slice(
+    meta.teammateDistanceStart,
+    meta.teammateDistanceStart + meta.teammateDistanceSize,
+  );
+});
+
+const teammateAngles = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.teammateDistanceSize === 0) return [];
+  return obs.slice(
+    meta.teammateAngleStart,
+    meta.teammateAngleStart + meta.teammateDistanceSize,
+  );
+});
+
+const teammateLabels = computed(() => {
+  const meta = obsMeta.value;
+  if (!meta || meta.perTeamTeammate === 0) return [];
+  const labels = [];
+  const appendTeam = (teamIds, label) => {
+    if (!teamIds || teamIds.length <= 1) return;
+    const baseId = teamIds[0];
+    for (let i = 1; i < teamIds.length; i += 1) {
+      labels.push(`${label} base P${baseId} → P${teamIds[i]}`);
+    }
+  };
+  appendTeam(props.gameState.offense_ids, 'Offense');
+  appendTeam(props.gameState.defense_ids, 'Defense');
+  return labels;
 });
 
 const laneSteps = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense);
-  return obs.slice(idx, idx + nPlayers);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(meta.laneStepsStart, meta.laneStepsStart + meta.laneStepsLen);
 });
 
 const expectedPoints = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers;
-  return obs.slice(idx, idx + nOffense);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(
+    meta.expectedPointsStart,
+    meta.expectedPointsStart + meta.expectedPointsLen,
+  );
 });
 
 const turnoverProbs = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers + nOffense;
-  return obs.slice(idx, idx + nOffense);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(
+    meta.turnoverStart,
+    meta.turnoverStart + meta.nOffense,
+  );
 });
 
 const stealRisks = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const nOffense = props.gameState.offense_ids?.length || 0;
-  const nDefense = props.gameState.defense_ids?.length || 0;
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers + 2 + 2 + (nOffense * nDefense) + (nOffense * nDefense) + nPlayers + nOffense + nOffense;
-  return obs.slice(idx, idx + nOffense);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(
+    meta.stealStart,
+    meta.stealStart + meta.nOffense,
+  );
 });
 </script>
 
@@ -970,7 +1085,7 @@ const stealRisks = computed(() => {
     <div v-if="activeTab === 'controls'" class="tab-content">
       <div class="player-tabs">
           <button 
-              v-for="playerId in userControlledPlayerIds" 
+              v-for="playerId in allPlayerIds" 
               :key="playerId"
               :class="{ active: activePlayerId === playerId }"
               @click="$emit('update:activePlayerId', playerId)"
@@ -1142,7 +1257,7 @@ const stealRisks = computed(() => {
             <tr>
               <th>Turn</th>
               <th>Shot Clock</th>
-              <th v-for="playerId in userControlledPlayerIds" :key="playerId">
+              <th v-for="playerId in allPlayerIds" :key="playerId">
                 Player {{ playerId }}
               </th>
               <th>Off Value</th>
@@ -1153,7 +1268,7 @@ const stealRisks = computed(() => {
             <tr v-for="move in props.moveHistory" :key="move.turn" :class="{ 'current-shot-clock-row': move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done) }">
               <td>{{ move.turn }}</td>
               <td class="shot-clock-cell">{{ move.shotClock !== undefined ? move.shotClock : '-' }}</td>
-              <td v-for="playerId in userControlledPlayerIds" :key="playerId" class="move-cell">
+              <td v-for="playerId in allPlayerIds" :key="playerId" class="move-cell">
                 <div class="move-action">
                   <span v-if="move.ballHolder === playerId" class="ball-holder-icon">🏀 </span>{{ move.moves[`Player ${playerId}`] || 'NOOP' }}
                 </div>
@@ -1484,6 +1599,42 @@ const stealRisks = computed(() => {
               <tr v-for="(angle, idx) in allPairsAngles" :key="`angle-${idx}`" class="group-angles">
                 <td v-if="idx === 0" :rowspan="allPairsAngles.length" class="group-label">All-Pairs Angles (cos)</td>
                 <td>O{{ Math.floor(idx / numDefenders) }} → D{{ idx % numDefenders }}</td>
+                <td class="value-mono">{{ angle.toFixed(4) }}</td>
+                <td class="notes">{{ getAngleDescription(angle) }}</td>
+              </tr>
+
+              <!-- Teammate Distances -->
+              <tr
+                v-for="(dist, idx) in teammateDistances"
+                :key="`team-dist-${idx}`"
+                class="group-teammate-distances"
+              >
+                <td
+                  v-if="idx === 0"
+                  :rowspan="teammateDistances.length"
+                  class="group-label"
+                >
+                  Teammate Distances
+                </td>
+                <td>{{ teammateLabels[idx] || 'Teammate spacing' }}</td>
+                <td class="value-mono">{{ dist.toFixed(4) }}</td>
+                <td class="notes">Team spacing</td>
+              </tr>
+
+              <!-- Teammate Angles -->
+              <tr
+                v-for="(angle, idx) in teammateAngles"
+                :key="`team-angle-${idx}`"
+                class="group-teammate-angles"
+              >
+                <td
+                  v-if="idx === 0"
+                  :rowspan="teammateAngles.length"
+                  class="group-label"
+                >
+                  Teammate Angles (cos)
+                </td>
+                <td>{{ teammateLabels[idx] || 'Teammate direction' }}</td>
                 <td class="value-mono">{{ angle.toFixed(4) }}</td>
                 <td class="notes">{{ getAngleDescription(angle) }}</td>
               </tr>

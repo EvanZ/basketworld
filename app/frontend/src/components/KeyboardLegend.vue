@@ -60,9 +60,10 @@ const shortcuts = [
   list-style: none;
   margin: 0;
   padding: 0;
-  display: grid;
-  grid-template-columns: repeat(2, auto);
-  gap: 6px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: center;
 }
 .kb-item { display: flex; align-items: center; gap: 6px; }
 .kb-label { white-space: nowrap; }

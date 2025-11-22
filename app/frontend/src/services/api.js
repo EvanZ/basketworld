@@ -212,3 +212,54 @@ export async function runEvaluation(numEpisodes = 100, playerDeterministic = fal
   }
   return response.json();
 }
+
+export async function updatePlayerPosition(playerId, q, r) {
+  const response = await fetch(`${API_BASE_URL}/api/update_player_position`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ player_id: playerId, q, r }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update player position');
+  }
+  return response.json();
+}
+
+export async function batchUpdatePlayerPositions(updates) {
+  const response = await fetch(`${API_BASE_URL}/api/batch_update_player_positions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ updates }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to batch update player positions');
+  }
+  return response.json();
+}
+
+export async function setShotClock(delta) {
+  const response = await fetch(`${API_BASE_URL}/api/set_shot_clock`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ delta }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set shot clock');
+  }
+  return response.json();
+}
+
+export async function resetTurnState() {
+  const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to reset turn state');
+  }
+  return response.json();
+}

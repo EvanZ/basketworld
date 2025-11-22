@@ -90,6 +90,7 @@ from basketworld.utils.wrappers import (
     RewardAggregationWrapper,
     EpisodeStatsWrapper,
     BetaSetterWrapper,
+    EnvIndexWrapper,
 )
 import csv
 
@@ -335,8 +336,14 @@ def get_max_alternation_index(client, run_id: str) -> int:
     return max(idxs) if idxs else 0
 
 
-def setup_environment(args, training_team):
-    """Create, configure, and wrap the environment for training."""
+def setup_environment(args, training_team, env_idx=None):
+    """Create, configure, and wrap the environment for training.
+    
+    Args:
+        args: Configuration arguments
+        training_team: Team.OFFENSE or Team.DEFENSE
+        env_idx: Optional environment index for mixed training (used by EnvIndexWrapper)
+    """
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
         players=args.players,
@@ -366,6 +373,7 @@ def setup_environment(args, training_team):
         spawn_distance=getattr(args, "spawn_distance", 3),
         max_spawn_distance=getattr(args, "max_spawn_distance", None),
         defender_spawn_distance=getattr(args, "defender_spawn_distance", 0),
+        defender_guard_distance=getattr(args, "defender_guard_distance", 1),
         # Reward shaping
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
@@ -407,9 +415,10 @@ def setup_environment(args, training_team):
     env = RewardAggregationWrapper(env)
     # Put BetaSetterWrapper at the top so env_method('set_phi_beta', ...) hits it directly
     env = BetaSetterWrapper(env)
-    return Monitor(
+    monitored_env = Monitor(
         env,
         info_keywords=(
+            "training_team",  # Added for mixed training filtering
             "shot_dunk",
             "shot_2pt",
             "shot_3pt",
@@ -423,11 +432,14 @@ def setup_environment(args, training_team):
             "turnover_pressure",
             "turnover_offensive_lane",
             "defensive_lane_violation",
+            "move_rejected_occupied",
             # Keys required for PPP calculation
             "made_dunk",
             "made_2pt",
             "made_3pt",
             "attempts",
+        "legal_actions_offense",
+        "legal_actions_defense",
             # Potential-based shaping diagnostics
             "phi_beta",
             "phi_prev",
@@ -444,6 +456,12 @@ def setup_environment(args, training_team):
             "basket_r",
         ),
     )
+    
+    # Add environment index if specified (for mixed training metrics filtering)
+    if env_idx is not None:
+        monitored_env = EnvIndexWrapper(monitored_env, env_idx)
+    
+    return monitored_env
 
 
 # ----------------------------------------------------------
@@ -479,8 +497,8 @@ def make_vector_env(
                 return SelfPlayEnvWrapper(
                     base_env,
                     opponent_policy=opp_policy_path,
-                    training_strategy=IllegalActionStrategy.NOOP,
-                    opponent_strategy=IllegalActionStrategy.NOOP,
+                    training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
                     deterministic_opponent=deterministic_opponent,
                 )
             return _thunk
@@ -500,8 +518,8 @@ def make_vector_env(
                 return SelfPlayEnvWrapper(
                     base_env,
                     opponent_policy=opponent_policy,
-                    training_strategy=IllegalActionStrategy.NOOP,
-                    opponent_strategy=IllegalActionStrategy.NOOP,
+                    training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
                     deterministic_opponent=deterministic_opponent,
                 )
             return _thunk
@@ -509,6 +527,83 @@ def make_vector_env(
         # Use subprocesses for parallelism.
         env_fns = [_make_env() for _ in range(num_envs)]
         return SubprocVecEnv(env_fns, start_method="spawn")
+
+
+def make_mixed_vector_env(
+    args,
+    opponent_policy,
+    num_envs: int,
+    deterministic_opponent: bool,
+) -> SubprocVecEnv:
+    """Create a vectorized environment with mixed offense and defense training.
+    
+    Returns a SubprocVecEnv where:
+    - First num_envs//2 environments train OFFENSE (with role_flag=+1.0)
+    - Last num_envs - num_envs//2 environments train DEFENSE (with role_flag=-1.0)
+    - All environments share the same opponent checkpoint(s)
+    - PPO updates mix data from both roles in a single learn() call
+    
+    Args:
+        opponent_policy: Can be:
+            - Single policy path/object: all envs use same opponent
+            - List of policy paths: each env gets different opponent (cycled if needed)
+    """
+    num_offense = num_envs // 2
+    num_defense = num_envs - num_offense  # Handles odd num_envs
+    
+    # Create environment factory functions
+    if isinstance(opponent_policy, list):
+        def _make_env_with_opponent(env_idx: int, training_team: Team, opp_policy_path) -> Callable[[], gym.Env]:
+            """Create environment factory with specific opponent."""
+            def _thunk():
+                base_env = setup_environment(args, training_team, env_idx=env_idx)
+                return SelfPlayEnvWrapper(
+                    base_env,
+                    opponent_policy=opp_policy_path,
+                    training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    deterministic_opponent=deterministic_opponent,
+                )
+            return _thunk
+        
+        # Create offense environments (first half)
+        env_fns = [
+            _make_env_with_opponent(i, Team.OFFENSE, opponent_policy[i % len(opponent_policy)])
+            for i in range(num_offense)
+        ]
+        
+        # Create defense environments (second half)
+        env_fns.extend([
+            _make_env_with_opponent(num_offense + i, Team.DEFENSE, opponent_policy[(num_offense + i) % len(opponent_policy)])
+            for i in range(num_defense)
+        ])
+    else:
+        def _make_env_with_team(env_idx: int, training_team: Team) -> Callable[[], gym.Env]:
+            """Create environment factory for a specific team."""
+            def _thunk():
+                base_env = setup_environment(args, training_team, env_idx=env_idx)
+                return SelfPlayEnvWrapper(
+                    base_env,
+                    opponent_policy=opponent_policy,
+                    training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    deterministic_opponent=deterministic_opponent,
+                )
+            return _thunk
+        
+        # Create offense environments (first half)
+        env_fns = [
+            _make_env_with_team(i, Team.OFFENSE)
+            for i in range(num_offense)
+        ]
+        
+        # Create defense environments (second half)
+        env_fns.extend([
+            _make_env_with_team(num_offense + i, Team.DEFENSE)
+            for i in range(num_defense)
+        ])
+    
+    return SubprocVecEnv(env_fns, start_method="spawn")
 
 
 def main(args):
@@ -627,12 +722,17 @@ def main(args):
         # --- Initialize Base Environment (just for policy creation) ---
         # The model must be created with the same number of parallel envs that will be
         # used later (SB3 stores this value internally).
-        temp_env = DummyVecEnv(
-            [
-                (lambda: setup_environment(args, Team.OFFENSE))
-                for _ in range(args.num_envs)
-            ]
-        )
+        def _make_temp_env():
+            base_env = setup_environment(args, Team.OFFENSE)
+            return SelfPlayEnvWrapper(
+                base_env,
+                opponent_policy=None,
+                training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                deterministic_opponent=False,
+            )
+
+        temp_env = DummyVecEnv([_make_temp_env for _ in range(args.num_envs)])
 
         # --- Initialize Timing Callbacks ---
         offense_timing_callback = RolloutUpdateTimingCallback()
@@ -1304,28 +1404,29 @@ def main(args):
             except Exception:
                 pass
 
-            # --- 1. Train Offense against frozen Defense ---
-            print(f"\nTraining Offense...")
-            offense_env = make_vector_env(
+            # --- Simultaneous Mixed Training (Offense + Defense Together) ---
+            print(f"\nTraining Mixed (Offense + Defense simultaneously)...")
+            
+            # Create mixed environment pool (first half offense, second half defense)
+            mixed_env = make_mixed_vector_env(
                 args,
-                training_team=Team.OFFENSE,
                 opponent_policy=opponent_for_offense,
                 num_envs=args.num_envs,
                 deterministic_opponent=bool(args.deterministic_opponent),
             )
-            unified_policy.set_env(offense_env)
+            unified_policy.set_env(mixed_env)
 
-            offense_mlflow_callback = AccumulativeMetricsCallback(
-                team_name="Offense"
-            )
+            # Create single callback for metrics (auto-separates by training_team)
+            metrics_callback = AccumulativeMetricsCallback()
 
-            offense_logger = Logger(
+            # Use "Mixed" logger for training metrics (shared PPO metrics computed on all data)
+            mixed_logger = Logger(
                 folder=None,
-                output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Offense")],
+                output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Mixed")],
             )
-            unified_policy.set_logger(offense_logger)
+            unified_policy.set_logger(mixed_logger)
 
-            # Bump entropy at the start of each alternation segment if supported
+            # Bump entropy at the start of each alternation
             if entropy_callback is not None and hasattr(
                 entropy_callback, "start_new_alternation"
             ):
@@ -1334,194 +1435,57 @@ def main(args):
                 except Exception:
                     pass
 
-            offense_callbacks = [offense_mlflow_callback, offense_timing_callback]
+            # Combine callbacks for mixed training
+            mixed_callbacks = [
+                metrics_callback,
+                offense_timing_callback,
+            ]
             if entropy_callback is not None:
-                offense_callbacks.append(entropy_callback)
+                mixed_callbacks.append(entropy_callback)
             if beta_callback is not None:
-                offense_callbacks.append(beta_callback)
+                mixed_callbacks.append(beta_callback)
             if pass_bias_callback is not None:
-                offense_callbacks.append(pass_bias_callback)
+                mixed_callbacks.append(pass_bias_callback)
             if pass_curriculum_callback is not None:
-                offense_callbacks.append(pass_curriculum_callback)
+                mixed_callbacks.append(pass_curriculum_callback)
             if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
-                offense_callbacks.append(
+                # Log episodes from both offense and defense
+                mixed_callbacks.append(
                     EpisodeSampleLogger(
                         team_name="Offense",
                         alternation_id=global_alt,
                         sample_prob=args.episode_sample_prob,
                     )
                 )
-            unified_policy.learn(
-                total_timesteps=args.steps_per_alternation
-                * args.num_envs
-                * args.n_steps,
-                reset_num_timesteps=False,
-                callback=offense_callbacks,
-                progress_bar=True,
-            )
-            
-            # Collect profiling stats before closing the environment
-            if args.enable_env_profiling:
-                try:
-                    print("\nCollecting Offense environment profiling stats...")
-                    # Get profiling stats from all environments
-                    offense_profile_stats = offense_env.unwrapped.env_method("get_profile_stats")
-                    
-                    # Aggregate stats across all environments
-                    aggregated_stats = {}
-                    for env_idx, stats in enumerate(offense_profile_stats):
-                        for section_name, metrics in stats.items():
-                            if section_name not in aggregated_stats:
-                                aggregated_stats[section_name] = {
-                                    "total_ms": 0.0,
-                                    "total_calls": 0,
-                                    "avg_us_list": []
-                                }
-                            aggregated_stats[section_name]["total_ms"] += metrics["total_ms"]
-                            aggregated_stats[section_name]["total_calls"] += int(metrics["calls"])
-                            aggregated_stats[section_name]["avg_us_list"].append(metrics["avg_us"])
-                    
-                    # Log aggregated stats to MLflow
-                    for section_name, metrics in aggregated_stats.items():
-                        # Average the avg_us across environments
-                        mean_avg_us = np.mean(metrics["avg_us_list"])
-                        mlflow.log_metric(
-                            f"Offense/profile_{section_name}_avg_us",
-                            mean_avg_us,
-                            step=global_alt
-                        )
-                        mlflow.log_metric(
-                            f"Offense/profile_{section_name}_total_ms",
-                            metrics["total_ms"],
-                            step=global_alt
-                        )
-                        mlflow.log_metric(
-                            f"Offense/profile_{section_name}_total_calls",
-                            metrics["total_calls"],
-                            step=global_alt
-                        )
-                    
-                    print(f"Logged profiling stats for {len(aggregated_stats)} sections")
-                    
-                    # Reset profiling stats for next alternation
-                    offense_env.unwrapped.env_method("reset_profile_stats")
-                except Exception as e:
-                    print(f"Warning: Could not collect offense profiling stats: {e}")
-            
-            offense_env.close()
-            try:
-                del offense_env
-            except Exception:
-                pass
-            gc.collect()
-            time.sleep(0.05)
-
-            # --- Clear buffers before switching phases ---
-            # Clear accumulated episodes and metrics from offense training
-            # so defense training starts with a clean slate (avoids metric contamination)
-            try:
-                if hasattr(unified_policy, 'ep_info_buffer'):
-                    unified_policy.ep_info_buffer.clear()
-                    print(f"Cleared episode info buffer between offense and defense training")
-            except Exception:
-                pass
-            
-            # Reset offense callback's cache so defense training gets clean metrics
-            try:
-                offense_mlflow_callback.reset()
-                print(f"Reset offense metrics callback for defense phase")
-            except Exception:
-                pass
-
-            # --- Save trained policy as opponent for defense ---
-            # Save the trained unified_policy so defense can load it as opponent
-            # (avoids pickle issues with SubprocVecEnv spawn method)
-            print(f"\nSaving trained policy for Defense opponent...")
-            with tempfile.TemporaryDirectory() as tmpdir:
-                offense_checkpoint_path = os.path.join(
-                    tmpdir, f"unified_alt_{global_alt}.zip"
-                )
-                unified_policy.save(offense_checkpoint_path)
-                # Also save to opponent_cache_dir for reference
-                opponent_cache_checkpoint = os.path.join(
-                    opponent_cache_dir, f"unified_alt_{global_alt}.zip"
-                )
-                unified_policy.save(opponent_cache_checkpoint)
-            
-            # Use the saved checkpoint as opponent for defense
-            if isinstance(opponent_for_offense, list):
-                opponent_for_defense = [opponent_cache_checkpoint] * args.num_envs
-                print(f"  - Using saved policy for all {args.num_envs} parallel environments")
-            else:
-                opponent_for_defense = opponent_cache_checkpoint
-                print(f"  - Using saved policy as single opponent")
-
-            # --- 2. Train Defense against frozen Offense ---
-            print(f"\nTraining Defense...")
-            defense_env = make_vector_env(
-                args,
-                training_team=Team.DEFENSE,
-                opponent_policy=opponent_for_defense,
-                num_envs=args.num_envs,
-                deterministic_opponent=bool(args.deterministic_opponent),
-            )
-            unified_policy.set_env(defense_env)
-
-            defense_mlflow_callback = AccumulativeMetricsCallback(
-                team_name="Defense"
-            )
-
-            defense_logger = Logger(
-                folder=None,
-                output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Defense")],
-            )
-            unified_policy.set_logger(defense_logger)
-
-            # Bump entropy again at the start of the defense segment
-            if entropy_callback is not None and hasattr(
-                entropy_callback, "start_new_alternation"
-            ):
-                try:
-                    entropy_callback.start_new_alternation()
-                except Exception:
-                    pass
-
-            defense_callbacks = [defense_mlflow_callback, defense_timing_callback]
-            if entropy_callback is not None:
-                defense_callbacks.append(entropy_callback)
-            if beta_callback is not None:
-                defense_callbacks.append(beta_callback)
-            if pass_bias_callback is not None:
-                defense_callbacks.append(pass_bias_callback)
-            if pass_curriculum_callback is not None:
-                defense_callbacks.append(pass_curriculum_callback)
-            if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
-                defense_callbacks.append(
+                mixed_callbacks.append(
                     EpisodeSampleLogger(
                         team_name="Defense",
                         alternation_id=global_alt,
                         sample_prob=args.episode_sample_prob,
                     )
                 )
+            
+            # Single learn() call trains both offense and defense together
+            # PPO collects and mixes data from all environments
             unified_policy.learn(
                 total_timesteps=args.steps_per_alternation
                 * args.num_envs
                 * args.n_steps,
                 reset_num_timesteps=False,
-                callback=defense_callbacks,
+                callback=mixed_callbacks,
                 progress_bar=True,
             )
             
             # Collect profiling stats before closing the environment
             if args.enable_env_profiling:
                 try:
-                    print("\nCollecting Defense environment profiling stats...")
+                    print("\nCollecting mixed environment profiling stats...")
                     # Get profiling stats from all environments
-                    defense_profile_stats = defense_env.env_method("get_profile_stats")
+                    mixed_profile_stats = mixed_env.env_method("get_profile_stats")
                     
                     # Aggregate stats across all environments
                     aggregated_stats = {}
-                    for env_idx, stats in enumerate(defense_profile_stats):
+                    for env_idx, stats in enumerate(mixed_profile_stats):
                         for section_name, metrics in stats.items():
                             if section_name not in aggregated_stats:
                                 aggregated_stats[section_name] = {
@@ -1538,17 +1502,17 @@ def main(args):
                         # Average the avg_us across environments
                         mean_avg_us = np.mean(metrics["avg_us_list"])
                         mlflow.log_metric(
-                            f"Defense/profile_{section_name}_avg_us",
+                            f"Mixed/profile_{section_name}_avg_us",
                             mean_avg_us,
                             step=global_alt
                         )
                         mlflow.log_metric(
-                            f"Defense/profile_{section_name}_total_ms",
+                            f"Mixed/profile_{section_name}_total_ms",
                             metrics["total_ms"],
                             step=global_alt
                         )
                         mlflow.log_metric(
-                            f"Defense/profile_{section_name}_total_calls",
+                            f"Mixed/profile_{section_name}_total_calls",
                             metrics["total_calls"],
                             step=global_alt
                         )
@@ -1556,32 +1520,25 @@ def main(args):
                     print(f"Logged profiling stats for {len(aggregated_stats)} sections")
                     
                     # Reset profiling stats for next alternation
-                    defense_env.env_method("reset_profile_stats")
+                    mixed_env.env_method("reset_profile_stats")
                 except Exception as e:
-                    print(f"Warning: Could not collect defense profiling stats: {e}")
+                    print(f"Warning: Could not collect mixed profiling stats: {e}")
             
-            # Close defense env and clean up
-            defense_env.close()
+            # Close mixed env and clean up
+            mixed_env.close()
             try:
-                del defense_env
+                del mixed_env
             except Exception:
                 pass
             gc.collect()
             time.sleep(0.05)
 
-            # Reset defense callback's cache for next alternation
-            try:
-                defense_mlflow_callback.reset()
-                print(f"Reset defense metrics callback for next alternation")
-            except Exception:
-                pass
 
-            # Save final unified checkpoint per alternation
-            # (overwrites the intermediate one from after offense training)
-            print(f"\nSaving final unified checkpoint for alternation {global_alt}...")
+            # Save unified checkpoint per alternation
+            print(f"\nSaving unified checkpoint for alternation {global_alt}...")
             with tempfile.TemporaryDirectory() as tmpdir:
                 unified_model_path = os.path.join(
-                    tmpdir, f"unified_alt_{global_alt}.zip"
+                    tmpdir, f"unified_iter_{global_alt}.zip"
                 )
                 unified_policy.save(unified_model_path)
                 mlflow.log_artifact(unified_model_path, artifact_path="models")
@@ -1592,7 +1549,7 @@ def main(args):
                 print(f"\n--- Running Evaluation for Alternation {global_alt} ---")
 
                 # Create a renderable environment for evaluation
-                eval_env = basketworld.HexagonBasketballEnv(
+                base_eval_env = basketworld.HexagonBasketballEnv(
                     grid_size=args.grid_size,
                     players=args.players,
                     shot_clock_steps=args.shot_clock,
@@ -1638,6 +1595,13 @@ def main(args):
                     mask_occupied_moves=args.mask_occupied_moves,
                     enable_pass_gating=getattr(args, "enable_pass_gating", True),
                 )
+                eval_env = SelfPlayEnvWrapper(
+                    base_eval_env,
+                    opponent_policy=unified_policy,
+                    training_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    opponent_strategy=IllegalActionStrategy.SAMPLE_PROB,
+                    deterministic_opponent=True,
+                )
 
                 with tempfile.TemporaryDirectory() as temp_dir:
                     for ep_num in range(args.eval_episodes):
@@ -1646,7 +1610,7 @@ def main(args):
                         episode_frames = []
 
                         while not done:
-                            # Single unified policy chooses all actions
+                            # Policy controls training team; wrapper mirrors actions to the opponent policy
                             full_action, _ = unified_policy.predict(
                                 obs, deterministic=True
                             )
@@ -2095,6 +2059,16 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="randomize defender spawn distance from matched offense player (0 = spawn adjacent; N = spawn 1-N hexes away).",
+    )
+    parser.add_argument(
+        "--defender-guard-distance",
+        dest="defender_guard_distance",
+        type=int,
+        default=1,
+        help=(
+            "Hex distance (N) within which a defender reset their lane counter if guarding "
+            "an offensive player while in the lane. 0 disables guarding resets."
+        ),
     )
     parser.add_argument(
         "--deterministic-opponent",

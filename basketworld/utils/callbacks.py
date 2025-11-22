@@ -161,6 +161,7 @@ class MLflowCallback(BaseCallback):
                 turnover_pressure_pct = mean_key("turnover_pressure")
                 turnover_offensive_lane_pct = mean_key("turnover_offensive_lane")
                 defensive_lane_violation_pct = mean_key("defensive_lane_violation")
+                rejected_move_occupied = mean_key("move_rejected_occupied")
 
                 def mean_ppp(default: float = 0.0):
                     numer = []
@@ -269,6 +270,11 @@ class MLflowCallback(BaseCallback):
                     defensive_lane_violation_pct,
                     step=global_step,
                 )
+                mlflow.log_metric(
+                    f"{self.team_name} Rejected Move Occupied",
+                    rejected_move_occupied,
+                    step=global_step,
+                )
                 mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
                 # Log current pass logit bias if custom policy exposes it
                 try:
@@ -301,25 +307,14 @@ class MLflowCallback(BaseCallback):
 
 
 class AccumulativeMetricsCallback(BaseCallback):
-    """
-    Log episode-aggregated metrics at the end of each rollout.
+    """Log episode metrics separated by training team (Offense/Defense).
     
-    Collects all episodes completed during a rollout and logs aggregated metrics
-    (mean reward, PPP, etc.) once per rollout. This provides cleaner, per-rollout
-    metrics without memory accumulation.
-    
-    Uses _on_rollout_start/_on_rollout_end lifecycle hooks for efficiency.
+    For mixed training environments, automatically groups episodes by training_team
+    and logs separate metrics for each team.
     """
 
-    def __init__(
-        self, 
-        team_name: str,
-        verbose=0
-    ):
+    def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.team_name = team_name
-        # Store only extracted metrics from current rollout
-        self.episode_cache = []  # List of dicts with only the metrics we need
         self._seen_episode_ids = set()
 
     def _extract_episode_metrics(self, ep: dict) -> dict:
@@ -340,6 +335,7 @@ class AccumulativeMetricsCallback(BaseCallback):
             "turnover_pressure": float(ep.get("turnover_pressure", 0.0)),
             "turnover_offensive_lane": float(ep.get("turnover_offensive_lane", 0.0)),
             "defensive_lane_violation": float(ep.get("defensive_lane_violation", 0.0)),
+            "move_rejected_occupied": float(ep.get("move_rejected_occupied", 0.0)),
             "made_dunk": float(ep.get("made_dunk", 0.0)),
             "made_2pt": float(ep.get("made_2pt", 0.0)),
             "made_3pt": float(ep.get("made_3pt", 0.0)),
@@ -354,219 +350,97 @@ class AccumulativeMetricsCallback(BaseCallback):
         self.episode_cache = []
         self._seen_episode_ids = set()
 
-    def _on_rollout_start(self) -> None:
-        """Called at the start of each rollout phase. Clear cache for fresh metrics per rollout."""
-        # Clear cache to aggregate metrics only for this rollout
-        self.episode_cache = []
-        # Note: We keep _seen_episode_ids to avoid re-processing episodes
-
     def _on_rollout_end(self) -> None:
-        """Called at the end of each rollout phase. Aggregate and log metrics."""
-        # Extract metrics from all new episodes in ep_info_buffer
-        if self.model.ep_info_buffer:
-            for ep in self.model.ep_info_buffer:
-                ep_id = id(ep)
-                if ep_id not in self._seen_episode_ids:
-                    self._seen_episode_ids.add(ep_id)
-                    # Store only extracted metrics
-                    self.episode_cache.append(self._extract_episode_metrics(ep))
+        """Aggregate and log metrics by team."""
+        if not self.model.ep_info_buffer:
+            return
+
+        # Group episodes by training_team
+        episodes_by_team = {}
+        for ep in self.model.ep_info_buffer:
+            ep_id = id(ep)
+            if ep_id not in self._seen_episode_ids:
+                self._seen_episode_ids.add(ep_id)
+                team_name = ep.get("training_team", "Unknown")
+                if team_name not in episodes_by_team:
+                    episodes_by_team[team_name] = []
+                episodes_by_team[team_name].append(ep)
         
-        # Log aggregated metrics for this rollout
-        if self.episode_cache:
-            self._log_metrics()
+        # Log metrics for each team
+        global_step = self.model.num_timesteps
+        for team_name, episodes in episodes_by_team.items():
+            self._log_team_metrics(team_name, episodes, global_step)
 
     def _on_step(self) -> bool:
         return True
-
-    def _log_metrics(self):
-        """Log all cached episode metrics.
+    
+    def _log_team_metrics(self, team_name: str, episodes: list, global_step: int):
+        """Log metrics for a specific team."""
+        if not episodes:
+            return
         
-        Both offense and defense within the same alternation share the same x-axis range
-        in terms of ENVIRONMENT STEPS (not PPO updates).
+        # Format team name for display (e.g., "OFFENSE" -> "Offense")
+        team_label = team_name.capitalize() if isinstance(team_name, str) else team_name
         
-        - Each PPO update processes n_steps * num_envs environment transitions
-        - num_timesteps = number of PPO updates
-        - actual_env_steps = num_timesteps * n_steps * num_envs
+        # Basic metrics
+        ep_rewards = [ep.get("r", 0.0) for ep in episodes]
+        ep_lengths = [ep.get("l", 0.0) for ep in episodes]
         
-        Both offense and defense start fresh at 0 env steps within each alternation.
-        """
-        # Convert PPO updates to actual environment steps
-        # self.model.num_timesteps is the number of PPO gradient updates
-        # Each update processed n_steps * num_envs environment transitions
-        global_step = self.model.num_timesteps
-
-        ep_rew_mean = np.mean(
-            [ep["r"] for ep in self.episode_cache]
-        )
-        ep_len_mean = np.mean(
-            [ep["l"] for ep in self.episode_cache]
-        )
-
+        ep_rew_mean = float(np.mean(ep_rewards)) if ep_rewards else 0.0
+        ep_len_mean = float(np.mean(ep_lengths)) if ep_lengths else 0.0
+        
+        mlflow.log_metric(f"{team_label} Mean Episode Reward", ep_rew_mean, step=global_step)
+        mlflow.log_metric(f"{team_label} Mean Episode Length", ep_len_mean, step=global_step)
+        
+        # Helper function to compute mean of a metric
         def mean_key(key: str, default: float = 0.0):
-            vals = [
-                ep.get(key, default) for ep in self.episode_cache
-            ]
+            vals = [float(ep.get(key, default)) for ep in episodes]
             return float(np.mean(vals)) if vals else default
-
-        # Shot types and assists
-        shot_dunk_pct = mean_key("shot_dunk")
-        shot_2pt_pct = mean_key("shot_2pt")
-        shot_3pt_pct = mean_key("shot_3pt")
-        asst_dunk_pct = mean_key("assisted_dunk")
-        asst_2pt_pct = mean_key("assisted_2pt")
-        asst_3pt_pct = mean_key("assisted_3pt")
-        passes_avg = mean_key("passes")
-        turnover_pct = mean_key("turnover")
-        turnover_pass_oob_pct = mean_key("turnover_pass_oob")
-        turnover_intercepted_pct = mean_key("turnover_intercepted")
-        turnover_pressure_pct = mean_key("turnover_pressure")
-        turnover_offensive_lane_pct = mean_key("turnover_offensive_lane")
-        defensive_lane_violation_pct = mean_key("defensive_lane_violation")
-
-        def mean_ppp(default: float = 0.0):
-            numer = []
-            for ep in self.episode_cache:
-                m2 = float(ep.get("made_2pt", 0.0))
-                m3 = float(ep.get("made_3pt", 0.0))
-                md = float(ep.get("made_dunk", 0.0))
-                att = float(ep.get("attempts", 0.0))
-                tov = float(ep.get("turnover", 0.0))
-                n = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
-                d = max(1.0, att + tov)
-                numer.append(n / d)
-            return float(np.mean(numer)) if numer else default
-
-        ppp_avg = mean_ppp()
-
-        # Log basic metrics
-        mlflow.log_metric(
-            f"{self.team_name} Mean Episode Reward",
-            ep_rew_mean,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Mean Episode Length",
-            ep_len_mean,
-            step=global_step,
-        )
-
-        # Entropy coefficient
-        try:
-            total_ts = getattr(self.model, "_total_timesteps", None)
-            if callable(getattr(self.model, "ent_coef", None)):
-                progress_remaining = 1.0
-                if total_ts and total_ts > 0:
-                    progress_remaining = max(
-                        0.0,
-                        min(
-                            1.0,
-                            1.0 - (self.model.num_timesteps / float(total_ts)),
-                        ),
-                    )
-                current_ent_coef = float(
-                    self.model.ent_coef(progress_remaining)
-                )
-            else:
-                current_ent_coef = float(getattr(self.model, "ent_coef", 0.0))
-            mlflow.log_metric(
-                f"{self.team_name} Entropy Coef",
-                current_ent_coef,
-                step=global_step,
-            )
-        except Exception:
-            pass
-
-        # Shot metrics
-        mlflow.log_metric(
-            f"{self.team_name} ShotPct Dunk", shot_dunk_pct, step=global_step
-        )
-        mlflow.log_metric(
-            f"{self.team_name} ShotPct 2PT", shot_2pt_pct, step=global_step
-        )
-        mlflow.log_metric(
-            f"{self.team_name} ShotPct 3PT", shot_3pt_pct, step=global_step
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Assist ShotPct Dunk",
-            asst_dunk_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Assist ShotPct 2PT",
-            asst_2pt_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Assist ShotPct 3PT",
-            asst_3pt_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Passes / Episode", passes_avg, step=global_step
-        )
-        mlflow.log_metric(
-            f"{self.team_name} TurnoverPct", turnover_pct, step=global_step
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Turnover Pass OOB",
-            turnover_pass_oob_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Turnover Intercepted",
-            turnover_intercepted_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Turnover Pressure",
-            turnover_pressure_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} 3-Second Violation",
-            turnover_offensive_lane_pct,
-            step=global_step,
-        )
-        mlflow.log_metric(
-            f"{self.team_name} Illegal Defense Violation",
-            defensive_lane_violation_pct,
-            step=global_step,
-        )
         
-        # NOTE: PPP always measures OFFENSE performance (only offense scores in basketball)
-        # For Offense training: this is the training team's performance ✓
-        # For Defense training: this is the OPPONENT's (frozen offense) performance
-        # So during Defense training, we label it as "Opponent PPP" for clarity
-        metric_name = "PPP" if self.team_name == "Offense" else "Opponent PPP"
-        mlflow.log_metric(f"{self.team_name} {metric_name}", ppp_avg, step=global_step)
-
-        # Pass logit bias if available
-        try:
-            pass_bias = float(
-                getattr(self.model.policy, "pass_logit_bias", 0.0)
-            )
-            mlflow.log_metric(
-                f"{self.team_name} Pass Logit Bias", pass_bias, step=global_step
-            )
-        except Exception:
-            pass
-
+        # Shot metrics
+        mlflow.log_metric(f"{team_label} ShotPct Dunk", mean_key("shot_dunk"), step=global_step)
+        mlflow.log_metric(f"{team_label} ShotPct 2PT", mean_key("shot_2pt"), step=global_step)
+        mlflow.log_metric(f"{team_label} ShotPct 3PT", mean_key("shot_3pt"), step=global_step)
+        
+        # Assist metrics
+        mlflow.log_metric(f"{team_label} Assist ShotPct Dunk", mean_key("assisted_dunk"), step=global_step)
+        mlflow.log_metric(f"{team_label} Assist ShotPct 2PT", mean_key("assisted_2pt"), step=global_step)
+        mlflow.log_metric(f"{team_label} Assist ShotPct 3PT", mean_key("assisted_3pt"), step=global_step)
+        
+        # Other metrics
+        mlflow.log_metric(f"{team_label} Passes / Episode", mean_key("passes"), step=global_step)
+        mlflow.log_metric(f"{team_label} TurnoverPct", mean_key("turnover"), step=global_step)
+        mlflow.log_metric(f"{team_label} Turnover Pass OOB", mean_key("turnover_pass_oob"), step=global_step)
+        mlflow.log_metric(f"{team_label} Turnover Intercepted", mean_key("turnover_intercepted"), step=global_step)
+        mlflow.log_metric(f"{team_label} Turnover Pressure", mean_key("turnover_pressure"), step=global_step)
+        mlflow.log_metric(f"{team_label} 3-Second Violation", mean_key("turnover_offensive_lane"), step=global_step)
+        mlflow.log_metric(f"{team_label} Illegal Defense Violation", mean_key("defensive_lane_violation"), step=global_step)
+        mlflow.log_metric(f"{team_label} Rejected Move Occupied", mean_key("move_rejected_occupied"), step=global_step)
+        legal_key = "legal_actions_offense" if str(team_name).lower() == "offense" else "legal_actions_defense"
+        mlflow.log_metric(f"{team_label} Legal Actions", mean_key(legal_key), step=global_step)
+        
+        # PPP (Points Per Possession)
+        ppp_values = []
+        for ep in episodes:
+            m2 = float(ep.get("made_2pt", 0.0))
+            m3 = float(ep.get("made_3pt", 0.0))
+            md = float(ep.get("made_dunk", 0.0))
+            att = float(ep.get("attempts", 0.0))
+            tov = float(ep.get("turnover", 0.0))
+            points = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
+            possessions = max(1.0, att + tov)
+            ppp_values.append(points / possessions)
+        ppp_mean = float(np.mean(ppp_values)) if ppp_values else 0.0
+        mlflow.log_metric(f"{team_label} PPP", ppp_mean, step=global_step)
+        
         # Phi diagnostics
         try:
-            phi_beta_avg = mean_key("phi_beta")
-            phi_prev_avg = mean_key("phi_prev")
-            phi_next_avg = mean_key("phi_next")
-            mlflow.log_metric(
-                f"{self.team_name} Phi Beta", phi_beta_avg, step=global_step
-            )
-            mlflow.log_metric(
-                f"{self.team_name} Phi Prev", phi_prev_avg, step=global_step
-            )
-            mlflow.log_metric(
-                f"{self.team_name} Phi Next", phi_next_avg, step=global_step
-            )
+            mlflow.log_metric(f"{team_label} Phi Beta", mean_key("phi_beta"), step=global_step)
+            mlflow.log_metric(f"{team_label} Phi Prev", mean_key("phi_prev"), step=global_step)
+            mlflow.log_metric(f"{team_label} Phi Next", mean_key("phi_next"), step=global_step)
         except Exception:
             pass
+
 
 
 # --- Entropy Schedules ---

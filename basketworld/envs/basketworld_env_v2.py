@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import random
 import math
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Callable, Dict, List, Tuple, Optional, Union
 from enum import Enum
 from collections import defaultdict
 
@@ -118,6 +118,7 @@ class HexagonBasketballEnv(gym.Env):
         spawn_distance: int = 3,
         max_spawn_distance: Optional[int] = None,
         defender_spawn_distance: int = 0,
+        defender_guard_distance: int = 1,
         # Reward shaping parameters
         pass_reward: float = 0.0,
         turnover_penalty: float = 0.0,
@@ -186,6 +187,7 @@ class HexagonBasketballEnv(gym.Env):
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
         self.defender_spawn_distance = defender_spawn_distance
+        self.defender_guard_distance = max(0, int(defender_guard_distance))
         self.use_egocentric_obs = bool(use_egocentric_obs)
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
@@ -201,6 +203,8 @@ class HexagonBasketballEnv(gym.Env):
             self.illegal_action_policy = IllegalActionPolicy.NOOP
         # Optional per-step action probabilities provided by caller
         self._pending_action_probs: Optional[np.ndarray] = None
+        self._legal_actions_offense: float = 0.0
+        self._legal_actions_defense: float = 0.0
         # Honor constructor flag for strict illegal action handling
         self.raise_on_illegal_action = bool(raise_on_illegal_action)
         # Three-point configuration and shot model parameters
@@ -274,16 +278,32 @@ class HexagonBasketballEnv(gym.Env):
         ball_handler_pos_extra = 2  # Absolute position of ball handler (NEW - helps distinguish court regions)
         hoop_extra = 2 if self.include_hoop_vector else 0
         # All-pairs offense-defense distances and angles (replaces nearest defender distances)
-        offense_defense_distances = self.players_per_side * self.players_per_side  
+        offense_defense_distances = self.players_per_side * self.players_per_side
         offense_defense_angles = self.players_per_side * self.players_per_side
         lane_steps_extra = self.n_players  # Lane violation counters for all players
         ep_extra = self.players_per_side  # EP for each offensive player
         turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
         steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
+        teammate_distance_extra = 2 * max(0, self.players_per_side - 1)
+        teammate_angle_extra = 2 * max(0, self.players_per_side - 1)
+        state_vector_length = (
+            base_len
+            + team_encoding_extra
+            + ball_handler_pos_extra
+            + hoop_extra
+            + offense_defense_distances
+            + offense_defense_angles
+            + lane_steps_extra
+            + ep_extra
+            + turnover_risk_extra
+            + steal_risk_extra
+            + teammate_distance_extra
+            + teammate_angle_extra
+        )
         state_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(base_len + team_encoding_extra + ball_handler_pos_extra + hoop_extra + offense_defense_distances + offense_defense_angles + lane_steps_extra + ep_extra + turnover_risk_extra + steal_risk_extra,),
+            shape=(state_vector_length,),
             dtype=np.float32,
         )
         action_mask_space = spaces.Box(
@@ -483,6 +503,20 @@ class HexagonBasketballEnv(gym.Env):
         q1, r1 = pos1
         q2, r2 = pos2
         return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
+
+    @profile_section("_defender_is_guarding_offense")
+    def _defender_is_guarding_offense(self, defender_id: int) -> bool:
+        """Return True if any offensive player is within guard distance of the defender."""
+        if self.defender_guard_distance <= 0:
+            return False
+        if not self.positions:
+            return False
+
+        def_pos = self.positions[defender_id]
+        for off_id in self.offense_ids:
+            if self._hex_distance(def_pos, self.positions[off_id]) <= self.defender_guard_distance:
+                return True
+        return False
 
     @profile_section("_point_to_line_distance")
     def _point_to_line_distance(
@@ -685,7 +719,19 @@ class HexagonBasketballEnv(gym.Env):
             ),
             "skills": self._get_offense_skills_array(),
         }
-        info = {"training_team": self.training_team.name}
+        mask = obs["action_mask"]
+        try:
+            offense_mask = mask[self.offense_ids]
+            defense_mask = mask[self.defense_ids]
+            self._legal_actions_offense = float(np.mean(np.sum(offense_mask, axis=1)))
+            self._legal_actions_defense = float(np.mean(np.sum(defense_mask, axis=1)))
+        except Exception:
+            self._legal_actions_offense = 0.0
+            self._legal_actions_defense = 0.0
+
+        info = self._attach_legal_action_stats(
+            {"training_team": self.training_team.name}
+        )
 
         return obs, info
 
@@ -749,11 +795,13 @@ class HexagonBasketballEnv(gym.Env):
                         ),
                         "skills": self._get_offense_skills_array(),
                     }
-                    info = {
-                        "training_team": self.training_team.name,
-                        "action_results": turnover_results,
-                        "shot_clock": self.shot_clock,
-                    }
+                    info = self._attach_legal_action_stats(
+                        {
+                            "training_team": self.training_team.name,
+                            "action_results": turnover_results,
+                            "shot_clock": self.shot_clock,
+                        }
+                    )
 
                     # Phi diagnostics and optional shaping on early turnover path
                     if self.enable_phi_shaping:
@@ -822,6 +870,14 @@ class HexagonBasketballEnv(gym.Env):
         # Resolve illegal actions according to configured policy
         try:
             masks = self._get_action_masks()
+            offense_mask = masks[self.offense_ids]
+            defense_mask = masks[self.defense_ids]
+            self._legal_actions_offense = float(
+                np.mean(np.sum(offense_mask, axis=1))
+            )
+            self._legal_actions_defense = float(
+                np.mean(np.sum(defense_mask, axis=1))
+            )
             for i in range(self.n_players):
                 a = int(actions[i])
                 # Legal and in-bounds → keep
@@ -902,6 +958,10 @@ class HexagonBasketballEnv(gym.Env):
         if self.illegal_defense_enabled:
             for did in self.defense_ids:
                 if self.positions and tuple(self.positions[did]) in self.defensive_lane_hexes:
+                    if self._defender_is_guarding_offense(did):
+                        self._defender_in_key_steps[did] = 0
+                        continue
+
                     steps = self._defender_in_key_steps.get(did, 0) + 1
                     self._defender_in_key_steps[did] = steps
                     
@@ -930,15 +990,8 @@ class HexagonBasketballEnv(gym.Env):
 
         self.episode_ended = done
         
-        # Track offensive lane occupancy for offensive 3-second violations
-        if self.offensive_three_seconds_enabled:
-            for oid in self.offense_ids:
-                if self.positions and tuple(self.positions[oid]) in self.offensive_lane_hexes:
-                    self._offensive_lane_steps[oid] = (
-                        self._offensive_lane_steps.get(oid, 0) + 1
-                    )
-                else:
-                    self._offensive_lane_steps[oid] = 0
+        # Note: Offensive lane step counters are now updated in _process_simultaneous_actions
+        # immediately after moves are resolved and before violation checks
 
         # Clear per-step external probabilities after use to avoid reuse
         self._pending_action_probs = None
@@ -1014,6 +1067,7 @@ class HexagonBasketballEnv(gym.Env):
             info["phi_next"] = 0.0
             info["phi_beta"] = 0.0
 
+        info = self._attach_legal_action_stats(info)
         return obs, rewards, done, False, info
 
     @profile_section("set_illegal_action_probs")
@@ -1071,34 +1125,6 @@ class HexagonBasketballEnv(gym.Env):
                 pass_action_idx = ActionType.PASS_E.value + dir_idx
                 if not self._has_teammate_in_pass_arc(self.ball_holder, dir_idx):
                     masks[self.ball_holder, pass_action_idx] = 0
-
-        # Enforce illegal defense: after max steps in lane, mask NOOP so defender must move
-        # This now applies to the full lane area, not just the basket hex
-        if self.illegal_defense_enabled and self.three_second_max_steps > 0:
-            for did in self.defense_ids:
-                if (
-                    self._defender_in_key_steps.get(did, 0)
-                    >= self.three_second_max_steps
-                ):
-                    if tuple(self.positions[did]) in self.defensive_lane_hexes:
-                        masks[did, ActionType.NOOP.value] = 0
-        
-        # Enforce offensive 3-second rule: after max steps in lane, must leave or shoot
-        if self.offensive_three_seconds_enabled and self.three_second_max_steps > 0:
-            for oid in self.offense_ids:
-                steps_in_lane = self._offensive_lane_steps.get(oid, 0)
-                in_lane = tuple(self.positions[oid]) in self.offensive_lane_hexes
-                has_ball = (oid == self.ball_holder)
-                
-                if in_lane and steps_in_lane >= self.three_second_max_steps:
-                    if not has_ball:
-                        # Must leave the lane (mask NOOP)
-                        masks[oid, ActionType.NOOP.value] = 0
-                    elif steps_in_lane > self.three_second_max_steps:
-                        # Ball handler at max_steps+1: can ONLY shoot
-                        # Mask everything except SHOOT
-                        masks[oid, :] = 0
-                        masks[oid, ActionType.SHOOT.value] = 1
 
         return masks
 
@@ -1399,8 +1425,8 @@ class HexagonBasketballEnv(gym.Env):
                         "reason": "out_of_bounds",
                     }
 
-        # If configured, block moves into any cell that was occupied at the start of the step
-        if self.mask_occupied_moves and intended_moves:
+        # Always block moves into any cell that was occupied at the start of the step
+        if intended_moves:
             occupied_start = set(current_positions)
             to_remove = []
             for pid, dest in intended_moves.items():
@@ -1467,9 +1493,19 @@ class HexagonBasketballEnv(gym.Env):
 
         self.positions = final_positions
         
-        # Check for offensive 3-second violations BEFORE updating step counts
-        # This check happens here (before lane steps are incremented in step())
+        # Check for offensive 3-second violations
+        # First update the lane counters based on new positions, then check for violations
         if self.offensive_three_seconds_enabled:
+            # Update lane step counters based on new positions
+            for oid in self.offense_ids:
+                if tuple(self.positions[oid]) in self.offensive_lane_hexes:
+                    self._offensive_lane_steps[oid] = (
+                        self._offensive_lane_steps.get(oid, 0) + 1
+                    )
+                else:
+                    self._offensive_lane_steps[oid] = 0
+            
+            # Now check for violations using the updated counters
             for oid in self.offense_ids:
                 steps_in_lane = self._offensive_lane_steps.get(oid, 0)
                 in_lane = tuple(self.positions[oid]) in self.offensive_lane_hexes
@@ -2192,132 +2228,119 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
-    @profile_section("_get_defender_distances_for_offensive_player")
-    def _get_defender_distances_for_offensive_player(self, offense_id: int) -> np.ndarray:
-        """
-        Get distances from a specific offensive player to all defenders.
-        
-        Args:
-            offense_id: The offensive player ID (0, 1, or 2 for 3v3)
-            
-        Returns:
-            Array of shape (players_per_side,) with distances to each defender.
-        """
-        distances = []
-        off_pos = self.positions[offense_id]
-        for def_id in self.defense_ids:
-            def_pos = self.positions[def_id]
-            distance = self._hex_distance(off_pos, def_pos)
-            distances.append(float(distance))
+    @profile_section("_get_player_distances")
+    def _get_player_distances(self, base_id: int, target_ids: List[int]) -> np.ndarray:
+        """Return hex distances from `base_id` to each ID in `target_ids`."""
+        if not self.positions or base_id >= len(self.positions):
+            return np.zeros(0, dtype=np.float32)
+
+        base_pos = self.positions[base_id]
+        distances = [
+            float(self._hex_distance(base_pos, self.positions[target_id]))
+            for target_id in target_ids
+        ]
         return np.array(distances, dtype=np.float32)
-    
-    @profile_section("_get_defender_angles_for_offensive_player")
-    def _get_defender_angles_for_offensive_player(self, offense_id: int) -> np.ndarray:
-        """
-        Get angle cosines from a specific offensive player to all defenders.
-        
-        For each defender, calculates cos(angle) where angle is at the offensive player between:
-        - Vector from offensive player to basket (direction they want to go)
-        - Vector from offensive player to defender (where the defender is)
-        
-        Args:
-            offense_id: The offensive player ID
-            
-        Returns:
-            Array of shape (players_per_side,) with cos(angle) values in [-1, 1].
-            
-        Interpretation:
-            +1.0: Defender directly between offensive player and basket (best defensive position)
-            0.0:  Defender perpendicular (side/help defense)
-            -1.0: Defender directly behind offensive player (beaten/helping from behind)
-        """
-        off_pos = self.positions[offense_id]
-        
-        # Vector from offense to basket
-        to_basket_q = self.basket_position[0] - off_pos[0]
-        to_basket_r = self.basket_position[1] - off_pos[1]
-        
-        # Calculate basket vector magnitude (using hex metric)
-        # In axial coords: |v|² = q² + r² + qr
+
+    @profile_section("_get_player_angles")
+    def _get_player_angles(self, base_id: int, target_ids: List[int]) -> np.ndarray:
+        """Return cosine angles between base→target and base→basket for each target."""
+        if not self.positions or base_id >= len(self.positions):
+            return np.zeros(0, dtype=np.float32)
+
+        base_pos = self.positions[base_id]
+        to_basket_q = self.basket_position[0] - base_pos[0]
+        to_basket_r = self.basket_position[1] - base_pos[1]
         basket_mag_sq = to_basket_q**2 + to_basket_r**2 + to_basket_q * to_basket_r
-        basket_mag = math.sqrt(max(0, basket_mag_sq))
-        
-        angles = []
-        for def_id in self.defense_ids:
-            def_pos = self.positions[def_id]
-            
-            # Vector from offense to defender
-            to_defender_q = def_pos[0] - off_pos[0]
-            to_defender_r = def_pos[1] - off_pos[1]
-            
-            # Calculate defender vector magnitude
-            defender_mag_sq = to_defender_q**2 + to_defender_r**2 + to_defender_q * to_defender_r
-            defender_mag = math.sqrt(max(0, defender_mag_sq))
-            
-            # Handle edge cases
-            if basket_mag < 1e-6 or defender_mag < 1e-6:
-                # Offensive player at basket or defender at same position as offensive player
+        basket_mag = math.sqrt(max(0.0, basket_mag_sq))
+
+        angles: List[float] = []
+        for target_id in target_ids:
+            target_pos = self.positions[target_id]
+            to_target_q = target_pos[0] - base_pos[0]
+            to_target_r = target_pos[1] - base_pos[1]
+            target_mag_sq = (
+                to_target_q**2 + to_target_r**2 + to_target_q * to_target_r
+            )
+            target_mag = math.sqrt(max(0.0, target_mag_sq))
+
+            if basket_mag < 1e-6 or target_mag < 1e-6:
                 angles.append(0.0)
                 continue
-            
-            # Dot product in axial coordinates
-            # A·B = A.q*B.q + A.r*B.r + 0.5*(A.q*B.r + A.r*B.q)
-            # This accounts for 120° angle between axial coordinate axes
-            dot = (to_basket_q * to_defender_q + 
-                   to_basket_r * to_defender_r + 
-                   0.5 * (to_basket_q * to_defender_r + to_basket_r * to_defender_q))
-            
-            # cos(angle) = (A·B) / (|A| * |B|)
-            cos_angle = dot / (basket_mag * defender_mag)
-            
-            # Clamp to [-1, 1] to handle floating point errors
+
+            dot = (
+                to_basket_q * to_target_q
+                + to_basket_r * to_target_r
+                + 0.5 * (to_basket_q * to_target_r + to_basket_r * to_target_q)
+            )
+            cos_angle = dot / (basket_mag * target_mag)
             cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            
             angles.append(float(cos_angle))
-        
+
         return np.array(angles, dtype=np.float32)
+
     
+    @profile_section("_collect_pairwise_features")
+    def _collect_pairwise_features(
+        self,
+        base_ids: List[int],
+        target_ids: List[int],
+        getter: Callable[[int, List[int]], np.ndarray],
+    ) -> np.ndarray:
+        """Collect features for each (base, target) pair using the provided getter."""
+        values: List[float] = []
+        if not target_ids:
+            return np.array([], dtype=np.float32)
+
+        for base_id in base_ids:
+            feature_vec = getter(base_id, target_ids)
+            values.extend(feature_vec.tolist())
+        return np.array(values, dtype=np.float32)
+
     @profile_section("_calculate_offense_defense_distances")
     def _calculate_offense_defense_distances(self) -> np.ndarray:
-        """
-        Calculate all-pairs distances between offensive and defensive players.
-        
-        Returns:
-            Array of shape (players_per_side * players_per_side,) with distances.
-            For 3v3: [O0→D0, O0→D1, O0→D2, O1→D0, O1→D1, O1→D2, O2→D0, O2→D1, O2→D2]
-            
-        This is ordered as: for each offensive player (outer loop), distance to each defender (inner loop).
-        For defense perspective, this can be interpreted as transposed (defender × offensive player).
-        """
-        all_distances = []
-        for off_id in self.offense_ids:
-            distances = self._get_defender_distances_for_offensive_player(off_id)
-            all_distances.extend(distances.tolist())
-        return np.array(all_distances, dtype=np.float32)
-    
+        return self._collect_pairwise_features(
+            self.offense_ids,
+            self.defense_ids,
+            self._get_player_distances,
+        )
+
     @profile_section("_calculate_offense_defense_angles")
     def _calculate_offense_defense_angles(self) -> np.ndarray:
-        """
-        Calculate angle cosines between offensive players, defenders, and basket.
-        
-        For each (offensive player, defender) pair, calculates cos(angle) where angle is at 
-        the offensive player between:
-        - Vector from offensive player to basket (where they want to go)
-        - Vector from offensive player to defender (where the defender is)
-        
-        Returns:
-            Array of shape (players_per_side * players_per_side,) with cos(angle) values in [-1, 1].
-            
-        Interpretation:
-            +1.0: Defender directly between offensive player and basket (best defensive position)
-            0.0:  Defender perpendicular (side/help defense)
-            -1.0: Defender directly behind offensive player (beaten/helping from behind)
-        """
-        all_angles = []
-        for off_id in self.offense_ids:
-            angles = self._get_defender_angles_for_offensive_player(off_id)
-            all_angles.extend(angles.tolist())
-        return np.array(all_angles, dtype=np.float32)
+        return self._collect_pairwise_features(
+            self.offense_ids,
+            self.defense_ids,
+            self._get_player_angles,
+        )
+
+    def _collect_teammate_features(
+        self,
+        team_ids: List[int],
+        getter: Callable[[int, List[int]], np.ndarray],
+    ) -> np.ndarray:
+        """Collect features from the first teammate to their squad-mates."""
+        if len(team_ids) <= 1:
+            return np.array([], dtype=np.float32)
+        return self._collect_pairwise_features([team_ids[0]], team_ids[1:], getter)
+
+    @profile_section("_calculate_teammate_distances")
+    def _calculate_teammate_distances(self) -> np.ndarray:
+        offense_distances = self._collect_teammate_features(
+            self.offense_ids, self._get_player_distances
+        )
+        defense_distances = self._collect_teammate_features(
+            self.defense_ids, self._get_player_distances
+        )
+        return np.concatenate((offense_distances, defense_distances)) if offense_distances.size or defense_distances.size else np.array([], dtype=np.float32)
+
+    @profile_section("_calculate_teammate_angles")
+    def _calculate_teammate_angles(self) -> np.ndarray:
+        offense_angles = self._collect_teammate_features(
+            self.offense_ids, self._get_player_angles
+        )
+        defense_angles = self._collect_teammate_features(
+            self.defense_ids, self._get_player_angles
+        )
+        return np.concatenate((offense_angles, defense_angles)) if offense_angles.size or defense_angles.size else np.array([], dtype=np.float32)
 
     @profile_section("_get_observation")
     def _get_observation(self) -> np.ndarray:
@@ -2390,6 +2413,15 @@ class HexagonBasketballEnv(gym.Env):
         angles = self._calculate_offense_defense_angles()
         obs.extend(angles.tolist())
         
+        # Teammate distances / angles
+        teammate_distances = self._calculate_teammate_distances()
+        if self.normalize_obs:
+            teammate_distances = teammate_distances / norm_den
+        obs.extend(teammate_distances.tolist())
+
+        teammate_angles = self._calculate_teammate_angles()
+        obs.extend(teammate_angles.tolist())
+        
         # Lane step counts for all players (offensive and defensive)
         # This allows agents to learn to manage their time in the lane
         # Offensive players track time in offensive lane, defensive players track time in defensive lane (basket)
@@ -2449,6 +2481,19 @@ class HexagonBasketballEnv(gym.Env):
                 float(self.offense_dunk_pct_by_player[i]) - float(self.dunk_pct)
             )
         return np.array(skills, dtype=np.float32)
+
+    def _attach_legal_action_stats(self, info: Optional[Dict]) -> Dict:
+        if info is None:
+            info = {}
+        info.setdefault(
+            "legal_actions_offense",
+            float(getattr(self, "_legal_actions_offense", 0.0)),
+        )
+        info.setdefault(
+            "legal_actions_defense",
+            float(getattr(self, "_legal_actions_defense", 0.0)),
+        )
+        return info
 
     @profile_section("render")
     def render(self):
@@ -3090,8 +3135,8 @@ class HexagonBasketballEnv(gym.Env):
             return []  # Only offensive ball handlers face defender pressure
         
         # Get distances and angles for the ball handler
-        distances = self._get_defender_distances_for_offensive_player(self.ball_holder)
-        angles = self._get_defender_angles_for_offensive_player(self.ball_holder)
+        distances = self._get_player_distances(self.ball_holder, self.defense_ids)
+        angles = self._get_player_angles(self.ball_holder, self.defense_ids)
         
         defender_pressure_info = []
         

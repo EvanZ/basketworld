@@ -4,6 +4,7 @@ from typing import Optional, Any
 
 import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
 from stable_baselines3 import PPO
 
 from .action_resolution import (
@@ -20,6 +21,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
     - training_strategy: strategy for the current training team
     - opponent_strategy: strategy for the frozen opponent
     - deterministic_opponent: when True, use deterministic choice in sampling
+    - action_space: exposes only the training team's actions to the learning policy
     """
 
     def __init__(
@@ -36,6 +38,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         self.opponent_strategy = opponent_strategy
         self.deterministic_opponent = bool(deterministic_opponent)
         self._set_team_ids()
+        self._configure_action_space()
 
     def _ensure_opponent_loaded(self):
         # Allow passing a policy path string to avoid pickling full PPO
@@ -44,17 +47,34 @@ class SelfPlayEnvWrapper(gym.Wrapper):
 
     def _set_team_ids(self) -> None:
         if self.env.unwrapped.training_team == Team.OFFENSE:
-            self.training_player_ids = self.env.unwrapped.offense_ids
-            self.opponent_player_ids = self.env.unwrapped.defense_ids
+            self.training_player_ids = list(self.env.unwrapped.offense_ids)
+            self.opponent_player_ids = list(self.env.unwrapped.defense_ids)
         else:
-            self.training_player_ids = self.env.unwrapped.defense_ids
-            self.opponent_player_ids = self.env.unwrapped.offense_ids
+            self.training_player_ids = list(self.env.unwrapped.defense_ids)
+            self.opponent_player_ids = list(self.env.unwrapped.offense_ids)
+        # Precompute numpy indices for fast masking
+        self._training_player_indices = np.array(self.training_player_ids, dtype=int)
+        self._opponent_player_indices = np.array(self.opponent_player_ids, dtype=int)
+
+    def _configure_action_space(self) -> None:
+        """Expose a reduced MultiDiscrete action space for the training team."""
+        base_space = getattr(self.env, "action_space", None)
+        if not isinstance(base_space, spaces.MultiDiscrete):
+            raise TypeError(
+                "SelfPlayEnvWrapper requires underlying env to use MultiDiscrete action space"
+            )
+        if len(self.training_player_ids) == 0:
+            raise ValueError("Training player list cannot be empty")
+        training_nvec = [int(base_space.nvec[i]) for i in self.training_player_ids]
+        self.action_space = spaces.MultiDiscrete(training_nvec)
 
     def reset(self, **kwargs):
         try:
             obs, info = self.env.reset(**kwargs)
             self._last_obs = obs
             self._set_team_ids()
+            # Ensure action space matches the (potentially updated) training team
+            self._configure_action_space()
             return obs, info
         except Exception as e:
             # Provide detailed context so SubprocVecEnv surfaces useful diagnostics
@@ -88,28 +108,60 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 f"SelfPlayEnvWrapper.step opponent predict failed: {type(e).__name__}: {e}"
             ) from e
 
-        # Resolve opponent illegal actions
+        # Resolve opponent illegal actions using only their players
+        opponent_mask = action_mask[self._opponent_player_indices]
         try:
-            opp_probs = get_policy_action_probabilities(
+            opp_probs_full = get_policy_action_probabilities(
                 self.opponent_policy, opponent_obs
             )
         except Exception:
-            opp_probs = None
+            opp_probs_full = None
+
+        opponent_probs = None
+        if opp_probs_full is not None:
+            try:
+                total_players = self.env.unwrapped.n_players
+            except Exception:
+                total_players = len(opp_probs_full)
+
+            if len(opp_probs_full) == total_players:
+                opponent_probs = [opp_probs_full[int(pid)] for pid in self.opponent_player_ids]
+            else:
+                opponent_probs = opp_probs_full[: len(self.opponent_player_ids)]
+
         opp_actions = resolve_illegal_actions(
             np.array(opp_actions_raw),
-            action_mask,
+            opponent_mask,
             self.opponent_strategy,
             self.deterministic_opponent,
-            opp_probs,
+            opponent_probs,
         )
 
-        # Build full action vector
+        action = np.array(action, dtype=int)
+        expected_dims = len(self.training_player_ids)
+        if action.shape[0] != expected_dims:
+            raise ValueError(
+                f"Expected {expected_dims} training actions, received shape {action.shape}"
+            )
+        training_mask = action_mask[self._training_player_indices]
+        n_actions = action_mask.shape[1]
+        uniform_probs = [
+            np.ones(n_actions, dtype=np.float32) for _ in range(expected_dims)
+        ]
+        training_actions = resolve_illegal_actions(
+            action,
+            training_mask,
+            self.training_strategy,
+            False,
+            uniform_probs,
+        )
+
+        # Build full action vector for the underlying environment
         full_action = np.zeros(self.env.unwrapped.n_players, dtype=int)
-        for i in range(self.env.unwrapped.n_players):
-            if i in self.training_player_ids:
-                full_action[i] = int(action[i])
-            else:
-                full_action[i] = int(opp_actions[i])
+        for idx, pid in enumerate(self.training_player_ids):
+            full_action[pid] = int(training_actions[idx])
+        for idx, pid in enumerate(self.opponent_player_ids):
+            full_action[pid] = int(opp_actions[idx])
 
         try:
             obs, reward, done, truncated, info = self.env.step(full_action)
