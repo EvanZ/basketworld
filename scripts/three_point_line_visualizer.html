@@ -242,9 +242,10 @@
       <p>
         Because we are working with a discrete hex grid, the line highlight shows which hex centers sit on (or very
         near) the perimeter. Use the sliders/inputs to explore how different radius combinations would look on the 13×13
-        court—the hoop is on the baseline at the bottom middle, so the arc faces upward just like a standard NBA half
-        court. Hexes outlined in pale gold are the ones where at least half of the polygon lies “behind” the theoretical
-        line, meaning those are the tiles that would count as three-point attempts under a ≥50% coverage rule.
+        court—the hoop is fixed on the left baseline (matching BasketWorld’s orientation where play flows left → right)
+        so the arc faces the open court. Hexes outlined in pale gold are the ones where at least half of the polygon lies
+        “behind” the theoretical line, meaning those are the tiles that would count as three-point attempts under a ≥50%
+        coverage rule.
       </p>
     </section>
 
@@ -343,7 +344,7 @@
           for (let i = 0; i <= steps; i += 1) {
             const t = startAngle + dir * (i / steps) * total;
             const x = hoop.x + radius * Math.cos(t);
-            const y = hoop.y - radius * Math.sin(t);
+            const y = hoop.y + radius * Math.sin(t);
             commands.push(`${i === 0 ? "M" : "L"} ${x} ${y}`);
           }
           return commands.join(" ");
@@ -378,37 +379,32 @@
           cell,
           hoop,
           radius,
-          shortPx,
-          segmentHeight,
+          shortBandPx,
           tolerance,
           hexSize,
           pointTest,
           baselineDepth,
         ) => {
           const dx = cell.x - hoop.x;
-          const dy = hoop.y - cell.y; // positive when in front of the hoop (up the court)
+          const dy = cell.y - hoop.y;
+          const absDy = Math.abs(dy);
 
-          if (dy < -baselineDepth - tolerance) {
+          if (dx < -baselineDepth - tolerance) {
             return { isThree: false, onLine: false, qualifies: false };
           }
 
           const dist = Math.hypot(dx, dy);
-          const withinBand =
-            shortPx !== null &&
-            segmentHeight !== null &&
-            dy <= segmentHeight + tolerance * 0.5 &&
-            dy >= -baselineDepth - tolerance;
-          const horizontalDist = Math.abs(dx);
+          const inShortBand = shortBandPx !== null && absDy >= shortBandPx - tolerance;
 
-          const isThreeCenter = pointTest(cell.x, cell.y);
-          let isThree = isThreeCenter;
-          let onLine = Math.abs(dist - radius) <= tolerance;
+          let isThree;
+          let onLine;
 
-          if (withinBand) {
-            isThree = horizontalDist >= shortPx;
-            onLine = Math.abs(horizontalDist - shortPx) <= tolerance;
-          } else if (segmentHeight !== null) {
-            onLine = onLine && dy >= segmentHeight - tolerance;
+          if (inShortBand && shortBandPx !== null) {
+            isThree = true;
+            onLine = Math.abs(absDy - shortBandPx) <= tolerance;
+          } else {
+            isThree = pointTest(cell.x, cell.y);
+            onLine = Math.abs(dist - radius) <= tolerance;
           }
 
           const verts = hexVertices(cell.x, cell.y, hexSize - 1);
@@ -459,8 +455,8 @@
           warningEl.textContent = "";
 
           const { cells, bounds } = buildCells(rows, cols, hexSize);
-          const hoopRow = rows - 1;
-          const hoopCol = Math.floor(cols / 2);
+          const hoopRow = Math.floor(rows / 2);
+          const hoopCol = 0;
           const hoopCell =
             cells.find((c) => c.row === hoopRow && c.col === hoopCol) ||
             cells.find((c) => c.row === hoopRow) ||
@@ -472,8 +468,8 @@
 
           const radiusPx = threePointDistance * pxPerHex;
           let shortPx = null;
-          let segmentHeight = null;
-          let thetaSwitch = null;
+          let horizontalReach = null;
+          let arcAngle = null;
 
           if (threePointShortDistance !== null && threePointShortDistance !== undefined && threePointShortDistance !== "") {
             const shortRaw = Number(threePointShortDistance);
@@ -484,9 +480,11 @@
                 state.threePointShortDistance = null;
               } else {
                 shortPx = shortRaw * pxPerHex;
-                const ratio = clamp(shortPx / radiusPx, 0, 0.999);
-                thetaSwitch = Math.acos(ratio);
-                segmentHeight = radiusPx * Math.sin(thetaSwitch);
+                if (shortPx >= radiusPx) {
+                  shortPx = radiusPx * 0.999;
+                }
+                horizontalReach = Math.sqrt(Math.max(radiusPx * radiusPx - shortPx * shortPx, 0));
+                arcAngle = Math.asin(shortPx / radiusPx);
                 state.threePointShortDistance = shortRaw;
               }
             }
@@ -508,17 +506,12 @@
 
           const pointIsThree = (px, py) => {
             const dx = px - hoop.x;
-            const dy = hoop.y - py;
-            if (dy < -baselineDepth - tolerance) {
+            const dy = py - hoop.y;
+            if (dx < -baselineDepth - tolerance) {
               return false;
             }
-            if (
-              shortPx !== null &&
-              segmentHeight !== null &&
-              dy <= segmentHeight + tolerance &&
-              dy >= -baselineDepth - tolerance
-            ) {
-              return Math.abs(dx) >= shortPx;
+            if (shortPx !== null && Math.abs(dy) >= shortPx - tolerance) {
+              return true;
             }
             return Math.hypot(dx, dy) >= radiusPx;
           };
@@ -543,7 +536,6 @@
               hoop,
               radiusPx,
               shortPx,
-              segmentHeight,
               tolerance,
               hexSize,
               pointIsThree,
@@ -568,33 +560,32 @@
           const lineGroup = document.createElementNS(NS, "g");
           svg.appendChild(lineGroup);
 
-          if (shortPx !== null && segmentHeight !== null && thetaSwitch !== null) {
-            const leftX = hoop.x - shortPx;
-            const rightX = hoop.x + shortPx;
-            const segmentTop = hoop.y - segmentHeight;
-            const segmentBottom = hoop.y + baselineDepth;
+          if (shortPx !== null && horizontalReach !== null && arcAngle !== null) {
+            const topY = hoop.y - shortPx;
+            const bottomY = hoop.y + shortPx;
+            const startX = hoop.x;
+            const endX = hoop.x + horizontalReach;
 
-            const drawVertical = (x) => {
+            const drawHorizontal = (y) => {
               const line = document.createElementNS(NS, "line");
-              line.setAttribute("x1", x);
-              line.setAttribute("x2", x);
-              line.setAttribute("y1", segmentBottom);
-              line.setAttribute("y2", segmentTop);
+              line.setAttribute("x1", startX);
+              line.setAttribute("x2", endX);
+              line.setAttribute("y1", y);
+              line.setAttribute("y2", y);
               line.setAttribute("class", "line-path secondary");
               lineGroup.appendChild(line);
             };
 
-            drawVertical(leftX);
-            drawVertical(rightX);
+            drawHorizontal(topY);
+            drawHorizontal(bottomY);
 
-            const theta = Math.atan2(segmentHeight, shortPx);
             const arcPath = document.createElementNS(NS, "path");
-            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, Math.PI - theta, theta, 200));
+            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, -arcAngle, arcAngle, 200));
             arcPath.setAttribute("class", "line-path");
             lineGroup.appendChild(arcPath);
           } else {
             const arcPath = document.createElementNS(NS, "path");
-            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, Math.PI, 0, 240));
+            arcPath.setAttribute("d", buildArcPath(hoop, radiusPx, -Math.PI / 2, Math.PI / 2, 240));
             arcPath.setAttribute("class", "line-path");
             lineGroup.appendChild(arcPath);
           }
