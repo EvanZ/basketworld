@@ -357,6 +357,7 @@ def setup_environment(args, training_team, env_idx=None):
         steal_distance_factor=getattr(args, "steal_distance_factor", 0.08),
         steal_position_weight_min=getattr(args, "steal_position_weight_min", 0.3),
         three_point_distance=args.three_point_distance,
+        three_point_short_distance=getattr(args, "three_point_short_distance", None),
         layup_pct=args.layup_pct,
         layup_std=getattr(args, "layup_std", 0.0),
         three_pt_pct=args.three_pt_pct,
@@ -1556,6 +1557,7 @@ def main(args):
                     min_shot_clock=getattr(args, "min_shot_clock", 10),
                     render_mode="rgb_array",
                     three_point_distance=args.three_point_distance,
+                    three_point_short_distance=getattr(args, "three_point_short_distance", None),
                     layup_pct=args.layup_pct,
                     layup_std=getattr(args, "layup_std", 0.0),
                     three_pt_pct=args.three_pt_pct,
@@ -1774,9 +1776,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--three-point-distance",
-        type=int,
-        default=4,
+        type=float,
+        default=4.0,
         help="Hex distance defining the three-point line.",
+    )
+    parser.add_argument(
+        "--three-point-short-distance",
+        type=float,
+        default=None,
+        help="Optional short corner distance for 3pt line (like NBA). If None, uses circular arc.",
     )
     parser.add_argument(
         "--players", type=int, default=2, help="Number of players per side."

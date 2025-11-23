@@ -52,8 +52,14 @@ def get_mlflow_params(
             "three_pt_distance",
             "three-pt-distance",
         ],
-        int,
-        4,
+        float,
+        4.0,
+    )
+    optional["three_point_short_distance"] = _get_param(
+        params,
+        ["three_point_short_distance", "three-point-short-distance"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None,
     )
     optional["layup_pct"] = _get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
     optional["three_pt_pct"] = _get_param(

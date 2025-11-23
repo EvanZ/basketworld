@@ -1375,6 +1375,14 @@ const stealRisks = computed(() => {
               <span class="param-name">Min shot clock at reset:</span>
               <span class="param-value">{{ props.gameState.min_shot_clock ?? 'N/A' }}</span>
             </div>
+            <div class="param-item">
+              <span class="param-name">Three point distance:</span>
+              <span class="param-value">{{ props.gameState.three_point_distance || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Three point short distance:</span>
+              <span class="param-value">{{ props.gameState.three_point_short_distance || 'N/A' }}</span>
+            </div>
           </div>
 
           <div class="param-category">
@@ -1445,10 +1453,6 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>Shot Parameters</h5>
-            <div class="param-item">
-              <span class="param-name">Three point distance:</span>
-              <span class="param-value">{{ props.gameState.three_point_distance || 'N/A' }}</span>
-            </div>
             <div v-if="props.gameState.shot_params" class="param-group">
               <div class="param-item">
                 <span class="param-name">Layup mean:</span>
@@ -1790,21 +1794,25 @@ const stealRisks = computed(() => {
 
 <style scoped>
 .player-controls-container {
-  padding: 1rem;
-  background-color: #f8f9fa;
-  border-radius: 8px;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
-  max-height: 80vh;
+  height: 100%;
+  min-height: 400px;
+}
+
+.controls-wrapper {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
   overflow-y: auto;
 }
 
 .tab-navigation {
   display: flex;
   gap: 0.5rem;
-  border-bottom: 1px solid #dee2e6;
+  border-bottom: 1px solid var(--app-panel-border);
   margin-bottom: 1rem;
+  flex-wrap: wrap;
 }
 
 .tab-navigation button {
@@ -1814,16 +1822,21 @@ const stealRisks = computed(() => {
   cursor: pointer;
   border-bottom: 2px solid transparent;
   font-weight: 500;
+  color: var(--app-text-muted);
   transition: all 0.2s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.85rem;
 }
 
 .tab-navigation button:hover {
-  background-color: #e9ecef;
+  color: var(--app-text);
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 .tab-navigation button.active {
-  border-bottom-color: #007bff;
-  color: #007bff;
+  border-bottom-color: var(--app-accent);
+  color: var(--app-accent);
 }
 
 .tab-content {
@@ -1833,37 +1846,45 @@ const stealRisks = computed(() => {
   gap: 1rem;
 }
 
-/* Existing styles */
+/* Player tabs */
 .player-tabs {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+  margin-bottom: 0.5rem;
 }
 
 .player-tabs button {
-  padding: 0.5rem 1rem;
-  border: 1px solid #ccc;
-  background-color: white;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--app-panel-border);
+  background-color: rgba(15, 23, 42, 0.4);
+  color: var(--app-text-muted);
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 999px;
   transition: all 0.2s ease;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
-.player-tabs button:hover {
-  background-color: #e9ecef;
+.player-tabs button:hover:not(:disabled) {
+  border-color: var(--app-accent);
+  color: var(--app-accent);
 }
 
 .player-tabs button.active {
-  background-color: #007bff;
-  color: white;
-  border-color: #007bff;
+  background-color: rgba(56, 189, 248, 0.15);
+  color: var(--app-accent);
+  border-color: var(--app-accent);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
 }
 
 .player-tabs button:disabled {
-  background-color: #e9ecef;
-  color: #6c757d;
+  background-color: rgba(0, 0, 0, 0.2);
+  color: var(--app-text-muted);
+  opacity: 0.5;
   cursor: not-allowed;
-  opacity: 0.6;
+  border-color: transparent;
 }
 
 /* Rewards styles */
@@ -1877,9 +1898,10 @@ const stealRisks = computed(() => {
   display: flex;
   gap: 1rem;
   padding: 1rem;
-  background-color: white;
-  border-radius: 4px;
-  border: 1px solid #dee2e6;
+  background-color: rgba(15, 23, 42, 0.6);
+  border-radius: 16px;
+  border: 1px solid var(--app-panel-border);
+  justify-content: space-around;
 }
 
 .total-item {
@@ -1890,50 +1912,62 @@ const stealRisks = computed(() => {
 }
 
 .team-label {
-  font-weight: bold;
-  font-size: 0.9rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .team-label.offense {
-  color: #dc3545;
+  color: #fb7185;
 }
 
 .team-label.defense {
-  color: #007bff;
+  color: var(--app-accent);
 }
 
 .reward-value {
-  font-size: 1.2rem;
+  font-size: 1.3rem;
   font-weight: bold;
+  font-family: 'DSEG7 Classic', monospace;
+  color: var(--app-text);
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.1);
 }
 
 .reward-history {
   max-height: 300px;
   overflow-y: auto;
+  border-radius: 12px;
+  border: 1px solid var(--app-panel-border);
 }
 
 .no-rewards {
   text-align: center;
   padding: 2rem;
-  color: #6c757d;
+  color: var(--app-text-muted);
   font-style: italic;
 }
 
 .reward-table {
-  background-color: white;
-  border-radius: 4px;
-  border: 1px solid #dee2e6;
-  overflow: hidden;
+  background-color: transparent;
+  width: 100%;
+  border-collapse: collapse;
 }
 
 .reward-header {
   display: grid;
   grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr;
   padding: 0.75rem;
-  background-color: #f8f9fa;
-  font-weight: bold;
-  border-bottom: 1px solid #dee2e6;
+  background-color: rgba(15, 23, 42, 0.8);
+  font-weight: 600;
+  border-bottom: 1px solid var(--app-panel-border);
   text-align: center;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  position: sticky;
+  top: 0;
 }
 
 .reward-table.with-phi .reward-header {
@@ -1943,9 +1977,11 @@ const stealRisks = computed(() => {
 .reward-row {
   display: grid;
   grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr;
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid #f1f3f4;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   text-align: center;
+  font-size: 0.9rem;
+  color: var(--app-text);
 }
 
 .reward-table.with-phi .reward-row {
@@ -1957,34 +1993,32 @@ const stealRisks = computed(() => {
 }
 
 .reward-row:hover {
-  background-color: #f8f9fa;
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 .reward-row.current-reward-row {
-  background-color: #fff3cd !important;
-  font-weight: 600;
-  border-top: 2px solid #ffc107;
-  border-bottom: 2px solid #ffc107;
+  background-color: rgba(251, 146, 60, 0.1) !important;
+  border-top: 1px solid rgba(251, 146, 60, 0.3);
+  border-bottom: 1px solid rgba(251, 146, 60, 0.3);
 }
 
 .reward-row.current-reward-row:hover {
-  background-color: #ffe69c !important;
+  background-color: rgba(251, 146, 60, 0.15) !important;
 }
 
 .positive {
-  color: #28a745;
-  font-weight: bold;
+  color: var(--app-success);
+  font-weight: 600;
 }
 
 .negative {
-  color: #dc3545;
-  font-weight: bold;
+  color: #fb7185;
+  font-weight: 600;
 }
 
 .reason-text {
-  font-size: 0.85rem;
-  color: #6c757d;
-  font-style: italic;
+  font-size: 0.8rem;
+  color: var(--app-text-muted);
 }
 
 /* Existing control styles */
@@ -1993,68 +2027,76 @@ const stealRisks = computed(() => {
   flex-direction: column;
   align-items: center;
   gap: 1rem;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.4);
+  border-radius: 16px;
+  border: 1px solid var(--app-panel-border);
 }
 
-
 .disabled {
-  opacity: 0.7;
+  opacity: 0.5;
   pointer-events: none;
+  filter: grayscale(100%);
 }
 
 /* Moves styles */
 .moves-section {
-  padding: 1rem;
+  padding: 0.5rem;
 }
 
 .moves-table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 10px;
+  margin-top: 0;
+  border-radius: 8px;
+  overflow: hidden;
 }
 
 .moves-table th,
 .moves-table td {
-  border: 1px solid #ddd;
-  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  padding: 0.6rem;
   text-align: center;
+  font-size: 0.9rem;
 }
 
 .moves-table th {
-  background-color: #f5f5f5;
-  font-weight: bold;
+  background-color: rgba(15, 23, 42, 0.8);
+  color: var(--app-text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.05em;
 }
 
 .value-cell {
   font-family: 'Courier New', monospace;
   font-size: 0.9em;
-  color: #333;
+  color: var(--app-accent);
   font-weight: 500;
 }
 
 .moves-table tr:nth-child(even) {
-  background-color: #f9f9f9;
+  background-color: rgba(255, 255, 255, 0.02);
 }
 
 .moves-table tr.current-shot-clock-row {
-  background-color: #fff3cd !important;
-  font-weight: 600;
-}
-
-.moves-table tr.current-shot-clock-row:hover {
-  background-color: #ffe69c !important;
+  background-color: rgba(56, 189, 248, 0.15) !important;
+  box-shadow: inset 0 0 10px rgba(56, 189, 248, 0.1);
 }
 
 .moves-table tr.current-shot-clock-row td {
-  border-top: 2px solid #ffc107;
-  border-bottom: 2px solid #ffc107;
+  border-top: 1px solid rgba(56, 189, 248, 0.4);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.4);
+  color: var(--app-text);
 }
 
 .moves-table tr.current-shot-clock-row td:first-child {
-  border-left: 2px solid #ffc107;
+  border-left: 1px solid rgba(56, 189, 248, 0.4);
 }
 
 .moves-table tr.current-shot-clock-row td:last-child {
-  border-right: 2px solid #ffc107;
+  border-right: 1px solid rgba(56, 189, 248, 0.4);
 }
 
 .move-cell {
@@ -2063,80 +2105,87 @@ const stealRisks = computed(() => {
 
 .move-action {
   font-weight: 500;
-  margin-bottom: 2px;
+  color: var(--app-text);
 }
 
 .ball-holder-icon {
   font-size: 1em;
+  color: var(--app-warning);
+  margin-left: 4px;
 }
 
 .pass-steal-info {
-  font-size: 0.8em;
-  color: #dc3545;
+  font-size: 0.75em;
+  color: #fb7185;
   font-style: italic;
 }
 
 .defender-pressure-info {
-  font-size: 0.8em;
-  color: #ff6b35;
+  font-size: 0.75em;
+  color: var(--app-warning);
   font-style: italic;
 }
 
 .shot-clock-cell {
   font-weight: 600;
-  color: #495057;
-  background-color: #f8f9fa;
+  color: var(--app-warning);
+  font-family: 'DSEG7 Classic', monospace;
 }
 
 .no-moves {
   text-align: center;
-  color: #666;
+  color: var(--app-text-muted);
   font-style: italic;
   padding: 20px;
 }
 
 /* Parameters styles */
 .parameters-section {
-  padding: 1rem;
+  padding: 0;
 }
 
 .parameters-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 1rem;
 }
 
 .param-category {
-  background: #f8f9fa;
-  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.4);
+  border-radius: 12px;
   padding: 1rem;
+  border: 1px solid var(--app-panel-border);
 }
 
 .param-category h5 {
-  margin: 0 0 0.5rem 0;
-  color: #333;
+  margin: 0 0 0.8rem 0;
+  color: var(--app-accent);
   font-weight: 600;
-  border-bottom: 1px solid #ddd;
-  padding-bottom: 0.25rem;
+  border-bottom: 1px solid var(--app-panel-border);
+  padding-bottom: 0.5rem;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.05em;
 }
 
 .param-item {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.25rem 0;
-  border-bottom: 1px solid #eee;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
 }
 
 .policy-select-item {
   flex-direction: column;
   align-items: flex-start;
-  gap: 0.35rem;
+  gap: 0.5rem;
 }
 
 .policy-label {
   font-weight: 500;
-  color: #444;
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
 }
 
 .policy-select-wrapper {
@@ -2145,27 +2194,27 @@ const stealRisks = computed(() => {
 
 .policy-select-wrapper select {
   width: 100%;
-  padding: 0.35rem 0.5rem;
-  border: 1px solid #cfd3d7;
-  border-radius: 6px;
-  font-size: 0.95rem;
-  background: #fff;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  background: rgba(13, 20, 38, 0.8);
+  color: var(--app-text);
 }
 
 .policy-select-wrapper select:disabled {
-  opacity: 0.6;
-  background: #f1f3f5;
+  opacity: 0.5;
   cursor: not-allowed;
 }
 
 .policy-status {
-  font-size: 0.85rem;
-  margin-top: 0.35rem;
-  color: #6c757d;
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+  color: var(--app-text-muted);
 }
 
 .policy-status.error {
-  color: #c0392b;
+  color: #fb7185;
 }
 
 .param-item:last-child {
@@ -2174,103 +2223,112 @@ const stealRisks = computed(() => {
 
 .param-name {
   font-weight: 500;
-  color: #555;
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
 }
 
 .param-value {
   font-family: 'Courier New', monospace;
-  background: #fff;
-  padding: 0.2rem 0.4rem;
-  border-radius: 3px;
-  border: 1px solid #ddd;
-  font-size: 0.9em;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  font-size: 0.85em;
+  color: var(--app-accent);
 }
 
 /* Observation Tab Styles */
 .observation-section {
-  padding: 1rem;
+  padding: 0;
 }
 
 .observation-table-wrapper {
   max-height: 600px;
   overflow-y: auto;
-  border: 1px solid #dee2e6;
-  border-radius: 4px;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.4);
 }
 
 .observation-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9em;
-  background: white;
+  background: transparent;
 }
 
 .observation-table th {
   position: sticky;
   top: 0;
-  background-color: #2c3e50;
-  color: white;
+  background-color: rgba(15, 23, 42, 0.95);
+  color: var(--app-text-muted);
   padding: 0.75rem;
   text-align: left;
   font-weight: 600;
-  border-bottom: 2px solid #34495e;
+  border-bottom: 1px solid var(--app-panel-border);
   z-index: 10;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.05em;
 }
 
 .observation-table td {
   padding: 0.6rem 0.75rem;
-  border-bottom: 1px solid #ecf0f1;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: var(--app-text);
 }
 
 .observation-table tbody tr:hover {
-  background-color: #f8f9fa;
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 .group-label {
   font-weight: 600;
-  background-color: #ecf0f1;
-  color: #2c3e50;
+  background-color: rgba(15, 23, 42, 0.6);
+  color: var(--app-accent);
   min-width: 140px;
+  border-right: 1px solid rgba(148, 163, 184, 0.1);
 }
 
 .value-mono {
   font-family: 'Courier New', monospace;
-  background: #f5f5f5;
-  padding: 0.3rem 0.5rem;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.2rem 0.4rem;
   border-radius: 3px;
   font-weight: 500;
-  color: #d35400;
+  color: var(--app-warning);
+  border: 1px solid rgba(148, 163, 184, 0.15);
 }
 
 .notes {
   font-size: 0.85em;
-  color: #7f8c8d;
+  color: var(--app-text-muted);
   font-style: italic;
 }
 
 .notes.highlight {
-  color: #c0392b;
+  color: #fb7185;
   font-weight: 600;
   font-style: normal;
 }
 
-.group-player-pos td:first-child { background-color: #e8f4f8; }
-.group-ball-holder td:first-child { background-color: #fef5e7; }
-.group-shot-clock td:first-child { background-color: #ebf5fb; }
-.group-team-encoding td:first-child { background-color: #f0e6ff; }
-.group-ball-handler-pos td:first-child { background-color: #fef9e7; }
-.group-hoop td:first-child { background-color: #eafaf1; }
-.group-distances td:first-child { background-color: #fdeef4; }
-.group-angles td:first-child { background-color: #f4ecf7; }
-.group-lane-steps td:first-child { background-color: #fef5e7; }
-.group-ep td:first-child { background-color: #eafaf1; }
-.group-turnover td:first-child { background-color: #fadbd8; }
-.group-steal td:first-child { background-color: #fadbd8; }
+.group-player-pos td:first-child { background-color: rgba(56, 189, 248, 0.05); }
+.group-ball-holder td:first-child { background-color: rgba(251, 146, 60, 0.05); }
+.group-shot-clock td:first-child { background-color: rgba(56, 189, 248, 0.08); }
+.group-team-encoding td:first-child { background-color: rgba(168, 85, 247, 0.05); }
+.group-ball-handler-pos td:first-child { background-color: rgba(251, 146, 60, 0.08); }
+.group-hoop td:first-child { background-color: rgba(45, 212, 191, 0.05); }
+.group-distances td:first-child { background-color: rgba(244, 114, 182, 0.05); }
+.group-angles td:first-child { background-color: rgba(192, 132, 252, 0.05); }
+.group-lane-steps td:first-child { background-color: rgba(251, 146, 60, 0.05); }
+.group-ep td:first-child { background-color: rgba(45, 212, 191, 0.08); }
+.group-turnover td:first-child { background-color: rgba(251, 113, 133, 0.08); }
+.group-steal td:first-child { background-color: rgba(251, 113, 133, 0.08); }
 
 .no-data {
   text-align: center;
   padding: 2rem;
-  color: #7f8c8d;
+  color: var(--app-text-muted);
   font-style: italic;
 }
 </style> 

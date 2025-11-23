@@ -87,8 +87,8 @@ class HexagonBasketballEnv(gym.Env):
         steal_perp_decay: float = 1.5,
         steal_distance_factor: float = 0.08,
         steal_position_weight_min: float = 0.3,
-        three_point_distance: int = 4,
-        three_point_short_distance: Optional[int] = None,
+        three_point_distance: float = 4.0,
+        three_point_short_distance: Optional[float] = None,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
         # Baseline shooting variability (per-player, sampled each episode)
@@ -209,9 +209,9 @@ class HexagonBasketballEnv(gym.Env):
         # Honor constructor flag for strict illegal action handling
         self.raise_on_illegal_action = bool(raise_on_illegal_action)
         # Three-point configuration and shot model parameters
-        self.three_point_distance = int(three_point_distance)
+        self.three_point_distance = float(three_point_distance)
         self.three_point_short_distance = (
-            int(three_point_short_distance)
+            float(three_point_short_distance)
             if three_point_short_distance is not None
             else None
         )
@@ -1392,12 +1392,156 @@ class HexagonBasketballEnv(gym.Env):
                 qualifies = False
                 is_outline = False
 
-                if short_band is not None and abs_dy >= short_band - tolerance:
-                    qualifies = True
-                    if abs(abs_dy - short_band) <= tolerance:
-                        is_outline = True
-                elif dist_cart >= radius_cart - tolerance:
-                    qualifies = True
+                # Sampling logic to determine qualification (at least 50% of hex area)
+                # We use a 7-point sampling pattern: center + 6 vertices
+                hex_size_px = 1.0
+                px_per_hex = hex_size_px * math.sqrt(3)
+                # Radius of circumcircle for hex with height 1.0 (pointy-top) is 1/sqrt(3) * height?
+                # No, our hexes are pointy-topped.
+                # Height of pointy-topped hex is 2 * size. Width is sqrt(3) * size.
+                # If we assume axial coordinates map to Cartesian where dist((0,0), (1,0)) = sqrt(3) * size,
+                # then spacing is sqrt(3) * size.
+                # In _axial_to_cartesian: x = size * sqrt(3) * (q + r/2), y = size * 3/2 * r
+                # Normalized hex size in _axial_to_cartesian seems to be 1.0 implicit.
+                # Let's assume size=1 for sampling.
+                
+                # Vertices of a pointy-topped hex at (cx, cy) with size=1
+                # angles: 30, 90, 150, 210, 270, 330 degrees
+                # x = cx + size * cos(angle)
+                # y = cy + size * sin(angle)
+                
+                samples = [(cx, cy)] # Center
+                for i in range(6):
+                    angle_deg = 30 + 60 * i
+                    angle_rad = math.radians(angle_deg)
+                    # Use slightly smaller radius to stay within the hex
+                    sx = cx + 0.95 * math.cos(angle_rad)
+                    sy = cy + 0.95 * math.sin(angle_rad)
+                    samples.append((sx, sy))
+                
+                qualified_samples = 0
+                for sx, sy in samples:
+                    sdx = sx - hoop_x
+                    sdy = sy - hoop_y
+                    sabs_dy = abs(sdy)
+                    sdist = math.hypot(sdx, sdy)
+                    
+                    is_3pt_pt = False
+                    if short_band is not None and sabs_dy >= short_band - tolerance:
+                         # Behind short line (extended infinitely? No, usually just horizontal band)
+                         # The visualizer logic:
+                         # if abs(dy) >= short_band: qualifies
+                         # But wait, the short line is a vertical line segments at x? 
+                         # No, in NBA, short lines are parallel to sidelines (horizontal in our rotated view?)
+                         # Our visualizer had: "short distance refers to distance from basket to lines on SIDES"
+                         # Basket is at (0, H/2). Court is WxH.
+                         # Sidelines are top/bottom in our (x,y) or left/right?
+                         # _axial_to_cartesian: x is roughly col, y is roughly row.
+                         # Basket at (0, H/2) is left-center.
+                         # So sidelines are top (y=0) and bottom (y=max).
+                         # Short distance is distance from basket center Y to the straight lines.
+                         # So straight lines are at hoop_y +/- short_band.
+                         # Yes, so abs(dy) >= short_band means OUTSIDE the central lane, i.e. near the sidelines.
+                         # Wait, NBA short corner: The line is straight near the sidelines, then curves.
+                         # The straight part is CLOSER to the basket than the arc would be.
+                         # The 3pt line is the arc, UNLESS the straight line is closer.
+                         # So you are a 3pt shooter if you are OUTSIDE the shape formed by min(arc, straight).
+                         # The straight lines are at y = +/- 22ft (NBA). Arc is r=23.75ft.
+                         # If |y| > 22, the distance to hoop > 22. 
+                         # But the line is AT 22. So if |y| > 22, you are "behind" the line?
+                         # No, the line is x = ...?
+                         # Let's re-read visualizer logic.
+                         pass
+
+                    # Re-implementing precise visualizer logic for point classification
+                    # Visualizer: pointIsThree(px, py)
+                    # if (shortPx defined)
+                    #    horizontalReach = sqrt(R^2 - short^2)
+                    #    if abs(dy) >= shortPx:
+                    #        return dx >= horizontalReach (Wait, this implies a box corner?)
+                    # No, NBA line:
+                    # You are 3pt if:
+                    # 1. |y| > 22ft ? No.
+                    # The line is defined by x = 22ft (corner) -- wait, in NBA corners are at bottom/top of visual.
+                    # In our view (hoop left), corners are top/bottom.
+                    # Straight lines are y = hoop_y +/- short_band?
+                    # If |y - hoop_y| > short_band... that means you are FAR from center.
+                    # Actually, the straight lines in NBA are parallel to the sidelines.
+                    # Distance from center stripe is fixed (22ft).
+                    # So if you are in the "corner" (high |y|), the line is straight at x = constant? 
+                    # No, the line is parallel to side, so y = const? No, line is parallel to side...
+                    # Sideline is y=0 and y=H.
+                    # Parallel to sideline means y = const.
+                    # So the 3pt line is y = hoop_y + 22 and y = hoop_y - 22? 
+                    # That would be a horizontal line running full court.
+                    # No, the 3pt line *segment* is straight there.
+                    # It connects to the baseline (x=0).
+                    # So for x < some_intersection, the line is y = +/- 22.
+                    # For x > intersection, it's the arc.
+                    # Wait, if line is y = 22, then distance from hoop (0,0) is sqrt(x^2 + 22^2).
+                    # If x=0, dist=22. This is < 23.75.
+                    # So yes, near baseline, the line is closer (22ft).
+                    # So a point (x,y) is a 3pt attempt if:
+                    #   if x < intersection:
+                    #       return |y| > short_band (You must be "outside" the line towards the sideline)
+                    #   else:
+                    #       return dist > radius
+                    
+                    # BUT our visualizer had specific logic.
+                    # Let's assume the visualizer logic was:
+                    # if short_band is set:
+                    #    horizontal_reach = sqrt(radius^2 - short^2)
+                    #    if dx < horizontal_reach:
+                    #        is_3pt = abs(dy) >= short_band
+                    #    else:
+                    #        is_3pt = dist >= radius
+                    
+                    # Let's validate this.
+                    # If dx is small (near baseline), we check if |dy| is large enough.
+                    # If |dy| < short_band, we are inside the paint/2pt zone.
+                    # If |dy| > short_band, we are outside -> 3pt.
+                    # Correct.
+                    
+                    # Calculate horizontal_reach (x-coord where arc meets straight line)
+                    # straight line at y = short_band. Circle x^2 + y^2 = R^2.
+                    # x^2 + short^2 = R^2 => x = sqrt(R^2 - short^2)
+                    
+                    horizontal_reach = 0.0
+                    if short_band is not None and short_band < radius_cart:
+                        horizontal_reach = math.sqrt(radius_cart**2 - short_band**2)
+                    
+                    if short_band is not None:
+                        if dx < horizontal_reach:
+                            # In the straight-line region (corner)
+                            if sabs_dy >= short_band:
+                                is_3pt_pt = True
+                        else:
+                            # In the arc region
+                            if sdist >= radius_cart:
+                                is_3pt_pt = True
+                    else:
+                        # Just arc
+                        if sdist >= radius_cart:
+                            is_3pt_pt = True
+                            
+                    if is_3pt_pt:
+                        qualified_samples += 1
+                
+                qualifies = (qualified_samples / len(samples)) >= 0.5
+                
+                # Outline check (simplified: if center is close to boundary)
+                # Ideally we check if hex crosses the boundary, but distance check is decent proxy
+                if short_band is not None:
+                    if dx < horizontal_reach:
+                        # Distance to straight line
+                        dist_to_line = abs(sabs_dy - short_band)
+                        if dist_to_line <= tolerance:
+                            is_outline = True
+                    else:
+                        # Distance to arc
+                        if abs(dist_cart - radius_cart) <= tolerance:
+                            is_outline = True
+                else:
                     if abs(dist_cart - radius_cart) <= tolerance:
                         is_outline = True
 
@@ -2000,7 +2144,12 @@ class HexagonBasketballEnv(gym.Env):
         """
         # Anchors
         d0 = 1
-        d1 = max(self.three_point_distance, d0 + 1)
+        # Fix: When three_point_distance is float (e.g., 4.75), max() needs comparable types.
+        # Use ceil() for integer hex distance logic, or just keep as float for interpolation.
+        # Here we need the 'distance' value that corresponds to the 3pt line anchor.
+        # Since 'distance' argument is integer hex distance, we should round up or use the raw float.
+        # Let's use the raw float for the anchor to allow sub-hex precision in the probability curve.
+        d1 = max(float(self.three_point_distance), float(d0 + 1))
         # Use per-offense-player anchors if applicable
         if shooter_id in self.offense_ids:
             idx = int(shooter_id)

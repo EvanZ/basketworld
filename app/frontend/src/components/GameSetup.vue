@@ -97,28 +97,99 @@ function startGame() {
 
 <style scoped>
 .setup-container {
-    max-width: 500px;
-    margin: 2rem auto;
-    padding: 2rem;
-    border: 1px solid #ccc;
-    border-radius: 8px;
+  max-width: 540px;
+  margin: 1.5rem auto;
+  padding: 1.75rem;
+  background: var(--app-panel);
+  border: 1px solid var(--app-panel-border);
+  border-radius: 24px;
+  box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
 }
+
+.setup-container h2 {
+  margin-bottom: 0.6rem;
+  color: var(--app-accent);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 0.95rem;
+}
+
+.setup-container p {
+  color: var(--app-text-muted);
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+}
+
 .form-group {
-    margin-bottom: 1.5rem;
+  margin-bottom: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
 }
+
 label {
-    margin-right: 1rem;
+  color: var(--app-text);
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
 }
-input[type="text"] {
-    width: 100%;
-    padding: 0.5rem;
+
+input[type="text"],
+select {
+  width: 100%;
+  background: rgba(13, 20, 38, 0.85);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: var(--app-text);
+  border-radius: 18px;
+  padding: 0.6rem 0.9rem;
+  font-family: inherit;
+  letter-spacing: 0.04em;
+  transition: border 0.2s ease, box-shadow 0.2s ease;
 }
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--app-accent-strong);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
+}
+
+.radio-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.radio-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
 button {
-    padding: 0.75rem 1.5rem;
-    cursor: pointer;
+  margin-top: 0.5rem;
+  padding: 0.65rem 1.4rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  transition: color 0.15s ease, border 0.15s ease, transform 0.15s ease;
 }
+
+button:hover {
+  transform: translateY(-1px);
+  color: var(--app-accent);
+  border-color: var(--app-accent-strong);
+}
+
 .error-message {
-    margin-top: 1rem;
-    color: red;
+  margin-top: 1rem;
+  color: #f87171;
 }
-</style> 
+</style>

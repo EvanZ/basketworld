@@ -492,11 +492,13 @@ const episodeOutcome = computed(() => {
         const shotResult = results.shots[shooterId];
         const pid = parseInt(shooterId, 10);
         const pos = currentGameState.value.positions[pid];
+        // isThree comes directly from the backend shot result
+        const isThree = shotResult.is_three;
         const [q, r] = pos;
         const bq = currentGameState.value.basket_position[0];
         const br = currentGameState.value.basket_position[1];
+        // Simple distance for dunk check
         const dist = (Math.abs(q - bq) + Math.abs((q + r) - (bq + br)) + Math.abs(r - br)) / 2;
-        const isThree = dist >= (currentGameState.value.three_point_distance ?? 4);
         const isDunk = dist === 0;
         return {
             type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT',

@@ -1047,20 +1047,19 @@ onBeforeUnmount(() => {
           </button>
           
           <button 
+            v-if="gameState && !gameState.done"
+            @click="handleResetPositions" 
+            class="action-button reset-button" 
+            title="Reset player positions to start of turn"
+          >
+            Reset Pos
+          </button>
+
+          <button 
             @click="handlePlayAgain" 
             class="action-button new-game-button"
           >
             New Game
-          </button>
-        </div>
-
-        <div class="action-buttons" v-if="gameState && !gameState.done">
-           <button 
-            @click="handleResetPositions" 
-            class="action-button reset-button" 
-            title="Reset player positions to start of turn"
-           >
-            Reset Pos
           </button>
         </div>
 
@@ -1092,283 +1091,231 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-header {
-  text-align: center;
-  margin-bottom: 2rem;
-}
-.loading {
-  text-align: center;
-  font-size: 1.5rem;
-  margin-top: 2rem;
-}
-.error-message {
-  color: red;
-  text-align: center;
-  margin-top: 1rem;
+main {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
 }
 
-.ai-toggle {
+header {
   text-align: center;
-  margin-bottom: 1rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--app-accent);
+  font-size: 1.1rem;
+  margin-bottom: 0.5rem;
 }
+
+.loading,
+.error-message {
+  text-align: center;
+  font-size: 0.95rem;
+  color: var(--app-text-muted);
+}
+
+.error-message {
+  color: #fb7185;
+}
+
+.panel {
+  background: var(--app-panel);
+  border: 1px solid var(--app-panel-border);
+  border-radius: 24px;
+  padding: 1.5rem;
+  box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
+}
+
+.ai-toggle,
+.eval-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.8rem;
+  margin-bottom: 0.5rem;
+}
+
 .toggle-btn {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.4rem 0.8rem;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  background: #fff;
-  cursor: pointer;
-  margin: 0 0.5rem;
-  font-size: 1.2rem;
-}
-.toggle-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.toggle-label {
-  font-weight: 500;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  font-size: 0.85rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition: color 0.15s ease, border 0.15s ease;
 }
 
-.eval-controls {
-  text-align: center;
-  margin-bottom: 1rem;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.5rem;
+.toggle-btn:hover:not(:disabled) {
+  color: var(--app-accent);
+  border-color: var(--app-accent-strong);
+}
+
+.toggle-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .eval-controls-row {
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 0.75rem;
 }
 
 .eval-input {
-  width: 100px;
-  padding: 0.5rem;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  font-size: 1rem;
+  width: 110px;
+  padding: 0.55rem 0.8rem;
+  border-radius: 16px;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(13, 20, 38, 0.85);
+  color: var(--app-text);
+  letter-spacing: 0.05em;
 }
 
 .eval-button {
-  padding: 0.5rem 1rem;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  background: #4CAF50;
-  color: white;
-  font-size: 1rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  padding: 0.5rem 1.2rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.75rem;
 }
 
 .eval-button:hover:not(:disabled) {
-  background: #45a049;
+  border-color: var(--app-success);
+  color: var(--app-success);
 }
 
 .eval-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  background: #999;
+  opacity: 0.4;
 }
 
 .eval-status {
-  font-size: 1rem;
-  font-weight: 500;
-  color: #333;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
 }
 
 .eval-progress-bar {
-  width: 300px;
-  height: 8px;
-  background-color: #ddd;
-  border-radius: 4px;
+  width: 260px;
+  height: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
   overflow: hidden;
-  border: 1px solid #999;
 }
 
 .eval-progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, #4CAF50 0%, #45a049 100%);
-  transition: width 0.3s ease;
+  background: linear-gradient(90deg, var(--app-success), var(--app-accent));
 }
 
 .eval-progress-fill.indeterminate {
-  animation: indeterminate-progress 1.5s ease-in-out infinite;
+  animation: indeterminate-progress 1.5s linear infinite;
 }
 
 @keyframes indeterminate-progress {
   0% {
     transform: translateX(-100%);
-    width: 30%;
+    width: 35%;
   }
   50% {
-    transform: translateX(250%);
+    transform: translateX(150%);
   }
   100% {
     transform: translateX(-100%);
-    width: 30%;
+    width: 35%;
   }
 }
+
 .game-container {
   display: flex;
-  flex-direction: column; /* Changed to column for vertical stacking */
-  justify-content: flex-start;
-  align-items: stretch;
-  gap: 1rem;
-  width: 100%;
-  max-width: 100vw;
+  flex-direction: column;
+  gap: 1.5rem;
 }
 
 .board-area {
   display: flex;
   flex-direction: column;
+  gap: 0.6rem;
   align-items: center;
-  width: 100%; /* Full width */
-  padding: 1rem;
 }
 
 .run-title {
-  font-size: 1.1rem;
-  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   margin-bottom: 0.5rem;
   text-align: center;
 }
 
 .controls-area {
-  width: 100%; /* Full width */
   display: flex;
   flex-direction: column;
-  padding: 0 1rem 1rem 1rem;
+  gap: 1rem;
 }
 
 .action-buttons {
   display: flex;
-  gap: 0.5rem;
-  margin-top: 1rem;
+  gap: 0.6rem;
+  justify-content: center;
 }
 
-.action-button {
+.action-button,
+.save-episode-button,
+.replay-button,
+.step-button {
   flex: 1;
-  padding: 0.75rem 1rem;
-  font-size: 1rem;
-  font-weight: 600;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.2s ease;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  padding: 0.55rem 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.75rem;
+  transition: border 0.15s ease, color 0.15s ease;
 }
 
-.action-button:disabled {
-  opacity: 0.5;
+.action-button:hover:not(:disabled),
+.save-episode-button:hover,
+.replay-button:hover,
+.step-button:hover:not(:disabled) {
+  border-color: var(--app-accent);
+  color: var(--app-accent);
+}
+
+.action-button:disabled,
+.step-button:disabled {
+  opacity: 0.3;
   cursor: not-allowed;
-}
-
-.submit-button {
-  background: #007bff;
-  color: white;
-}
-
-.submit-button:hover:not(:disabled) {
-  background: #0056b3;
-}
-
-.self-play-button {
-  background: #28a745;
-  color: white;
-}
-
-.self-play-button:hover:not(:disabled) {
-  background: #218838;
-}
-
-.new-game-button {
-  background: orange;
-  color: white;
-}
-
-.new-game-button:hover {
-  background: #5a6268;
-}
-
-.reset-button {
-  background: #6c757d;
-  color: white;
-}
-
-.reset-button:hover {
-  background: #5a6268;
-}
-
-.save-episode-button {
-  margin-top: 1rem;
-  padding: 0.5rem 1rem;
 }
 
 .replay-controls {
   display: flex;
   align-items: center;
   gap: 1rem;
-  margin-top: 1rem;
-  padding: 0.75rem;
-  background: rgba(255, 255, 255, 0.9);
-  border: 1px solid #ddd;
-  border-radius: 8px;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-}
-
-.replay-button {
-  padding: 0.5rem 1rem;
-  font-size: 1.1rem;
-  background: #4CAF50;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.replay-button:hover {
-  background: #45a049;
+  padding: 1rem;
+  background: rgba(8, 11, 19, 0.85);
+  border-radius: 24px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  justify-content: center;
 }
 
 .step-controls-inline {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-}
-
-.step-button {
-  padding: 0.5rem 0.75rem;
-  font-size: 1.2rem;
-  background: #2196F3;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.2s;
-  min-width: 40px;
-}
-
-.step-button:hover:not(:disabled) {
-  background: #1976D2;
-}
-
-.step-button:disabled {
-  background: #ccc;
-  cursor: not-allowed;
-  opacity: 0.6;
+  gap: 0.5rem;
+  color: var(--app-text-muted);
 }
 
 .step-indicator {
-  font-weight: 600;
-  font-size: 1rem;
-  color: #333;
+  font-size: 0.85rem;
   min-width: 60px;
   text-align: center;
 }
