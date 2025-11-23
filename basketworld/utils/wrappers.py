@@ -91,9 +91,10 @@ class EpisodeStatsWrapper(gym.Wrapper):
                     shooter_pos, self.env.unwrapped.basket_position
                 )
                 is_dunk = dist == 0
-                is_three = dist >= getattr(
-                    self.env.unwrapped, "three_point_distance", 4
-                )
+                if "is_three" in shot_res:
+                    is_three = bool(shot_res["is_three"])
+                else:
+                    is_three = self.env.unwrapped.is_three_point_location(shooter_pos)
                 self._attempts = 1.0
                 self._gt_is_three = 1.0 if (not is_dunk and is_three) else 0.0
                 self._gt_is_dunk = 1.0 if is_dunk else 0.0

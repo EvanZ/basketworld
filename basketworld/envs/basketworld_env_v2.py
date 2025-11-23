@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import random
 import math
-from typing import Callable, Dict, List, Tuple, Optional, Union
+from typing import Callable, Dict, List, Tuple, Optional, Union, Set
 from enum import Enum
 from collections import defaultdict
 
@@ -88,6 +88,7 @@ class HexagonBasketballEnv(gym.Env):
         steal_distance_factor: float = 0.08,
         steal_position_weight_min: float = 0.3,
         three_point_distance: int = 4,
+        three_point_short_distance: Optional[int] = None,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
         # Baseline shooting variability (per-player, sampled each episode)
@@ -208,7 +209,12 @@ class HexagonBasketballEnv(gym.Env):
         # Honor constructor flag for strict illegal action handling
         self.raise_on_illegal_action = bool(raise_on_illegal_action)
         # Three-point configuration and shot model parameters
-        self.three_point_distance = three_point_distance
+        self.three_point_distance = int(three_point_distance)
+        self.three_point_short_distance = (
+            int(three_point_short_distance)
+            if three_point_short_distance is not None
+            else None
+        )
         self.layup_pct = float(layup_pct)
         self.three_pt_pct = float(three_pt_pct)
         # Std deviations for per-player variability (sampled each episode)
@@ -239,6 +245,10 @@ class HexagonBasketballEnv(gym.Env):
         basket_col = 0
         basket_row = self.court_height // 2
         self.basket_position = self._offset_to_axial(basket_col, basket_row)
+        self._three_point_hexes: Set[Tuple[int, int]] = set()
+        self._three_point_line_hexes: Set[Tuple[int, int]] = set()
+        self._three_point_outline_points: List[Tuple[float, float]] = []
+        self._compute_three_point_geometry()
         # Shared 3-second violation configuration (used by both offense and defense)
         self.three_second_lane_width = int(three_second_lane_width)
         self.three_second_lane_height = int(three_second_lane_height)
@@ -845,15 +855,12 @@ class HexagonBasketballEnv(gym.Env):
                             for pid in range(self.n_players):
                                 pos = self.positions[pid]
                                 dist = self._hex_distance(pos, self.basket_position)
-                                shot_value = (
-                                    2.0
-                                    if (self.allow_dunks and dist == 0)
-                                    else (
-                                        3.0
-                                        if dist >= self.three_point_distance
-                                        else 2.0
-                                    )
-                                )
+                                is_three = self._is_three_point_hex(tuple(pos))
+                                shot_value = 2.0
+                                if self.allow_dunks and dist == 0:
+                                    shot_value = 2.0
+                                elif is_three:
+                                    shot_value = 3.0
                                 p = float(
                                     self._calculate_shot_probability(pid, dist)
                                 )
@@ -1050,11 +1057,11 @@ class HexagonBasketballEnv(gym.Env):
                 for pid in range(self.n_players):
                     pos = self.positions[pid]
                     dist = self._hex_distance(pos, self.basket_position)
-                    shot_value = (
-                        2.0
-                        if (self.allow_dunks and dist == 0)
-                        else (3.0 if dist >= self.three_point_distance else 2.0)
-                    )
+                    is_three = self._is_three_point_hex(pos)
+                    if self.allow_dunks and dist == 0:
+                        shot_value = 2.0
+                    else:
+                        shot_value = 3.0 if is_three else 2.0
                     p = float(self._calculate_shot_probability(pid, dist))
                     ep_by_player.append(float(shot_value * p))
                 info["phi_ep_by_player"] = ep_by_player
@@ -1350,6 +1357,70 @@ class HexagonBasketballEnv(gym.Env):
         """
         # Defensive lane is the same area as offensive lane
         return self._calculate_offensive_lane_hexes()
+
+    def _compute_three_point_geometry(self) -> None:
+        """Precompute which hexes qualify for threes and the outline cells."""
+        self._three_point_hexes.clear()
+        self._three_point_line_hexes.clear()
+        self._three_point_outline_points.clear()
+
+        if self.three_point_distance <= 0:
+            return
+
+        basket_axial = self.basket_position
+        hoop_x, hoop_y = self._axial_to_cartesian(*basket_axial)
+        radius_cart = float(self.three_point_distance) * math.sqrt(3.0)
+        short_band = (
+            float(self.three_point_short_distance) * math.sqrt(3.0)
+            if self.three_point_short_distance is not None
+            else None
+        )
+        tolerance = 0.35  # tuned to keep outline contiguous on discrete grid
+
+        outline_seen: Set[Tuple[int, int]] = set()
+
+        for row in range(self.court_height):
+            for col in range(self.court_width):
+                q, r = self._offset_to_axial(col, row)
+                cell = (q, r)
+                cx, cy = self._axial_to_cartesian(q, r)
+                dx = cx - hoop_x
+                dy = cy - hoop_y
+                abs_dy = abs(dy)
+                dist_cart = math.hypot(dx, dy)
+
+                qualifies = False
+                is_outline = False
+
+                if short_band is not None and abs_dy >= short_band - tolerance:
+                    qualifies = True
+                    if abs(abs_dy - short_band) <= tolerance:
+                        is_outline = True
+                elif dist_cart >= radius_cart - tolerance:
+                    qualifies = True
+                    if abs(dist_cart - radius_cart) <= tolerance:
+                        is_outline = True
+
+                if qualifies:
+                    self._three_point_hexes.add(cell)
+                if is_outline:
+                    self._three_point_line_hexes.add(cell)
+                    outline_seen.add(cell)
+
+        outline_points = [self._axial_to_cartesian(q, r) for q, r in outline_seen]
+        outline_points.sort(
+            key=lambda pt: math.atan2(pt[1] - hoop_y, pt[0] - hoop_x)
+        )
+        self._three_point_outline_points = outline_points
+
+    def _is_three_point_hex(self, coord: Tuple[int, int]) -> bool:
+        if coord is None:
+            return False
+        return tuple(coord) in self._three_point_hexes
+
+    def is_three_point_location(self, coord: Tuple[int, int]) -> bool:
+        """Public helper for external modules (analytics, wrappers, etc.)."""
+        return self._is_three_point_hex(coord)
 
     @profile_section("process_actions")
     def _process_simultaneous_actions(self, actions: np.ndarray) -> Dict:
@@ -1887,6 +1958,8 @@ class HexagonBasketballEnv(gym.Env):
             # Missed shot - possession ends
             self.ball_holder = None
 
+        is_three = self._is_three_point_hex(tuple(shooter_pos))
+
         return {
             "success": shot_made,
             "distance": distance,
@@ -1894,6 +1967,7 @@ class HexagonBasketballEnv(gym.Env):
             "rng": rng_u,
             "base_probability": base_prob,
             "pressure_multiplier": pressure_mult,
+            "is_three": bool(is_three),
         }
 
     @profile_section("_turnover_to_defense")
@@ -2010,12 +2084,13 @@ class HexagonBasketballEnv(gym.Env):
             # Compute distance to basket and value of the attempted shot
             shooter_pos = self.positions[player_id]
             dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
+            is_three_point = self._is_three_point_hex(tuple(shooter_pos))
 
             if shot_result["success"]:
                 # Basket was made
                 made_shot_reward = (
                     made_shot_reward_three
-                    if dist_to_basket >= self.three_point_distance
+                    if is_three_point
                     else made_shot_reward_inside
                 )
                 # Offense scored, good for them, bad for defense
@@ -2050,9 +2125,7 @@ class HexagonBasketballEnv(gym.Env):
                             self.positions[player_id], self.basket_position
                         )
                         base_for_pct = (
-                            made_shot_reward_three
-                            if _dist_for_pct >= self.three_point_distance
-                            else made_shot_reward_inside
+                            made_shot_reward_three if is_three_point else made_shot_reward_inside
                         )
                     potential_assist_amt = (
                         max(0.0, float(self.potential_assist_pct) * float(base_for_pct))
@@ -2090,6 +2163,7 @@ class HexagonBasketballEnv(gym.Env):
             # Annotate shot result for evaluation
             shot_result["assist_potential"] = bool(assist_potential)
             shot_result["assist_full"] = bool(assist_full)
+            shot_result["is_three"] = bool(is_three_point)
             if assist_passer is not None:
                 shot_result["assist_passer_id"] = assist_passer
             # Clear assist window after a shot attempt (episode ends anyway)
@@ -2118,7 +2192,7 @@ class HexagonBasketballEnv(gym.Env):
         if self.allow_dunks and dist == 0:
             shot_value = 2.0
         else:
-            shot_value = 3.0 if dist >= self.three_point_distance else 2.0
+            shot_value = 3.0 if self._is_three_point_hex(tuple(player_pos)) else 2.0
         p_make = float(self._calculate_shot_probability(player_id, dist))
         return float(shot_value * p_make)
 
@@ -2642,9 +2716,8 @@ class HexagonBasketballEnv(gym.Env):
                     )
                     ax.add_patch(basket_ring)
 
-                # Paint the three-point line: all hexes at exactly self.three_point_distance
-                cell_distance = self._hex_distance((q, r_ax), self.basket_position)
-                if cell_distance == self.three_point_distance:
+                # Paint the three-point line
+                if (q, r_ax) in self._three_point_line_hexes:
                     tp_outline = RegularPolygon(
                         (x, y),
                         numVertices=6,
@@ -2849,7 +2922,7 @@ class HexagonBasketballEnv(gym.Env):
                 if is_dunk:
                     label_text = "Dunk"
                 else:
-                    is_three = dist_to_basket >= self.three_point_distance
+                    is_three = self._is_three_point_hex(tuple(shooter_pos))
                     label_text = "3" if is_three else "2"
 
                 if shot_result["success"]:

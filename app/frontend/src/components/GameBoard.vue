@@ -32,6 +32,7 @@ const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'ad
 // ------------------------------------------------------------
 
 const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
+const SQRT3 = Math.sqrt(3);
 
 // Axial (q,r) → pixel cartesian (x,y) for pointy-topped hexes.
 // Formula identical to the one in basketworld_env_v2.py:_render_visual.
@@ -212,25 +213,57 @@ const boardTransform = computed(() => {
   return '';
 });
 
-const threePointSegments = computed(() => {
-  const segs = [];
+const threePointQualifiedSet = computed(() => {
   const gs = currentGameState.value;
-  if (!gs) return segs;
-  const dist3 = gs.three_point_distance ?? 4;
-  for (let r_off = 0; r_off < gs.court_height; r_off++) {
-    for (let c_off = 0; c_off < gs.court_width; c_off++) {
-      const { q, r } = offsetToAxial(c_off, r_off);
-      const dq = Math.abs(q - gs.basket_position[0]);
-      const dr = Math.abs(r - gs.basket_position[1]);
-      const ds = Math.abs((q + r) - (gs.basket_position[0] + gs.basket_position[1]));
-      const hexDist = (dq + dr + ds) / 2;
-      if (hexDist === dist3) {
-        const { x, y } = axialToCartesian(q, r);
-        segs.push({ x, y, key: `tp-${q},${r}` });
-      }
-    }
+  if (!gs || !gs.three_point_hexes) return new Set();
+  return new Set(gs.three_point_hexes.map(([q, r]) => `${q},${r}`));
+});
+
+const buildArcPoints = (hoop, radius, startAngle, endAngle, steps = 160) => {
+  const pts = [];
+  const dir = endAngle >= startAngle ? 1 : -1;
+  const total = Math.abs(endAngle - startAngle);
+  for (let i = 0; i <= steps; i += 1) {
+    const t = startAngle + dir * (i / steps) * total;
+    const x = hoop.x + radius * Math.cos(t);
+    const y = hoop.y + radius * Math.sin(t);
+    pts.push({ x, y });
   }
-  return segs;
+  return pts;
+};
+
+const threePointArcPath = computed(() => {
+  const gs = currentGameState.value;
+  const hoop = basketPosition.value;
+  if (!gs || !hoop) return '';
+  const radiusPx = (gs.three_point_distance ?? 5) * HEX_RADIUS * SQRT3;
+  if (radiusPx <= 0) return '';
+
+  const segs = [];
+  const shortDist = gs.three_point_short_distance;
+
+  if (shortDist === null || shortDist === undefined) {
+    const pts = buildArcPoints(hoop, radiusPx, Math.PI / 2, -Math.PI / 2, 240);
+    pts.forEach((pt, idx) => {
+      segs.push(`${idx === 0 ? 'M' : 'L'} ${pt.x} ${pt.y}`);
+    });
+    return segs.join(' ');
+  }
+
+  const shortPxRaw = shortDist * HEX_RADIUS * SQRT3;
+  const shortPx = Math.min(shortPxRaw, radiusPx * 0.999);
+  const connectX = Math.sqrt(Math.max(radiusPx * radiusPx - shortPx * shortPx, 0));
+  const theta = Math.asin(shortPx / radiusPx);
+
+  segs.push(`M ${hoop.x} ${hoop.y - shortPx}`);
+  segs.push(`L ${hoop.x + connectX} ${hoop.y - shortPx}`);
+
+  const arcPts = buildArcPoints(hoop, radiusPx, -theta, theta, 200);
+  arcPts.forEach((pt) => segs.push(`L ${pt.x} ${pt.y}`));
+
+  segs.push(`L ${hoop.x} ${hoop.y + shortPx}`);
+
+  return segs.join(' ');
 });
 
 const offensiveLaneHexes = computed(() => {
@@ -703,20 +736,19 @@ async function downloadBoardAsImage() {
           <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc3545" />
         </marker>
       </defs>
-      <!-- Flip the whole court vertically with translation to keep it in view -->
       <g :transform="boardTransform">
-        <!-- Draw the court hexes -->
+        <!-- Draw qualified (blue) and unqualified (dark) court hexes -->
         <polygon
           v-for="hex in courtLayout"
           :key="hex.key"
           :points="[...Array(6)].map((_, i) => {
-            const angle_deg = 60 * i + 30; // 30° offset for pointy-topped hexes
+            const angle_deg = 60 * i + 30;
             const angle_rad = Math.PI / 180 * angle_deg;
             const xPoint = hex.x + HEX_RADIUS * Math.cos(angle_rad);
             const yPoint = hex.y + HEX_RADIUS * Math.sin(angle_rad);
             return `${xPoint},${yPoint}`;
           }).join(' ')"
-          class="court-hex"
+          :class="['court-hex', threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified']"
         />
 
         <!-- Offensive Lane (painted area) -->
@@ -730,26 +762,14 @@ async function downloadBoardAsImage() {
             const yPoint = hex.y + HEX_RADIUS * Math.sin(angle_rad);
             return `${xPoint},${yPoint}`;
           }).join(' ')"
-          fill="rgba(255, 100, 100, 0.15)"
-          stroke="rgba(255, 100, 100, 0.3)"
-          stroke-width="1"
           class="offensive-lane"
         />
 
-        <!-- 3PT line: red outlines on hexes at exactly the 3PT distance -->
-        <polygon
-          v-for="hex in threePointSegments"
-          :key="hex.key"
-          :points="[...Array(6)].map((_, i) => {
-            const ang = 60 * i + 30;
-            const rad = Math.PI / 180 * ang;
-            const xPoint = hex.x + HEX_RADIUS * Math.cos(rad);
-            const yPoint = hex.y + HEX_RADIUS * Math.sin(rad);
-            return `${xPoint},${yPoint}`;
-          }).join(' ')"
-          fill="none"
-          stroke="red"
-          stroke-width="2"
+        <!-- 3PT line outline -->
+        <path
+          v-if="threePointArcPath"
+          :d="threePointArcPath"
+          class="three-point-arc"
         />
 
         <!-- Draw the basket -->
@@ -1006,13 +1026,9 @@ async function downloadBoardAsImage() {
   margin: 0; /* Remove auto margin which conflicts with flexbox */
   border-radius: 8px;
   overflow: visible; /* Allow the shot clock to be positioned outside */
-  /* Parquet-style checkerboard background */
-  background-color: #d2b48c; /* Base light wood color */
-  background-image: 
-    linear-gradient(45deg, #c19a6b 25%, transparent 25%, transparent 75%, #c19a6b 75%), 
-    linear-gradient(45deg, #c19a6b 25%, transparent 25%, transparent 75%, #c19a6b 75%);
-  background-size: 60px 60px;
-  background-position: 0 0, 30px 30px;
+  background: radial-gradient(circle at 30% 50%, #0f172a, #01010a 70%);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0 20px 45px rgba(2, 6, 23, 0.65);
 }
 
 .shot-clock-overlay {
@@ -1111,9 +1127,28 @@ svg {
   height: auto;
 }
 .court-hex {
-  fill: rgba(255, 255, 255, 0.65); /* More transparent fill */
-  stroke: #ffffff;
-  stroke-width: 1;
+  stroke: rgba(15, 23, 42, 0.6);
+  stroke-width: 1.2;
+}
+.court-hex.qualified {
+  fill: rgba(59, 130, 246, 0.35);
+  stroke: #fef3c7;
+  stroke-width: 2;
+}
+.court-hex.unqualified {
+  fill: rgba(45, 51, 72, 0.85);
+  stroke: rgba(15, 23, 42, 0.95);
+}
+.three-point-arc {
+  fill: none;
+  stroke: #fb923c;
+  stroke-width: 6;
+  stroke-linecap: round;
+}
+.offensive-lane {
+  fill: rgba(255, 100, 100, 0.2);
+  stroke: rgba(255, 140, 140, 0.5);
+  stroke-width: 1.5;
 }
 .player-offense {
   fill: #007bff;
@@ -1246,4 +1281,4 @@ svg {
   stroke-width: 1.2px;
   pointer-events: none;
 }
-</style> 
+</style>

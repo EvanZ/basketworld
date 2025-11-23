@@ -512,11 +512,11 @@ async def init_game(request: InitGameRequest):
             for pid in range(env.n_players):
                 pos = env.positions[pid]
                 dist = env._hex_distance(pos, env.basket_position)
-                shot_value = (
-                    2.0
-                    if (getattr(env, "allow_dunks", True) and dist == 0)
-                    else (3.0 if dist >= env.three_point_distance else 2.0)
-                )
+                is_three = env.is_three_point_location(pos)
+                if getattr(env, "allow_dunks", True) and dist == 0:
+                    shot_value = 2.0
+                else:
+                    shot_value = 3.0 if is_three else 2.0
                 p = float(env._calculate_shot_probability(pid, dist))
                 ep = float(shot_value * p)
                 ep_by_player.append(ep)
@@ -978,7 +978,11 @@ def take_step(request: ActionRequest):
                 pid_int = pid
             # Use the shot distance at the time of the attempt for labeling
             dist_at_shot = int(shot_res.get("distance", 0))
-            is_three = bool(dist_at_shot >= game_state.env.three_point_distance)
+            is_three = bool(
+                shot_res.get("is_three")
+                if "is_three" in shot_res
+                else dist_at_shot >= game_state.env.three_point_distance
+            )
             game_state.shot_log.append(
                 {
                     "step": int(len(game_state.reward_history) + 1),
@@ -1011,10 +1015,12 @@ def take_step(request: ActionRequest):
             if shot_result.get("success"):
                 # Determine if it was a 2PT or 3PT based on distance
                 shooter_pos = game_state.env.positions[player_id]
-                dist_to_basket = game_state.env._hex_distance(
-                    shooter_pos, game_state.env.basket_position
+                is_three = bool(
+                    shot_result.get("is_three")
+                    if "is_three" in shot_result
+                    else game_state.env.is_three_point_location(tuple(shooter_pos))
                 )
-                if dist_to_basket >= game_state.env.three_point_distance:
+                if is_three:
                     offense_reasons.append("Made 3PT")
                 else:
                     offense_reasons.append("Made 2PT")
@@ -1112,11 +1118,11 @@ def take_step(request: ActionRequest):
             for pid in range(env.n_players):
                 pos = env.positions[pid]
                 dist = env._hex_distance(pos, env.basket_position)
-                shot_value = (
-                    2.0
-                    if (getattr(env, "allow_dunks", False) and dist == 0)
-                    else (3.0 if dist >= env.three_point_distance else 2.0)
-                )
+                is_three = env.is_three_point_location(pos)
+                if getattr(env, "allow_dunks", False) and dist == 0:
+                    shot_value = 2.0
+                else:
+                    shot_value = 3.0 if is_three else 2.0
                 p = float(env._calculate_shot_probability(pid, dist))
                 ep_by_player.append(float(shot_value * p))
         except Exception as e:
@@ -1792,7 +1798,11 @@ def save_episode():
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
             is_dunk = distance == 0
-            is_three = distance >= game_state.env.three_point_distance
+            is_three = bool(
+                shot_res.get("is_three")
+                if "is_three" in shot_res
+                else distance >= game_state.env.three_point_distance
+            )
             success = bool(shot_res.get("success"))
             assist_full = bool(shot_res.get("assist_full", False))
             assist_potential = bool(shot_res.get("assist_potential", False))
@@ -2813,11 +2823,11 @@ def get_full_game_state(
         for pid in range(env.n_players):
             pos = env.positions[pid]
             dist = env._hex_distance(pos, env.basket_position)
-            shot_value = (
-                2.0
-                if (getattr(env, "allow_dunks", True) and dist == 0)
-                else (3.0 if dist >= env.three_point_distance else 2.0)
-            )
+            is_three = env.is_three_point_location(pos)
+            if getattr(env, "allow_dunks", True) and dist == 0:
+                shot_value = 2.0
+            else:
+                shot_value = 3.0 if is_three else 2.0
             p = float(env._calculate_shot_probability(pid, dist))
             ep = float(shot_value * p)
             ep_by_player.append(ep)
@@ -2854,6 +2864,23 @@ def get_full_game_state(
         "court_width": game_state.env.court_width,
         "court_height": game_state.env.court_height,
         "three_point_distance": int(getattr(game_state.env, "three_point_distance", 4)),
+        "three_point_short_distance": (
+            int(getattr(game_state.env, "three_point_short_distance"))
+            if getattr(game_state.env, "three_point_short_distance", None) is not None
+            else None
+        ),
+        "three_point_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "_three_point_hexes", set())
+        ],
+        "three_point_line_hexes": [
+            (int(q), int(r))
+            for q, r in getattr(game_state.env, "_three_point_line_hexes", set())
+        ],
+        "three_point_outline": [
+            (float(x), float(y))
+            for x, y in getattr(game_state.env, "_three_point_outline_points", [])
+        ],
         "shot_probs": getattr(game_state.env, "shot_probs", None),
         # Expose global shot means/stds used to sample per-player skills each episode
         "shot_params": {
