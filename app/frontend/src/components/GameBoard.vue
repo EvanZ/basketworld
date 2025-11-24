@@ -1036,7 +1036,7 @@ async function downloadBoardAsImage() {
 .shot-clock-overlay {
   position: relative;
   font-family: 'DSEG7 Classic', sans-serif;
-  font-size: 48px;
+  font-size: 5rem;
   color: #ff4d4d; /* Bright red for the LED color */
   background-color: #1a1a1a; /* Dark background for contrast */
   padding: 2px 8px;
@@ -1091,14 +1091,14 @@ async function downloadBoardAsImage() {
   border-radius: 6px;
   padding: 8px 12px;
   cursor: pointer;
-  font-size: 18px;
+  font-size: 2rem;
   color: #333;
   transition: all 0.2s ease;
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .download-button:hover {
-  background: white;
+  background: rgb(13, 9, 223);
   box-shadow: 0 4px 8px rgba(0,0,0,0.15);
   transform: translateY(-1px);
 }
@@ -1117,7 +1117,7 @@ async function downloadBoardAsImage() {
 
 .state-value-text {
   fill: #fffbf2;
-  font-size: 14px;
+  font-size: 1.1rem;
   font-weight: 600;
   letter-spacing: 0.3px;
 }
@@ -1130,12 +1130,12 @@ svg {
 }
 .court-hex {
   stroke: rgba(15, 23, 42, 0.6);
-  stroke-width: 1.2;
+  stroke-width: 0.1rem;
 }
 .court-hex.qualified {
   fill: rgba(59, 130, 246, 0.35);
-  stroke: #fef3c7;
-  stroke-width: 2;
+  stroke: #fef3c781;
+  stroke-width: 0.05rem;
 }
 .court-hex.unqualified {
   fill: rgba(45, 51, 72, 0.85);
@@ -1144,27 +1144,29 @@ svg {
 .three-point-arc {
   fill: none;
   stroke: #fb923c;
-  stroke-width: 6;
-  stroke-linecap: round;
+  stroke-width: 0.3rem;
+  stroke-linecap: square;
+  /* stroke-dasharray: 4 8; */
+  filter: drop-shadow(0px 0px 4px rgba(0, 0, 0, 0.6));
 }
 .offensive-lane {
-  fill: rgba(255, 100, 100, 0.2);
+  fill: rgba(243, 4, 16, 0.87);
   stroke: rgba(255, 140, 140, 0.5);
-  stroke-width: 1.5;
+  stroke-width: 1;
 }
 .player-offense {
   fill: #007bff;
-  stroke: #0056b3;
-  stroke-width: 1;
+  stroke: white;
+  stroke-width: 0.05rem;
 }
 .player-defense {
   fill: #dc3545;
-  stroke: #b22222;
-  stroke-width: 1;
+  stroke: white;
+  stroke-width: 0.05rem;
 }
 .active-player-hex {
-  stroke: #ffeb3b; /* Bright yellow */
-  stroke-width: 4; /* Increased width for better visibility */
+  stroke: #62ff3b; /* Bright yellow */
+  stroke-width: 0.15rem; /* Increased width for better visibility */
 }
 .dragging {
   opacity: 0.8;
@@ -1174,10 +1176,10 @@ svg {
 .player-text {
   fill: white;
   font-weight: bold;
-  font-size: 12px;
+  font-size: 0.85rem;
   paint-order: stroke;
   stroke: black;
-  stroke-width: 0.5;
+  stroke-width: 0.1rem;
 }
 .ghost-text {
   font-size: 10px;
@@ -1187,33 +1189,34 @@ svg {
 .basket-rim {
   fill: none;
   stroke: #ff8c00;
-  stroke-width: 3;
+  stroke-width: 0.25rem;
 }
 .ball-indicator {
   fill: none;
   stroke: orange;
-  stroke-width: 3;
-  stroke-dasharray: 6 3;
+  stroke-linecap: round;
+  stroke-width: 0.25rem;
+  stroke-dasharray: 4 8;
 }
 .ghost {
   stroke: none;
 }
 .policy-suggestion-text {
-  font-size: 10px;
+  font-size: 0.65rem;
   font-weight: bold;
-  fill: #333;
+  fill: white;
   paint-order: stroke;
-  stroke: white;
-  stroke-width: 0.5;
+  stroke: black;
+  stroke-width: 0.1rem;
   pointer-events: none;
 }
 .shot-prob-text {
-  font-size: 10px;
+  font-size: 1.5rem;
   font-weight: bold;
-  fill: #000;
+  fill: greenyellow;
   paint-order: stroke;
-  stroke: #fff;
-  stroke-width: 0.5px;
+  stroke: black;
+  stroke-width: 0.25rem;
 }
 
 .noop-prob-text {

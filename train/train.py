@@ -346,6 +346,8 @@ def setup_environment(args, training_team, env_idx=None):
     """
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
+        court_rows=getattr(args, "court_rows", None),
+        court_cols=getattr(args, "court_cols", None),
         players=args.players,
         shot_clock_steps=args.shot_clock,
         min_shot_clock=getattr(args, "min_shot_clock", 10),
@@ -1755,6 +1757,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO models using self-play.")
     parser.add_argument(
         "--grid-size", type=int, default=12, help="The size of the grid."
+    )
+    parser.add_argument(
+        "--court-rows",
+        dest="court_rows",
+        type=int,
+        default=None,
+        help="Number of rows in the court (defaults to grid-size if None).",
+    )
+    parser.add_argument(
+        "--court-cols",
+        dest="court_cols",
+        type=int,
+        default=None,
+        help="Number of columns in the court (defaults to grid-size if None).",
     )
     parser.add_argument(
         "--layup-pct", type=float, default=0.60, help="Percentage of layups."

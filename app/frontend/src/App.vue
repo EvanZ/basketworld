@@ -1102,7 +1102,7 @@ header {
   letter-spacing: 0.15em;
   text-transform: uppercase;
   color: var(--app-accent);
-  font-size: 1.1rem;
+  font-size: 1.5rem;
   margin-bottom: 0.5rem;
 }
 
@@ -1143,7 +1143,7 @@ header {
   border: 1px solid rgba(148, 163, 184, 0.4);
   background: transparent;
   color: var(--app-text);
-  font-size: 0.85rem;
+  font-size: 1rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   transition: color 0.15s ease, border 0.15s ease;
@@ -1173,6 +1173,7 @@ header {
   background: rgba(13, 20, 38, 0.85);
   color: var(--app-text);
   letter-spacing: 0.05em;
+  font-size: 1rem;
 }
 
 .eval-button {
@@ -1183,7 +1184,7 @@ header {
   padding: 0.5rem 1.2rem;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  font-size: 0.75rem;
+  font-size: 1rem;
 }
 
 .eval-button:hover:not(:disabled) {
@@ -1246,7 +1247,7 @@ header {
 }
 
 .run-title {
-  font-size: 0.85rem;
+  font-size: 1.25rem;
   color: var(--app-text-muted);
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1278,7 +1279,7 @@ header {
   padding: 0.55rem 1rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  font-size: 0.75rem;
+  font-size: 1rem;
   transition: border 0.15s ease, color 0.15s ease;
 }
 

@@ -1817,16 +1817,16 @@ const stealRisks = computed(() => {
 
 .tab-navigation button {
   padding: 0.5rem 1rem;
-  border: none;
+  border: 1px solid var(--app-panel-border);
   background-color: transparent;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
+  border-bottom: 1px solid transparent;
   font-weight: 500;
   color: var(--app-text-muted);
   transition: all 0.2s ease;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  font-size: 0.85rem;
+  font-size: 1rem;
 }
 
 .tab-navigation button:hover {

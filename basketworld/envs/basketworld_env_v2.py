@@ -71,6 +71,8 @@ class HexagonBasketballEnv(gym.Env):
     def __init__(
         self,
         grid_size: int = 16,
+        court_rows: int | None = None,
+        court_cols: int | None = None,
         players: int | None = None,
         players_per_side: int | None = None,
         shot_clock: int | None = None,
@@ -161,8 +163,8 @@ class HexagonBasketballEnv(gym.Env):
         super().__init__()
 
         self.grid_size = grid_size
-        self.court_width = int(grid_size * 1.0)
-        self.court_height = grid_size
+        self.court_width = int(court_cols) if court_cols is not None else int(grid_size * 1.0)
+        self.court_height = int(court_rows) if court_rows is not None else grid_size
         # Prefer new canonical name `players`; fall back to legacy `players_per_side`
         if players is None and players_per_side is not None:
             players = players_per_side

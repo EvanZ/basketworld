@@ -44,6 +44,18 @@ def get_mlflow_params(
 
     # Optional
     optional = {}
+    optional["court_rows"] = _get_param(
+        params,
+        ["court_rows", "court-rows"],
+        lambda v: None if v == "" or v == "None" else int(v),
+        None,
+    )
+    optional["court_cols"] = _get_param(
+        params,
+        ["court_cols", "court-cols"],
+        lambda v: None if v == "" or v == "None" else int(v),
+        None,
+    )
     optional["three_point_distance"] = _get_param(
         params,
         [

@@ -153,8 +153,8 @@ function selectAction(action) {
 }
 
 .value-display {
-  font-size: 11px;
-  color: #333;
+  font-size: .85rem;
+  color: var(--app-text);
 }
 
 .action-button.selected {
