@@ -5,6 +5,7 @@ const shortcuts = [
   { key: 'T', label: 'Submit Turn' },
   { key: 'S', label: 'Save Episode' },
   { key: 'Y', label: 'Replay Episode' },
+  { key: 'X', label: 'Reset Positions' },
   { key: 'R', label: 'Reset Stats' },
   { key: 'C', label: 'Copy Stats to Clipboard' },
   { key: '0-9', label: 'Select Player (by ID)' },

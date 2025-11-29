@@ -132,6 +132,22 @@ export async function saveEpisode() {
     return response.json();
 }
 
+export async function saveEpisodeFromPngs(frames) {
+    const response = await fetch(`${API_BASE_URL}/api/save_episode_from_pngs`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ frames }),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to save episode from PNGs' }));
+        console.error('[API] saveEpisodeFromPngs failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to save episode from PNGs');
+    }
+    return response.json();
+}
+
 export async function startSelfPlay() {
     const response = await fetch(`${API_BASE_URL}/api/start_self_play`, {
         method: 'POST'

@@ -5,6 +5,7 @@ This module enables continuing training with schedules (entropy, phi-beta, etc.)
 that pick up where they left off rather than restarting from scratch.
 """
 
+import math
 from typing import Dict, Optional, Any
 import mlflow
 
@@ -26,6 +27,9 @@ def save_schedule_metadata(
     pass_arc_end: Optional[float] = None,
     pass_oob_turnover_prob_start: Optional[float] = None,
     pass_oob_turnover_prob_end: Optional[float] = None,
+    spa_start: Optional[int] = None,
+    spa_end: Optional[int] = None,
+    spa_schedule: str = "linear",
     total_planned_timesteps: int = 0,
     current_timesteps: int = 0,
 ) -> None:
@@ -52,6 +56,9 @@ def save_schedule_metadata(
         pass_arc_end: Ending pass arc degrees
         pass_oob_turnover_prob_start: Starting OOB turnover probability
         pass_oob_turnover_prob_end: Ending OOB turnover probability
+        spa_start: Starting steps per alternation
+        spa_end: Ending steps per alternation
+        spa_schedule: Schedule type for steps per alternation ('linear' or 'constant')
         total_planned_timesteps: Total timesteps planned for this run
         current_timesteps: Current timesteps completed (from model.num_timesteps)
     """
@@ -59,6 +66,16 @@ def save_schedule_metadata(
         "schedule_total_planned_timesteps": total_planned_timesteps,
         "schedule_current_timesteps": current_timesteps,
     }
+
+    # Steps per alternation schedule metadata
+    if spa_start is not None:
+        metadata.update(
+            {
+                "schedule_spa_start": spa_start,
+                "schedule_spa_end": spa_end if spa_end is not None else spa_start,
+                "schedule_spa_schedule": spa_schedule,
+            }
+        )
 
     # Entropy schedule metadata
     if ent_coef_start is not None:
@@ -159,37 +176,53 @@ def load_schedule_metadata(
     )
     metadata["current_timesteps"] = get_param("schedule_current_timesteps", int, 0)
 
-    # Load entropy schedule
-    metadata["ent_coef_start"] = get_param("schedule_ent_coef_start")
-    metadata["ent_coef_end"] = get_param("schedule_ent_coef_end")
-    metadata["ent_schedule"] = get_param("schedule_ent_schedule", str, "linear")
-    metadata["ent_bump_updates"] = get_param("schedule_ent_bump_updates", int, 0)
-    metadata["ent_bump_multiplier"] = get_param(
-        "schedule_ent_bump_multiplier", float, 1.0
-    )
+    # Load entropy schedule (only include if values exist in MLflow)
+    ent_start = get_param("schedule_ent_coef_start")
+    if ent_start is not None:
+        metadata["ent_coef_start"] = ent_start
+        metadata["ent_coef_end"] = get_param("schedule_ent_coef_end")
+        metadata["ent_schedule"] = get_param("schedule_ent_schedule", str, "linear")
+        metadata["ent_bump_updates"] = get_param("schedule_ent_bump_updates", int, 0)
+        metadata["ent_bump_multiplier"] = get_param(
+            "schedule_ent_bump_multiplier", float, 1.0
+        )
 
-    # Load phi beta schedule
-    metadata["phi_beta_start"] = get_param("schedule_phi_beta_start")
-    metadata["phi_beta_end"] = get_param("schedule_phi_beta_end")
-    metadata["phi_beta_schedule"] = get_param("schedule_phi_beta_schedule", str, "exp")
-    metadata["phi_bump_updates"] = get_param("schedule_phi_bump_updates", int, 0)
-    metadata["phi_bump_multiplier"] = get_param(
-        "schedule_phi_bump_multiplier", float, 1.0
-    )
+    # Load phi beta schedule (only include if values exist in MLflow)
+    phi_beta_start = get_param("schedule_phi_beta_start")
+    if phi_beta_start is not None:
+        metadata["phi_beta_start"] = phi_beta_start
+        metadata["phi_beta_end"] = get_param("schedule_phi_beta_end")
+        metadata["phi_beta_schedule"] = get_param("schedule_phi_beta_schedule", str, "exp")
+        metadata["phi_bump_updates"] = get_param("schedule_phi_bump_updates", int, 0)
+        metadata["phi_bump_multiplier"] = get_param(
+            "schedule_phi_bump_multiplier", float, 1.0
+        )
 
-    # Load pass logit bias schedule
-    metadata["pass_logit_bias_start"] = get_param("schedule_pass_logit_bias_start")
-    metadata["pass_logit_bias_end"] = get_param("schedule_pass_logit_bias_end")
+    # Load pass logit bias schedule (only include if values exist in MLflow)
+    pass_logit_bias_start = get_param("schedule_pass_logit_bias_start")
+    if pass_logit_bias_start is not None:
+        metadata["pass_logit_bias_start"] = pass_logit_bias_start
+        metadata["pass_logit_bias_end"] = get_param("schedule_pass_logit_bias_end")
 
-    # Load pass curriculum schedule
-    metadata["pass_arc_start"] = get_param("schedule_pass_arc_start")
-    metadata["pass_arc_end"] = get_param("schedule_pass_arc_end")
-    metadata["pass_oob_turnover_prob_start"] = get_param(
-        "schedule_pass_oob_turnover_prob_start"
-    )
-    metadata["pass_oob_turnover_prob_end"] = get_param(
-        "schedule_pass_oob_turnover_prob_end"
-    )
+    # Load pass curriculum schedule (only include if values exist in MLflow)
+    pass_arc_start = get_param("schedule_pass_arc_start")
+    if pass_arc_start is not None:
+        metadata["pass_arc_start"] = pass_arc_start
+        metadata["pass_arc_end"] = get_param("schedule_pass_arc_end")
+    
+    pass_oob_turnover_prob_start = get_param("schedule_pass_oob_turnover_prob_start")
+    if pass_oob_turnover_prob_start is not None:
+        metadata["pass_oob_turnover_prob_start"] = pass_oob_turnover_prob_start
+        metadata["pass_oob_turnover_prob_end"] = get_param(
+            "schedule_pass_oob_turnover_prob_end"
+        )
+
+    # Load steps per alternation schedule (only include if values exist in MLflow)
+    spa_start = get_param("schedule_spa_start", int)
+    if spa_start is not None:
+        metadata["spa_start"] = spa_start
+        metadata["spa_end"] = get_param("schedule_spa_end", int, spa_start)
+        metadata["spa_schedule"] = get_param("schedule_spa_schedule", str, "linear")
 
     return metadata
 
@@ -198,7 +231,9 @@ def calculate_continued_total_timesteps(
     original_total: int,
     original_current: int,
     new_alternations: int,
-    steps_per_alternation: int,
+    spa_start: int,
+    spa_end: int,
+    spa_schedule: str,
     num_envs: int,
     n_steps: int,
 ) -> int:
@@ -212,14 +247,29 @@ def calculate_continued_total_timesteps(
         original_total: Total timesteps planned in original run
         original_current: Timesteps completed in original run
         new_alternations: Number of alternations in continuation
-        steps_per_alternation: Steps per alternation
+        spa_start: Starting steps per alternation
+        spa_end: Ending steps per alternation
+        spa_schedule: Schedule type ('linear', 'log', or 'constant')
         num_envs: Number of environments
         n_steps: Steps per rollout
 
     Returns:
         New total timesteps for schedule calculation
     """
-    new_timesteps = int(
-        2 * new_alternations * steps_per_alternation * num_envs * n_steps
-    )
+    # Calculate total timesteps for the new alternations with schedule
+    new_timesteps = 0
+    for i in range(new_alternations):
+        if spa_schedule == "constant" or new_alternations <= 1 or spa_start == spa_end:
+            steps = spa_start
+        else:
+            progress = i / (new_alternations - 1)
+            if spa_schedule == "log":
+                # Logarithmic interpolation: slower increase at start, faster at end
+                k = 9.0
+                log_progress = math.log1p(progress * k) / math.log1p(k)
+                steps = int(round(spa_start + (spa_end - spa_start) * log_progress))
+            else:
+                # Linear interpolation (default)
+                steps = int(round(spa_start + (spa_end - spa_start) * progress))
+        new_timesteps += steps * num_envs * n_steps
     return original_total + new_timesteps

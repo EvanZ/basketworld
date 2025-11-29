@@ -687,22 +687,33 @@ class HexagonBasketballEnv(gym.Env):
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
-        def _sample_prob(mean: float, std: float) -> float:
-            if std <= 0.0:
-                return float(mean)
-            val = float(self._rng.normal(loc=float(mean), scale=float(std)))
-            return float(max(0.01, min(0.99, val)))
+        # Allow override via options to maintain consistent skills across resets
+        opt_skills = options.get("offense_skills") if options else None
+        
+        if opt_skills is not None:
+            # Use provided skills (for replay/self-play consistency)
+            for i in range(self.players_per_side):
+                self.offense_layup_pct_by_player[i] = float(opt_skills["layup"][i])
+                self.offense_three_pt_pct_by_player[i] = float(opt_skills["three_pt"][i])
+                self.offense_dunk_pct_by_player[i] = float(opt_skills["dunk"][i])
+        else:
+            # Sample new skills
+            def _sample_prob(mean: float, std: float) -> float:
+                if std <= 0.0:
+                    return float(mean)
+                val = float(self._rng.normal(loc=float(mean), scale=float(std)))
+                return float(max(0.01, min(0.99, val)))
 
-        for i in range(self.players_per_side):
-            self.offense_layup_pct_by_player[i] = _sample_prob(
-                self.layup_pct, self.layup_std
-            )
-            self.offense_three_pt_pct_by_player[i] = _sample_prob(
-                self.three_pt_pct, self.three_pt_std
-            )
-            self.offense_dunk_pct_by_player[i] = _sample_prob(
-                self.dunk_pct, self.dunk_std
-            )
+            for i in range(self.players_per_side):
+                self.offense_layup_pct_by_player[i] = _sample_prob(
+                    self.layup_pct, self.layup_std
+                )
+                self.offense_three_pt_pct_by_player[i] = _sample_prob(
+                    self.three_pt_pct, self.three_pt_std
+                )
+                self.offense_dunk_pct_by_player[i] = _sample_prob(
+                    self.dunk_pct, self.dunk_std
+                )
 
         # Initialize positions
         if opt_positions is not None:
@@ -1322,31 +1333,34 @@ class HexagonBasketballEnv(gym.Env):
         up to (but not including) the 3-point line distance.
         The lane has symmetric width on both sides.
         
+        The lane is defined by two criteria:
+        1. Hex distance from basket < lane_height
+        2. Row offset from basket row <= lane_width
+        
         Returns:
             Set of (q, r) tuples representing lane hexes
         """
         lane_hexes = set()
-        basket_q, basket_r = self.basket_position
         lane_width = self.three_second_lane_width
         lane_height = self.three_second_lane_height
         
-        # Lane extends from distance 0 (basket) to just before 3pt line
-        for dist in range(0, lane_height):
-            # For each distance, add hexes within lane_width perpendicular distance
-            # We'll explore in the +q direction from basket
-            # At each step along q-axis, check r offsets within lane_width
-            for q_offset in range(dist + 1):
-                for r_offset in range(-dist, dist + 1):
-                    q = basket_q + q_offset
-                    r = basket_r + r_offset
-                    
-                    # Check if this hex is within the lane width and at the right distance
-                    if self._hex_distance((q, r), self.basket_position) == dist:
-                        # Calculate perpendicular distance from center line
-                        # Center line is along +q axis from basket
-                        # For simplicity, check if r_offset is within bounds
-                        if abs(r - basket_r) <= lane_width and self._is_valid_position(q, r):
-                            lane_hexes.add((q, r))
+        # Get basket's offset coordinates to determine its row
+        basket_col, basket_row = self._axial_to_offset(*self.basket_position)
+        
+        # Iterate over all valid court positions
+        for col in range(self.court_width):
+            for row in range(self.court_height):
+                q, r = self._offset_to_axial(col, row)
+                
+                # Check hex distance from basket (for lane height/depth)
+                dist = self._hex_distance((q, r), self.basket_position)
+                if dist >= lane_height:
+                    continue
+                
+                # Check row offset from basket row (for lane width)
+                row_offset = abs(row - basket_row)
+                if row_offset <= lane_width:
+                    lane_hexes.add((q, r))
         
         return lane_hexes
     

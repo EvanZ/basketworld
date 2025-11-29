@@ -77,13 +77,14 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed']);
 
 const selectedActions = ref({});
 
 // Debug: Watch for any changes to selectedActions
 watch(selectedActions, (newActions, oldActions) => {
   console.log('[PlayerControls] 🔍 selectedActions changed from:', oldActions, 'to:', newActions);
+  emit('selections-changed', { ...newActions });
 }, { deep: true });
 
 const actionValues = ref(null);
@@ -1116,10 +1117,16 @@ const stealRisks = computed(() => {
         Moves
       </button>
       <button 
-        :class="{ active: activeTab === 'parameters' }"
-        @click="activeTab = 'parameters'"
+        :class="{ active: activeTab === 'environment' }"
+        @click="activeTab = 'environment'"
       >
-        Parameters
+        Environment
+      </button>
+      <button 
+        :class="{ active: activeTab === 'training' }"
+        @click="activeTab = 'training'"
+      >
+        Training
       </button>
       <button 
         :class="{ active: activeTab === 'phi' }"
@@ -1345,41 +1352,41 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
-    <!-- Parameters Tab -->
-    <div v-if="activeTab === 'parameters'" class="tab-content">
+    <!-- Environment Tab -->
+    <div v-if="activeTab === 'environment'" class="tab-content">
       <div class="parameters-section">
-        <h4>MLflow Parameters</h4>
+        <h4>Environment Parameters</h4>
         <div v-if="!props.gameState" class="no-data">
           No game loaded
         </div>
         <div v-else class="parameters-grid">
           <div class="param-category">
             <h5>Environment Settings</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Number of players on each team (offense and defense)">
               <span class="param-name">Players per side:</span>
               <span class="param-value">{{ Math.floor((props.gameState.offense_ids?.length || 0)) }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Width × Height of the hexagonal court grid in hex cells">
               <span class="param-name">Court dimensions:</span>
               <span class="param-value">{{ props.gameState.court_width }}×{{ props.gameState.court_height }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="The player currently in possession of the ball">
               <span class="param-name">Ball holder:</span>
               <span class="param-value">Player {{ props.gameState.ball_holder }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Remaining steps before shot clock violation (turnover). Decrements each turn.">
               <span class="param-name">Shot clock:</span>
               <span class="param-value">{{ props.gameState.shot_clock }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Minimum shot clock value when the game resets for a new possession">
               <span class="param-name">Min shot clock at reset:</span>
               <span class="param-value">{{ props.gameState.min_shot_clock ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Hex distance from basket that marks the three-point line. Shots from this distance or further are worth 3 points.">
               <span class="param-name">Three point distance:</span>
               <span class="param-value">{{ props.gameState.three_point_distance || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Shorter three-point distance used for corner areas of the court">
               <span class="param-name">Three point short distance:</span>
               <span class="param-value">{{ props.gameState.three_point_short_distance || 'N/A' }}</span>
             </div>
@@ -1387,7 +1394,7 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>Policies</h5>
-            <div class="param-item policy-select-item">
+            <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the player's team">
               <div class="policy-label">
                 Player ({{ props.gameState.user_team_name || 'OFFENSE' }})
               </div>
@@ -1416,7 +1423,7 @@ const stealRisks = computed(() => {
                 </select>
               </div>
             </div>
-            <div class="param-item policy-select-item">
+            <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the opponent team. 'Mirror' uses the same policy as the player.">
               <div class="policy-label">
                 Opponent ({{ props.gameState.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE' }})
               </div>
@@ -1454,40 +1461,40 @@ const stealRisks = computed(() => {
           <div class="param-category">
             <h5>Shot Parameters</h5>
             <div v-if="props.gameState.shot_params" class="param-group">
-              <div class="param-item">
-                <span class="param-name">Layup mean:</span>
+              <div class="param-item" data-tooltip="Mean (average) base probability for layup shots (distance 1-2 hexes from basket)">
+                <span class="param-name">Layup &mu;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.layup_pct * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Layup std:</span>
+              <div class="param-item" data-tooltip="Standard deviation for sampling individual player layup skill. Higher = more variance between players.">
+                <span class="param-name">Layup &sigma;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.layup_std * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Three-point mean:</span>
+              <div class="param-item" data-tooltip="Mean (average) base probability for three-point shots">
+                <span class="param-name">Three-point &mu;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.three_pt_pct * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Three-point std:</span>
+              <div class="param-item" data-tooltip="Standard deviation for sampling individual player three-point skill. Higher = more variance between players.">
+                <span class="param-name">Three-point &sigma;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.three_pt_std * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Dunk mean:</span>
+              <div class="param-item" data-tooltip="Mean (average) base probability for dunk shots (distance 0 from basket)">
+                <span class="param-name">Dunk &mu;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.dunk_pct * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Dunk std:</span>
+              <div class="param-item" data-tooltip="Standard deviation for sampling individual player dunk skill. Higher = more variance between players.">
+                <span class="param-name">Dunk &sigma;</span>
                 <span class="param-value">{{ (props.gameState.shot_params.dunk_std * 100).toFixed(1) }}%</span>
               </div>
-              <div class="param-item">
-                <span class="param-name">Dunks enabled:</span>
-                <span class="param-value">{{ props.gameState.shot_params.allow_dunks ? 'Yes' : 'No' }}</span>
+              <div class="param-item" data-tooltip="Whether players can attempt dunks when standing on the basket hex">
+                <span class="param-name">Dunks allowed:</span>
+                <span class="param-value">{{ props.gameState.shot_params.allow_dunks ? '✓ Yes' : '✗ No' }}</span>
               </div>
             </div>
           </div>
           <div class="param-category" v-if="props.gameState.offense_shooting_pct_by_player">
             <h5>Sampled Player Skills (Offense)</h5>
-            <div class="param-item" v-for="(pid, idx) in (props.gameState.offense_ids || [])" :key="`skill-${pid}`">
-              <span class="param-name">Player {{ pid }}:</span>
+            <div class="param-item" v-for="(pid, idx) in (props.gameState.offense_ids || [])" :key="`skill-${pid}`" data-tooltip="Individual shooting percentages sampled from μ±σ distributions. L=Layup, 3=Three-point, D=Dunk">
+              <span class="param-name">{{ pid }}:</span>
               <span class="param-value">
                 L {{ ((props.gameState.offense_shooting_pct_by_player.layup?.[idx] || 0) * 100).toFixed(1) }}% ·
                 3 {{ ((props.gameState.offense_shooting_pct_by_player.three_pt?.[idx] || 0) * 100).toFixed(1) }}% ·
@@ -1497,64 +1504,72 @@ const stealRisks = computed(() => {
           </div>
           <div class="param-category">
             <h5>Defender Turnover Pressure</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Maximum hex distance at which defenders can apply turnover pressure to the ball handler">
               <span class="param-name">Pressure distance:</span>
               <span class="param-value">{{ props.gameState.defender_pressure_distance || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Base probability of turnover when a defender is adjacent (distance=1) to ball handler">
               <span class="param-name">Turnover chance:</span>
               <span class="param-value">{{ props.gameState.defender_pressure_turnover_chance || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Exponential decay rate for pressure. Higher values = pressure drops off faster with distance.">
               <span class="param-name">Decay lambda:</span>
               <span class="param-value">{{ props.gameState.defender_pressure_decay_lambda || 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">
             <h5>Pass Interception (Line-of-Sight)</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line">
               <span class="param-name">Base steal rate:</span>
               <span class="param-value">{{ props.gameState.base_steal_rate ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="How quickly steal probability drops as defender is further from pass line. Higher = faster decay.">
               <span class="param-name">Perpendicular decay:</span>
               <span class="param-value">{{ props.gameState.steal_perp_decay ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="How pass distance affects interception chance. Longer passes are easier to intercept.">
               <span class="param-name">Distance factor:</span>
               <span class="param-value">{{ props.gameState.steal_distance_factor ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver)">
               <span class="param-name">Position weight min:</span>
               <span class="param-value">{{ props.gameState.steal_position_weight_min ?? 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">
             <h5>Spawn Distance</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Minimum hex distance from basket where players spawn at episode start">
               <span class="param-name">Min spawn distance:</span>
               <span class="param-value">{{ props.gameState.spawn_distance || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Maximum hex distance from basket where players spawn. 'Unlimited' means anywhere on court.">
               <span class="param-name">Max spawn distance:</span>
               <span class="param-value">{{ props.gameState.max_spawn_distance ?? 'Unlimited' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Randomize defender spawn distance from matched offense player (0 = spawn adjacent; N = spawn 1-N hexes away)">
+              <span class="param-name">Defender spawn distance:</span>
+              <span class="param-value">{{ props.gameState.defender_spawn_distance || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Hex distance (N) within which a defender reset their lane counter if guarding an offensive player while in the lane. 0 disables guarding resets.">
+              <span class="param-name">Defender guard distance:</span>
+              <span class="param-value">{{ props.gameState.defender_guard_distance || 'N/A' }}</span>
             </div>
           </div>
           <div class="param-category">
             <h5>Shot Pressure</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Whether nearby defenders reduce shot accuracy">
               <span class="param-name">Pressure enabled:</span>
               <span class="param-value">{{ props.gameState.shot_pressure_enabled || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Maximum percentage reduction in shot accuracy from defender pressure (e.g., 0.3 = up to 30% reduction)">
               <span class="param-name">Max pressure:</span>
               <span class="param-value">{{ props.gameState.shot_pressure_max || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Exponential decay rate for shot pressure over distance. Higher = pressure drops faster.">
               <span class="param-name">Pressure lambda:</span>
               <span class="param-value">{{ props.gameState.shot_pressure_lambda || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Angular width of the defensive pressure cone. Defenders outside this arc apply less pressure.">
               <span class="param-name">Pressure arc degrees:</span>
               <span class="param-value">{{ props.gameState.shot_pressure_arc_degrees || 'N/A' }}°</span>
             </div>
@@ -1562,35 +1577,31 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>Pass & Action Policy</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Angular width of valid pass directions. Passes outside this arc from the intended direction fail.">
               <span class="param-name">Pass arc degrees:</span>
               <span class="param-value">{{ props.gameState.pass_arc_degrees || 'N/A' }}°</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Probability of turnover when a pass goes out of bounds (no teammate in direction)">
               <span class="param-name">Pass OOB turnover prob:</span>
               <span class="param-value">{{ props.gameState.pass_oob_turnover_prob != null ? (props.gameState.pass_oob_turnover_prob * 100).toFixed(0) + '%' : 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Bias added to pass action logits in the policy network. Positive = encourage passing.">
               <span class="param-name">Pass logit bias:</span>
               <span class="param-value">{{ props.gameState.pass_logit_bias != null ? props.gameState.pass_logit_bias.toFixed(2) : 'N/A' }}</span>
-            </div>
-            <div class="param-item">
-              <span class="param-name">Illegal action policy:</span>
-              <span class="param-value">{{ props.gameState.illegal_action_policy || 'N/A' }}</span>
             </div>
           </div>
 
           <div class="param-category">
             <h5>Team Configuration</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Which team the user/player controls (offense or defense)">
               <span class="param-name">User team:</span>
               <span class="param-value">{{ props.gameState.user_team_name }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Player IDs assigned to the offensive team">
               <span class="param-name">Offense IDs:</span>
               <span class="param-value">{{ props.gameState.offense_ids?.join(', ') || 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Player IDs assigned to the defensive team">
               <span class="param-name">Defense IDs:</span>
               <span class="param-value">{{ props.gameState.defense_ids?.join(', ') || 'N/A' }}</span>
             </div>
@@ -1598,29 +1609,175 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>3-Second Violation Rules</h5>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Width of the paint/lane area in hex cells, centered on the basket">
               <span class="param-name">Lane width (hexes):</span>
               <span class="param-value">{{ props.gameState.three_second_lane_width ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Height/depth of the paint/lane area extending from the baseline">
               <span class="param-name">Lane height (hexes):</span>
               <span class="param-value">{{ props.gameState.three_second_lane_height ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Maximum consecutive steps a player can stay in the lane before a violation">
               <span class="param-name">Max steps in lane:</span>
               <span class="param-value">{{ props.gameState.three_second_max_steps ?? 'N/A' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Whether offensive players get violations for staying in the paint too long (turnover)">
               <span class="param-name">Offensive 3-sec enabled:</span>
               <span class="param-value">{{ props.gameState.offensive_three_seconds_enabled ? '✓ Yes' : '✗ No' }}</span>
             </div>
-            <div class="param-item">
+            <div class="param-item" data-tooltip="Whether defensive players get violations for camping in the paint without guarding (technical foul)">
               <span class="param-name">Illegal defense enabled:</span>
               <span class="param-value">{{ props.gameState.illegal_defense_enabled ? '✓ Yes' : '✗ No' }}</span>
             </div>
-            <div class="param-item" v-if="props.gameState.offensive_lane_hexes">
+            <div class="param-item" v-if="props.gameState.offensive_lane_hexes" data-tooltip="Total number of hex cells that make up the painted lane area">
               <span class="param-name">Lane hexes count:</span>
               <span class="param-value">{{ props.gameState.offensive_lane_hexes?.length || 0 }} hexes</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Training Tab -->
+    <div v-if="activeTab === 'training'" class="tab-content">
+      <div class="parameters-section">
+        <h4>Training Hyperparameters</h4>
+        <div v-if="!props.gameState || !props.gameState.training_params" class="no-data">
+          No training parameters available
+        </div>
+        <div v-else class="parameters-grid">
+          <div class="param-category">
+            <h5>PPO Core</h5>
+            <div class="param-item" data-tooltip="Step size for gradient descent. Lower = slower but more stable training.">
+              <span class="param-name">Learning rate:</span>
+              <span class="param-value">{{ props.gameState.training_params.learning_rate?.toExponential(2) || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of environment steps collected per update. Higher = more stable gradients but slower iteration.">
+              <span class="param-name">N steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.n_steps || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of samples per gradient update. Must divide n_steps × num_envs evenly.">
+              <span class="param-name">Batch size:</span>
+              <span class="param-value">{{ props.gameState.training_params.batch_size || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of passes through collected data per update. More epochs = better sample efficiency but risk of overfitting.">
+              <span class="param-name">N epochs:</span>
+              <span class="param-value">{{ props.gameState.training_params.n_epochs || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Discount factor for future rewards. Higher (closer to 1) = considers longer-term consequences.">
+              <span class="param-name">Gamma (γ):</span>
+              <span class="param-value">{{ props.gameState.training_params.gamma || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="GAE lambda for advantage estimation. Higher = lower bias but higher variance.">
+              <span class="param-name">GAE Lambda:</span>
+              <span class="param-value">{{ props.gameState.training_params.gae_lambda || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="PPO clipping parameter. Limits how much the policy can change per update.">
+              <span class="param-name">Clip range:</span>
+              <span class="param-value">{{ props.gameState.training_params.clip_range || 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Loss Coefficients</h5>
+            <div class="param-item" data-tooltip="Weight for value function loss in total loss. Higher = more emphasis on accurate value predictions.">
+              <span class="param-name">VF coefficient:</span>
+              <span class="param-value">{{ props.gameState.training_params.vf_coef || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Weight for entropy bonus. Higher = more exploration. Can be scheduled.">
+              <span class="param-name">Entropy coefficient:</span>
+              <span class="param-value">{{ props.gameState.training_params.ent_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.ent_coef_start != null" data-tooltip="Starting value for entropy coefficient schedule.">
+              <span class="param-name">Entropy start:</span>
+              <span class="param-value">{{ props.gameState.training_params.ent_coef_start }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.ent_coef_end != null" data-tooltip="Ending value for entropy coefficient schedule.">
+              <span class="param-name">Entropy end:</span>
+              <span class="param-value">{{ props.gameState.training_params.ent_coef_end }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Network Architecture</h5>
+            <div class="param-item" data-tooltip="Type of policy network. Dual critic has separate value heads for offense/defense.">
+              <span class="param-name">Policy class:</span>
+              <span class="param-value policy-class-value">{{ props.gameState.training_params.policy_class || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether using dual critic architecture (separate offense/defense value heads).">
+              <span class="param-name">Dual critic:</span>
+              <span class="param-value">{{ props.gameState.training_params.use_dual_critic ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.net_arch_used" data-tooltip="Actual network architecture used (logged after policy creation). Shows pi/vf layer sizes.">
+              <span class="param-name">Net arch (actual):</span>
+              <span class="param-value policy-class-value">{{ props.gameState.training_params.net_arch_used }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.net_arch_pi" data-tooltip="Actor (policy) network hidden layer sizes from CLI args.">
+              <span class="param-name">Net arch π:</span>
+              <span class="param-value">{{ props.gameState.training_params.net_arch_pi }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.net_arch_vf" data-tooltip="Critic (value) network hidden layer sizes from CLI args.">
+              <span class="param-name">Net arch vf:</span>
+              <span class="param-value">{{ props.gameState.training_params.net_arch_vf }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.net_arch && !props.gameState.training_params.net_arch_used" data-tooltip="Shared network architecture (both actor and critic).">
+              <span class="param-name">Net arch:</span>
+              <span class="param-value">{{ props.gameState.training_params.net_arch }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Training Setup</h5>
+            <div class="param-item" data-tooltip="Number of parallel environments used during training.">
+              <span class="param-name">Num envs:</span>
+              <span class="param-value">{{ props.gameState.training_params.num_envs || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of times to alternate training (each alternation loads a new opponent).">
+              <span class="param-name">Alternations:</span>
+              <span class="param-value">{{ props.gameState.training_params.alternations || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of PPO updates per alternation. Can be scheduled from start to end value.">
+              <span class="param-name">Steps per alternation:</span>
+              <span class="param-value" v-if="props.gameState.training_params.steps_per_alternation_end && props.gameState.training_params.steps_per_alternation_end !== props.gameState.training_params.steps_per_alternation">
+                {{ props.gameState.training_params.steps_per_alternation }} → {{ props.gameState.training_params.steps_per_alternation_end }}
+              </span>
+              <span class="param-value" v-else>{{ props.gameState.training_params.steps_per_alternation ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.steps_per_alternation_end && props.gameState.training_params.steps_per_alternation_end !== props.gameState.training_params.steps_per_alternation" data-tooltip="Schedule type for steps per alternation: linear interpolates from start to end.">
+              <span class="param-name">SPA schedule:</span>
+              <span class="param-value">{{ props.gameState.training_params.steps_per_alternation_schedule || 'linear' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps per alternation = steps_per_alternation × num_envs × n_steps">
+              <span class="param-name">Timesteps/alternation:</span>
+              <span class="param-value">{{ props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(2) + 'M' : 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Total timesteps for training (approximate if using SPA schedule).">
+              <span class="param-name">Total timesteps:</span>
+              <span class="param-value">{{ props.gameState.training_params.alternations && props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.alternations * props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(1) + 'M' : 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Self-Play & Opponents</h5>
+            <div class="param-item" data-tooltip="Whether opponent uses deterministic action selection during training.">
+              <span class="param-name">Deterministic opponent:</span>
+              <span class="param-value">{{ props.gameState.training_params.deterministic_opponent ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether each parallel env samples different opponents (prevents forgetting).">
+              <span class="param-name">Per-env opponent sampling:</span>
+              <span class="param-value">{{ props.gameState.training_params.per_env_opponent_sampling ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.per_env_opponent_sampling" data-tooltip="Number of recent checkpoints to sample opponents from.">
+              <span class="param-name">Opponent sample K:</span>
+              <span class="param-value">{{ props.gameState.training_params.opponent_sample_k || 'N/A' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.opponent_pool_beta" data-tooltip="Geometric distribution parameter for opponent sampling. Higher = more recency bias.">
+              <span class="param-name">Opponent pool beta:</span>
+              <span class="param-value">{{ props.gameState.training_params.opponent_pool_beta || 'N/A' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.opponent_pool_exploration" data-tooltip="Geometric distribution parameter for opponent sampling. Higher = more recency bias.">
+              <span class="param-name">Opponent pool exploration:</span>
+              <span class="param-value">{{ props.gameState.training_params.opponent_pool_exploration || 'N/A' }}</span>
             </div>
           </div>
         </div>
@@ -2174,6 +2331,94 @@ const stealRisks = computed(() => {
   align-items: center;
   padding: 0.4rem 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  position: relative;
+  cursor: help;
+}
+
+/* Tooltip styles */
+.param-item[data-tooltip] {
+  cursor: help;
+}
+
+.param-item[data-tooltip]::before {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.6rem 0.8rem;
+  background: rgba(15, 23, 42, 0.98);
+  color: var(--app-text);
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.4;
+  border-radius: 8px;
+  border: 1px solid var(--app-accent);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 15px rgba(56, 189, 248, 0.15);
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  z-index: 1000;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  pointer-events: none;
+  text-align: left;
+}
+
+.param-item[data-tooltip]::after {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: var(--app-accent);
+  z-index: 1001;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+
+.param-item[data-tooltip]:hover::before,
+.param-item[data-tooltip]:hover::after {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Adjust tooltip position for items near edges */
+.param-item[data-tooltip]:first-child::before {
+  left: 0;
+  transform: translateX(0);
+}
+
+.param-item[data-tooltip]:first-child::after {
+  left: 20px;
+  transform: translateX(0);
+}
+
+/* Add a subtle help indicator */
+.param-item[data-tooltip] .param-name::after {
+  content: '?';
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.4rem;
+  width: 14px;
+  height: 14px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--app-accent);
+  border-radius: 50%;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  opacity: 0.6;
+  transition: opacity 0.2s ease;
+}
+
+.param-item[data-tooltip]:hover .param-name::after {
+  opacity: 1;
+  background: rgba(56, 189, 248, 0.25);
 }
 
 .policy-select-item {
@@ -2235,6 +2480,13 @@ const stealRisks = computed(() => {
   border: 1px solid rgba(148, 163, 184, 0.2);
   font-size: 0.85em;
   color: var(--app-accent);
+}
+
+.param-value.policy-class-value {
+  font-size: 0.75em;
+  word-break: break-all;
+  max-width: 180px;
+  text-align: right;
 }
 
 /* Observation Tab Styles */

@@ -1,6 +1,7 @@
 import tempfile
 import re
 import os
+import multiprocessing as mp
 from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ from basketworld.utils.action_resolution import (
 from basketworld.utils.mlflow_params import (
     get_mlflow_params,
     get_mlflow_phi_shaping_params,
+    get_mlflow_training_params,
 )
 
 
@@ -57,6 +59,7 @@ class GameState:
         self.replay_initial_positions: list[tuple[int, int]] | None = None
         self.replay_ball_holder: int | None = None
         self.replay_shot_clock: int | None = None
+        self.replay_offense_skills: dict | None = None  # Store sampled skills for consistency
         self.actions_log: list[list[int]] = []  # full action arrays per step
         # General replay buffers (manual or AI). We store full game states for instant replay
         self.episode_states: list[dict] = (
@@ -68,6 +71,8 @@ class GameState:
         # MLflow phi shaping parameters (used for Rewards tab calculations)
         # This is separate from env.phi_beta etc which can be modified in Phi Shaping tab
         self.mlflow_phi_shaping_params: dict | None = None
+        # MLflow training parameters (PPO hyperparameters)
+        self.mlflow_training_params: dict | None = None
         # Role flag encoding (for backward compatibility with old models)
         self.role_flag_offense: float = 1.0  # Default to new encoding
         self.role_flag_defense: float = -1.0  # Default to new encoding
@@ -77,6 +82,11 @@ class GameState:
         self.turn_start_positions: list[tuple[int, int]] | None = None
         self.turn_start_ball_holder: int | None = None
         self.turn_start_shot_clock: int | None = None
+        # Parallel evaluation support - store params/paths for worker recreation
+        self.env_required_params: dict | None = None
+        self.env_optional_params: dict | None = None
+        self.unified_policy_path: str | None = None
+        self.opponent_policy_path: str | None = None
 
 
 game_state = GameState()
@@ -226,6 +236,545 @@ def _predict_policy_actions(
             probs_per_player[int(pid)] = prob_vec
 
     return full_actions, probs_per_player
+
+
+# --- Parallel Evaluation Helpers ---
+# These functions enable multi-process evaluation for speedup on multi-core systems
+
+# Worker-local storage (each process has its own copy)
+_worker_state = {}
+
+
+def _init_evaluation_worker(
+    required_params: dict,
+    optional_params: dict,
+    unified_policy_path: str,
+    opponent_policy_path: str | None,
+    user_team_name: str,
+    role_flag_offense: float,
+    role_flag_defense: float,
+):
+    """Initialize a worker process with its own environment and policies.
+    
+    This function is called once per worker when the ProcessPoolExecutor starts.
+    Each worker maintains its own copies of env and policies in _worker_state.
+    """
+    global _worker_state
+    
+    # Import all required modules for worker functions
+    import numpy as np
+    import basketworld
+    from stable_baselines3 import PPO
+    from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
+    from basketworld.envs.basketworld_env_v2 import Team
+    from basketworld.utils.action_resolution import (
+        IllegalActionStrategy,
+        get_policy_action_probabilities,
+        resolve_illegal_actions,
+    )
+    
+    # Create environment with same parameters
+    env = basketworld.HexagonBasketballEnv(
+        **required_params,
+        **optional_params,
+        render_mode=None,  # No rendering needed for evaluation
+    )
+    
+    # Load policies
+    custom_objects = {
+        "policy_class": PassBiasDualCriticPolicy,
+        "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+        "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+    }
+    unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
+    opponent_policy = (
+        PPO.load(opponent_policy_path, custom_objects=custom_objects)
+        if opponent_policy_path
+        else None
+    )
+    
+    # Parse user team
+    user_team = Team.OFFENSE if user_team_name == "OFFENSE" else Team.DEFENSE
+    
+    # Store in worker-local state (including imports needed by worker functions)
+    _worker_state = {
+        "env": env,
+        "unified_policy": unified_policy,
+        "opponent_policy": opponent_policy,
+        "user_team": user_team,
+        "role_flag_offense": role_flag_offense,
+        "role_flag_defense": role_flag_defense,
+        # Store imports for worker functions
+        "np": np,
+        "Team": Team,
+        "IllegalActionStrategy": IllegalActionStrategy,
+        "get_policy_action_probabilities": get_policy_action_probabilities,
+        "resolve_illegal_actions": resolve_illegal_actions,
+    }
+
+
+def _worker_role_flag_value(team) -> float:
+    """Get the role flag value for a team in the worker context."""
+    Team = _worker_state["Team"]
+    if team == Team.OFFENSE:
+        return _worker_state.get("role_flag_offense", 1.0)
+    return _worker_state.get("role_flag_defense", -1.0)
+
+
+def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
+    """Clone observation with role flag for worker context."""
+    np = _worker_state["np"]
+    cloned = {
+        "obs": np.copy(obs["obs"]),
+        "action_mask": obs["action_mask"],
+        "role_flag": np.array([role_flag_value], dtype=np.float32),
+    }
+    skills = obs.get("skills")
+    if skills is not None:
+        cloned["skills"] = np.copy(skills)
+    else:
+        cloned["skills"] = None
+    return cloned
+
+
+def _worker_predict_actions_for_team(
+    policy,
+    base_obs: dict,
+    env,
+    team,
+    deterministic: bool,
+    strategy,
+) -> dict[int, int]:
+    """Predict actions for a team in worker context."""
+    np = _worker_state["np"]
+    Team = _worker_state["Team"]
+    get_policy_action_probabilities = _worker_state["get_policy_action_probabilities"]
+    resolve_illegal_actions = _worker_state["resolve_illegal_actions"]
+    
+    actions_by_player: dict[int, int] = {}
+    
+    if policy is None or base_obs is None or env is None:
+        return actions_by_player
+    
+    team_ids = list(env.offense_ids if team == Team.OFFENSE else env.defense_ids)
+    if not team_ids:
+        return actions_by_player
+    
+    role_flag_value = _worker_role_flag_value(team)
+    conditioned_obs = _worker_clone_obs_with_role_flag(base_obs, role_flag_value)
+    
+    try:
+        raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
+    except Exception:
+        return actions_by_player
+    
+    raw_actions = np.array(raw_actions).reshape(-1)
+    action_len = raw_actions.shape[0]
+    team_mask = base_obs["action_mask"][team_ids]
+    
+    # Legacy policies output actions for every player; new policies output players_per_side only.
+    if action_len == len(team_ids):
+        team_pred_actions = raw_actions
+    elif action_len == getattr(env, "n_players", action_len):
+        team_pred_actions = raw_actions[team_ids]
+    else:
+        team_pred_actions = raw_actions[: len(team_ids)]
+    
+    # Get probabilities for sampling strategy
+    probs = get_policy_action_probabilities(policy, conditioned_obs)
+    if probs is not None:
+        probs = [np.asarray(p, dtype=np.float32) for p in probs]
+        if len(probs) == getattr(env, "n_players", len(probs)):
+            team_probs = [probs[int(pid)] for pid in team_ids]
+        else:
+            team_probs = probs[: len(team_ids)]
+    else:
+        team_probs = None
+    
+    resolved_actions = resolve_illegal_actions(
+        np.array(team_pred_actions),
+        team_mask,
+        strategy,
+        deterministic,
+        team_probs,
+    )
+    
+    for idx, pid in enumerate(team_ids):
+        actions_by_player[int(pid)] = int(resolved_actions[idx])
+    
+    return actions_by_player
+
+
+def _worker_predict_policy_actions(
+    policy,
+    base_obs: dict,
+    env,
+    deterministic: bool,
+    strategy,
+):
+    """Predict actions for all players using a policy in worker context."""
+    np = _worker_state["np"]
+    Team = _worker_state["Team"]
+    
+    if policy is None or base_obs is None or env is None:
+        return None
+    
+    num_players = env.n_players
+    full_actions = np.zeros(num_players, dtype=int)
+    
+    for team in (Team.OFFENSE, Team.DEFENSE):
+        team_actions = _worker_predict_actions_for_team(
+            policy, base_obs, env, team, deterministic, strategy
+        )
+        for pid, action in team_actions.items():
+            full_actions[int(pid)] = int(action)
+    
+    return full_actions
+
+
+def _run_episode_batch_worker(args: tuple) -> list[dict]:
+    """Run a batch of evaluation episodes in a worker process.
+    
+    Args:
+        args: Tuple of (episode_specs, player_deterministic, opponent_deterministic)
+              where episode_specs is a list of (episode_index, seed) tuples
+        
+    Returns:
+        List of dictionaries with episode results
+    """
+    np = _worker_state["np"]
+    Team = _worker_state["Team"]
+    IllegalActionStrategy = _worker_state["IllegalActionStrategy"]
+    
+    episode_specs, player_deterministic, opponent_deterministic = args
+    
+    env = _worker_state["env"]
+    unified_policy = _worker_state["unified_policy"]
+    opponent_policy = _worker_state["opponent_policy"]
+    user_team = _worker_state["user_team"]
+    
+    player_strategy = (
+        IllegalActionStrategy.BEST_PROB if player_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    opponent_strategy = (
+        IllegalActionStrategy.BEST_PROB if opponent_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    
+    results = []
+    
+    for ep_idx, seed in episode_specs:
+        # Reset environment with seed
+        obs, _ = env.reset(seed=seed)
+        
+        done = False
+        step_count = 0
+        episode_rewards = {"offense": 0.0, "defense": 0.0}
+        
+        # Run episode until done
+        while not done and step_count < 1000:
+            # Get actions from unified policy (for user team)
+            resolved_unified = _worker_predict_policy_actions(
+                unified_policy, obs, env, player_deterministic, player_strategy
+            )
+            if resolved_unified is None:
+                resolved_unified = np.zeros(env.n_players, dtype=int)
+            
+            # Get actions from opponent policy (or use unified if no separate opponent)
+            if opponent_policy is not None:
+                resolved_opponent = _worker_predict_policy_actions(
+                    opponent_policy, obs, env, opponent_deterministic, opponent_strategy
+                )
+            else:
+                resolved_opponent = np.array(resolved_unified)
+            
+            # Combine actions based on team roles
+            final_action = np.zeros(env.n_players, dtype=np.int32)
+            
+            if user_team == Team.OFFENSE:
+                for idx in env.offense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in env.defense_ids:
+                    final_action[idx] = resolved_opponent[idx]
+            else:
+                for idx in env.defense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in env.offense_ids:
+                    final_action[idx] = resolved_opponent[idx]
+            
+            # Execute step
+            obs, reward, terminated, truncated, info = env.step(final_action)
+            done = terminated or truncated
+            step_count += 1
+            
+            # Track rewards
+            if isinstance(reward, np.ndarray):
+                rewards_list = reward.tolist()
+            elif isinstance(reward, (list, tuple)):
+                rewards_list = list(reward)
+            else:
+                rewards_list = [reward]
+            
+            if len(rewards_list) > 1:
+                for i, r in enumerate(rewards_list):
+                    if i in env.offense_ids:
+                        episode_rewards["offense"] += float(r)
+                    elif i in env.defense_ids:
+                        episode_rewards["defense"] += float(r)
+            else:
+                episode_rewards["offense"] += float(rewards_list[0])
+        
+        # Extract outcome information from last_action_results
+        last_action_results = getattr(env, "last_action_results", {})
+        shot_clock = int(getattr(env, "shot_clock", 0))
+        three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+        
+        # Serialize last_action_results to be JSON-safe with full shot details
+        shots_info = {}
+        if last_action_results.get("shots"):
+            for k, v in last_action_results["shots"].items():
+                if isinstance(v, dict):
+                    shots_info[str(k)] = {
+                        "success": bool(v.get("success", False)),
+                        "distance": int(v.get("distance", 9999)),
+                        "assist_full": bool(v.get("assist_full", False)),
+                    }
+                else:
+                    shots_info[str(k)] = {"success": False, "distance": 9999, "assist_full": False}
+        
+        # Turnovers - preserve the list structure if it exists
+        turnovers_raw = last_action_results.get("turnovers", [])
+        turnovers_info = list(turnovers_raw) if isinstance(turnovers_raw, (list, tuple)) else []
+        
+        results.append({
+            "episode": ep_idx + 1,
+            "steps": step_count,
+            "episode_rewards": episode_rewards,
+            "outcome_info": {
+                "shots": shots_info,
+                "turnovers": turnovers_info,
+                "shot_clock": shot_clock,
+                "three_point_distance": three_point_distance,
+            }
+        })
+    
+    return results
+
+
+def _run_sequential_evaluation(
+    num_episodes: int,
+    player_deterministic: bool,
+    opponent_deterministic: bool,
+) -> list[dict]:
+    """Run evaluation episodes sequentially in the main process.
+    
+    This is faster than parallel for small episode counts because it avoids
+    the overhead of spawning worker processes and loading policies.
+    Uses the already-loaded game_state.env and policies.
+    """
+    results = []
+    
+    player_strategy = (
+        IllegalActionStrategy.BEST_PROB if player_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    opponent_strategy = (
+        IllegalActionStrategy.BEST_PROB if opponent_deterministic
+        else IllegalActionStrategy.SAMPLE_PROB
+    )
+    
+    for ep_idx in range(num_episodes):
+        # Reset environment with random seed
+        seed = int(np.random.randint(0, 2**31 - 1))
+        obs, _ = game_state.env.reset(seed=seed)
+        
+        done = False
+        step_count = 0
+        episode_rewards = {"offense": 0.0, "defense": 0.0}
+        
+        # Run episode until done
+        while not done and step_count < 1000:
+            # Get actions from unified policy (for user team)
+            resolved_unified, _ = _predict_policy_actions(
+                game_state.unified_policy,
+                obs,
+                game_state.env,
+                deterministic=player_deterministic,
+                strategy=player_strategy,
+            )
+            if resolved_unified is None:
+                resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
+            
+            # Get actions from opponent policy (or use unified if no separate opponent)
+            if game_state.defense_policy is not None:
+                resolved_opponent, _ = _predict_policy_actions(
+                    game_state.defense_policy,
+                    obs,
+                    game_state.env,
+                    deterministic=opponent_deterministic,
+                    strategy=opponent_strategy,
+                )
+            else:
+                resolved_opponent = np.array(resolved_unified)
+            
+            # Combine actions based on team roles
+            final_action = np.zeros(game_state.env.n_players, dtype=np.int32)
+            
+            if game_state.user_team == Team.OFFENSE:
+                for idx in game_state.env.offense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in game_state.env.defense_ids:
+                    final_action[idx] = resolved_opponent[idx]
+            else:
+                for idx in game_state.env.defense_ids:
+                    final_action[idx] = resolved_unified[idx]
+                for idx in game_state.env.offense_ids:
+                    final_action[idx] = resolved_opponent[idx]
+            
+            # Execute step
+            obs, reward, terminated, truncated, info = game_state.env.step(final_action)
+            done = terminated or truncated
+            step_count += 1
+            
+            # Track rewards
+            if isinstance(reward, np.ndarray):
+                rewards_list = reward.tolist()
+            elif isinstance(reward, (list, tuple)):
+                rewards_list = list(reward)
+            else:
+                rewards_list = [reward]
+            
+            if len(rewards_list) > 1:
+                for i, r in enumerate(rewards_list):
+                    if i in game_state.env.offense_ids:
+                        episode_rewards["offense"] += float(r)
+                    elif i in game_state.env.defense_ids:
+                        episode_rewards["defense"] += float(r)
+            else:
+                episode_rewards["offense"] += float(rewards_list[0])
+        
+        # Extract outcome information
+        env = game_state.env
+        last_action_results = getattr(env, "last_action_results", {})
+        shot_clock = int(getattr(env, "shot_clock", 0))
+        three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+        
+        # Serialize shot details
+        shots_info = {}
+        if last_action_results.get("shots"):
+            for k, v in last_action_results["shots"].items():
+                if isinstance(v, dict):
+                    shots_info[str(k)] = {
+                        "success": bool(v.get("success", False)),
+                        "distance": int(v.get("distance", 9999)),
+                        "assist_full": bool(v.get("assist_full", False)),
+                    }
+                else:
+                    shots_info[str(k)] = {"success": False, "distance": 9999, "assist_full": False}
+        
+        turnovers_raw = last_action_results.get("turnovers", [])
+        turnovers_info = list(turnovers_raw) if isinstance(turnovers_raw, (list, tuple)) else []
+        
+        results.append({
+            "episode": ep_idx + 1,
+            "steps": step_count,
+            "episode_rewards": episode_rewards,
+            "outcome_info": {
+                "shots": shots_info,
+                "turnovers": turnovers_info,
+                "shot_clock": shot_clock,
+                "three_point_distance": three_point_distance,
+            }
+        })
+    
+    return results
+
+
+def _run_parallel_evaluation(
+    num_episodes: int,
+    player_deterministic: bool,
+    opponent_deterministic: bool,
+    required_params: dict,
+    optional_params: dict,
+    unified_policy_path: str,
+    opponent_policy_path: str | None,
+    user_team_name: str,
+    role_flag_offense: float,
+    role_flag_defense: float,
+    num_workers: int | None = None,
+) -> list[dict]:
+    """Run evaluation episodes in parallel using ProcessPoolExecutor with batching.
+    
+    Each worker processes multiple episodes to minimize IPC overhead.
+    
+    Args:
+        num_episodes: Number of episodes to run
+        player_deterministic: Whether to use deterministic actions for player
+        opponent_deterministic: Whether to use deterministic actions for opponent
+        required_params: Required environment parameters
+        optional_params: Optional environment parameters
+        unified_policy_path: Path to the unified policy file
+        opponent_policy_path: Path to the opponent policy file (or None)
+        user_team_name: "OFFENSE" or "DEFENSE"
+        role_flag_offense: Role flag value for offense team
+        role_flag_defense: Role flag value for defense team
+        num_workers: Number of worker processes (default: CPU count)
+        
+    Returns:
+        List of episode results
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    
+    if num_workers is None:
+        # Use number of physical cores, capped at 16
+        num_workers = min(mp.cpu_count(), 16)
+    
+    # For small number of episodes, use fewer workers
+    num_workers = min(num_workers, num_episodes)
+    
+    # Generate episode specs: (index, seed) for each episode
+    episode_specs = [
+        (i, int(np.random.randint(0, 2**31 - 1)))
+        for i in range(num_episodes)
+    ]
+    
+    # Divide episodes into batches for each worker (reduces IPC overhead)
+    # Each worker gets a chunk of episodes to process sequentially
+    batch_size = (num_episodes + num_workers - 1) // num_workers  # Ceiling division
+    batches = []
+    for i in range(0, num_episodes, batch_size):
+        batch = episode_specs[i:i + batch_size]
+        if batch:
+            batches.append((batch, player_deterministic, opponent_deterministic))
+    
+    print(f"[Parallel Evaluation] Using {len(batches)} worker processes for {num_episodes} episodes ({batch_size} episodes/batch)")
+    
+    # Use spawn context for safety with PyTorch/CUDA
+    ctx = mp.get_context("spawn")
+    
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        mp_context=ctx,
+        initializer=_init_evaluation_worker,
+        initargs=(
+            required_params,
+            optional_params,
+            unified_policy_path,
+            opponent_policy_path,
+            user_team_name,
+            role_flag_offense,
+            role_flag_defense,
+        ),
+    ) as executor:
+        batch_results = list(executor.map(_run_episode_batch_worker, batches))
+    
+    # Flatten results from all batches
+    results = []
+    for batch_result in batch_results:
+        results.extend(batch_result)
+    
+    return results
 
 
 # --- API Models ---
@@ -393,6 +942,9 @@ async def init_game(request: InitGameRequest):
         # These will be used for Rewards tab calculations (independent of Phi Shaping tab)
         mlflow_phi_params = get_mlflow_phi_shaping_params(client, request.run_id)
         
+        # Load training parameters from MLflow (PPO hyperparameters)
+        mlflow_training_params = get_mlflow_training_params(client, request.run_id)
+        
         # Load environment parameters including role_flag encoding
         required, optional = get_mlflow_params(client, request.run_id)
 
@@ -456,6 +1008,20 @@ async def init_game(request: InitGameRequest):
         )
         game_state.obs, _ = game_state.env.reset()
         game_state.prev_obs = None  # No previous observation at start
+        
+        # Store params and paths for parallel evaluation workers
+        game_state.env_required_params = copy.deepcopy(required)
+        game_state.env_optional_params = copy.deepcopy(optional)
+        game_state.unified_policy_path = unified_path
+        game_state.opponent_policy_path = opponent_unified_path
+        
+        # Capture the sampled skills for this episode so they remain consistent across resets
+        game_state.replay_offense_skills = {
+            "layup": list(game_state.env.offense_layup_pct_by_player),
+            "three_pt": list(game_state.env.offense_three_pt_pct_by_player),
+            "dunk": list(game_state.env.offense_dunk_pct_by_player),
+        }
+        
         _capture_turn_start_snapshot()
 
         # Log shot clock configuration for debugging
@@ -479,6 +1045,7 @@ async def init_game(request: InitGameRequest):
         game_state.run_id = request.run_id
         game_state.run_name = run_name or request.run_id
         game_state.mlflow_phi_shaping_params = mlflow_phi_params
+        game_state.mlflow_training_params = mlflow_training_params
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
@@ -1196,28 +1763,30 @@ def take_step(request: ActionRequest):
         print(f"Warning: Failed to capture frame at step {len(game_state.frames)}: {e}")
         import traceback
         traceback.print_exc()
-    # Record resulting state for replay with policy probs
+    
+    # Map action indices to names for frontend display (do this BEFORE storing episode state)
+    action_names = [a.name for a in ActionType]
+    actions_taken = {}
+    for pid, act_idx in enumerate(full_action):
+        if pid < len(full_action): 
+            actions_taken[str(pid)] = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
+    
+    # Record resulting state for replay with policy probs AND the actions that led to this state
     try:
-        game_state.episode_states.append(
-            get_full_game_state(
-                include_policy_probs=True,
-                include_action_values=True,
-                include_state_values=True,
-            )
+        state_with_actions = get_full_game_state(
+            include_policy_probs=True,
+            include_action_values=True,
+            include_state_values=True,
         )
+        # Store the actions that were taken to reach this state
+        state_with_actions["actions_taken"] = actions_taken
+        game_state.episode_states.append(state_with_actions)
     except Exception:
         pass
     _capture_turn_start_snapshot()
     # End of self-play: mark inactive when episode is done
     if game_state.self_play_active and done:
         game_state.self_play_active = False
-
-    # Map action indices to names for frontend display
-    action_names = [a.name for a in ActionType]
-    actions_taken = {}
-    for pid, act_idx in enumerate(full_action):
-        if pid < len(full_action): 
-            actions_taken[str(pid)] = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
 
     return {
         "status": "success",
@@ -1340,12 +1909,15 @@ def start_self_play():
     game_state.frames = []
     game_state.reward_history = []
     game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+    game_state.episode_states = []  # Reset episode states for new self-play
 
     # Reset environment using overrides to avoid RNG draws during reset
+    # Include offense_skills to maintain consistent skills throughout the episode
     options = {
         "initial_positions": init_positions,
         "ball_holder": init_ball_holder,
         "shot_clock": init_shot_clock,
+        "offense_skills": game_state.replay_offense_skills,
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
     game_state.prev_obs = None  # No previous observation at start
@@ -1358,6 +1930,14 @@ def start_self_play():
             game_state.frames.append(frame)
     except Exception:
         pass
+
+    # Record initial state for replay (no actions_taken for initial state)
+    initial_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    game_state.episode_states.append(initial_state)
 
     return {
         "status": "success",
@@ -1377,11 +1957,13 @@ def run_evaluation(request: EvaluationRequest):
     """Run N episodes of self-play for evaluation purposes.
 
     Returns final state of each episode for stats tracking.
-    Runs in deterministic mode using the unified policy.
+    Uses parallel execution on multiple CPU cores for speedup.
 
     Note: Uses the environment initialized in /api/init_game which loads
     all parameters (including min_shot_clock and shot_clock) from MLflow.
     """
+    import time
+    
     if not game_state.env:
         raise HTTPException(
             status_code=400, detail="Game not initialized. Call /api/init_game first."
@@ -1391,19 +1973,20 @@ def run_evaluation(request: EvaluationRequest):
         raise HTTPException(
             status_code=400, detail="Unified policy required for evaluation."
         )
+    
+    # Check if we have the params needed for parallel evaluation
+    if game_state.env_required_params is None or game_state.unified_policy_path is None:
+        raise HTTPException(
+            status_code=400, 
+            detail="Missing environment parameters. Please re-initialize the game with /api/init_game."
+        )
 
-    num_episodes = max(1, min(request.num_episodes, 10000))  # Cap at 10000 for safety
+    num_episodes = max(1, min(request.num_episodes, 1000000))  # Cap at 1M for safety
     player_deterministic = request.player_deterministic
     opponent_deterministic = request.opponent_deterministic
 
-    episode_results = []
-
-    # Track entropy for diagnosis (to compare with training entropy)
-    episode_entropies = []
-
     # Log shot clock configuration before evaluation
-    # These values come from the environment initialized with MLflow parameters
-    print(f"[Evaluation] Starting {num_episodes} episodes")
+    print(f"[Evaluation] Starting {num_episodes} episodes (parallel)")
     print(f"[Evaluation] Configuration:")
     print(f"  - Player deterministic: {player_deterministic}")
     print(f"  - Opponent deterministic: {opponent_deterministic}")
@@ -1433,132 +2016,59 @@ def run_evaluation(request: EvaluationRequest):
         )
         print(f"  - DEFENSE: {game_state.unified_policy_key} (user policy)")
 
-    for ep_idx in range(num_episodes):
-        # Reset environment for new episode
-        episode_seed = int(np.random.randint(0, 2**31 - 1))
-        obs, _ = game_state.env.reset(seed=episode_seed)
-        game_state.obs = obs
-
-        # Log shot clock for first few episodes to verify randomization
-        if ep_idx < 5:
-            print(
-                f"  Episode {ep_idx + 1} starting shot clock: {game_state.env.shot_clock}"
-            )
-
-        done = False
-        step_count = 0
-        episode_rewards = {"offense": 0.0, "defense": 0.0}
-        episode_entropy_sum = 0.0
-        episode_entropy_count = 0
-
-        # Run episode until done
-        while not done and step_count < 1000:  # Safety limit
-            # Get AI actions for both teams
-            try:
-                obs_tensor = game_state.unified_policy.policy.obs_to_tensor(obs)[0]
-                distributions = game_state.unified_policy.policy.get_distribution(
-                    obs_tensor
-                )
-                for dist in distributions.distribution:
-                    entropy = dist.entropy().mean().item()
-                    episode_entropy_sum += entropy
-                    episode_entropy_count += 1
-            except Exception:
-                pass
-
-            player_team_strategy = (
-                IllegalActionStrategy.BEST_PROB
-                if player_deterministic
-                else IllegalActionStrategy.SAMPLE_PROB
-            )
-            opponent_team_strategy = (
-                IllegalActionStrategy.BEST_PROB
-                if opponent_deterministic
-                else IllegalActionStrategy.SAMPLE_PROB
-            )
-            resolved_unified, _ = _predict_policy_actions(
-                game_state.unified_policy,
-                obs,
-                game_state.env,
-                deterministic=player_deterministic,
-                strategy=player_team_strategy,
-            )
-            if resolved_unified is None:
-                resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
-
-            resolved_opponent = None
-            if game_state.defense_policy is not None:
-                resolved_opponent, _ = _predict_policy_actions(
-                    game_state.defense_policy,
-                    obs,
-                    game_state.env,
-                    deterministic=opponent_deterministic,
-                    strategy=opponent_team_strategy,
-                )
-            else:
-                resolved_opponent = np.array(resolved_unified)
-
-            # Combine actions based on team roles
-            # IMPORTANT: unified_policy represents the USER's policy (game_state.user_team)
-            # and defense_policy represents the OPPONENT's policy
-            # We need to assign them to the correct team based on game_state.user_team
-            final_action = np.zeros(game_state.env.n_players, dtype=np.int32)
-
-            if game_state.user_team == Team.OFFENSE:
-                # User is offense, opponent is defense
-                for idx in game_state.env.offense_ids:
-                    final_action[idx] = resolved_unified[idx]
-                for idx in game_state.env.defense_ids:
-                    final_action[idx] = resolved_opponent[idx]
-            else:
-                # User is defense, opponent is offense
-                for idx in game_state.env.defense_ids:
-                    final_action[idx] = resolved_unified[idx]
-                for idx in game_state.env.offense_ids:
-                    final_action[idx] = resolved_opponent[idx]
-
-            # Execute step
-            obs, reward, terminated, truncated, info = game_state.env.step(final_action)
-            done = terminated or truncated
-            step_count += 1
-
-            # Track rewards by team
-            if isinstance(reward, np.ndarray):
-                rewards_list = reward.tolist()
-            elif isinstance(reward, (list, tuple)):
-                rewards_list = list(reward)
-            else:
-                rewards_list = [reward]
-
-            if len(rewards_list) > 1:
-                for i, r in enumerate(rewards_list):
-                    if i in game_state.env.offense_ids:
-                        episode_rewards["offense"] += float(r)
-                    elif i in game_state.env.defense_ids:
-                        episode_rewards["defense"] += float(r)
-            else:
-                episode_rewards["offense"] += float(rewards_list[0])
-
-        # Capture final state
-        game_state.obs = obs
-        final_state = get_full_game_state(include_state_values=True)
-
-        # Calculate average entropy for this episode
-        avg_entropy = (
-            episode_entropy_sum / episode_entropy_count
-            if episode_entropy_count > 0
-            else 0.0
+    start_time = time.time()
+    
+    # Choose between sequential and parallel based on episode count
+    # Parallel has ~15-20s startup overhead (spawning workers, loading policies)
+    # Sequential runs at ~100+ ep/s, so parallel only wins for large runs
+    PARALLEL_THRESHOLD = 1000  # Only use parallel for 1000+ episodes
+    
+    if num_episodes >= PARALLEL_THRESHOLD and game_state.env_required_params is not None:
+        print(f"[Evaluation] Using parallel execution ({num_episodes} >= {PARALLEL_THRESHOLD})")
+        raw_results = _run_parallel_evaluation(
+            num_episodes=num_episodes,
+            player_deterministic=player_deterministic,
+            opponent_deterministic=opponent_deterministic,
+            required_params=game_state.env_required_params,
+            optional_params=game_state.env_optional_params,
+            unified_policy_path=game_state.unified_policy_path,
+            opponent_policy_path=game_state.opponent_policy_path,
+            user_team_name=game_state.user_team.name,
+            role_flag_offense=game_state.role_flag_offense,
+            role_flag_defense=game_state.role_flag_defense,
         )
-        episode_entropies.append(avg_entropy)
-
-        episode_results.append(
-            {
-                "episode": ep_idx + 1,
-                "final_state": final_state,
-                "steps": step_count,
-                "episode_rewards": episode_rewards,
-            }
+    else:
+        print(f"[Evaluation] Using sequential execution ({num_episodes} < {PARALLEL_THRESHOLD})")
+        raw_results = _run_sequential_evaluation(
+            num_episodes=num_episodes,
+            player_deterministic=player_deterministic,
+            opponent_deterministic=opponent_deterministic,
         )
+    
+    elapsed_time = time.time() - start_time
+    
+    # Convert results to expected format
+    # Both sequential and parallel return outcome_info; we reconstruct final_state for frontend
+    episode_results = []
+    for r in raw_results:
+        outcome_info = r.get("outcome_info", {})
+        # Reconstruct final_state with all fields needed by frontend stats recording
+        final_state = {
+            "last_action_results": {
+                "shots": outcome_info.get("shots", {}),
+                "turnovers": outcome_info.get("turnovers", []),
+            },
+            "shot_clock": outcome_info.get("shot_clock", 0),
+            "three_point_distance": outcome_info.get("three_point_distance", 4.0),
+            "user_team_name": game_state.user_team.name,
+            "done": True,  # All evaluation episodes are complete
+        }
+        episode_results.append({
+            "episode": r["episode"],
+            "final_state": final_state,
+            "steps": r["steps"],
+            "episode_rewards": r["episode_rewards"],
+        })
 
     # Log evaluation summary statistics with outcome analysis
     if episode_results:
@@ -1600,15 +2110,8 @@ def run_evaluation(request: EvaluationRequest):
         print(f"  - Min: {min_length} steps")
         print(f"  - Max: {max_length} steps")
         print(f"  - Total episodes: {len(episode_results)}")
+        print(f"  - Total time: {elapsed_time:.1f}s ({num_episodes/elapsed_time:.1f} episodes/sec)")
 
-        # Log average policy entropy (to compare with training)
-        if episode_entropies:
-            avg_entropy = sum(episode_entropies) / len(episode_entropies)
-            print(f"[Evaluation Complete] Policy entropy:")
-            print(f"  - Average entropy: {avg_entropy:.3f}")
-            print(
-                f"  - NOTE: Compare with training 'train/entropy_loss' metric in MLflow"
-            )
         print(f"[Evaluation Complete] Episode outcomes:")
         print(
             f"  - Made shots: {outcomes['made_shot']} ({100*outcomes['made_shot']/len(episode_results):.1f}%)"
@@ -1623,10 +2126,31 @@ def run_evaluation(request: EvaluationRequest):
             f"  - Other: {outcomes['other']} ({100*outcomes['other']/len(episode_results):.1f}%)"
         )
 
+    # Reset environment to a fresh playable state after evaluation
+    # This ensures the user can continue playing individual games
+    print("[Evaluation] Resetting environment to playable state...")
+    game_state.obs, _ = game_state.env.reset()
+    game_state.prev_obs = None
+    game_state.episode_states = []
+    game_state.actions_log = []
+    game_state.frames = []
+    game_state.reward_history = []
+    game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+    _capture_turn_start_snapshot()
+    
+    # Record initial state for potential replay
+    current_game_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    game_state.episode_states.append(current_game_state)
+
     return {
         "status": "success",
         "num_episodes": len(episode_results),
         "results": episode_results,
+        "current_state": current_game_state,  # Fresh game state for UI to use
     }
 
 
@@ -1659,6 +2183,7 @@ def replay_last_episode():
         "initial_positions": game_state.replay_initial_positions,
         "ball_holder": game_state.replay_ball_holder,
         "shot_clock": game_state.replay_shot_clock,
+        "offense_skills": game_state.replay_offense_skills,
     }
     obs, _ = game_state.env.reset(seed=game_state.replay_seed, options=options)
 
@@ -1773,6 +2298,10 @@ def debug_frames():
         "has_offensive_lane_hexes": hasattr(game_state.env, "offensive_lane_hexes") if game_state.env else False,
     }
 
+class SaveEpisodeRequest(BaseModel):
+    frames: List[str]  # Base64-encoded PNG images
+
+
 @app.post("/api/save_episode")
 def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
@@ -1861,6 +2390,105 @@ def save_episode():
     game_state.frames = []
 
     return {"status": "success", "file_path": file_path}
+
+
+@app.post("/api/save_episode_from_pngs")
+def save_episode_from_pngs(request: SaveEpisodeRequest):
+    """Saves episode from base64-encoded PNG frames sent from frontend."""
+    import base64
+    from PIL import Image
+    import io
+    
+    if not request.frames or len(request.frames) == 0:
+        raise HTTPException(status_code=400, detail="No frames provided")
+    
+    # Determine directory using MLflow run_id if available
+    base_dir = "episodes"
+    if getattr(game_state, "run_id", None):
+        base_dir = os.path.join(base_dir, str(game_state.run_id))
+    os.makedirs(base_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Determine outcome label
+    outcome = "Unknown"
+    category = None
+    try:
+        ar = game_state.env.last_action_results or {}
+        if ar.get("shots"):
+            shooter_id_str = list(ar["shots"].keys())[0]
+            shot_res = ar["shots"][shooter_id_str]
+            distance = int(shot_res.get("distance", 999))
+            is_dunk = distance == 0
+            is_three = bool(
+                shot_res.get("is_three")
+                if "is_three" in shot_res
+                else distance >= game_state.env.three_point_distance
+            )
+            success = bool(shot_res.get("success"))
+            assist_full = bool(shot_res.get("assist_full", False))
+            assist_potential = bool(shot_res.get("assist_potential", False))
+
+            shot_type = "dunk" if is_dunk else ("3pt" if is_three else "2pt")
+            if success:
+                outcome = f"Made {shot_type.upper()}" if shot_type != "dunk" else "Made Dunk"
+                category = f"made_assisted_{shot_type}" if assist_full else f"made_unassisted_{shot_type}"
+            else:
+                outcome = f"Missed {shot_type.upper()}" if shot_type != "dunk" else "Missed Dunk"
+                category = f"missed_potentially_assisted_{shot_type}" if assist_potential else f"missed_{shot_type}"
+        elif ar.get("turnovers"):
+            reason = ar["turnovers"][0].get("reason", "turnover")
+            if reason == "intercepted":
+                outcome = "Turnover (Intercepted)"
+            elif reason in ("pass_out_of_bounds", "move_out_of_bounds"):
+                outcome = "Turnover (OOB)"
+            elif reason == "defender_pressure":
+                outcome = "Turnover (Pressure)"
+            else:
+                outcome = f"Turnover ({reason})"
+        elif getattr(game_state.env, "shot_clock", 1) <= 0:
+            outcome = "Turnover (Shot Clock Violation)"
+    except Exception:
+        pass
+
+    if category is None:
+        category = get_outcome_category(outcome)
+    
+    file_path = os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
+    
+    # Decode base64 PNG frames and convert to numpy arrays
+    try:
+        frames = []
+        for base64_frame in request.frames:
+            # Remove data URL prefix if present
+            if ',' in base64_frame:
+                base64_frame = base64_frame.split(',')[1]
+            
+            # Decode base64 to bytes
+            img_bytes = base64.b64decode(base64_frame)
+            
+            # Open with PIL
+            img = Image.open(io.BytesIO(img_bytes))
+            
+            # Convert to RGB (remove alpha channel if present)
+            if img.mode == 'RGBA':
+                # Create white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Convert to numpy array
+            frames.append(np.array(img))
+        
+        # Save as GIF
+        imageio.mimsave(file_path, frames, fps=1, loop=0)
+        
+        return {"status": "success", "file_path": file_path}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to save GIF from PNGs: {e}")
 
 
 @app.get("/api/policy_probabilities")
@@ -1980,13 +2608,13 @@ def get_action_values(player_id: int):
         print(f"[API] Episode has ended, returning empty action values for player {player_id}")
         return jsonable_encoder({})
 
-    print(f"\n[API] Received request for Q-values for player {player_id}")
+    # print(f"\n[API] Received request for Q-values for player {player_id}")
     action_values = _compute_q_values_for_player(player_id, game_state)
 
-    print(f"[API] Sending action values for player {player_id}:")
+    # print(f"[API] Sending action values for player {player_id}:")
     import json
 
-    print(json.dumps(action_values, indent=2))
+    # print(json.dumps(action_values, indent=2))
     return jsonable_encoder(action_values)
 
 
@@ -2021,8 +2649,8 @@ def get_state_values():
         game_state.prev_obs = None
         
         if state_values:
-            print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {state_values['offensive_value']:.3f}")
-            print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {state_values['defensive_value']:.3f}")
+            # print(f"[STATE_VALUES] Offensive value (role_flag={game_state.role_flag_offense}): {state_values['offensive_value']:.3f}")
+            # print(f"[STATE_VALUES] Defensive value (role_flag={game_state.role_flag_defense}): {state_values['defensive_value']:.3f}")
             return state_values
         else:
             return {
@@ -2057,15 +2685,15 @@ def get_shot_probability(player_id: int):
         distance = game_state.env._hex_distance(player_pos, basket_pos)
 
         # Debug: Log the basic parameters
-        print(
-            f"[SHOT_PROB_DEBUG] Player {player_id} at {player_pos}, basket at {basket_pos}, distance: {distance}"
-        )
-        print(
-            f"[SHOT_PROB_DEBUG] Environment params: layup_pct={game_state.env.layup_pct}, three_pt_pct={game_state.env.three_pt_pct}, three_point_distance={game_state.env.three_point_distance}"
-        )
-        print(
-            f"[SHOT_PROB_DEBUG] Shot pressure params: enabled={game_state.env.shot_pressure_enabled}, max={game_state.env.shot_pressure_max}, lambda={game_state.env.shot_pressure_lambda}"
-        )
+        # print(
+        #     f"[SHOT_PROB_DEBUG] Player {player_id} at {player_pos}, basket at {basket_pos}, distance: {distance}"
+        # )
+        # print(
+        #     f"[SHOT_PROB_DEBUG] Environment params: layup_pct={game_state.env.layup_pct}, three_pt_pct={game_state.env.three_pt_pct}, three_point_distance={game_state.env.three_point_distance}"
+        # )
+        # print(
+        #     f"[SHOT_PROB_DEBUG] Shot pressure params: enabled={game_state.env.shot_pressure_enabled}, max={game_state.env.shot_pressure_max}, lambda={game_state.env.shot_pressure_lambda}"
+        # )
 
         # Calculate base probability first (without pressure)
         d0 = 1
@@ -2079,13 +2707,13 @@ def get_shot_probability(player_id: int):
             t = (distance - d0) / (d1 - d0)
             base_prob = p0 + (p1 - p0) * t
 
-        print(f"[SHOT_PROB_DEBUG] Base probability before pressure: {base_prob:.3f}")
+        # print(f"[SHOT_PROB_DEBUG] Base probability before pressure: {base_prob:.3f}")
 
         # Calculate pressure-adjusted probability (for logging/diagnostics)
         final_prob = game_state.env._calculate_shot_probability(player_id, distance)
-        print(
-            f"[SHOT_PROB_DEBUG] Final shot probability after pressure: {final_prob:.3f}"
-        )
+        # print(
+        #     f"[SHOT_PROB_DEBUG] Final shot probability after pressure: {final_prob:.3f}"
+        # )
 
         return {
             "player_id": player_id,
@@ -2124,13 +2752,13 @@ def get_rewards():
     import sys
 
     print("=" * 80, flush=True)
-    print("[DEBUG] /api/rewards endpoint called", flush=True)
+    # print("[DEBUG] /api/rewards endpoint called", flush=True)
     sys.stdout.flush()
 
     # Calculate phi shaping rewards using MLflow parameters (if available)
     # This is separate from the Phi Shaping tab which is for experimentation
     mlflow_phi_params = game_state.mlflow_phi_shaping_params
-    print(f"[DEBUG] mlflow_phi_params = {mlflow_phi_params}", flush=True)
+    # print(f"[DEBUG] mlflow_phi_params = {mlflow_phi_params}", flush=True)
     sys.stdout.flush()
 
     # Calculate MLflow-based phi shaping rewards
@@ -2139,9 +2767,9 @@ def get_rewards():
         beta = mlflow_phi_params.get("phi_beta", 0.0)
         gamma = mlflow_phi_params.get("reward_shaping_gamma", 1.0)
 
-        print(
-            f"[MLflow Phi] Calculating rewards with beta={beta}, gamma={gamma}, mode={mlflow_phi_params.get('phi_aggregation_mode')}, history_length={len(game_state.reward_history)}"
-        )
+        # print(
+        #     f"[MLflow Phi] Calculating rewards with beta={beta}, gamma={gamma}, mode={mlflow_phi_params.get('phi_aggregation_mode')}, history_length={len(game_state.reward_history)}"
+        # )
 
         # Calculate phi for initial state (step 0) from phi_log if available
         phi_prev = 0.0
@@ -2152,16 +2780,16 @@ def get_rewards():
                 initial_ep = initial_entry.get("ep_by_player", [])
                 initial_ball = initial_entry.get("ball_handler", -1)
                 initial_offense = initial_entry.get("offense_ids", [])
-                print(
-                    f"[MLflow Phi] Initial state: ep_by_player={initial_ep}, ball={initial_ball}, offense={initial_offense}"
-                )
+                # print(
+                #     f"[MLflow Phi] Initial state: ep_by_player={initial_ep}, ball={initial_ball}, offense={initial_offense}"
+                # )
                 if initial_ep and initial_ball >= 0 and initial_offense:
                     phi_prev = calculate_phi_from_ep_data(
                         initial_ep, initial_ball, initial_offense, mlflow_phi_params
                     )
-                    print(
-                        f"[MLflow Phi] Initial state phi_prev = {phi_prev} (expected from Phi Shaping tab)"
-                    )
+                    # print(
+                    #     f"[MLflow Phi] Initial state phi_prev = {phi_prev} (expected from Phi Shaping tab)"
+                    # )
                 else:
                     print(
                         f"[MLflow Phi] WARNING: Could not calculate initial phi - missing data"
@@ -2816,6 +3444,16 @@ def get_full_game_state(
         except Exception:
             ball_handler_shot_prob = None
 
+    # Calculate pass steal probabilities for replay
+    pass_steal_probs = {}
+    if ball_holder_py is not None:
+        try:
+            steal_probs = game_state.env.calculate_pass_steal_probabilities(ball_holder_py)
+            pass_steal_probs = {int(k): float(v) for k, v in steal_probs.items()}
+        except Exception as e:
+            print(f"[get_full_game_state] Failed to calculate pass steal probabilities: {e}")
+            pass_steal_probs = {}
+
     # Calculate EP (expected points) for all players
     ep_by_player = []
     try:
@@ -2841,6 +3479,7 @@ def get_full_game_state(
         "positions": positions_py,
         "ball_holder": ball_holder_py,
         "ball_handler_shot_probability": ball_handler_shot_prob,
+        "pass_steal_probabilities": pass_steal_probs,
         "shot_clock": int(game_state.env.shot_clock),
         "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
         "shot_clock_steps": int(
@@ -2912,6 +3551,7 @@ def get_full_game_state(
             else None
         ),
         "defender_spawn_distance": int(getattr(game_state.env, "defender_spawn_distance", 0)),
+        "defender_guard_distance": int(getattr(game_state.env, "defender_guard_distance", 1)),
         "shot_pressure_enabled": bool(
             getattr(game_state.env, "shot_pressure_enabled", True)
         ),
@@ -2984,6 +3624,8 @@ def get_full_game_state(
         # MLflow metadata for UI display
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),
+        # Training parameters from MLflow (PPO hyperparameters)
+        "training_params": getattr(game_state, "mlflow_training_params", None),
         # Policies in use
         "unified_policy_name": getattr(game_state, "unified_policy_key", None),
         "opponent_unified_policy_name": getattr(

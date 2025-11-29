@@ -130,6 +130,80 @@ def linear_schedule(start, end):
     return f
 
 
+def get_steps_for_alternation(
+    alternation_idx: int,
+    total_alternations: int,
+    start_steps: int,
+    end_steps: int,
+    schedule_type: str = "linear",
+) -> int:
+    """
+    Calculate the number of steps for a given alternation based on a schedule.
+
+    Args:
+        alternation_idx: Current alternation index (0-based)
+        total_alternations: Total number of alternations in the run
+        start_steps: Steps per alternation at the beginning
+        end_steps: Steps per alternation at the end
+        schedule_type: Type of schedule ('linear', 'log', or 'constant')
+
+    Returns:
+        Number of steps for this alternation
+    """
+    # Handle edge cases
+    if total_alternations <= 1 or start_steps == end_steps:
+        return start_steps
+
+    if schedule_type == "constant":
+        return start_steps
+
+    # Linear progress from 0 to 1
+    progress = alternation_idx / (total_alternations - 1)
+
+    if schedule_type == "log":
+        # Logarithmic interpolation: slower increase at start, faster at end
+        # Uses log1p for smooth curve: log(1 + x*k) / log(1 + k) maps [0,1] -> [0,1]
+        # k=9 gives a nice curve shape
+        import math
+        k = 9.0
+        log_progress = math.log1p(progress * k) / math.log1p(k)
+        return int(round(start_steps + (end_steps - start_steps) * log_progress))
+
+    # Default: linear interpolation
+    return int(round(start_steps + (end_steps - start_steps) * progress))
+
+
+def calculate_total_timesteps_with_schedule(
+    total_alternations: int,
+    start_steps: int,
+    end_steps: int,
+    schedule_type: str,
+    num_envs: int,
+    n_steps: int,
+) -> int:
+    """
+    Calculate total timesteps for a run with a steps-per-alternation schedule.
+
+    Args:
+        total_alternations: Number of alternations
+        start_steps: Starting steps per alternation
+        end_steps: Ending steps per alternation
+        schedule_type: Schedule type ('linear' or 'constant')
+        num_envs: Number of parallel environments
+        n_steps: PPO n_steps parameter
+
+    Returns:
+        Total timesteps for the entire run
+    """
+    total = 0
+    for i in range(total_alternations):
+        steps = get_steps_for_alternation(
+            i, total_alternations, start_steps, end_steps, schedule_type
+        )
+        total += steps * num_envs * n_steps
+    return total
+
+
 def sample_geometric(indices: list[int], beta: float) -> int:
     """Return index sampled with decayed probability (newest highest)."""
     K = len(indices)
@@ -1075,14 +1149,52 @@ def main(args):
         entropy_callback = None
         beta_callback = None
 
+        # Determine effective steps-per-alternation schedule parameters
+        # Check if continuing from a previous run with spa schedule
+        if (
+            args.continue_run_id
+            and schedule_mode == "extend"
+            and previous_schedule_meta
+            and "spa_start" in previous_schedule_meta
+        ):
+            # Use previous spa schedule if it exists
+            spa_start = previous_schedule_meta.get("spa_start", args.steps_per_alternation)
+            spa_end = previous_schedule_meta.get(
+                "spa_end",
+                args.steps_per_alternation_end
+                if args.steps_per_alternation_end is not None
+                else args.steps_per_alternation,
+            )
+            spa_schedule = previous_schedule_meta.get(
+                "spa_schedule", args.steps_per_alternation_schedule
+            )
+            print(f"  Using previous SPA schedule: {spa_start} → {spa_end} ({spa_schedule})")
+        else:
+            # Fresh start or no previous spa schedule
+            spa_start = args.steps_per_alternation
+            spa_end = (
+                args.steps_per_alternation_end
+                if args.steps_per_alternation_end is not None
+                else args.steps_per_alternation
+            )
+            spa_schedule = args.steps_per_alternation_schedule
+
         # Calculate total planned timesteps for this training session
-        new_training_timesteps = int(
-            2
-            * args.alternations
-            * args.steps_per_alternation
-            * args.num_envs
-            * args.n_steps
+        new_training_timesteps = calculate_total_timesteps_with_schedule(
+            args.alternations,
+            spa_start,
+            spa_end,
+            spa_schedule,
+            args.num_envs,
+            args.n_steps,
         )
+
+        # Print SPA schedule info if not constant
+        if spa_start != spa_end:
+            print(f"Steps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
+            print(f"  First alternation: {get_steps_for_alternation(0, args.alternations, spa_start, spa_end, spa_schedule)} steps")
+            print(f"  Last alternation: {get_steps_for_alternation(args.alternations - 1, args.alternations, spa_start, spa_end, spa_schedule)} steps")
+            print(f"  Total timesteps: {new_training_timesteps:,}")
 
         # Determine schedule parameters based on continuation mode
         if (
@@ -1112,7 +1224,9 @@ def main(args):
                 original_total,
                 original_current,
                 args.alternations,
-                args.steps_per_alternation,
+                spa_start,
+                spa_end,
+                spa_schedule,
                 args.num_envs,
                 args.n_steps,
             )
@@ -1156,6 +1270,8 @@ def main(args):
                     if args.ent_coef_start is None
                     else args.ent_coef_start
                 )
+            if ent_end is None:
+                ent_end = args.ent_coef_end if args.ent_coef_end is not None else 0.0
             if ent_schedule_type == "exp":
                 entropy_callback = EntropyExpScheduleCallback(
                     ent_start,
@@ -1304,7 +1420,13 @@ def main(args):
         for i in range(args.alternations):
             print("-" * 50)
             global_alt = base_alt_idx + i + 1
+            # Calculate steps for this alternation based on schedule
+            current_spa = get_steps_for_alternation(
+                i, args.alternations, spa_start, spa_end, spa_schedule
+            )
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
+            if spa_start != spa_end:
+                print(f"  Steps per alternation: {current_spa} (scheduled {spa_start} → {spa_end})")
             print("-" * 50)
 
             # --- Load opponent(s) for this alternation ---
@@ -1471,9 +1593,7 @@ def main(args):
             # Single learn() call trains both offense and defense together
             # PPO collects and mixes data from all environments
             unified_policy.learn(
-                total_timesteps=args.steps_per_alternation
-                * args.num_envs
-                * args.n_steps,
+                total_timesteps=current_spa * args.num_envs * args.n_steps,
                 reset_num_timesteps=False,
                 callback=mixed_callbacks,
                 progress_bar=True,
@@ -1718,6 +1838,9 @@ def main(args):
                 pass_oob_turnover_prob_end=getattr(
                     args, "pass_oob_turnover_prob_end", None
                 ),
+                spa_start=spa_start if "spa_start" in locals() else None,
+                spa_end=spa_end if "spa_end" in locals() else None,
+                spa_schedule=spa_schedule if "spa_schedule" in locals() else "linear",
                 total_planned_timesteps=(
                     total_planned_ts if "total_planned_ts" in locals() else 0
                 ),
@@ -1825,7 +1948,20 @@ if __name__ == "__main__":
         "--steps-per-alternation",
         type=int,
         default=1,
-        help="Timesteps to train each policy per alternation.",
+        help="Starting timesteps to train each policy per alternation (or constant if no end specified).",
+    )
+    parser.add_argument(
+        "--steps-per-alternation-end",
+        type=int,
+        default=None,
+        help="Ending timesteps per alternation. If specified, steps will be scheduled from start to end.",
+    )
+    parser.add_argument(
+        "--steps-per-alternation-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "log", "constant"],
+        help="Schedule type for steps-per-alternation: 'linear' interpolates linearly, 'log' uses logarithmic curve (slower increase early, faster late), 'constant' uses start value only.",
     )
     parser.add_argument(
         "--n-steps",

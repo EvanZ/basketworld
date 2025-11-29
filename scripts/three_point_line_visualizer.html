@@ -166,6 +166,10 @@
         pointer-events: none;
       }
 
+      .hex.lane {
+        fill: rgba(219, 39, 119, 0.35);
+      }
+
       @media (max-width: 980px) {
         main {
           flex-direction: column;
@@ -223,6 +227,14 @@
           Hex Radius (visual only)
           <input id="hexSize" type="number" min="12" max="48" step="1" value="26" />
         </label>
+        <label>
+          Lane Width (rows from center)
+          <input id="laneWidth" type="number" min="0" max="10" step="1" value="1" />
+        </label>
+        <label>
+          Lane Height (hex distance)
+          <input id="laneHeight" type="number" min="0" max="10" step="1" value="3" />
+        </label>
         <p id="warnings" class="warning"></p>
       </section>
 
@@ -234,17 +246,23 @@
     <section class="panel legend">
       <h2>How to read this</h2>
       <p>
-        Blue hexes are counted as three-point attempts. Pale hexes remain two-pointers. When
+        Blue hexes are counted as three-point attempts. Pale hexes remain two-pointers. Pink/magenta hexes are the
+        <strong>lane (painted area)</strong> where 3-second violations apply. When
         <code>three-point-short-distance</code> is supplied, straight segments anchor to the sidelines until they hit
         the orange arc defined by <code>three-point-distance</code>. Leave it blank to match the current implementation
         (one arc everywhere).
       </p>
       <p>
+        The lane is defined by two parameters: <code>lane-width</code> (how many rows above/below the basket row to include)
+        and <code>lane-height</code> (hex distance from the basket). A hex is in the lane if its hex distance from the basket
+        is less than <code>lane-height</code> AND its row offset from the basket row is at most <code>lane-width</code>.
+      </p>
+      <p>
         Because we are working with a discrete hex grid, the line highlight shows which hex centers sit on (or very
         near) the perimeter. Use the sliders/inputs to explore how different radius combinations would look on the 13×13
-        court—the hoop is fixed on the left baseline (matching BasketWorld’s orientation where play flows left → right)
+        court—the hoop is fixed on the left baseline (matching BasketWorld's orientation where play flows left → right)
         so the arc faces the open court. Hexes outlined in pale gold are the ones where at least half of the polygon lies
-        “behind” the theoretical line, meaning those are the tiles that would count as three-point attempts under a ≥50%
+        "behind" the theoretical line, meaning those are the tiles that would count as three-point attempts under a ≥50%
         coverage rule.
       </p>
     </section>
@@ -259,6 +277,8 @@
           threePointDistance: document.getElementById("threePointDistance"),
           threePointShortDistance: document.getElementById("threePointShortDistance"),
           hexSize: document.getElementById("hexSize"),
+          laneWidth: document.getElementById("laneWidth"),
+          laneHeight: document.getElementById("laneHeight"),
         };
         const warningEl = document.getElementById("warnings");
         const svg = document.getElementById("court");
@@ -269,6 +289,8 @@
           threePointDistance: 5,
           threePointShortDistance: null,
           hexSize: 26,
+          laneWidth: 1,
+          laneHeight: 3,
         };
 
         const syncInputs = () => {
@@ -280,6 +302,8 @@
             state.threePointShortDistance === null || state.threePointShortDistance === undefined
               ? ""
               : state.threePointShortDistance;
+          inputs.laneWidth.value = state.laneWidth;
+          inputs.laneHeight.value = state.laneHeight;
         };
 
         Object.entries(inputs).forEach(([key, el]) => {
@@ -296,6 +320,18 @@
         });
 
         const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+        // Convert offset coordinates to axial coordinates (odd-r offset)
+        const offsetToAxial = (col, row) => {
+          const q = col - ((row - (row & 1)) >> 1);
+          const r = row;
+          return { q, r };
+        };
+
+        // Calculate hex distance between two axial positions
+        const hexDistance = (q1, r1, q2, r2) => {
+          return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
+        };
 
         const offsetToPixel = (col, row, size) => {
           const w = SQRT3 * size;
@@ -446,11 +482,15 @@
 
           const threePointDistance = Math.max(state.threePointDistance || 1, 0.25);
           let threePointShortDistance = state.threePointShortDistance;
+          const laneWidth = clamp(Math.round(state.laneWidth ?? 1), 0, 10);
+          const laneHeight = clamp(Math.round(state.laneHeight ?? 3), 0, 10);
 
           state.rows = rows;
           state.cols = cols;
           state.hexSize = hexSize;
           state.threePointDistance = threePointDistance;
+          state.laneWidth = laneWidth;
+          state.laneHeight = laneHeight;
 
           warningEl.textContent = "";
 
@@ -516,6 +556,23 @@
             return Math.hypot(dx, dy) >= radiusPx;
           };
 
+          // Calculate lane hexes
+          // The lane is defined by:
+          // 1. Hex distance from basket < laneHeight
+          // 2. Row offset from basket row <= laneWidth
+          const hoopAxial = offsetToAxial(hoopCol, hoopRow);
+          const laneSet = new Set();
+          
+          cells.forEach((cell) => {
+            const cellAxial = offsetToAxial(cell.col, cell.row);
+            const dist = hexDistance(cellAxial.q, cellAxial.r, hoopAxial.q, hoopAxial.r);
+            const rowOffset = Math.abs(cell.row - hoopRow);
+            
+            if (dist < laneHeight && rowOffset <= laneWidth) {
+              laneSet.add(`${cell.col},${cell.row}`);
+            }
+          });
+
           // Court background
           const bg = document.createElementNS(NS, "rect");
           bg.setAttribute("x", bounds.minX - hexSize);
@@ -541,9 +598,13 @@
               pointIsThree,
               baselineDepth,
             );
+            const isLane = laneSet.has(`${cell.col},${cell.row}`);
             const classNames = ["hex", isThree ? "three" : "two"];
             if (onLine) {
               classNames.push("line");
+            }
+            if (isLane) {
+              classNames.push("lane");
             }
             polygon.setAttribute("class", classNames.join(" "));
             svg.appendChild(polygon);

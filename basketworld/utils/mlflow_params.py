@@ -94,6 +94,9 @@ def get_mlflow_params(
     optional["defender_spawn_distance"] = _get_param(
         params, ["defender_spawn_distance", "defender-spawn-distance"], int, 0
     )
+    optional["defender_guard_distance"] = _get_param(
+        params, ["defender_guard_distance", "defender-guard-distance"], int, 1
+    )
     optional["allow_dunks"] = _get_param(
         params,
         ["allow_dunks", "allow-dunks"],
@@ -397,3 +400,135 @@ def get_mlflow_phi_shaping_params(
     )
 
     return phi_params
+
+
+def get_mlflow_training_params(
+    client: mlflow.tracking.MlflowClient, run_id: str
+) -> dict:
+    """Fetch PPO training parameters from an MLflow run.
+
+    Returns a dict with training hyperparameters like learning_rate, gamma, etc.
+    """
+    run = client.get_run(run_id)
+    params = run.data.params
+
+    training_params = {}
+
+    # PPO Core Hyperparameters
+    training_params["learning_rate"] = _get_param(
+        params, ["learning_rate", "learning-rate"], float, 2.5e-4
+    )
+    training_params["n_steps"] = _get_param(
+        params, ["n_steps", "n-steps"], int, 2048
+    )
+    training_params["batch_size"] = _get_param(
+        params, ["batch_size", "batch-size"], int, 64
+    )
+    training_params["n_epochs"] = _get_param(
+        params, ["n_epochs", "n-epochs"], int, 10
+    )
+    training_params["gamma"] = _get_param(
+        params, ["gamma"], float, 0.99
+    )
+    training_params["gae_lambda"] = _get_param(
+        params, ["gae_lambda", "gae-lambda"], float, 0.95
+    )
+    training_params["clip_range"] = _get_param(
+        params, ["clip_range", "clip-range"], float, 0.2
+    )
+    training_params["vf_coef"] = _get_param(
+        params, ["vf_coef", "vf-coef"], float, 0.5
+    )
+    training_params["ent_coef"] = _get_param(
+        params, ["ent_coef", "ent-coef"], float, 0.0
+    )
+    training_params["ent_coef_start"] = _get_param(
+        params, ["ent_coef_start", "ent-coef-start"], 
+        lambda v: None if v == "" or v == "None" else float(v), 
+        None
+    )
+    training_params["ent_coef_end"] = _get_param(
+        params, ["ent_coef_end", "ent-coef-end"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None
+    )
+
+    # Network Architecture
+    # net_arch_used is logged after policy creation and shows actual architecture
+    training_params["net_arch_used"] = _get_param(
+        params, ["net_arch_used", "net-arch-used"], str, None
+    )
+    # Original net_arch from CLI (may be None if using pi/vf separately)
+    training_params["net_arch"] = _get_param(
+        params, ["net_arch", "net-arch"], str, None
+    )
+    # Separate pi/vf architectures - stored as list strings like "[64, 64]"
+    training_params["net_arch_pi"] = _get_param(
+        params, ["net_arch_pi", "net-arch-pi", "net_arch-pi"], str, None
+    )
+    training_params["net_arch_vf"] = _get_param(
+        params, ["net_arch_vf", "net-arch-vf", "net_arch-vf"], str, None
+    )
+    training_params["use_dual_critic"] = _get_param(
+        params,
+        ["use_dual_critic", "use-dual-critic"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["policy_class"] = _get_param(
+        params, ["policy_class", "policy-class"], str, "PassBiasMultiInputPolicy"
+    )
+
+    # Training Setup
+    training_params["num_envs"] = _get_param(
+        params, ["num_envs", "num-envs"], int, 8
+    )
+    # Alternation settings
+    training_params["alternations"] = _get_param(
+        params, ["alternations"], int, 10
+    )
+    training_params["steps_per_alternation"] = _get_param(
+        params, ["steps_per_alternation", "steps-per-alternation"], int, 1
+    )
+    training_params["steps_per_alternation_end"] = _get_param(
+        params, ["steps_per_alternation_end", "steps-per-alternation-end"], 
+        lambda v: None if v in ("None", "null", "") else int(v), 
+        None
+    )
+    training_params["steps_per_alternation_schedule"] = _get_param(
+        params, ["steps_per_alternation_schedule", "steps-per-alternation-schedule"], 
+        str, 
+        "linear"
+    )
+    # Calculated: timesteps_per_alternation = steps_per_alternation * num_envs * n_steps
+    # Calculated: total_timesteps = alternations * timesteps_per_alternation (approximate if using SPA schedule)
+
+    # Self-play and Opponent Sampling
+    training_params["deterministic_opponent"] = _get_param(
+        params,
+        ["deterministic_opponent", "deterministic-opponent"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["per_env_opponent_sampling"] = _get_param(
+        params,
+        ["per_env_opponent_sampling", "per-env-opponent-sampling"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["opponent_sample_k"] = _get_param(
+        params, ["opponent_sample_k", "opponent-sample-k"], int, 5
+    )
+    training_params["opponent_pool_beta"] = _get_param(
+        params, ["opponent_pool_beta", "opponent-pool-beta"], float, 0.5
+    )
+    training_params["opponent_pool_exploration"] = _get_param(
+        params, ["opponent_pool_exploration", "opponent-pool-exploration"], float, 0.5
+    )
+
+    # Pass Logit Bias
+    training_params["pass_logit_bias"] = _get_param(
+        params, ["pass_logit_bias", "pass-logit-bias"], float, 0.0
+    )
+
+    return training_params

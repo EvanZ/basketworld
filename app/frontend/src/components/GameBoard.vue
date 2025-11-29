@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch, onMounted } from 'vue';
-import { getShotProbability } from '@/services/api';
+import { getShotProbability, getPassStealProbabilities } from '@/services/api';
 
 const props = defineProps({
   gameHistory: {
@@ -22,6 +22,10 @@ const props = defineProps({
   isShotClockUpdating: {
     type: Boolean,
     default: false,
+  },
+  selectedActions: {
+    type: Object,
+    default: () => ({}),
   },
 });
 
@@ -65,13 +69,27 @@ function onPlayerClick(player) {
   if (isDragging.value) return;
   // Allow selecting any player (offense or defense) from the board
   if (!player) return;
-  emit('update:activePlayerId', player.id);
+  
+  // Check if this player currently has policy probs displayed
+  // If so, toggle the visibility off. If not visible, turn them on.
+  const hasProbs = (props.activePlayerId === player.id && showPolicyProbs.value);
+  
+  if (hasProbs) {
+    // Toggle off policy display
+    showPolicyProbs.value = false;
+  } else {
+    // Show policy display and select this player
+    showPolicyProbs.value = true;
+    emit('update:activePlayerId', player.id);
+  }
 }
 
 const svgRef = ref(null);
 const draggedPlayerId = ref(null);
 const draggedPlayerPos = ref({ x: 0, y: 0 });
 const isDragging = ref(false);
+const passStealProbs = ref({});
+const showPolicyProbs = ref(true); // Toggle for policy probability visibility
 
 function getSvgPoint(clientX, clientY) {
   if (!svgRef.value) return { x: 0, y: 0 };
@@ -208,6 +226,87 @@ const basketPosition = computed(() => {
     return axialToCartesian(q, r);
 });
 
+// Action indicator configuration
+// Position angles for hex faces (pointy-top hex)
+// These are the angles from center to each hex face
+const POSITION_ANGLES = {
+  'MOVE_E':  0,      // Right
+  'MOVE_NE': -60,    // Upper-right
+  'MOVE_NW': -120,   // Upper-left
+  'MOVE_W':  180,    // Left
+  'MOVE_SW': 120,    // Lower-left
+  'MOVE_SE': 60,     // Lower-right
+  'PASS_E':  0,
+  'PASS_NE': -60,
+  'PASS_NW': -120,
+  'PASS_W':  180,
+  'PASS_SW': 120,
+  'PASS_SE': 60,
+};
+
+// Icon rotation angles (matching HexagonControlPad)
+const ICON_ROTATIONS = {
+  'MOVE_E':  0 + 90,
+  'MOVE_NE': -60 + 90,
+  'MOVE_NW': -120 + 90,
+  'MOVE_W':  180 + 90,
+  'MOVE_SW': 120 + 90,
+  'MOVE_SE': 60 + 90,
+  'PASS_E':  0 + 90,
+  'PASS_NE': -60 + 90,
+  'PASS_NW': -120 + 90,
+  'PASS_W':  180 + 90,
+  'PASS_SW': 120 + 90,
+  'PASS_SE': 60 + 90,
+};
+
+// Get action indicator data for a player
+function getActionIndicator(playerId, playerX, playerY, hasBall) {
+  const action = props.selectedActions[playerId];
+  if (!action || action === 'NOOP') return null;
+  
+  const indicatorRadius = HEX_RADIUS * 0.55; // Distance from player center to indicator
+  
+  if (action.startsWith('MOVE_')) {
+    const posAngle = POSITION_ANGLES[action];
+    const rad = posAngle * Math.PI / 180;
+    return {
+      type: 'move',
+      x: playerX + indicatorRadius * Math.cos(rad),
+      y: playerY + indicatorRadius * Math.sin(rad),
+      rotation: ICON_ROTATIONS[action],
+    };
+  }
+  
+  if (action.startsWith('PASS_') && hasBall) {
+    const posAngle = POSITION_ANGLES[action];
+    const rad = posAngle * Math.PI / 180;
+    return {
+      type: 'pass',
+      x: playerX + indicatorRadius * Math.cos(rad),
+      y: playerY + indicatorRadius * Math.sin(rad),
+      rotation: ICON_ROTATIONS[action],
+    };
+  }
+  
+  if (action === 'SHOOT' && hasBall) {
+    // Point toward basket
+    const basket = basketPosition.value;
+    const dx = basket.x - playerX;
+    const dy = basket.y - playerY;
+    const posAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+    const rad = Math.atan2(dy, dx);
+    return {
+      type: 'shoot',
+      x: playerX + indicatorRadius * Math.cos(rad),
+      y: playerY + indicatorRadius * Math.sin(rad),
+      rotation: 0, // Target icon doesn't need rotation
+    };
+  }
+  
+  return null;
+}
+
 // Board transform - no flip needed, render as-is
 const boardTransform = computed(() => {
   return '';
@@ -314,6 +413,35 @@ watch(() => props.isShotClockUpdating, (updating) => {
   }
 });
 
+// Fetch pass steal probabilities when game state changes
+watch(currentGameState, async (newState) => {
+  if (!newState || newState.ball_holder === null || newState.ball_holder === undefined) {
+    passStealProbs.value = {};
+    return;
+  }
+  
+  // If the state has stored pass steal probabilities (from replay or recorded episode), use those
+  if (newState.pass_steal_probabilities) {
+    passStealProbs.value = newState.pass_steal_probabilities;
+    console.log('[GameBoard] Using stored pass steal probabilities from state:', newState.pass_steal_probabilities);
+    return;
+  }
+  
+  // During manual stepping without stored probs, keep existing values (don't fetch)
+  if (props.isManualStepping) {
+    return;
+  }
+  
+  // During live gameplay, fetch from API
+  try {
+    const probs = await getPassStealProbabilities();
+    passStealProbs.value = probs || {};
+  } catch (err) {
+    console.error('[GameBoard] Failed to fetch pass steal probabilities:', err);
+    passStealProbs.value = {};
+  }
+}, { immediate: true });
+
 function adjustShotClock(delta) {
   if (!isShotClockEditable.value) return;
   const minClock = 0;
@@ -375,6 +503,11 @@ const hexDirections = [
 ];
 
 const policySuggestions = computed(() => {
+    // Check if policy display is toggled off
+    if (!showPolicyProbs.value) {
+        return [];
+    }
+    
     // If we're in manual stepping, use the stored policy probabilities from the snapshot.
     const gs = currentGameState.value;
     const activeId = props.activePlayerId;
@@ -579,6 +712,53 @@ const playerTransitions = computed(() => {
   return transitions;
 });
 
+// Compute pass rays from ball handler to teammates with steal probabilities
+const passRays = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return [];
+  
+  const ballHandlerId = gs.ball_holder;
+  const ballHandlerPos = gs.positions[ballHandlerId];
+  if (!ballHandlerPos) return [];
+  
+  const [bhQ, bhR] = ballHandlerPos;
+  const bhCoords = axialToCartesian(bhQ, bhR);
+  
+  const isOffense = gs.offense_ids.includes(ballHandlerId);
+  const teamIds = isOffense ? gs.offense_ids : gs.defense_ids;
+  
+  const rays = [];
+  for (const teammateId of teamIds) {
+    if (teammateId === ballHandlerId) continue;
+    
+    const teammatePos = gs.positions[teammateId];
+    if (!teammatePos) continue;
+    
+    const [tmQ, tmR] = teammatePos;
+    const tmCoords = axialToCartesian(tmQ, tmR);
+    
+    const stealProb = passStealProbs.value[teammateId];
+    if (stealProb === undefined) continue;
+    
+    // Calculate midpoint for label placement
+    const midX = (bhCoords.x + tmCoords.x) / 2;
+    const midY = (bhCoords.y + tmCoords.y) / 2;
+    
+    rays.push({
+      x1: bhCoords.x,
+      y1: bhCoords.y,
+      x2: tmCoords.x,
+      y2: tmCoords.y,
+      midX,
+      midY,
+      stealProb: (stealProb * 100).toFixed(1), // Convert to percentage
+      teammateId,
+    });
+  }
+  
+  return rays;
+});
+
 async function downloadBoardAsImage() {
   if (!svgRef.value) return;
   
@@ -647,7 +827,10 @@ async function downloadBoardAsImage() {
       
       const ctx = canvas.getContext('2d');
       
-      // No background fill - transparent background
+      // Fill with dark background to match web app
+      ctx.fillStyle = '#0a0f1e';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
       // Draw the SVG onto the canvas (scaled up)
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       
@@ -701,6 +884,130 @@ async function downloadBoardAsImage() {
     alert('Failed to download board image');
   }
 }
+
+// Expose method to render current state as PNG (for episode saving)
+async function renderStateToPng() {
+  if (!svgRef.value) return null;
+  
+  try {
+    // Helper to inline computed styles
+    const inlineStyles = (source, target) => {
+      const computed = window.getComputedStyle(source);
+      const properties = [
+        'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
+        'opacity', 'font-family', 'font-size', 'font-weight',
+        'text-anchor', 'dominant-baseline', 'paint-order'
+      ];
+      properties.forEach(prop => {
+        const val = computed.getPropertyValue(prop);
+        if (val) target.style[prop] = val;
+      });
+      
+      for (let i = 0; i < source.children.length; i++) {
+        if (target.children[i]) {
+          inlineStyles(source.children[i], target.children[i]);
+        }
+      }
+    };
+
+    const svgClone = svgRef.value.cloneNode(true);
+    inlineStyles(svgRef.value, svgClone);
+    
+    const viewBox = svgRef.value.getAttribute('viewBox').split(' ').map(Number);
+    const [minX, minY, width, height] = viewBox;
+    
+    svgClone.setAttribute('width', width);
+    svgClone.setAttribute('height', height);
+    
+    const serializer = new XMLSerializer();
+    let svgString = serializer.serializeToString(svgClone);
+    svgString = '<?xml version="1.0" encoding="UTF-8"?>' + svgString;
+    
+    const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    
+    // Return a promise that resolves with the PNG data URL
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const shotClock = currentGameState.value?.shot_clock;
+      const hasShotClock = shotClock !== undefined && shotClock !== null;
+      const shotClockVal = String(shotClock);
+
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          const scale = 2;
+          canvas.width = width * scale;
+          canvas.height = height * scale;
+          
+          const ctx = canvas.getContext('2d');
+          
+          // Fill with dark background to match web app
+          ctx.fillStyle = '#0a0f1e';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          
+          // Draw Shot Clock if available
+          if (hasShotClock) {
+            const fontSize = 48 * scale;
+            const paddingX = 16 * scale;
+            const paddingY = 4 * scale;
+            const margin = 20 * scale;
+            
+            ctx.font = `${fontSize}px "DSEG7 Classic", monospace`;
+            const textMetrics = ctx.measureText(shotClockVal);
+            const textWidth = textMetrics.width;
+            const boxWidth = textWidth + (paddingX * 2);
+            const boxHeight = fontSize + (paddingY * 2);
+            
+            const x = canvas.width - boxWidth - margin;
+            const y = margin;
+            
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(x, y, boxWidth, boxHeight);
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2 * scale;
+            ctx.strokeRect(x, y, boxWidth, boxHeight);
+            
+            ctx.fillStyle = '#ff4d4d';
+            ctx.shadowColor = '#ff4d4d';
+            ctx.shadowBlur = 10 * scale;
+            ctx.textBaseline = 'top';
+            ctx.fillText(shotClockVal, x + paddingX, y + paddingY);
+            ctx.shadowBlur = 0;
+          }
+          
+          // Convert canvas to PNG data URL
+          const dataUrl = canvas.toDataURL('image/png');
+          
+          // Cleanup
+          URL.revokeObjectURL(url);
+          
+          resolve(dataUrl);
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load SVG image'));
+      };
+      
+      img.src = url;
+    });
+  } catch (err) {
+    console.error('[GameBoard] Failed to render PNG:', err);
+    return null;
+  }
+}
+
+// Expose method to parent component
+defineExpose({
+  renderStateToPng
+});
 
 </script>
 
@@ -898,7 +1205,60 @@ async function downloadBoardAsImage() {
                 class="ball-indicator" 
                 style="pointer-events: none;"
             />
+            <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
+            <g 
+              v-if="draggedPlayerId !== player.id && getActionIndicator(player.id, player.x, player.y, player.hasBall)"
+              class="action-indicator"
+              :transform="`translate(${getActionIndicator(player.id, player.x, player.y, player.hasBall).x}, ${getActionIndicator(player.id, player.x, player.y, player.hasBall).y})`"
+            >
+              <!-- Move arrow icon (location-arrow style) -->
+              <g 
+                v-if="getActionIndicator(player.id, player.x, player.y, player.hasBall).type === 'move'"
+                :transform="`rotate(${getActionIndicator(player.id, player.x, player.y, player.hasBall).rotation})`"
+              >
+                <path 
+                  d="M0,-7 L5,5 L0,2 L-5,5 Z" 
+                  :class="['action-arrow', player.isOffense ? 'offense' : 'defense']"
+                />
+              </g>
+              <!-- Pass indicator (hand-pointer style arrow) -->
+              <g 
+                v-if="getActionIndicator(player.id, player.x, player.y, player.hasBall).type === 'pass'"
+                :transform="`rotate(${getActionIndicator(player.id, player.x, player.y, player.hasBall).rotation})`"
+              >
+                <path 
+                  d="M0,-7 L4,3 L1,1 L1,7 L-1,7 L-1,1 L-4,3 Z" 
+                  class="action-pass"
+                />
+              </g>
+              <!-- Shoot indicator (bullseye style target) -->
+              <g v-if="getActionIndicator(player.id, player.x, player.y, player.hasBall).type === 'shoot'">
+                <circle r="6" class="action-shoot-outer" />
+                <circle r="3" class="action-shoot-middle" />
+                <circle r="1.5" class="action-shoot-inner" />
+              </g>
+            </g>
           </g>
+        </g>
+        
+        <!-- Draw Pass Rays (ball handler to teammates with steal probabilities) - drawn after players for visibility -->
+        <g v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
+          <line
+            :x1="ray.x1"
+            :y1="ray.y1"
+            :x2="ray.x2"
+            :y2="ray.y2"
+            class="pass-ray"
+          />
+          <text
+            :x="ray.midX"
+            :y="ray.midY"
+            text-anchor="middle"
+            dominant-baseline="middle"
+            class="steal-prob-label"
+          >
+            {{ ray.stealProb }}%
+          </text>
         </g>
         
         <!-- Draw Policy Suggestions -->
@@ -981,11 +1341,11 @@ async function downloadBoardAsImage() {
           </text>
       </g>
 
-      <!-- MLflow Run ID label (top-left) -->
+      <!-- MLflow Run ID label (top-left, outside transformed group) -->
       <text
         v-if="currentGameState && currentGameState.run_id"
-        x="0%"
-        y="-15%"
+        :x="parseFloat(viewBox.split(' ')[0]) + 100"
+        :y="parseFloat(viewBox.split(' ')[1]) + 10"
         text-anchor="start"
         dominant-baseline="hanging"
         class="run-id-label"
@@ -1138,7 +1498,7 @@ svg {
   stroke-width: 0.05rem;
 }
 .court-hex.unqualified {
-  fill: rgba(45, 51, 72, 0.85);
+  fill: rgba(38, 47, 77, 0.89);
   stroke: rgba(15, 23, 42, 0.95);
 }
 .three-point-arc {
@@ -1150,7 +1510,7 @@ svg {
   filter: drop-shadow(0px 0px 4px rgba(0, 0, 0, 0.6));
 }
 .offensive-lane {
-  fill: rgba(243, 4, 16, 0.87);
+  fill: rgba(243, 4, 104, 0.397);
   stroke: rgba(255, 140, 140, 0.5);
   stroke-width: 1;
 }
@@ -1198,6 +1558,43 @@ svg {
   stroke-width: 0.25rem;
   stroke-dasharray: 4 8;
 }
+
+/* Action indicator styles */
+.action-indicator {
+  pointer-events: none;
+}
+.action-arrow {
+  stroke: #000;
+  stroke-width: 1;
+  filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
+}
+.action-arrow.offense {
+  fill: #ffd700;
+}
+.action-arrow.defense {
+  fill: #ff6b6b;
+}
+.action-pass {
+  fill: #90EE90;
+  stroke: #000;
+  stroke-width: 1;
+  filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
+}
+.action-shoot-outer {
+  fill: none;
+  stroke: #ff4500;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
+}
+.action-shoot-middle {
+  fill: none;
+  stroke: #ff4500;
+  stroke-width: 1.5;
+}
+.action-shoot-inner {
+  fill: #ff4500;
+}
+
 .ghost {
   stroke: none;
 }
@@ -1274,16 +1671,36 @@ svg {
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
 .violation { fill: orange; }
-</style>
 
-<style scoped>
-.run-id-label {
+/* Pass rays and steal probability labels */
+.pass-ray {
+  stroke: rgba(255, 255, 255, 0.3);
+  stroke-width: 2;
+  stroke-dasharray: 8, 4;
+  pointer-events: none;
+}
+
+.steal-prob-label {
   font-size: 14px;
   font-weight: bold;
   fill: white;
   paint-order: stroke;
   stroke: black;
-  stroke-width: 1.2px;
+  stroke-width: 2px;
+  pointer-events: none;
+  opacity: 0.9;
+}
+
+</style>
+
+<style scoped>
+.run-id-label {
+  font-size: 0.8rem;
+  font-weight: normal;
+  fill: white;
+  paint-order: stroke;
+  stroke: black;
+  stroke-width: 0.1rem;
   pointer-events: none;
 }
 </style>

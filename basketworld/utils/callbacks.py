@@ -352,6 +352,17 @@ class AccumulativeMetricsCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         """Aggregate and log metrics by team."""
+        global_step = self.model.num_timesteps
+        
+        # Log entropy coefficient (model-level, not per-episode)
+        try:
+            ent_coef = getattr(self.model, "ent_coef", None)
+            if ent_coef is not None:
+                current_ent_coef = float(ent_coef)
+                mlflow.log_metric("Entropy Coef", current_ent_coef, step=global_step)
+        except Exception:
+            pass
+        
         if not self.model.ep_info_buffer:
             return
 
