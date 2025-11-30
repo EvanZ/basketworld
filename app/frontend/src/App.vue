@@ -401,6 +401,23 @@ async function handlePolicySwap({ target, policyName }) {
           console.warn('[App] Failed to refresh policy probabilities after swap:', err);
         }
       }
+
+      // Update initialSetup so new games use the updated policy
+      if (initialSetup.value) {
+        if (target === 'user') {
+          initialSetup.value = {
+            ...initialSetup.value,
+            unifiedPolicyName: policyName,
+          };
+          console.log('[App] Updated initialSetup user policy to:', policyName);
+        } else if (target === 'opponent') {
+          initialSetup.value = {
+            ...initialSetup.value,
+            opponentUnifiedPolicyName: policyName || null,
+          };
+          console.log('[App] Updated initialSetup opponent policy to:', policyName || 'Mirror');
+        }
+      }
     }
   } catch (err) {
     console.error('[App] Policy swap failed:', err);
@@ -437,6 +454,15 @@ async function handleMoveRecorded(moveData) {
 // Handler for selections changed from PlayerControls
 function handleSelectionsChanged(selections) {
   userSelections.value = selections;
+}
+
+// Handler for refresh policies request from PlayerControls
+async function handleRefreshPolicies() {
+  if (gameState.value?.run_id) {
+    console.log('[App] Refreshing policies for run:', gameState.value.run_id);
+    await refreshPolicyOptions(gameState.value.run_id);
+    console.log('[App] Policy refresh complete, found', policyOptions.value.length, 'policies');
+  }
 }
 
 // Computed: which selections to show on board (user or self-play)
@@ -1134,6 +1160,7 @@ onBeforeUnmount(() => {
             @move-recorded="handleMoveRecorded"
             @policy-swap-requested="handlePolicySwap"
             @selections-changed="handleSelectionsChanged"
+            @refresh-policies="handleRefreshPolicies"
             ref="controlsRef"
         />
 

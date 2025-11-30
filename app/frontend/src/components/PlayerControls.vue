@@ -77,7 +77,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies']);
 
 const selectedActions = ref({});
 
@@ -1450,6 +1450,17 @@ const stealRisks = computed(() => {
                 </select>
               </div>
             </div>
+            <div class="policy-actions">
+              <button 
+                class="refresh-policies-btn"
+                @click="$emit('refresh-policies')"
+                :disabled="policiesLoading || props.isPolicySwapping"
+                title="Refresh policy list from MLflow"
+              >
+                <span v-if="policiesLoading">⟳ Loading...</span>
+                <span v-else>⟳ Refresh Policies</span>
+              </button>
+            </div>
             <div class="policy-status" v-if="policiesLoading">
               Loading policies…
             </div>
@@ -1751,9 +1762,14 @@ const stealRisks = computed(() => {
               <span class="param-name">Timesteps/alternation:</span>
               <span class="param-value">{{ props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(2) + 'M' : 'N/A' }}</span>
             </div>
-            <div class="param-item" data-tooltip="Total timesteps for training (approximate if using SPA schedule).">
+            <div class="param-item" data-tooltip="Total planned timesteps for training (exact value when using SPA schedule).">
               <span class="param-name">Total timesteps:</span>
-              <span class="param-value">{{ props.gameState.training_params.alternations && props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.alternations * props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(1) + 'M' : 'N/A' }}</span>
+              <span class="param-value" v-if="props.gameState.training_params.total_timesteps_planned">
+                {{ (props.gameState.training_params.total_timesteps_planned / 1e6).toFixed(2) + 'M' }}
+              </span>
+              <span class="param-value" v-else>
+                {{ props.gameState.training_params.alternations && props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.alternations * props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(1) + 'M' : 'N/A' }}
+              </span>
             </div>
           </div>
 
@@ -2460,6 +2476,33 @@ const stealRisks = computed(() => {
 
 .policy-status.error {
   color: #fb7185;
+}
+
+.policy-actions {
+  margin-top: 0.5rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.refresh-policies-btn {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--app-panel-border);
+  background: rgba(56, 189, 248, 0.1);
+  color: var(--app-text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.refresh-policies-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.25);
+  border-color: var(--app-accent);
+}
+
+.refresh-policies-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .param-item:last-child {

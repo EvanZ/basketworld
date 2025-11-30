@@ -686,6 +686,12 @@ def make_mixed_vector_env(
 def main(args):
     """Main training function."""
     
+    # --- Auto-enable dual critic if dual policy is requested ---
+    # Dual policy implies dual critic (separate actors need separate critics)
+    if args.use_dual_policy and not args.use_dual_critic:
+        print(f"[Config] Auto-enabling --use-dual-critic due to --use-dual-policy")
+        args.use_dual_critic = True
+    
     # --- Auto-enable dual critic if transfer learning is requested ---
     if args.init_critic_from_run is not None:
         if not args.use_dual_critic:
@@ -746,9 +752,13 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
-        # Log policy architecture (single vs dual critic)
+        # Log policy architecture (single vs dual critic, single vs dual policy)
         mlflow.log_param("use_dual_critic", args.use_dual_critic)
-        mlflow.log_param("policy_class", "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy")
+        mlflow.log_param("use_dual_policy", args.use_dual_policy)
+        policy_class_name = "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy"
+        if args.use_dual_policy:
+            policy_class_name += " (dual_policy=True)"
+        mlflow.log_param("policy_class", policy_class_name)
         
         print(f"MLflow Run ID: {run.info.run_id}")
 
@@ -790,6 +800,10 @@ def main(args):
             policy_kwargs["net_arch"] = dict(pi=pi_arch, vf=vf_arch)
         # Prevent the policy from learning directly from action_mask
         policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
+        
+        # Enable dual policy (separate action networks for offense/defense) if requested
+        if args.use_dual_policy:
+            policy_kwargs["use_dual_policy"] = True
 
         # The save_path is no longer needed as models are saved to a temp dir
         # timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1189,12 +1203,57 @@ def main(args):
             args.n_steps,
         )
 
-        # Print SPA schedule info if not constant
+        # Print and log SPA schedule info if not constant
         if spa_start != spa_end:
-            print(f"Steps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
-            print(f"  First alternation: {get_steps_for_alternation(0, args.alternations, spa_start, spa_end, spa_schedule)} steps")
-            print(f"  Last alternation: {get_steps_for_alternation(args.alternations - 1, args.alternations, spa_start, spa_end, spa_schedule)} steps")
-            print(f"  Total timesteps: {new_training_timesteps:,}")
+            print(f"\nSteps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
+            print(f"Total timesteps: {new_training_timesteps:,}\n")
+            
+            # Generate full schedule table
+            schedule_lines = []
+            schedule_lines.append(f"Steps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
+            schedule_lines.append(f"Total alternations: {args.alternations}")
+            schedule_lines.append(f"Total timesteps: {new_training_timesteps:,}")
+            schedule_lines.append("")
+            schedule_lines.append("| Alternation | Steps |")
+            schedule_lines.append("|-------------|-------|")
+            
+            for i in range(args.alternations):
+                steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
+                schedule_lines.append(f"| {i + 1:11d} | {steps:5d} |")
+            
+            schedule_table = "\n".join(schedule_lines)
+            
+            # Print table to console (compact format for many alternations)
+            if args.alternations <= 20:
+                print(schedule_table)
+            else:
+                # Print abbreviated version for long schedules
+                print("| Alternation | Steps |")
+                print("|-------------|-------|")
+                # First 5
+                for i in range(min(5, args.alternations)):
+                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
+                    print(f"| {i + 1:11d} | {steps:5d} |")
+                print("|     ...     |  ...  |")
+                # Last 5
+                for i in range(max(5, args.alternations - 5), args.alternations):
+                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
+                    print(f"| {i + 1:11d} | {steps:5d} |")
+                print(f"\n(Full schedule logged to MLflow artifacts)")
+            
+            # Log schedule to MLflow as artifact
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    schedule_file = os.path.join(tmpdir, "spa_schedule.md")
+                    with open(schedule_file, 'w') as f:
+                        f.write(schedule_table)
+                    mlflow.log_artifact(schedule_file, artifact_path="schedules")
+                print("Logged SPA schedule to MLflow: schedules/spa_schedule.md")
+            except Exception as e:
+                print(f"Warning: Could not log SPA schedule to MLflow: {e}")
+
+        # Log total planned timesteps as a parameter (useful for web UI)
+        mlflow.log_param("total_timesteps_planned", new_training_timesteps)
 
         # Determine schedule parameters based on continuation mode
         if (
@@ -2072,6 +2131,12 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use separate value networks for offense and defense (recommended for zero-sum self-play).",
+    )
+    parser.add_argument(
+        "--use-dual-policy",
+        action="store_true",
+        default=False,
+        help="Use separate action networks for offense and defense. Enables distinct strategies for each role. Implies --use-dual-critic.",
     )
     parser.add_argument(
         "--init-critic-from-run",
