@@ -90,8 +90,12 @@ const evalNumEpisodes = ref(100);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
+    if (newState?.policy_probabilities) {
+        policyProbs.value = newState.policy_probabilities;
+    }
+
     // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
-    if (newState && !newState.done && !isManualStepping.value) {
+    if (newState && !newState.done && !isManualStepping.value && !isReplaying.value) {
         try {
             console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
             const response = await getPolicyProbs();
@@ -101,6 +105,8 @@ watch(gameState, async (newState, oldState) => {
         }
     } else if (newState && !newState.done && isManualStepping.value) {
         console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
+    } else if (newState && !newState.done && isReplaying.value) {
+        console.log('[App] Skipping policy probs fetch during replay - using stored probabilities in snapshots');
     }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {

@@ -462,31 +462,39 @@ async function fetchAllActionValues() {
 
 // Watch for game state changes to fetch all action values when needed
 watch(() => props.gameState, async (newGameState) => {
-  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping);
+  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping, 'Replaying:', props.isReplaying);
   
   let consumedStoredValues = false;
+  let consumedStoredProbs = false;
   if (newGameState && newGameState.action_values) {
     console.log('[PlayerControls] Applying stored action values from game state snapshot');
     applyStoredActionValues(newGameState.action_values);
     consumedStoredValues = true;
   }
+  if (newGameState && newGameState.policy_probabilities) {
+    console.log('[PlayerControls] Applying stored policy probabilities from game state snapshot');
+    policyProbabilities.value = newGameState.policy_probabilities;
+    consumedStoredProbs = true;
+  }
 
+  const allowApiFetch = !props.isManualStepping && !props.isReplaying;
   const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
-  const shouldSkipFetchBecauseStored = props.isManualStepping && consumedStoredValues;
+  const shouldFetchActionValues = shouldFetchAIData && allowApiFetch && !consumedStoredValues;
+  const shouldFetchPolicyProbs = shouldFetchAIData && allowApiFetch && !consumedStoredProbs;
 
-  if (shouldFetchAIData && !shouldSkipFetchBecauseStored) {
-    // Fetch both action values and policy probabilities for AI mode
+  if (shouldFetchActionValues || shouldFetchPolicyProbs) {
     try {
-      console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
-      await fetchAllActionValues();
+      if (shouldFetchActionValues) {
+        console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
+        await fetchAllActionValues();
+      }
       
-      // Only fetch policy probabilities from API if NOT in manual stepping mode
-      if (!props.isManualStepping) {
+      if (shouldFetchPolicyProbs) {
         console.log('[PlayerControls] Fetching policy probabilities from API for ball holder:', newGameState.ball_holder);
         await fetchPolicyProbabilities();
         console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
-      } else {
-        console.log('[PlayerControls] Skipping API fetch - in manual stepping mode, will use stored probs');
+      } else if (consumedStoredProbs) {
+        console.log('[PlayerControls] Skipping policy probability fetch - using stored snapshot');
       }
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
