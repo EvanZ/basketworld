@@ -1563,6 +1563,7 @@ def take_step(request: ActionRequest):
                     "pressure_multiplier": float(
                         shot_res.get("pressure_multiplier", -1.0)
                     ),
+                    "expected_points": float(shot_res.get("expected_points", 0.0)),
                     # Adjusted FG% at time of shot (pressure applied and clamped)
                     "shooter_fg_pct": float(shot_res.get("probability", 0.0)),
                 }
@@ -1579,22 +1580,14 @@ def take_step(request: ActionRequest):
     # 1. Check for shots
     if action_results.get("shots"):
         for player_id, shot_result in action_results["shots"].items():
+            ep_val = float(shot_result.get("expected_points", 0.0))
+            ep_str = f"{ep_val:.2f}"
             if shot_result.get("success"):
-                # Determine if it was a 2PT or 3PT based on distance
-                shooter_pos = game_state.env.positions[player_id]
-                is_three = bool(
-                    shot_result.get("is_three")
-                    if "is_three" in shot_result
-                    else game_state.env.is_three_point_location(tuple(shooter_pos))
-                )
-                if is_three:
-                    offense_reasons.append("Made 3PT")
-                else:
-                    offense_reasons.append("Made 2PT")
-                defense_reasons.append("Opp Made Shot")
+                offense_reasons.append(f"Shot Make (EP={ep_str})")
+                defense_reasons.append(f"Opp Shot (EP={ep_str})")
             else:
-                offense_reasons.append("Missed Shot")
-                defense_reasons.append("Opp Missed")
+                offense_reasons.append(f"Shot Miss (EP={ep_str})")
+                defense_reasons.append(f"Opp Shot (EP={ep_str})")
 
     # 2. Check for passes
     if action_results.get("passes"):
@@ -2925,15 +2918,11 @@ def get_rewards():
         reward_params = {
             # Absolute team-averaged rewards
             "pass_reward": float(getattr(env, "pass_reward", 0.0)),
-            "turnover_penalty": float(getattr(env, "turnover_penalty", 0.0)),
-            "made_shot_reward_inside": float(
-                getattr(env, "made_shot_reward_inside", 0.0)
-            ),
-            "made_shot_reward_three": float(
-                getattr(env, "made_shot_reward_three", 0.0)
-            ),
+            "turnover_reward": 0.0,  # Explicitly zeroed for dense reward scheme
+            # Shot rewards now use expected points (shot value × pressure-adjusted make prob)
+            "shot_reward_type": "expected_points",
+            "shot_reward_description": "Reward = shot_value × pressure-adjusted make probability (applies to makes and misses)",
             "violation_reward": float(getattr(env, "violation_reward", 0.0)),
-            "missed_shot_penalty": float(getattr(env, "missed_shot_penalty", 0.0)),
             # Percentage-based assist shaping
             "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
             "full_assist_bonus_pct": float(getattr(env, "full_assist_bonus_pct", 0.0)),
