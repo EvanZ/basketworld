@@ -50,6 +50,7 @@ const isPolicySwapping = ref(false);
 const policyOptions = ref([]);
 const policiesLoading = ref(false);
 const policyLoadError = ref(null);
+const mctsOptionsForStep = ref(null);
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -200,7 +201,7 @@ async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
   // No loading indicator for steps, feels more responsive
   try {
-    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value);
+    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value, mctsOptionsForStep.value);
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
@@ -469,6 +470,10 @@ async function handleRefreshPolicies() {
     await refreshPolicyOptions(gameState.value.run_id);
     console.log('[App] Policy refresh complete, found', policyOptions.value.length, 'policies');
   }
+}
+
+function handleMctsOptionsChanged(options) {
+  mctsOptionsForStep.value = options;
 }
 
 // Computed: which selections to show on board (user or self-play)
@@ -1167,6 +1172,7 @@ onBeforeUnmount(() => {
             @policy-swap-requested="handlePolicySwap"
             @selections-changed="handleSelectionsChanged"
             @refresh-policies="handleRefreshPolicies"
+            @mcts-options-changed="handleMctsOptionsChanged"
             ref="controlsRef"
         />
 

@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -77,7 +77,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed']);
 
 const selectedActions = ref({});
 
@@ -169,6 +169,23 @@ const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
+
+// Advisor (MCTS) state
+const advisorPlayerId = ref(null);
+const advisorMaxDepth = ref(3);
+const advisorTimeBudget = ref(200);
+const advisorExplorationC = ref(1.4);
+const advisorUsePriors = ref(true);
+const advisorResult = ref(null);
+const advisorError = ref(null);
+const advisorLoading = ref(false);
+const useMctsForStep = ref(false);
+const advisorPolicyTop = computed(() => {
+  if (!advisorResult.value || !advisorResult.value.policy) return [];
+  const pairs = advisorResult.value.policy.map((p, idx) => ({ idx, prob: p }));
+  pairs.sort((a, b) => b.prob - a.prob);
+  return pairs.slice(0, 5);
+});
 
 // Auto-scroll to current shot clock in moves table
 const isMounted = ref(false);
@@ -530,6 +547,12 @@ watch(allPlayerIds, (newPlayerIds) => {
     }
 }, { immediate: true });
 
+watch(() => props.gameState?.ball_holder, (bh) => {
+  if (bh !== null && bh !== undefined) {
+    advisorPlayerId.value = bh;
+  }
+}, { immediate: true });
+
 const actionNames = Object.values({
   0: "NOOP", 
   1: "MOVE_E", 2: "MOVE_NE", 3: "MOVE_NW", 4: "MOVE_W", 5: "MOVE_SW", 6: "MOVE_SE", 
@@ -642,6 +665,16 @@ function submitActions() {
   });
   
   emit('actions-submitted', actionsToSubmit);
+
+  // Emit current MCTS options (or null) so parent can include in step
+  emit('mcts-options-changed', useMctsForStep.value ? {
+    use_mcts: true,
+    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+    max_depth: advisorMaxDepth.value,
+    time_budget_ms: advisorTimeBudget.value,
+    exploration_c: advisorExplorationC.value,
+    use_priors: advisorUsePriors.value,
+  } : null);
   
   if (!props.aiMode) {
     // Only clear selections in manual mode
@@ -658,6 +691,54 @@ function submitActions() {
 function getSelectedActions() {
   // Return current selections for parent to use
   return { ...selectedActions.value };
+}
+
+async function runAdvisor() {
+  advisorLoading.value = true;
+  advisorError.value = null;
+  advisorResult.value = null;
+  try {
+    const payload = {
+      player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+      max_depth: advisorMaxDepth.value,
+      time_budget_ms: advisorTimeBudget.value,
+      exploration_c: advisorExplorationC.value,
+      use_priors: advisorUsePriors.value,
+    };
+    const res = await mctsAdvise(payload);
+    advisorResult.value = res?.advice || null;
+  } catch (err) {
+    advisorError.value = err?.message || 'Failed to fetch advice';
+  } finally {
+    advisorLoading.value = false;
+  }
+}
+
+function applyAdvisorAction() {
+  if (!advisorResult.value || advisorResult.value.action === undefined || advisorResult.value.action === null) return;
+  const actionIdx = Number(advisorResult.value.action);
+  const actionName = actionNames[actionIdx] || 'NOOP';
+  const targetPid = advisorPlayerId.value ?? props.activePlayerId;
+  if (targetPid === null || targetPid === undefined) return;
+  const legal = getLegalActions(targetPid);
+  if (legal.length > 0 && !legal.includes(actionName)) {
+    advisorError.value = `Advisor suggested ${actionName}, but it is not legal now.`;
+    return;
+  }
+  selectedActions.value = { ...selectedActions.value, [targetPid]: actionName };
+  emit('selections-changed', { ...selectedActions.value });
+}
+
+function toggleUseMcts(val) {
+  useMctsForStep.value = val;
+  emit('mcts-options-changed', val ? {
+    use_mcts: true,
+    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+    max_depth: advisorMaxDepth.value,
+    time_budget_ms: advisorTimeBudget.value,
+    exploration_c: advisorExplorationC.value,
+    use_priors: advisorUsePriors.value,
+  } : null);
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
@@ -1119,6 +1200,12 @@ const stealRisks = computed(() => {
         Stats
       </button>
       <button 
+        :class="{ active: activeTab === 'advisor' }"
+        @click="activeTab = 'advisor'"
+      >
+        Advisor
+      </button>
+      <button 
         :class="{ active: activeTab === 'moves' }"
         @click="activeTab = 'moves'"
       >
@@ -1181,6 +1268,71 @@ const stealRisks = computed(() => {
               Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
           </p>
       </div>
+    </div>
+
+    <!-- Advisor Tab -->
+    <div v-if="activeTab === 'advisor'" class="tab-content advisor-tab">
+      <div class="advisor-grid">
+        <label>
+          Player
+          <select v-model.number="advisorPlayerId">
+            <option v-for="pid in allPlayerIds" :key="pid" :value="pid">Player {{ pid }}</option>
+          </select>
+        </label>
+        <label>
+          Max depth (plies)
+          <input type="number" min="1" v-model.number="advisorMaxDepth" />
+        </label>
+        <label>
+          Time budget (ms)
+          <input type="number" min="10" step="10" v-model.number="advisorTimeBudget" />
+        </label>
+        <label>
+          Exploration C
+          <input type="number" step="0.1" v-model.number="advisorExplorationC" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" v-model="advisorUsePriors" /> Use policy priors
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" :checked="useMctsForStep" @change="toggleUseMcts($event.target.checked)" /> Use MCTS on next step
+        </label>
+        <div class="advisor-actions">
+          <button @click="runAdvisor" :disabled="advisorLoading || !props.gameState || props.gameState.done">
+            {{ advisorLoading ? 'Running...' : 'Get Advice' }}
+          </button>
+          <button @click="applyAdvisorAction" :disabled="!advisorResult" title="Apply recommended action to selection">
+            Apply Action
+          </button>
+        </div>
+      </div>
+      <div class="advisor-results" v-if="advisorResult">
+        <div class="advisor-summary">
+          <div>
+            Recommended: <strong>{{ actionNames[advisorResult.action] || 'UNKNOWN' }}</strong>
+          </div>
+          <div v-if="advisorResult.q_estimate !== null && advisorResult.q_estimate !== undefined">
+            Q ≈ {{ Number(advisorResult.q_estimate).toFixed(2) }}
+          </div>
+          <div class="advisor-stats">
+            <span>Visits: {{ advisorResult.visits ? advisorResult.visits[advisorResult.action] || 0 : 0 }}</span>
+            <span>Nodes: {{ advisorResult.nodes_expanded }}</span>
+            <span>Depth: {{ advisorResult.max_depth_reached }}</span>
+            <span>Cache hits: {{ advisorResult.cache_hits }}</span>
+            <span v-if="advisorResult.nodes_per_sec">{{ advisorResult.nodes_per_sec.toFixed(0) }} nodes/s</span>
+            <span v-if="advisorResult.duration_ms">{{ advisorResult.duration_ms.toFixed(1) }} ms</span>
+          </div>
+        </div>
+        <div v-if="advisorPolicyTop.length" class="advisor-policy">
+          <div v-for="item in advisorPolicyTop" :key="item.idx" class="advisor-policy-row">
+            <span class="policy-action">{{ actionNames[item.idx] || 'UNKNOWN' }}</span>
+            <span class="policy-prob">{{ (item.prob * 100).toFixed(1) }}%</span>
+            <span class="policy-visits" v-if="advisorResult.visits">{{ advisorResult.visits[item.idx] || 0 }} visits</span>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="advisorLoading" class="advisor-results">Running advisor…</div>
+      <div v-if="advisorError" class="advisor-error">{{ advisorError }}</div>
     </div>
 
     <!-- Rewards Tab -->
@@ -2069,6 +2221,114 @@ const stealRisks = computed(() => {
   opacity: 0.5;
   cursor: not-allowed;
   border-color: transparent;
+}
+
+/* Advisor */
+.advisor-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.advisor-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.advisor-grid label {
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--app-text-muted);
+}
+
+.advisor-grid input,
+.advisor-grid select {
+  padding: 8px 10px;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--app-text);
+}
+
+.advisor-grid .checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.advisor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.advisor-actions button {
+  padding: 10px 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--app-accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.advisor-actions button:disabled {
+  background: rgba(56, 189, 248, 0.4);
+  cursor: not-allowed;
+}
+
+.advisor-results {
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.advisor-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  font-size: 14px;
+  color: var(--app-text);
+}
+
+.advisor-stats span {
+  margin-right: 10px;
+  color: var(--app-text-muted);
+}
+
+.advisor-policy {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.advisor-policy-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+}
+
+.policy-action {
+  font-weight: 700;
+}
+
+.policy-prob {
+  color: var(--app-accent);
+}
+
+.policy-visits {
+  color: var(--app-text-muted);
+}
+
+.advisor-error {
+  color: #fca5a5;
+  font-weight: 700;
 }
 
 /* Rewards styles */

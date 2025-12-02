@@ -29,8 +29,8 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
     return response.json();
 }
 
-export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null) {
-    console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic);
+export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null) {
+    console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions);
     const response = await fetch(`${API_BASE_URL}/api/step`, {
         method: 'POST',
         headers: {
@@ -39,7 +39,13 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
         body: JSON.stringify({ 
             actions, 
             player_deterministic: playerDeterministic,
-            opponent_deterministic: opponentDeterministic 
+            opponent_deterministic: opponentDeterministic,
+            use_mcts: mctsOptions?.use_mcts || false,
+            mcts_player_id: mctsOptions?.player_id ?? null,
+            mcts_max_depth: mctsOptions?.max_depth ?? null,
+            mcts_time_budget_ms: mctsOptions?.time_budget_ms ?? null,
+            mcts_exploration_c: mctsOptions?.exploration_c ?? null,
+            mcts_use_priors: mctsOptions?.use_priors ?? null,
         }),
     });
     if (!response.ok) {
@@ -48,6 +54,25 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
         throw new Error(errorData.detail || 'Failed to take step');
     }
     return response.json();
+}
+
+export async function mctsAdvise(options = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/mcts_advise`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player_id: options.player_id ?? null,
+      max_depth: options.max_depth ?? null,
+      time_budget_ms: options.time_budget_ms ?? null,
+      exploration_c: options.exploration_c ?? null,
+      use_priors: options.use_priors ?? true,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to get MCTS advice');
+  }
+  return response.json();
 }
 
 export async function getPolicyProbs() {
