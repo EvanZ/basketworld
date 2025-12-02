@@ -63,6 +63,7 @@ class GameState:
         self.replay_ball_holder: int | None = None
         self.replay_shot_clock: int | None = None
         self.replay_offense_skills: dict | None = None  # Store sampled skills for consistency
+        self.sampled_offense_skills: dict | None = None  # Baseline skills from initial game creation
         self.actions_log: list[list[int]] = []  # full action arrays per step
         # General replay buffers (manual or AI). We store full game states for instant replay
         self.episode_states: list[dict] = (
@@ -1033,11 +1034,13 @@ async def init_game(request: InitGameRequest):
         game_state.opponent_policy_path = opponent_unified_path
         
         # Capture the sampled skills for this episode so they remain consistent across resets
-        game_state.replay_offense_skills = {
+        sampled_skills = {
             "layup": list(game_state.env.offense_layup_pct_by_player),
             "three_pt": list(game_state.env.offense_three_pt_pct_by_player),
             "dunk": list(game_state.env.offense_dunk_pct_by_player),
         }
+        game_state.replay_offense_skills = copy.deepcopy(sampled_skills)
+        game_state.sampled_offense_skills = copy.deepcopy(sampled_skills)
         
         _capture_turn_start_snapshot()
 
@@ -2311,6 +2314,14 @@ def start_self_play():
     game_state.reward_history = []
     game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
     game_state.episode_states = []  # Reset episode states for new self-play
+    if game_state.replay_offense_skills is None:
+        game_state.replay_offense_skills = {
+            "layup": list(game_state.env.offense_layup_pct_by_player),
+            "three_pt": list(game_state.env.offense_three_pt_pct_by_player),
+            "dunk": list(game_state.env.offense_dunk_pct_by_player),
+        }
+    if game_state.sampled_offense_skills is None and game_state.replay_offense_skills is not None:
+        game_state.sampled_offense_skills = copy.deepcopy(game_state.replay_offense_skills)
 
     # Reset environment using overrides to avoid RNG draws during reset
     # Include offense_skills to maintain consistent skills throughout the episode
@@ -3455,6 +3466,108 @@ class BatchUpdatePositionRequest(BaseModel):
     updates: List[UpdatePositionRequest]
 
 
+class OffenseSkillsPayload(BaseModel):
+    layup: List[float]
+    three_pt: List[float]
+    dunk: List[float]
+
+
+class SetOffenseSkillsRequest(BaseModel):
+    skills: OffenseSkillsPayload | None = None
+    reset_to_sampled: bool = False
+
+
+@app.post("/api/offense_skills")
+def set_offense_skills(req: SetOffenseSkillsRequest):
+    """
+    Override or reset the per-offensive-player shooting percentages for the current episode.
+    """
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    env = game_state.env
+    count = env.players_per_side
+
+    def _normalize(values: List[float] | None, name: str) -> List[float]:
+        if values is None:
+            raise HTTPException(status_code=400, detail=f"Missing {name} values.")
+        if len(values) != count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must include {count} values (one per offensive player).",
+            )
+        normalized: List[float] = []
+        for v in values:
+            try:
+                val = float(v)
+            except Exception:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid {name} value: {v}"
+                )
+            normalized.append(float(max(0.01, min(0.99, val))))
+        return normalized
+
+    target_skills: dict | None = None
+    if req.reset_to_sampled:
+        baseline = game_state.sampled_offense_skills or {}
+        target_skills = {
+            "layup": _normalize(
+                baseline.get("layup")
+                or list(env.offense_layup_pct_by_player),
+                "layup",
+            ),
+            "three_pt": _normalize(
+                baseline.get("three_pt")
+                or list(env.offense_three_pt_pct_by_player),
+                "three_pt",
+            ),
+            "dunk": _normalize(
+                baseline.get("dunk")
+                or list(env.offense_dunk_pct_by_player),
+                "dunk",
+            ),
+        }
+    elif req.skills is not None:
+        target_skills = {
+            "layup": _normalize(req.skills.layup, "layup"),
+            "three_pt": _normalize(req.skills.three_pt, "three_pt"),
+            "dunk": _normalize(req.skills.dunk, "dunk"),
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide skills or set reset_to_sampled=true to revert.",
+        )
+
+    # Apply to environment
+    for i in range(count):
+        env.offense_layup_pct_by_player[i] = float(target_skills["layup"][i])
+        env.offense_three_pt_pct_by_player[i] = float(target_skills["three_pt"][i])
+        env.offense_dunk_pct_by_player[i] = float(target_skills["dunk"][i])
+
+    # Update cached skills for replay/self-play consistency
+    game_state.replay_offense_skills = copy.deepcopy(target_skills)
+
+    # Refresh skills in observation to keep UI/policies consistent
+    try:
+        skills_array = env._get_offense_skills_array()
+    except Exception:
+        skills_array = None
+
+    if game_state.obs is not None and skills_array is not None:
+        game_state.obs["skills"] = skills_array
+        game_state.prev_obs = None
+
+    return {
+        "status": "success",
+        "state": get_full_game_state(
+            include_policy_probs=True,
+            include_action_values=True,
+            include_state_values=True,
+        ),
+    }
+
+
 @app.post("/api/batch_update_player_positions")
 def batch_update_player_positions(req: BatchUpdatePositionRequest):
     """
@@ -3870,6 +3983,8 @@ def get_full_game_state(
         # If EP calculation fails, use empty list
         ep_by_player = []
 
+    sampled_offense_skills = getattr(game_state, "sampled_offense_skills", None) or {}
+
     state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
@@ -4041,6 +4156,20 @@ def get_full_game_state(
             "dunk": [
                 float(x)
                 for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])
+            ],
+        },
+        "offense_shooting_pct_sampled": {
+            "layup": [
+                float(x)
+                for x in sampled_offense_skills.get("layup", [])
+            ],
+            "three_pt": [
+                float(x)
+                for x in sampled_offense_skills.get("three_pt", [])
+            ],
+            "dunk": [
+                float(x)
+                for x in sampled_offense_skills.get("dunk", [])
             ],
         },
         # Expected points for all players (indexed by player ID)

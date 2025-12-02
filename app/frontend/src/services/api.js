@@ -317,3 +317,16 @@ export async function swapPolicies(payload = {}) {
   }
   return response.json();
 }
+
+export async function setOffenseSkills(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/offense_skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update offense skills');
+  }
+  return response.json();
+}

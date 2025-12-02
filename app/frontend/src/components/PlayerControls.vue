@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -77,7 +77,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'state-updated']);
 
 const selectedActions = ref({});
 
@@ -161,6 +161,116 @@ function handlePolicySelection(type, event) {
   if (value === (opponentPolicySelection.value || '')) return;
   opponentPolicySelection.value = value;
   emit('policy-swap-requested', { target: 'opponent', policyName: value });
+}
+
+// Offense skill overrides (Environment tab)
+const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
+const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
+const skillsUpdating = ref(false);
+const skillsError = ref(null);
+
+function percentFromProb(prob) {
+  const num = Number(prob ?? 0);
+  if (Number.isNaN(num)) return 0;
+  return Math.max(0, Math.min(100, Number((num * 100).toFixed(1))));
+}
+
+function fillOffenseSkills(targetRef, sourceSkills) {
+  const count = props.gameState?.offense_ids?.length || 0;
+  const safe = sourceSkills || {};
+  targetRef.value = {
+    layup: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.layup?.[idx] ?? 0)),
+    three_pt: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.three_pt?.[idx] ?? 0)),
+    dunk: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.dunk?.[idx] ?? 0)),
+  };
+}
+
+watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
+  fillOffenseSkills(offenseSkillInputs, skills);
+}, { immediate: true, deep: true });
+
+watch(() => props.gameState?.offense_shooting_pct_sampled, (skills) => {
+  fillOffenseSkills(
+    offenseSkillSampled,
+    skills || props.gameState?.offense_shooting_pct_by_player || null
+  );
+}, { immediate: true, deep: true });
+
+watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
+  if (!props.gameState?.offense_shooting_pct_sampled) {
+    fillOffenseSkills(offenseSkillSampled, skills);
+  }
+}, { deep: true });
+
+const offenseSkillRows = computed(() => {
+  const ids = props.gameState?.offense_ids || [];
+  const lay = offenseSkillInputs.value?.layup || [];
+  const three = offenseSkillInputs.value?.three_pt || [];
+  const dunk = offenseSkillInputs.value?.dunk || [];
+  const sampleLay = offenseSkillSampled.value?.layup || [];
+  const sampleThree = offenseSkillSampled.value?.three_pt || [];
+  const sampleDunk = offenseSkillSampled.value?.dunk || [];
+  return ids.map((pid, idx) => ({
+    playerId: pid,
+    layup: Number(lay[idx] ?? 0),
+    threePt: Number(three[idx] ?? 0),
+    dunk: Number(dunk[idx] ?? 0),
+    sampledLayup: Number(sampleLay[idx] ?? lay[idx] ?? 0),
+    sampledThree: Number(sampleThree[idx] ?? three[idx] ?? 0),
+    sampledDunk: Number(sampleDunk[idx] ?? dunk[idx] ?? 0),
+  }));
+});
+
+function percentToProb(percent) {
+  const num = Number(percent ?? 0);
+  if (Number.isNaN(num)) return 0.01;
+  const clamped = Math.max(1, Math.min(99, num));
+  return clamped / 100;
+}
+
+async function applyOffenseSkillOverrides() {
+  if (!props.gameState) return;
+  skillsUpdating.value = true;
+  skillsError.value = null;
+  try {
+    const payload = {
+      skills: {
+        layup: (offenseSkillInputs.value?.layup || []).map(percentToProb),
+        three_pt: (offenseSkillInputs.value?.three_pt || []).map(percentToProb),
+        dunk: (offenseSkillInputs.value?.dunk || []).map(percentToProb),
+      },
+    };
+    const res = await setOffenseSkills(payload);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update skills');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update offense skills', err);
+    skillsError.value = err?.message || 'Failed to update skills';
+  } finally {
+    skillsUpdating.value = false;
+  }
+}
+
+async function resetOffenseSkillsToSampled() {
+  if (!props.gameState) return;
+  skillsUpdating.value = true;
+  skillsError.value = null;
+  try {
+    const res = await setOffenseSkills({ reset_to_sampled: true });
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to reset skills');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to reset offense skills', err);
+    skillsError.value = err?.message || 'Failed to reset skills';
+  } finally {
+    skillsUpdating.value = false;
+  }
 }
 
 // Add rewards tracking
@@ -1667,13 +1777,53 @@ const stealRisks = computed(() => {
           </div>
           <div class="param-category" v-if="props.gameState.offense_shooting_pct_by_player">
             <h5>Sampled Player Skills (Offense)</h5>
-            <div class="param-item" v-for="(pid, idx) in (props.gameState.offense_ids || [])" :key="`skill-${pid}`" data-tooltip="Individual shooting percentages sampled from μ±σ distributions. L=Layup, 3=Three-point, D=Dunk">
-              <span class="param-name">{{ pid }}:</span>
-              <span class="param-value">
-                L {{ ((props.gameState.offense_shooting_pct_by_player.layup?.[idx] || 0) * 100).toFixed(1) }}% ·
-                3 {{ ((props.gameState.offense_shooting_pct_by_player.three_pt?.[idx] || 0) * 100).toFixed(1) }}% ·
-                D {{ ((props.gameState.offense_shooting_pct_by_player.dunk?.[idx] || 0) * 100).toFixed(1) }}%
-              </span>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header">
+                <span>Player</span>
+                <span>Layup %</span>
+                <span>3PT %</span>
+                <span>Dunk %</span>
+              </div>
+              <div
+                class="offense-skills-row"
+                v-for="(row, idx) in offenseSkillRows"
+                :key="`skill-${row.playerId}`"
+                data-tooltip="Individual shooting percentages sampled from μ±σ distributions. Editable to override per-player skills."
+              >
+                <span class="skills-player">Player {{ row.playerId }}</span>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.layup[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledLayup.toFixed(1) }}%</span>
+                </div>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.three_pt[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledThree.toFixed(1) }}%</span>
+                </div>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.dunk[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledDunk.toFixed(1) }}%</span>
+                </div>
+              </div>
+              <div class="offense-skill-actions">
+                <button 
+                  class="refresh-policies-btn" 
+                  @click="resetOffenseSkillsToSampled" 
+                  :disabled="skillsUpdating || !offenseSkillRows.length"
+                  title="Reset to the values sampled when this game was created"
+                >
+                  Reset to Sampled
+                </button>
+                <button 
+                  class="refresh-policies-btn" 
+                  @click="applyOffenseSkillOverrides" 
+                  :disabled="skillsUpdating || !offenseSkillRows.length"
+                >
+                  {{ skillsUpdating ? 'Saving...' : 'Apply Overrides' }}
+                </button>
+              </div>
+              <div class="policy-status error" v-if="skillsError">
+                {{ skillsError }}
+              </div>
             </div>
           </div>
           <div class="param-category">
@@ -2774,6 +2924,60 @@ const stealRisks = computed(() => {
 .refresh-policies-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.offense-skills-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.offense-skills-row {
+  display: grid;
+  grid-template-columns: 0.9fr repeat(3, 1fr);
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.offense-skills-row.header {
+  font-size: 0.8rem;
+  color: var(--app-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+  padding-bottom: 0.25rem;
+}
+
+.offense-skill-input {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.offense-skill-input input {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(13, 20, 38, 0.7);
+  color: var(--app-text);
+}
+
+.skills-player {
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+.offense-skill-default {
+  font-size: 0.75rem;
+  color: var(--app-text-muted);
+}
+
+.offense-skill-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
 }
 
 .param-item:last-child {

@@ -334,6 +334,20 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
   }
 }
 
+function handlePatchedGameState(newState) {
+  if (!newState) return;
+  gameState.value = newState;
+  const clonedState = cloneState(newState);
+  if (gameHistory.value.length > 0) {
+    gameHistory.value[gameHistory.value.length - 1] = clonedState;
+  } else {
+    gameHistory.value = [clonedState];
+  }
+  if (newState.policy_probabilities) {
+    policyProbs.value = { ...newState.policy_probabilities };
+  }
+}
+
 async function handleShotClockAdjustment(delta) {
   if (!gameState.value || gameState.value.done) {
     console.warn('[App] Cannot adjust shot clock after episode has ended.');
@@ -1173,6 +1187,7 @@ onBeforeUnmount(() => {
             @selections-changed="handleSelectionsChanged"
             @refresh-policies="handleRefreshPolicies"
             @mcts-options-changed="handleMctsOptionsChanged"
+            @state-updated="handlePatchedGameState"
             ref="controlsRef"
         />
 
