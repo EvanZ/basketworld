@@ -66,6 +66,9 @@ class IllegalActionPolicy(Enum):
 class HexagonBasketballEnv(gym.Env):
     """Hexagon-tessellated basketball environment for self-play RL."""
 
+    # Small tolerance to treat pass-arc boundary angles as in-arc (avoids floating error gaps)
+    _PASS_ARC_COS_EPS = 1e-9
+
     metadata = {"render.modes": ["human", "rgb_array"]}
 
     def __init__(
@@ -1805,7 +1808,8 @@ class HexagonBasketballEnv(gym.Env):
         dir_norm = math.hypot(dir_x, dir_y) or 1.0
         # Arc total in degrees -> half-angle in radians
         half_angle_rad = math.radians(max(1.0, min(360.0, self.pass_arc_degrees))) / 2.0
-        cos_threshold = math.cos(half_angle_rad)
+        # Use a tiny tolerance so passes on the exact arc boundary count as legal
+        cos_threshold = math.cos(half_angle_rad) - self._PASS_ARC_COS_EPS
 
         # Check if any teammate is in arc
         team_ids = (
@@ -1858,7 +1862,8 @@ class HexagonBasketballEnv(gym.Env):
             math.radians(max(1.0, min(360.0, getattr(self, "pass_arc_degrees", 60.0))))
             / 2.0
         )
-        cos_threshold = math.cos(half_angle_rad)
+        # Use a tiny tolerance so receivers on the exact arc boundary are counted
+        cos_threshold = math.cos(half_angle_rad) - self._PASS_ARC_COS_EPS
 
         def in_arc(to_q: int, to_r: int) -> bool:
             vx, vy = self._axial_to_cartesian(
