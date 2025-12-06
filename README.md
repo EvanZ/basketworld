@@ -1,167 +1,104 @@
 # BasketWorld
 
-BasketWorld is a grid-based, Gym-compatible simulation of  half-court basketball. It is designed for reinforcement learning research into emergent coordination, strategy, and multi-agent decision-making using a shared policy framework.
+BasketWorld is a hex-grid, Gymnasium-compatible half-court basketball simulator for self-play reinforcement learning. A unified PPO policy (offense/defense encoded with role flags) trains against itself, logs to MLflow, and can be driven through a FastAPI backend plus a Vue front-end for interactive play, analysis, and evaluation.
 
----
+## What's new
+- **Absolute-coordinate observations**: Egocentric rotation is gone; models need retraining. Ball handler position, hoop location, EP/risk features, and action masks are all absolute-court based.
+- **Unified policy pipeline**: Training saves `unified_*.zip` checkpoints with optional dual-critic/dual-policy heads and pass-logit bias. Role flags encode offense/defense so one network drives both teams.
+- **Interactive stack refresh**: Backend loads policies directly from MLflow by `run_id`, supports policy swapping, evaluation batches, MCTS advice, phi shaping, skill overrides, replays, and shot/pass diagnostics surfaced in the Vue UI.
+- **MLflow-first configuration**: Environment/training params and role-flag encoding are read from MLflow for faithful evaluation; optional `.env.aws` enables S3 artifacts without touching global AWS config.
 
-## 🧠 Core Concepts
-
-- **Grid-Based Court**: A hexagonally tiled half-court with discrete agent movements and a hoop on one side.
-- **Configurable Teams**: Play 2-on-2, 3-on-3, 5-on-5 — simply pass `--players <N>` (default 3). One shared policy controls all agents on a team.
-- **Simultaneous Actions**: All agents act at each timestep.
-- **Role-Conditioned Learning**: Observations and rewards are tailored to each agent's role (offense/defense).
-- **Gym-Compatible**: Standard `reset()`, `step()`, and `render()` APIs.
-
----
-
-## 📂 Project Structure
-
+## Repo map
 ```
 basketworld/
-├── basketworld/
-│   ├── envs/               # Environment and wrappers
-│   ├── models/             # Shared PyTorch policy networks
-│   ├── sim/                # Core simulation logic (court, rules, game state)
-│   └── utils/              # Rendering, reward helpers, etc.
-├── app/
-│   ├── backend/            # FastAPI server powering the interactive demo
-│   └── frontend/           # Vue 3 + Vite single-page application
-├── train/                  # PPO training scripts and configs
-├── tests/                  # Unit tests
-├── assets/                 # Logos and visual assets
-├── notebooks/              # Exploration and analysis notebooks
-├── scripts/                # Dataset or rollout tools
-├── README.md
-├── setup.py
-└── requirements.txt
+- basketworld/           # Core env: envs/, sim/, utils/, custom SB3 policies
+- train/                 # Self-play PPO training loop, callbacks, schedules
+- app/
+  - backend/             # FastAPI service that loads MLflow runs and runs games
+  - frontend/            # Vue 3 + Vite UI (board, controls, analytics, replays)
+- analytics/             # Evaluation/visualization scripts (heatmaps, ELO, etc.)
+- readmes/               # Design docs and migration notes (obs, EP, phi, etc.)
+- docs/                  # Research notes (opponent sampling, continuation, ...)
+- requirements.txt       # Python deps (installs package in editable mode)
+- start_mlflow*.sh       # Convenience scripts for local MLflow (optional)
 ```
 
----
-
-## 🚀 Getting Started
-
-### 1. Python backend / RL code
-
+## Setup
+### Python (env, training, backend)
 ```bash
-# 1 — Install Python deps
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2 — (Recommended) start the MLflow tracking server
-mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000 &
-
-# 3 — Kick off training (vectorised, self-play PPO)
-python train/train.py \
-  --grid-size 12 \
-  --players 3 \
-  --alternations 10 \
-  --steps-per-alternation 20000 \
-  --num-envs 8            # parallel envs to speed up rollouts
-
-# 4 — Watch progress in http://localhost:5000 and in the console.
+pip install -r requirements.txt       # installs basketworld in editable mode
+# Backend deps are included; alternatively: pip install -r app/backend/requirements.txt
 ```
 
-The training script automatically:
-
-* Alternates between offense & defense learning phases
-* Logs metrics and model checkpoints to MLflow (`./mlruns/`)
-* Utilises **vectorised environments** via `--num-envs` (defaults to 8) for faster PPO rollouts.
-
----
-
-### 2. Interactive Web-App (FastAPI + Vue)
-
+Run MLflow locally (default for training/backend):
 ```bash
-# 1 — Backend (FastAPI)
-uvicorn app.backend.main:app --host 0.0.0.0 --port 8080 --reload
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+```
 
-# 2 — Frontend (Vue 3 + Vite)
+S3 artifacts (project-scoped credentials, auto-loaded):
+```
+# .env.aws at repo root (already gitignored)
+MLFLOW_ARTIFACT_ROOT=s3://your-bucket/mlflow-artifacts
+MLFLOW_AWS_ACCESS_KEY_ID=...
+MLFLOW_AWS_SECRET_ACCESS_KEY=...
+MLFLOW_AWS_DEFAULT_REGION=us-east-1
+```
+
+### Frontend
+```bash
 cd app/frontend
-npm install   # first time only
-
-# Configure the backend URL (defaults to localhost:8080 if unset)
+npm install
 echo "VITE_API_BASE_URL=http://localhost:8080" > .env
-
 npm run dev   # opens http://localhost:5173
 ```
 
-In the web UI enter an **MLflow run_id** from the training you just executed.  The app downloads the latest offense/defense models from that run and lets you play as either team, while visualising policy probabilities and action values.
+## Train unified PPO agents
+The training loop alternates self-play on a unified policy, logs everything to MLflow, and saves checkpoints under `models/unified_iter_<alt>.zip` (plus `unified_policy_final.zip`).
 
----
-
-## ⚙️  CLI & Environment Variables
-
-| Component | Default | How to change |
-|-----------|---------|---------------|
-| FastAPI port | 8080 | `uvicorn ... --port <PORT>` |
-| Frontend API URL | `VITE_API_BASE_URL` env | set in `.env` or export before `npm run dev` |
-| MLflow UI port | 5000 | `mlflow ui --port <PORT>` |
-| Parallel envs | 8 | `--num-envs` flag to `train.py` |
-
----
-
-## ☁️  Remote Storage (S3)
-
-MLflow can store experiments and artifacts in your personal S3 bucket instead of local storage.
-
-**Quick Setup (Project-Specific Credentials - No Conflicts!):**
-
+Example (3v3, dual critics/policies, scheduled alternations):
 ```bash
-# 1. Install boto3
-pip install boto3
-
-# 2. Create .env file with project-specific credentials (won't affect other projects)
-cat > .env << 'EOF'
-MLFLOW_ARTIFACT_ROOT=s3://your-bucket/mlflow-artifacts
-MLFLOW_AWS_ACCESS_KEY_ID=your-mlflow-key
-MLFLOW_AWS_SECRET_ACCESS_KEY=your-mlflow-secret
-MLFLOW_AWS_DEFAULT_REGION=us-east-1
-EOF
-
-# 3. Start MLflow server with S3 backend
-mlflow server \
-  --backend-store-uri sqlite:///mlflow.db \
-  --default-artifact-root s3://your-bucket/mlflow-artifacts \
-  --port 5000
-
-# 4. Run training - automatically uses project-specific S3 credentials!
-python train/train.py --mlflow-experiment-name my-experiment
+python train/train.py \
+  --grid-size 16 --players 3 --shot-clock 24 \
+  --alternations 30 \
+  --steps-per-alternation 20000 \
+  --steps-per-alternation-end 40000 \
+  --steps-per-alternation-schedule log \
+  --num-envs 8 \
+  --use-dual-policy --use-dual-critic \
+  --ent-coef-start 0.02 --ent-coef-end 0.001 --ent-schedule linear \
+  --mlflow-experiment-name BasketWorld_Training
 ```
+Key capabilities:
+- **Role-flag unified policy** with optional dual critics/policies (`--use-dual-critic`, `--use-dual-policy`) and pass-logit bias scheduling.
+- **Alternation scheduling** (`--steps-per-alternation*`, `--continue-run-id`/`--continue-schedule-mode`) and periodic evals (`--eval-freq`, `--eval-episodes`).
+- **Environment controls** (spawn distances, pressure/defense knobs, shot clock, dunk/three rules, phi shaping hooks) logged to MLflow so backend/UI recreate runs faithfully.
 
-**Key Features:**
-- ✅ `.env` file automatically loaded - no manual sourcing
-- ✅ Project-specific `MLFLOW_AWS_*` credentials won't conflict with other AWS projects
-- ✅ All scripts automatically detect and use S3 when configured
-- ✅ Secure - `.env` is already in `.gitignore`
+Grab the MLflow `run_id` for the interactive app; old egocentric models are incompatible with the absolute-coordinate obs.
 
-📖 **Documentation**: [S3 Setup](docs/mlflow_s3_setup.md) | [Quick Start](docs/mlflow_s3_quickstart.md) | [Project Credentials](docs/mlflow_project_credentials.md)
+## Interactive app
+### Backend (FastAPI)
+```bash
+uvicorn app.backend.main:app --host 0.0.0.0 --port 8080 --reload
+```
+- Reads env/training params, role-flag encoding, and available unified policies directly from MLflow for a given `run_id`.
+- Caches and loads `unified_*.zip` artifacts; optional frozen opponent policy selection.
+- Endpoints cover stepping games, policy probabilities, MCTS advice, batch evaluation, phi-shaping tweaks, offense skill overrides, shot/pass diagnostics, replays, GIF/PNG exports, and policy swapping mid-session.
 
----
+### Frontend (Vue 3 + Vite)
+- Enter an MLflow `run_id`, choose offense/defense side, and pick a unified policy for you vs. the (optional) frozen opponent.
+- Play manually or toggle AI suggestions/self-play; action masks and policy logits are surfaced.
+- Tabs for environment tweaks (skills, shot clock), phi shaping, evaluation batches, replays/manual stepping, shot/pass overlays, and reward breakdowns.
+- Saves episodes locally from backend endpoints; supports cached policy lists per run.
 
-## 🤖 Reinforcement Learning Ready
+## Core concepts
+- **Hex court + simultaneous actions**: MultiDiscrete action space (move/shoot/pass for each player) with illegal-action resolution strategies.
+- **Absolute observations**: Player coords, hoop vector, ball handler flag, EP/turnover/steal risk features; role flag distinguishes offense/defense for unified policies.
+- **Reward shaping**: Phi shaping hooks, expected-points diagnostics, defender pressure, three-second/illegal-defense enforcement, optional dunk/3pt rules.
+- **MLflow-first**: Training, evaluation, backend, and UI all hydrate from MLflow params/artifacts; `.env.aws` keeps project-specific S3 credentials isolated.
 
-BasketWorld is designed to work with single-policy RL algorithms like PPO, A2C, or DQN by:
-- Exposing individual agent observations in a consistent format
-- Using role-specific reward shaping
-- Providing full control over environment dynamics and rendering
-
----
-
-## 🏀 Use Cases
-- Emergent passing and team play
-- Defensive strategy learning
-- Curriculum training from 1v1 to 5v5
-- Multi-agent transfer learning
-- Simulation-based basketball strategy research
-
----
-
-## 📜 License
-MIT License
-
----
-
-## 🧩 Credits
-BasketWorld is inspired by classic RL environments like [GridWorld](https://gymnasium.farama.org/environments/toy_text/frozen_lake/) and adapted for multi-agent, role-based learning in sports simulation.
-
-> For ideas, bugs, or contributions — open an issue or pull request!
+## Quick references
+- Train: `python train/train.py ...` (see `train/train.py` for full CLI)
+- Backend: `uvicorn app.backend.main:app --port 8080`
+- Frontend: `npm run dev` in `app/frontend` with `VITE_API_BASE_URL` set
+- Docs: `readmes/` (obs migration, EP refactors, phi shaping, coordinate systems) and `docs/` (opponent sampling, schedule continuation)

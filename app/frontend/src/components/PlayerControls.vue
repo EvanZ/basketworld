@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -77,7 +77,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'state-updated']);
 
 const selectedActions = ref({});
 
@@ -163,12 +163,139 @@ function handlePolicySelection(type, event) {
   emit('policy-swap-requested', { target: 'opponent', policyName: value });
 }
 
+// Offense skill overrides (Environment tab)
+const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
+const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
+const skillsUpdating = ref(false);
+const skillsError = ref(null);
+
+function percentFromProb(prob) {
+  const num = Number(prob ?? 0);
+  if (Number.isNaN(num)) return 0;
+  return Math.max(0, Math.min(100, Number((num * 100).toFixed(1))));
+}
+
+function fillOffenseSkills(targetRef, sourceSkills) {
+  const count = props.gameState?.offense_ids?.length || 0;
+  const safe = sourceSkills || {};
+  targetRef.value = {
+    layup: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.layup?.[idx] ?? 0)),
+    three_pt: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.three_pt?.[idx] ?? 0)),
+    dunk: Array.from({ length: count }, (_, idx) => percentFromProb(safe?.dunk?.[idx] ?? 0)),
+  };
+}
+
+watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
+  fillOffenseSkills(offenseSkillInputs, skills);
+}, { immediate: true, deep: true });
+
+watch(() => props.gameState?.offense_shooting_pct_sampled, (skills) => {
+  fillOffenseSkills(
+    offenseSkillSampled,
+    skills || props.gameState?.offense_shooting_pct_by_player || null
+  );
+}, { immediate: true, deep: true });
+
+watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
+  if (!props.gameState?.offense_shooting_pct_sampled) {
+    fillOffenseSkills(offenseSkillSampled, skills);
+  }
+}, { deep: true });
+
+const offenseSkillRows = computed(() => {
+  const ids = props.gameState?.offense_ids || [];
+  const lay = offenseSkillInputs.value?.layup || [];
+  const three = offenseSkillInputs.value?.three_pt || [];
+  const dunk = offenseSkillInputs.value?.dunk || [];
+  const sampleLay = offenseSkillSampled.value?.layup || [];
+  const sampleThree = offenseSkillSampled.value?.three_pt || [];
+  const sampleDunk = offenseSkillSampled.value?.dunk || [];
+  return ids.map((pid, idx) => ({
+    playerId: pid,
+    layup: Number(lay[idx] ?? 0),
+    threePt: Number(three[idx] ?? 0),
+    dunk: Number(dunk[idx] ?? 0),
+    sampledLayup: Number(sampleLay[idx] ?? lay[idx] ?? 0),
+    sampledThree: Number(sampleThree[idx] ?? three[idx] ?? 0),
+    sampledDunk: Number(sampleDunk[idx] ?? dunk[idx] ?? 0),
+  }));
+});
+
+function percentToProb(percent) {
+  const num = Number(percent ?? 0);
+  if (Number.isNaN(num)) return 0.01;
+  const clamped = Math.max(1, Math.min(99, num));
+  return clamped / 100;
+}
+
+async function applyOffenseSkillOverrides() {
+  if (!props.gameState) return;
+  skillsUpdating.value = true;
+  skillsError.value = null;
+  try {
+    const payload = {
+      skills: {
+        layup: (offenseSkillInputs.value?.layup || []).map(percentToProb),
+        three_pt: (offenseSkillInputs.value?.three_pt || []).map(percentToProb),
+        dunk: (offenseSkillInputs.value?.dunk || []).map(percentToProb),
+      },
+    };
+    const res = await setOffenseSkills(payload);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update skills');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update offense skills', err);
+    skillsError.value = err?.message || 'Failed to update skills';
+  } finally {
+    skillsUpdating.value = false;
+  }
+}
+
+async function resetOffenseSkillsToSampled() {
+  if (!props.gameState) return;
+  skillsUpdating.value = true;
+  skillsError.value = null;
+  try {
+    const res = await setOffenseSkills({ reset_to_sampled: true });
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to reset skills');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to reset offense skills', err);
+    skillsError.value = err?.message || 'Failed to reset skills';
+  } finally {
+    skillsUpdating.value = false;
+  }
+}
+
 // Add rewards tracking
 const activeTab = ref('controls');
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
+
+// Advisor (MCTS) state
+const advisorPlayerId = ref(null);
+const advisorMaxDepth = ref(3);
+const advisorTimeBudget = ref(200);
+const advisorExplorationC = ref(1.4);
+const advisorUsePriors = ref(true);
+const advisorResult = ref(null);
+const advisorError = ref(null);
+const advisorLoading = ref(false);
+const useMctsForStep = ref(false);
+const advisorPolicyTop = computed(() => {
+  if (!advisorResult.value || !advisorResult.value.policy) return [];
+  const pairs = advisorResult.value.policy.map((p, idx) => ({ idx, prob: p }));
+  pairs.sort((a, b) => b.prob - a.prob);
+  return pairs.slice(0, 5);
+});
 
 // Auto-scroll to current shot clock in moves table
 const isMounted = ref(false);
@@ -462,31 +589,39 @@ async function fetchAllActionValues() {
 
 // Watch for game state changes to fetch all action values when needed
 watch(() => props.gameState, async (newGameState) => {
-  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping);
+  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping, 'Replaying:', props.isReplaying);
   
   let consumedStoredValues = false;
+  let consumedStoredProbs = false;
   if (newGameState && newGameState.action_values) {
     console.log('[PlayerControls] Applying stored action values from game state snapshot');
     applyStoredActionValues(newGameState.action_values);
     consumedStoredValues = true;
   }
+  if (newGameState && newGameState.policy_probabilities) {
+    console.log('[PlayerControls] Applying stored policy probabilities from game state snapshot');
+    policyProbabilities.value = newGameState.policy_probabilities;
+    consumedStoredProbs = true;
+  }
 
+  const allowApiFetch = !props.isManualStepping && !props.isReplaying;
   const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
-  const shouldSkipFetchBecauseStored = props.isManualStepping && consumedStoredValues;
+  const shouldFetchActionValues = shouldFetchAIData && allowApiFetch && !consumedStoredValues;
+  const shouldFetchPolicyProbs = shouldFetchAIData && allowApiFetch && !consumedStoredProbs;
 
-  if (shouldFetchAIData && !shouldSkipFetchBecauseStored) {
-    // Fetch both action values and policy probabilities for AI mode
+  if (shouldFetchActionValues || shouldFetchPolicyProbs) {
     try {
-      console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
-      await fetchAllActionValues();
+      if (shouldFetchActionValues) {
+        console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
+        await fetchAllActionValues();
+      }
       
-      // Only fetch policy probabilities from API if NOT in manual stepping mode
-      if (!props.isManualStepping) {
+      if (shouldFetchPolicyProbs) {
         console.log('[PlayerControls] Fetching policy probabilities from API for ball holder:', newGameState.ball_holder);
         await fetchPolicyProbabilities();
         console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
-      } else {
-        console.log('[PlayerControls] Skipping API fetch - in manual stepping mode, will use stored probs');
+      } else if (consumedStoredProbs) {
+        console.log('[PlayerControls] Skipping policy probability fetch - using stored snapshot');
       }
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
@@ -520,6 +655,12 @@ watch(allPlayerIds, (newPlayerIds) => {
         const firstUser = userControlledPlayerIds.value.length > 0 ? userControlledPlayerIds.value[0] : newPlayerIds[0];
         emit('update:activePlayerId', firstUser);
     }
+}, { immediate: true });
+
+watch(() => props.gameState?.ball_holder, (bh) => {
+  if (bh !== null && bh !== undefined) {
+    advisorPlayerId.value = bh;
+  }
 }, { immediate: true });
 
 const actionNames = Object.values({
@@ -634,6 +775,16 @@ function submitActions() {
   });
   
   emit('actions-submitted', actionsToSubmit);
+
+  // Emit current MCTS options (or null) so parent can include in step
+  emit('mcts-options-changed', useMctsForStep.value ? {
+    use_mcts: true,
+    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+    max_depth: advisorMaxDepth.value,
+    time_budget_ms: advisorTimeBudget.value,
+    exploration_c: advisorExplorationC.value,
+    use_priors: advisorUsePriors.value,
+  } : null);
   
   if (!props.aiMode) {
     // Only clear selections in manual mode
@@ -650,6 +801,54 @@ function submitActions() {
 function getSelectedActions() {
   // Return current selections for parent to use
   return { ...selectedActions.value };
+}
+
+async function runAdvisor() {
+  advisorLoading.value = true;
+  advisorError.value = null;
+  advisorResult.value = null;
+  try {
+    const payload = {
+      player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+      max_depth: advisorMaxDepth.value,
+      time_budget_ms: advisorTimeBudget.value,
+      exploration_c: advisorExplorationC.value,
+      use_priors: advisorUsePriors.value,
+    };
+    const res = await mctsAdvise(payload);
+    advisorResult.value = res?.advice || null;
+  } catch (err) {
+    advisorError.value = err?.message || 'Failed to fetch advice';
+  } finally {
+    advisorLoading.value = false;
+  }
+}
+
+function applyAdvisorAction() {
+  if (!advisorResult.value || advisorResult.value.action === undefined || advisorResult.value.action === null) return;
+  const actionIdx = Number(advisorResult.value.action);
+  const actionName = actionNames[actionIdx] || 'NOOP';
+  const targetPid = advisorPlayerId.value ?? props.activePlayerId;
+  if (targetPid === null || targetPid === undefined) return;
+  const legal = getLegalActions(targetPid);
+  if (legal.length > 0 && !legal.includes(actionName)) {
+    advisorError.value = `Advisor suggested ${actionName}, but it is not legal now.`;
+    return;
+  }
+  selectedActions.value = { ...selectedActions.value, [targetPid]: actionName };
+  emit('selections-changed', { ...selectedActions.value });
+}
+
+function toggleUseMcts(val) {
+  useMctsForStep.value = val;
+  emit('mcts-options-changed', val ? {
+    use_mcts: true,
+    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
+    max_depth: advisorMaxDepth.value,
+    time_budget_ms: advisorTimeBudget.value,
+    exploration_c: advisorExplorationC.value,
+    use_priors: advisorUsePriors.value,
+  } : null);
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
@@ -1111,6 +1310,12 @@ const stealRisks = computed(() => {
         Stats
       </button>
       <button 
+        :class="{ active: activeTab === 'advisor' }"
+        @click="activeTab = 'advisor'"
+      >
+        Advisor
+      </button>
+      <button 
         :class="{ active: activeTab === 'moves' }"
         @click="activeTab = 'moves'"
       >
@@ -1175,6 +1380,71 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
+    <!-- Advisor Tab -->
+    <div v-if="activeTab === 'advisor'" class="tab-content advisor-tab">
+      <div class="advisor-grid">
+        <label>
+          Player
+          <select v-model.number="advisorPlayerId">
+            <option v-for="pid in allPlayerIds" :key="pid" :value="pid">Player {{ pid }}</option>
+          </select>
+        </label>
+        <label>
+          Max depth (plies)
+          <input type="number" min="1" v-model.number="advisorMaxDepth" />
+        </label>
+        <label>
+          Time budget (ms)
+          <input type="number" min="10" step="10" v-model.number="advisorTimeBudget" />
+        </label>
+        <label>
+          Exploration C
+          <input type="number" step="0.1" v-model.number="advisorExplorationC" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" v-model="advisorUsePriors" /> Use policy priors
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" :checked="useMctsForStep" @change="toggleUseMcts($event.target.checked)" /> Use MCTS on next step
+        </label>
+        <div class="advisor-actions">
+          <button @click="runAdvisor" :disabled="advisorLoading || !props.gameState || props.gameState.done">
+            {{ advisorLoading ? 'Running...' : 'Get Advice' }}
+          </button>
+          <button @click="applyAdvisorAction" :disabled="!advisorResult" title="Apply recommended action to selection">
+            Apply Action
+          </button>
+        </div>
+      </div>
+      <div class="advisor-results" v-if="advisorResult">
+        <div class="advisor-summary">
+          <div>
+            Recommended: <strong>{{ actionNames[advisorResult.action] || 'UNKNOWN' }}</strong>
+          </div>
+          <div v-if="advisorResult.q_estimate !== null && advisorResult.q_estimate !== undefined">
+            Q ≈ {{ Number(advisorResult.q_estimate).toFixed(2) }}
+          </div>
+          <div class="advisor-stats">
+            <span>Visits: {{ advisorResult.visits ? advisorResult.visits[advisorResult.action] || 0 : 0 }}</span>
+            <span>Nodes: {{ advisorResult.nodes_expanded }}</span>
+            <span>Depth: {{ advisorResult.max_depth_reached }}</span>
+            <span>Cache hits: {{ advisorResult.cache_hits }}</span>
+            <span v-if="advisorResult.nodes_per_sec">{{ advisorResult.nodes_per_sec.toFixed(0) }} nodes/s</span>
+            <span v-if="advisorResult.duration_ms">{{ advisorResult.duration_ms.toFixed(1) }} ms</span>
+          </div>
+        </div>
+        <div v-if="advisorPolicyTop.length" class="advisor-policy">
+          <div v-for="item in advisorPolicyTop" :key="item.idx" class="advisor-policy-row">
+            <span class="policy-action">{{ actionNames[item.idx] || 'UNKNOWN' }}</span>
+            <span class="policy-prob">{{ (item.prob * 100).toFixed(1) }}%</span>
+            <span class="policy-visits" v-if="advisorResult.visits">{{ advisorResult.visits[item.idx] || 0 }} visits</span>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="advisorLoading" class="advisor-results">Running advisor…</div>
+      <div v-if="advisorError" class="advisor-error">{{ advisorError }}</div>
+    </div>
+
     <!-- Rewards Tab -->
     <div v-if="activeTab === 'rewards'" class="tab-content">
       <div class="rewards-section">
@@ -1182,9 +1452,16 @@ const stealRisks = computed(() => {
         <div class="parameters-grid" v-if="rewardParams">
           <div class="param-category">
             <h5>Shot Rewards</h5>
-            <div class="param-item"><span class="param-name">Made 2pt reward:</span><span class="param-value">{{ rewardParams.made_shot_reward_inside }}</span></div>
-            <div class="param-item"><span class="param-name">Made 3pt reward:</span><span class="param-value">{{ rewardParams.made_shot_reward_three }}</span></div>
-            <div class="param-item"><span class="param-name">Missed shot penalty:</span><span class="param-value">{{ rewardParams.missed_shot_penalty }}</span></div>
+            <div class="param-item">
+              <span class="param-name">Shot reward:</span>
+              <span class="param-value">
+                {{ rewardParams.shot_reward_description || 'Expected points (shot value × pressure-adjusted make probability, applies to makes and misses)' }}
+              </span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Turnover reward:</span>
+              <span class="param-value">{{ rewardParams.turnover_reward !== undefined ? rewardParams.turnover_reward : 0 }}</span>
+            </div>
           </div>
           <div class="param-category">
             <h5>Assist Shaping</h5>
@@ -1195,11 +1472,7 @@ const stealRisks = computed(() => {
           <div class="param-category">
             <h5>Other</h5>
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
-            <div class="param-item"><span class="param-name">Turnover penalty:</span><span class="param-value">{{ rewardParams.turnover_penalty }}</span></div>
             <div class="param-item"><span class="param-name">Violation reward:</span><span class="param-value">{{ rewardParams.violation_reward }}</span></div>
-            <div class="param-item"><span class="param-name">Made shot reward inside:</span><span class="param-value">{{ rewardParams.made_shot_reward_inside }}</span></div>
-            <div class="param-item"><span class="param-name">Made shot reward three:</span><span class="param-value">{{ rewardParams.made_shot_reward_three }}</span></div>
-            <div class="param-item"><span class="param-name">Missed shot penalty:</span><span class="param-value">{{ rewardParams.missed_shot_penalty }}</span></div>
           </div>
           <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
             <h5>Phi Shaping (from MLflow)</h5>
@@ -1450,6 +1723,17 @@ const stealRisks = computed(() => {
                 </select>
               </div>
             </div>
+            <div class="policy-actions">
+              <button 
+                class="refresh-policies-btn"
+                @click="$emit('refresh-policies')"
+                :disabled="policiesLoading || props.isPolicySwapping"
+                title="Refresh policy list from MLflow"
+              >
+                <span v-if="policiesLoading">⟳ Loading...</span>
+                <span v-else>⟳ Refresh Policies</span>
+              </button>
+            </div>
             <div class="policy-status" v-if="policiesLoading">
               Loading policies…
             </div>
@@ -1493,13 +1777,53 @@ const stealRisks = computed(() => {
           </div>
           <div class="param-category" v-if="props.gameState.offense_shooting_pct_by_player">
             <h5>Sampled Player Skills (Offense)</h5>
-            <div class="param-item" v-for="(pid, idx) in (props.gameState.offense_ids || [])" :key="`skill-${pid}`" data-tooltip="Individual shooting percentages sampled from μ±σ distributions. L=Layup, 3=Three-point, D=Dunk">
-              <span class="param-name">{{ pid }}:</span>
-              <span class="param-value">
-                L {{ ((props.gameState.offense_shooting_pct_by_player.layup?.[idx] || 0) * 100).toFixed(1) }}% ·
-                3 {{ ((props.gameState.offense_shooting_pct_by_player.three_pt?.[idx] || 0) * 100).toFixed(1) }}% ·
-                D {{ ((props.gameState.offense_shooting_pct_by_player.dunk?.[idx] || 0) * 100).toFixed(1) }}%
-              </span>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header">
+                <span>Player</span>
+                <span>Layup %</span>
+                <span>3PT %</span>
+                <span>Dunk %</span>
+              </div>
+              <div
+                class="offense-skills-row"
+                v-for="(row, idx) in offenseSkillRows"
+                :key="`skill-${row.playerId}`"
+                data-tooltip="Individual shooting percentages sampled from μ±σ distributions. Editable to override per-player skills."
+              >
+                <span class="skills-player">Player {{ row.playerId }}</span>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.layup[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledLayup.toFixed(1) }}%</span>
+                </div>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.three_pt[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledThree.toFixed(1) }}%</span>
+                </div>
+                <div class="offense-skill-input">
+                  <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.dunk[idx]" :disabled="skillsUpdating" />
+                  <span class="offense-skill-default">Sampled {{ row.sampledDunk.toFixed(1) }}%</span>
+                </div>
+              </div>
+              <div class="offense-skill-actions">
+                <button 
+                  class="refresh-policies-btn" 
+                  @click="resetOffenseSkillsToSampled" 
+                  :disabled="skillsUpdating || !offenseSkillRows.length"
+                  title="Reset to the values sampled when this game was created"
+                >
+                  Reset to Sampled
+                </button>
+                <button 
+                  class="refresh-policies-btn" 
+                  @click="applyOffenseSkillOverrides" 
+                  :disabled="skillsUpdating || !offenseSkillRows.length"
+                >
+                  {{ skillsUpdating ? 'Saving...' : 'Apply Overrides' }}
+                </button>
+              </div>
+              <div class="policy-status error" v-if="skillsError">
+                {{ skillsError }}
+              </div>
             </div>
           </div>
           <div class="param-category">
@@ -1751,9 +2075,14 @@ const stealRisks = computed(() => {
               <span class="param-name">Timesteps/alternation:</span>
               <span class="param-value">{{ props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(2) + 'M' : 'N/A' }}</span>
             </div>
-            <div class="param-item" data-tooltip="Total timesteps for training (approximate if using SPA schedule).">
+            <div class="param-item" data-tooltip="Total planned timesteps for training (exact value when using SPA schedule).">
               <span class="param-name">Total timesteps:</span>
-              <span class="param-value">{{ props.gameState.training_params.alternations && props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.alternations * props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(1) + 'M' : 'N/A' }}</span>
+              <span class="param-value" v-if="props.gameState.training_params.total_timesteps_planned">
+                {{ (props.gameState.training_params.total_timesteps_planned / 1e6).toFixed(2) + 'M' }}
+              </span>
+              <span class="param-value" v-else>
+                {{ props.gameState.training_params.alternations && props.gameState.training_params.steps_per_alternation && props.gameState.training_params.num_envs && props.gameState.training_params.n_steps ? ((props.gameState.training_params.alternations * props.gameState.training_params.steps_per_alternation * props.gameState.training_params.num_envs * props.gameState.training_params.n_steps) / 1e6).toFixed(1) + 'M' : 'N/A' }}
+              </span>
             </div>
           </div>
 
@@ -2042,6 +2371,114 @@ const stealRisks = computed(() => {
   opacity: 0.5;
   cursor: not-allowed;
   border-color: transparent;
+}
+
+/* Advisor */
+.advisor-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.advisor-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.advisor-grid label {
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--app-text-muted);
+}
+
+.advisor-grid input,
+.advisor-grid select {
+  padding: 8px 10px;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--app-text);
+}
+
+.advisor-grid .checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.advisor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.advisor-actions button {
+  padding: 10px 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--app-accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.advisor-actions button:disabled {
+  background: rgba(56, 189, 248, 0.4);
+  cursor: not-allowed;
+}
+
+.advisor-results {
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.advisor-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  font-size: 14px;
+  color: var(--app-text);
+}
+
+.advisor-stats span {
+  margin-right: 10px;
+  color: var(--app-text-muted);
+}
+
+.advisor-policy {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.advisor-policy-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+}
+
+.policy-action {
+  font-weight: 700;
+}
+
+.policy-prob {
+  color: var(--app-accent);
+}
+
+.policy-visits {
+  color: var(--app-text-muted);
+}
+
+.advisor-error {
+  color: #fca5a5;
+  font-weight: 700;
 }
 
 /* Rewards styles */
@@ -2460,6 +2897,87 @@ const stealRisks = computed(() => {
 
 .policy-status.error {
   color: #fb7185;
+}
+
+.policy-actions {
+  margin-top: 0.5rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.refresh-policies-btn {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--app-panel-border);
+  background: rgba(56, 189, 248, 0.1);
+  color: var(--app-text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.refresh-policies-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.25);
+  border-color: var(--app-accent);
+}
+
+.refresh-policies-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.offense-skills-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.offense-skills-row {
+  display: grid;
+  grid-template-columns: 0.9fr repeat(3, 1fr);
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.offense-skills-row.header {
+  font-size: 0.8rem;
+  color: var(--app-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+  padding-bottom: 0.25rem;
+}
+
+.offense-skill-input {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.offense-skill-input input {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(13, 20, 38, 0.7);
+  color: var(--app-text);
+}
+
+.skills-player {
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+.offense-skill-default {
+  font-size: 0.75rem;
+  color: var(--app-text-muted);
+}
+
+.offense-skill-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
 }
 
 .param-item:last-child {

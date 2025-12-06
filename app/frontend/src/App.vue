@@ -50,6 +50,7 @@ const isPolicySwapping = ref(false);
 const policyOptions = ref([]);
 const policiesLoading = ref(false);
 const policyLoadError = ref(null);
+const mctsOptionsForStep = ref(null);
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -90,8 +91,12 @@ const evalNumEpisodes = ref(100);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
+    if (newState?.policy_probabilities) {
+        policyProbs.value = newState.policy_probabilities;
+    }
+
     // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
-    if (newState && !newState.done && !isManualStepping.value) {
+    if (newState && !newState.done && !isManualStepping.value && !isReplaying.value) {
         try {
             console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
             const response = await getPolicyProbs();
@@ -101,6 +106,8 @@ watch(gameState, async (newState, oldState) => {
         }
     } else if (newState && !newState.done && isManualStepping.value) {
         console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
+    } else if (newState && !newState.done && isReplaying.value) {
+        console.log('[App] Skipping policy probs fetch during replay - using stored probabilities in snapshots');
     }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
@@ -194,7 +201,7 @@ async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
   // No loading indicator for steps, feels more responsive
   try {
-    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value);
+    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value, mctsOptionsForStep.value);
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
@@ -327,6 +334,20 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
   }
 }
 
+function handlePatchedGameState(newState) {
+  if (!newState) return;
+  gameState.value = newState;
+  const clonedState = cloneState(newState);
+  if (gameHistory.value.length > 0) {
+    gameHistory.value[gameHistory.value.length - 1] = clonedState;
+  } else {
+    gameHistory.value = [clonedState];
+  }
+  if (newState.policy_probabilities) {
+    policyProbs.value = { ...newState.policy_probabilities };
+  }
+}
+
 async function handleShotClockAdjustment(delta) {
   if (!gameState.value || gameState.value.done) {
     console.warn('[App] Cannot adjust shot clock after episode has ended.');
@@ -401,6 +422,23 @@ async function handlePolicySwap({ target, policyName }) {
           console.warn('[App] Failed to refresh policy probabilities after swap:', err);
         }
       }
+
+      // Update initialSetup so new games use the updated policy
+      if (initialSetup.value) {
+        if (target === 'user') {
+          initialSetup.value = {
+            ...initialSetup.value,
+            unifiedPolicyName: policyName,
+          };
+          console.log('[App] Updated initialSetup user policy to:', policyName);
+        } else if (target === 'opponent') {
+          initialSetup.value = {
+            ...initialSetup.value,
+            opponentUnifiedPolicyName: policyName || null,
+          };
+          console.log('[App] Updated initialSetup opponent policy to:', policyName || 'Mirror');
+        }
+      }
     }
   } catch (err) {
     console.error('[App] Policy swap failed:', err);
@@ -437,6 +475,19 @@ async function handleMoveRecorded(moveData) {
 // Handler for selections changed from PlayerControls
 function handleSelectionsChanged(selections) {
   userSelections.value = selections;
+}
+
+// Handler for refresh policies request from PlayerControls
+async function handleRefreshPolicies() {
+  if (gameState.value?.run_id) {
+    console.log('[App] Refreshing policies for run:', gameState.value.run_id);
+    await refreshPolicyOptions(gameState.value.run_id);
+    console.log('[App] Policy refresh complete, found', policyOptions.value.length, 'policies');
+  }
+}
+
+function handleMctsOptionsChanged(options) {
+  mctsOptionsForStep.value = options;
 }
 
 // Computed: which selections to show on board (user or self-play)
@@ -1134,6 +1185,9 @@ onBeforeUnmount(() => {
             @move-recorded="handleMoveRecorded"
             @policy-swap-requested="handlePolicySwap"
             @selections-changed="handleSelectionsChanged"
+            @refresh-policies="handleRefreshPolicies"
+            @mcts-options-changed="handleMctsOptionsChanged"
+            @state-updated="handlePatchedGameState"
             ref="controlsRef"
         />
 

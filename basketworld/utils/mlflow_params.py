@@ -500,8 +500,12 @@ def get_mlflow_training_params(
         str, 
         "linear"
     )
-    # Calculated: timesteps_per_alternation = steps_per_alternation * num_envs * n_steps
-    # Calculated: total_timesteps = alternations * timesteps_per_alternation (approximate if using SPA schedule)
+    # Total planned timesteps (calculated, accounts for SPA schedule)
+    training_params["total_timesteps_planned"] = _get_param(
+        params, ["total_timesteps_planned"], 
+        int, 
+        None
+    )
 
     # Self-play and Opponent Sampling
     training_params["deterministic_opponent"] = _get_param(

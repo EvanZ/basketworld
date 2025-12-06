@@ -66,6 +66,9 @@ class IllegalActionPolicy(Enum):
 class HexagonBasketballEnv(gym.Env):
     """Hexagon-tessellated basketball environment for self-play RL."""
 
+    # Small tolerance to treat pass-arc boundary angles as in-arc (avoids floating error gaps)
+    _PASS_ARC_COS_EPS = 1e-9
+
     metadata = {"render.modes": ["human", "rgb_array"]}
 
     def __init__(
@@ -1805,7 +1808,8 @@ class HexagonBasketballEnv(gym.Env):
         dir_norm = math.hypot(dir_x, dir_y) or 1.0
         # Arc total in degrees -> half-angle in radians
         half_angle_rad = math.radians(max(1.0, min(360.0, self.pass_arc_degrees))) / 2.0
-        cos_threshold = math.cos(half_angle_rad)
+        # Use a tiny tolerance so passes on the exact arc boundary count as legal
+        cos_threshold = math.cos(half_angle_rad) - self._PASS_ARC_COS_EPS
 
         # Check if any teammate is in arc
         team_ids = (
@@ -1858,7 +1862,8 @@ class HexagonBasketballEnv(gym.Env):
             math.radians(max(1.0, min(360.0, getattr(self, "pass_arc_degrees", 60.0))))
             / 2.0
         )
-        cos_threshold = math.cos(half_angle_rad)
+        # Use a tiny tolerance so receivers on the exact arc boundary are counted
+        cos_threshold = math.cos(half_angle_rad) - self._PASS_ARC_COS_EPS
 
         def in_arc(to_q: int, to_r: int) -> bool:
             vx, vy = self._axial_to_cartesian(
@@ -2208,14 +2213,9 @@ class HexagonBasketballEnv(gym.Env):
         done = False
         pass_reward = self.pass_reward
         violation_reward = self.violation_reward
-        turnover_penalty = self.turnover_penalty
         # Assist shaping
         potential_assist_reward = self.potential_assist_reward
         full_assist_bonus = self.full_assist_bonus
-        # Define the reward magnitude for shots (2PT vs 3PT)
-        made_shot_reward_inside = self.made_shot_reward_inside
-        made_shot_reward_three = self.made_shot_reward_three
-        missed_shot_penalty = self.missed_shot_penalty
 
         # --- Reward successful passes ---
         for _, pass_result in action_results.get("passes", {}).items():
@@ -2226,10 +2226,8 @@ class HexagonBasketballEnv(gym.Env):
         # --- Handle all turnovers from actions ---
         if action_results.get("turnovers"):
             done = True
-            # Penalize offense, reward defense for the turnover
-            # We assume only one turnover can happen per step
-            rewards[self.offense_ids] -= turnover_penalty / self.players_per_side
-            rewards[self.defense_ids] += turnover_penalty / self.players_per_side
+            # Turnovers now provide zero reward (dense signal comes from shots)
+            # Keep episode termination behavior unchanged.
 
         # --- Handle defensive lane violations (illegal defense) ---
         # Only apply violation reward if there's no shot on this step
@@ -2251,21 +2249,12 @@ class HexagonBasketballEnv(gym.Env):
             dist_to_basket = self._hex_distance(shooter_pos, self.basket_position)
             is_three_point = self._is_three_point_hex(tuple(shooter_pos))
 
-            if shot_result["success"]:
-                # Basket was made
-                made_shot_reward = (
-                    made_shot_reward_three
-                    if is_three_point
-                    else made_shot_reward_inside
-                )
-                # Offense scored, good for them, bad for defense
-                rewards[self.offense_ids] += made_shot_reward / self.players_per_side
-                rewards[self.defense_ids] -= made_shot_reward / self.players_per_side
-                # else: handle rare case of defense scoring on own basket
-            else:
-                # Offense missed, bad for them, good for defense
-                rewards[self.offense_ids] -= missed_shot_penalty / self.players_per_side
-                rewards[self.defense_ids] += missed_shot_penalty / self.players_per_side
+            # Dense reward: always grant expected points based on shot model (PPP),
+            # regardless of make/miss. Defense gets the negative of the same amount.
+            shot_expected_points = self._calculate_expected_points_for_player(int(player_id))
+            shot_result["expected_points"] = float(shot_expected_points)
+            rewards[self.offense_ids] += shot_expected_points / self.players_per_side
+            rewards[self.defense_ids] -= shot_expected_points / self.players_per_side
 
             # --- Assist rewards and annotations ---
             assist_potential = False
@@ -2279,19 +2268,8 @@ class HexagonBasketballEnv(gym.Env):
                 ):
                     assist_potential = True
                     assist_passer = int(self._assist_candidate["passer_id"])
-                    # Reward potential assist
-                    # Prefer % of shot reward if configured; otherwise fall back to absolute
-                    if shot_result["success"]:
-                        base_for_pct = made_shot_reward
-                    else:
-                        # If missed, use would-be shot reward magnitude as base.
-                        # Recompute distance locally to avoid scope issues.
-                        _dist_for_pct = self._hex_distance(
-                            self.positions[player_id], self.basket_position
-                        )
-                        base_for_pct = (
-                            made_shot_reward_three if is_three_point else made_shot_reward_inside
-                        )
+                    # Reward potential assist using the shot's expected points as the base magnitude.
+                    base_for_pct = shot_expected_points
                     potential_assist_amt = (
                         max(0.0, float(self.potential_assist_pct) * float(base_for_pct))
                         if hasattr(self, "potential_assist_pct")
@@ -2307,12 +2285,12 @@ class HexagonBasketballEnv(gym.Env):
                     )
                     if shot_result["success"]:
                         assist_full = True
-                        # Full assist bonus proportional to made shot reward if configured
+                        # Full assist bonus proportional to shot expected points if configured
                         full_bonus_amt = (
                             max(
                                 0.0,
                                 float(self.full_assist_bonus_pct)
-                                * float(made_shot_reward),
+                                * float(shot_expected_points),
                             )
                             if hasattr(self, "full_assist_bonus_pct")
                             and self.full_assist_bonus_pct is not None

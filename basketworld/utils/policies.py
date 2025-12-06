@@ -101,11 +101,15 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
     """Multi-input Actor-Critic policy with dual critics AND additive pass-logit bias.
     
     Combines:
-    - DualCriticActorCriticPolicy: Separate value networks for offense/defense
+    - DualCriticActorCriticPolicy: Separate value networks for offense/defense,
+      and optionally separate action networks (dual policy)
     - PassBias: Additive bias to PASS action logits for exploration
     
     This policy addresses the fundamental value function issue in zero-sum self-play
     while maintaining the pass exploration mechanism.
+    
+    When use_dual_policy=True is passed to __init__, separate action networks are used
+    for offense and defense, allowing each role to learn distinct strategies.
     """
 
     def __init__(self, *args, **kwargs):
@@ -135,16 +139,16 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         except Exception:
             self.pass_logit_bias = 0.0
 
-    def _get_action_dist_from_latent(
-        self, latent_pi: th.Tensor, latent_sde: Optional[th.Tensor] = None
-    ) -> Distribution:
-        """Override to inject bias into PASS logits before building the distribution."""
-        # Base logits from action head
-        action_logits: th.Tensor = self.action_net(latent_pi)
-
+    def _apply_pass_bias(self, action_logits: th.Tensor) -> th.Tensor:
+        """
+        Apply pass logit bias to action logits.
+        
+        :param action_logits: Raw action logits
+        :return: Biased action logits (or original if bias is zero)
+        """
         # No-op if not MultiDiscrete or bias is effectively zero
         if not self._nvec or abs(self.pass_logit_bias) <= 1e-12:
-            return self.action_dist.proba_distribution(action_logits=action_logits)
+            return action_logits
 
         # Split flat logits into per-dimension chunks: [B, sum(nvec)] -> list of [B, n_i]
         with th.no_grad():
@@ -168,7 +172,25 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
                     c[:, idx] = c[:, idx] + bias
             biased_chunks.append(c)
 
-        biased_logits = th.cat(biased_chunks, dim=1)
+        return th.cat(biased_chunks, dim=1)
+
+    def _get_action_dist_from_latent(
+        self, latent_pi: th.Tensor, latent_sde: Optional[th.Tensor] = None
+    ) -> Distribution:
+        """
+        Override to inject bias into PASS logits before building the distribution.
+        
+        Uses the base class's _get_action_logits to properly handle dual policy
+        (selecting offense or defense action network based on role_flag), then
+        applies pass bias on top.
+        """
+        # Get action logits from the appropriate action network
+        # (handles dual policy routing if use_dual_policy=True)
+        action_logits: th.Tensor = self._get_action_logits(latent_pi)
+        
+        # Apply pass bias
+        biased_logits = self._apply_pass_bias(action_logits)
+        
         return self.action_dist.proba_distribution(action_logits=biased_logits)
 
 

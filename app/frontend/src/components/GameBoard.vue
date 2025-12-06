@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch, onMounted } from 'vue';
+import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import { getShotProbability, getPassStealProbabilities } from '@/services/api';
 
 const props = defineProps({
@@ -64,32 +64,74 @@ function getRenderablePlayers(gameState) {
   });
 }
 
-function onPlayerClick(player) {
-  // If dragging, don't trigger click
-  if (isDragging.value) return;
-  // Allow selecting any player (offense or defense) from the board
-  if (!player) return;
-  
-  // Check if this player currently has policy probs displayed
-  // If so, toggle the visibility off. If not visible, turn them on.
-  const hasProbs = (props.activePlayerId === player.id && showPolicyProbs.value);
-  
-  if (hasProbs) {
-    // Toggle off policy display
-    showPolicyProbs.value = false;
-  } else {
-    // Show policy display and select this player
-    showPolicyProbs.value = true;
-    emit('update:activePlayerId', player.id);
-  }
-}
-
 const svgRef = ref(null);
 const draggedPlayerId = ref(null);
 const draggedPlayerPos = ref({ x: 0, y: 0 });
 const isDragging = ref(false);
 const passStealProbs = ref({});
-const showPolicyProbs = ref(true); // Toggle for policy probability visibility
+const policyVisibility = ref(new Set()); // Player IDs with policy overlays shown
+const clickTimeout = ref(null);
+const SINGLE_CLICK_DELAY = 220;
+
+function clearClickTimeout() {
+  if (clickTimeout.value) {
+    clearTimeout(clickTimeout.value);
+    clickTimeout.value = null;
+  }
+}
+
+function togglePolicyVisibility(playerId) {
+  const next = new Set(policyVisibility.value);
+  if (next.has(playerId)) {
+    next.delete(playerId);
+  } else {
+    next.add(playerId);
+  }
+  policyVisibility.value = next;
+}
+
+function showPoliciesForAllPlayers() {
+  const positions = currentGameState.value?.positions;
+  if (!positions || positions.length === 0) {
+    policyVisibility.value = new Set();
+    return;
+  }
+  policyVisibility.value = new Set(positions.map((_, idx) => idx));
+}
+
+function hideAllPolicies() {
+  policyVisibility.value = new Set();
+}
+
+function toggleAllPolicies() {
+  if (allPoliciesVisible.value) {
+    hideAllPolicies();
+  } else {
+    showPoliciesForAllPlayers();
+  }
+}
+
+function isPolicyVisible(playerId) {
+  return policyVisibility.value.has(playerId);
+}
+
+function onPlayerClick(_event, player) {
+  // If dragging, don't trigger click
+  if (isDragging.value) return;
+  if (!player) return;
+
+  clearClickTimeout();
+  clickTimeout.value = setTimeout(() => {
+    togglePolicyVisibility(player.id);
+    clickTimeout.value = null;
+  }, SINGLE_CLICK_DELAY);
+}
+
+function onPlayerDoubleClick(_event, player) {
+  if (!player) return;
+  clearClickTimeout();
+  emit('update:activePlayerId', player.id);
+}
 
 function getSvgPoint(clientX, clientY) {
   if (!svgRef.value) return { x: 0, y: 0 };
@@ -165,6 +207,12 @@ function onGlobalMouseUp(event) {
 
 const currentGameState = computed(() => {
   return props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
+});
+
+const allPoliciesVisible = computed(() => {
+  const positions = currentGameState.value?.positions;
+  if (!positions || positions.length === 0) return false;
+  return policyVisibility.value.size === positions.length;
 });
 
 const offenseStateValue = computed(() => {
@@ -442,6 +490,33 @@ watch(currentGameState, async (newState) => {
   }
 }, { immediate: true });
 
+// Reset policy visibility when the game history is cleared (new game)
+watch(
+  () => props.gameHistory.length,
+  (len) => {
+    if (len === 0) {
+      policyVisibility.value = new Set();
+    }
+  }
+);
+
+// Keep policy visibility aligned to existing player IDs
+watch(
+  () => currentGameState.value?.positions?.length,
+  () => {
+    const positions = currentGameState.value?.positions;
+    if (!positions || positions.length === 0) {
+      policyVisibility.value = new Set();
+      return;
+    }
+    const validIds = new Set(positions.map((_, idx) => idx));
+    const filtered = new Set([...policyVisibility.value].filter((id) => validIds.has(id)));
+    if (filtered.size !== policyVisibility.value.size) {
+      policyVisibility.value = filtered;
+    }
+  }
+);
+
 function adjustShotClock(delta) {
   if (!isShotClockEditable.value) return;
   const minClock = 0;
@@ -503,54 +578,46 @@ const hexDirections = [
 ];
 
 const policySuggestions = computed(() => {
-    // Check if policy display is toggled off
-    if (!showPolicyProbs.value) {
-        return [];
-    }
-    
-    // If we're in manual stepping, use the stored policy probabilities from the snapshot.
-    const gs = currentGameState.value;
-    const activeId = props.activePlayerId;
-    let probsByPlayer = null;
+  const gs = currentGameState.value;
+  if (!gs) return [];
 
-    if (!gs || activeId === null) {
-        console.log('[GameBoard] No suggestions to render - missing game state or active player.');
-        return [];
-    }
+  const visibleIds = Array.from(policyVisibility.value);
+  if (visibleIds.length === 0) return [];
 
-    if (props.isManualStepping && gs.policy_probabilities) {
-        probsByPlayer = gs.policy_probabilities;
-    } else {
-        probsByPlayer = props.policyProbabilities;
-    }
+  // If we're in manual stepping, use the stored policy probabilities from the snapshot.
+  const probsByPlayer =
+    props.isManualStepping && gs.policy_probabilities
+      ? gs.policy_probabilities
+      : props.policyProbabilities;
 
-    if (!probsByPlayer || !probsByPlayer[activeId]) {
-        console.log('[GameBoard] No suggestions to render - missing probabilities for player', activeId);
-        return [];
-    }
+  if (!probsByPlayer) return [];
 
-    const probs = probsByPlayer[activeId];
-    const currentPlayerPos = currentGameState.value.positions[activeId];
+  const suggestions = [];
 
-    const suggestions = [];
+  for (const pid of visibleIds) {
+    const probs = probsByPlayer[pid];
+    const currentPlayerPos = gs.positions?.[pid];
+    if (!probs || !currentPlayerPos) continue;
+
     for (let i = 0; i < hexDirections.length; i++) {
-        const dir = hexDirections[i];
-        const moveActionIndex = i + 1; // MOVE_E .. MOVE_SE
-        const passActionIndex = 8 + i; // PASS_E .. PASS_SE
+      const dir = hexDirections[i];
+      const moveActionIndex = i + 1; // MOVE_E .. MOVE_SE
+      const passActionIndex = 8 + i; // PASS_E .. PASS_SE
 
-        const targetPos = { q: currentPlayerPos[0] + dir.q, r: currentPlayerPos[1] + dir.r };
-        const cartesianPos = axialToCartesian(targetPos.q, targetPos.r);
+      const targetPos = { q: currentPlayerPos[0] + dir.q, r: currentPlayerPos[1] + dir.r };
+      const cartesianPos = axialToCartesian(targetPos.q, targetPos.r);
 
-        suggestions.push({
-            x: cartesianPos.x,
-            y: cartesianPos.y,
-            moveProb: probs[moveActionIndex] ?? 0,
-            passProb: probs[passActionIndex] ?? 0,
-            key: `sugg-${i}`
-        });
+      suggestions.push({
+        x: cartesianPos.x,
+        y: cartesianPos.y,
+        moveProb: probs[moveActionIndex] ?? 0,
+        passProb: probs[passActionIndex] ?? 0,
+        key: `sugg-${pid}-${i}`
+      });
     }
-    console.log('[GameBoard] Generated suggestions:', suggestions);
-    return suggestions;
+  }
+
+  return suggestions;
 });
 
 const ballHandlerShotProb = computed(() => {
@@ -1009,17 +1076,33 @@ defineExpose({
   renderStateToPng
 });
 
+onBeforeUnmount(() => {
+  clearClickTimeout();
+  window.removeEventListener('mousemove', onGlobalMouseMove);
+  window.removeEventListener('mouseup', onGlobalMouseUp);
+});
+
 </script>
 
 <template>
   <div class="game-board-container">
-    <button 
-      class="download-button" 
-      @click="downloadBoardAsImage"
-      title="Download board as PNG"
-    >
-      📥
-    </button>
+    <div class="board-toolbar">
+      <button 
+        class="download-button" 
+        @click="downloadBoardAsImage"
+        title="Download board as PNG"
+      >
+        📥
+      </button>
+      <button
+        class="policy-toggle-button"
+        @click="toggleAllPolicies"
+        :aria-pressed="allPoliciesVisible"
+        title="Show or hide policy probabilities for all players"
+      >
+        {{ allPoliciesVisible ? 'Hide Policies' : 'Show Policies' }}
+      </button>
+    </div>
     <svg :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
       <defs>
         <marker
@@ -1139,7 +1222,8 @@ defineExpose({
                 { 'dragging': draggedPlayerId === player.id }
               ]"
               @mousedown="onMouseDown($event, player)"
-              @click="onPlayerClick(player)"
+              @click="onPlayerClick($event, player)"
+              @dblclick.stop="onPlayerDoubleClick($event, player)"
               style="cursor: grab;"
             />
             <text 
@@ -1163,7 +1247,7 @@ defineExpose({
             </text>
             <!-- NOOP probability label (index 0) for the player -->
             <text
-              v-if="player.isOffense && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined && draggedPlayerId !== player.id"
+              v-if="player.isOffense && isPolicyVisible(player.id) && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
               dy="1.2em"
@@ -1174,7 +1258,7 @@ defineExpose({
             </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
-              v-if="player.hasBall && ballHandlerShotProb !== null && draggedPlayerId !== player.id"
+              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerShotProb !== null && draggedPlayerId !== player.id"
               :x="player.x" 
               :y="player.y" 
               dy="0.4em" 
@@ -1186,7 +1270,7 @@ defineExpose({
             </text>
             <!-- Display conditional make percentage for ball handler -->
             <text 
-              v-if="player.hasBall && ballHandlerMakeProb !== null && draggedPlayerId !== player.id"
+              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerMakeProb !== null && draggedPlayerId !== player.id"
               :x="player.x" 
               :y="player.y" 
               dy="-0.4em" 
@@ -1441,11 +1525,17 @@ defineExpose({
   cursor: not-allowed;
 }
 
-.download-button {
+.board-toolbar {
   position: absolute;
   top: 10px;
   left: 10px;
-  z-index: 10;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  z-index: 12;
+}
+
+.download-button {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid #ddd;
   border-radius: 6px;
@@ -1464,6 +1554,30 @@ defineExpose({
 }
 
 .download-button:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.policy-toggle-button {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  color: #0b172d;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.policy-toggle-button:hover {
+  background: #0d59df;
+  color: #f8fafc;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+  transform: translateY(-1px);
+}
+
+.policy-toggle-button:active {
   transform: translateY(0);
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
