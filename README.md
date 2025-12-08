@@ -4,6 +4,7 @@ BasketWorld is a hex-grid, Gymnasium-compatible half-court basketball simulator 
 
 ![Sample episode](docs/assets/episode_20251207_184600_made_unassisted_3pt.gif)
 ![Sample episode](docs/assets/episode_20251208_055831_missed_potentially_assisted_3pt.gif)
+![Sample episode](docs/assets/episode_20251207_202731_missed_potentially_assisted_2pt.gif)
 
 ## What's new
 - **Absolute-coordinate observations**: Egocentric rotation is gone; models need retraining. Ball handler position, hoop location, EP/risk features, and action masks are all absolute-court based.
