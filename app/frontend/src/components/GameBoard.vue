@@ -69,6 +69,13 @@ const draggedPlayerId = ref(null);
 const draggedPlayerPos = ref({ x: 0, y: 0 });
 const isDragging = ref(false);
 const passStealProbs = ref({});
+const ballColor = '#ffa500';
+const PASS_FLASH_DURATION_MS = 1100;
+const SHOT_FLASH_DURATION_MS = 1100;
+const passFlash = ref(null);
+const passFlashTimeout = ref(null);
+const shotFlash = ref(null);
+const shotFlashTimeout = ref(null);
 const policyVisibility = ref(new Set()); // Player IDs with policy overlays shown
 const clickTimeout = ref(null);
 const SINGLE_CLICK_DELAY = 220;
@@ -826,6 +833,149 @@ const passRays = computed(() => {
   return rays;
 });
 
+function clearPassFlash() {
+  if (passFlashTimeout.value) {
+    clearTimeout(passFlashTimeout.value);
+    passFlashTimeout.value = null;
+  }
+  passFlash.value = null;
+}
+
+function triggerPassFlash(passerId, receiverId, start, end) {
+  if (passFlashTimeout.value) {
+    clearTimeout(passFlashTimeout.value);
+    passFlashTimeout.value = null;
+  }
+
+  passFlash.value = {
+    passerId,
+    receiverId,
+    x1: start.x,
+    y1: start.y,
+    x2: end.x,
+    y2: end.y,
+    labelX: (start.x + end.x) / 2,
+    labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
+  };
+
+  passFlashTimeout.value = setTimeout(() => {
+    passFlash.value = null;
+    passFlashTimeout.value = null;
+  }, PASS_FLASH_DURATION_MS);
+}
+
+function clearShotFlash() {
+  if (shotFlashTimeout.value) {
+    clearTimeout(shotFlashTimeout.value);
+    shotFlashTimeout.value = null;
+  }
+  shotFlash.value = null;
+}
+
+function triggerShotFlash(shooterId, start, end, success) {
+  if (shotFlashTimeout.value) {
+    clearTimeout(shotFlashTimeout.value);
+    shotFlashTimeout.value = null;
+  }
+
+  shotFlash.value = {
+    shooterId,
+    x1: start.x,
+    y1: start.y,
+    x2: end.x,
+    y2: end.y,
+    color: success ? '#22c55e' : '#ef4444',
+  };
+
+  shotFlashTimeout.value = setTimeout(() => {
+    shotFlash.value = null;
+    shotFlashTimeout.value = null;
+  }, SHOT_FLASH_DURATION_MS);
+}
+
+watch(
+  currentGameState,
+  (state) => {
+    if (!state) {
+      clearPassFlash();
+      return;
+    }
+
+    const passes = state.last_action_results?.passes;
+    if (!passes || Object.keys(passes).length === 0) {
+      clearPassFlash();
+      return;
+    }
+
+    let successfulPass = null;
+    for (const [passerId, passResult] of Object.entries(passes)) {
+      if (passResult && passResult.success && typeof passResult.target === 'number') {
+        successfulPass = { passerId: Number(passerId), receiverId: Number(passResult.target) };
+        break;
+      }
+    }
+
+    if (!successfulPass) {
+      clearPassFlash();
+      return;
+    }
+
+    const passerPos = state.positions?.[successfulPass.passerId];
+    const receiverPos = state.positions?.[successfulPass.receiverId];
+    if (!passerPos || !receiverPos) {
+      clearPassFlash();
+      return;
+    }
+
+    const start = axialToCartesian(passerPos[0], passerPos[1]);
+    const end = axialToCartesian(receiverPos[0], receiverPos[1]);
+    triggerPassFlash(successfulPass.passerId, successfulPass.receiverId, start, end);
+  },
+  { immediate: true }
+);
+
+watch(
+  currentGameState,
+  (state) => {
+    if (!state) {
+      clearShotFlash();
+      return;
+    }
+
+    const shots = state.last_action_results?.shots;
+    if (!shots || Object.keys(shots).length === 0) {
+      clearShotFlash();
+      return;
+    }
+
+    let shotData = null;
+    for (const [shooterId, shotResult] of Object.entries(shots)) {
+      if (shotResult) {
+        shotData = { shooterId: Number(shooterId), result: shotResult };
+        break;
+      }
+    }
+
+    if (!shotData) {
+      clearShotFlash();
+      return;
+    }
+
+    const shooterPos = state.positions?.[shotData.shooterId];
+    const basketPos = state.basket_position;
+    if (!shooterPos || !basketPos) {
+      clearShotFlash();
+      return;
+    }
+
+    const start = axialToCartesian(shooterPos[0], shooterPos[1]);
+    const end = axialToCartesian(basketPos[0], basketPos[1]);
+    const success = !!shotData.result.success;
+    triggerShotFlash(shotData.shooterId, start, end, success);
+  },
+  { immediate: true }
+);
+
 async function downloadBoardAsImage() {
   if (!svgRef.value) return;
   
@@ -1080,6 +1230,8 @@ onBeforeUnmount(() => {
   clearClickTimeout();
   window.removeEventListener('mousemove', onGlobalMouseMove);
   window.removeEventListener('mouseup', onGlobalMouseUp);
+  clearPassFlash();
+  clearShotFlash();
 });
 
 </script>
@@ -1343,6 +1495,41 @@ onBeforeUnmount(() => {
           >
             {{ ray.stealProb }}%
           </text>
+        </g>
+
+        <!-- Flash effect for completed passes -->
+        <g v-if="passFlash" class="pass-flash-group">
+          <line
+            :x1="passFlash.x1"
+            :y1="passFlash.y1"
+            :x2="passFlash.x2"
+            :y2="passFlash.y2"
+            :stroke="ballColor"
+            class="pass-flash-line"
+          />
+          <text
+            :x="passFlash.labelX"
+            :y="passFlash.labelY"
+            text-anchor="middle"
+            dominant-baseline="middle"
+            :fill="ballColor"
+            class="pass-flash-text"
+          >
+            PASS {{ passFlash.passerId }} -> {{ passFlash.receiverId }}
+          </text>
+        </g>
+
+        <!-- Flash effect for shot attempts -->
+        <g v-if="shotFlash" class="shot-flash-group">
+          <line
+            :x1="shotFlash.x1"
+            :y1="shotFlash.y1"
+            :x2="shotFlash.x2"
+            :y2="shotFlash.y2"
+            :stroke="shotFlash.color"
+            class="shot-flash-line"
+            :style="{ filter: `drop-shadow(0 0 10px ${shotFlash.color})` }"
+          />
         </g>
         
         <!-- Draw Policy Suggestions -->
@@ -1803,6 +1990,41 @@ svg {
   stroke-width: 2px;
   pointer-events: none;
   opacity: 0.9;
+}
+
+.pass-flash-line {
+  stroke-width: 8;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 8px rgba(255, 165, 0, 0.6));
+  animation: pass-flash-line 1s ease-out forwards;
+}
+
+.pass-flash-text {
+  font-size: 18px;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: #0a0f1e;
+  stroke-width: 3px;
+  letter-spacing: 0.5px;
+  animation: pass-flash-text 1s ease-out forwards;
+}
+
+@keyframes pass-flash-line {
+  0% { opacity: 1; stroke-width: 10; }
+  60% { opacity: 0.75; stroke-width: 6; }
+  100% { opacity: 0; stroke-width: 2; }
+}
+
+@keyframes pass-flash-text {
+  0% { opacity: 1; transform: scale(1); }
+  70% { opacity: 0.85; transform: scale(1.06); }
+  100% { opacity: 0; transform: scale(1.08); }
+}
+
+.shot-flash-line {
+  stroke-width: 10;
+  stroke-linecap: round;
+  animation: pass-flash-line 1s ease-out forwards;
 }
 
 </style>

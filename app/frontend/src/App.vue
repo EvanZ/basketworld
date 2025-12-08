@@ -89,6 +89,10 @@ const currentShotClock = computed(() => {
 const isEvaluating = ref(false);
 const evalNumEpisodes = ref(100);
 
+const FLASH_CAPTURE_OFFSETS_MS = [0, 350, 750];
+const BASE_STEP_DURATION_MS = 900;
+const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
+
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
     if (newState?.policy_probabilities) {
@@ -823,6 +827,20 @@ async function handleEvaluation() {
   }
 }
 
+function stateHasAnimatedFlash(state) {
+  const results = state?.last_action_results;
+  if (!results) return false;
+
+  const hasShot = results.shots && Object.keys(results.shots).length > 0;
+  const hasPass =
+    results.passes &&
+    Object.values(results.passes).some(
+      (passRes) => passRes && passRes.success && typeof passRes.target === 'number'
+    );
+
+  return Boolean(hasShot || hasPass);
+}
+
 async function handleSaveEpisode() {
   try {
     // Check if we have episode states to render
@@ -840,27 +858,44 @@ async function handleSaveEpisode() {
     
     // Generate PNG frames for each state
     const frames = [];
+    const frameDurations = [];
     for (let i = 0; i < states.length; i++) {
       try {
         // Update currentStepIndex so boardSelectedActions shows correct actions for this frame
         currentStepIndex.value = i;
         
         // Temporarily set the game history to show this state
-        const tempHistory = [states[i]];
+        const tempHistory = states.slice(0, i + 1);
         gameHistory.value = tempHistory;
         
         // Wait for Vue to update the DOM
         await nextTick();
         
         // Give a small delay to ensure rendering is complete
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-        // Render this state as PNG
-        if (gameBoardRef.value && gameBoardRef.value.renderStateToPng) {
-          const pngDataUrl = await gameBoardRef.value.renderStateToPng();
-          if (pngDataUrl) {
-            frames.push(pngDataUrl);
+        await new Promise(resolve => setTimeout(resolve, 60));
+
+        const offsets = stateHasAnimatedFlash(states[i]) ? FLASH_CAPTURE_OFFSETS_MS : [0];
+        const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+        const frameDurationMs = stepDurationMs / offsets.length;
+
+        let lastOffset = 0;
+        for (const offset of offsets) {
+          const waitMs = Math.max(offset - lastOffset, 0);
+          if (waitMs > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise(resolve => setTimeout(resolve, waitMs));
           }
+
+          // Render this state as PNG
+          if (gameBoardRef.value && gameBoardRef.value.renderStateToPng) {
+            // eslint-disable-next-line no-await-in-loop
+            const pngDataUrl = await gameBoardRef.value.renderStateToPng();
+            if (pngDataUrl) {
+              frames.push(pngDataUrl);
+              frameDurations.push(frameDurationMs / 1000);
+            }
+          }
+          lastOffset = offset;
         }
       } catch (err) {
         console.error(`Failed to render frame ${i}:`, err);
@@ -878,8 +913,16 @@ async function handleSaveEpisode() {
       return;
     }
     
-    // Send frames to backend to create GIF
-    const res = await saveEpisodeFromPngs(frames);
+    if (frameDurations.length !== frames.length) {
+      const fallbackDur = Math.max(0.2, (gifStepDurationMs.value || BASE_STEP_DURATION_MS) / 1000);
+      while (frameDurations.length < frames.length) {
+        frameDurations.push(fallbackDur);
+      }
+      frameDurations.length = frames.length;
+    }
+
+    // Send frames (with per-frame durations) to backend to create GIF
+    const res = await saveEpisodeFromPngs(frames, frameDurations, gifStepDurationMs.value);
     alert(`Episode saved to ${res.file_path}`);
   } catch (e) {
     console.error('Failed to save episode:', e);
@@ -1225,9 +1268,23 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <button v-if="gameState.done || isManualStepping" @click="handleSaveEpisode" class="save-episode-button">
-          Save Episode
-        </button>
+        <div v-if="gameState.done || isManualStepping" class="save-episode-row">
+          <div class="gif-speed-control">
+            <label for="gif-speed-slider">GIF speed</label>
+            <input
+              id="gif-speed-slider"
+              type="range"
+              min="300"
+              max="2400"
+              step="100"
+              v-model.number="gifStepDurationMs"
+            />
+            <span class="gif-speed-label">{{ (gifStepDurationMs / 1000).toFixed(2) }}s / step</span>
+          </div>
+          <button @click="handleSaveEpisode" class="save-episode-button">
+            Save Episode
+          </button>
+        </div>
         
         <div v-if="isManualStepping && canReplay" class="replay-controls">
           <button @click="handleReplay" class="replay-button" title="Replay (animated)">
@@ -1449,6 +1506,36 @@ header {
   display: flex;
   gap: 0.6rem;
   justify-content: center;
+}
+
+.save-episode-row {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.gif-speed-control {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--app-text-muted);
+}
+
+.gif-speed-control input[type='range'] {
+  accent-color: var(--app-accent);
+}
+
+.gif-speed-label {
+  font-weight: 600;
+  color: var(--app-text);
+  min-width: 84px;
+  text-align: right;
 }
 
 .action-button,

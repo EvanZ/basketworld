@@ -2712,6 +2712,8 @@ def debug_frames():
 
 class SaveEpisodeRequest(BaseModel):
     frames: List[str]  # Base64-encoded PNG images
+    durations: Optional[List[float]] = None  # Optional per-frame durations in seconds
+    step_duration_ms: Optional[float] = None  # Optional fallback duration per step in milliseconds
 
 
 @app.post("/api/save_episode")
@@ -2869,7 +2871,7 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
     
     # Decode base64 PNG frames and convert to numpy arrays
     try:
-        frames = []
+        pil_frames = []
         for base64_frame in request.frames:
             # Remove data URL prefix if present
             if ',' in base64_frame:
@@ -2883,18 +2885,45 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
             
             # Convert to RGB (remove alpha channel if present)
             if img.mode == 'RGBA':
-                # Create white background
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
                 img = background
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            # Convert to numpy array
-            frames.append(np.array(img))
-        
-        # Save as GIF
-        imageio.mimsave(file_path, frames, fps=1, loop=0)
+            pil_frames.append(img)
+
+        durations_sec = None
+        if request.durations and len(request.durations) > 0:
+            durations_sec = [max(0.01, float(d)) for d in request.durations]
+        elif request.step_duration_ms:
+            dur = max(10.0, float(request.step_duration_ms))
+            durations_sec = [dur / 1000.0] * len(pil_frames)
+        else:
+            durations_sec = [1.0] * len(pil_frames)
+
+        if len(durations_sec) != len(pil_frames):
+            # Pad or trim to match frame count
+            if len(durations_sec) < len(pil_frames):
+                last_d = durations_sec[-1] if durations_sec else 1.0
+                durations_sec.extend([last_d] * (len(pil_frames) - len(durations_sec)))
+            durations_sec = durations_sec[: len(pil_frames)]
+
+        durations_ms = [max(10, int(round(d * 1000))) for d in durations_sec]
+
+        if not pil_frames:
+            raise HTTPException(status_code=400, detail="No frames provided after decoding")
+
+        # Save GIF using Pillow directly to ensure per-frame durations are honored
+        pil_frames[0].save(
+            file_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=durations_ms,
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
         
         return {"status": "success", "file_path": file_path}
     except Exception as e:

@@ -2,6 +2,8 @@
 
 BasketWorld is a hex-grid, Gymnasium-compatible half-court basketball simulator for self-play reinforcement learning. A unified PPO policy (offense/defense encoded with role flags) trains against itself, logs to MLflow, and can be driven through a FastAPI backend plus a Vue front-end for interactive play, analysis, and evaluation.
 
+![Sample episode](docs/assets/episode_20251207_184600_made_unassisted_3pt.gif)
+
 ## What's new
 - **Absolute-coordinate observations**: Egocentric rotation is gone; models need retraining. Ball handler position, hoop location, EP/risk features, and action masks are all absolute-court based.
 - **Unified policy pipeline**: Training saves `unified_*.zip` checkpoints with optional dual-critic/dual-policy heads and pass-logit bias. Role flags encode offense/defense so one network drives both teams.
