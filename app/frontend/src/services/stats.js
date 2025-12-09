@@ -5,9 +5,9 @@ const STORAGE_KEY = 'bw_stats_v1';
 export function getDefaultStats() {
   return {
     episodes: 0,
-    dunk: { attempts: 0, made: 0, assists: 0 },
-    twoPt: { attempts: 0, made: 0, assists: 0 },
-    threePt: { attempts: 0, made: 0, assists: 0 },
+    dunk: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
+    twoPt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
+    threePt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
     turnovers: 0,
     points: 0,
     rewardSum: 0,
@@ -27,16 +27,19 @@ export function loadStats() {
         attempts: Number(parsed?.dunk?.attempts) || 0,
         made: Number(parsed?.dunk?.made) || 0,
         assists: Number(parsed?.dunk?.assists) || 0,
+        potentialAssists: Number(parsed?.dunk?.potentialAssists) || 0,
       },
       twoPt: {
         attempts: Number(parsed?.twoPt?.attempts) || 0,
         made: Number(parsed?.twoPt?.made) || 0,
         assists: Number(parsed?.twoPt?.assists) || 0,
+        potentialAssists: Number(parsed?.twoPt?.potentialAssists) || 0,
       },
       threePt: {
         attempts: Number(parsed?.threePt?.attempts) || 0,
         made: Number(parsed?.threePt?.made) || 0,
         assists: Number(parsed?.threePt?.assists) || 0,
+        potentialAssists: Number(parsed?.threePt?.potentialAssists) || 0,
       },
       turnovers: Number(parsed.turnovers) || 0,
       points: Number(parsed.points) || 0,
@@ -64,5 +67,4 @@ export function resetStatsStorage() {
   saveStats(fresh);
   return fresh;
 }
-
 

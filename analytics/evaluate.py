@@ -44,6 +44,9 @@ def analyze_results(results: list, num_episodes: int):
     total_pass_intercepts = 0
     total_pass_oob = 0
     total_potential_assists = 0
+    total_potential_assisted_2pt = 0
+    total_potential_assisted_3pt = 0
+    total_potential_assisted_dunk = 0
     total_assists = 0
     total_assisted_2pt = 0
     total_assisted_3pt = 0
@@ -59,6 +62,9 @@ def analyze_results(results: list, num_episodes: int):
         total_pass_intercepts += res.get("pass_intercepts", 0)
         total_pass_oob += res.get("pass_oob", 0)
         total_potential_assists += res.get("potential_assists", 0)
+        total_potential_assisted_2pt += res.get("potential_assisted_2pt", 0)
+        total_potential_assisted_3pt += res.get("potential_assisted_3pt", 0)
+        total_potential_assisted_dunk += res.get("potential_assisted_dunk", 0)
         total_assists += res.get("assists", 0)
         total_assisted_2pt += res.get("assisted_2pt", 0)
         total_assisted_3pt += res.get("assisted_3pt", 0)
@@ -129,7 +135,10 @@ def analyze_results(results: list, num_episodes: int):
     print(f"Out-of-bounds passes: {total_pass_oob}")
     # --- Assist Statistics ---
     print("\nAssist Stats:")
-    print(f"Potential assists: {total_potential_assists}")
+    print(f"Potential assists (missed): {total_potential_assists}")
+    print(f"  - Potential assisted 2pt misses: {total_potential_assisted_2pt}")
+    print(f"  - Potential assisted 3pt misses: {total_potential_assisted_3pt}")
+    print(f"  - Potential assisted dunk misses: {total_potential_assisted_dunk}")
     print(f"Assists: {total_assists}")
     print(f"Assisted 2pt FGM: {total_assisted_2pt}")
     print(f"Assisted 3pt FGM: {total_assisted_3pt}")
@@ -368,7 +377,9 @@ def run_eval_for_pair(
         assisted_2pt = 0
         assisted_3pt = 0
         assisted_dunk = 0
-        assisted_dunk = 0
+        potential_assisted_2pt = 0
+        potential_assisted_3pt = 0
+        potential_assisted_dunk = 0
         if action_results.get("shots"):
             shot_result = list(action_results["shots"].values())[0]
             is_dunk = shot_result.get("distance", 999) == 0
@@ -395,8 +406,14 @@ def run_eval_for_pair(
             ):
                 outcome = "Missed 3pt"
             # Assist flags
-            if shot_result.get("assist_potential"):
+            if shot_result.get("assist_potential") and not shot_result.get("success"):
                 potential_assists += 1
+                if is_dunk:
+                    potential_assisted_dunk += 1
+                elif shot_result.get("distance", 999) >= three_point_distance:
+                    potential_assisted_3pt += 1
+                else:
+                    potential_assisted_2pt += 1
             if shot_result.get("assist_full"):
                 assists += 1
                 if shot_result.get("success"):
@@ -452,6 +469,9 @@ def run_eval_for_pair(
                 "pass_intercepts": pass_intercepts,
                 "pass_oob": pass_oob,
                 "potential_assists": potential_assists,
+                "potential_assisted_2pt": potential_assisted_2pt,
+                "potential_assisted_3pt": potential_assisted_3pt,
+                "potential_assisted_dunk": potential_assisted_dunk,
                 "assists": assists,
                 "assisted_2pt": assisted_2pt,
                 "assisted_3pt": assisted_3pt,
@@ -571,6 +591,9 @@ def run_eval_for_unified(
         assisted_2pt = 0
         assisted_3pt = 0
         assisted_dunk = 0
+        potential_assisted_2pt = 0
+        potential_assisted_3pt = 0
+        potential_assisted_dunk = 0
         if action_results.get("shots"):
             shot_result = list(action_results["shots"].values())[0]
             is_dunk = shot_result.get("distance", 999) == 0
@@ -597,8 +620,14 @@ def run_eval_for_unified(
             ):
                 outcome = "Missed 3pt"
             # Assist flags
-            if shot_result.get("assist_potential"):
+            if shot_result.get("assist_potential") and not shot_result.get("success"):
                 potential_assists += 1
+                if is_dunk:
+                    potential_assisted_dunk += 1
+                elif shot_result.get("distance", 999) >= three_point_distance:
+                    potential_assisted_3pt += 1
+                else:
+                    potential_assisted_2pt += 1
             if shot_result.get("assist_full"):
                 assists += 1
                 if shot_result.get("success"):
@@ -654,6 +683,9 @@ def run_eval_for_unified(
                 "pass_intercepts": pass_intercepts,
                 "pass_oob": pass_oob,
                 "potential_assists": potential_assists,
+                "potential_assisted_2pt": potential_assisted_2pt,
+                "potential_assisted_3pt": potential_assisted_3pt,
+                "potential_assisted_dunk": potential_assisted_dunk,
                 "assists": assists,
                 "assisted_2pt": assisted_2pt,
                 "assisted_3pt": assisted_3pt,
@@ -687,6 +719,9 @@ def summarize_to_row(results: list, alternation_index: int):
     total_pass_intercepts = 0
     total_pass_oob = 0
     total_potential_assists = 0
+    total_potential_assisted_2pt = 0
+    total_potential_assisted_3pt = 0
+    total_potential_assisted_dunk = 0
     total_assists = 0
     total_assisted_2pt = 0
     total_assisted_3pt = 0
@@ -702,6 +737,9 @@ def summarize_to_row(results: list, alternation_index: int):
         total_pass_intercepts += res.get("pass_intercepts", 0)
         total_pass_oob += res.get("pass_oob", 0)
         total_potential_assists += res.get("potential_assists", 0)
+        total_potential_assisted_2pt += res.get("potential_assisted_2pt", 0)
+        total_potential_assisted_3pt += res.get("potential_assisted_3pt", 0)
+        total_potential_assisted_dunk += res.get("potential_assisted_dunk", 0)
         total_assists += res.get("assists", 0)
         total_assisted_2pt += res.get("assisted_2pt", 0)
         total_assisted_3pt += res.get("assisted_3pt", 0)
@@ -747,6 +785,9 @@ def summarize_to_row(results: list, alternation_index: int):
         "pass_intercepts": total_pass_intercepts,
         "pass_oob": total_pass_oob,
         "potential_assists": total_potential_assists,
+        "potential_assisted_2pt": total_potential_assisted_2pt,
+        "potential_assisted_3pt": total_potential_assisted_3pt,
+        "potential_assisted_dunk": total_potential_assisted_dunk,
         "assists": total_assists,
         "assisted_2pt": total_assisted_2pt,
         "assisted_3pt": total_assisted_3pt,

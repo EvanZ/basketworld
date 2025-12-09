@@ -31,6 +31,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
 
     Exposes keys consumed by Monitor(info_keywords=...):
       shot_dunk, shot_2pt, shot_3pt, assisted_dunk, assisted_2pt, assisted_3pt,
+      potential_assisted_dunk, potential_assisted_2pt, potential_assisted_3pt,
       passes, turnover, turnover_pass_oob, turnover_intercepted, turnover_pressure,
       turnover_offensive_lane, defensive_lane_violation, move_rejected_occupied,
       made_dunk, made_2pt, made_3pt, attempts
@@ -48,6 +49,10 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._asst_dunk = 0.0
         self._asst_2pt = 0.0
         self._asst_3pt = 0.0
+        self._potential_asst_dunk = 0.0
+        self._potential_asst_2pt = 0.0
+        self._potential_asst_3pt = 0.0
+        self._potential_assists = 0.0
         self._turnover = 0.0
         self._turnover_pass_oob = 0.0
         self._turnover_intercepted = 0.0
@@ -91,6 +96,9 @@ class EpisodeStatsWrapper(gym.Wrapper):
                     shooter_pos, self.env.unwrapped.basket_position
                 )
                 is_dunk = dist == 0
+                potential_assist = bool(shot_res.get("assist_potential")) and not bool(
+                    shot_res.get("success")
+                )
                 if "is_three" in shot_res:
                     is_three = bool(shot_res["is_three"])
                 else:
@@ -129,18 +137,26 @@ class EpisodeStatsWrapper(gym.Wrapper):
                         self._made_dunk = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_dunk = 1.0
+                    if potential_assist:
+                        self._potential_asst_dunk = 1.0
                 elif is_three:
                     self._shot_3pt = 1.0
                     if shot_res.get("success"):
                         self._made_3pt = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_3pt = 1.0
+                    if potential_assist:
+                        self._potential_asst_3pt = 1.0
                 else:
                     self._shot_2pt = 1.0
                     if shot_res.get("success"):
                         self._made_2pt = 1.0
                     if shot_res.get("assist_full") and shot_res.get("success"):
                         self._asst_2pt = 1.0
+                    if potential_assist:
+                        self._potential_asst_2pt = 1.0
+                if potential_assist:
+                    self._potential_assists = 1.0
             elif ar.get("turnovers"):
                 self._turnover = 1.0
                 # Track specific turnover types
@@ -175,6 +191,10 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["assisted_dunk"] = self._asst_dunk
             info["assisted_2pt"] = self._asst_2pt
             info["assisted_3pt"] = self._asst_3pt
+            info["potential_assisted_dunk"] = self._potential_asst_dunk
+            info["potential_assisted_2pt"] = self._potential_asst_2pt
+            info["potential_assisted_3pt"] = self._potential_asst_3pt
+            info["potential_assists"] = self._potential_assists
             info["passes"] = float(self._passes)
             info["turnover"] = self._turnover
             info["turnover_pass_oob"] = self._turnover_pass_oob

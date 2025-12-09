@@ -154,6 +154,10 @@ class MLflowCallback(BaseCallback):
                 asst_dunk_pct = mean_key("assisted_dunk")
                 asst_2pt_pct = mean_key("assisted_2pt")
                 asst_3pt_pct = mean_key("assisted_3pt")
+                pot_asst_dunk_pct = mean_key("potential_assisted_dunk")
+                pot_asst_2pt_pct = mean_key("potential_assisted_2pt")
+                pot_asst_3pt_pct = mean_key("potential_assisted_3pt")
+                pot_asst_total = mean_key("potential_assists")
                 passes_avg = mean_key("passes")
                 turnover_pct = mean_key("turnover")
                 turnover_pass_oob_pct = mean_key("turnover_pass_oob")
@@ -237,6 +241,26 @@ class MLflowCallback(BaseCallback):
                 mlflow.log_metric(
                     f"{self.team_name} Assist ShotPct 3PT",
                     asst_3pt_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Potential Assist Dunk",
+                    pot_asst_dunk_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Potential Assist 2PT",
+                    pot_asst_2pt_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Potential Assist 3PT",
+                    pot_asst_3pt_pct,
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"{self.team_name} Potential Assists",
+                    pot_asst_total,
                     step=global_step,
                 )
                 mlflow.log_metric(
@@ -328,6 +352,10 @@ class AccumulativeMetricsCallback(BaseCallback):
             "assisted_dunk": float(ep.get("assisted_dunk", 0.0)),
             "assisted_2pt": float(ep.get("assisted_2pt", 0.0)),
             "assisted_3pt": float(ep.get("assisted_3pt", 0.0)),
+            "potential_assisted_dunk": float(ep.get("potential_assisted_dunk", 0.0)),
+            "potential_assisted_2pt": float(ep.get("potential_assisted_2pt", 0.0)),
+            "potential_assisted_3pt": float(ep.get("potential_assisted_3pt", 0.0)),
+            "potential_assists": float(ep.get("potential_assists", 0.0)),
             "passes": float(ep.get("passes", 0.0)),
             "turnover": float(ep.get("turnover", 0.0)),
             "turnover_pass_oob": float(ep.get("turnover_pass_oob", 0.0)),
@@ -417,6 +445,10 @@ class AccumulativeMetricsCallback(BaseCallback):
         mlflow.log_metric(f"{team_label} Assist ShotPct Dunk", mean_key("assisted_dunk"), step=global_step)
         mlflow.log_metric(f"{team_label} Assist ShotPct 2PT", mean_key("assisted_2pt"), step=global_step)
         mlflow.log_metric(f"{team_label} Assist ShotPct 3PT", mean_key("assisted_3pt"), step=global_step)
+        mlflow.log_metric(f"{team_label} Potential Assist Dunk", mean_key("potential_assisted_dunk"), step=global_step)
+        mlflow.log_metric(f"{team_label} Potential Assist 2PT", mean_key("potential_assisted_2pt"), step=global_step)
+        mlflow.log_metric(f"{team_label} Potential Assist 3PT", mean_key("potential_assisted_3pt"), step=global_step)
+        mlflow.log_metric(f"{team_label} Potential Assists", mean_key("potential_assists"), step=global_step)
         
         # Other metrics
         mlflow.log_metric(f"{team_label} Passes / Episode", mean_key("passes"), step=global_step)

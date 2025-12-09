@@ -349,6 +349,11 @@ watch(activeTab, async (newTab) => {
 const statsState = ref(loadStats());
 function safeDiv(n, d) { return d > 0 ? (n / d) : 0; }
 const totalAssists = computed(() => (statsState.value.dunk.assists + statsState.value.twoPt.assists + statsState.value.threePt.assists));
+const totalPotentialAssists = computed(() => (
+  statsState.value.dunk.potentialAssists
+  + statsState.value.twoPt.potentialAssists
+  + statsState.value.threePt.potentialAssists
+));
 const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
@@ -367,19 +372,23 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
     const isTwo = !isDunk && !isThree;
     const made = Boolean(shot?.success);
     const assisted = Boolean(shot?.assist_full);
+    const potentialAssisted = Boolean(shot?.assist_potential) && !made;
 
     if (isDunk) {
       statsState.value.dunk.attempts += 1;
       if (made) statsState.value.dunk.made += 1;
       if (assisted) statsState.value.dunk.assists += 1;
+      if (potentialAssisted) statsState.value.dunk.potentialAssists += 1;
     } else if (isThree) {
       statsState.value.threePt.attempts += 1;
       if (made) statsState.value.threePt.made += 1;
       if (assisted) statsState.value.threePt.assists += 1;
+      if (potentialAssisted) statsState.value.threePt.potentialAssists += 1;
     } else if (isTwo) {
       statsState.value.twoPt.attempts += 1;
       if (made) statsState.value.twoPt.made += 1;
       if (assisted) statsState.value.twoPt.assists += 1;
+      if (potentialAssisted) statsState.value.twoPt.potentialAssists += 1;
     }
 
     if (made) {
@@ -432,13 +441,14 @@ async function copyStatsMarkdown() {
       ['Avg reward/ep', avgRewardPerEp.value.toFixed(2)],
       ['Avg ep length (steps)', safeDiv(s.episodeStepsSum, Math.max(1, s.episodes)).toFixed(1)],
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
+      ['Total potential assists', String(s.dunk.potentialAssists + s.twoPt.potentialAssists + s.threePt.potentialAssists)],
       ['Total turnovers', String(s.turnovers)],
     ];
-    const shotsHeader = ['Type', 'Attempts', 'Made', 'FG%', 'Assists'];
+    const shotsHeader = ['Type', 'Attempts', 'Made', 'FG%', 'Assists', 'Potential assists (missed)'];
     const shotsRows = [
-      ['Dunks', s.dunk.attempts, s.dunk.made, fg(s.dunk.made, s.dunk.attempts), s.dunk.assists],
-      ['2PT', s.twoPt.attempts, s.twoPt.made, fg(s.twoPt.made, s.twoPt.attempts), s.twoPt.assists],
-      ['3PT', s.threePt.attempts, s.threePt.made, fg(s.threePt.made, s.threePt.attempts), s.threePt.assists],
+      ['Dunks', s.dunk.attempts, s.dunk.made, fg(s.dunk.made, s.dunk.attempts), s.dunk.assists, s.dunk.potentialAssists],
+      ['2PT', s.twoPt.attempts, s.twoPt.made, fg(s.twoPt.made, s.twoPt.attempts), s.twoPt.assists, s.twoPt.potentialAssists],
+      ['3PT', s.threePt.attempts, s.threePt.made, fg(s.threePt.made, s.threePt.attempts), s.threePt.assists, s.threePt.potentialAssists],
     ];
     const table = (rows) => rows.map(r => `| ${r.join(' | ')} |`).join('\n');
     const md = [
@@ -1545,6 +1555,7 @@ const stealRisks = computed(() => {
             <h5>Totals</h5>
             <div class="param-item"><span class="param-name">Episodes played:</span><span class="param-value">{{ statsState.episodes }}</span></div>
             <div class="param-item"><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
+            <div class="param-item"><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item"><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
             <div class="param-item"><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
             <div class="param-item"><span class="param-name">Avg reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
@@ -1556,6 +1567,7 @@ const stealRisks = computed(() => {
             <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.dunk.made }}</span></div>
             <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.dunk.made, Math.max(1, statsState.dunk.attempts)) * 100).toFixed(1) }}%</span></div>
             <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.dunk.assists }}</span></div>
+            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.dunk.potentialAssists }}</span></div>
           </div>
           <div class="param-category">
             <h5>2PT</h5>
@@ -1563,6 +1575,7 @@ const stealRisks = computed(() => {
             <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.twoPt.made }}</span></div>
             <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.twoPt.made, Math.max(1, statsState.twoPt.attempts)) * 100).toFixed(1) }}%</span></div>
             <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.twoPt.assists }}</span></div>
+            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.twoPt.potentialAssists }}</span></div>
           </div>
           <div class="param-category">
             <h5>3PT</h5>
@@ -1570,6 +1583,7 @@ const stealRisks = computed(() => {
             <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.threePt.made }}</span></div>
             <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.threePt.made, Math.max(1, statsState.threePt.attempts)) * 100).toFixed(1) }}%</span></div>
             <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.threePt.assists }}</span></div>
+            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.threePt.potentialAssists }}</span></div>
           </div>
         </div>
         <div style="display:flex; gap: 0.5rem;">

@@ -543,9 +543,15 @@ def _run_episode_batch_worker(args: tuple) -> list[dict]:
                         "success": bool(v.get("success", False)),
                         "distance": int(v.get("distance", 9999)),
                         "assist_full": bool(v.get("assist_full", False)),
+                        "assist_potential": bool(v.get("assist_potential", False)),
                     }
                 else:
-                    shots_info[str(k)] = {"success": False, "distance": 9999, "assist_full": False}
+                    shots_info[str(k)] = {
+                        "success": False,
+                        "distance": 9999,
+                        "assist_full": False,
+                        "assist_potential": False,
+                    }
         
         # Turnovers - preserve the list structure if it exists
         turnovers_raw = last_action_results.get("turnovers", [])
@@ -673,9 +679,15 @@ def _run_sequential_evaluation(
                         "success": bool(v.get("success", False)),
                         "distance": int(v.get("distance", 9999)),
                         "assist_full": bool(v.get("assist_full", False)),
+                        "assist_potential": bool(v.get("assist_potential", False)),
                     }
                 else:
-                    shots_info[str(k)] = {"success": False, "distance": 9999, "assist_full": False}
+                    shots_info[str(k)] = {
+                        "success": False,
+                        "distance": 9999,
+                        "assist_full": False,
+                        "assist_potential": False,
+                    }
         
         turnovers_raw = last_action_results.get("turnovers", [])
         turnovers_info = list(turnovers_raw) if isinstance(turnovers_raw, (list, tuple)) else []

@@ -6,7 +6,7 @@ For each episode, compute:
 - delta = ball_handler_pct - teammate_pct
   - If a potential assist occurred: ball_handler is the passer, teammate is the shooter
   - Else: ball_handler is the initial ball holder; teammate is the best-dunk teammate at reset
-- potential_assist: 1 if episode's shot had assist_potential, else 0
+- potential_assist: 1 if episode's shot had assist_potential and missed, else 0
 - ball_handler_pct: dunk% for the chosen ball handler in this episode
 - teammate_pct: dunk% for the chosen teammate in this episode
 
@@ -225,7 +225,7 @@ def run_episodes_and_log_csv(args):
                 if action_results.get("shots"):
                     shooter_id = int(list(action_results["shots"].keys())[0])
                     shot_result = list(action_results["shots"].values())[0]
-                    if shot_result.get("assist_potential"):
+                    if shot_result.get("assist_potential") and not shot_result.get("success"):
                         potential_assist = 1
                         passer_id = int(
                             shot_result.get("assist_passer_id", initial_ball_holder)
