@@ -691,6 +691,16 @@ const viewBox = computed(() => {
     return `${minX} ${minY} ${width} ${height}`;
 });
 
+const courtCenter = computed(() => {
+  if (courtLayout.value.length === 0) return { x: 0, y: 0 };
+  const xs = courtLayout.value.map((h) => h.x);
+  const ys = courtLayout.value.map((h) => h.y);
+  return {
+    x: (Math.min(...xs) + Math.max(...xs)) / 2,
+    y: (Math.min(...ys) + Math.max(...ys)) / 2,
+  };
+});
+
 const stateValueBoxWidth = HEX_RADIUS * 3;
 const stateValueBoxBaseHeight = HEX_RADIUS * 1.3;
 const stateValueBoxHeight = computed(() =>
@@ -1002,6 +1012,29 @@ function triggerPassFlash(passerId, receiverId, start, end) {
   }, PASS_FLASH_DURATION_MS);
 }
 
+function buildShotArcPath(start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const distance = Math.hypot(dx, dy) || 1;
+
+  const midX = (start.x + end.x) / 2;
+  const midY = (start.y + end.y) / 2;
+
+  // Perpendicular direction to shot line
+  const perpX = -dy / distance;
+  const perpY = dx / distance;
+
+  // Flip curvature as shooter crosses the court midline (sideline to sideline)
+  const sideSign = start.y >= courtCenter.value.y ? -1 : 1;
+  // Add arc height that scales with shot distance so deeper shots arc more
+  const arcHeight = Math.min(HEX_RADIUS * 8, HEX_RADIUS * 0.4 + distance * 0.25);
+
+  const controlX = midX + perpX * arcHeight * sideSign;
+  const controlY = midY + perpY * arcHeight * sideSign;
+
+  return `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`;
+}
+
 function clearShotFlash() {
   if (shotFlashTimeout.value) {
     clearTimeout(shotFlashTimeout.value);
@@ -1023,6 +1056,7 @@ function triggerShotFlash(shooterId, start, end, success) {
     x2: end.x,
     y2: end.y,
     color: success ? '#22c55e' : '#ef4444',
+    path: buildShotArcPath(start, end),
   };
 
   shotFlashTimeout.value = setTimeout(() => {
@@ -1698,13 +1732,11 @@ onBeforeUnmount(() => {
 
         <!-- Flash effect for shot attempts -->
         <g v-if="shotFlash && showPlayers" class="shot-flash-group">
-          <line
-            :x1="shotFlash.x1"
-            :y1="shotFlash.y1"
-            :x2="shotFlash.x2"
-            :y2="shotFlash.y2"
+          <path
+            :d="shotFlash.path"
             :stroke="shotFlash.color"
             class="shot-flash-line"
+            fill="none"
             :style="{ filter: `drop-shadow(0 0 10px ${shotFlash.color})` }"
           />
         </g>
