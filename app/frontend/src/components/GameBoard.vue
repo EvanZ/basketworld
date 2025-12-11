@@ -27,6 +27,10 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  shotAccumulator: {
+    type: Object,
+    default: () => ({}),
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock']);
@@ -273,6 +277,140 @@ const courtLayout = computed(() => {
     }
     return hexes;
 });
+
+const shotCountsMap = computed(() => props.shotAccumulator || {});
+
+const shotCountsNormalized = computed(() => {
+  const out = {};
+  const src = shotCountsMap.value || {};
+  for (const [rawKey, val] of Object.entries(src)) {
+    if (!Array.isArray(val) || val.length < 2) continue;
+    const attempts = Number(val[0]) || 0;
+    const makes = Number(val[1]) || 0;
+    if (attempts <= 0 && makes <= 0) continue;
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (Number.isNaN(q) || Number.isNaN(r)) continue;
+    const normalizedKey = `${q},${r}`;
+    out[normalizedKey] = { attempts, makes };
+  }
+  return out;
+});
+
+function getShotCount(q, r) {
+  if (q === undefined || r === undefined || q === null || r === null) return null;
+  const key = `${q},${r}`;
+  return shotCountsNormalized.value[key] || null;
+}
+
+const shotCountList = computed(() => {
+  const entries = Object.entries(shotCountsNormalized.value || {});
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  return entries.map(([key, val]) => ({
+    key,
+    q: Number(key.split(',')[0]),
+    r: Number(key.split(',')[1]),
+    attempts: val.attempts,
+    makes: val.makes,
+  }));
+});
+
+const hasShotCounts = computed(() => shotCountList.value.length > 0);
+
+const shotOverlayPoints = computed(() => {
+  if (!hasShotCounts.value) return [];
+  return shotCountList.value.map((entry) => {
+    const { x, y } = axialToCartesian(entry.q, entry.r);
+    return {
+      key: entry.key,
+      x,
+      y,
+      attempts: entry.attempts,
+      makes: entry.makes,
+    };
+  });
+});
+
+const maxShotAttempts = computed(() => {
+  let max = 0;
+  for (const pt of shotOverlayPoints.value) {
+    if (pt.attempts > max) max = pt.attempts;
+  }
+  return max || 1;
+});
+
+function volumeFill(att) {
+  const t = Math.max(0, Math.min(1, att / maxShotAttempts.value));
+  // Lerp from deep navy to accent orange
+  const start = [15, 23, 42];     // dark base
+  const end = [251, 146, 60];     // warm accent
+  const r = Math.round(start[0] + (end[0] - start[0]) * t);
+  const g = Math.round(start[1] + (end[1] - start[1]) * t);
+  const b = Math.round(start[2] + (end[2] - start[2]) * t);
+  return `rgba(${r}, ${g}, ${b}, ${0.75})`;
+}
+
+function volumeStroke(att) {
+  const t = Math.max(0, Math.min(1, att / maxShotAttempts.value));
+  // Slightly brighter stroke
+  const start = [56, 189, 248];
+  const end = [251, 191, 36];
+  const r = Math.round(start[0] + (end[0] - start[0]) * t);
+  const g = Math.round(start[1] + (end[1] - start[1]) * t);
+  const b = Math.round(start[2] + (end[2] - start[2]) * t);
+  return `rgba(${r}, ${g}, ${b}, 0.9)`;
+}
+
+function hexPointsFor(x, y, radius = HEX_RADIUS) {
+  const pts = [];
+  for (let i = 0; i < 6; i += 1) {
+    const angleDeg = 60 * i + 30;
+    const angleRad = (Math.PI / 180) * angleDeg;
+    const px = x + radius * Math.cos(angleRad);
+    const py = y + radius * Math.sin(angleRad);
+    pts.push(`${px},${py}`);
+  }
+  return pts.join(' ');
+}
+
+const showPlayers = computed(() => !hasShotCounts.value);
+const showValueAnnotations = computed(() => !hasShotCounts.value);
+
+const shotLegendConfig = computed(() => {
+  if (!hasShotCounts.value || courtLayout.value.length === 0) return null;
+  const parts = viewBox.value.split(' ').map((v) => Number(v));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return null;
+  const [minX, minY, width, height] = parts;
+  const legendWidth = HEX_RADIUS * 10;
+  const legendHeight = HEX_RADIUS * 1.5;
+  const margin = HEX_RADIUS * 0.1;
+  const x = minX + (width - legendWidth) / 2;
+  const y = minY + height - legendHeight - margin;
+  return { x, y, width: legendWidth, height: legendHeight };
+});
+
+watch(
+  () => props.shotAccumulator,
+  (val) => {
+    try {
+      const keys = val ? Object.keys(val) : [];
+      console.log('[GameBoard] shotAccumulator updated, keys=', keys.length);
+    } catch (_) { /* ignore */ }
+  },
+  { deep: true }
+);
+
+watch(
+  () => shotCountList.value,
+  (list) => {
+    try {
+      console.log('[GameBoard] shotCountList size=', list.length, 'sample=', list.slice(0, 3));
+    } catch (_) { /* ignore */ }
+  },
+  { deep: true }
+);
 
 const basketPosition = computed(() => {
     if (!currentGameState.value) return { x: 0, y: 0 };
@@ -1033,6 +1171,7 @@ async function downloadBoardAsImage() {
     // Capture state variables before async operations to ensure consistency
     const shotClock = currentGameState.value?.shot_clock;
     const hasShotClock = shotClock !== undefined && shotClock !== null;
+    const shouldDrawShotClock = !hasShotCounts.value && hasShotClock;
     const shotClockVal = String(shotClock);
 
     img.onload = () => {
@@ -1051,8 +1190,8 @@ async function downloadBoardAsImage() {
       // Draw the SVG onto the canvas (scaled up)
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       
-      // Draw Shot Clock if available
-      if (hasShotClock) {
+      // Draw Shot Clock if available and not in shot overlay mode
+      if (shouldDrawShotClock) {
         const fontSize = 48 * scale;
         const paddingX = 16 * scale;
         const paddingY = 4 * scale;
@@ -1148,6 +1287,7 @@ async function renderStateToPng() {
       const img = new Image();
       const shotClock = currentGameState.value?.shot_clock;
       const hasShotClock = shotClock !== undefined && shotClock !== null;
+      const shouldDrawShotClock = !hasShotCounts.value && hasShotClock;
       const shotClockVal = String(shotClock);
 
       img.onload = () => {
@@ -1165,8 +1305,8 @@ async function renderStateToPng() {
           
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           
-          // Draw Shot Clock if available
-          if (hasShotClock) {
+          // Draw Shot Clock if available and not in shot overlay mode
+          if (shouldDrawShotClock) {
             const fontSize = 48 * scale;
             const paddingX = 16 * scale;
             const paddingY = 4 * scale;
@@ -1279,6 +1419,10 @@ onBeforeUnmount(() => {
         >
           <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc3545" />
         </marker>
+        <linearGradient id="shot-volume-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="rgba(15,23,42,0.85)" />
+          <stop offset="100%" stop-color="rgba(251,146,60,0.95)" />
+        </linearGradient>
       </defs>
       <g :transform="boardTransform">
         <!-- Draw qualified (blue) and unqualified (dark) court hexes -->
@@ -1321,6 +1465,7 @@ onBeforeUnmount(() => {
 
         <!-- Draw Ghost Trails -->
         <g 
+          v-if="showPlayers"
           v-for="(gameState, step) in gameHistory" 
           :key="`step-${step}`" 
           :style="{ opacity: 0.1 + (0.2 * step / (gameHistory.length - 1)) }"
@@ -1348,7 +1493,7 @@ onBeforeUnmount(() => {
         </g>
         
         <!-- Draw Transition Arrows -->
-        <g v-for="move in playerTransitions" :key="move.key" :style="{ opacity: move.opacity }">
+        <g v-if="showPlayers" v-for="move in playerTransitions" :key="move.key" :style="{ opacity: move.opacity }">
           <line
             :x1="move.startX"
             :y1="move.startY"
@@ -1361,7 +1506,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Draw the current players on top -->
-        <g v-if="currentGameState">
+        <g v-if="currentGameState && showPlayers">
         <g v-for="player in sortedPlayers" :key="player.id">
             <!-- If dragging this player, show it at dragged pos, otherwise at hex pos -->
             <circle 
@@ -1410,7 +1555,7 @@ onBeforeUnmount(() => {
             </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
-              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerShotProb !== null && draggedPlayerId !== player.id"
+              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerShotProb !== null && draggedPlayerId !== player.id && showValueAnnotations"
               :x="player.x" 
               :y="player.y" 
               dy="0.4em" 
@@ -1422,7 +1567,7 @@ onBeforeUnmount(() => {
             </text>
             <!-- Display conditional make percentage for ball handler -->
             <text 
-              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerMakeProb !== null && draggedPlayerId !== player.id"
+              v-if="player.hasBall && isPolicyVisible(player.id) && ballHandlerMakeProb !== null && draggedPlayerId !== player.id && showValueAnnotations"
               :x="player.x" 
               :y="player.y" 
               dy="-0.4em" 
@@ -1477,8 +1622,40 @@ onBeforeUnmount(() => {
           </g>
         </g>
         
+        <!-- Shot count annotations (from evaluation) -->
+        <g class="shot-count-layer" v-if="hasShotCounts">
+        <polygon
+          v-for="pt in shotOverlayPoints"
+          :key="`shot-poly-${pt.key}`"
+          :points="hexPointsFor(pt.x, pt.y, HEX_RADIUS)"
+          :fill="volumeFill(pt.attempts)"
+            :stroke="volumeStroke(pt.attempts)"
+            stroke-width="1.4"
+          />
+          <text
+            v-for="pt in shotOverlayPoints"
+            :key="`shot-${pt.key}`"
+            :x="pt.x"
+            :y="pt.y - HEX_RADIUS * 0.05"
+            text-anchor="middle"
+            class="shot-count-text"
+          >
+            {{ pt.attempts > 0 ? Math.round((pt.makes / pt.attempts) * 100) : 0 }}%
+          </text>
+         <text
+            v-for="pt in shotOverlayPoints"
+            :key="`shot-atts-${pt.key}`"
+            :x="pt.x"
+            :y="pt.y + HEX_RADIUS * 0.55"
+            text-anchor="middle"
+            class="shot-count-attempts"
+          >
+            {{ pt.attempts }}
+          </text>
+        </g>
+        
         <!-- Draw Pass Rays (ball handler to teammates with steal probabilities) - drawn after players for visibility -->
-        <g v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
+        <g v-if="showPlayers" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
           <line
             :x1="ray.x1"
             :y1="ray.y1"
@@ -1498,7 +1675,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Flash effect for completed passes -->
-        <g v-if="passFlash" class="pass-flash-group">
+        <g v-if="passFlash && showPlayers" class="pass-flash-group">
           <line
             :x1="passFlash.x1"
             :y1="passFlash.y1"
@@ -1520,7 +1697,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Flash effect for shot attempts -->
-        <g v-if="shotFlash" class="shot-flash-group">
+        <g v-if="shotFlash && showPlayers" class="shot-flash-group">
           <line
             :x1="shotFlash.x1"
             :y1="shotFlash.y1"
@@ -1561,7 +1738,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- State-value overlay -->
-        <g v-if="offenseStateValue !== null || defenseStateValue !== null" class="state-value-overlay">
+        <g v-if="(offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
           <rect
             :x="stateValueAnchor.x"
             :y="stateValueAnchor.y"
@@ -1612,6 +1789,53 @@ onBeforeUnmount(() => {
           </text>
       </g>
 
+      <!-- In-canvas shot legend -->
+      <g v-if="shotLegendConfig" class="legend-overlay">
+        <rect
+          :x="shotLegendConfig.x"
+          :y="shotLegendConfig.y"
+          :width="shotLegendConfig.width"
+          :height="shotLegendConfig.height"
+          class="legend-bg"
+          rx="10"
+          ry="10"
+        />
+        <text
+          :x="shotLegendConfig.x + shotLegendConfig.width / 2"
+          :y="shotLegendConfig.y + shotLegendConfig.height * 0.32"
+          text-anchor="middle"
+          class="legend-label-text"
+        >
+          Volume
+        </text>
+        <rect
+          :x="shotLegendConfig.x + shotLegendConfig.width * 0.08"
+          :y="shotLegendConfig.y + shotLegendConfig.height * 0.48"
+          :width="shotLegendConfig.width * 0.84"
+          :height="shotLegendConfig.height * 0.32"
+          fill="url(#shot-volume-gradient)"
+          class="legend-gradient-rect"
+          rx="6"
+          ry="6"
+        />
+        <text
+          :x="shotLegendConfig.x + shotLegendConfig.width * 0.08"
+          :y="shotLegendConfig.y + shotLegendConfig.height * 0.75"
+          text-anchor="start"
+          class="legend-scale-text"
+        >
+          0
+        </text>
+        <text
+          :x="shotLegendConfig.x + shotLegendConfig.width * 0.92"
+          :y="shotLegendConfig.y + shotLegendConfig.height * 0.75"
+          text-anchor="end"
+          class="legend-scale-text"
+        >
+          {{ maxShotAttempts }}
+        </text>
+      </g>
+
       <!-- MLflow Run ID label (top-left, outside transformed group) -->
       <text
         v-if="currentGameState && currentGameState.run_id"
@@ -1624,7 +1848,7 @@ onBeforeUnmount(() => {
         {{ currentGameState.run_id }}
       </text>
     </svg>
-    <div class="shot-clock-wrapper">
+    <div class="shot-clock-wrapper" v-if="!hasShotCounts">
       <div class="shot-clock-overlay">
         {{ displayedShotClockValue }}
       </div>
@@ -1755,6 +1979,25 @@ onBeforeUnmount(() => {
   color: #0b172d;
   transition: all 0.2s ease;
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  margin-left: auto;
+}
+
+.shot-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: 0.75rem;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: var(--app-text);
+  font-size: 0.8rem;
+}
+
+.shot-status .status-label {
+  color: var(--app-text-muted);
+  letter-spacing: 0.04em;
 }
 
 .policy-toggle-button:hover {
@@ -1924,6 +2167,55 @@ svg {
   paint-order: stroke;
   stroke: #fff;
   stroke-width: 0.6px;
+}
+
+.shot-count-layer {
+  pointer-events: none;
+}
+
+.shot-count-text {
+  fill: #f8fafc;
+  font-size: 0.9rem;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.85);
+  stroke-width: 1.1px;
+}
+
+.shot-count-attempts {
+  fill: #e2e8f0;
+  font-size: 0.60rem;
+  font-weight: 500;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.6);
+}
+
+.legend-overlay {
+  pointer-events: none;
+}
+
+.legend-bg {
+  fill: rgba(15, 23, 42, 0.82);
+  stroke: rgba(148, 163, 184, 0.4);
+  stroke-width: 0.02rem;
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.45));
+}
+
+.legend-label-text {
+  fill: var(--app-text, #e2e8f0);
+  font-size: 0.6rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+}
+
+.legend-gradient-rect {
+  stroke: rgba(148, 163, 184, 0.45);
+  stroke-width: 0.02rem;
+}
+
+.legend-scale-text {
+  fill: var(--app-text-muted, #cbe1e0);
+  font-size: 0.8rem;
+  font-weight: 500;
 }
 
 /* --- Outcome Indicator Styles --- */

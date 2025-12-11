@@ -8,6 +8,15 @@ import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 // Import API_BASE_URL for policy probabilities fetch
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
 
+function formatParamCount(n) {
+  if (n === null || n === undefined) return 'N/A';
+  const num = Number(n);
+  if (Number.isNaN(num)) return 'N/A';
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`;
+  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`;
+  return String(num);
+}
+
 const props = defineProps({
   gameState: Object,
   activePlayerId: Number,
@@ -80,6 +89,8 @@ const props = defineProps({
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'state-updated']);
 
 const selectedActions = ref({});
+
+const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
 
 // Debug: Watch for any changes to selectedActions
 watch(selectedActions, (newActions, oldActions) => {
@@ -2061,6 +2072,22 @@ const stealRisks = computed(() => {
             <div class="param-item" v-if="props.gameState.training_params.net_arch && !props.gameState.training_params.net_arch_used" data-tooltip="Shared network architecture (both actor and critic).">
               <span class="param-name">Net arch:</span>
               <span class="param-value">{{ props.gameState.training_params.net_arch }}</span>
+            </div>
+            <div class="param-item" v-if="paramCounts" data-tooltip="Total trainable parameters across trunk and heads.">
+              <span class="param-name">Params (total):</span>
+              <span class="param-value">{{ formatParamCount(paramCounts.total) }}</span>
+            </div>
+            <div class="param-item" v-if="paramCounts" data-tooltip="Shared trunk (features + MLP extractor) parameters.">
+              <span class="param-name">Params (shared trunk):</span>
+              <span class="param-value">{{ formatParamCount(paramCounts.shared_trunk) }}</span>
+            </div>
+            <div class="param-item" v-if="paramCounts" data-tooltip="Policy head parameters (including log_std).">
+              <span class="param-name">Params (policy):</span>
+              <span class="param-value">{{ formatParamCount(paramCounts.policy_heads) }}</span>
+            </div>
+            <div class="param-item" v-if="paramCounts" data-tooltip="Value head parameters (offense/defense critics).">
+              <span class="param-name">Params (value):</span>
+              <span class="param-value">{{ formatParamCount(paramCounts.value_heads) }}</span>
             </div>
           </div>
 

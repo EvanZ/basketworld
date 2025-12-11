@@ -12,6 +12,16 @@ function cloneState(state) {
   return state ? JSON.parse(JSON.stringify(state)) : null;
 }
 
+function normalizeShotAccumulator(acc) {
+  const result = {};
+  if (!acc || typeof acc !== 'object') return result;
+  for (const [key, val] of Object.entries(acc)) {
+    if (!Array.isArray(val) || val.length < 2) continue;
+    result[key] = [Number(val[0]) || 0, Number(val[1]) || 0];
+  }
+  return result;
+}
+
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
@@ -19,6 +29,8 @@ const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
+const shotAccumulator = ref({});
+const shotAccumulatorForBoard = computed(() => shotAccumulator.value || {});
 // Reflect the actions being applied on each step to keep UI tabs in sync during self-play
 const currentSelections = ref(null);
 // Track user-selected actions for display on game board
@@ -144,6 +156,7 @@ async function handleGameStarted(setupData) {
   
   // Clear move history for new game
   moveHistory.value = [];
+  shotAccumulator.value = {};
   // Clear any self-play selections state
   currentSelections.value = null;
   userSelections.value = {};
@@ -209,6 +222,9 @@ async function handleActionsSubmitted(actions) {
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
+      if (response.state?.policy_probabilities) {
+        policyProbs.value = response.state.policy_probabilities;
+      }
       
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -693,6 +709,9 @@ async function handleSelfPlay(preselected = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
+        if (response.state?.policy_probabilities) {
+          policyProbs.value = response.state.policy_probabilities;
+        }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -761,6 +780,7 @@ async function handleEvaluation() {
   if (!gameState.value || isEvaluating.value) return;
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
+  shotAccumulator.value = {};
   
   // Reset stats at the beginning
   console.log('[App] Resetting stats before evaluation');
@@ -798,6 +818,11 @@ async function handleEvaluation() {
       }
       
       console.log('[App] All stats recorded');
+      if (!response.shot_accumulator) {
+        console.warn('[App] No shot_accumulator returned from evaluation');
+      }
+      shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      console.log('[App] Shot accumulator keys:', Object.keys(shotAccumulator.value || {}).length, 'data:', shotAccumulator.value);
       
       // Update game state to the fresh state from backend (after evaluation reset)
       // This ensures the UI shows a playable game, not the last episode's final state
@@ -1054,6 +1079,7 @@ function handlePlayAgain() {
   gameState.value = null;
   gameHistory.value = [];
   policyProbs.value = null;
+  shotAccumulator.value = {};
   activePlayerId.value = null;
   currentSelections.value = null;
   userSelections.value = {};
@@ -1198,6 +1224,7 @@ onBeforeUnmount(() => {
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
           :selected-actions="boardSelectedActions"
+          :shot-accumulator="shotAccumulatorForBoard"
           @update-player-position="handlePlayerPositionUpdate"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"

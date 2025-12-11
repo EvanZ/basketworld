@@ -37,6 +37,54 @@ from basketworld.utils.mlflow_params import (
 # --- Globals ---
 # This is a simple way to manage state for a single-user demo.
 # For a multi-user app, you would need a more robust session management system.
+
+
+def _compute_param_counts_from_policy(policy_obj):
+    """Return trainable parameter counts for shared trunk, policy heads, and value heads."""
+    try:
+        model = policy_obj.policy
+    except Exception:
+        return None
+
+    def count_params(module):
+        try:
+            return sum(p.numel() for p in module.parameters() if getattr(p, "requires_grad", False))
+        except Exception:
+            return 0
+
+    shared_trunk = 0
+    for attr in ("features_extractor", "mlp_extractor"):
+        if hasattr(model, attr):
+            shared_trunk += count_params(getattr(model, attr))
+
+    policy_heads = 0
+    for attr in ("action_net", "action_net_offense", "action_net_defense"):
+        if hasattr(model, attr):
+            policy_heads += count_params(getattr(model, attr))
+
+    log_std_count = 0
+    if hasattr(model, "log_std") and isinstance(model.log_std, torch.nn.Parameter):
+        if model.log_std.requires_grad:
+            try:
+                log_std_count = int(model.log_std.numel())
+            except Exception:
+                log_std_count = 0
+
+    value_heads = 0
+    for attr in ("value_net", "value_net_offense", "value_net_defense"):
+        if hasattr(model, attr):
+            value_heads += count_params(getattr(model, attr))
+
+    total = shared_trunk + policy_heads + value_heads + log_std_count
+    return {
+        "total": int(total),
+        "shared_trunk": int(shared_trunk),
+        "policy_heads": int(policy_heads + log_std_count),
+        "value_heads": int(value_heads),
+        "log_std": int(log_std_count),
+    }
+
+
 class GameState:
     def __init__(self):
         self.env = None
@@ -436,7 +484,7 @@ def _worker_predict_policy_actions(
     return full_actions
 
 
-def _run_episode_batch_worker(args: tuple) -> list[dict]:
+def _run_episode_batch_worker(args: tuple) -> dict:
     """Run a batch of evaluation episodes in a worker process.
     
     Args:
@@ -444,14 +492,14 @@ def _run_episode_batch_worker(args: tuple) -> list[dict]:
               where episode_specs is a list of (episode_index, seed) tuples
         
     Returns:
-        List of dictionaries with episode results
+        Dict with episode results and per-batch shot accumulator
     """
     np = _worker_state["np"]
     Team = _worker_state["Team"]
     IllegalActionStrategy = _worker_state["IllegalActionStrategy"]
     
     episode_specs, player_deterministic, opponent_deterministic = args
-    
+
     env = _worker_state["env"]
     unified_policy = _worker_state["unified_policy"]
     opponent_policy = _worker_state["opponent_policy"]
@@ -467,10 +515,12 @@ def _run_episode_batch_worker(args: tuple) -> list[dict]:
     )
     
     results = []
+    shot_accumulator: dict[str, list[int]] = {}
     
     for ep_idx, seed in episode_specs:
         # Reset environment with seed
         obs, _ = env.reset(seed=seed)
+        episode_shots: dict[str, list[int]] = {}
         
         done = False
         step_count = 0
@@ -530,10 +580,30 @@ def _run_episode_batch_worker(args: tuple) -> list[dict]:
                 episode_rewards["offense"] += float(rewards_list[0])
         
         # Extract outcome information from last_action_results
-        last_action_results = getattr(env, "last_action_results", {})
+        last_action_results = getattr(env, "last_action_results", {}) or {}
         shot_clock = int(getattr(env, "shot_clock", 0))
         three_point_distance = float(getattr(env, "three_point_distance", 4.0))
         
+        # One shot per episode: accumulate at episode end
+        shots_for_episode = last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {}
+        for shooter_id, shot_res in shots_for_episode.items():
+            try:
+                sid = int(shooter_id)
+                pos = env.positions[sid]
+                q, r = int(pos[0]), int(pos[1])
+                key = f"{q},{r}"
+                if key not in shot_accumulator:
+                    shot_accumulator[key] = [0, 0]
+                if key not in episode_shots:
+                    episode_shots[key] = [0, 0]
+                shot_accumulator[key][0] += 1
+                episode_shots[key][0] += 1
+                if bool(shot_res.get("success", False)):
+                    shot_accumulator[key][1] += 1
+                    episode_shots[key][1] += 1
+            except Exception:
+                continue
+
         # Serialize last_action_results to be JSON-safe with full shot details
         shots_info = {}
         if last_action_results.get("shots"):
@@ -566,17 +636,19 @@ def _run_episode_batch_worker(args: tuple) -> list[dict]:
                 "turnovers": turnovers_info,
                 "shot_clock": shot_clock,
                 "three_point_distance": three_point_distance,
-            }
+            },
+            "shot_counts": episode_shots,
         })
     
-    return results
+    return {"results": results, "shot_accumulator": shot_accumulator}
 
 
 def _run_sequential_evaluation(
     num_episodes: int,
     player_deterministic: bool,
     opponent_deterministic: bool,
-) -> list[dict]:
+    shot_accumulator: dict | None = None,
+) -> dict:
     """Run evaluation episodes sequentially in the main process.
     
     This is faster than parallel for small episode counts because it avoids
@@ -598,6 +670,8 @@ def _run_sequential_evaluation(
         # Reset environment with random seed
         seed = int(np.random.randint(0, 2**31 - 1))
         obs, _ = game_state.env.reset(seed=seed)
+        
+        episode_shots: dict[str, list[int]] = {}
         
         done = False
         step_count = 0
@@ -646,7 +720,7 @@ def _run_sequential_evaluation(
             obs, reward, terminated, truncated, info = game_state.env.step(final_action)
             done = terminated or truncated
             step_count += 1
-            
+
             # Track rewards
             if isinstance(reward, np.ndarray):
                 rewards_list = reward.tolist()
@@ -666,9 +740,32 @@ def _run_sequential_evaluation(
         
         # Extract outcome information
         env = game_state.env
-        last_action_results = getattr(env, "last_action_results", {})
+        last_action_results = getattr(env, "last_action_results", {}) or {}
         shot_clock = int(getattr(env, "shot_clock", 0))
         three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+
+        # One shot per episode: accumulate at episode end
+        shots_for_episode = last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {}
+        for shooter_id, shot_res in shots_for_episode.items():
+            try:
+                sid = int(shooter_id)
+                pos = game_state.env.positions[sid]
+                q, r = int(pos[0]), int(pos[1])
+                key = f"{q},{r}"
+                if shot_accumulator is not None:
+                    if key not in shot_accumulator:
+                        shot_accumulator[key] = [0, 0]
+                if key not in episode_shots:
+                    episode_shots[key] = [0, 0]
+                if shot_accumulator is not None:
+                    shot_accumulator[key][0] += 1
+                episode_shots[key][0] += 1
+                if bool(shot_res.get("success", False)):
+                    if shot_accumulator is not None:
+                        shot_accumulator[key][1] += 1
+                    episode_shots[key][1] += 1
+            except Exception:
+                continue
         
         # Serialize shot details
         shots_info = {}
@@ -701,10 +798,11 @@ def _run_sequential_evaluation(
                 "turnovers": turnovers_info,
                 "shot_clock": shot_clock,
                 "three_point_distance": three_point_distance,
-            }
+            },
+            "shot_counts": episode_shots,
         })
     
-    return results
+    return {"results": results, "shot_accumulator": shot_accumulator if shot_accumulator is not None else {}}
 
 
 def _run_parallel_evaluation(
@@ -718,8 +816,9 @@ def _run_parallel_evaluation(
     user_team_name: str,
     role_flag_offense: float,
     role_flag_defense: float,
+    shot_accumulator: dict[str, list[int]] | None = None,
     num_workers: int | None = None,
-) -> list[dict]:
+) -> dict:
     """Run evaluation episodes in parallel using ProcessPoolExecutor with batching.
     
     Each worker processes multiple episodes to minimize IPC overhead.
@@ -785,12 +884,31 @@ def _run_parallel_evaluation(
     ) as executor:
         batch_results = list(executor.map(_run_episode_batch_worker, batches))
     
-    # Flatten results from all batches
+    # Flatten results from all batches and merge shot counts
     results = []
-    for batch_result in batch_results:
-        results.extend(batch_result)
+    for payload in batch_results:
+        if not payload:
+            continue
+        if isinstance(payload, dict):
+            batch_res = payload.get("results", [])
+            results.extend(batch_res)
+            if shot_accumulator is not None:
+                batch_shots = payload.get("shot_accumulator", {}) or {}
+                for key, vals in batch_shots.items():
+                    try:
+                        att = int(vals[0]) if isinstance(vals, (list, tuple)) and len(vals) > 0 else 0
+                        mk = int(vals[1]) if isinstance(vals, (list, tuple)) and len(vals) > 1 else 0
+                    except Exception:
+                        att, mk = 0, 0
+                    if key not in shot_accumulator:
+                        shot_accumulator[key] = [0, 0]
+                    shot_accumulator[key][0] += att
+                    shot_accumulator[key][1] += mk
+        elif isinstance(payload, list):
+            # Backward compatibility: older worker may return list of results only
+            results.extend(payload)
     
-    return results
+    return {"results": results, "shot_accumulator": shot_accumulator if shot_accumulator is not None else {}}
 
 
 # --- API Models ---
@@ -973,7 +1091,7 @@ async def init_game(request: InitGameRequest):
         mlflow_phi_params = get_mlflow_phi_shaping_params(client, request.run_id)
         
         # Load training parameters from MLflow (PPO hyperparameters)
-        mlflow_training_params = get_mlflow_training_params(client, request.run_id)
+        mlflow_training_params = dict(get_mlflow_training_params(client, request.run_id) or {})
         
         # Load environment parameters including role_flag encoding
         required, optional = get_mlflow_params(client, request.run_id)
@@ -1008,6 +1126,7 @@ async def init_game(request: InitGameRequest):
                 client, request.run_id, request.opponent_unified_policy_name
             )
         unified_key = os.path.basename(unified_path)
+        print(f"[INIT] Loading unified policy: {unified_key} ({unified_path})")
 
         # Reset per-episode stats/logs and set policy keys for UI on every init
         game_state.shot_log = []
@@ -1030,6 +1149,18 @@ async def init_game(request: InitGameRequest):
         game_state.defense_policy = (
             PPO.load(opponent_unified_path, custom_objects=custom_objects) if opponent_unified_path else None
         )
+        if opponent_unified_path:
+            print(f"[INIT] Loading opponent policy: {os.path.basename(opponent_unified_path)} ({opponent_unified_path})")
+        else:
+            print("[INIT] Opponent policy: mirror unified (no separate policy loaded)")
+
+        # Compute parameter counts for UI display
+        try:
+            counts = _compute_param_counts_from_policy(game_state.unified_policy)
+            if counts:
+                mlflow_training_params["param_counts"] = counts
+        except Exception:
+            pass
 
         game_state.env = basketworld.HexagonBasketballEnv(
             **required,
@@ -2186,9 +2317,15 @@ def take_step(request: ActionRequest):
     if game_state.self_play_active and done:
         game_state.self_play_active = False
 
+    # Package state with policy probabilities so the frontend can render fresh annotations
+    state_with_policy = get_full_game_state(
+        include_policy_probs=True,
+        include_state_values=True,
+    )
+
     return {
         "status": "success",
-        "state": get_full_game_state(include_state_values=True),
+        "state": state_with_policy,
         "actions_taken": actions_taken,
         "step_rewards": {
             "offense": float(step_rewards["offense"]),
@@ -2441,6 +2578,7 @@ def run_evaluation(request: EvaluationRequest):
         print(f"  - DEFENSE: {game_state.unified_policy_key} (user policy)")
 
     start_time = time.time()
+    shot_accumulator: dict[str, list[int]] = {}
     
     # Choose between sequential and parallel based on episode count
     # Parallel has ~15-20s startup overhead (spawning workers, loading policies)
@@ -2460,6 +2598,7 @@ def run_evaluation(request: EvaluationRequest):
             user_team_name=game_state.user_team.name,
             role_flag_offense=game_state.role_flag_offense,
             role_flag_defense=game_state.role_flag_defense,
+            shot_accumulator=shot_accumulator,
         )
     else:
         print(f"[Evaluation] Using sequential execution ({num_episodes} < {PARALLEL_THRESHOLD})")
@@ -2467,14 +2606,53 @@ def run_evaluation(request: EvaluationRequest):
             num_episodes=num_episodes,
             player_deterministic=player_deterministic,
             opponent_deterministic=opponent_deterministic,
+            shot_accumulator=shot_accumulator,
         )
     
     elapsed_time = time.time() - start_time
     
+    # raw_results now wraps both episode list and shot accumulator
+    if isinstance(raw_results, dict):
+        episode_payload = raw_results.get("results", [])
+        returned_shots = raw_results.get("shot_accumulator", {}) or {}
+    else:
+        episode_payload = raw_results
+        returned_shots = {}
+
+    # Merge shot data if workers provided it (parallel or sequential) and we don't already have counts
+    merged_shots = False
+    if returned_shots and isinstance(returned_shots, dict):
+        if returned_shots is not shot_accumulator:
+            for key, vals in returned_shots.items():
+                try:
+                    att = int(vals[0]) if isinstance(vals, (list, tuple)) and len(vals) > 0 else 0
+                    mk = int(vals[1]) if isinstance(vals, (list, tuple)) and len(vals) > 1 else 0
+                except Exception:
+                    att, mk = 0, 0
+                if key not in shot_accumulator:
+                    shot_accumulator[key] = [0, 0]
+                shot_accumulator[key][0] += att
+                shot_accumulator[key][1] += mk
+        merged_shots = True
+    if not merged_shots and isinstance(episode_payload, list):
+        # Fallback: merge per-episode shot_counts if provided
+        for r in episode_payload:
+            ep_counts = r.get("shot_counts", {}) if isinstance(r, dict) else {}
+            for key, vals in (ep_counts or {}).items():
+                try:
+                    att = int(vals[0]) if isinstance(vals, (list, tuple)) and len(vals) > 0 else 0
+                    mk = int(vals[1]) if isinstance(vals, (list, tuple)) and len(vals) > 1 else 0
+                except Exception:
+                    att, mk = 0, 0
+                if key not in shot_accumulator:
+                    shot_accumulator[key] = [0, 0]
+                shot_accumulator[key][0] += att
+                shot_accumulator[key][1] += mk
+
     # Convert results to expected format
     # Both sequential and parallel return outcome_info; we reconstruct final_state for frontend
     episode_results = []
-    for r in raw_results:
+    for r in episode_payload:
         outcome_info = r.get("outcome_info", {})
         # Reconstruct final_state with all fields needed by frontend stats recording
         final_state = {
@@ -2570,11 +2748,25 @@ def run_evaluation(request: EvaluationRequest):
     )
     game_state.episode_states.append(current_game_state)
 
+    try:
+        # Log accumulated shot locations (q,r) -> (attempts, makes)
+        sorted_items = sorted(shot_accumulator.items(), key=lambda kv: kv[0])
+        print("[Evaluation] Shot location totals (q,r -> (FGA, FGM)):")
+        if not sorted_items:
+            print("  (no shots recorded during evaluation)")
+        else:
+            for loc, vals in sorted_items:
+                att, mk = vals
+                print(f"  {loc}: ({att}, {mk})")
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "num_episodes": len(episode_results),
         "results": episode_results,
         "current_state": current_game_state,  # Fresh game state for UI to use
+        "shot_accumulator": shot_accumulator,
     }
 
 
@@ -3854,6 +4046,16 @@ def swap_policies(req: SwapPoliciesRequest):
                 user_path = get_unified_policy_path(client, game_state.run_id, requested_user_policy)
                 game_state.unified_policy = PPO.load(user_path, custom_objects=custom_objects)
                 game_state.unified_policy_key = os.path.basename(user_path)
+                game_state.unified_policy_path = user_path  # keep eval workers in sync
+                print(f"[SWAP] Loaded user policy: {game_state.unified_policy_key} ({user_path})")
+                try:
+                    counts = _compute_param_counts_from_policy(game_state.unified_policy)
+                    if counts:
+                        if game_state.mlflow_training_params is None:
+                            game_state.mlflow_training_params = {}
+                        game_state.mlflow_training_params["param_counts"] = counts
+                except Exception:
+                    pass
                 policies_changed = True
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to load user policy '{requested_user_policy}': {e}")
@@ -3864,12 +4066,25 @@ def swap_policies(req: SwapPoliciesRequest):
             if game_state.defense_policy is not None or game_state.opponent_unified_policy_key is not None:
                 game_state.defense_policy = None
                 game_state.opponent_unified_policy_key = None
+                game_state.opponent_policy_path = None
+                print("[SWAP] Opponent policy set to mirror user policy")
                 policies_changed = True
         elif requested_opponent_policy != game_state.opponent_unified_policy_key:
             try:
                 opp_path = get_unified_policy_path(client, game_state.run_id, requested_opponent_policy)
                 game_state.defense_policy = PPO.load(opp_path, custom_objects=custom_objects)
                 game_state.opponent_unified_policy_key = os.path.basename(opp_path)
+                game_state.opponent_policy_path = opp_path  # keep eval workers in sync
+                print(f"[SWAP] Loaded opponent policy: {game_state.opponent_unified_policy_key} ({opp_path})")
+                # For completeness, keep param counts aligned with current unified policy
+                try:
+                    counts = _compute_param_counts_from_policy(game_state.unified_policy)
+                    if counts:
+                        if game_state.mlflow_training_params is None:
+                            game_state.mlflow_training_params = {}
+                        game_state.mlflow_training_params["param_counts"] = counts
+                except Exception:
+                    pass
                 policies_changed = True
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to load opponent policy '{requested_opponent_policy}': {e}")
