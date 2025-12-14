@@ -42,6 +42,7 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
             opponent_deterministic: opponentDeterministic,
             use_mcts: mctsOptions?.use_mcts || false,
             mcts_player_id: mctsOptions?.player_id ?? null,
+            mcts_player_ids: mctsOptions?.player_ids ?? null,
             mcts_max_depth: mctsOptions?.max_depth ?? null,
             mcts_time_budget_ms: mctsOptions?.time_budget_ms ?? null,
             mcts_exploration_c: mctsOptions?.exploration_c ?? null,

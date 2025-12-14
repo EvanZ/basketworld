@@ -732,6 +732,19 @@ const hexDirections = [
     {q: -1, r:  0}, {q: -1, r: +1}, {q:  0, r: +1}
 ];
 
+const policyProbsForDisplay = computed(() => {
+  const gs = currentGameState.value;
+  if (props.isManualStepping && gs?.policy_probabilities) {
+    return gs.policy_probabilities;
+  }
+  return props.policyProbabilities;
+});
+
+function getPolicyProbsForPlayer(playerId) {
+  const probs = policyProbsForDisplay.value;
+  return probs?.[playerId] ?? probs?.[String(playerId)] ?? null;
+}
+
 const policySuggestions = computed(() => {
   const gs = currentGameState.value;
   if (!gs) return [];
@@ -739,12 +752,7 @@ const policySuggestions = computed(() => {
   const visibleIds = Array.from(policyVisibility.value);
   if (visibleIds.length === 0) return [];
 
-  // If we're in manual stepping, use the stored policy probabilities from the snapshot.
-  const probsByPlayer =
-    props.isManualStepping && gs.policy_probabilities
-      ? gs.policy_probabilities
-      : props.policyProbabilities;
-
+  const probsByPlayer = policyProbsForDisplay.value;
   if (!probsByPlayer) return [];
 
   const suggestions = [];
@@ -752,6 +760,7 @@ const policySuggestions = computed(() => {
   for (const pid of visibleIds) {
     const probs = probsByPlayer[pid];
     const currentPlayerPos = gs.positions?.[pid];
+    const mask = gs.action_mask?.[pid];
     if (!probs || !currentPlayerPos) continue;
 
     for (let i = 0; i < hexDirections.length; i++) {
@@ -761,12 +770,16 @@ const policySuggestions = computed(() => {
 
       const targetPos = { q: currentPlayerPos[0] + dir.q, r: currentPlayerPos[1] + dir.r };
       const cartesianPos = axialToCartesian(targetPos.q, targetPos.r);
+      const moveAllowed = Array.isArray(mask) ? mask[moveActionIndex] > 0 : true;
+      const passAllowed = Array.isArray(mask) ? mask[passActionIndex] > 0 : true;
+      const moveProb = moveAllowed ? (probs[moveActionIndex] ?? 0) : null;
+      const passProb = passAllowed ? (probs[passActionIndex] ?? 0) : null;
 
       suggestions.push({
         x: cartesianPos.x,
         y: cartesianPos.y,
-        moveProb: probs[moveActionIndex] ?? 0,
-        passProb: probs[passActionIndex] ?? 0,
+        moveProb,
+        passProb,
         key: `sugg-${pid}-${i}`
       });
     }
@@ -776,11 +789,11 @@ const policySuggestions = computed(() => {
 });
 
 const ballHandlerShotProb = computed(() => {
-    if (!currentGameState.value || currentGameState.value.ball_holder === null || !props.policyProbabilities) {
+    if (!currentGameState.value || currentGameState.value.ball_holder === null || !policyProbsForDisplay.value) {
         return null;
     }
     const ballHolderId = currentGameState.value.ball_holder;
-    const probs = props.policyProbabilities[ballHolderId];
+    const probs = getPolicyProbsForPlayer(ballHolderId);
     if (!probs) {
         return null;
     }
@@ -1578,14 +1591,14 @@ onBeforeUnmount(() => {
             </text>
             <!-- NOOP probability label (index 0) for the player -->
             <text
-              v-if="player.isOffense && isPolicyVisible(player.id) && policyProbabilities && policyProbabilities[player.id] && policyProbabilities[player.id][0] !== undefined && draggedPlayerId !== player.id"
+              v-if="isPolicyVisible(player.id) && getPolicyProbsForPlayer(player.id) && getPolicyProbsForPlayer(player.id)[0] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
               dy="1.2em"
               text-anchor="middle"
               class="noop-prob-text"
             >
-              {{ Number(policyProbabilities[player.id][0]).toFixed(2) }}
+              {{ Number(getPolicyProbsForPlayer(player.id)[0]).toFixed(2) }}
             </text>
             <!-- Display policy attempt probability for ball handler -->
             <text 
@@ -1751,8 +1764,21 @@ onBeforeUnmount(() => {
             text-anchor="middle"
             class="policy-suggestion-text"
           >
-            <tspan :x="sugg.x" dy="-0.4em">{{ Number(sugg.moveProb).toFixed(3) }}</tspan>
-            <tspan :x="sugg.x" dy="1.4em">{{ Number(sugg.passProb).toFixed(3) }}</tspan>
+            <tspan
+              v-if="sugg.moveProb !== null && sugg.moveProb !== undefined"
+              :x="sugg.x"
+              dy="-0.4em"
+            >
+              {{ Number(sugg.moveProb).toFixed(3) }}
+            </tspan>
+            <tspan
+              v-if="sugg.passProb !== null && sugg.passProb !== undefined"
+              :x="sugg.x"
+              :dy="sugg.moveProb !== null && sugg.moveProb !== undefined ? '1.4em' : '0'"
+              class="policy-pass-prob"
+            >
+              {{ Number(sugg.passProb).toFixed(3) }}
+            </tspan>
           </text>
         </g>
 
@@ -2182,6 +2208,9 @@ svg {
   stroke: black;
   stroke-width: 0.1rem;
   pointer-events: none;
+}
+.policy-pass-prob {
+  fill: #f97316;
 }
 .shot-prob-text {
   font-size: 1.5rem;

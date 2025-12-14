@@ -941,6 +941,7 @@ class ActionRequest(BaseModel):
     opponent_deterministic: bool | None = None
     use_mcts: bool | None = None
     mcts_player_id: int | None = None
+    mcts_player_ids: list[int] | None = None
     mcts_max_depth: int | None = None
     mcts_time_budget_ms: int | None = None
     mcts_exploration_c: float | None = None
@@ -1883,7 +1884,7 @@ def take_step(request: ActionRequest):
 
     # Get AI actions (unified-only)
     ai_obs = game_state.obs
-    mcts_result = None
+    mcts_results: dict[str, dict] = {}
     # Default to deterministic=True if not provided to preserve previous behavior
     player_deterministic = (
         True if request.player_deterministic is None else bool(request.player_deterministic)
@@ -1927,31 +1928,45 @@ def take_step(request: ActionRequest):
 
     if request.use_mcts:
         try:
-            target_pid = request.mcts_player_id
-            if target_pid is None:
-                target_pid = getattr(game_state.env, "ball_holder", None)
-            if target_pid is None:
-                target_pid = 0
-            mcts_result = _run_mcts_advisor(
-                player_id=target_pid,
-                obs=ai_obs,
-                env=game_state.env,
-                max_depth=request.mcts_max_depth,
-                time_budget_ms=request.mcts_time_budget_ms,
-                exploration_c=request.mcts_exploration_c,
-                use_priors=request.mcts_use_priors,
-            )
-            best_action = mcts_result.get("action") if isinstance(mcts_result, dict) else None
-            if best_action is not None:
-                # Ensure arrays exist before assignment
-                if resolved_unified is None:
-                    resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
-                if target_pid in getattr(game_state.env, "offense_ids", []):
-                    resolved_unified[target_pid] = int(best_action)
-                elif resolved_opponent is not None:
-                    resolved_opponent[target_pid] = int(best_action)
-                else:
-                    resolved_unified[target_pid] = int(best_action)
+            target_pids: list[int] = []
+            if request.mcts_player_ids:
+                target_pids = [int(pid) for pid in request.mcts_player_ids if pid is not None]
+            elif request.mcts_player_id is not None:
+                target_pids = [int(request.mcts_player_id)]
+            else:
+                default_pid = getattr(game_state.env, "ball_holder", None)
+                target_pids = [int(default_pid) if default_pid is not None else 0]
+
+            if not target_pids:
+                target_pids = [0]
+
+            unique_targets = []
+            for pid in target_pids:
+                if pid not in unique_targets:
+                    unique_targets.append(pid)
+
+            for target_pid in unique_targets:
+                result = _run_mcts_advisor(
+                    player_id=target_pid,
+                    obs=ai_obs,
+                    env=game_state.env,
+                    max_depth=request.mcts_max_depth,
+                    time_budget_ms=request.mcts_time_budget_ms,
+                    exploration_c=request.mcts_exploration_c,
+                    use_priors=request.mcts_use_priors,
+                )
+                mcts_results[str(target_pid)] = result
+                best_action = result.get("action") if isinstance(result, dict) else None
+                if best_action is not None:
+                    # Ensure arrays exist before assignment
+                    if resolved_unified is None:
+                        resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
+                    if target_pid in getattr(game_state.env, "offense_ids", []):
+                        resolved_unified[target_pid] = int(best_action)
+                    elif resolved_opponent is not None:
+                        resolved_opponent[target_pid] = int(best_action)
+                    else:
+                        resolved_unified[target_pid] = int(best_action)
         except Exception as err:
             print(f"[MCTS] Failed to run advisor inside step: {err}")
 
@@ -2339,7 +2354,7 @@ def take_step(request: ActionRequest):
             "offensive_value": float(pre_step_offensive_value) if pre_step_offensive_value is not None else None,
             "defensive_value": float(pre_step_defensive_value) if pre_step_defensive_value is not None else None,
         },
-        "mcts": jsonable_encoder(mcts_result) if mcts_result is not None else None,
+        "mcts": jsonable_encoder(mcts_results) if mcts_results else None,
     }
 
 

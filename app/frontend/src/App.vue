@@ -63,6 +63,9 @@ const policyOptions = ref([]);
 const policiesLoading = ref(false);
 const policyLoadError = ref(null);
 const mctsOptionsForStep = ref(null);
+const lastMctsResults = ref(null);
+const persistUseMcts = ref(false);
+const isMctsStepRunning = ref(false);
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -174,11 +177,14 @@ async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
   policyProbs.value = null;
+  lastMctsResults.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
   gameState.value = null;      // Ensure old board is cleared
   gameHistory.value = [];      // Clear history
   activePlayerId.value = null;
+  // Clear options; PlayerControls will re-emit with the persisted toggle state
+  mctsOptionsForStep.value = null;
   try {
     const response = await initGame(
       setupData.runId,
@@ -216,8 +222,12 @@ async function handleGameStarted(setupData) {
 
 async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
+  const shouldUseMcts = !!(mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts);
   // No loading indicator for steps, feels more responsive
   try {
+    if (shouldUseMcts) {
+      isMctsStepRunning.value = true;
+    }
     const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value, mctsOptionsForStep.value);
      if (response.status === 'success') {
       gameState.value = response.state;
@@ -225,12 +235,30 @@ async function handleActionsSubmitted(actions) {
       if (response.state?.policy_probabilities) {
         policyProbs.value = response.state.policy_probabilities;
       }
+      lastMctsResults.value = response.mcts || null;
       
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
           const lastMove = moveHistory.value[moveHistory.value.length - 1];
           if (response.state.last_action_results) {
             lastMove.actionResults = response.state.last_action_results;
+          }
+          // Track which players were controlled by MCTS for this step
+          if (response.mcts && typeof response.mcts === 'object') {
+            lastMove.mctsPlayers = Object.keys(response.mcts).map(k => Number(k));
+          } else if (!lastMove.mctsPlayers) {
+            lastMove.mctsPlayers = [];
+          }
+          if ((!lastMove.mctsPlayers || lastMove.mctsPlayers.length === 0) && shouldUseMcts && mctsOptionsForStep.value) {
+            const opt = mctsOptionsForStep.value;
+            const players = Array.isArray(opt.player_ids) ? opt.player_ids : [];
+            if (players.length > 0) {
+              lastMove.mctsPlayers = players.map(p => Number(p));
+            } else if (opt.player_id !== null && opt.player_id !== undefined) {
+              lastMove.mctsPlayers = [Number(opt.player_id)];
+            } else if (response.state?.ball_holder !== undefined && response.state?.ball_holder !== null) {
+              lastMove.mctsPlayers = [Number(response.state.ball_holder)];
+            }
           }
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
@@ -288,6 +316,8 @@ async function handleActionsSubmitted(actions) {
   } catch (err) {
     error.value = err.message;
     console.error(err);
+  } finally {
+    isMctsStepRunning.value = false;
   }
 }
 
@@ -486,6 +516,13 @@ async function handleMoveRecorded(moveData) {
         moveData.passStealProbabilities = {};
     }
     
+    // Carry forward any MCTS selection info from the controls emit (so Moves table can show icons)
+    if (moveData.mctsPlayers && Array.isArray(moveData.mctsPlayers)) {
+        moveData.mctsPlayers = moveData.mctsPlayers.map(p => Number(p));
+    } else {
+        moveData.mctsPlayers = [];
+    }
+    
     const stateValues = gameState.value?.state_values;
     moveData.offensiveValue = stateValues?.offensive_value ?? null;
     moveData.defensiveValue = stateValues?.defensive_value ?? null;
@@ -508,6 +545,10 @@ async function handleRefreshPolicies() {
 
 function handleMctsOptionsChanged(options) {
   mctsOptionsForStep.value = options;
+}
+
+function handleMctsToggleChanged(val) {
+  persistUseMcts.value = !!val;
 }
 
 // Computed: which selections to show on board (user or self-play)
@@ -553,6 +594,7 @@ function handleSelfPlayButton() {
 // New function for self-play mode (runs full episode)
 async function handleSelfPlay(preselected = null) {
   if (!gameState.value || !aiMode.value) return;
+  const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
   // Start deterministic self-play on backend: snapshot seed and initial state
   try {
     const res = await startSelfPlay();
@@ -574,6 +616,16 @@ async function handleSelfPlay(preselected = null) {
     try {
       // Get AI actions for user-controlled players
       let aiActions = {};
+      const mctsTargets = new Set();
+      if (mctsOptions) {
+        if (Array.isArray(mctsOptions.player_ids)) {
+          mctsOptions.player_ids.forEach(pid => { if (pid !== null && pid !== undefined) mctsTargets.add(Number(pid)); });
+        } else if (mctsOptions.player_id !== null && mctsOptions.player_id !== undefined) {
+          mctsTargets.add(Number(mctsOptions.player_id));
+        } else if (gameState.value?.ball_holder !== null && gameState.value?.ball_holder !== undefined) {
+          mctsTargets.add(Number(gameState.value.ball_holder));
+        }
+      }
       
       if (policyProbs.value) {
         // Determine which players are user-controlled
@@ -583,6 +635,10 @@ async function handleSelfPlay(preselected = null) {
         
         // Get AI actions for user-controlled players
         for (const playerId of userControlledIds) {
+          // If MCTS should override this player, skip explicit action
+          if (mctsTargets.has(playerId)) {
+            continue;
+          }
           const probs = policyProbs.value[playerId];
           const actionMask = gameState.value.action_mask[playerId];
 
@@ -662,50 +718,56 @@ async function handleSelfPlay(preselected = null) {
       // Clear preselected after applying for the first step
       preselected = null;
       
-      // Track moves for AI self-play
-      if (Object.keys(aiActions).length > 0) {
-        const currentTurn = moveHistory.value.length + 1;
-        const teamMoves = {};
-        
-        // Convert action indices back to action names for tracking
-        const actionNames = [
-          "NOOP", "MOVE_E", "MOVE_NE", "MOVE_NW", "MOVE_W", "MOVE_SW", "MOVE_SE", 
-          "SHOOT", "PASS_E", "PASS_NE", "PASS_NW", "PASS_W", "PASS_SW", "PASS_SE"
-        ];
-        
-        const appliedSelections = {};
-        for (const [playerId, actionIndex] of Object.entries(aiActions)) {
-          const actionName = actionNames[actionIndex] || 'UNKNOWN';
+      // Track moves for AI self-play (even if all players are MCTS)
+      const currentTurn = moveHistory.value.length + 1;
+      const teamMoves = {};
+      const appliedSelections = {};
+      const actionNames = [
+        "NOOP", "MOVE_E", "MOVE_NE", "MOVE_NW", "MOVE_W", "MOVE_SW", "MOVE_SE", 
+        "SHOOT", "PASS_E", "PASS_NE", "PASS_NW", "PASS_W", "PASS_SW", "PASS_SE"
+      ];
+
+      for (const playerId of gameState.value.offense_ids.concat(gameState.value.defense_ids)) {
+        if (mctsTargets.has(playerId)) {
+          teamMoves[`Player ${playerId}`] = 'MCTS';
+          appliedSelections[playerId] = 'MCTS';
+        } else if (aiActions[playerId] !== undefined) {
+          const idx = aiActions[playerId];
+          const actionName = actionNames[idx] || 'UNKNOWN';
           teamMoves[`Player ${playerId}`] = actionName;
           appliedSelections[playerId] = actionName;
+        } else {
+          teamMoves[`Player ${playerId}`] = 'NOOP';
+          appliedSelections[playerId] = 'NOOP';
         }
-        // Update UI tabs to mirror applied actions
-        currentSelections.value = appliedSelections;
-        
-        // Capture ball holder before the action is taken
-        const ballHolder = gameState.value?.ball_holder;
-        
-        // Fetch pass steal probabilities before the action is taken
-        let passStealProbs = {};
-        try {
-          passStealProbs = await getPassStealProbabilities();
-        } catch (err) {
-          console.warn('[App Self-play] Failed to fetch pass steal probs:', err);
-        }
-        
-        // Push move to history (state values will be added after step response)
-        const currentStateValues = gameState.value?.state_values;
-        moveHistory.value.push({
-          turn: currentTurn,
-          moves: teamMoves,
-          ballHolder: ballHolder,
-          passStealProbabilities: passStealProbs,
-          offensiveValue: currentStateValues?.offensive_value ?? null,
-          defensiveValue: currentStateValues?.defensive_value ?? null
-        });
+      }
+
+      currentSelections.value = appliedSelections;
+      
+      // Capture ball holder before the action is taken
+      const ballHolder = gameState.value?.ball_holder;
+      
+      // Fetch pass steal probabilities before the action is taken
+      let passStealProbs = {};
+      try {
+        passStealProbs = await getPassStealProbabilities();
+      } catch (err) {
+        console.warn('[App Self-play] Failed to fetch pass steal probs:', err);
       }
       
-      const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value);
+      // Push move to history (state values will be added after step response)
+      const currentStateValues = gameState.value?.state_values;
+      moveHistory.value.push({
+        turn: currentTurn,
+        moves: teamMoves,
+        ballHolder: ballHolder,
+        passStealProbabilities: passStealProbs,
+        mctsPlayers: Array.from(mctsTargets),
+        offensiveValue: currentStateValues?.offensive_value ?? null,
+        defensiveValue: currentStateValues?.defensive_value ?? null
+      });
+      
+      const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value, mctsOptions);
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
@@ -718,6 +780,11 @@ async function handleSelfPlay(preselected = null) {
           const lastMove = moveHistory.value[moveHistory.value.length - 1];
           if (response.state.last_action_results) {
             lastMove.actionResults = response.state.last_action_results;
+          }
+          if (response.mcts && typeof response.mcts === 'object') {
+            lastMove.mctsPlayers = Object.keys(response.mcts).map(k => Number(k));
+          } else if (!lastMove.mctsPlayers || lastMove.mctsPlayers.length === 0) {
+            lastMove.mctsPlayers = Array.from(mctsTargets);
           }
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
@@ -1245,6 +1312,9 @@ onBeforeUnmount(() => {
             :policies-loading="policiesLoading"
             :policy-load-error="policyLoadError"
             :stored-policy-probs="policyProbs"
+            :mcts-results="lastMctsResults"
+            :initial-use-mcts="persistUseMcts"
+            :mcts-step-running="isMctsStepRunning"
             :ai-mode="aiMode"
             :deterministic="playerDeterministic"
             :opponent-deterministic="opponentDeterministic"
@@ -1257,6 +1327,7 @@ onBeforeUnmount(() => {
             @selections-changed="handleSelectionsChanged"
             @refresh-policies="handleRefreshPolicies"
             @mcts-options-changed="handleMctsOptionsChanged"
+            @mcts-toggle-changed="handleMctsToggleChanged"
             @state-updated="handlePatchedGameState"
             ref="controlsRef"
         />

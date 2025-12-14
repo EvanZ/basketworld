@@ -84,9 +84,22 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  initialUseMcts: {
+    type: Boolean,
+    default: false,
+  },
+  mctsStepRunning: {
+    type: Boolean,
+    default: false,
+  },
+  // MCTS results returned from the last step (when backend ran MCTS)
+  mctsResults: {
+    type: Object,
+    default: null,
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'state-updated']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated']);
 
 const selectedActions = ref({});
 
@@ -292,20 +305,25 @@ const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
 
 // Advisor (MCTS) state
-const advisorPlayerId = ref(null);
 const advisorMaxDepth = ref(3);
 const advisorTimeBudget = ref(200);
 const advisorExplorationC = ref(1.4);
 const advisorUsePriors = ref(true);
-const advisorResult = ref(null);
+const advisorResults = ref({}); // playerId -> advisor result
 const advisorError = ref(null);
 const advisorLoading = ref(false);
-const useMctsForStep = ref(false);
+const advisorSelectedPlayerIds = ref([]);
+const advisorProgress = ref(0);
+const useMctsForStep = ref(!!props.initialUseMcts);
 const advisorPolicyTop = computed(() => {
-  if (!advisorResult.value || !advisorResult.value.policy) return [];
-  const pairs = advisorResult.value.policy.map((p, idx) => ({ idx, prob: p }));
-  pairs.sort((a, b) => b.prob - a.prob);
-  return pairs.slice(0, 5);
+  const topByPlayer = {};
+  for (const [pid, res] of Object.entries(advisorResults.value || {})) {
+    if (!res || !res.policy) continue;
+    const pairs = res.policy.map((p, idx) => ({ idx, prob: p }));
+    pairs.sort((a, b) => b.prob - a.prob);
+    topByPlayer[pid] = pairs.slice(0, 5);
+  }
+  return topByPlayer;
 });
 
 // Auto-scroll to current shot clock in moves table
@@ -517,6 +535,66 @@ const allPlayerIds = computed(() => {
   return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
 });
 
+function computeEntropy(probArray) {
+  if (!Array.isArray(probArray)) return null;
+  let entropy = 0;
+  for (const raw of probArray) {
+    const p = Number(raw);
+    if (!Number.isFinite(p) || p <= 0) continue;
+    entropy -= p * Math.log(p);
+  }
+  return entropy;
+}
+
+const entropyRows = computed(() => {
+  if (!props.gameState || !policyProbabilities.value) return [];
+  const offenseIds = props.gameState.offense_ids || [];
+  const defenseIds = props.gameState.defense_ids || [];
+  const userTeam = props.gameState.user_team_name;
+  const opponentHasOwnPolicy = !!props.gameState.opponent_unified_policy_name;
+
+  return allPlayerIds.value.map((pid) => {
+    const probs = policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
+    const entropy = computeEntropy(probs);
+    const isUserTeam =
+      (userTeam === 'OFFENSE' && offenseIds.includes(pid)) ||
+      (userTeam === 'DEFENSE' && defenseIds.includes(pid));
+    const teamLabel = offenseIds.includes(pid) ? 'Offense' : 'Defense';
+    const policyOwner = isUserTeam
+      ? 'Player policy'
+      : opponentHasOwnPolicy
+        ? 'Opponent policy'
+        : 'Player policy (mirror)';
+
+    return { playerId: pid, teamLabel, policyOwner, entropy, isUserTeam };
+  });
+});
+
+const entropyTotals = computed(() => {
+  let playerPolicy = 0;
+  let opponentPolicy = 0;
+  let hasPlayer = false;
+  let hasOpponent = false;
+
+  entropyRows.value.forEach((row) => {
+    if (row.entropy === null || row.entropy === undefined) return;
+    if (row.isUserTeam) {
+      playerPolicy += row.entropy;
+      hasPlayer = true;
+    } else {
+      opponentPolicy += row.entropy;
+      hasOpponent = true;
+    }
+  });
+
+  return {
+    playerPolicy: hasPlayer ? playerPolicy : null,
+    opponentPolicy: hasOpponent ? opponentPolicy : null,
+  };
+});
+
+const hasEntropyData = computed(() => entropyRows.value.some((row) => row.entropy !== null && row.entropy !== undefined));
+
 // Shot probability display is handled on the board
 
 // Fetch policy probabilities for probabilistic action sampling
@@ -678,11 +756,53 @@ watch(allPlayerIds, (newPlayerIds) => {
     }
 }, { immediate: true });
 
-watch(() => props.gameState?.ball_holder, (bh) => {
-  if (bh !== null && bh !== undefined) {
-    advisorPlayerId.value = bh;
+watch(allPlayerIds, (newPlayerIds) => {
+  if (!newPlayerIds || !newPlayerIds.length) {
+    advisorSelectedPlayerIds.value = [];
+    return;
+  }
+  // Keep only IDs that still exist
+  advisorSelectedPlayerIds.value = advisorSelectedPlayerIds.value.filter(pid => newPlayerIds.includes(pid));
+  // Default selection if empty
+  if (!advisorSelectedPlayerIds.value.length) {
+    const bh = props.gameState?.ball_holder;
+    const defaultId = (bh !== null && bh !== undefined && newPlayerIds.includes(bh)) ? bh : newPlayerIds[0];
+    advisorSelectedPlayerIds.value = [defaultId];
   }
 }, { immediate: true });
+
+watch(() => props.gameState?.ball_holder, (bh) => {
+  if (bh === null || bh === undefined) return;
+  // If nothing is selected yet, default to the ball handler
+  if (!advisorSelectedPlayerIds.value.length) {
+    advisorSelectedPlayerIds.value = [bh];
+    return;
+  }
+  // Keep selection in sync if the current selection is not on the floor
+  if (!advisorSelectedPlayerIds.value.includes(bh)) {
+    const newList = [...advisorSelectedPlayerIds.value, bh];
+    advisorSelectedPlayerIds.value = Array.from(new Set(newList));
+  }
+}, { immediate: true });
+
+watch([advisorSelectedPlayerIds, advisorMaxDepth, advisorTimeBudget, advisorExplorationC, advisorUsePriors], () => {
+  if (useMctsForStep.value) {
+    emit('mcts-options-changed', buildMctsOptions());
+  }
+});
+
+watch(() => props.initialUseMcts, (val) => {
+  useMctsForStep.value = !!val;
+}, { immediate: true });
+
+// When backend runs MCTS on step, surface results in the table
+watch(() => props.mctsResults, (newResults) => {
+  if (newResults && typeof newResults === 'object') {
+    advisorResults.value = { ...newResults };
+  } else if (newResults === null) {
+    advisorResults.value = {};
+  }
+});
 
 const actionNames = Object.values({
   0: "NOOP", 
@@ -759,6 +879,19 @@ function handleActionSelected(action) {
   }
 }
 
+function buildMctsOptions() {
+  if (!useMctsForStep.value) return null;
+  const targets = getAdvisorTargets();
+  return {
+    use_mcts: true,
+    player_ids: targets,
+    max_depth: advisorMaxDepth.value,
+    time_budget_ms: advisorTimeBudget.value,
+    exploration_c: advisorExplorationC.value,
+    use_priors: advisorUsePriors.value,
+  };
+}
+
 function submitActions() {
   let actionsToSubmit = {};
   
@@ -769,8 +902,11 @@ function submitActions() {
   // If manual mode (AI Mode off), we allow controlling everyone.
   // If AI mode on, we also want to send everyone (including AI pre-selections).
   const playersToSubmit = allPlayerIds.value; 
+  const mctsTargets = useMctsForStep.value ? new Set(getAdvisorTargets()) : new Set();
 
   for (const playerId of playersToSubmit) {
+    // If MCTS is set to override this player, omit the explicit action so the backend can fill it
+    if (mctsTargets.has(playerId)) continue;
     // If a selection exists, use it. Otherwise send 0 (NOOP).
     // Note: In AI mode, selections are pre-filled. In Manual mode, they are filled by click.
     // If unselected in manual mode, it defaults to NOOP (0), which allows manual override of opponents.
@@ -792,20 +928,14 @@ function submitActions() {
   
   emit('move-recorded', {
     turn: currentTurn,
-    moves: teamMoves
+    moves: teamMoves,
+    mctsPlayers: Array.from(mctsTargets),
   });
   
   emit('actions-submitted', actionsToSubmit);
 
   // Emit current MCTS options (or null) so parent can include in step
-  emit('mcts-options-changed', useMctsForStep.value ? {
-    use_mcts: true,
-    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
-    max_depth: advisorMaxDepth.value,
-    time_budget_ms: advisorTimeBudget.value,
-    exploration_c: advisorExplorationC.value,
-    use_priors: advisorUsePriors.value,
-  } : null);
+  emit('mcts-options-changed', buildMctsOptions());
   
   if (!props.aiMode) {
     // Only clear selections in manual mode
@@ -824,52 +954,79 @@ function getSelectedActions() {
   return { ...selectedActions.value };
 }
 
+function getAdvisorTargets() {
+  const ids = advisorSelectedPlayerIds.value || [];
+  if (ids.length > 0) {
+    return Array.from(new Set(ids.map(pid => Number(pid))));
+  }
+  // Fallback to active player if nothing is selected
+  if (props.activePlayerId !== null && props.activePlayerId !== undefined) {
+    return [Number(props.activePlayerId)];
+  }
+  return [];
+}
+
 async function runAdvisor() {
   advisorLoading.value = true;
   advisorError.value = null;
-  advisorResult.value = null;
+  advisorResults.value = {};
+  advisorProgress.value = 0;
+  const targets = getAdvisorTargets();
+  if (!targets.length) {
+    advisorError.value = 'Select at least one player.';
+    advisorLoading.value = false;
+    return;
+  }
   try {
     const payload = {
-      player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
       max_depth: advisorMaxDepth.value,
       time_budget_ms: advisorTimeBudget.value,
       exploration_c: advisorExplorationC.value,
       use_priors: advisorUsePriors.value,
     };
-    const res = await mctsAdvise(payload);
-    advisorResult.value = res?.advice || null;
+    const results = {};
+    let completed = 0;
+    for (const pid of targets) {
+      const res = await mctsAdvise({ ...payload, player_id: pid });
+      results[pid] = res?.advice || null;
+      completed += 1;
+      advisorProgress.value = targets.length ? completed / targets.length : 1;
+    }
+    advisorResults.value = results;
   } catch (err) {
     advisorError.value = err?.message || 'Failed to fetch advice';
   } finally {
+    advisorProgress.value = 1;
     advisorLoading.value = false;
   }
 }
 
 function applyAdvisorAction() {
-  if (!advisorResult.value || advisorResult.value.action === undefined || advisorResult.value.action === null) return;
-  const actionIdx = Number(advisorResult.value.action);
-  const actionName = actionNames[actionIdx] || 'NOOP';
-  const targetPid = advisorPlayerId.value ?? props.activePlayerId;
-  if (targetPid === null || targetPid === undefined) return;
-  const legal = getLegalActions(targetPid);
-  if (legal.length > 0 && !legal.includes(actionName)) {
-    advisorError.value = `Advisor suggested ${actionName}, but it is not legal now.`;
-    return;
+  const targets = getAdvisorTargets();
+  if (!targets.length) return;
+  let errorMsg = null;
+  const newSelections = { ...selectedActions.value };
+  for (const pid of targets) {
+    const res = advisorResults.value?.[pid];
+    if (!res || res.action === undefined || res.action === null) continue;
+    const actionIdx = Number(res.action);
+    const actionName = actionNames[actionIdx] || 'NOOP';
+    const legal = getLegalActions(pid);
+    if (legal.length > 0 && !legal.includes(actionName)) {
+      errorMsg = `Advisor suggested ${actionName} for Player ${pid}, but it is not legal now.`;
+      continue;
+    }
+    newSelections[pid] = actionName;
   }
-  selectedActions.value = { ...selectedActions.value, [targetPid]: actionName };
+  selectedActions.value = newSelections;
   emit('selections-changed', { ...selectedActions.value });
+  advisorError.value = errorMsg;
 }
 
 function toggleUseMcts(val) {
   useMctsForStep.value = val;
-  emit('mcts-options-changed', val ? {
-    use_mcts: true,
-    player_id: advisorPlayerId.value ?? props.activePlayerId ?? null,
-    max_depth: advisorMaxDepth.value,
-    time_budget_ms: advisorTimeBudget.value,
-    exploration_c: advisorExplorationC.value,
-    use_priors: advisorUsePriors.value,
-  } : null);
+  emit('mcts-toggle-changed', val);
+  emit('mcts-options-changed', buildMctsOptions());
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
@@ -1331,6 +1488,12 @@ const stealRisks = computed(() => {
         Stats
       </button>
       <button 
+        :class="{ active: activeTab === 'entropy' }"
+        @click="activeTab = 'entropy'"
+      >
+        Entropy
+      </button>
+      <button 
         :class="{ active: activeTab === 'advisor' }"
         @click="activeTab = 'advisor'"
       >
@@ -1403,13 +1566,50 @@ const stealRisks = computed(() => {
 
     <!-- Advisor Tab -->
     <div v-if="activeTab === 'advisor'" class="tab-content advisor-tab">
+      <div class="advisor-table-wrapper">
+        <table class="advisor-table">
+          <thead>
+            <tr>
+              <th>Select</th>
+              <th>Player</th>
+              <th>Recommended</th>
+              <th>Q</th>
+              <th>Stats</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="pid in allPlayerIds" :key="pid">
+              <td>
+                <input type="checkbox" :value="Number(pid)" v-model="advisorSelectedPlayerIds" />
+              </td>
+              <td>Player {{ pid }}</td>
+              <td>
+                <span v-if="advisorResults?.[pid] && advisorResults[pid]?.action !== undefined">
+                  {{ actionNames[advisorResults[pid].action] || 'UNKNOWN' }}
+                </span>
+                <span v-else>—</span>
+                <div v-if="advisorPolicyTop?.[pid]?.length" class="policy-row">
+                  <span v-for="item in advisorPolicyTop[pid]" :key="item.idx" class="policy-chip">
+                    {{ actionNames[item.idx] || 'UNKNOWN' }} {{ (item.prob * 100).toFixed(0) }}%
+                  </span>
+                </div>
+              </td>
+              <td>
+                <span v-if="advisorResults?.[pid]?.q_estimate !== null && advisorResults?.[pid]?.q_estimate !== undefined">
+                  {{ Number(advisorResults[pid].q_estimate).toFixed(2) }}
+                </span>
+                <span v-else>—</span>
+              </td>
+              <td class="advisor-stat-cell">
+                <span v-if="advisorResults?.[pid]?.visits">Visits: {{ advisorResults[pid].visits?.[advisorResults[pid].action] || 0 }}</span>
+                <span v-if="advisorResults?.[pid]?.nodes_expanded">Nodes: {{ advisorResults[pid].nodes_expanded }}</span>
+                <span v-if="advisorResults?.[pid]?.max_depth_reached">Depth: {{ advisorResults[pid].max_depth_reached }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
       <div class="advisor-grid">
-        <label>
-          Player
-          <select v-model.number="advisorPlayerId">
-            <option v-for="pid in allPlayerIds" :key="pid" :value="pid">Player {{ pid }}</option>
-          </select>
-        </label>
         <label>
           Max depth (plies)
           <input type="number" min="1" v-model.number="advisorMaxDepth" />
@@ -1430,39 +1630,33 @@ const stealRisks = computed(() => {
         </label>
         <div class="advisor-actions">
           <button @click="runAdvisor" :disabled="advisorLoading || !props.gameState || props.gameState.done">
-            {{ advisorLoading ? 'Running...' : 'Get Advice' }}
+            {{ advisorLoading ? 'Running...' : 'Get Advice for Selected' }}
           </button>
-          <button @click="applyAdvisorAction" :disabled="!advisorResult" title="Apply recommended action to selection">
-            Apply Action
+          <button @click="applyAdvisorAction" :disabled="!Object.keys(advisorResults || {}).length" title="Apply recommended actions to selection">
+            Apply Actions
           </button>
         </div>
       </div>
-      <div class="advisor-results" v-if="advisorResult">
-        <div class="advisor-summary">
-          <div>
-            Recommended: <strong>{{ actionNames[advisorResult.action] || 'UNKNOWN' }}</strong>
-          </div>
-          <div v-if="advisorResult.q_estimate !== null && advisorResult.q_estimate !== undefined">
-            Q ≈ {{ Number(advisorResult.q_estimate).toFixed(2) }}
-          </div>
-          <div class="advisor-stats">
-            <span>Visits: {{ advisorResult.visits ? advisorResult.visits[advisorResult.action] || 0 : 0 }}</span>
-            <span>Nodes: {{ advisorResult.nodes_expanded }}</span>
-            <span>Depth: {{ advisorResult.max_depth_reached }}</span>
-            <span>Cache hits: {{ advisorResult.cache_hits }}</span>
-            <span v-if="advisorResult.nodes_per_sec">{{ advisorResult.nodes_per_sec.toFixed(0) }} nodes/s</span>
-            <span v-if="advisorResult.duration_ms">{{ advisorResult.duration_ms.toFixed(1) }} ms</span>
-          </div>
+      <div class="advisor-progress" v-if="advisorLoading">
+        <div class="advisor-progress-bar">
+          <div 
+            class="advisor-progress-fill" 
+            :class="{ indeterminate: advisorProgress < 1 }"
+            :style="advisorProgress >= 1 ? { width: '100%' } : {}"
+          ></div>
         </div>
-        <div v-if="advisorPolicyTop.length" class="advisor-policy">
-          <div v-for="item in advisorPolicyTop" :key="item.idx" class="advisor-policy-row">
-            <span class="policy-action">{{ actionNames[item.idx] || 'UNKNOWN' }}</span>
-            <span class="policy-prob">{{ (item.prob * 100).toFixed(1) }}%</span>
-            <span class="policy-visits" v-if="advisorResult.visits">{{ advisorResult.visits[item.idx] || 0 }} visits</span>
-          </div>
-        </div>
+        <span class="advisor-progress-text">Running MCTS…</span>
       </div>
-      <div v-else-if="advisorLoading" class="advisor-results">Running advisor…</div>
+      <div class="advisor-note" v-if="props.mctsResults && useMctsForStep">
+        Showing MCTS results returned by the last step for selected players.
+      </div>
+      <div class="advisor-progress" v-if="useMctsForStep && props.mctsStepRunning">
+        <div class="advisor-progress-bar">
+          <div class="advisor-progress-fill indeterminate"></div>
+        </div>
+        <span class="advisor-progress-text">Running MCTS for turn…</span>
+      </div>
+      <div v-if="advisorLoading && !Object.keys(advisorResults || {}).length" class="advisor-results">Running advisor…</div>
       <div v-if="advisorError" class="advisor-error">{{ advisorError }}</div>
     </div>
 
@@ -1604,6 +1798,55 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
+    <!-- Entropy Tab -->
+    <div v-if="activeTab === 'entropy'" class="tab-content">
+      <div class="entropy-section">
+        <h4>Action Entropy</h4>
+        <p class="entropy-note">Computed as -∑ p ln p from current policy probabilities.</p>
+
+        <div v-if="!policyProbabilities || !hasEntropyData" class="no-data">
+          No policy probabilities available yet.
+        </div>
+        <div v-else>
+          <div class="episode-totals">
+            <div class="total-item">
+              <span class="team-label offense">Player policy</span>
+              <span class="reward-value">
+                {{ entropyTotals.playerPolicy !== null ? entropyTotals.playerPolicy.toFixed(3) : '—' }}
+              </span>
+            </div>
+            <div class="total-item">
+              <span class="team-label defense">Opponent policy</span>
+              <span class="reward-value">
+                {{ entropyTotals.opponentPolicy !== null ? entropyTotals.opponentPolicy.toFixed(3) : '—' }}
+              </span>
+            </div>
+          </div>
+
+          <div class="entropy-table-wrapper">
+            <table class="entropy-table">
+              <thead>
+                <tr>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th>Policy Owner</th>
+                  <th>Entropy</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in entropyRows" :key="row.playerId">
+                  <td>Player {{ row.playerId }}</td>
+                  <td>{{ row.teamLabel }}</td>
+                  <td>{{ row.policyOwner }}</td>
+                  <td>{{ row.entropy !== null && row.entropy !== undefined ? row.entropy.toFixed(3) : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Moves Tab -->
     <div v-if="activeTab === 'moves'" class="tab-content">
       <div class="moves-section">
@@ -1629,7 +1872,9 @@ const stealRisks = computed(() => {
               <td class="shot-clock-cell">{{ move.shotClock !== undefined ? move.shotClock : '-' }}</td>
               <td v-for="playerId in allPlayerIds" :key="playerId" class="move-cell">
                 <div class="move-action">
-                  <span v-if="move.ballHolder === playerId" class="ball-holder-icon">🏀 </span>{{ move.moves[`Player ${playerId}`] || 'NOOP' }}
+                  <span v-if="move.ballHolder === playerId" class="ball-holder-icon">🏀 </span>
+                  <span v-if="move.mctsPlayers && move.mctsPlayers.includes(playerId)" class="mcts-icon" title="Selected via MCTS">🔍 </span>
+                  {{ move.moves[`Player ${playerId}`] || 'NOOP' }}
                 </div>
                 <div v-if="getPassStealProbability(move, playerId) !== null" class="pass-steal-info">
                   ({{ (getPassStealProbability(move, playerId) * 100).toFixed(1) }}% steal risk)
@@ -2421,6 +2666,57 @@ const stealRisks = computed(() => {
   gap: 12px;
 }
 
+.advisor-table-wrapper {
+  overflow-x: auto;
+}
+
+.advisor-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--app-panel-border);
+  border-radius: 12px;
+}
+
+.advisor-table th,
+.advisor-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--app-panel-border);
+  text-align: left;
+  font-size: 14px;
+}
+
+.advisor-table th {
+  color: var(--app-text-muted);
+  font-weight: 600;
+}
+
+.advisor-table tr:last-child td {
+  border-bottom: none;
+}
+
+.policy-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.policy-chip {
+  background: rgba(56, 189, 248, 0.12);
+  color: var(--app-accent);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.advisor-stat-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--app-text-muted);
+}
+
 .advisor-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -2522,6 +2818,59 @@ const stealRisks = computed(() => {
   font-weight: 700;
 }
 
+.advisor-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--app-text-muted);
+}
+
+.advisor-progress-bar {
+  position: relative;
+  flex: 1;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--app-panel-border);
+}
+
+.advisor-progress-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.9), rgba(14, 165, 233, 0.9));
+  transition: width 0.2s ease;
+}
+
+.advisor-progress-fill.indeterminate {
+  width: 40%;
+  animation: advisor-indeterminate 1s ease-in-out infinite;
+}
+
+@keyframes advisor-indeterminate {
+  0% { left: -40%; }
+  50% { left: 60%; }
+  100% { left: -40%; }
+}
+
+.advisor-progress-text {
+  min-width: 70px;
+}
+
+.advisor-note {
+  font-size: 13px;
+  color: var(--app-text-muted);
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.15);
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
 /* Rewards styles */
 .rewards-section {
   display: flex;
@@ -2574,6 +2923,54 @@ const stealRisks = computed(() => {
   overflow-y: auto;
   border-radius: 12px;
   border: 1px solid var(--app-panel-border);
+}
+
+.entropy-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.entropy-note {
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.entropy-table-wrapper {
+  border: 1px solid var(--app-panel-border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.entropy-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.entropy-table th,
+.entropy-table td {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  font-size: 0.9rem;
+}
+
+.entropy-table th {
+  background: rgba(15, 23, 42, 0.8);
+  color: var(--app-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8rem;
+}
+
+.entropy-table tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.entropy-table td:last-child {
+  font-family: 'Courier New', monospace;
+  color: var(--app-accent);
 }
 
 .no-rewards {
@@ -2747,6 +3144,10 @@ const stealRisks = computed(() => {
   font-size: 1em;
   color: var(--app-warning);
   margin-left: 4px;
+}
+
+.mcts-icon {
+  color: var(--app-accent);
 }
 
 .pass-steal-info {
