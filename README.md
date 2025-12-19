@@ -5,6 +5,7 @@ BasketWorld is a hex-grid, Gymnasium-compatible half-court basketball simulator 
 ![Sample episode](docs/assets/episode_20251207_184600_made_unassisted_3pt.gif)
 ![Sample episode](docs/assets/episode_20251208_055831_missed_potentially_assisted_3pt.gif)
 ![Sample episode](docs/assets/episode_20251207_202731_missed_potentially_assisted_2pt.gif)
+![Sample episode](docs/assets/episode_20251218_215954_missed_potentially_assisted_2pt.gif)
 
 You can even run thousands of episodes of self-play and look at a detailed statistical summary of game play and shot charts.
 
