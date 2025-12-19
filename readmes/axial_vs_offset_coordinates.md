@@ -49,7 +49,7 @@ This is the system the environment uses for all its internal logic: player movem
 
 ### How the Conversion Math Works
 
-To get the best of both worlds, we need to convert between the two systems. Here's how the functions in our code work. We are using a "pointy-topped" layout, and our offset system is "odd-q" (meaning odd-numbered columns are shifted down).
+To get the best of both worlds, we need to convert between the two systems. Here's how the functions in our code work. We are using a **pointy-topped** layout, and our offset system is **odd-r** (meaning odd-numbered rows are shifted to the right).
 
 #### `_offset_to_axial(col, row)`
 
@@ -57,17 +57,14 @@ This function takes a human-friendly `(col, row)` and turns it into a math-frien
 
 ```python
 def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
-    """Converts odd-q offset coordinates to axial coordinates."""
-    q = col
-    r = row - (col - (col & 1)) // 2
+    """Converts odd-r offset coordinates to axial coordinates."""
+    q = col - (row - (row & 1)) // 2
+    r = row
     return q, r
 ```
-*   `q = col`: The `q` axis in an "odd-q" system conveniently aligns perfectly with the columns. So, `q` is just `col`.
-*   `r = row - (col - (col & 1)) // 2`: This is the clever part.
-    *   `(col & 1)` is a fast, bitwise way to check if `col` is odd. It returns `1` if odd, `0` if even.
-    *   `(col - (col & 1))` effectively rounds the column number *down* to the nearest even number.
-    *   `// 2`: We divide by two.
-    *   **In English:** This line says, "The `r` coordinate is the row, but for every two columns we move to the right, we need to shift our `r` coordinate up by one to compensate for the grid's vertical stagger."
+*   `(row & 1)` is a fast, bitwise way to check if `row` is odd. It returns `1` if odd, `0` if even.
+*   `(row - (row & 1)) // 2` effectively subtracts `floor(row / 2)` when the row is odd, shifting all columns on odd rows half a step to the right.
+*   **In English:** `q` tracks column position but is left-shifted by half of the row index for odd rows. `r` is just the row.
 
 #### `_axial_to_offset(q, r)`
 
@@ -75,13 +72,15 @@ This function takes a math-friendly `(q, r)` and turns it back into a human-frie
 
 ```python
 def _axial_to_offset(self, q: int, r: int) -> Tuple[int, int]:
-    """Converts axial coordinates to odd-q offset coordinates."""
-    col = q
-    row = r + (q - (q & 1)) // 2
+    """Converts axial coordinates to odd-r offset coordinates."""
+    col = q + (r - (r & 1)) // 2
+    row = r
     return col, row
 ```
-*   `col = q`: Again, the column is simply the `q` value.
-*   `row = r + (q - (q & 1)) // 2`: This is the exact reverse of the logic above. It adds back the offset to the `r` coordinate to find the correct row number.
+*   This reverses the earlier shift: add back half of the row index (for odd rows) to recover the column.
+*   `row` is unchanged because axial `r` already tracks row in the odd-r layout.
+
+For a visual snapshot, see the 9×9 odd-r grid (offset and axial labels) in `../docs/assets/odd_r_9x9_coordinates.png`.
 
 ### Summary
 

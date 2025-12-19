@@ -4,6 +4,12 @@
 
 Your court uses three different coordinate systems that all represent the **same physical location**, just in different formats:
 
+### Quick visual: 9×9 odd-r map
+
+![9x9 odd-r grid showing offset (col,row) and axial (q,r) per hex](../docs/assets/odd_r_9x9_coordinates.png)
+
+Each hex is labeled with its offset `(col,row)` on the first line and axial `(q,r)` on the second line. Rows increase downward; odd rows are shifted to the right (odd-r).
+
 ### Layer 1: Offset Coordinates (Human-Friendly)
 This is what you see when rendered:
 ```
@@ -216,6 +222,5 @@ The network learns that:
 | **Basket in observation** | **(-0.25, 0.5)** | ✓ This is what you see! |
 
 The -0.25 is NOT a bug—it's mathematically correct! The odd-r offset system naturally produces negative q values for the left edge of the court. 🎯
-
 
 

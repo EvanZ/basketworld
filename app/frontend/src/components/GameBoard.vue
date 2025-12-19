@@ -745,6 +745,23 @@ function getPolicyProbsForPlayer(playerId) {
   return probs?.[playerId] ?? probs?.[String(playerId)] ?? null;
 }
 
+function probToAlpha(prob) {
+  const val = Number(prob);
+  if (Number.isNaN(val)) return 0;
+  // Keep very small probabilities faint but still visible
+  return Math.max(0.2, Math.min(1, val));
+}
+
+function probToStealAlpha(prob) {
+  const val = Number(prob);
+  if (Number.isNaN(val)) return 0;
+  // Accept values as fractions (0-1) or percents (0-100)
+  const normalized = Math.max(0, Math.min(1, val > 1 ? val / 100 : val));
+  // Slight gamma curve to widen contrast while keeping a visible floor
+  const scaled = Math.pow(normalized, 0.7);
+  return Math.max(0.1, Math.min(1, scaled));
+}
+
 const policySuggestions = computed(() => {
   const gs = currentGameState.value;
   if (!gs) return [];
@@ -758,7 +775,7 @@ const policySuggestions = computed(() => {
   const suggestions = [];
 
   for (const pid of visibleIds) {
-    const probs = probsByPlayer[pid];
+    const probs = getPolicyProbsForPlayer(pid);
     const currentPlayerPos = gs.positions?.[pid];
     const mask = gs.action_mask?.[pid];
     if (!probs || !currentPlayerPos) continue;
@@ -774,12 +791,16 @@ const policySuggestions = computed(() => {
       const passAllowed = Array.isArray(mask) ? mask[passActionIndex] > 0 : true;
       const moveProb = moveAllowed ? (probs[moveActionIndex] ?? 0) : null;
       const passProb = passAllowed ? (probs[passActionIndex] ?? 0) : null;
+      const moveOpacity = moveProb !== null ? probToAlpha(moveProb) : 0;
+      const passOpacity = passProb !== null ? probToAlpha(passProb) : 0;
 
       suggestions.push({
         x: cartesianPos.x,
         y: cartesianPos.y,
         moveProb,
         passProb,
+        moveOpacity,
+        passOpacity,
         key: `sugg-${pid}-${i}`
       });
     }
@@ -974,6 +995,7 @@ const passRays = computed(() => {
     
     const stealProb = passStealProbs.value[teammateId];
     if (stealProb === undefined) continue;
+    const stealPercent = Math.round(stealProb * 100);
     
     // Calculate midpoint for label placement
     const midX = (bhCoords.x + tmCoords.x) / 2;
@@ -986,7 +1008,8 @@ const passRays = computed(() => {
       y2: tmCoords.y,
       midX,
       midY,
-      stealProb: (stealProb * 100).toFixed(1), // Convert to percentage
+      stealProb: stealPercent, // Rounded to nearest percent
+      stealOpacity: probToStealAlpha(stealProb),
       teammateId,
     });
   }
@@ -1597,6 +1620,7 @@ onBeforeUnmount(() => {
               dy="1.2em"
               text-anchor="middle"
               class="noop-prob-text"
+              :opacity="probToAlpha(getPolicyProbsForPlayer(player.id)[0])"
             >
               {{ Number(getPolicyProbsForPlayer(player.id)[0]).toFixed(2) }}
             </text>
@@ -1709,6 +1733,7 @@ onBeforeUnmount(() => {
             :x2="ray.x2"
             :y2="ray.y2"
             class="pass-ray"
+            :opacity="ray.stealOpacity"
           />
           <text
             :x="ray.midX"
@@ -1716,6 +1741,7 @@ onBeforeUnmount(() => {
             text-anchor="middle"
             dominant-baseline="middle"
             class="steal-prob-label"
+            :opacity="ray.stealOpacity"
           >
             {{ ray.stealProb }}%
           </text>
@@ -1768,6 +1794,7 @@ onBeforeUnmount(() => {
               v-if="sugg.moveProb !== null && sugg.moveProb !== undefined"
               :x="sugg.x"
               dy="-0.4em"
+              :opacity="sugg.moveOpacity"
             >
               {{ Number(sugg.moveProb).toFixed(3) }}
             </tspan>
@@ -1776,6 +1803,7 @@ onBeforeUnmount(() => {
               :x="sugg.x"
               :dy="sugg.moveProb !== null && sugg.moveProb !== undefined ? '1.4em' : '0'"
               class="policy-pass-prob"
+              :opacity="sugg.passOpacity"
             >
               {{ Number(sugg.passProb).toFixed(3) }}
             </tspan>
@@ -2342,7 +2370,6 @@ svg {
   stroke: black;
   stroke-width: 2px;
   pointer-events: none;
-  opacity: 0.9;
 }
 
 .pass-flash-line {
