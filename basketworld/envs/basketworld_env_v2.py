@@ -119,6 +119,7 @@ class HexagonBasketballEnv(gym.Env):
         # Pass/OOB curriculum controls
         pass_arc_degrees: float = 60.0,
         pass_oob_turnover_prob: float = 1.0,
+        pass_target_strategy: str = "nearest",
         enable_profiling: bool = False,
         profiling_sample_rate: float = 1.0,  # Fraction of episodes to profile (0.0-1.0)
         spawn_distance: int = 3,
@@ -237,6 +238,12 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_pressure_arc_rad = math.radians(shot_pressure_arc_degrees)
         # Passing arc (degrees) centered on chosen pass direction; schedulable
         self.pass_arc_degrees = float(max(1.0, min(360.0, pass_arc_degrees)))
+        # How to pick the receiver when multiple teammates are in the arc
+        self.pass_target_strategy = (
+            str(pass_target_strategy).lower()
+            if str(pass_target_strategy).lower() in ("nearest", "best_ev")
+            else "nearest"
+        )
         # Probability an attempted pass with no receiver in arc is ruled OOB turnover
         # (1.0 retains prior behavior). Can be annealed by scheduler.
         self.pass_oob_turnover_prob = float(max(0.0, min(1.0, pass_oob_turnover_prob)))
@@ -1887,12 +1894,16 @@ class HexagonBasketballEnv(gym.Env):
             # 180° arc means cos >= 0 (angles from -90° to +90°)
             return cosang >= 0.0
 
-        # Pick closest teammate in arc
+        # Pick receiver in arc based on configured strategy
         team_ids = (
             self.offense_ids if passer_id in self.offense_ids else self.defense_ids
         )
         recv_id = None
         recv_dist = None
+        recv_value = None
+        strategy = getattr(self, "pass_target_strategy", "nearest")
+        strategy = strategy if strategy in ("nearest", "best_ev") else "nearest"
+        candidate_data: List[Dict[str, Union[int, float]]] = []
         for pid in team_ids:
             if pid == passer_id:
                 continue
@@ -1900,9 +1911,38 @@ class HexagonBasketballEnv(gym.Env):
             if not in_arc(tq, tr):
                 continue
             d = self._hex_distance(passer_pos, (tq, tr))
-            if recv_id is None or d < recv_dist:
-                recv_id = pid
-                recv_dist = d
+            if strategy == "nearest":
+                if recv_id is None or d < recv_dist:
+                    recv_id = pid
+                    recv_dist = d
+            else:
+                # EV-based targeting: prefer higher (1 - steal_prob) * EP, tie-break by distance
+                steal_prob, _ = self._calculate_steal_probability_for_pass(
+                    passer_pos, (tq, tr), passer_id
+                )
+                ep = float(self._calculate_expected_points_for_player(pid))
+                value = (1.0 - float(steal_prob)) * ep
+                candidate_data.append(
+                    {
+                        "pid": pid,
+                        "distance": float(d),
+                        "steal_prob": float(steal_prob),
+                        "ep": ep,
+                        "value": value,
+                    }
+                )
+        if strategy == "best_ev" and candidate_data:
+            candidate_data.sort(
+                key=lambda c: (
+                    -c.get("value", -1e9),
+                    c.get("distance", float("inf")),
+                    c.get("pid", 0),
+                )
+            )
+            top = candidate_data[0]
+            recv_id = int(top["pid"])
+            recv_dist = int(top["distance"])
+            recv_value = float(top["value"])
 
         if recv_id is None:
             # No teammate in arc: roll for OOB turnover; on non-turnover, treat as NOOP
@@ -1967,6 +2007,8 @@ class HexagonBasketballEnv(gym.Env):
                 "reason": "intercepted",
                 "interceptor_id": thief_id,
                 "pass_distance": pass_distance,
+                "target_strategy": strategy,
+                "target_value": recv_value,
                 "total_steal_prob": total_steal_prob,
                 "defenders_evaluated": [
                     {
@@ -1986,6 +2028,8 @@ class HexagonBasketballEnv(gym.Env):
             "success": True,
             "target": recv_id,
             "pass_distance": pass_distance,
+            "target_strategy": strategy,
+            "target_value": recv_value,
             "total_steal_prob": total_steal_prob,
             "defenders_evaluated": [
                 {
@@ -2442,6 +2486,15 @@ class HexagonBasketballEnv(gym.Env):
     def set_pass_oob_turnover_prob(self, value: float) -> None:
         try:
             self.pass_oob_turnover_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
+    @profile_section("set_pass_target_strategy")
+    def set_pass_target_strategy(self, strategy: str) -> None:
+        try:
+            normalized = str(strategy).lower()
+            if normalized in ("nearest", "best_ev"):
+                self.pass_target_strategy = normalized
         except Exception:
             pass
 

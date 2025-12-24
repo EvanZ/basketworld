@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise, setOffenseSkills } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -192,6 +192,17 @@ const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
 const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
 const skillsUpdating = ref(false);
 const skillsError = ref(null);
+const passStrategyUpdating = ref(false);
+const passStrategyError = ref(null);
+const PASS_TARGET_STRATEGIES = [
+  { value: 'nearest', label: 'Nearest (legacy)' },
+  { value: 'best_ev', label: 'Best EV' },
+];
+
+const passTargetStrategyValue = computed(() => {
+  const val = props.gameState?.pass_target_strategy || 'nearest';
+  return String(val).toLowerCase();
+});
 
 function percentFromProb(prob) {
   const num = Number(prob ?? 0);
@@ -294,6 +305,27 @@ async function resetOffenseSkillsToSampled() {
     skillsError.value = err?.message || 'Failed to reset skills';
   } finally {
     skillsUpdating.value = false;
+  }
+}
+
+async function handlePassTargetStrategyChange(event) {
+  if (!props.gameState) return;
+  const value = String(event?.target?.value || '').toLowerCase();
+  if (!value || value === passTargetStrategyValue.value) return;
+  passStrategyUpdating.value = true;
+  passStrategyError.value = null;
+  try {
+    const res = await setPassTargetStrategy(value);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update pass target strategy');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update pass target strategy', err);
+    passStrategyError.value = err?.message || 'Failed to update pass target strategy';
+  } finally {
+    passStrategyUpdating.value = false;
   }
 }
 
@@ -2174,6 +2206,27 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="Angular width of valid pass directions. Passes outside this arc from the intended direction fail.">
               <span class="param-name">Pass arc degrees:</span>
               <span class="param-value">{{ props.gameState.pass_arc_degrees || 'N/A' }}°</span>
+            </div>
+            <div class="param-item" data-tooltip="Receiver selection when multiple teammates are in the pass arc.">
+              <span class="param-name">Pass target strategy:</span>
+              <div class="param-select-wrapper">
+                <select
+                  :value="passTargetStrategyValue"
+                  @change="handlePassTargetStrategyChange"
+                  :disabled="passStrategyUpdating || !props.gameState || props.gameState.done"
+                >
+                  <option
+                    v-for="opt in PASS_TARGET_STRATEGIES"
+                    :key="opt.value"
+                    :value="opt.value"
+                  >
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </div>
+              <div v-if="passStrategyError" class="policy-status error">
+                {{ passStrategyError }}
+              </div>
             </div>
             <div class="param-item" data-tooltip="Probability of turnover when a pass goes out of bounds (no teammate in direction)">
               <span class="param-name">Pass OOB turnover prob:</span>

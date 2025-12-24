@@ -104,7 +104,11 @@ const currentShotClock = computed(() => {
 const isEvaluating = ref(false);
 const evalNumEpisodes = ref(100);
 
-const FLASH_CAPTURE_OFFSETS_MS = [0, 350, 750];
+const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
+const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
+const moveTransitionMs = computed(() => Math.max(120, gifStepDurationMs.value || BASE_STEP_DURATION_MS));
+const disableTransitionsForCapture = ref(false);
+const moveProgressForCapture = ref(1);
 const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
@@ -556,6 +560,14 @@ function handleMctsToggleChanged(val) {
 // (because actions_taken in state N shows what was done to GET to N, but we want to show
 // what will be done FROM the current state N, which is stored in state N+1)
 const boardSelectedActions = computed(() => {
+  // During animated replay, show the actions that led to the current state
+  if (isReplaying.value && gameState.value?.actions_taken) {
+    const actions = {};
+    for (const [pid, action] of Object.entries(gameState.value.actions_taken)) {
+      actions[parseInt(pid, 10)] = action;
+    }
+    return actions;
+  }
   // During replay/manual stepping, show the stored actions from the next step
   if (isManualStepping.value && replayStates.value.length > 0) {
     const nextIndex = currentStepIndex.value + 1;
@@ -572,10 +584,6 @@ const boardSelectedActions = computed(() => {
       }
       return actions;
     }
-    return {};
-  }
-  // During animated replay, don't show (too fast to be useful)
-  if (isReplaying.value) {
     return {};
   }
   if (isSelfPlaying.value && currentSelections.value) {
@@ -933,8 +941,43 @@ function stateHasAnimatedFlash(state) {
   return Boolean(hasShot || hasPass);
 }
 
+function captureOffsetsForState(state) {
+  const hasFlash = stateHasAnimatedFlash(state);
+  const moveEnd = moveTransitionMs.value;
+  if (hasFlash) {
+    const merged = [...FLASH_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
+    return Array.from(new Set(merged)).sort((a, b) => a - b);
+  }
+  const merged = [...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
+  return Array.from(new Set(merged)).sort((a, b) => a - b);
+}
+
+function interpolateState(prevState, currState, t) {
+  if (!currState) return null;
+  const clampedT = Math.max(0, Math.min(1, t));
+  if (!prevState || !prevState.positions || !currState.positions) {
+    return currState;
+  }
+  const positions = currState.positions.map((pos, idx) => {
+    const prev = prevState.positions?.[idx] || pos;
+    const [q1, r1] = prev;
+    const [q2, r2] = pos;
+    return [
+      q1 + (q2 - q1) * clampedT,
+      r1 + (r2 - r1) * clampedT,
+    ];
+  });
+  return {
+    ...currState,
+    positions,
+  };
+}
+
 async function handleSaveEpisode() {
   try {
+    disableTransitionsForCapture.value = true;
+    moveProgressForCapture.value = 1;
+    await nextTick();
     // Check if we have episode states to render
     const states = replayStates.value.length > 0 ? replayStates.value : [gameState.value];
     
@@ -966,7 +1009,7 @@ async function handleSaveEpisode() {
         // Give a small delay to ensure rendering is complete
         await new Promise(resolve => setTimeout(resolve, 60));
 
-        const offsets = stateHasAnimatedFlash(states[i]) ? FLASH_CAPTURE_OFFSETS_MS : [0];
+        const offsets = captureOffsetsForState(states[i]);
         const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
         const frameDurationMs = stepDurationMs / offsets.length;
 
@@ -977,6 +1020,18 @@ async function handleSaveEpisode() {
             // eslint-disable-next-line no-await-in-loop
             await new Promise(resolve => setTimeout(resolve, waitMs));
           }
+
+          const prevState = i > 0 ? states[i - 1] : states[i];
+          const t = moveTransitionMs.value > 0 ? Math.min(1, offset / moveTransitionMs.value) : 1;
+          moveProgressForCapture.value = t;
+          const interpState = interpolateState(prevState, states[i], t);
+          const tempHistory = [...states.slice(0, i), interpState];
+          gameHistory.value = tempHistory;
+          // eslint-disable-next-line no-await-in-loop
+          await nextTick();
+          // Give a tiny delay for the DOM to paint
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise(resolve => setTimeout(resolve, 10));
 
           // Render this state as PNG
           if (gameBoardRef.value && gameBoardRef.value.renderStateToPng) {
@@ -999,6 +1054,7 @@ async function handleSaveEpisode() {
     if (replayStates.value.length > 0) {
       gameHistory.value = replayStates.value.slice(0, savedStepIndex + 1);
     }
+    moveProgressForCapture.value = 1;
     
     if (frames.length === 0) {
       alert('Failed to generate any frames');
@@ -1019,6 +1075,9 @@ async function handleSaveEpisode() {
   } catch (e) {
     console.error('Failed to save episode:', e);
     alert(`Failed to save episode: ${e.message}`);
+  } finally {
+    disableTransitionsForCapture.value = false;
+    moveProgressForCapture.value = 1;
   }
 }
 
@@ -1030,12 +1089,13 @@ async function handleReplay() {
       isReplaying.value = true;
       isManualStepping.value = false;
       gameHistory.value = [];
+      const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
       for (const s of res.states) {
         gameState.value = s;
         gameHistory.value.push(s);
-        // Small delay between frames
+        // Small delay between frames aligned to slider
         // eslint-disable-next-line no-await-in-loop
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, stepDurationMs));
       }
       isReplaying.value = false;
       // After animated replay, reload for manual stepping (keep showing final state)
@@ -1295,6 +1355,8 @@ onBeforeUnmount(() => {
           @update-player-position="handlePlayerPositionUpdate"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
+          :disable-transitions="disableTransitionsForCapture"
+          :move-progress="moveProgressForCapture"
         />
         <KeyboardLegend />
       </div>

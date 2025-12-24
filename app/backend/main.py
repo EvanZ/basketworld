@@ -3725,6 +3725,10 @@ class SetOffenseSkillsRequest(BaseModel):
     reset_to_sampled: bool = False
 
 
+class SetPassTargetStrategyRequest(BaseModel):
+    strategy: str
+
+
 @app.post("/api/offense_skills")
 def set_offense_skills(req: SetOffenseSkillsRequest):
     """
@@ -4028,6 +4032,51 @@ def set_shot_clock(req: UpdateShotClockRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to set shot clock: {e}")
+
+
+@app.post("/api/set_pass_target_strategy")
+def set_pass_target_strategy(req: SetPassTargetStrategyRequest):
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot adjust pass target strategy after episode has ended.")
+
+    try:
+        strategy = str(req.strategy).lower()
+        if strategy not in ("nearest", "best_ev"):
+            raise HTTPException(status_code=400, detail="Invalid pass target strategy.")
+
+        game_state.env.set_pass_target_strategy(strategy)
+
+        obs_vec = game_state.env._get_observation()
+        action_mask = game_state.env._get_action_masks()
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if game_state.env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": game_state.env._get_offense_skills_array(),
+        }
+        game_state.obs = new_obs_dict
+        game_state.prev_obs = None
+
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[set_pass_target_strategy] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/swap_policies")
@@ -4391,6 +4440,7 @@ def get_full_game_state(
         "pass_oob_turnover_prob": float(
             getattr(game_state.env, "pass_oob_turnover_prob", 1.0)
         ),
+        "pass_target_strategy": getattr(game_state.env, "pass_target_strategy", "nearest"),
         # Illegal action policy
         "illegal_action_policy": (
             getattr(game_state.env, "illegal_action_policy", None).value

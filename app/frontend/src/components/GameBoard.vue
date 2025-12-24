@@ -31,6 +31,14 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  disableTransitions: {
+    type: Boolean,
+    default: false,
+  },
+  moveProgress: {
+    type: Number,
+    default: 1,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock']);
@@ -41,6 +49,24 @@ const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'ad
 
 const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
 const SQRT3 = Math.sqrt(3);
+const PASS_COS_EPS = 1e-9;
+// Axial direction vectors (q, r) aligned with ActionType ordering (E, NE, NW, W, SW, SE)
+const HEX_DIRECTIONS = [
+  [1, 0],
+  [1, -1],
+  [0, -1],
+  [-1, 0],
+  [-1, 1],
+  [0, 1],
+];
+const PASS_ACTION_TO_DIR = {
+  PASS_E: 0,
+  PASS_NE: 1,
+  PASS_NW: 2,
+  PASS_W: 3,
+  PASS_SW: 4,
+  PASS_SE: 5,
+};
 
 // Axial (q,r) → pixel cartesian (x,y) for pointy-topped hexes.
 // Formula identical to the one in basketworld_env_v2.py:_render_visual.
@@ -55,6 +81,13 @@ function offsetToAxial(col, row) {
   const q = col - ((row - (row & 1)) >> 1);
   const r = row;
   return { q, r };
+}
+
+// Hex distance on axial coords (matches env._hex_distance)
+function hexDistance(a, b) {
+  const [q1, r1] = a;
+  const [q2, r2] = b;
+  return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
 function getRenderablePlayers(gameState) {
@@ -80,9 +113,27 @@ const passFlash = ref(null);
 const passFlashTimeout = ref(null);
 const shotFlash = ref(null);
 const shotFlashTimeout = ref(null);
+const shotJumpPlayerId = ref(null);
+const shotJumpTimeout = ref(null);
+const shotJumpIsDunk = ref(false);
+const shotInFlightPlayerId = computed(() => {
+  const shots = currentGameState.value?.last_action_results?.shots;
+  if (!shots || Object.keys(shots).length === 0) return null;
+  const entry = Object.entries(shots)[0];
+  if (!entry || entry.length < 2) return null;
+  const shooterId = Number(entry[0]);
+  return Number.isNaN(shooterId) ? null : shooterId;
+});
 const policyVisibility = ref(new Set()); // Player IDs with policy overlays shown
 const clickTimeout = ref(null);
 const SINGLE_CLICK_DELAY = 220;
+const DRIBBLE_PERIOD_SECONDS = 0.5;
+const DRIBBLE_AMPLITUDE_PX = HEX_RADIUS * 0.33;
+const SHOOT_JUMP_PERIOD_SECONDS = 2.0;
+const SHOOT_JUMP_AMPLITUDE_PX = HEX_RADIUS * 1.0;
+const SHOOT_DUNK_AMPLITUDE_PX = HEX_RADIUS * 1.33;
+const SHOOT_JUMP_SCALE = 1.2;
+const SHOOT_DUNK_SCALE = 1.5;
 
 function clearClickTimeout() {
   if (clickTimeout.value) {
@@ -262,6 +313,10 @@ const sortedPlayers = computed(() => {
     ...(activePlayer ? [activePlayer] : []),
   ];
 });
+
+function dribbleDelay(playerId) {
+  return `${(playerId % 3) * 0.08}s`;
+}
 
 // no-op
 
@@ -745,6 +800,13 @@ function getPolicyProbsForPlayer(playerId) {
   return probs?.[playerId] ?? probs?.[String(playerId)] ?? null;
 }
 
+function playerLabelTransform(player) {
+  const isDragged = draggedPlayerId.value === player.id;
+  const x = isDragged ? draggedPlayerPos.value.x : player.x;
+  const y = isDragged ? draggedPlayerPos.value.y : player.y;
+  return `translate(${x}, ${y})`;
+}
+
 function probToAlpha(prob) {
   const val = Number(prob);
   if (Number.isNaN(val)) return 0;
@@ -935,10 +997,12 @@ const playerTransitions = computed(() => {
     return [];
   }
   const transitions = [];
+  const progress = Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
   // Start from the second state, as moves happen between states.
   for (let step = 1; step < props.gameHistory.length; step++) {
     const previousGameState = props.gameHistory[step - 1];
     const currentGameState = props.gameHistory[step];
+    const isLastStep = step === props.gameHistory.length - 1;
     // Opacity should match the destination ghost cell's opacity.
     const opacity = 0.1 + (0.2 * (step - 1) / (props.gameHistory.length - 1));
 
@@ -949,7 +1013,9 @@ const playerTransitions = computed(() => {
       // Check if the position has changed
       if (prevPos[0] !== currentPos[0] || prevPos[1] !== currentPos[1]) {
         const { x: startX, y: startY } = axialToCartesian(prevPos[0], prevPos[1]);
-        const { x: endX, y: endY } = axialToCartesian(currentPos[0], currentPos[1]);
+        const { x: fullEndX, y: fullEndY } = axialToCartesian(currentPos[0], currentPos[1]);
+        const endX = isLastStep && progress < 1 ? startX + (fullEndX - startX) * progress : fullEndX;
+        const endY = isLastStep && progress < 1 ? startY + (fullEndY - startY) * progress : fullEndY;
         
         const isOffense = currentGameState.offense_ids.includes(playerId);
 
@@ -1017,6 +1083,101 @@ const passRays = computed(() => {
   return rays;
 });
 
+// Preview which teammate will receive a pass based on current selection/strategy
+const passTargetPreview = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return null;
+
+  const passerId = gs.ball_holder;
+  const action = props.selectedActions?.[passerId];
+  if (!action || !action.startsWith('PASS_')) return null;
+
+  const dirIdx = PASS_ACTION_TO_DIR[action];
+  if (dirIdx === undefined) return null;
+
+  const passerPos = gs.positions?.[passerId];
+  if (!passerPos) return null;
+
+  const arcDegrees = gs.pass_arc_degrees ?? 60;
+  const halfAngleRad = (Math.max(1, Math.min(360, arcDegrees)) * Math.PI) / 360;
+  const dirVec = HEX_DIRECTIONS[dirIdx];
+  const dirCart = axialToCartesian(dirVec[0], dirVec[1]);
+  const dirNorm = Math.hypot(dirCart.x, dirCart.y) || 1;
+  const cosThreshold = Math.cos(halfAngleRad) - PASS_COS_EPS;
+
+  const inArc = (targetPos) => {
+    const [tq, tr] = targetPos;
+    const vx = tq - passerPos[0];
+    const vy = tr - passerPos[1];
+    const vCart = axialToCartesian(vx, vy);
+    const vNorm = Math.hypot(vCart.x, vCart.y);
+    if (vNorm === 0) return false;
+    const cosang = (vCart.x * dirCart.x + vCart.y * dirCart.y) / (vNorm * dirNorm);
+    return cosang >= cosThreshold;
+  };
+
+  const isOffense = gs.offense_ids?.includes(passerId);
+  const teamIds = isOffense ? gs.offense_ids : gs.defense_ids;
+  if (!teamIds) return null;
+
+  const strategy = (gs.pass_target_strategy || 'nearest').toLowerCase();
+  let best = null;
+
+  for (const tid of teamIds) {
+    if (tid === passerId) continue;
+    const tPos = gs.positions?.[tid];
+    if (!tPos || !inArc(tPos)) continue;
+
+    const distance = hexDistance(passerPos, tPos);
+
+    if (strategy === 'best_ev') {
+      const ep = (gs.ep_by_player && gs.ep_by_player[tid] !== undefined)
+        ? Number(gs.ep_by_player[tid])
+        : 0;
+      const stealProb = passStealProbs.value?.[tid] ?? 0;
+      const value = (1 - stealProb) * ep;
+      const candidate = {
+        receiverId: tid,
+        distance,
+        value,
+        stealProb,
+        ep,
+      };
+      if (
+        !best ||
+        candidate.value > best.value + 1e-9 ||
+        (Math.abs(candidate.value - best.value) < 1e-9 && distance < best.distance) ||
+        (Math.abs(candidate.value - best.value) < 1e-9 && distance === best.distance && tid < best.receiverId)
+      ) {
+        best = candidate;
+      }
+    } else {
+      const candidate = { receiverId: tid, distance };
+      if (!best || distance < best.distance || (distance === best.distance && tid < best.receiverId)) {
+        best = candidate;
+      }
+    }
+  }
+
+  if (!best) return null;
+
+  const passerCoords = axialToCartesian(passerPos[0], passerPos[1]);
+  const recvPos = gs.positions[best.receiverId];
+  const recvCoords = axialToCartesian(recvPos[0], recvPos[1]);
+
+  return {
+    passerId,
+    receiverId: best.receiverId,
+    start: passerCoords,
+    end: recvCoords,
+    strategy,
+    distance: best.distance,
+    value: best.value ?? null,
+    stealProb: best.stealProb ?? null,
+    ep: best.ep ?? null,
+  };
+});
+
 function clearPassFlash() {
   if (passFlashTimeout.value) {
     clearTimeout(passFlashTimeout.value);
@@ -1079,7 +1240,29 @@ function clearShotFlash() {
   shotFlash.value = null;
 }
 
-function triggerShotFlash(shooterId, start, end, success) {
+function clearShotJump() {
+  if (shotJumpTimeout.value) {
+    clearTimeout(shotJumpTimeout.value);
+    shotJumpTimeout.value = null;
+  }
+  shotJumpPlayerId.value = null;
+  shotJumpIsDunk.value = false;
+}
+
+function triggerShotJump(shooterId, isDunk = false) {
+  if (shooterId === null || shooterId === undefined) return;
+  if (shotJumpTimeout.value) {
+    clearTimeout(shotJumpTimeout.value);
+    shotJumpTimeout.value = null;
+  }
+  shotJumpPlayerId.value = shooterId;
+  shotJumpIsDunk.value = !!isDunk;
+  shotJumpTimeout.value = setTimeout(() => {
+    clearShotJump();
+  }, SHOOT_JUMP_PERIOD_SECONDS * 1000);
+}
+
+function triggerShotFlash(shooterId, start, end, success, isDunk = false) {
   if (shotFlashTimeout.value) {
     clearTimeout(shotFlashTimeout.value);
     shotFlashTimeout.value = null;
@@ -1099,6 +1282,7 @@ function triggerShotFlash(shooterId, start, end, success) {
     shotFlash.value = null;
     shotFlashTimeout.value = null;
   }, SHOT_FLASH_DURATION_MS);
+  triggerShotJump(shooterId, isDunk);
 }
 
 watch(
@@ -1147,12 +1331,14 @@ watch(
   (state) => {
     if (!state) {
       clearShotFlash();
+      clearShotJump();
       return;
     }
 
     const shots = state.last_action_results?.shots;
     if (!shots || Object.keys(shots).length === 0) {
       clearShotFlash();
+      clearShotJump();
       return;
     }
 
@@ -1166,6 +1352,7 @@ watch(
 
     if (!shotData) {
       clearShotFlash();
+      clearShotJump();
       return;
     }
 
@@ -1173,13 +1360,17 @@ watch(
     const basketPos = state.basket_position;
     if (!shooterPos || !basketPos) {
       clearShotFlash();
+      clearShotJump();
       return;
     }
 
     const start = axialToCartesian(shooterPos[0], shooterPos[1]);
     const end = axialToCartesian(basketPos[0], basketPos[1]);
     const success = !!shotData.result.success;
-    triggerShotFlash(shotData.shooterId, start, end, success);
+    const isDunk =
+      (shotData.result && typeof shotData.result.is_dunk === 'boolean' && shotData.result.is_dunk) ||
+      hexDistance(shooterPos, basketPos) === 0;
+    triggerShotFlash(shotData.shooterId, start, end, success, isDunk);
   },
   { immediate: true }
 );
@@ -1194,7 +1385,8 @@ async function downloadBoardAsImage() {
       const properties = [
         'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
         'opacity', 'font-family', 'font-size', 'font-weight',
-        'text-anchor', 'dominant-baseline', 'paint-order'
+        'text-anchor', 'dominant-baseline', 'paint-order',
+        'transform', 'transform-origin', 'transform-box'
       ];
       properties.forEach(prop => {
         // Only set if not default/empty to keep it clean, 
@@ -1322,7 +1514,8 @@ async function renderStateToPng() {
       const properties = [
         'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
         'opacity', 'font-family', 'font-size', 'font-weight',
-        'text-anchor', 'dominant-baseline', 'paint-order'
+        'text-anchor', 'dominant-baseline', 'paint-order',
+        'transform', 'transform-origin', 'transform-box'
       ];
       properties.forEach(prop => {
         const val = computed.getPropertyValue(prop);
@@ -1442,12 +1635,13 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onGlobalMouseUp);
   clearPassFlash();
   clearShotFlash();
+  clearShotJump();
 });
 
 </script>
 
 <template>
-  <div class="game-board-container">
+  <div class="game-board-container" :class="{ 'no-move-transitions': disableTransitions }">
     <div class="board-toolbar">
       <button 
         class="download-button" 
@@ -1575,9 +1769,41 @@ onBeforeUnmount(() => {
           />
         </g>
 
+        <!-- Pass target preview (selected receiver) -->
+        <g v-if="passTargetPreview && showPlayers" class="pass-preview-group">
+          <line
+            :x1="passTargetPreview.start.x"
+            :y1="passTargetPreview.start.y"
+            :x2="passTargetPreview.end.x"
+            :y2="passTargetPreview.end.y"
+            class="pass-preview-line"
+          />
+        </g>
+
         <!-- Draw the current players on top -->
         <g v-if="currentGameState && showPlayers">
-        <g v-for="player in sortedPlayers" :key="player.id">
+        <g
+          v-for="player in sortedPlayers"
+          :key="player.id"
+          :class="[
+            'player-group',
+            { 'ball-handler-bounce': player.hasBall && draggedPlayerId !== player.id && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id },
+            { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
+            { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id }
+          ]"
+          :style="{
+            ...(player.hasBall && draggedPlayerId !== player.id ? {
+              '--dribble-amp': `${DRIBBLE_AMPLITUDE_PX}px`,
+              '--dribble-period': `${DRIBBLE_PERIOD_SECONDS}s`,
+              '--dribble-delay': dribbleDelay(player.id)
+            } : {}),
+            ...(shotJumpPlayerId === player.id && draggedPlayerId !== player.id ? {
+              '--jump-amp': `${shotJumpIsDunk ? SHOOT_DUNK_AMPLITUDE_PX : SHOOT_JUMP_AMPLITUDE_PX}px`,
+              '--jump-period': `${SHOOT_JUMP_PERIOD_SECONDS}s`,
+              '--jump-scale-peak': `${shotJumpIsDunk ? SHOOT_DUNK_SCALE : SHOOT_JUMP_SCALE}`
+            } : {})
+          }"
+        >
             <!-- If dragging this player, show it at dragged pos, otherwise at hex pos -->
             <circle 
               :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
@@ -1586,7 +1812,8 @@ onBeforeUnmount(() => {
               :class="[
                 player.isOffense ? 'player-offense' : 'player-defense',
                 { 'active-player-hex': player.id === activePlayerId },
-                { 'dragging': draggedPlayerId === player.id }
+                { 'dragging': draggedPlayerId === player.id },
+                { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id }
               ]"
               @mousedown="onMouseDown($event, player)"
               @click="onPlayerClick($event, player)"
@@ -1594,8 +1821,9 @@ onBeforeUnmount(() => {
               style="cursor: grab;"
             />
             <text 
-              :x="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
-              :y="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
+              :transform="playerLabelTransform(player)"
+              x="0" 
+              y="0" 
               dy="0.3em" 
               text-anchor="middle" 
               class="player-text"
@@ -1650,7 +1878,7 @@ onBeforeUnmount(() => {
             </text>
             <!-- Ball handler indicator -->
             <circle 
-                v-if="player.hasBall" 
+                v-if="player.hasBall && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id" 
                 :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
                 :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
                 :r="HEX_RADIUS * 0.9" 
@@ -2148,20 +2376,44 @@ svg {
   fill: #007bff;
   stroke: white;
   stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 .player-defense {
   fill: #dc3545;
   stroke: white;
   stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
+.player-group {
+  transform-origin: center;
+  transform-box: fill-box; /* keep scale/translate centered on the marker */
+}
+.ball-handler-bounce {
+  animation: dribble-bounce var(--dribble-period, 0.95s) ease-in-out infinite;
+  animation-delay: var(--dribble-delay, 0s);
+  will-change: transform;
+}
+.shoot-jump {
+  animation: shoot-jump var(--jump-period, 1.35s) ease-out forwards;
+  will-change: transform;
+}
+.shoot-jump-dunk {
+  animation-name: shoot-jump;
 }
 .active-player-hex {
   stroke: #62ff3b; /* Bright yellow */
   stroke-width: 0.15rem; /* Increased width for better visibility */
 }
+.pass-target-preview {
+  stroke: #f8e71c;
+  stroke-width: 0.2rem;
+  filter: drop-shadow(0 0 6px rgba(248, 231, 28, 0.6));
+}
 .dragging {
   opacity: 0.8;
   stroke: white;
   stroke-dasharray: 4 2;
+  transition: none !important;
 }
 .player-text {
   fill: white;
@@ -2170,6 +2422,7 @@ svg {
   paint-order: stroke;
   stroke: black;
   stroke-width: 0.1rem;
+  transition: transform 0.26s ease;
 }
 .ghost-text {
   font-size: 10px;
@@ -2187,11 +2440,13 @@ svg {
   stroke-linecap: round;
   stroke-width: 0.25rem;
   stroke-dasharray: 4 8;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 
 /* Action indicator styles */
 .action-indicator {
   pointer-events: none;
+  transition: transform 0.26s ease;
 }
 .action-arrow {
   stroke: #000;
@@ -2247,6 +2502,17 @@ svg {
   paint-order: stroke;
   stroke: black;
   stroke-width: 0.25rem;
+  transition: x 0.26s ease, y 0.26s ease;
+}
+
+.no-move-transitions .player-offense,
+.no-move-transitions .player-defense,
+.no-move-transitions .player-text,
+.no-move-transitions .shot-prob-text,
+.no-move-transitions .noop-prob-text,
+.no-move-transitions .ball-indicator,
+.no-move-transitions .action-indicator {
+  transition: none !important;
 }
 
 .noop-prob-text {
@@ -2256,6 +2522,7 @@ svg {
   paint-order: stroke;
   stroke: #fff;
   stroke-width: 0.6px;
+  transition: x 0.26s ease, y 0.26s ease;
 }
 
 .shot-count-layer {
@@ -2372,6 +2639,14 @@ svg {
   pointer-events: none;
 }
 
+.pass-preview-line {
+  stroke: rgba(248, 231, 28, 0.9);
+  stroke-width: 4px;
+  stroke-dasharray: 10 6;
+  filter: drop-shadow(0 0 6px rgba(248, 231, 28, 0.5));
+  pointer-events: none;
+}
+
 .pass-flash-line {
   stroke-width: 8;
   stroke-linecap: round;
@@ -2399,6 +2674,21 @@ svg {
   0% { opacity: 1; transform: scale(1); }
   70% { opacity: 0.85; transform: scale(1.06); }
   100% { opacity: 0; transform: scale(1.08); }
+}
+
+@keyframes dribble-bounce {
+  0%, 100% { transform: translateY(0); }
+  38% { transform: translateY(calc(-1 * var(--dribble-amp, 6px))); }
+  50% { transform: translateY(calc(-1 * var(--dribble-amp, 6px))); }
+  72% { transform: translateY(calc(-0.25 * var(--dribble-amp, 6px))); }
+}
+
+@keyframes shoot-jump {
+  0% { transform: translateY(0) scale(1); }
+  28% { transform: translateY(calc(-1 * var(--jump-amp, 8px))) scale(var(--jump-scale-peak, 1)); }
+  55% { transform: translateY(calc(-0.82 * var(--jump-amp, 8px))) scale(var(--jump-scale-peak, 1)); }
+  85% { transform: translateY(calc(-0.12 * var(--jump-amp, 8px))) scale(1.04); }
+  100% { transform: translateY(0) scale(1); }
 }
 
 .shot-flash-line {

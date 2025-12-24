@@ -338,3 +338,16 @@ export async function setOffenseSkills(payload = {}) {
   }
   return response.json();
 }
+
+export async function setPassTargetStrategy(strategy) {
+  const response = await fetch(`${API_BASE_URL}/api/set_pass_target_strategy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ strategy }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update pass target strategy');
+  }
+  return response.json();
+}

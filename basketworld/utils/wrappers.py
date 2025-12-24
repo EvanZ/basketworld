@@ -268,3 +268,9 @@ class BetaSetterWrapper(gym.Wrapper):
             self.env.unwrapped.set_pass_oob_turnover_prob(float(value))
         except Exception:
             pass
+
+    def set_pass_target_strategy(self, strategy: str) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_pass_target_strategy(strategy)
+        except Exception:
+            pass
