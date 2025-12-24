@@ -97,9 +97,21 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  evalConfig: {
+    type: Object,
+    default: null,
+  },
+  evalNumEpisodes: {
+    type: Number,
+    default: 100,
+  },
+  perPlayerEvalStats: {
+    type: Object,
+    default: null,
+  },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed']);
 
 const selectedActions = ref({});
 
@@ -263,6 +275,179 @@ function percentToProb(percent) {
   return clamped / 100;
 }
 
+const defaultEvalConfig = () => ({
+  mode: 'default',
+  placementEditing: false,
+  positions: [],
+  ballHolder: null,
+  shootingMode: 'random',
+  skills: { layup: [], three_pt: [], dunk: [] },
+  randomizeOffensePermutation: false,
+});
+
+const evalConfigSafe = computed(() => {
+  const base = defaultEvalConfig();
+  const incoming = props.evalConfig || {};
+  return {
+    ...base,
+    ...incoming,
+    skills: { ...base.skills, ...(incoming.skills || {}) },
+  };
+});
+
+const evalPlacementEditing = computed(() => evalConfigSafe.value.placementEditing && evalConfigSafe.value.mode === 'custom');
+const evalModeIsCustom = computed(() => evalConfigSafe.value.mode === 'custom');
+const evalOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const ballStartOptions = computed(() => {
+  const ids = evalOffenseIds.value || [];
+  return Array.isArray(ids) ? [...ids] : [];
+});
+
+const evalEpisodesInput = ref(props.evalNumEpisodes || 100);
+watch(() => props.evalNumEpisodes, (val) => {
+  const safe = Number.isFinite(val) ? Number(val) : 100;
+  evalEpisodesInput.value = safe;
+});
+
+function updateEvalEpisodes(val) {
+  const safe = Math.max(1, Number(val) || 1);
+  evalEpisodesInput.value = safe;
+}
+
+function emitEvalConfigUpdate(patch = {}) {
+  const base = evalConfigSafe.value;
+  const next = {
+    ...base,
+    ...(patch || {}),
+    skills: {
+      ...base.skills,
+      ...(patch.skills || {}),
+    },
+  };
+  if (next.mode !== 'custom') {
+    next.placementEditing = false;
+  }
+  emit('eval-config-changed', next);
+}
+
+function seedEvalConfigFromGameState(copySkills = true) {
+  if (!props.gameState) return;
+  const positions = (props.gameState.positions || []).map((pos) => [pos[0], pos[1]]);
+  const offenseCount = props.gameState.offense_ids?.length || 0;
+  const bhDefault = evalOffenseIds.value.length ? evalOffenseIds.value[0] : null;
+  const sourceSkills =
+    props.gameState.offense_shooting_pct_sampled ||
+    props.gameState.offense_shooting_pct_by_player ||
+    null;
+  const skills = copySkills ? { layup: [], three_pt: [], dunk: [] } : (evalConfigSafe.value.skills || {});
+  if (copySkills && sourceSkills) {
+    skills.layup = Array.from({ length: offenseCount }, (_, idx) => percentFromProb(sourceSkills?.layup?.[idx]));
+    skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => percentFromProb(sourceSkills?.three_pt?.[idx]));
+    skills.dunk = Array.from({ length: offenseCount }, (_, idx) => percentFromProb(sourceSkills?.dunk?.[idx]));
+  }
+  const nextBallHolder = (bhDefault !== null && evalOffenseIds.value.includes(props.gameState.ball_holder))
+    ? props.gameState.ball_holder
+    : bhDefault;
+
+  const patch = {
+    positions,
+    ballHolder: nextBallHolder,
+    mode: evalConfigSafe.value.mode,
+    skills: copySkills ? skills : (evalConfigSafe.value.skills || skills),
+  };
+  emitEvalConfigUpdate(patch);
+}
+
+function toggleEvalPlacement(val) {
+  if (val && (!evalConfigSafe.value.positions || evalConfigSafe.value.positions.length === 0)) {
+    seedEvalConfigFromGameState(false);
+  }
+  emitEvalConfigUpdate({ placementEditing: val, mode: 'custom' });
+  emit('active-tab-changed', 'eval');
+}
+
+function setEvalBallHolder(val) {
+  const num = val === null || val === '' ? null : Number(val);
+  if (num !== null && !evalOffenseIds.value.includes(num)) return;
+  emitEvalConfigUpdate({ ballHolder: num });
+}
+
+function setEvalShootingMode(mode) {
+  if (mode === 'fixed') {
+    // If no skills are populated yet, seed from game state for convenience
+    const skills = evalConfigSafe.value.skills || {};
+    const hasSkills =
+      (skills.layup && skills.layup.length > 0) ||
+      (skills.three_pt && skills.three_pt.length > 0) ||
+      (skills.dunk && skills.dunk.length > 0);
+    if (!hasSkills) {
+      seedEvalConfigFromGameState(true);
+    }
+  }
+  emitEvalConfigUpdate({ shootingMode: mode, mode: 'custom' });
+}
+
+function setEvalRandomizePermutation(val) {
+  emitEvalConfigUpdate({ randomizeOffensePermutation: !!val });
+}
+
+function updateEvalSkill(idx, key, value) {
+  const offenseCount = props.gameState?.offense_ids?.length || 0;
+  const base = evalConfigSafe.value.skills || {};
+  const nextSkills = {
+    ...base,
+    [key]: Array.from({ length: offenseCount }, (_, i) => {
+      if (i === idx) {
+        return Number(value) || 0;
+      }
+      return base[key]?.[i] ?? 0;
+    }),
+  };
+  emitEvalConfigUpdate({ skills: nextSkills });
+}
+
+function handleEvalRunClick() {
+  emit('eval-run', {
+    numEpisodes: evalEpisodesInput.value,
+    config: evalConfigSafe.value,
+  });
+}
+
+function handleEvalModeChange(mode) {
+  if (mode === 'custom') {
+    if (!evalPlacementEditing.value) {
+      toggleEvalPlacement(true);
+    }
+    if (!evalConfigSafe.value.positions || evalConfigSafe.value.positions.length === 0) {
+      seedEvalConfigFromGameState(true);
+    }
+    // Default to fixed skills when entering custom mode so controls appear
+    const nextMode = evalConfigSafe.value.shootingMode || 'random';
+    const patch = { mode: 'custom' };
+    if (nextMode === 'random') {
+      patch.shootingMode = 'fixed';
+    }
+    emitEvalConfigUpdate(patch);
+  } else {
+    emitEvalConfigUpdate({ mode: 'default', placementEditing: false });
+  }
+  emit('active-tab-changed', mode === 'custom' ? 'eval' : 'controls');
+}
+
+const evalOffenseSkillRows = computed(() => {
+  const ids = props.gameState?.offense_ids || [];
+  const skills = evalConfigSafe.value.skills || {};
+  const lay = skills.layup || [];
+  const three = skills.three_pt || [];
+  const dunk = skills.dunk || [];
+  return ids.map((pid, idx) => ({
+    playerId: pid,
+    layup: Number(lay[idx] ?? 0),
+    threePt: Number(three[idx] ?? 0),
+    dunk: Number(dunk[idx] ?? 0),
+  }));
+});
+
 async function applyOffenseSkillOverrides() {
   if (!props.gameState) return;
   skillsUpdating.value = true;
@@ -385,6 +570,7 @@ watch(() => props.currentShotClock, async (newShotClock) => {
 // Also scroll when switching tabs
 watch(activeTab, async (newTab) => {
   try {
+    emit('active-tab-changed', newTab);
     if (isMounted.value && props.currentShotClock !== null) {
       await nextTick();
       if (newTab === 'moves') {
@@ -418,6 +604,167 @@ const totalPotentialAssists = computed(() => (
 const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
+const selectedShotChartTarget = ref('team');
+const offensePlayerIdsForStats = computed(() => {
+  const fromEval = Object.keys(props.perPlayerEvalStats || {}).map((k) => Number(k)).filter((n) => !Number.isNaN(n));
+  if (fromEval.length > 0) {
+    const offense = props.gameState?.offense_ids || [];
+    if (Array.isArray(offense) && offense.length > 0) {
+      return fromEval.filter((pid) => offense.includes(pid)).sort((a, b) => a - b);
+    }
+    return fromEval.sort((a, b) => a - b);
+  }
+  const offense = props.gameState?.offense_ids || [];
+  return Array.isArray(offense) ? offense.map(Number) : [];
+});
+
+function aggregatePlayerStats(entries) {
+  const base = {
+    shots: 0,
+    makes: 0,
+    assists: 0,
+    potential_assists: 0,
+    turnovers: 0,
+    points: 0,
+    shot_types: { dunk: [0, 0], two: [0, 0], three: [0, 0] },
+    shot_chart: {},
+  };
+  entries.forEach((entry) => {
+    if (!entry) return;
+    base.shots += Number(entry.shots || 0);
+    base.makes += Number(entry.makes || 0);
+    base.assists += Number(entry.assists || 0);
+    base.potential_assists += Number(entry.potential_assists || 0);
+    base.turnovers += Number(entry.turnovers || 0);
+    base.points += Number(entry.points || 0);
+    const st = entry.shot_types || {};
+    ['dunk', 'two', 'three'].forEach((k) => {
+      const vals = st[k] || [0, 0];
+      base.shot_types[k][0] += Number(vals[0] || 0);
+      base.shot_types[k][1] += Number(vals[1] || 0);
+    });
+    const chart = entry.shot_chart || {};
+    Object.entries(chart).forEach(([loc, vals]) => {
+      const target = base.shot_chart[loc] || [0, 0];
+      target[0] += Number((vals || [])[0] || 0);
+      target[1] += Number((vals || [])[1] || 0);
+      base.shot_chart[loc] = target;
+    });
+  });
+  return base;
+}
+
+const selectedEvalStats = computed(() => {
+  const stats = props.perPlayerEvalStats || {};
+  const offenseIds = offensePlayerIdsForStats.value;
+  if (!stats || Object.keys(stats).length === 0 || offenseIds.length === 0) return null;
+  if (selectedShotChartTarget.value === 'team') {
+    const offenseEntries = offenseIds.map((pid) => stats[pid] || stats[String(pid)]).filter(Boolean);
+    return aggregatePlayerStats(offenseEntries);
+  }
+  const key = selectedShotChartTarget.value;
+  return stats[key] || stats[String(key)] || null;
+});
+
+const selectedEvalSummary = computed(() => {
+  const s = selectedEvalStats.value;
+  if (!s) return null;
+  const attempts = Number(s.shots || 0);
+  const makes = Number(s.makes || 0);
+  const fgPct = attempts > 0 ? (makes / attempts) * 100 : 0;
+  const turnovers = Number(s.turnovers || 0);
+  const points = Number(s.points || 0);
+  return {
+    attempts,
+    makes,
+    fgPct,
+    turnovers,
+    points,
+    shotTypes: s.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] },
+    shotChart: s.shot_chart || {},
+  };
+});
+
+const offensePlayerStatsTable = computed(() => {
+  const stats = props.perPlayerEvalStats || {};
+  const offenseIds = offensePlayerIdsForStats.value;
+  if (!stats || offenseIds.length === 0) return [];
+  return offenseIds.map((pid) => {
+    const entry = stats[pid] || stats[String(pid)] || {};
+    const attemptSum = Number(entry.shots || 0);
+    const makeSum = Number(entry.makes || 0);
+    const shotTypes = entry.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] };
+    const getPair = (k) => {
+      const vals = shotTypes[k] || [0, 0];
+      return { att: Number(vals[0] || 0), mk: Number(vals[1] || 0) };
+    };
+    const dunk = getPair('dunk');
+    const two = getPair('two');
+    const three = getPair('three');
+    const un = entry.unassisted || {};
+    const af = entry.assist_full_by_type || {};
+    return {
+      playerId: pid,
+      attempts: attemptSum,
+      makes: makeSum,
+      fg: attemptSum > 0 ? (makeSum / attemptSum) * 100 : 0,
+      dunk,
+      two,
+      three,
+      assists: Number(entry.assists || 0),
+      potentialAssists: Number(entry.potential_assists || 0),
+      turnovers: Number(entry.turnovers || 0),
+      points: Number(entry.points || 0),
+      unassisted: {
+        dunk: Math.max(0, dunk.mk - Number(af.dunk || 0)),
+        two: Math.max(0, two.mk - Number(af.two || 0)),
+        three: Math.max(0, three.mk - Number(af.three || 0)),
+      },
+    };
+  });
+});
+
+const CHART_HEX_RADIUS = 12;
+function chartAxialToCartesian(q, r, radius = CHART_HEX_RADIUS) {
+  const x = radius * (Math.sqrt(3) * q + (Math.sqrt(3) / 2) * r);
+  const y = radius * (1.5 * r);
+  return { x, y };
+}
+
+const shotChartConfig = computed(() => {
+  const points = [];
+  const stats = selectedEvalSummary.value;
+  if (!stats || !stats.shotChart) {
+    return { points: [], width: 0, height: 0, radius: CHART_HEX_RADIUS };
+  }
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  Object.entries(stats.shotChart).forEach(([loc, vals]) => {
+    const [q, r] = loc.split(',').map((v) => Number(v));
+    const { x, y } = chartAxialToCartesian(q, r);
+    const att = Number((vals || [])[0] || 0);
+    const makes = Number((vals || [])[1] || 0);
+    points.push({ x, y, attempts: att, makes, ratio: att > 0 ? makes / att : 0 });
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  });
+  if (points.length === 0) {
+    return { points: [], width: 0, height: 0, radius: CHART_HEX_RADIUS };
+  }
+  const margin = CHART_HEX_RADIUS * 2;
+  const width = maxX - minX + margin * 2;
+  const height = maxY - minY + margin * 2;
+  const adjusted = points.map((p) => ({
+    ...p,
+    x: p.x - minX + margin,
+    y: p.y - minY + margin,
+  }));
+  return { points: adjusted, width, height, radius: CHART_HEX_RADIUS };
+});
 
 async function recordEpisodeStats(finalState, skipApiCall = false, episodeData = null) {
   console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
@@ -1240,6 +1587,7 @@ watch(() => activeTab.value, (newTab) => {
 onMounted(() => {
   isMounted.value = true;
   fetchRewards();
+  emit('active-tab-changed', activeTab.value);
 });
 
 // Record stats once on episode completion (but skip during evaluation mode)
@@ -1272,6 +1620,7 @@ watch(() => props.externalSelections, (newSelections) => {
 watch(() => props.activePlayerId, (newVal, oldVal) => {
   if (newVal !== oldVal) {
     activeTab.value = 'controls';
+    emit('active-tab-changed', activeTab.value);
   }
 });
 
@@ -1538,6 +1887,12 @@ const stealRisks = computed(() => {
         Moves
       </button>
       <button 
+        :class="{ active: activeTab === 'eval' }"
+        @click="activeTab = 'eval'"
+      >
+        Eval
+      </button>
+      <button 
         :class="{ active: activeTab === 'environment' }"
         @click="activeTab = 'environment'"
       >
@@ -1785,6 +2140,37 @@ const stealRisks = computed(() => {
 
     <!-- Stats Tab -->
     <div v-if="activeTab === 'stats'" class="tab-content">
+      <div v-if="offensePlayerStatsTable.length" class="per-player-stats">
+        <h4>Per-Player Offense Stats (Eval)</h4>
+        <table class="per-player-table">
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>FG</th>
+              <th>Dunk</th>
+              <th>2PT</th>
+              <th>3PT</th>
+              <th>Assists</th>
+              <th>Pot. Ast</th>
+              <th>TOV</th>
+              <th>Points</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in offensePlayerStatsTable" :key="`stat-${row.playerId}`">
+              <td>Player {{ row.playerId }}</td>
+              <td>{{ row.makes }}/{{ row.attempts }} ({{ row.fg.toFixed(1) }}%)</td>
+              <td>{{ row.dunk.mk }}/{{ row.dunk.att }} ({{ row.unassisted.dunk }})</td>
+              <td>{{ row.two.mk }}/{{ row.two.att }} ({{ row.unassisted.two }})</td>
+              <td>{{ row.three.mk }}/{{ row.three.att }} ({{ row.unassisted.three }})</td>
+              <td>{{ row.assists }}</td>
+              <td>{{ row.potentialAssists }}</td>
+              <td>{{ row.turnovers }}</td>
+              <td>{{ row.points.toFixed(1) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
       <div class="rewards-section">
         <h4>Episode Stats</h4>
         <div class="parameters-grid">
@@ -1924,6 +2310,107 @@ const stealRisks = computed(() => {
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Eval Tab -->
+    <div v-if="activeTab === 'eval'" class="tab-content eval-tab">
+      <div class="eval-row">
+        <label class="inline-label">
+          <input type="radio" value="default" :checked="!evalModeIsCustom" @change="handleEvalModeChange('default')" />
+          Default (current behavior)
+        </label>
+        <label class="inline-label">
+          <input type="radio" value="custom" :checked="evalModeIsCustom" @change="handleEvalModeChange('custom')" />
+          Custom pinned setup
+        </label>
+      </div>
+
+      <div class="eval-row">
+        <label>Episodes</label>
+        <input
+          type="number"
+          min="1"
+          max="1000000"
+          :value="evalEpisodesInput"
+          @input="updateEvalEpisodes($event.target.value)"
+          :disabled="props.isEvaluating"
+        />
+        <button
+          class="eval-run-btn"
+          @click="handleEvalRunClick"
+          :disabled="props.isEvaluating || !props.gameState"
+        >
+          {{ props.isEvaluating ? 'Evaluating…' : 'Run Eval' }}
+        </button>
+        <span v-if="props.isEvaluating" class="eval-status">
+          Running {{ evalEpisodesInput }} episodes…
+        </span>
+      </div>
+
+      <div class="eval-row">
+        <label class="inline-label">
+          <input
+            type="checkbox"
+            :checked="evalConfigSafe.randomizeOffensePermutation"
+            @change="setEvalRandomizePermutation($event.target.checked)"
+          />
+          Randomize offense player slots each episode (shuffle positions)
+        </label>
+      </div>
+
+      <div v-if="evalModeIsCustom" class="eval-custom">
+        <div class="eval-row">
+          <label class="inline-label">
+            <input type="checkbox" :checked="evalPlacementEditing" @change="toggleEvalPlacement($event.target.checked)" />
+            Edit starting positions on board
+          </label>
+          <button class="ghost-btn" @click="seedEvalConfigFromGameState(false)">
+            Use current board positions
+          </button>
+        </div>
+
+        <div class="eval-row">
+          <label>Ball starts with</label>
+          <select :value="evalConfigSafe.ballHolder ?? ''" @change="setEvalBallHolder($event.target.value ? Number($event.target.value) : null)">
+            <option v-if="!ballStartOptions.length" disabled value="">No offense players</option>
+            <option v-for="pid in ballStartOptions" :key="`ball-${pid}`" :value="pid">Player {{ pid }}</option>
+          </select>
+        </div>
+
+        <div class="eval-row">
+          <label>Shooting skills</label>
+          <div class="radio-row">
+            <label class="inline-label">
+              <input type="radio" value="random" :checked="evalConfigSafe.shootingMode === 'random'" @change="setEvalShootingMode('random')" />
+              Random each episode
+            </label>
+            <label class="inline-label">
+              <input type="radio" value="fixed" :checked="evalConfigSafe.shootingMode === 'fixed'" @change="setEvalShootingMode('fixed')" />
+              Fixed overrides
+            </label>
+          </div>
+        </div>
+
+        <div v-if="evalConfigSafe.shootingMode === 'fixed'" class="eval-skills">
+          <div class="skills-header">
+            <span>Player</span>
+            <span>Layup %</span>
+            <span>3PT %</span>
+            <span>Dunk %</span>
+          </div>
+          <div class="skills-row" v-for="(row, idx) in evalOffenseSkillRows" :key="`eval-skill-${row.playerId}`">
+            <span class="skills-player">Player {{ row.playerId }}</span>
+            <input type="number" min="1" max="99" step="0.1" :value="row.layup" @input="updateEvalSkill(idx, 'layup', $event.target.value)" />
+            <input type="number" min="1" max="99" step="0.1" :value="row.threePt" @input="updateEvalSkill(idx, 'three_pt', $event.target.value)" />
+            <input type="number" min="1" max="99" step="0.1" :value="row.dunk" @input="updateEvalSkill(idx, 'dunk', $event.target.value)" />
+          </div>
+          <div class="skills-actions">
+            <button class="ghost-btn" @click="seedEvalConfigFromGameState(true)">
+              Copy sampled skills
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -3588,6 +4075,171 @@ const stealRisks = computed(() => {
 .group-lane-steps td:first-child { background-color: rgba(251, 146, 60, 0.05); }
 .group-ep td:first-child { background-color: rgba(45, 212, 191, 0.08); }
 .group-turnover td:first-child { background-color: rgba(251, 113, 133, 0.08); }
+
+/* Eval tab */
+.eval-tab .eval-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.eval-tab .inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.eval-run-btn {
+  padding: 0.5rem 1rem;
+  border-radius: 12px;
+  background: #0ea5e9;
+  color: #0b1221;
+  border: none;
+  cursor: pointer;
+}
+.eval-run-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.eval-status {
+  color: #38bdf8;
+}
+.eval-custom {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+.radio-row {
+  display: flex;
+  gap: 1rem;
+}
+.eval-skills {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.skills-header,
+.skills-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 1fr;
+  gap: 0.5rem;
+  align-items: center;
+}
+.skills-header {
+  font-size: 0.85rem;
+  color: #cbd5e1;
+  opacity: 0.8;
+}
+.skills-row input {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.7);
+  color: #e2e8f0;
+}
+.skills-player {
+  font-weight: 600;
+}
+.skills-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.25rem;
+}
+.ghost-btn {
+  background: transparent;
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  border-radius: 10px;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+}
+.ghost-btn:hover {
+  border-color: #7dd3fc;
+}
+.stats-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.eval-stats-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.stat-chip {
+  padding: 0.75rem;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.stat-chip span {
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+.stat-chip strong {
+  color: #e2e8f0;
+  font-size: 1.05rem;
+}
+.shot-chart-wrapper {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.55);
+  padding: 0.75rem;
+  margin-bottom: 1rem;
+}
+.shot-chart {
+  width: 100%;
+  max-width: 420px;
+  height: 280px;
+}
+.shot-chart-legend {
+  margin-top: 0.35rem;
+  color: #cbd5e1;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #22c55e;
+}
+.legend-dot.made {
+  background: #22c55e;
+}
+.per-player-stats {
+  margin-top: 0.75rem;
+}
+.per-player-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.per-player-table th,
+.per-player-table td {
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+.per-player-table th {
+  text-align: left;
+  color: #cbd5e1;
+}
+.per-player-table td {
+  color: #e2e8f0;
+}
 .group-steal td:first-child { background-color: rgba(251, 113, 133, 0.08); }
 
 .no-data {

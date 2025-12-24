@@ -5,7 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies } from './services/api';
+import { initGame, stepGame, getPolicyProbs, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -22,6 +22,19 @@ function normalizeShotAccumulator(acc) {
   return result;
 }
 
+function probToPercent(prob) {
+  const num = Number(prob ?? 0);
+  if (Number.isNaN(num)) return 0;
+  return Math.max(0, Math.min(100, Number((num * 100).toFixed(1))));
+}
+
+function percentToProbClamp(percent) {
+  const num = Number(percent ?? 0);
+  if (Number.isNaN(num)) return 0.01;
+  const clamped = Math.max(1, Math.min(99, num));
+  return clamped / 100;
+}
+
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
@@ -30,7 +43,22 @@ const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
-const shotAccumulatorForBoard = computed(() => shotAccumulator.value || {});
+const shotChartTarget = ref('team');
+const shotAccumulatorForBoard = computed(() => {
+  if (shotChartTarget.value === 'team' || !shotChartTarget.value) {
+    return shotAccumulator.value || {};
+  }
+  const pid = Number(shotChartTarget.value);
+  const stats = perPlayerEvalStats.value?.[pid] || perPlayerEvalStats.value?.[String(pid)];
+  if (!stats || !stats.shot_chart) return shotAccumulator.value || {};
+  const converted = {};
+  for (const [key, vals] of Object.entries(stats.shot_chart || {})) {
+    if (!Array.isArray(vals) || vals.length < 2) continue;
+    const [att, mk] = vals;
+    converted[key] = [Number(att) || 0, Number(mk) || 0];
+  }
+  return converted;
+});
 // Reflect the actions being applied on each step to keep UI tabs in sync during self-play
 const currentSelections = ref(null);
 // Track user-selected actions for display on game board
@@ -103,6 +131,29 @@ const currentShotClock = computed(() => {
 // Evaluation mode state
 const isEvaluating = ref(false);
 const evalNumEpisodes = ref(100);
+const defaultEvalConfig = () => ({
+  mode: 'default',
+  placementEditing: false,
+  positions: [],
+  ballHolder: null,
+  shootingMode: 'random',
+  skills: { layup: [], three_pt: [], dunk: [] },
+  randomizeOffensePermutation: false,
+});
+const evalConfig = ref(defaultEvalConfig());
+const perPlayerEvalStats = ref({});
+const placementPassPreview = ref({});
+const isEvalPlacementMode = computed(() => evalConfig.value.mode === 'custom');
+const activeControlsTab = ref('controls');
+const shotChartOptions = computed(() => {
+  const opts = [{ label: 'Team', value: 'team' }];
+  const offenseIds = gameState.value?.offense_ids || [];
+  if (Array.isArray(offenseIds)) {
+    offenseIds.forEach((pid) => opts.push({ label: `Player ${pid}`, value: String(pid) }));
+  }
+  return opts;
+});
+const showShotChartSelector = computed(() => !isEvalPlacementMode.value && !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0);
 
 const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
 const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
@@ -555,6 +606,10 @@ function handleMctsToggleChanged(val) {
   persistUseMcts.value = !!val;
 }
 
+function handleActiveTabChanged(tab) {
+  activeControlsTab.value = tab || 'controls';
+}
+
 // Computed: which selections to show on board (user or self-play)
 // During manual stepping (replay), show the stored actions_taken from the NEXT state
 // (because actions_taken in state N shows what was done to GET to N, but we want to show
@@ -594,6 +649,10 @@ const boardSelectedActions = computed(() => {
 
 // Handler for Self-Play button click
 function handleSelfPlayButton() {
+  if (activeControlsTab.value === 'eval') {
+    console.log('[App] Self-play disabled in Eval tab');
+    return;
+  }
   // Get current selections from PlayerControls
   const preselected = controlsRef.value?.getSelectedActions?.() || null;
   handleSelfPlay(preselected);
@@ -851,11 +910,128 @@ async function handleSelfPlay(preselected = null) {
   canReplay.value = true;
 }
 
+function handleEvalConfigChanged(nextConfig) {
+  const base = defaultEvalConfig();
+  const current = evalConfig.value || base;
+  const merged = {
+    ...base,
+    ...current,
+    ...(nextConfig || {}),
+    skills: {
+      ...base.skills,
+      ...(current.skills || {}),
+      ...(nextConfig?.skills || {}),
+    },
+  };
+  if (merged.mode !== 'custom') {
+    merged.placementEditing = false;
+  }
+  evalConfig.value = merged;
+  if (merged.mode === 'custom') {
+    refreshPlacementPreview(merged.positions, merged.ballHolder);
+  }
+  if (merged.mode !== 'custom') {
+    shotChartTarget.value = 'team';
+  }
+}
+
+function seedEvalConfigFromGameState(copySkills = true) {
+  if (!gameState.value) return;
+  const positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
+  const base = defaultEvalConfig();
+  const offenseCount = gameState.value.offense_ids?.length || 0;
+  const sourceSkills =
+    gameState.value.offense_shooting_pct_sampled ||
+    gameState.value.offense_shooting_pct_by_player ||
+    null;
+  const skills = { ...base.skills };
+  if (copySkills && sourceSkills) {
+    skills.layup = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.layup?.[idx]));
+    skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.three_pt?.[idx]));
+    skills.dunk = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.dunk?.[idx]));
+  }
+  evalConfig.value = {
+    ...base,
+    ...evalConfig.value,
+    positions,
+    ballHolder: gameState.value.ball_holder ?? evalConfig.value.ballHolder,
+    skills: copySkills ? skills : (evalConfig.value?.skills || skills),
+  };
+}
+
+function ensureEvalPositionsInitialized() {
+  if (!gameState.value) return;
+  const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+  if (!Array.isArray(evalConfig.value.positions) || evalConfig.value.positions.length !== nPlayers) {
+    seedEvalConfigFromGameState(false);
+  }
+}
+
+function handleEvalPlacementUpdate({ playerId, q, r }) {
+  if (playerId === undefined || playerId === null) return;
+  ensureEvalPositionsInitialized();
+  const positions = Array.isArray(evalConfig.value.positions)
+    ? evalConfig.value.positions.map((pos) => [pos[0], pos[1]])
+    : [];
+  positions[playerId] = [q, r];
+  handleEvalConfigChanged({ positions });
+  refreshPlacementPreview(positions, evalConfig.value.ballHolder);
+}
+
+function buildCustomEvalSetup() {
+  if (!gameState.value || evalConfig.value.mode !== 'custom') return null;
+  const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+  let positions = Array.isArray(evalConfig.value.positions) ? evalConfig.value.positions : [];
+  if (positions.length !== nPlayers && gameState.value.positions) {
+    positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
+  }
+  if (positions.length !== nPlayers) {
+    throw new Error(`Custom setup requires ${nPlayers} positions (found ${positions.length}).`);
+  }
+  const offenseIds = gameState.value.offense_ids || [];
+  const defaultBall = offenseIds.length ? offenseIds[0] : 0;
+  const rawBh = evalConfig.value.ballHolder ?? gameState.value.ball_holder ?? defaultBall;
+  const ballHolder = offenseIds.includes(rawBh) ? rawBh : defaultBall;
+  const shootingMode = evalConfig.value.shootingMode || 'random';
+  const payload = {
+    initial_positions: positions,
+    ball_holder: ballHolder,
+    shooting_mode: shootingMode,
+  };
+  if (shootingMode === 'fixed') {
+    const offenseCount = gameState.value.offense_ids?.length || 0;
+    const skills = evalConfig.value.skills || {};
+    const toProb = (arrKey) =>
+      Array.from({ length: offenseCount }, (_, idx) => percentToProbClamp(skills?.[arrKey]?.[idx] ?? 0));
+    payload.offense_skills = {
+      layup: toProb('layup'),
+      three_pt: toProb('three_pt'),
+      dunk: toProb('dunk'),
+    };
+  }
+  return payload;
+}
+
+async function refreshPlacementPreview(positionsOverride = null, ballHolderOverride = null) {
+  try {
+    if (!gameState.value || evalConfig.value.mode !== 'custom') return;
+    ensureEvalPositionsInitialized();
+    const positions = positionsOverride || evalConfig.value.positions;
+    const ballHolder = ballHolderOverride ?? evalConfig.value.ballHolder;
+    if (!Array.isArray(positions) || ballHolder === null || ballHolder === undefined) return;
+    const res = await previewPassSteal(positions, ballHolder);
+    placementPassPreview.value = res?.pass_steal_probabilities || {};
+  } catch (err) {
+    console.warn('[App] Failed to refresh placement preview:', err);
+  }
+}
+
 async function handleEvaluation() {
   if (!gameState.value || isEvaluating.value) return;
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
+  perPlayerEvalStats.value = {};
   
   // Reset stats at the beginning
   console.log('[App] Resetting stats before evaluation');
@@ -873,14 +1049,29 @@ async function handleEvaluation() {
   try {
     console.log(`[App] Starting evaluation: ${numEpisodes} episodes, playerDeterministic=${playerDeterministic.value}, opponentDeterministic=${opponentDeterministic.value}`);
     
-    // Run evaluation on backend (this will block until all episodes complete)
-    const response = await runEvaluation(numEpisodes, playerDeterministic.value, opponentDeterministic.value);
+    let customSetup = null;
+    if (evalConfig.value.mode === 'custom') {
+      try {
+        customSetup = buildCustomEvalSetup();
+      } catch (setupErr) {
+        throw new Error(setupErr.message || 'Invalid custom eval setup');
+      }
+    }
     
-    if (response.status === 'success' && Array.isArray(response.results)) {
-      console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
-      
-      // Process all episode results and update stats immediately
-      let lastEpisodeState = null;
+    // Run evaluation on backend (this will block until all episodes complete)
+    const response = await runEvaluation(
+      numEpisodes,
+      playerDeterministic.value,
+      opponentDeterministic.value,
+      customSetup,
+      !!evalConfig.value.randomizeOffensePermutation
+    );
+    
+  if (response.status === 'success' && Array.isArray(response.results)) {
+    console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
+    
+    // Process all episode results and update stats immediately
+    let lastEpisodeState = null;
       
       for (const result of response.results) {
         // Save the last episode state for display
@@ -897,6 +1088,7 @@ async function handleEvaluation() {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      perPlayerEvalStats.value = response.per_player_stats || {};
       console.log('[App] Shot accumulator keys:', Object.keys(shotAccumulator.value || {}).length, 'data:', shotAccumulator.value);
       
       // Update game state to the fresh state from backend (after evaluation reset)
@@ -905,6 +1097,9 @@ async function handleEvaluation() {
         console.log('[App] Updating gameState to fresh state from backend');
         gameState.value = response.current_state;
         gameHistory.value = [response.current_state];
+        // Exit placement/preview mode so shot charts and live controls render normally
+        evalConfig.value = defaultEvalConfig();
+        placementPassPreview.value = {};
       } else if (lastEpisodeState) {
         // Fallback for older backend versions
         console.log('[App] Updating gameState to show last episode (isEvaluating still true)');
@@ -926,6 +1121,19 @@ async function handleEvaluation() {
     isEvaluating.value = false;
   }
 }
+
+function handleEvalRunRequested(payload) {
+  if (payload?.numEpisodes) {
+    evalNumEpisodes.value = payload.numEpisodes;
+  }
+  if (payload?.config) {
+    handleEvalConfigChanged(payload.config);
+  }
+  refreshPlacementPreview(payload?.config?.positions, payload?.config?.ballHolder);
+  handleEvaluation();
+}
+
+const liveButtonsDisabled = computed(() => activeControlsTab.value === 'eval');
 
 function stateHasAnimatedFlash(state) {
   const results = state?.last_action_results;
@@ -1207,6 +1415,8 @@ function handlePlayAgain() {
   gameHistory.value = [];
   policyProbs.value = null;
   shotAccumulator.value = {};
+  placementPassPreview.value = {};
+  evalConfig.value = defaultEvalConfig();
   activePlayerId.value = null;
   currentSelections.value = null;
   userSelections.value = {};
@@ -1216,6 +1426,9 @@ function handlePlayAgain() {
   isManualStepping.value = false;
   replayStates.value = [];
   currentStepIndex.value = 0;
+  isEvaluating.value = false;
+  perPlayerEvalStats.value = {};
+  evalNumEpisodes.value = 100;
   if (initialSetup.value) {
     handleGameStarted(initialSetup.value);
   }
@@ -1312,38 +1525,20 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div v-if="gameState && !gameState.done && !isSelfPlaying" class="eval-controls">
-          <div class="eval-controls-row">
-            <input 
-              type="number" 
-              v-model.number="evalNumEpisodes" 
-              min="1" 
-              max="1000000" 
-              class="eval-input"
-              :disabled="isEvaluating"
-              placeholder="Num episodes"
-            />
-            <button 
-              @click="handleEvaluation" 
-              class="eval-button"
-              :disabled="isEvaluating || isSelfPlaying"
-            >
-              {{ isEvaluating ? 'Evaluating...' : 'Eval' }}
-            </button>
-            <span v-if="isEvaluating" class="eval-status">
-              Running {{ evalNumEpisodes }} episodes...
-            </span>
-          </div>
-          <div v-if="isEvaluating" class="eval-progress-bar">
-            <div class="eval-progress-fill indeterminate"></div>
-          </div>
-        </div>
       </div>
     </div>
 
     <div v-if="gameState" class="game-container">
       <div class="board-area">
         <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
+        <div v-if="showShotChartSelector" class="shot-chart-selector">
+          <label>Shot chart:</label>
+          <select v-model="shotChartTarget">
+            <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+        </div>
         <GameBoard 
           ref="gameBoardRef"
           :game-history="gameHistory" 
@@ -1352,7 +1547,14 @@ onBeforeUnmount(() => {
           :is-manual-stepping="isManualStepping"
           :selected-actions="boardSelectedActions"
           :shot-accumulator="shotAccumulatorForBoard"
+          :shot-chart-label="shotChartOptions.find(o => o.value === shotChartTarget)?.label || ''"
+          :placement-mode="isEvalPlacementMode"
+          :placement-editable="evalConfig.placementEditing"
+          :placement-positions="evalConfig.positions"
+          :placement-ball-holder="evalConfig.ballHolder"
+          :placement-pass-probs="placementPassPreview"
           @update-player-position="handlePlayerPositionUpdate"
+          @update-placement="handleEvalPlacementUpdate"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
@@ -1376,29 +1578,35 @@ onBeforeUnmount(() => {
             :stored-policy-probs="policyProbs"
             :mcts-results="lastMctsResults"
             :initial-use-mcts="persistUseMcts"
-            :mcts-step-running="isMctsStepRunning"
-            :ai-mode="aiMode"
-            :deterministic="playerDeterministic"
-            :opponent-deterministic="opponentDeterministic"
-            :move-history="moveHistory"
-            :current-shot-clock="currentShotClock"
-            :external-selections="isSelfPlaying ? currentSelections : null"
-            @actions-submitted="handleActionsSubmitted" 
-            @move-recorded="handleMoveRecorded"
-            @policy-swap-requested="handlePolicySwap"
-            @selections-changed="handleSelectionsChanged"
-            @refresh-policies="handleRefreshPolicies"
-            @mcts-options-changed="handleMctsOptionsChanged"
-            @mcts-toggle-changed="handleMctsToggleChanged"
-            @state-updated="handlePatchedGameState"
-            ref="controlsRef"
+          :mcts-step-running="isMctsStepRunning"
+          :ai-mode="aiMode"
+          :deterministic="playerDeterministic"
+          :opponent-deterministic="opponentDeterministic"
+          :move-history="moveHistory"
+          :current-shot-clock="currentShotClock"
+          :external-selections="isSelfPlaying ? currentSelections : null"
+          :eval-config="evalConfig"
+          :eval-num-episodes="evalNumEpisodes"
+          :per-player-eval-stats="perPlayerEvalStats"
+          @actions-submitted="handleActionsSubmitted" 
+          @move-recorded="handleMoveRecorded"
+          @policy-swap-requested="handlePolicySwap"
+          @selections-changed="handleSelectionsChanged"
+          @refresh-policies="handleRefreshPolicies"
+          @mcts-options-changed="handleMctsOptionsChanged"
+          @mcts-toggle-changed="handleMctsToggleChanged"
+          @state-updated="handlePatchedGameState"
+          @eval-config-changed="handleEvalConfigChanged"
+          @eval-run="handleEvalRunRequested"
+          @active-tab-changed="handleActiveTabChanged"
+          ref="controlsRef"
         />
 
         <div class="action-buttons">
           <button 
             @click="controlsRef?.submitActions?.()" 
             class="action-button submit-button" 
-            :disabled="gameState.done"
+            :disabled="gameState.done || liveButtonsDisabled"
           >
             {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
           </button>
@@ -1406,7 +1614,7 @@ onBeforeUnmount(() => {
           <button 
             @click="handleSelfPlayButton" 
             class="action-button self-play-button"
-            :disabled="!aiMode || gameState.done"
+            :disabled="!aiMode || gameState.done || liveButtonsDisabled"
           >
             Self-Play
           </button>
@@ -1416,6 +1624,7 @@ onBeforeUnmount(() => {
             @click="handleResetPositions" 
             class="action-button reset-button" 
             title="Reset player positions to start of turn"
+            :disabled="liveButtonsDisabled"
           >
             Reset Pos
           </button>
@@ -1654,6 +1863,23 @@ header {
   text-transform: uppercase;
   margin-bottom: 0.5rem;
   text-align: center;
+}
+.shot-chart-selector {
+  margin: -0.25rem 0 0.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.shot-chart-selector label {
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
+}
+.shot-chart-selector select {
+  background: rgba(13, 20, 38, 0.85);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: var(--app-text);
+  border-radius: 10px;
+  padding: 0.25rem 0.5rem;
 }
 
 .controls-area {

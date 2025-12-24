@@ -245,19 +245,37 @@ export async function getPhiLog() {
   return response.json();
 }
 
-export async function runEvaluation(numEpisodes = 100, playerDeterministic = false, opponentDeterministic = true) {
+export async function runEvaluation(numEpisodes = 100, playerDeterministic = false, opponentDeterministic = true, customSetup = null, randomizeOffensePermutation = false) {
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ 
       num_episodes: numEpisodes, 
       player_deterministic: playerDeterministic,
-      opponent_deterministic: opponentDeterministic
+      opponent_deterministic: opponentDeterministic,
+      custom_setup: customSetup || null,
+      randomize_offense_permutation: Boolean(randomizeOffensePermutation),
     }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to run evaluation');
+  }
+  return response.json();
+}
+
+export async function previewPassSteal(positions, ballHolder) {
+  const response = await fetch(`${API_BASE_URL}/api/pass_steal_preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      positions,
+      ball_holder: ballHolder,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to preview pass steal probabilities');
   }
   return response.json();
 }

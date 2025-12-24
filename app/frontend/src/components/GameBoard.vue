@@ -39,9 +39,33 @@ const props = defineProps({
     type: Number,
     default: 1,
   },
+  shotChartLabel: {
+    type: String,
+    default: '',
+  },
+  placementMode: {
+    type: Boolean,
+    default: false,
+  },
+  placementPositions: {
+    type: Array,
+    default: null,
+  },
+  placementBallHolder: {
+    type: Number,
+    default: null,
+  },
+  placementEditable: {
+    type: Boolean,
+    default: false,
+  },
+  placementPassProbs: {
+    type: Object,
+    default: () => ({}),
+  },
 });
 
-const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock']);
+const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
 
 // ------------------------------------------------------------
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
@@ -254,8 +278,11 @@ function onGlobalMouseUp(event) {
       );
       
       if (!isOccupied && (currentPos[0] !== newPos[0] || currentPos[1] !== newPos[1])) {
-         // Emit update event
-         emit('update-player-position', { playerId: pid, q: newPos[0], r: newPos[1] });
+         if (props.placementMode && props.placementEditable) {
+           emit('update-placement', { playerId: pid, q: newPos[0], r: newPos[1] });
+         } else if (!props.placementMode) {
+           emit('update-player-position', { playerId: pid, q: newPos[0], r: newPos[1] });
+         }
       }
     }
   }
@@ -268,7 +295,17 @@ function onGlobalMouseUp(event) {
 
 
 const currentGameState = computed(() => {
-  return props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
+  const base = props.gameHistory.length > 0 ? props.gameHistory[props.gameHistory.length - 1] : null;
+  if (!base) return null;
+  if (!props.placementMode) return base;
+  const cloned = { ...base };
+  if (Array.isArray(props.placementPositions) && props.placementPositions.length === (base.positions?.length || 0)) {
+    cloned.positions = props.placementPositions.map((pos) => [pos[0], pos[1]]);
+  }
+  if (props.placementBallHolder !== null && props.placementBallHolder !== undefined) {
+    cloned.ball_holder = props.placementBallHolder;
+  }
+  return cloned;
 });
 
 const allPoliciesVisible = computed(() => {
@@ -334,6 +371,22 @@ const courtLayout = computed(() => {
 });
 
 const shotCountsMap = computed(() => props.shotAccumulator || {});
+const shotChartLabel = computed(() => props.shotChartLabel || '');
+const shotChartTitlePos = computed(() => {
+  const vbString = viewBox.value;
+  if (!vbString) return { x: 0, y: 0 };
+  const parts = vbString.split(' ').map((val) => Number(val));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) {
+    return { x: 0, y: 0 };
+  }
+  const [minX, minY, width, height] = parts;
+  const paddingX = HEX_RADIUS * 1.5;
+  const paddingY = HEX_RADIUS * 0.8;
+  return {
+    x: minX + width - paddingX,
+    y: minY + height - paddingY,
+  };
+});
 
 const shotCountsNormalized = computed(() => {
   const out = {};
@@ -372,7 +425,7 @@ const shotCountList = computed(() => {
   }));
 });
 
-const hasShotCounts = computed(() => shotCountList.value.length > 0);
+const hasShotCounts = computed(() => !props.placementMode && shotCountList.value.length > 0);
 
 const shotOverlayPoints = computed(() => {
   if (!hasShotCounts.value) return [];
@@ -1050,6 +1103,8 @@ const passRays = computed(() => {
   const teamIds = isOffense ? gs.offense_ids : gs.defense_ids;
   
   const rays = [];
+  const usePlacementPreview = !!(props.placementMode && props.placementEditable && props.placementPassProbs && Object.keys(props.placementPassProbs || {}).length);
+  const stealMap = usePlacementPreview ? props.placementPassProbs : (passStealProbs.value || {});
   for (const teammateId of teamIds) {
     if (teammateId === ballHandlerId) continue;
     
@@ -1059,9 +1114,15 @@ const passRays = computed(() => {
     const [tmQ, tmR] = teammatePos;
     const tmCoords = axialToCartesian(tmQ, tmR);
     
-    const stealProb = passStealProbs.value[teammateId];
-    if (stealProb === undefined) continue;
-    const stealPercent = Math.round(stealProb * 100);
+    const stealProbRaw = stealMap ? stealMap[teammateId] : null;
+    const hasProb = stealProbRaw !== null && stealProbRaw !== undefined && !Number.isNaN(Number(stealProbRaw));
+    // In live mode, if no probability is available, skip drawing this ray (preserves old behavior)
+    if (!hasProb && !usePlacementPreview) continue;
+    const stealProb = hasProb ? Number(stealProbRaw) : 0;
+    const probFraction = stealProb > 1 ? stealProb / 100 : stealProb;
+    const stealPercent = hasProb ? probFraction * 100 : null;
+    const stealLabel = hasProb ? `${stealPercent.toFixed(1)}%` : '—';
+    const stealOpacity = hasProb ? probToStealAlpha(probFraction) : 0.3;
     
     // Calculate midpoint for label placement
     const midX = (bhCoords.x + tmCoords.x) / 2;
@@ -1074,8 +1135,9 @@ const passRays = computed(() => {
       y2: tmCoords.y,
       midX,
       midY,
-      stealProb: stealPercent, // Rounded to nearest percent
-      stealOpacity: probToStealAlpha(stealProb),
+      stealProb: stealPercent, // Rounded to nearest percent (nullable)
+      stealLabel,
+      stealOpacity,
       teammateId,
     });
   }
@@ -1923,6 +1985,15 @@ onBeforeUnmount(() => {
         
         <!-- Shot count annotations (from evaluation) -->
         <g class="shot-count-layer" v-if="hasShotCounts">
+        <text
+          v-if="shotChartLabel"
+          :x="shotChartTitlePos.x"
+          :y="shotChartTitlePos.y"
+          text-anchor="end"
+          class="shot-chart-title"
+        >
+          {{ shotChartLabel }}
+        </text>
         <polygon
           v-for="pt in shotOverlayPoints"
           :key="`shot-poly-${pt.key}`"
@@ -1971,7 +2042,7 @@ onBeforeUnmount(() => {
             class="steal-prob-label"
             :opacity="ray.stealOpacity"
           >
-            {{ ray.stealProb }}%
+            {{ ray.stealLabel }}
           </text>
         </g>
 
@@ -2543,6 +2614,12 @@ svg {
   font-size: 0.60rem;
   font-weight: 500;
   text-shadow: 0 0 3px rgba(0, 0, 0, 0.6);
+}
+.shot-chart-title {
+  fill: #fbbf24;
+  font-size: 0.9rem;
+  font-weight: 800;
+  text-shadow: 0 0 8px rgba(0,0,0,0.65);
 }
 
 .legend-overlay {
