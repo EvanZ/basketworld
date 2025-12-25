@@ -787,21 +787,13 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         # Reset environment with seed and custom setup (if provided)
         reset_opts = _build_reset_options_for_custom_setup(custom_setup, enforce_fixed_skills=True)
         obs, _ = env.reset(seed=seed, options=reset_opts)
-        perm = None
+        policy_order = None
         if randomize_offense_permutation:
             try:
-                perm = _sample_offense_permutation(env, np.random.default_rng(int(seed)))
+                policy_order = _build_offense_policy_order(env, np.random.default_rng(int(seed)))
             except Exception:
-                perm = None
-        if perm:
-            _apply_offense_permutation_in_env(env, perm)
-            obs = {
-                "obs": env._get_observation(),
-                "action_mask": env._get_action_masks(),
-                "role_flag": np.array([_worker_state["role_flag_offense"]], dtype=np.float32),
-                "skills": env._get_offense_skills_array(),
-            }
-            perm = None
+                policy_order = None
+        policy_env = _build_policy_env_view(env) if policy_order else env
         episode_shots: dict[str, list[int]] = {}
         
         done = False
@@ -813,20 +805,33 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         
         # Run episode until done
         while not done and step_count < 1000:
+            policy_obs = obs
+            if policy_order:
+                policy_obs = _build_permuted_policy_obs(
+                    env,
+                    policy_order,
+                    _worker_state["role_flag_offense"],
+                    normalize_obs=getattr(env, "normalize_obs", True),
+                )
+
             # Get actions from unified policy (for user team)
             resolved_unified = _worker_predict_policy_actions(
-                unified_policy, obs, env, player_deterministic, player_strategy
+                unified_policy, policy_obs, policy_env, player_deterministic, player_strategy
             )
             if resolved_unified is None:
                 resolved_unified = np.zeros(env.n_players, dtype=int)
+            elif policy_order:
+                resolved_unified = _unpermute_actions_policy_to_env(resolved_unified, policy_order, env.n_players)
             
             # Get actions from opponent policy (or use unified if no separate opponent)
             if opponent_policy is not None:
                 resolved_opponent = _worker_predict_policy_actions(
-                    opponent_policy, obs, env, opponent_deterministic, opponent_strategy
+                    opponent_policy, policy_obs, policy_env, opponent_deterministic, opponent_strategy
                 )
             else:
                 resolved_opponent = np.array(resolved_unified)
+            if policy_order:
+                resolved_opponent = _unpermute_actions_policy_to_env(resolved_opponent, policy_order, env.n_players)
             
             # Combine actions based on team roles
             final_action = np.zeros(env.n_players, dtype=np.int32)
@@ -986,22 +991,13 @@ def _run_sequential_evaluation(
         seed = int(np.random.randint(0, 2**31 - 1))
         reset_opts = _build_reset_options_for_custom_setup(custom_setup, enforce_fixed_skills=True)
         obs, _ = game_state.env.reset(seed=seed, options=reset_opts)
-        perm = None
+        policy_order = None
         if randomize_offense_permutation:
             try:
-                perm = _sample_offense_permutation(game_state.env, np.random.default_rng(seed))
+                policy_order = _build_offense_policy_order(game_state.env, np.random.default_rng(seed))
             except Exception:
-                perm = None
-        if perm:
-            _apply_offense_permutation_in_env(game_state.env, perm)
-            obs = {
-                "obs": game_state.env._get_observation(),
-                "action_mask": game_state.env._get_action_masks(),
-                "role_flag": np.array([game_state.role_flag_offense], dtype=np.float32),
-                "skills": game_state.env._get_offense_skills_array(),
-            }
-            # After physical permutation, no need to virtual-permute policy inputs
-            perm = None
+                policy_order = None
+        policy_env = _build_policy_env_view(game_state.env) if policy_order else game_state.env
         
         episode_shots: dict[str, list[int]] = {}
         
@@ -1014,28 +1010,42 @@ def _run_sequential_evaluation(
         
         # Run episode until done
         while not done and step_count < 1000:
+            # Build policy-facing observation (optionally permuted)
+            policy_obs = obs
+            if policy_order:
+                policy_obs = _build_permuted_policy_obs(
+                    game_state.env,
+                    policy_order,
+                    game_state.role_flag_offense,
+                    normalize_obs=getattr(game_state.env, "normalize_obs", True),
+                )
+
             # Get actions from unified policy (for user team)
             resolved_unified, _ = _predict_policy_actions(
                 game_state.unified_policy,
-                obs,
-                game_state.env,
+                policy_obs,
+                policy_env,
                 deterministic=player_deterministic,
                 strategy=player_strategy,
             )
             if resolved_unified is None:
                 resolved_unified = np.zeros(game_state.env.n_players, dtype=int)
+            elif policy_order:
+                resolved_unified = _unpermute_actions_policy_to_env(resolved_unified, policy_order, game_state.env.n_players)
             
             # Get actions from opponent policy (or use unified if no separate opponent)
             if game_state.defense_policy is not None:
                 resolved_opponent, _ = _predict_policy_actions(
                     game_state.defense_policy,
-                    obs,
-                    game_state.env,
+                    policy_obs,
+                    policy_env,
                     deterministic=opponent_deterministic,
                     strategy=opponent_strategy,
                 )
             else:
                 resolved_opponent = np.array(resolved_unified)
+            if policy_order:
+                resolved_opponent = _unpermute_actions_policy_to_env(resolved_opponent, policy_order, game_state.env.n_players)
             
             # Combine actions based on team roles
             final_action = np.zeros(game_state.env.n_players, dtype=np.int32)
@@ -4321,6 +4331,10 @@ class UpdateShotClockRequest(BaseModel):
     delta: int
 
 
+class SetBallHolderRequest(BaseModel):
+    player_id: int
+
+
 class BatchUpdatePositionRequest(BaseModel):
     updates: List[UpdatePositionRequest]
 
@@ -4643,6 +4657,50 @@ def set_shot_clock(req: UpdateShotClockRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to set shot clock: {e}")
+
+
+@app.post("/api/set_ball_holder")
+def set_ball_holder(req: SetBallHolderRequest):
+    """Manually set the ball handler during a live game (offense only)."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot set ball holder after episode has ended.")
+
+    pid = int(req.player_id)
+    if pid not in getattr(game_state.env, "offense_ids", []):
+        raise HTTPException(status_code=400, detail="Ball holder must be an offensive player.")
+
+    try:
+        game_state.env.ball_holder = pid
+
+        obs_vec = game_state.env._get_observation()
+        action_mask = game_state.env._get_action_masks()
+        new_obs_dict = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": np.array(
+                [1.0 if game_state.env.training_team == Team.OFFENSE else -1.0],
+                dtype=np.float32,
+            ),
+            "skills": game_state.env._get_offense_skills_array(),
+        }
+        game_state.obs = new_obs_dict
+        game_state.prev_obs = None
+
+        return {
+            "status": "success",
+            "state": get_full_game_state(
+                include_policy_probs=True,
+                include_action_values=True,
+                include_state_values=True,
+            ),
+        }
+    except Exception as e:
+        print(f"[set_ball_holder] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to set ball holder: {e}")
 
 
 @app.post("/api/set_pass_target_strategy")

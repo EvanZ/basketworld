@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setBallHolder } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -514,6 +514,30 @@ async function handlePassTargetStrategyChange(event) {
   }
 }
 
+async function handleBallHolderChange(val) {
+  if (val === null || val === undefined) return;
+  const pid = Number(val);
+  if (Number.isNaN(pid) || !offenseIdsLive.value.includes(pid)) {
+    return;
+  }
+  if (!props.gameState || props.isEvaluating || props.isReplaying) return;
+  ballHolderUpdating.value = true;
+  ballHolderError.value = null;
+  try {
+    const res = await setBallHolder(pid);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to set ball holder');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to set ball holder', err);
+    ballHolderError.value = err?.message || 'Failed to set ball holder';
+  } finally {
+    ballHolderUpdating.value = false;
+  }
+}
+
 // Add rewards tracking
 const activeTab = ref('controls');
 const rewardHistory = ref([]);
@@ -529,6 +553,8 @@ const advisorUsePriors = ref(true);
 const advisorResults = ref({}); // playerId -> advisor result
 const advisorError = ref(null);
 const advisorLoading = ref(false);
+const ballHolderUpdating = ref(false);
+const ballHolderError = ref(null);
 const advisorSelectedPlayerIds = ref([]);
 const advisorProgress = ref(0);
 const useMctsForStep = ref(!!props.initialUseMcts);
@@ -913,6 +939,8 @@ const allPlayerIds = computed(() => {
   }
   return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
 });
+const offenseIdsLive = computed(() => props.gameState?.offense_ids || []);
+const ballHolderSelection = computed(() => props.gameState?.ball_holder ?? null);
 
 function computeEntropy(probArray) {
   if (!Array.isArray(probArray)) return null;
@@ -1920,6 +1948,20 @@ const stealRisks = computed(() => {
 
     <!-- Controls Tab -->
     <div v-if="activeTab === 'controls'" class="tab-content">
+      <div class="ball-holder-row">
+        <label>Ball handler</label>
+        <select
+          :value="ballHolderSelection ?? ''"
+          @change="handleBallHolderChange($event.target.value)"
+          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || offenseIdsLive.length === 0"
+        >
+          <option v-if="offenseIdsLive.length === 0" disabled value="">No offense players</option>
+          <option v-for="pid in offenseIdsLive" :key="`bh-${pid}`" :value="pid">Player {{ pid }}</option>
+        </select>
+        <span v-if="ballHolderUpdating" class="status-note">Updating…</span>
+        <span v-if="ballHolderError" class="error-note">{{ ballHolderError }}</span>
+      </div>
+
       <div class="player-tabs">
           <button 
               v-for="playerId in allPlayerIds" 
@@ -4040,6 +4082,23 @@ const stealRisks = computed(() => {
   color: var(--app-accent);
   min-width: 140px;
   border-right: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.ball-holder-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.status-note {
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.error-note {
+  color: #ff7676;
+  font-size: 0.85rem;
 }
 
 .value-mono {

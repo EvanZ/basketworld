@@ -319,6 +319,19 @@ export async function setShotClock(delta) {
   return response.json();
 }
 
+export async function setBallHolder(playerId) {
+  const response = await fetch(`${API_BASE_URL}/api/set_ball_holder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ player_id: playerId }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set ball holder');
+  }
+  return response.json();
+}
+
 export async function resetTurnState() {
   const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
     method: 'POST',
