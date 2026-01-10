@@ -274,3 +274,17 @@ class BetaSetterWrapper(gym.Wrapper):
             self.env.unwrapped.set_pass_target_strategy(strategy)
         except Exception:
             pass
+
+    def get_profile_stats(self):  # pragma: no cover
+        """Expose profiling stats without deprecated wrapper forwarding."""
+        try:
+            return self.env.unwrapped.get_profile_stats()
+        except Exception:
+            return {}
+
+    def reset_profile_stats(self) -> None:  # pragma: no cover
+        """Reset profiling stats without deprecated wrapper forwarding."""
+        try:
+            self.env.unwrapped.reset_profile_stats()
+        except Exception:
+            pass
