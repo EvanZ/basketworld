@@ -12,9 +12,6 @@ class MLflowWriter(KVWriter):
 
     def write(self, key_values: Dict[str, Any], key_excludes: Dict[str, str], step: int = 0) -> None:
         for key, value in key_values.items():
-            # The previous exclusion logic was too aggressive and has been removed.
-            # We will now attempt to log all scalar values passed to the writer.
-
             # Handle tensor values by converting them to a scalar float
             if hasattr(value, "item"):
                 value = value.item()
@@ -26,4 +23,4 @@ class MLflowWriter(KVWriter):
         pass
 
     def flush(self) -> None:  # noqa: D401
-        pass 
+        pass
