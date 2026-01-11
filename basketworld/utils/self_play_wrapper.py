@@ -197,3 +197,15 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             self.env.unwrapped.set_pass_oob_turnover_prob(float(value))
         except Exception:
             pass
+
+    def get_profile_stats(self):  # pragma: no cover - thin shim
+        try:
+            return self.env.unwrapped.get_profile_stats()
+        except Exception:
+            return {}
+
+    def reset_profile_stats(self) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.reset_profile_stats()
+        except Exception:
+            pass

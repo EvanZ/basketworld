@@ -166,6 +166,14 @@ class HexagonBasketballEnv(gym.Env):
     ):
         super().__init__()
 
+        # Initialize caches early (used by coordinate helpers before full precompute)
+        self._offset_to_axial_cache: list[list[Tuple[int, int]]] = []
+        self._axial_to_offset_cache: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._valid_axial: set[Tuple[int, int]] = set()
+        self._axial_to_cart_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        self._hex_distance_lut = None
+        self._cell_index: Dict[Tuple[int, int], int] = {}
+
         self.grid_size = grid_size
         self.court_width = int(court_cols) if court_cols is not None else int(grid_size * 1.0)
         self.court_height = int(court_rows) if court_rows is not None else grid_size
@@ -368,6 +376,10 @@ class HexagonBasketballEnv(gym.Env):
         ]
 
         self._rng = np.random.default_rng(seed)
+        self._offset_to_axial_cache: list[list[Tuple[int, int]]] = []
+        self._axial_to_offset_cache: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._valid_axial: set[Tuple[int, int]] = set()
+        self._axial_to_cart_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
 
         # Game state
         self.positions: List[Tuple[int, int]] = []  # (q, r) axial coordinates
@@ -385,9 +397,11 @@ class HexagonBasketballEnv(gym.Env):
         # Precompute per-cell move validity mask (6 directions) to speed up action mask building
         # 1 = allowed, 0 = blocked (OOB or basket hex if dunks disabled)
         self._move_mask_by_cell: Dict[Tuple[int, int], np.ndarray] = {}
+        all_cells: List[Tuple[int, int]] = []
         for row in range(self.court_height):
             for col in range(self.court_width):
                 cell = self._offset_to_axial(col, row)
+                all_cells.append(cell)
                 allowed = np.ones(6, dtype=np.int8)
                 for dir_idx in range(6):
                     nbr = (
@@ -399,6 +413,8 @@ class HexagonBasketballEnv(gym.Env):
                     ):
                         allowed[dir_idx] = 0
                 self._move_mask_by_cell[cell] = allowed
+        self._precompute_coord_caches(all_cells)
+        self._precompute_hex_distance_lut(all_cells)
 
         # Precompute shoot/pass action indices
         self._shoot_pass_action_indices = [ActionType.SHOOT.value] + [
@@ -472,27 +488,66 @@ class HexagonBasketballEnv(gym.Env):
             float(self.dunk_pct)
         ] * self.players_per_side
 
-    @profile_section("_offset_to_axial")
-    def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
-        """Converts odd-r offset coordinates to axial coordinates."""
+    @staticmethod
+    def _offset_to_axial_formula(col: int, row: int) -> Tuple[int, int]:
+        """Pure conversion odd-r offset -> axial."""
         q = col - (row - (row & 1)) // 2
         r = row
         return q, r
 
-    @profile_section("_axial_to_offset")
-    def _axial_to_offset(self, q: int, r: int) -> Tuple[int, int]:
-        """Converts axial coordinates to odd-r offset coordinates."""
+    @staticmethod
+    def _axial_to_offset_formula(q: int, r: int) -> Tuple[int, int]:
+        """Pure conversion axial -> odd-r offset."""
         col = q + (r - (r & 1)) // 2
         row = r
         return col, row
 
-    @profile_section("_axial_to_cartesian")
-    def _axial_to_cartesian(self, q: int, r: int) -> Tuple[float, float]:
+    @staticmethod
+    def _axial_to_cartesian_formula(q: int, r: int) -> Tuple[float, float]:
         """Convert axial (q, r) to cartesian (x, y) matching rendering geometry."""
         size = 1.0
         x = size * (math.sqrt(3) * q + math.sqrt(3) / 2 * r)
         y = size * (1.5 * r)
         return x, y
+
+    @profile_section("_offset_to_axial")
+    def _offset_to_axial(self, col: int, row: int) -> Tuple[int, int]:
+        """Converts odd-r offset coordinates to axial coordinates."""
+        cache = getattr(self, "_offset_to_axial_cache", None)
+        if cache and 0 <= row < len(cache) and 0 <= col < len(cache[row]):
+            return cache[row][col]
+        return self._offset_to_axial_formula(col, row)
+
+    @profile_section("_axial_to_offset")
+    def _axial_to_offset(self, q: int, r: int) -> Tuple[int, int]:
+        """Converts axial coordinates to odd-r offset coordinates."""
+        cached = self._axial_to_offset_cache.get((q, r))
+        if cached is not None:
+            return cached
+        return self._axial_to_offset_formula(q, r)
+
+    @profile_section("_axial_to_cartesian")
+    def _axial_to_cartesian(self, q: int, r: int) -> Tuple[float, float]:
+        """Convert axial (q, r) to cartesian (x, y) matching rendering geometry."""
+        cached = self._axial_to_cart_cache.get((q, r))
+        if cached is not None:
+            return cached
+        return self._axial_to_cartesian_formula(q, r)
+
+    def _precompute_coord_caches(self, cells: List[Tuple[int, int]]) -> None:
+        """Precompute common coordinate conversions for all on-court cells."""
+        self._offset_to_axial_cache = [
+            [self._offset_to_axial_formula(c, r) for c in range(self.court_width)]
+            for r in range(self.court_height)
+        ]
+        self._axial_to_offset_cache = {}
+        self._axial_to_cart_cache = {}
+        for r in range(self.court_height):
+            for c in range(self.court_width):
+                axial = self._offset_to_axial_cache[r][c]
+                self._axial_to_offset_cache[axial] = (c, r)
+                self._axial_to_cart_cache[axial] = self._axial_to_cartesian_formula(*axial)
+        self._valid_axial = set(cells) if cells else set(self._axial_to_offset_cache.keys())
 
     @profile_section("_axial_to_cube")
     def _axial_to_cube(self, q: int, r: int) -> Tuple[int, int, int]:
@@ -519,12 +574,32 @@ class HexagonBasketballEnv(gym.Env):
             x, y, z = self._rotate60_cw_cube(x, y, z)
         return self._cube_to_axial(x, y, z)
 
+    @staticmethod
+    def _hex_distance_formula(q1: int, r1: int, q2: int, r2: int) -> int:
+        """Closed-form hex distance on axial coords."""
+        return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
+
     @profile_section("_hex_distance")
     def _hex_distance(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
         """Calculate distance between two hexagon positions."""
+        if self._hex_distance_lut is not None:
+            idx1 = self._cell_index.get(pos1)
+            idx2 = self._cell_index.get(pos2)
+            if idx1 is not None and idx2 is not None:
+                return int(self._hex_distance_lut[idx1, idx2])
         q1, r1 = pos1
         q2, r2 = pos2
-        return (abs(q1 - q2) + abs(q1 + r1 - q2 - r2) + abs(r1 - r2)) // 2
+        return self._hex_distance_formula(q1, r1, q2, r2)
+
+    def _precompute_hex_distance_lut(self, cells: List[Tuple[int, int]]) -> None:
+        """Precompute hex distances between all on-court cells for fast lookup."""
+        self._cell_index = {cell: idx for idx, cell in enumerate(cells)}
+        n = len(cells)
+        lut = np.zeros((n, n), dtype=np.int16)
+        for i, (q1, r1) in enumerate(cells):
+            for j, (q2, r2) in enumerate(cells):
+                lut[i, j] = self._hex_distance_formula(q1, r1, q2, r2)
+        self._hex_distance_lut = lut
 
     @profile_section("_defender_is_guarding_offense")
     def _defender_is_guarding_offense(self, defender_id: int) -> bool:
@@ -1332,7 +1407,9 @@ class HexagonBasketballEnv(gym.Env):
     @profile_section("_is_valid_position")
     def _is_valid_position(self, q: int, r: int) -> bool:
         """Check if a hexagon position is within the rectangular court bounds."""
-        col, row = self._axial_to_offset(q, r)
+        if self._valid_axial:
+            return (q, r) in self._valid_axial
+        col, row = self._axial_to_offset_formula(q, r)
         return 0 <= col < self.court_width and 0 <= row < self.court_height
     
     @profile_section("_calculate_offensive_lane_hexes")
