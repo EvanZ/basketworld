@@ -1,4 +1,6 @@
 import copy
+import logging
+import os
 
 from fastapi import APIRouter, HTTPException
 import mlflow
@@ -20,6 +22,7 @@ from basketworld.envs.basketworld_env_v2 import Team
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/api/batch_update_player_positions")
@@ -249,6 +252,7 @@ def swap_policies(req: SwapPoliciesRequest):
                 pass
             policies_changed = True
         except Exception as e:
+            logger.exception("swap_policies: failed loading user policy %s", requested_user_policy)
             raise HTTPException(status_code=500, detail=f"Failed to load user policy '{requested_user_policy}': {e}")
 
     if requested_opponent_policy is not None:
@@ -274,6 +278,7 @@ def swap_policies(req: SwapPoliciesRequest):
                     pass
                 policies_changed = True
             except Exception as e:
+                logger.exception("swap_policies: failed loading opponent policy %s", requested_opponent_policy)
                 raise HTTPException(status_code=500, detail=f"Failed to load opponent policy '{requested_opponent_policy}': {e}")
 
     if not policies_changed:
@@ -294,4 +299,9 @@ def swap_policies(req: SwapPoliciesRequest):
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
 
+    logger.info(
+        "swap_policies success: user=%s opponent=%s",
+        game_state.unified_policy_key,
+        game_state.opponent_unified_policy_key,
+    )
     return {"status": "success", "state": updated_state}
