@@ -1658,14 +1658,39 @@ const phiRef = vueRef(null);
 
 // Observation parsing utilities
 function getAngleDescription(cosAngle) {
-  if (cosAngle > 0.9) return '👍 In front (defender blocking)';
-  if (cosAngle > 0.5) return '📍 Somewhat in front';
-  if (cosAngle > -0.5) return '↔️ Side (help defense)';
-  if (cosAngle > -0.9) return '📍 Somewhat behind';
-  return '🔙 Behind (beaten)';
+  if (!Number.isFinite(cosAngle)) return '';
+  const angle = Math.max(-1, Math.min(1, cosAngle));
+  const absAngle = Math.abs(angle);
+  if (absAngle < 0.05) return '➡️ On basket line';
+  if (absAngle < 0.25) return angle > 0 ? '↗️ Left of basket line' : '↘️ Right of basket line';
+  if (absAngle < 0.5) return angle > 0 ? '⬆️ Far left of basket line' : '⬇️ Far right of basket line';
+  if (absAngle < 0.75) return angle > 0 ? '⬅️ Behind-left' : '➡️ Behind-right';
+  return angle > 0 ? '⬅️ Opposite direction' : '➡️ Opposite direction';
+}
+
+function formatAngleValue(cosAngle) {
+  const numeric = Number.isFinite(cosAngle) ? cosAngle : 0;
+  const clamped = Math.max(-1, Math.min(1, numeric));
+  const degrees = clamped * 180;
+  return `${clamped.toFixed(4)} (${degrees.toFixed(1)}°)`;
 }
 
 // Computed properties for observation parsing
+const offenseIds = computed(() => props.gameState?.offense_ids || []);
+const defenseIds = computed(() => props.gameState?.defense_ids || []);
+
+function formatOffenseId(index) {
+  const ids = offenseIds.value;
+  if (Number.isInteger(ids[index])) return ids[index];
+  return index;
+}
+
+function formatDefenseId(index) {
+  const ids = defenseIds.value;
+  if (Number.isInteger(ids[index])) return ids[index];
+  return offenseIds.value.length + index;
+}
+
 const numDefenders = computed(() => {
   if (!props.gameState) return 0;
   return props.gameState.defense_ids?.length || 0;
@@ -1730,8 +1755,11 @@ const obsMeta = computed(() => {
   const nDefense = gs.defense_ids?.length || 0;
   const nPlayers = nOffense + nDefense;
   const allPairsSize = nOffense * nDefense;
-  const teammatePerTeam = Math.max(0, nOffense - 1);
-  const teammateDistanceSize = 2 * teammatePerTeam;
+  const offensePairs = (nOffense * (nOffense - 1)) / 2;
+  const defensePairs = (nDefense * (nDefense - 1)) / 2;
+  const teammatePairCount = offensePairs + defensePairs;
+  const teammateDistanceSize = teammatePairCount;
+  const teammateAngleSize = (nOffense * (nOffense - 1)) + (nDefense * (nDefense - 1));
   let offset = 0;
   offset += nPlayers * 2; // player positions
   offset += nPlayers; // ball holder one-hot
@@ -1751,7 +1779,7 @@ const obsMeta = computed(() => {
   const teammateDistanceStart = offset;
   offset += teammateDistanceSize;
   const teammateAngleStart = offset;
-  offset += teammateDistanceSize;
+  offset += teammateAngleSize;
   const laneStepsStart = offset;
   const laneStepsLen = nPlayers;
   offset += laneStepsLen;
@@ -1773,6 +1801,7 @@ const obsMeta = computed(() => {
     teammateDistanceStart,
     teammateAngleStart,
     teammateDistanceSize,
+    teammateAngleSize,
     laneStepsStart,
     laneStepsLen,
     expectedPointsStart,
@@ -1780,7 +1809,7 @@ const obsMeta = computed(() => {
     turnoverStart,
     stealStart,
     nOffense,
-    perTeamTeammate: teammatePerTeam,
+    teammatePairCount,
   };
 });
 
@@ -1811,22 +1840,43 @@ const teammateDistances = computed(() => {
 const teammateAngles = computed(() => {
   const meta = obsMeta.value;
   const obs = props.gameState?.obs;
-  if (!meta || !obs || meta.teammateDistanceSize === 0) return [];
+  if (!meta || !obs || meta.teammateAngleSize === 0) return [];
   return obs.slice(
     meta.teammateAngleStart,
-    meta.teammateAngleStart + meta.teammateDistanceSize,
+    meta.teammateAngleStart + meta.teammateAngleSize,
   );
 });
 
-const teammateLabels = computed(() => {
+const teammateDistanceLabels = computed(() => {
   const meta = obsMeta.value;
-  if (!meta || meta.perTeamTeammate === 0) return [];
+  if (!meta || meta.teammatePairCount === 0) return [];
   const labels = [];
   const appendTeam = (teamIds, label) => {
     if (!teamIds || teamIds.length <= 1) return;
-    const baseId = teamIds[0];
-    for (let i = 1; i < teamIds.length; i += 1) {
-      labels.push(`${label} base P${baseId} → P${teamIds[i]}`);
+    for (let i = 0; i < teamIds.length - 1; i += 1) {
+      const baseId = teamIds[i];
+      for (let j = i + 1; j < teamIds.length; j += 1) {
+        labels.push(`${label} P${baseId} → P${teamIds[j]}`);
+      }
+    }
+  };
+  appendTeam(props.gameState.offense_ids, 'Offense');
+  appendTeam(props.gameState.defense_ids, 'Defense');
+  return labels;
+});
+
+const teammateAngleLabels = computed(() => {
+  const meta = obsMeta.value;
+  if (!meta || meta.teammateAngleSize === 0) return [];
+  const labels = [];
+  const appendTeam = (teamIds, label) => {
+    if (!teamIds || teamIds.length <= 1) return;
+    for (let i = 0; i < teamIds.length; i += 1) {
+      const baseId = teamIds[i];
+      for (let j = 0; j < teamIds.length; j += 1) {
+        if (j === i) continue;
+        labels.push(`${label} P${baseId} → P${teamIds[j]}`);
+      }
     }
   };
   appendTeam(props.gameState.offense_ids, 'Offense');
@@ -3056,16 +3106,16 @@ const stealRisks = computed(() => {
               <!-- All-Pairs Distances -->
               <tr v-for="(dist, idx) in allPairsDistances" :key="`dist-${idx}`" class="group-distances">
                 <td v-if="idx === 0" :rowspan="allPairsDistances.length" class="group-label">All-Pairs Distances</td>
-                <td>O{{ Math.floor(idx / numDefenders) }} → D{{ idx % numDefenders }}</td>
+                <td>O{{ formatOffenseId(Math.floor(idx / numDefenders)) }} → D{{ formatDefenseId(idx % numDefenders) }}</td>
                 <td class="value-mono">{{ dist.toFixed(4) }}</td>
                 <td class="notes">Hex distance</td>
               </tr>
 
               <!-- All-Pairs Angles -->
               <tr v-for="(angle, idx) in allPairsAngles" :key="`angle-${idx}`" class="group-angles">
-                <td v-if="idx === 0" :rowspan="allPairsAngles.length" class="group-label">All-Pairs Angles (cos)</td>
-                <td>O{{ Math.floor(idx / numDefenders) }} → D{{ idx % numDefenders }}</td>
-                <td class="value-mono">{{ angle.toFixed(4) }}</td>
+                <td v-if="idx === 0" :rowspan="allPairsAngles.length" class="group-label">All-Pairs Angles (signed)</td>
+                <td>O{{ formatOffenseId(Math.floor(idx / numDefenders)) }} → D{{ formatDefenseId(idx % numDefenders) }}</td>
+                <td class="value-mono">{{ formatAngleValue(angle) }}</td>
                 <td class="notes">{{ getAngleDescription(angle) }}</td>
               </tr>
 
@@ -3082,7 +3132,7 @@ const stealRisks = computed(() => {
                 >
                   Teammate Distances
                 </td>
-                <td>{{ teammateLabels[idx] || 'Teammate spacing' }}</td>
+                <td>{{ teammateDistanceLabels[idx] || 'Teammate spacing' }}</td>
                 <td class="value-mono">{{ dist.toFixed(4) }}</td>
                 <td class="notes">Team spacing</td>
               </tr>
@@ -3098,10 +3148,10 @@ const stealRisks = computed(() => {
                   :rowspan="teammateAngles.length"
                   class="group-label"
                 >
-                  Teammate Angles (cos)
+                  Teammate Angles (signed)
                 </td>
-                <td>{{ teammateLabels[idx] || 'Teammate direction' }}</td>
-                <td class="value-mono">{{ angle.toFixed(4) }}</td>
+                <td>{{ teammateAngleLabels[idx] || 'Teammate direction' }}</td>
+                <td class="value-mono">{{ formatAngleValue(angle) }}</td>
                 <td class="notes">{{ getAngleDescription(angle) }}</td>
               </tr>
 
@@ -3116,7 +3166,7 @@ const stealRisks = computed(() => {
               <!-- Expected Points -->
               <tr v-for="(ep, idx) in expectedPoints" :key="`ep-${idx}`" class="group-ep">
                 <td v-if="idx === 0" :rowspan="expectedPoints.length" class="group-label">Expected Points (EP)</td>
-                <td>O{{ idx }}</td>
+                <td>O{{ formatOffenseId(idx) }}</td>
                 <td class="value-mono">{{ ep.toFixed(4) }}</td>
                 <td class="notes">Shot quality estimate</td>
               </tr>
@@ -3124,7 +3174,7 @@ const stealRisks = computed(() => {
               <!-- Turnover Probabilities -->
               <tr v-for="(prob, idx) in turnoverProbs" :key="`turnover-${idx}`" class="group-turnover">
                 <td v-if="idx === 0" :rowspan="turnoverProbs.length" class="group-label">Turnover Probs</td>
-                <td>O{{ idx }}</td>
+                <td>O{{ formatOffenseId(idx) }}</td>
                 <td class="value-mono">{{ prob.toFixed(4) }}</td>
                 <td v-if="prob > 0" class="notes highlight">🚨 Risk</td>
                 <td v-else class="notes">No risk</td>
@@ -3133,7 +3183,7 @@ const stealRisks = computed(() => {
               <!-- Steal Risks -->
               <tr v-for="(risk, idx) in stealRisks" :key="`steal-${idx}`" class="group-steal">
                 <td v-if="idx === 0" :rowspan="stealRisks.length" class="group-label">Steal Risks</td>
-                <td>O{{ idx }}</td>
+                <td>O{{ formatOffenseId(idx) }}</td>
                 <td class="value-mono">{{ risk.toFixed(4) }}</td>
                 <td v-if="risk > 0" class="notes highlight">⚠️ Risk</td>
                 <td v-else class="notes">Safe</td>
