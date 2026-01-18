@@ -18,7 +18,7 @@ def get_player_distances(env, base_id: int, target_ids: List[int]) -> np.ndarray
 
 
 def get_player_angles(env, base_id: int, target_ids: List[int]) -> np.ndarray:
-    """Return cosine angles between base→target and base→basket for each target."""
+    """Return signed angles (normalized to [-1, 1]) between base→target and base→basket."""
     import math
 
     if not env.positions or base_id >= len(env.positions):
@@ -27,28 +27,25 @@ def get_player_angles(env, base_id: int, target_ids: List[int]) -> np.ndarray:
     base_pos = env.positions[base_id]
     to_basket_q = env.basket_position[0] - base_pos[0]
     to_basket_r = env.basket_position[1] - base_pos[1]
-    basket_mag_sq = to_basket_q ** 2 + to_basket_r ** 2 + to_basket_q * to_basket_r
-    basket_mag = math.sqrt(max(0.0, basket_mag_sq))
+    basket_x, basket_y = env._axial_to_cartesian(to_basket_q, to_basket_r)
+    basket_mag = math.hypot(basket_x, basket_y)
 
     angles: List[float] = []
     for target_id in target_ids:
         target_pos = env.positions[target_id]
         to_target_q = target_pos[0] - base_pos[0]
         to_target_r = target_pos[1] - base_pos[1]
-        target_mag_sq = to_target_q ** 2 + to_target_r ** 2 + to_target_q * to_target_r
-        target_mag = math.sqrt(max(0.0, target_mag_sq))
+        target_x, target_y = env._axial_to_cartesian(to_target_q, to_target_r)
+        target_mag = math.hypot(target_x, target_y)
 
         if target_mag == 0 or basket_mag == 0:
-            cos_angle = 0.0
+            signed_angle = 0.0
         else:
-            dot = (
-                to_basket_q * to_target_q
-                + to_basket_r * to_target_r
-                + to_basket_q * to_target_r
-            )
-            cos_angle = dot / (basket_mag * target_mag)
-            cos_angle = max(-1.0, min(1.0, cos_angle))
-        angles.append(float(cos_angle))
+            dot = (basket_x * target_x) + (basket_y * target_y)
+            cross = (basket_x * target_y) - (basket_y * target_x)
+            angle_rad = math.atan2(cross, dot)
+            signed_angle = angle_rad / math.pi
+        angles.append(float(signed_angle))
 
     return np.array(angles, dtype=np.float32)
 
@@ -72,10 +69,31 @@ def _collect_teammate_features(
     team_ids: List[int],
     getter: Callable[[int, List[int]], np.ndarray],
 ) -> np.ndarray:
-    """Collect features from the first teammate to their squad-mates."""
+    """Collect features for all unordered teammate pairs."""
     if len(team_ids) <= 1:
         return np.array([], dtype=np.float32)
-    return _collect_pairwise_features([team_ids[0]], team_ids[1:], getter)
+    values: List[float] = []
+    for idx, base_id in enumerate(team_ids[:-1]):
+        feature_vec = getter(base_id, team_ids[idx + 1 :])
+        values.extend(feature_vec.tolist())
+    return np.array(values, dtype=np.float32)
+
+
+def _collect_teammate_angle_features(
+    team_ids: List[int],
+    getter: Callable[[int, List[int]], np.ndarray],
+) -> np.ndarray:
+    """Collect features for all ordered teammate pairs."""
+    if len(team_ids) <= 1:
+        return np.array([], dtype=np.float32)
+    values: List[float] = []
+    for base_id in team_ids:
+        targets = [target_id for target_id in team_ids if target_id != base_id]
+        if not targets:
+            continue
+        feature_vec = getter(base_id, targets)
+        values.extend(feature_vec.tolist())
+    return np.array(values, dtype=np.float32)
 
 
 def calculate_offense_defense_distances(env) -> np.ndarray:
@@ -107,10 +125,10 @@ def calculate_teammate_distances(env) -> np.ndarray:
 
 
 def calculate_teammate_angles(env) -> np.ndarray:
-    offense_angles = _collect_teammate_features(
+    offense_angles = _collect_teammate_angle_features(
         env.offense_ids, lambda base, targets: get_player_angles(env, base, targets)
     )
-    defense_angles = _collect_teammate_features(
+    defense_angles = _collect_teammate_angle_features(
         env.defense_ids, lambda base, targets: get_player_angles(env, base, targets)
     )
     if offense_angles.size or defense_angles.size:

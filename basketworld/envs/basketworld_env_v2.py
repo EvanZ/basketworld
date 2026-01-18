@@ -321,8 +321,10 @@ class HexagonBasketballEnv(gym.Env):
         ep_extra = self.players_per_side  # EP for each offensive player
         turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
         steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
-        teammate_distance_extra = 2 * max(0, self.players_per_side - 1)
-        teammate_angle_extra = 2 * max(0, self.players_per_side - 1)
+        teammate_distance_pairs = (self.players_per_side * (self.players_per_side - 1)) // 2
+        teammate_angle_pairs = self.players_per_side * (self.players_per_side - 1)
+        teammate_distance_extra = 2 * teammate_distance_pairs
+        teammate_angle_extra = 2 * teammate_angle_pairs
         state_vector_length = (
             base_len
             + team_encoding_extra

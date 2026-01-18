@@ -51,8 +51,12 @@ def generate_initial_positions(env) -> List[Tuple[int, int]]:
     for pos in offense_positions:
         taken_positions.add(pos)
 
+    # Randomize offense order to avoid fixed defense-to-offense matchups.
+    offense_for_match = list(offense_positions)
+    rng.shuffle(offense_for_match)
+
     defense_positions = []
-    for off_pos in offense_positions:
+    for off_pos in offense_for_match:
         candidates = []
         target_dist_from_offense = max(0, env.defender_spawn_distance)
         for cell in all_cells:
