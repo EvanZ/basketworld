@@ -11,6 +11,7 @@ from basketworld.utils.wrappers import (
     EpisodeStatsWrapper,
     BetaSetterWrapper,
     EnvIndexWrapper,
+    SetObservationWrapper,
 )
 
 
@@ -84,6 +85,8 @@ def setup_environment(args, training_team, env_idx=None):
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
     env = BetaSetterWrapper(env)
+    if getattr(args, "use_set_obs", False):
+        env = SetObservationWrapper(env)
     monitored_env = Monitor(
         env,
         info_keywords=(

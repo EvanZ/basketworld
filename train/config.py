@@ -431,6 +431,14 @@ def get_parser() -> argparse.ArgumentParser:
         help="Normalize relative coordinates to roughly [-1,1].",
     )
     parser.add_argument(
+        "--use-set-obs",
+        dest="use_set_obs",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Expose set-based token observations under 'players' and 'globals' "
+        "(keeps existing obs keys).",
+    )
+    parser.add_argument(
         "--mask-occupied-moves",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,

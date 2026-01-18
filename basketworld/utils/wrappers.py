@@ -5,6 +5,120 @@ import numpy as np
 from basketworld.envs.basketworld_env_v2 import Team
 
 
+class SetObservationWrapper(gym.ObservationWrapper):
+    """Expose set-based player tokens + globals while preserving existing obs keys."""
+
+    _TOKEN_DIM = 8
+    _GLOBAL_DIM = 3
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        n_players = int(self.env.unwrapped.n_players)
+
+        if isinstance(env.observation_space, gym.spaces.Dict):
+            spaces_dict = dict(env.observation_space.spaces)
+        else:
+            spaces_dict = {"obs": env.observation_space}
+
+        spaces_dict["players"] = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(n_players, self._TOKEN_DIM),
+            dtype=np.float32,
+        )
+        spaces_dict["globals"] = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self._GLOBAL_DIM,),
+            dtype=np.float32,
+        )
+        self.observation_space = gym.spaces.Dict(spaces_dict)
+
+    def observation(self, obs):  # type: ignore[override]
+        if isinstance(obs, dict):
+            obs_dict = dict(obs)
+        else:
+            obs_dict = {"obs": obs}
+
+        env = self.env.unwrapped
+        n_players = int(env.n_players)
+        norm_den = float(max(env.court_width, env.court_height)) or 1.0
+        if not getattr(env, "normalize_obs", True):
+            norm_den = 1.0
+
+        skills_by_player: dict[int, np.ndarray] = {}
+        if hasattr(env, "offense_layup_pct_by_player"):
+            for idx, pid in enumerate(env.offense_ids):
+                skills_by_player[int(pid)] = np.array(
+                    [
+                        float(env.offense_layup_pct_by_player[idx]),
+                        float(env.offense_three_pt_pct_by_player[idx]),
+                        float(env.offense_dunk_pct_by_player[idx]),
+                    ],
+                    dtype=np.float32,
+                )
+        else:
+            base_layup = float(getattr(env, "layup_pct", 0.0))
+            base_three = float(getattr(env, "three_pt_pct", 0.0))
+            base_dunk = float(getattr(env, "dunk_pct", 0.0))
+            skills = obs_dict.get("skills")
+            if skills is not None:
+                skills_arr = np.asarray(skills, dtype=np.float32).reshape(-1)
+                for idx, pid in enumerate(env.offense_ids):
+                    start = idx * 3
+                    if start + 2 < len(skills_arr):
+                        skills_by_player[int(pid)] = np.array(
+                            [
+                                base_layup + float(skills_arr[start]),
+                                base_three + float(skills_arr[start + 1]),
+                                base_dunk + float(skills_arr[start + 2]),
+                            ],
+                            dtype=np.float32,
+                        )
+
+        max_lane_steps = float(getattr(env, "three_second_max_steps", 1) or 1)
+        players = np.zeros((n_players, self._TOKEN_DIM), dtype=np.float32)
+        for pid in range(n_players):
+            q, r = env.positions[pid]
+            role = 1.0 if pid in env.offense_ids else -1.0
+            has_ball = 1.0 if env.ball_holder == pid else 0.0
+            skill_vec = skills_by_player.get(pid, np.zeros(3, dtype=np.float32))
+            if pid in env.offense_ids:
+                lane_steps = env._offensive_lane_steps.get(pid, 0)
+            else:
+                lane_steps = env._defender_in_key_steps.get(pid, 0)
+            lane_steps_norm = float(lane_steps) / max_lane_steps
+            if lane_steps_norm > 1.0:
+                lane_steps_norm = 1.0
+
+            players[pid] = np.array(
+                [
+                    float(q) / norm_den,
+                    float(r) / norm_den,
+                    role,
+                    has_ball,
+                    float(skill_vec[0]) if skill_vec.size > 0 else 0.0,
+                    float(skill_vec[1]) if skill_vec.size > 1 else 0.0,
+                    float(skill_vec[2]) if skill_vec.size > 2 else 0.0,
+                    lane_steps_norm,
+                ],
+                dtype=np.float32,
+            )
+
+        hoop_q, hoop_r = env.basket_position
+        globals_vec = np.array(
+            [
+                float(env.shot_clock),
+                float(hoop_q) / norm_den,
+                float(hoop_r) / norm_den,
+            ],
+            dtype=np.float32,
+        )
+        obs_dict["players"] = players
+        obs_dict["globals"] = globals_vec
+        return obs_dict
+
+
 class RewardAggregationWrapper(gym.Wrapper):
     """Aggregate team rewards so the Monitor sees a single reward per step.
 
