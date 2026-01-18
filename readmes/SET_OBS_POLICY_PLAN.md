@@ -43,6 +43,7 @@ robust to arbitrary player ordering.
 **Offense vs defense note**
 
 Use one schema for all players. For fields that only apply to one side:
+
 - `has_ball`: set to 1 only for the current ball handler; 0 otherwise (both teams).
 - `lane_steps_norm`: offense uses offensive lane steps; defense uses defender-in-key steps.
 - Any offense-only field not listed above should be set to 0 for defense (and vice-versa)
@@ -66,14 +67,26 @@ Use one schema for all players. For fields that only apply to one side:
   - Computes per-player logits with a **shared action head**: `logits_i = g(z_i)`.
   - Flattens logits only at the very end for SB3 MultiCategorical (shape `(B, N*A)`).
 - Decision: keep the existing **dual-critic** structure (offense/defense value heads).
-  - Use permutation-invariant aggregates per team (e.g., mean of offense tokens vs defense tokens)
-    to preserve equivariance.
+  - Use **team CLS tokens** (one offense, one defense) for value heads to avoid pooling player tokens.
+- Decision: keep **pass-logit bias** support for parity with existing training schedules.
+- Defaults: `set_embed_dim=64`, `set_heads=4`, `set_token_mlp_dim=64`, `set_cls_tokens=2`.
 
 ### Phase 3: Training/Eval integration
 
 - Update `train/env_factory.py` to apply the set wrapper when flag enabled.
 - Update `train/train.py` and `train/policy_utils.py` to register the new policy.
 - Ensure `basketworld/utils/self_play_wrapper.py` passes through the new dict obs.
+
+### Phase 3b: Tests/Validation
+
+- Unit tests for wrapper:
+  - Shape checks for `(n_players, F)` and `(G,)`.
+  - Deterministic values from a fixed env state.
+- Model tests:
+  - Token permutation test: reorder player tokens and confirm logits are unchanged
+    (up to permutation for non-self tokens).
+- Integration test:
+  - One PPO step with the new policy, ensure no runtime errors.
 
 ### Phase 4: Backend (web app) impacts
 
@@ -90,17 +103,8 @@ Use one schema for all players. For fields that only apply to one side:
 - Keep current observation table intact by default (flat obs).
 - Decision: add a “Token View” to display per-player tokens + globals.
 - Decision: show an attention map (per-player attention weights) for debugging.
-
-### Phase 6: Tests
-
-- Unit tests for wrapper:
-  - Shape checks for `(n_players, F)` and `(G,)`.
-  - Deterministic values from a fixed env state.
-- Model tests:
-  - Token permutation test: reorder player tokens and confirm logits are unchanged
-    (up to permutation for non-self tokens).
-- Integration test:
-  - One PPO step with the new policy, ensure no runtime errors.
+  - Note: training/inference do not request attention weights; `average_attn_weights`
+    only affects debug/inspection output (per-head vs mean).
 
 ## Rollout Strategy
 

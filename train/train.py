@@ -51,6 +51,7 @@ from basketworld.utils.schedule_state import (
     calculate_continued_total_timesteps,
 )
 from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 import re
 
@@ -234,13 +235,25 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
+        if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
+            print("[Warning] Set-attention policy requires dual critics; enabling use_dual_critic.")
+            args.use_dual_critic = True
+
         # Log policy architecture (single vs dual critic, single vs dual policy)
         mlflow.log_param("use_dual_critic", args.use_dual_critic)
         mlflow.log_param("use_dual_policy", args.use_dual_policy)
-        policy_class_name = "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy"
+        if getattr(args, "use_set_obs", False):
+            policy_class_name = "SetAttentionDualCriticPolicy"
+        else:
+            policy_class_name = "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy"
         if args.use_dual_policy:
             policy_class_name += " (dual_policy=True)"
         mlflow.log_param("policy_class", policy_class_name)
+        if getattr(args, "use_set_obs", False):
+            mlflow.log_param("set_embed_dim", getattr(args, "set_embed_dim", 64))
+            mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
+            mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
+            mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
         
         print(f"MLflow Run ID: {run.info.run_id}")
 
@@ -280,8 +293,26 @@ def main(args):
             pi_arch = getattr(args, "net_arch_pi", [64, 64])
             vf_arch = getattr(args, "net_arch_vf", [64, 64])
             policy_kwargs["net_arch"] = dict(pi=pi_arch, vf=vf_arch)
-        # Prevent the policy from learning directly from action_mask
-        policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
+        use_set_obs = getattr(args, "use_set_obs", False)
+        if use_set_obs:
+            # Set-attention policy expects tokens and does its own extraction.
+            if args.net_arch is not None:
+                print("[Warning] --net-arch is ignored for set-attention policy.")
+            policy_kwargs["net_arch"] = []
+            policy_kwargs["embed_dim"] = int(getattr(args, "set_embed_dim", 64))
+            policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
+            policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))
+            policy_kwargs["num_cls_tokens"] = int(getattr(args, "set_cls_tokens", 2))
+            print(
+                "Set-attention config:",
+                f"embed_dim={policy_kwargs['embed_dim']}",
+                f"n_heads={policy_kwargs['n_heads']}",
+                f"token_mlp_dim={policy_kwargs['token_mlp_dim']}",
+                f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
+            )
+        else:
+            # Prevent the policy from learning directly from action_mask
+            policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
         
         # Enable dual policy (separate action networks for offense/defense) if requested
         if args.use_dual_policy:
@@ -312,7 +343,15 @@ def main(args):
                     uni_local = client.download_artifacts(
                         args.continue_run_id, uni_art, tmpd
                     )
-                    unified_policy = PPO.load(uni_local, env=temp_env, device=device)
+                    custom_objects = {
+                        "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+                        "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+                        "SetAttentionExtractor": SetAttentionExtractor,
+                    }
+                    unified_policy = PPO.load(
+                        uni_local, env=temp_env, device=device, custom_objects=custom_objects
+                    )
                     print(
                         f"  - Loaded latest unified policy: {os.path.basename(uni_art)}"
                     )
@@ -328,8 +367,11 @@ def main(args):
                 )
                 initial_ent_coef = float(start)
             
-            # Choose policy class based on --use-dual-critic flag
-            policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
+            # Choose policy class based on flags
+            if getattr(args, "use_set_obs", False):
+                policy_class = SetAttentionDualCriticPolicy
+            else:
+                policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
             
             unified_policy = PPO(
                 policy_class,
@@ -679,6 +721,22 @@ def main(args):
                     )
                     unified_policy.save(fallback_path)
                     opponent_for_offense = fallback_path
+            # Log opponent selection to stdout for quick sanity checks
+            try:
+                if isinstance(opponent_for_offense, list):
+                    from collections import Counter
+                    counts = Counter(
+                        os.path.basename(str(p)) for p in opponent_for_offense
+                    )
+                    print("Opponent selection (per-env):")
+                    for name, count in counts.most_common():
+                        print(f"  {name}: {count} env(s)")
+                else:
+                    print(
+                        f"Opponent selection: {os.path.basename(str(opponent_for_offense))}"
+                    )
+            except Exception:
+                pass
             # Log which opponent checkpoint(s) used this alternation
             try:
                 with tempfile.TemporaryDirectory() as _tmp_note_dir:

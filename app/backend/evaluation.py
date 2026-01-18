@@ -13,6 +13,7 @@ from basketworld.utils.action_resolution import (
     resolve_illegal_actions,
 )
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from stable_baselines3 import PPO
 
 from app.backend.mcts import _run_mcts_advisor
@@ -55,6 +56,8 @@ def _init_evaluation_worker(
         "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+        "SetAttentionExtractor": SetAttentionExtractor,
     }
     unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
     opponent_policy = (
@@ -99,6 +102,10 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
         cloned["skills"] = _np.copy(skills)
     else:
         cloned["skills"] = None
+    if "players" in obs:
+        cloned["players"] = _np.copy(obs["players"])
+    if "globals" in obs:
+        cloned["globals"] = _np.copy(obs["globals"])
     return cloned
 
 
@@ -836,6 +843,8 @@ def run_evaluation(
             "policy_class": PassBiasDualCriticPolicy,
             "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
             "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+            "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+            "SetAttentionExtractor": SetAttentionExtractor,
         }
         unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
         opponent_policy = (

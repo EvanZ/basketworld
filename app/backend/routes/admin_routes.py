@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 import mlflow
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 from app.backend.schemas import (
     BatchUpdatePositionRequest,
@@ -232,6 +233,8 @@ def swap_policies(req: SwapPoliciesRequest):
         "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+        "SetAttentionExtractor": SetAttentionExtractor,
     }
 
     policies_changed = False

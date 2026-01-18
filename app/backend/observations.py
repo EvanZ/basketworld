@@ -26,6 +26,10 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
         cloned["skills"] = np.copy(skills)
     else:
         cloned["skills"] = None
+    if "players" in obs:
+        cloned["players"] = np.copy(obs["players"])
+    if "globals" in obs:
+        cloned["globals"] = np.copy(obs["globals"])
     return cloned
 
 
@@ -181,12 +185,17 @@ def _build_role_conditioned_obs(base_obs: dict | None, role_flag_value: float):
     """Prepare an observation payload with a specific role flag for value prediction."""
     if base_obs is None or "obs" not in base_obs or "action_mask" not in base_obs:
         return None
-    return {
+    conditioned = {
         "obs": np.copy(base_obs["obs"]),
         "action_mask": base_obs["action_mask"],
         "role_flag": np.array([role_flag_value], dtype=np.float32),
         "skills": np.copy(base_obs.get("skills")) if base_obs.get("skills") is not None else None,
     }
+    if "players" in base_obs:
+        conditioned["players"] = np.copy(base_obs["players"])
+    if "globals" in base_obs:
+        conditioned["globals"] = np.copy(base_obs["globals"])
+    return conditioned
 
 
 def _compute_state_values_from_obs(obs_dict: dict | None):
