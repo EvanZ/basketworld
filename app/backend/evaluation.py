@@ -53,7 +53,6 @@ def _init_evaluation_worker(
     )
 
     custom_objects = {
-        "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
@@ -840,7 +839,6 @@ def run_evaluation(
     if num_workers is None or num_workers <= 1:
         env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
         custom_objects = {
-            "policy_class": PassBiasDualCriticPolicy,
             "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
             "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
             "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,

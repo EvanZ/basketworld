@@ -43,6 +43,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
         self.attn = nn.MultiheadAttention(self.embed_dim, n_heads, batch_first=True)
+        self.attn_norm = nn.LayerNorm(self.embed_dim)
         if self.num_cls_tokens > 0:
             self.cls_tokens = nn.Parameter(th.zeros(self.num_cls_tokens, self.embed_dim))
         else:
@@ -59,6 +60,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             cls = self.cls_tokens.unsqueeze(0).expand(batch, -1, -1)
             emb = th.cat([emb, cls], dim=1)
         attn_out, _ = self.attn(emb, emb, emb, need_weights=False)
+        attn_out = self.attn_norm(emb + attn_out)
         return attn_out.reshape(attn_out.size(0), -1)
 
 

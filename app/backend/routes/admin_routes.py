@@ -230,7 +230,6 @@ def swap_policies(req: SwapPoliciesRequest):
 
     client = mlflow.tracking.MlflowClient()
     custom_objects = {
-        "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,

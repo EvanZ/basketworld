@@ -1675,6 +1675,37 @@ function formatAngleValue(cosAngle) {
   return `${clamped.toFixed(4)} (${degrees.toFixed(1)}°)`;
 }
 
+function formatTokenValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  return numeric.toFixed(4);
+}
+
+function attentionColor(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return { r: 15, g: 23, b: 42, a: 0.0 };
+  }
+  const range = attentionRange.value;
+  const denom = range.max - range.min;
+  const normalized = denom > 0 ? (numeric - range.min) / denom : 0;
+  const intensity = Math.max(0, Math.min(1, normalized));
+  const start = { r: 59, g: 130, b: 246 }; // blue-500
+  const end = { r: 249, g: 115, b: 22 }; // orange-500
+  const r = Math.round(start.r + (end.r - start.r) * intensity);
+  const g = Math.round(start.g + (end.g - start.g) * intensity);
+  const b = Math.round(start.b + (end.b - start.b) * intensity);
+  const a = 0.12 + intensity * 0.75;
+  return { r, g, b, a };
+}
+
+function attentionCellStyle(value) {
+  const color = attentionColor(value);
+  return {
+    backgroundColor: `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a.toFixed(3)})`,
+  };
+}
+
 // Computed properties for observation parsing
 const offenseIds = computed(() => props.gameState?.offense_ids || []);
 const defenseIds = computed(() => props.gameState?.defense_ids || []);
@@ -1811,6 +1842,181 @@ const obsMeta = computed(() => {
     nOffense,
     teammatePairCount,
   };
+});
+
+const obsTokens = computed(() => props.gameState?.obs_tokens || null);
+const tokenFeatureLabels = [
+  'q_norm',
+  'r_norm',
+  'role',
+  'has_ball',
+  'skill_layup',
+  'skill_3pt',
+  'skill_dunk',
+  'lane_steps_norm',
+];
+const tokenGlobalLabels = ['shot_clock', 'hoop_q_norm', 'hoop_r_norm'];
+
+const tokenPlayers = computed(() => {
+  const players = obsTokens.value?.players;
+  return Array.isArray(players) ? players : [];
+});
+
+const tokenGlobals = computed(() => {
+  const globals = obsTokens.value?.globals;
+  return Array.isArray(globals) ? globals : [];
+});
+
+const tokenAttention = computed(() => obsTokens.value?.attention || null);
+const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
+const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
+const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
+const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
+const attentionView = ref('avg');
+const attentionHeadOptions = computed(() => {
+  const count = tokenAttentionHeads.value || 0;
+  return Array.from({ length: count }, (_, idx) => idx);
+});
+const tokenAttentionMatrix = computed(() => {
+  if (attentionView.value === 'avg') {
+    return tokenAttentionAvgWeights.value;
+  }
+  const idx = Number(attentionView.value);
+  const heads = tokenAttentionHeadWeights.value;
+  if (!Array.isArray(heads) || !Array.isArray(heads[idx])) {
+    return tokenAttentionAvgWeights.value;
+  }
+  return heads[idx];
+});
+const tokenAttentionSubtitle = computed(() => {
+  const count = tokenAttentionHeads.value;
+  if (!count) return '';
+  if (attentionView.value === 'avg') {
+    return `Average of ${count} heads`;
+  }
+  const idx = Number(attentionView.value);
+  if (!Number.isFinite(idx)) return `Average of ${count} heads`;
+  return `Head ${idx + 1} of ${count}`;
+});
+const attentionRange = computed(() => {
+  const weights = tokenAttentionMatrix.value;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of weights) {
+    if (!Array.isArray(row)) continue;
+    for (const val of row) {
+      const num = Number(val);
+      if (!Number.isFinite(num)) continue;
+      if (num < min) min = num;
+      if (num > max) max = num;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return { min: 0, max: 1 };
+  }
+  if (max <= min) {
+    return { min, max: min + 1 };
+  }
+  return { min, max };
+});
+
+function downloadAttentionPng() {
+  if (!tokenAttentionMatrix.value.length) {
+    alert('No attention data available.');
+    return;
+  }
+  const labels = tokenAttentionLabels.value;
+  const matrix = tokenAttentionMatrix.value;
+  const n = matrix.length;
+
+  const padding = 12;
+  const fontSize = 12;
+  const font = `${fontSize}px "Courier New", monospace`;
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.font = font;
+  let maxLabelWidth = 0;
+  labels.forEach((label) => {
+    const width = ctx.measureText(String(label)).width;
+    if (width > maxLabelWidth) maxLabelWidth = width;
+  });
+  const cellSize = Math.max(36, Math.ceil(maxLabelWidth) + 12);
+  const headerSize = Math.max(cellSize + padding, Math.ceil(maxLabelWidth) + padding * 2);
+  const width = headerSize + cellSize * n;
+  const height = headerSize + cellSize * n;
+
+  const scale = 2;
+  canvas.width = Math.ceil(width * scale);
+  canvas.height = Math.ceil(height * scale);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = '#cbd5f5';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = font;
+
+  for (let c = 0; c < n; c += 1) {
+    const label = labels[c] ?? `T${c}`;
+    const x = headerSize + c * cellSize + cellSize / 2;
+    const y = headerSize / 2;
+    ctx.fillText(String(label), x, y);
+  }
+
+  for (let r = 0; r < n; r += 1) {
+    const label = labels[r] ?? `T${r}`;
+    const x = headerSize / 2;
+    const y = headerSize + r * cellSize + cellSize / 2;
+    ctx.fillText(String(label), x, y);
+  }
+
+  for (let r = 0; r < n; r += 1) {
+    for (let c = 0; c < n; c += 1) {
+      const val = matrix[r]?.[c];
+      const color = attentionColor(val);
+      const x = headerSize + c * cellSize;
+      const y = headerSize + r * cellSize;
+      ctx.fillStyle = `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a})`;
+      ctx.fillRect(x, y, cellSize, cellSize);
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+      ctx.strokeRect(x, y, cellSize, cellSize);
+      ctx.fillStyle = '#0b1020';
+      ctx.font = `10px "Courier New", monospace`;
+      ctx.fillText(formatTokenValue(val), x + cellSize / 2, y + cellSize / 2);
+    }
+  }
+
+  const link = document.createElement('a');
+  link.download = 'attention_map.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+const tokenRows = computed(() => {
+  if (!props.gameState) return [];
+  return tokenPlayers.value.map((row, idx) => {
+    const teamLabel = offenseIds.value.includes(idx)
+      ? 'Offense'
+      : defenseIds.value.includes(idx)
+        ? 'Defense'
+        : 'Unknown';
+    return {
+      playerId: idx,
+      teamLabel,
+      features: Array.isArray(row) ? row : [],
+    };
+  });
+});
+
+const tokenGlobalRows = computed(() => {
+  return tokenGlobals.value.map((value, idx) => ({
+    label: tokenGlobalLabels[idx] || `global_${idx}`,
+    value,
+  }));
 });
 
 const allPairsDistances = computed(() => {
@@ -1993,6 +2199,12 @@ const stealRisks = computed(() => {
         @click="activeTab = 'observation'"
       >
         Observation
+      </button>
+      <button 
+        :class="{ active: activeTab === 'attention' }"
+        @click="activeTab = 'attention'"
+      >
+        Attention
       </button>
     </div>
 
@@ -3191,6 +3403,112 @@ const stealRisks = computed(() => {
             </tbody>
           </table>
         </div>
+
+      </div>
+    </div>
+
+    <!-- Attention Tab -->
+    <div v-if="activeTab === 'attention'" class="tab-content">
+      <div class="observation-section">
+        <div class="token-section">
+          <h4>Token View (Set-Observation)</h4>
+          <div v-if="!obsTokens" class="no-data">
+            No token data available.
+          </div>
+          <div v-else class="token-table-wrapper">
+            <table class="observation-table token-table">
+              <thead>
+                <tr>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th v-for="label in tokenFeatureLabels" :key="`token-head-${label}`">
+                    {{ label }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="row in tokenRows"
+                  :key="`token-${row.playerId}`"
+                  :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
+                >
+                  <td>Player {{ row.playerId }}</td>
+                  <td>{{ row.teamLabel }}</td>
+                  <td
+                    v-for="(label, fIdx) in tokenFeatureLabels"
+                    :key="`token-${row.playerId}-${label}`"
+                    class="value-mono"
+                  >
+                    {{ formatTokenValue(row.features[fIdx]) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h5 class="token-subtitle">Globals</h5>
+            <table class="observation-table token-table">
+              <thead>
+                <tr>
+                  <th>Global</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in tokenGlobalRows" :key="`token-global-${row.label}`">
+                  <td>{{ row.label }}</td>
+                  <td class="value-mono">{{ formatTokenValue(row.value) }}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="token-attn-section">
+              <h5 class="token-subtitle">Attention Map</h5>
+              <div v-if="tokenAttentionMatrix.length === 0" class="no-data">
+                Attention weights are not available.
+              </div>
+              <div v-else class="token-table-wrapper">
+                <div class="token-attn-controls" v-if="tokenAttentionHeads">
+                  <label for="token-attn-view">View:</label>
+                  <select id="token-attn-view" v-model="attentionView">
+                    <option value="avg">Average</option>
+                    <option v-for="idx in attentionHeadOptions" :key="`head-${idx}`" :value="String(idx)">
+                      Head {{ idx + 1 }}
+                    </option>
+                  </select>
+                  <button class="token-attn-download" type="button" @click="downloadAttentionPng">
+                    Download PNG
+                  </button>
+                </div>
+                <div class="token-attn-note" v-if="tokenAttentionSubtitle">
+                  {{ tokenAttentionSubtitle }}
+                </div>
+                <table class="observation-table token-table token-attn-table">
+                  <thead>
+                    <tr>
+                      <th>From \ To</th>
+                      <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
+                        {{ label }}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
+                      <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
+                      <td
+                        v-for="(val, cIdx) in row"
+                        :key="`attn-${rIdx}-${cIdx}`"
+                        class="value-mono"
+                        :style="attentionCellStyle(val)"
+                      >
+                        {{ formatTokenValue(val) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -4124,6 +4442,78 @@ const stealRisks = computed(() => {
 
 .observation-table tbody tr:hover {
   background-color: rgba(255, 255, 255, 0.03);
+}
+
+.token-section {
+  margin-top: 1.5rem;
+}
+
+.token-table-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.token-table {
+  font-size: 0.9em;
+}
+
+.token-ball-holder {
+  background-color: rgba(251, 191, 36, 0.12);
+}
+
+.token-subtitle {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+  color: var(--app-text-muted);
+}
+
+.token-attn-section {
+  margin-top: 0.75rem;
+}
+
+.token-attn-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+  flex-wrap: wrap;
+}
+
+.token-attn-controls select {
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--app-text);
+  font-size: 0.85rem;
+}
+
+.token-attn-download {
+  margin-left: auto;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--app-text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.token-attn-download:hover {
+  background: rgba(59, 130, 246, 0.2);
+}
+
+.token-attn-note {
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+.token-attn-table th,
+.token-attn-table td {
+  text-align: center;
+  white-space: nowrap;
 }
 
 .group-label {

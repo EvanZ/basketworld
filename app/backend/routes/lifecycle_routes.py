@@ -133,7 +133,6 @@ async def init_game(request: InitGameRequest):
                 raise HTTPException(status_code=500, detail=f"Failed to download opponent policy: {e}")
 
         custom_objects = {
-            "policy_class": PassBiasDualCriticPolicy,
             "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
             "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
             "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,

@@ -1,6 +1,8 @@
 import numpy as np
+import torch
 from fastapi.encoders import jsonable_encoder
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.wrappers import SetObservationWrapper
 
 
 class GameState:
@@ -127,6 +129,99 @@ def get_full_game_state(
         int(game_state.env.basket_position[1]),
     )
     action_mask_py = game_state.obs["action_mask"].tolist()
+    obs_tokens = None
+    if game_state.obs:
+        players_tokens = game_state.obs.get("players")
+        globals_tokens = game_state.obs.get("globals")
+        if players_tokens is not None or globals_tokens is not None:
+            obs_tokens = {}
+            if players_tokens is not None:
+                obs_tokens["players"] = (
+                    players_tokens.tolist()
+                    if hasattr(players_tokens, "tolist")
+                    else players_tokens
+                )
+            if globals_tokens is not None:
+                obs_tokens["globals"] = (
+                    globals_tokens.tolist()
+                    if hasattr(globals_tokens, "tolist")
+                    else globals_tokens
+                )
+    if obs_tokens is None and game_state.env and game_state.obs:
+        try:
+            wrapper = SetObservationWrapper(game_state.env)
+            derived = wrapper.observation(game_state.obs)
+            players_tokens = derived.get("players")
+            globals_tokens = derived.get("globals")
+            if players_tokens is not None or globals_tokens is not None:
+                obs_tokens = {}
+                if players_tokens is not None:
+                    obs_tokens["players"] = (
+                        players_tokens.tolist()
+                        if hasattr(players_tokens, "tolist")
+                        else players_tokens
+                    )
+                if globals_tokens is not None:
+                    obs_tokens["globals"] = (
+                        globals_tokens.tolist()
+                        if hasattr(globals_tokens, "tolist")
+                        else globals_tokens
+                    )
+        except Exception:
+            obs_tokens = obs_tokens
+
+    attention_payload = None
+    if obs_tokens is not None and game_state.unified_policy is not None:
+        try:
+            policy_obj = getattr(game_state.unified_policy, "policy", None)
+            extractor = getattr(policy_obj, "features_extractor", None)
+            if (
+                extractor is not None
+                and hasattr(extractor, "token_mlp")
+                and hasattr(extractor, "attn")
+                and obs_tokens.get("players") is not None
+                and obs_tokens.get("globals") is not None
+            ):
+                players_np = np.asarray(obs_tokens["players"], dtype=np.float32)
+                globals_np = np.asarray(obs_tokens["globals"], dtype=np.float32)
+                device = next(extractor.parameters()).device
+                with torch.no_grad():
+                    players_t = torch.as_tensor(players_np, device=device).unsqueeze(0)
+                    globals_t = torch.as_tensor(globals_np, device=device).unsqueeze(0)
+                    g = globals_t.unsqueeze(1).expand(-1, players_t.size(1), -1)
+                    tokens = torch.cat([players_t, g], dim=-1)
+                    emb = extractor.token_mlp(tokens)
+                    cls_tokens = getattr(extractor, "cls_tokens", None)
+                    if cls_tokens is not None:
+                        cls = cls_tokens.unsqueeze(0).expand(emb.size(0), -1, -1)
+                        emb = torch.cat([emb, cls], dim=1)
+                    _, attn_weights = extractor.attn(
+                        emb, emb, emb, need_weights=True, average_attn_weights=False
+                    )
+                    per_head = attn_weights[0].detach().cpu().numpy()
+                    avg_weights = per_head.mean(axis=0).tolist()
+                    per_head_weights = per_head.tolist()
+                labels = []
+                for pid in range(players_np.shape[0]):
+                    if pid in getattr(game_state.env, "offense_ids", []):
+                        labels.append(f"O{pid}")
+                    elif pid in getattr(game_state.env, "defense_ids", []):
+                        labels.append(f"D{pid}")
+                    else:
+                        labels.append(f"P{pid}")
+                num_cls = int(getattr(extractor, "num_cls_tokens", 0))
+                if num_cls >= 1:
+                    labels.append("CLS_OFF")
+                if num_cls >= 2:
+                    labels.append("CLS_DEF")
+                attention_payload = {
+                    "weights_avg": avg_weights,
+                    "weights_heads": per_head_weights,
+                    "labels": labels,
+                    "heads": int(getattr(extractor.attn, "num_heads", 0)),
+                }
+        except Exception:
+            attention_payload = None
 
     # Calculate ball handler's pressure-adjusted shot probability for replay
     ball_handler_shot_prob = None
@@ -193,6 +288,10 @@ def get_full_game_state(
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
         "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],
+        "obs_tokens": (
+            {**obs_tokens, "attention": attention_payload} if obs_tokens is not None else None
+        ),
+        "obs_tokens_version": 1 if obs_tokens is not None else 0,
         "last_action_results": last_action_results_py,
         "offense_ids": game_state.env.offense_ids,
         "defense_ids": game_state.env.defense_ids,

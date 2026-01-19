@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import gymnasium as gym
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 from stable_baselines3 import PPO
 
@@ -11,6 +12,7 @@ from basketworld.utils.action_resolution import (
     get_policy_action_probabilities,
     resolve_illegal_actions,
 )
+from basketworld.utils.wrappers import SetObservationWrapper
 
 from .state import GameState, _role_flag_value_for_team, game_state
 
@@ -33,6 +35,27 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
     return cloned
 
 
+def _ensure_set_obs(policy: PPO | None, env, obs: dict | None) -> dict | None:
+    if policy is None or env is None or obs is None:
+        return obs
+    try:
+        policy_obj = getattr(policy, "policy", None)
+        obs_space = getattr(policy_obj, "observation_space", None)
+        if not isinstance(obs_space, gym.spaces.Dict):
+            return obs
+        if "players" not in obs_space.spaces or "globals" not in obs_space.spaces:
+            return obs
+    except Exception:
+        return obs
+    if isinstance(obs, dict) and "players" in obs and "globals" in obs:
+        return obs
+    try:
+        wrapper = SetObservationWrapper(env)
+        return wrapper.observation(obs)
+    except Exception:
+        return obs
+
+
 def _team_player_ids(env, team: Team) -> List[int]:
     if team == Team.OFFENSE:
         return list(getattr(env, "offense_ids", []))
@@ -53,6 +76,7 @@ def _predict_actions_for_team(
     if policy is None or base_obs is None or env is None:
         return actions_by_player, probs_by_player
 
+    base_obs = _ensure_set_obs(policy, env, base_obs)
     team_ids = _team_player_ids(env, team)
     if not team_ids:
         return actions_by_player, probs_by_player
@@ -208,6 +232,7 @@ def _compute_state_values_from_obs(obs_dict: dict | None):
         return None
 
     try:
+        obs_dict = _ensure_set_obs(value_policy, game_state.env, obs_dict)
         offense_obs = _build_role_conditioned_obs(obs_dict, game_state.role_flag_offense)
         defense_obs = _build_role_conditioned_obs(obs_dict, game_state.role_flag_defense)
         if offense_obs is None or defense_obs is None:
@@ -287,6 +312,7 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
         except ValueError:
             # Episode ended; return empty to avoid crashing endpoints when in terminal states
             return {}
+        next_obs = _ensure_set_obs(value_policy, temp_env, next_obs)
         role_flag_value = state.role_flag_offense if player_id in state.env.offense_ids else state.role_flag_defense
         conditioned_next_obs = {
             "obs": np.copy(next_obs["obs"]),
@@ -294,6 +320,10 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             "role_flag": np.array([role_flag_value], dtype=np.float32),
             "skills": np.copy(next_obs.get("skills")) if next_obs.get("skills") is not None else None,
         }
+        if "players" in next_obs:
+            conditioned_next_obs["players"] = np.copy(next_obs["players"])
+        if "globals" in next_obs:
+            conditioned_next_obs["globals"] = np.copy(next_obs["globals"])
 
         next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
         with torch.no_grad():

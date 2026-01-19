@@ -66,6 +66,7 @@ Use one schema for all players. For fields that only apply to one side:
   - Produces **token outputs** `Z` shaped `(B, N, D)`.
   - Computes per-player logits with a **shared action head**: `logits_i = g(z_i)`.
   - Flattens logits only at the very end for SB3 MultiCategorical (shape `(B, N*A)`).
+- Use **residual + LayerNorm** around attention output to avoid head collapse.
 - Decision: keep the existing **dual-critic** structure (offense/defense value heads).
   - Use **team CLS tokens** (one offense, one defense) for value heads to avoid pooling player tokens.
 - Decision: keep **pass-logit bias** support for parity with existing training schedules.
@@ -76,6 +77,7 @@ Use one schema for all players. For fields that only apply to one side:
 - Update `train/env_factory.py` to apply the set wrapper when flag enabled.
 - Update `train/train.py` and `train/policy_utils.py` to register the new policy.
 - Ensure `basketworld/utils/self_play_wrapper.py` passes through the new dict obs.
+- Log set-attention hyperparameters to MLflow (`set_embed_dim`, `set_heads`, `set_token_mlp_dim`, `set_cls_tokens`).
 
 ### Phase 3b: Tests/Validation
 
@@ -96,15 +98,19 @@ Use one schema for all players. For fields that only apply to one side:
 - Decision: expose tokens to the UI.
   - Add fields to `get_full_game_state`:
     - `obs_tokens.players`, `obs_tokens.globals`
+    - `obs_tokens.attention` (avg + per-head weights, labels)
   - Add a version flag to avoid breaking existing clients.
 
 ### Phase 5: Frontend (web app) impacts
 
 - Keep current observation table intact by default (flat obs).
-- Decision: add a “Token View” to display per-player tokens + globals.
-- Decision: show an attention map (per-player attention weights) for debugging.
-  - Note: training/inference do not request attention weights; `average_attn_weights`
-    only affects debug/inspection output (per-head vs mean).
+- Decision: add an “Attention” tab with:
+  - Token View (per-player tokens + globals).
+  - Attention map table + per-head selector.
+  - Heatmap coloring with min-max normalization.
+  - Download PNG for attention maps.
+- Note: training/inference do not request attention weights; `average_attn_weights`
+  only affects debug/inspection output (per-head vs mean).
 
 ## Rollout Strategy
 
