@@ -1850,10 +1850,13 @@ const tokenFeatureLabels = [
   'r_norm',
   'role',
   'has_ball',
-  'skill_layup',
-  'skill_3pt',
-  'skill_dunk',
-  'lane_steps_norm',
+  'layup%',
+  '3pt%',
+  'dunk%',
+  'steps',
+  'EP',
+  'tov%',
+  'stl%',
 ];
 const tokenGlobalLabels = ['shot_clock', 'hoop_q_norm', 'hoop_r_norm'];
 

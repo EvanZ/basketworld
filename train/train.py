@@ -297,8 +297,9 @@ def main(args):
         if use_set_obs:
             # Set-attention policy expects tokens and does its own extraction.
             if args.net_arch is not None:
-                print("[Warning] --net-arch is ignored for set-attention policy.")
-            policy_kwargs["net_arch"] = []
+                print("[Info] Using --net-arch for set-attention head MLP.")
+            else:
+                print("[Info] Using --net-arch-pi/vf for set-attention head MLP.")
             policy_kwargs["embed_dim"] = int(getattr(args, "set_embed_dim", 64))
             policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
             policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))

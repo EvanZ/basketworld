@@ -14,7 +14,7 @@ def test_set_observation_wrapper_adds_tokens_and_globals():
 
     players = obs["players"]
     globals_vec = obs["globals"]
-    assert players.shape == (env.unwrapped.n_players, 8)
+    assert players.shape == (env.unwrapped.n_players, 11)
     assert globals_vec.shape == (3,)
 
     assert np.all(np.isfinite(players))

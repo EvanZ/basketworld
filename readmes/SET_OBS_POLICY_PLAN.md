@@ -28,7 +28,7 @@ robust to arbitrary player ordering.
 ### Phase 0: Define the token contract
 
 - Token schema (per player):
-  - `[q_norm, r_norm, role(+1/-1), has_ball, skill_layup, skill_3pt, skill_dunk, lane_steps_norm]`
+  - `[q_norm, r_norm, role(+1/-1), has_ball, skill_layup, skill_3pt, skill_dunk, lane_steps_norm, expected_points, turnover_prob, steal_risk]`
   - Skill values are absolute sampled percentages in [0, 1] (not deltas).
 - Global schema:
   - `[shot_clock, hoop_q_norm, hoop_r_norm]`
@@ -46,6 +46,9 @@ Use one schema for all players. For fields that only apply to one side:
 
 - `has_ball`: set to 1 only for the current ball handler; 0 otherwise (both teams).
 - `lane_steps_norm`: offense uses offensive lane steps; defense uses defender-in-key steps.
+- `expected_points`: offense uses EP for that player; defense uses 0.
+- `turnover_prob`: offense ball handler turnover probability; defense uses 0.
+- `steal_risk`: offense non-ball-handler steal risk on pass; defense uses 0.
 - Any offense-only field not listed above should be set to 0 for defense (and vice-versa)
   to keep a consistent token shape.
 
@@ -71,6 +74,9 @@ Use one schema for all players. For fields that only apply to one side:
   - Use **team CLS tokens** (one offense, one defense) for value heads to avoid pooling player tokens.
 - Decision: keep **pass-logit bias** support for parity with existing training schedules.
 - Defaults: `set_embed_dim=64`, `set_heads=4`, `set_token_mlp_dim=64`, `set_cls_tokens=2`.
+- Head MLPs remain configurable via CLI:
+  - `--net-arch` (shared) or `--net-arch-pi` / `--net-arch-vf` (separate).
+  - These apply **on top of** the attention features and do not replace the attention encoder.
 
 ### Phase 3: Training/Eval integration
 

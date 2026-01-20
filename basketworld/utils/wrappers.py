@@ -8,7 +8,7 @@ from basketworld.envs.basketworld_env_v2 import Team
 class SetObservationWrapper(gym.ObservationWrapper):
     """Expose set-based player tokens + globals while preserving existing obs keys."""
 
-    _TOKEN_DIM = 8
+    _TOKEN_DIM = 11
     _GLOBAL_DIM = 3
 
     def __init__(self, env: gym.Env):
@@ -78,18 +78,45 @@ class SetObservationWrapper(gym.ObservationWrapper):
 
         max_lane_steps = float(getattr(env, "three_second_max_steps", 1) or 1)
         players = np.zeros((n_players, self._TOKEN_DIM), dtype=np.float32)
+        offense_ids = set(getattr(env, "offense_ids", []))
+        expected_points = {}
+        try:
+            ep_values = env.calculate_expected_points_all_players()
+            for idx, pid in enumerate(env.offense_ids):
+                if idx < len(ep_values):
+                    expected_points[int(pid)] = float(ep_values[idx])
+        except Exception:
+            expected_points = {}
+        turnover_probs: dict[int, float] = {}
+        steal_risks: dict[int, float] = {}
+        try:
+            ball_holder = getattr(env, "ball_holder", None)
+            if ball_holder is not None and ball_holder in offense_ids:
+                turnover_prob = float(env.calculate_defender_pressure_turnover_probability())
+                turnover_probs[int(ball_holder)] = turnover_prob
+                steal_probs = env.calculate_pass_steal_probabilities(ball_holder)
+                for offense_id in offense_ids:
+                    if offense_id == ball_holder:
+                        continue
+                    steal_risks[int(offense_id)] = float(steal_probs.get(offense_id, 0.0))
+        except Exception:
+            turnover_probs = {}
+            steal_risks = {}
         for pid in range(n_players):
             q, r = env.positions[pid]
-            role = 1.0 if pid in env.offense_ids else -1.0
+            role = 1.0 if pid in offense_ids else -1.0
             has_ball = 1.0 if env.ball_holder == pid else 0.0
             skill_vec = skills_by_player.get(pid, np.zeros(3, dtype=np.float32))
-            if pid in env.offense_ids:
+            if pid in offense_ids:
                 lane_steps = env._offensive_lane_steps.get(pid, 0)
             else:
                 lane_steps = env._defender_in_key_steps.get(pid, 0)
             lane_steps_norm = float(lane_steps) / max_lane_steps
             if lane_steps_norm > 1.0:
                 lane_steps_norm = 1.0
+            ep_value = expected_points.get(pid, 0.0) if pid in offense_ids else 0.0
+            turnover_prob = turnover_probs.get(pid, 0.0) if pid in offense_ids else 0.0
+            steal_risk = steal_risks.get(pid, 0.0) if pid in offense_ids else 0.0
 
             players[pid] = np.array(
                 [
@@ -101,6 +128,9 @@ class SetObservationWrapper(gym.ObservationWrapper):
                     float(skill_vec[1]) if skill_vec.size > 1 else 0.0,
                     float(skill_vec[2]) if skill_vec.size > 2 else 0.0,
                     lane_steps_norm,
+                    ep_value,
+                    turnover_prob,
+                    steal_risk,
                 ],
                 dtype=np.float32,
             )
