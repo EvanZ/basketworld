@@ -3,6 +3,8 @@ import os
 import csv
 import tempfile
 import random
+from typing import Optional
+
 import numpy as np
 import mlflow
 from stable_baselines3.common.callbacks import BaseCallback
@@ -327,6 +329,83 @@ class MLflowCallback(BaseCallback):
                 except Exception:
                     pass
                 # (Reverted) no ground-truth auditing metrics
+        return True
+
+
+class GradNormCallback(BaseCallback):
+    """Log gradient norms at rollout start (after the previous update)."""
+
+    def __init__(self, log_freq_rollouts: int = 1, verbose=0):
+        super().__init__(verbose)
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._rollouts = 0
+
+    @staticmethod
+    def _grad_norm(module) -> Optional[float]:
+        if module is None:
+            return None
+        total = 0.0
+        has_grad = False
+        for param in module.parameters(recurse=True):
+            if param.grad is None:
+                continue
+            grad_norm = float(param.grad.data.norm(2).item())
+            total += grad_norm * grad_norm
+            has_grad = True
+        return (total ** 0.5) if has_grad else None
+
+    def _on_rollout_start(self) -> None:
+        self._rollouts += 1
+        if self._rollouts % self.log_freq_rollouts != 0:
+            return
+
+        policy = getattr(self.model, "policy", None)
+        if policy is None:
+            return
+
+        step = int(getattr(self.model, "num_timesteps", 0))
+        metrics = {}
+
+        features = getattr(policy, "features_extractor", None)
+        if features is not None:
+            metrics["GradNorm/token_mlp"] = self._grad_norm(
+                getattr(features, "token_mlp", None)
+            )
+            metrics["GradNorm/attn"] = self._grad_norm(
+                getattr(features, "attn", None)
+            )
+
+        metrics["GradNorm/action_head"] = self._grad_norm(
+            getattr(policy, "action_head", None)
+        )
+        metrics["GradNorm/action_head_offense"] = self._grad_norm(
+            getattr(policy, "action_head_offense", None)
+        )
+        metrics["GradNorm/action_head_defense"] = self._grad_norm(
+            getattr(policy, "action_head_defense", None)
+        )
+        metrics["GradNorm/value_head_offense"] = self._grad_norm(
+            getattr(policy, "value_net_offense", None)
+        )
+        metrics["GradNorm/value_head_defense"] = self._grad_norm(
+            getattr(policy, "value_net_defense", None)
+        )
+        metrics["GradNorm/token_head_mlp_pi"] = self._grad_norm(
+            getattr(policy, "token_head_mlp_pi", None)
+        )
+        metrics["GradNorm/token_head_mlp_vf"] = self._grad_norm(
+            getattr(policy, "token_head_mlp_vf", None)
+        )
+
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            try:
+                mlflow.log_metric(key, value, step=step)
+            except Exception:
+                pass
+
+    def _on_step(self) -> bool:
         return True
 
 

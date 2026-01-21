@@ -10,6 +10,17 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from basketworld.policies.dual_critic_policy import DualCriticActorCriticPolicy
 
 
+def _resolve_activation(name: str, fallback: str) -> Type[nn.Module]:
+    key = (name or fallback).lower()
+    if key == "relu":
+        return nn.ReLU
+    if key == "gelu":
+        return nn.GELU
+    if key in {"silu", "swish"}:
+        return nn.SiLU
+    return nn.Tanh
+
+
 class SetAttentionExtractor(BaseFeaturesExtractor):
     """Encode player tokens with shared MLP + self-attention, return flattened tokens."""
 
@@ -20,6 +31,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         n_heads: int = 4,
         token_mlp_dim: int = 64,
         num_cls_tokens: int = 2,
+        token_activation: str = "relu",
     ):
         players_space = observation_space.spaces.get("players")
         globals_space = observation_space.spaces.get("globals")
@@ -37,9 +49,10 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         total_tokens = self.n_players + self.num_cls_tokens
         super().__init__(observation_space, features_dim=total_tokens * self.embed_dim)
 
+        token_act = _resolve_activation(token_activation, "relu")
         self.token_mlp = nn.Sequential(
             nn.Linear(self.token_dim + self.global_dim, token_mlp_dim),
-            nn.ReLU(),
+            token_act(),
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
         self.attn = nn.MultiheadAttention(self.embed_dim, n_heads, batch_first=True)
@@ -74,8 +87,12 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         n_heads: int = 4,
         token_mlp_dim: int = 64,
         num_cls_tokens: int = 2,
+        token_activation: str = "relu",
+        head_activation: str = "tanh",
         **kwargs,
     ):
+        head_arch = kwargs.get("net_arch")
+        self._head_activation = _resolve_activation(head_activation, "tanh")
         if "features_extractor_class" not in kwargs:
             kwargs["features_extractor_class"] = SetAttentionExtractor
         features_extractor_kwargs = dict(kwargs.get("features_extractor_kwargs") or {})
@@ -83,13 +100,19 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         features_extractor_kwargs.setdefault("n_heads", n_heads)
         features_extractor_kwargs.setdefault("token_mlp_dim", token_mlp_dim)
         features_extractor_kwargs.setdefault("num_cls_tokens", num_cls_tokens)
+        features_extractor_kwargs.setdefault("token_activation", token_activation)
         kwargs["features_extractor_kwargs"] = features_extractor_kwargs
         effective_embed_dim = int(features_extractor_kwargs["embed_dim"])
 
         if "net_arch" not in kwargs:
             kwargs["net_arch"] = []
+        else:
+            # MLP extractor should not reshape token features; apply head MLPs manually instead.
+            kwargs["net_arch"] = []
 
         super().__init__(*args, **kwargs)
+        # Preserve the requested head architecture for logging/debugging.
+        self.net_arch = head_arch
 
         if not hasattr(self.action_space, "nvec"):
             raise ValueError("SetAttentionDualCriticPolicy requires MultiDiscrete action space.")
@@ -112,14 +135,39 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         if self.embed_dim <= 0:
             raise ValueError("embed_dim must be positive.")
 
-        if self.use_dual_policy:
-            self.action_head_offense = nn.Linear(self.embed_dim, self.actions_per_player)
-            self.action_head_defense = nn.Linear(self.embed_dim, self.actions_per_player)
-        else:
-            self.action_head = nn.Linear(self.embed_dim, self.actions_per_player)
+        self.token_head_mlp_pi = None
+        self.token_head_mlp_vf = None
+        self.pi_embed_dim = self.embed_dim
+        self.vf_embed_dim = self.embed_dim
 
-        self.value_net_offense = nn.Linear(self.embed_dim, 1)
-        self.value_net_defense = nn.Linear(self.embed_dim, 1)
+        head_arch = self._normalize_head_arch(head_arch)
+        if head_arch:
+            if "shared" in head_arch:
+                shared_mlp, shared_dim = self._build_token_head_mlp(
+                    self.embed_dim, head_arch["shared"]
+                )
+                self.token_head_mlp_pi = shared_mlp
+                self.token_head_mlp_vf = shared_mlp
+                self.pi_embed_dim = shared_dim
+                self.vf_embed_dim = shared_dim
+            else:
+                if "pi" in head_arch:
+                    self.token_head_mlp_pi, self.pi_embed_dim = self._build_token_head_mlp(
+                        self.embed_dim, head_arch["pi"]
+                    )
+                if "vf" in head_arch:
+                    self.token_head_mlp_vf, self.vf_embed_dim = self._build_token_head_mlp(
+                        self.embed_dim, head_arch["vf"]
+                    )
+
+        if self.use_dual_policy:
+            self.action_head_offense = nn.Linear(self.pi_embed_dim, self.actions_per_player)
+            self.action_head_defense = nn.Linear(self.pi_embed_dim, self.actions_per_player)
+        else:
+            self.action_head = nn.Linear(self.pi_embed_dim, self.actions_per_player)
+
+        self.value_net_offense = nn.Linear(self.vf_embed_dim, 1)
+        self.value_net_defense = nn.Linear(self.vf_embed_dim, 1)
 
         if self.ortho_init:
             for net, gain in [
@@ -135,6 +183,31 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             else:
                 nn.init.orthogonal_(self.action_head.weight, gain=0.01)
                 nn.init.constant_(self.action_head.bias, 0)
+
+        # Rebuild optimizer so newly created heads are trainable.
+        try:
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            self.optimizer = self.optimizer_class(
+                self.parameters(), lr=current_lr, **self.optimizer_kwargs
+            )
+            opt_params = {
+                id(p): p
+                for group in self.optimizer.param_groups
+                for p in group.get("params", [])
+            }
+            opt_param_total = sum(p.numel() for p in opt_params.values())
+            trainable_total = sum(
+                p.numel() for p in self.parameters() if p.requires_grad
+            )
+            print(
+                "[SetAttention] Optimizer params:",
+                opt_param_total,
+                "(trainable:",
+                trainable_total,
+                ")",
+            )
+        except Exception:
+            pass
 
     def _infer_pass_indices(self) -> list[int]:
         per_dim = int(self.actions_per_player)
@@ -170,6 +243,8 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
     def _get_action_logits(self, latent_pi: th.Tensor) -> th.Tensor:
         tokens = self._split_tokens(latent_pi)
         player_tokens = tokens[:, : self.token_players, :]
+        if self.token_head_mlp_pi is not None:
+            player_tokens = self.token_head_mlp_pi(player_tokens)
         if self.use_dual_policy and self._current_role_flags is not None:
             role_flags = self._current_role_flags.to(tokens.device)
             logits_off = self.action_head_offense(player_tokens)
@@ -202,6 +277,8 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
 
     def _get_value_from_latent(self, latent_vf: th.Tensor, role_flags: th.Tensor) -> th.Tensor:
         tokens = self._split_tokens(latent_vf)
+        if self.token_head_mlp_vf is not None:
+            tokens = self.token_head_mlp_vf(tokens)
         if self.num_cls_tokens < 2:
             raise ValueError("SetAttentionDualCriticPolicy requires 2 CLS tokens for critics.")
         offense_token = tokens[:, self.token_players, :]
@@ -212,3 +289,30 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         role_flags = role_flags.to(latent_vf.device)
         is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1)
         return th.where(is_offense, values_off, values_def)
+
+    @staticmethod
+    def _normalize_head_arch(net_arch: Optional[Any]) -> Optional[Dict[str, list[int]]]:
+        if net_arch is None:
+            return None
+        if isinstance(net_arch, list) and net_arch and isinstance(net_arch[0], dict):
+            net_arch = net_arch[0]
+        if isinstance(net_arch, dict):
+            pi_arch = list(net_arch.get("pi", []) or [])
+            vf_arch = list(net_arch.get("vf", []) or [])
+            return {"pi": pi_arch, "vf": vf_arch}
+        if isinstance(net_arch, (list, tuple)):
+            return {"shared": list(net_arch)}
+        return None
+
+    def _build_token_head_mlp(self, input_dim: int, layers: list[int]):
+        if not layers:
+            return None, input_dim
+        modules = []
+        last_dim = int(input_dim)
+        for size in layers:
+            modules.append(nn.Linear(last_dim, int(size)))
+            modules.append(self._head_activation())
+            last_dim = int(size)
+        return nn.Sequential(*modules), last_dim
+
+    @staticmethod

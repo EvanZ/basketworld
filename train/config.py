@@ -223,6 +223,20 @@ def get_parser() -> argparse.ArgumentParser:
         help="Hidden dimension for the set-attention token MLP.",
     )
     parser.add_argument(
+        "--set-token-activation",
+        type=str,
+        choices=["tanh", "relu", "gelu", "silu"],
+        default="relu",
+        help="Activation function for the set-attention token MLP.",
+    )
+    parser.add_argument(
+        "--set-head-activation",
+        type=str,
+        choices=["tanh", "relu", "gelu", "silu"],
+        default="tanh",
+        help="Activation function for the post-attention head MLP.",
+    )
+    parser.add_argument(
         "--set-cls-tokens",
         type=int,
         default=2,

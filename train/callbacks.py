@@ -11,6 +11,7 @@ from stable_baselines3.common.logger import Logger, HumanOutputFormat
 from basketworld.utils.callbacks import (
     RolloutUpdateTimingCallback,
     MLflowCallback,
+    GradNormCallback,
     AccumulativeMetricsCallback,
     EntropyScheduleCallback,
     EntropyExpScheduleCallback,
@@ -138,6 +139,7 @@ def build_mixed_callbacks(
     callbacks: List[BaseCallback] = [
         AccumulativeMetricsCallback(),
         offense_timing_cb,
+        GradNormCallback(),
     ]
     if entropy_cb is not None:
         callbacks.append(entropy_cb)

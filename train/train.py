@@ -254,6 +254,8 @@ def main(args):
             mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
             mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
             mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
+            mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
+            mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
         
         print(f"MLflow Run ID: {run.info.run_id}")
 
@@ -304,12 +306,16 @@ def main(args):
             policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
             policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))
             policy_kwargs["num_cls_tokens"] = int(getattr(args, "set_cls_tokens", 2))
+            policy_kwargs["token_activation"] = str(getattr(args, "set_token_activation", "relu"))
+            policy_kwargs["head_activation"] = str(getattr(args, "set_head_activation", "tanh"))
             print(
                 "Set-attention config:",
                 f"embed_dim={policy_kwargs['embed_dim']}",
                 f"n_heads={policy_kwargs['n_heads']}",
                 f"token_mlp_dim={policy_kwargs['token_mlp_dim']}",
                 f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
+                f"token_activation={policy_kwargs['token_activation']}",
+                f"head_activation={policy_kwargs['head_activation']}",
             )
         else:
             # Prevent the policy from learning directly from action_mask

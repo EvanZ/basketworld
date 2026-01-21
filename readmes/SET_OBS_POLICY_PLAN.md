@@ -76,7 +76,8 @@ Use one schema for all players. For fields that only apply to one side:
 - Defaults: `set_embed_dim=64`, `set_heads=4`, `set_token_mlp_dim=64`, `set_cls_tokens=2`.
 - Head MLPs remain configurable via CLI:
   - `--net-arch` (shared) or `--net-arch-pi` / `--net-arch-vf` (separate).
-  - These apply **on top of** the attention features and do not replace the attention encoder.
+  - These apply **per token** *after* the attention block (not via SB3’s MlpExtractor),
+    so token shapes stay intact and equivariance is preserved.
 
 ### Phase 3: Training/Eval integration
 
