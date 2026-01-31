@@ -18,6 +18,7 @@ Design notes:
   in each categorical, then re-concatenate.
 """
 
+import math
 from typing import Optional, Tuple, List
 
 import torch as th
@@ -25,6 +26,36 @@ from torch import nn
 from stable_baselines3.common.policies import MultiInputActorCriticPolicy
 from stable_baselines3.common.distributions import Distribution
 from basketworld.policies import DualCriticActorCriticPolicy
+
+
+def _compute_pass_bias_floor(
+    logits: th.Tensor,
+    pass_indices: List[int],
+    base_bias: float,
+    pass_prob_min: float,
+) -> th.Tensor:
+    batch = logits.shape[0]
+    base = th.full((batch,), float(base_bias), device=logits.device, dtype=logits.dtype)
+    if pass_prob_min is None or pass_prob_min <= 0.0:
+        return base
+    pass_idx = [idx for idx in pass_indices if idx < logits.shape[1]]
+    if not pass_idx or len(pass_idx) == logits.shape[1]:
+        return base
+    non_pass_mask = th.ones(logits.shape[1], dtype=th.bool, device=logits.device)
+    non_pass_mask[pass_idx] = False
+    pass_logits = logits[:, pass_idx]
+    non_pass_logits = logits[:, non_pass_mask]
+    if non_pass_logits.shape[1] == 0:
+        return base
+    p_min = min(max(float(pass_prob_min), 0.0), 1.0 - 1e-6)
+    log_p = math.log(p_min)
+    log_1mp = math.log1p(-p_min)
+    log_s = th.logsumexp(pass_logits, dim=1)
+    log_r = th.logsumexp(non_pass_logits, dim=1)
+    b_needed = log_p + log_r - log_1mp - log_s
+    total = th.maximum(base, b_needed)
+    valid = th.isfinite(log_s) & th.isfinite(log_r)
+    return th.where(valid, total, base)
 
 
 class PassBiasMultiInputPolicy(MultiInputActorCriticPolicy):
@@ -37,6 +68,7 @@ class PassBiasMultiInputPolicy(MultiInputActorCriticPolicy):
         super().__init__(*args, **kwargs)
         # Scalar bias added to each PASS logit (same for all players). 0.0 disables.
         self.pass_logit_bias: float = 0.0
+        self.pass_prob_min: float = 0.0
         # Cache per-dimension sizes from MultiDiscrete
         try:
             self._nvec: List[int] = list(self.action_space.nvec)
@@ -60,40 +92,45 @@ class PassBiasMultiInputPolicy(MultiInputActorCriticPolicy):
         except Exception:
             self.pass_logit_bias = 0.0
 
+    def set_pass_prob_min(self, value: float) -> None:
+        try:
+            self.pass_prob_min = float(value)
+        except Exception:
+            self.pass_prob_min = 0.0
+
+    def _apply_pass_bias(self, action_logits: th.Tensor) -> th.Tensor:
+        base_bias = float(self.pass_logit_bias)
+        pass_prob_min = float(getattr(self, "pass_prob_min", 0.0) or 0.0)
+        if not self._nvec or (abs(base_bias) <= 1e-12 and pass_prob_min <= 0.0):
+            return action_logits
+
+        with th.no_grad():
+            sizes = self._nvec
+        chunks = th.split(action_logits, sizes, dim=1)
+
+        biased_chunks: List[th.Tensor] = []
+        for chunk in chunks:
+            if chunk.shape[1] == 0:
+                biased_chunks.append(chunk)
+                continue
+            c = chunk.clone()
+            pass_idx = [idx for idx in self._pass_indices if idx < c.shape[1]]
+            if pass_idx:
+                total_bias = _compute_pass_bias_floor(
+                    chunk, pass_idx, base_bias, pass_prob_min
+                )
+                c[:, pass_idx] = c[:, pass_idx] + total_bias.unsqueeze(-1)
+            biased_chunks.append(c)
+
+        return th.cat(biased_chunks, dim=1)
+
     def _get_action_dist_from_latent(
         self, latent_pi: th.Tensor, latent_sde: Optional[th.Tensor] = None
     ) -> Distribution:
         """Override to inject bias into PASS logits before building the distribution."""
         # Base logits from action head
         action_logits: th.Tensor = self.action_net(latent_pi)
-
-        # No-op if not MultiDiscrete or bias is effectively zero
-        if not self._nvec or abs(self.pass_logit_bias) <= 1e-12:
-            return self.action_dist.proba_distribution(action_logits=action_logits)
-
-        # Split flat logits into per-dimension chunks: [B, sum(nvec)] -> list of [B, n_i]
-        with th.no_grad():
-            # Prepare split sizes
-            sizes = self._nvec
-        chunks = th.split(action_logits, sizes, dim=1)
-
-        # Add bias to PASS indices in each categorical
-        biased_chunks: List[th.Tensor] = []
-        bias = th.as_tensor(
-            self.pass_logit_bias, device=action_logits.device, dtype=action_logits.dtype
-        )
-        for i, chunk in enumerate(chunks):
-            if chunk.shape[1] == 0:
-                biased_chunks.append(chunk)
-                continue
-            # Clone to avoid in-place on autograd graph of original logits
-            c = chunk.clone()
-            for idx in self._pass_indices:
-                if idx < c.shape[1]:
-                    c[:, idx] = c[:, idx] + bias
-            biased_chunks.append(c)
-
-        biased_logits = th.cat(biased_chunks, dim=1)
+        biased_logits = self._apply_pass_bias(action_logits)
         return self.action_dist.proba_distribution(action_logits=biased_logits)
 
 
@@ -116,6 +153,7 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         super().__init__(*args, **kwargs)
         # Scalar bias added to each PASS logit (same for all players). 0.0 disables.
         self.pass_logit_bias: float = 0.0
+        self.pass_prob_min: float = 0.0
         # Cache per-dimension sizes from MultiDiscrete
         try:
             self._nvec: List[int] = list(self.action_space.nvec)
@@ -139,6 +177,12 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         except Exception:
             self.pass_logit_bias = 0.0
 
+    def set_pass_prob_min(self, value: float) -> None:
+        try:
+            self.pass_prob_min = float(value)
+        except Exception:
+            self.pass_prob_min = 0.0
+
     def _apply_pass_bias(self, action_logits: th.Tensor) -> th.Tensor:
         """
         Apply pass logit bias to action logits.
@@ -146,8 +190,10 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         :param action_logits: Raw action logits
         :return: Biased action logits (or original if bias is zero)
         """
-        # No-op if not MultiDiscrete or bias is effectively zero
-        if not self._nvec or abs(self.pass_logit_bias) <= 1e-12:
+        base_bias = float(self.pass_logit_bias)
+        pass_prob_min = float(getattr(self, "pass_prob_min", 0.0) or 0.0)
+        # No-op if not MultiDiscrete or bias/prob floor is effectively zero
+        if not self._nvec or (abs(base_bias) <= 1e-12 and pass_prob_min <= 0.0):
             return action_logits
 
         # Split flat logits into per-dimension chunks: [B, sum(nvec)] -> list of [B, n_i]
@@ -158,18 +204,18 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
 
         # Add bias to PASS indices in each categorical
         biased_chunks: List[th.Tensor] = []
-        bias = th.as_tensor(
-            self.pass_logit_bias, device=action_logits.device, dtype=action_logits.dtype
-        )
         for i, chunk in enumerate(chunks):
             if chunk.shape[1] == 0:
                 biased_chunks.append(chunk)
                 continue
             # Clone to avoid in-place on autograd graph of original logits
             c = chunk.clone()
-            for idx in self._pass_indices:
-                if idx < c.shape[1]:
-                    c[:, idx] = c[:, idx] + bias
+            pass_idx = [idx for idx in self._pass_indices if idx < c.shape[1]]
+            if pass_idx:
+                total_bias = _compute_pass_bias_floor(
+                    chunk, pass_idx, base_bias, pass_prob_min
+                )
+                c[:, pass_idx] = c[:, pass_idx] + total_bias.unsqueeze(-1)
             biased_chunks.append(c)
 
         return th.cat(biased_chunks, dim=1)
@@ -192,6 +238,5 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         biased_logits = self._apply_pass_bias(action_logits)
         
         return self.action_dist.proba_distribution(action_logits=biased_logits)
-
 
 

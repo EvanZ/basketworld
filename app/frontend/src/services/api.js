@@ -382,3 +382,16 @@ export async function setPassTargetStrategy(strategy) {
   }
   return response.json();
 }
+
+export async function setPassLogitBias(bias) {
+  const response = await fetch(`${API_BASE_URL}/api/set_pass_logit_bias`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bias }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update pass logit bias');
+  }
+  return response.json();
+}

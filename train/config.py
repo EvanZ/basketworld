@@ -243,6 +243,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="Number of CLS tokens for set-attention policy (2 for dual critics).",
     )
     parser.add_argument(
+        "--mirror-episode-prob",
+        type=float,
+        default=0.0,
+        help="Probability of mirroring observations/actions for an entire episode (set-obs only).",
+    )
+    parser.add_argument(
         "--init-critic-from-run",
         type=str,
         default=None,
@@ -395,6 +401,16 @@ def get_parser() -> argparse.ArgumentParser:
         help=(
             "Hex distance (N) within which a defender reset their lane counter if guarding "
             "an offensive player while in the lane. 0 disables guarding resets."
+        ),
+    )
+    parser.add_argument(
+        "--offense-spawn-boundary-margin",
+        dest="offense_spawn_boundary_margin",
+        type=int,
+        default=0,
+        help=(
+            "Number of hex rings to keep offense spawns away from the court boundary "
+            "(0 = no restriction)."
         ),
     )
     parser.add_argument(
@@ -777,6 +793,13 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Final additive bias (0 to disable at end).",
+    )
+    parser.add_argument(
+        "--pass-prob-min",
+        dest="pass_prob_min",
+        type=float,
+        default=None,
+        help="Minimum total probability mass assigned to pass actions per player.",
     )
     return parser
 

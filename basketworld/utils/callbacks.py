@@ -447,6 +447,7 @@ class AccumulativeMetricsCallback(BaseCallback):
             "made_2pt": float(ep.get("made_2pt", 0.0)),
             "made_3pt": float(ep.get("made_3pt", 0.0)),
             "attempts": float(ep.get("attempts", 0.0)),
+            "pressure_exposure": float(ep.get("pressure_exposure", 0.0)),
             "phi_beta": float(ep.get("phi_beta", 0.0)),
             "phi_prev": float(ep.get("phi_prev", 0.0)),
             "phi_next": float(ep.get("phi_next", 0.0)),
@@ -531,6 +532,7 @@ class AccumulativeMetricsCallback(BaseCallback):
         
         # Other metrics
         mlflow.log_metric(f"{team_label} Passes / Episode", mean_key("passes"), step=global_step)
+        mlflow.log_metric(f"{team_label} Pressure Exposure", mean_key("pressure_exposure"), step=global_step)
         mlflow.log_metric(f"{team_label} TurnoverPct", mean_key("turnover"), step=global_step)
         mlflow.log_metric(f"{team_label} Turnover Pass OOB", mean_key("turnover_pass_oob"), step=global_step)
         mlflow.log_metric(f"{team_label} Turnover Intercepted", mean_key("turnover_intercepted"), step=global_step)
@@ -785,15 +787,27 @@ class PassLogitBiasExpScheduleCallback(BaseCallback):
                 pass
         except Exception:
             pass
+        return None
+
+    def _log_current(self):
+        try:
+            global_step = int(getattr(self.model, "num_timesteps", 0))
+            t = global_step - self.timestep_offset
+            current = self._scheduled_value(t)
+            mlflow.log_metric("Pass Logit Bias", float(current), step=global_step)
+        except Exception:
+            pass
 
     def _on_training_start(self) -> None:
         self._apply_current()
+        self._log_current()
 
     def _on_rollout_start(self) -> None:
         self._apply_current()
 
     def _on_rollout_end(self) -> None:
         self._apply_current()
+        self._log_current()
 
     def _on_step(self) -> bool:
         # Throttled: avoid per-step update
@@ -944,6 +958,7 @@ class EpisodeSampleLogger(BaseCallback):
                             "turnover_intercepted": turnover_intercepted,
                             "turnover_pressure": turnover_pressure,
                             "passes": float(info.get("passes", 0.0)),
+                            "pressure_exposure": float(info.get("pressure_exposure", 0.0)),
                             "assisted_dunk": float(info.get("assisted_dunk", 0.0)),
                             "assisted_2pt": float(info.get("assisted_2pt", 0.0)),
                             "assisted_3pt": float(info.get("assisted_3pt", 0.0)),
@@ -985,6 +1000,7 @@ class EpisodeSampleLogger(BaseCallback):
                     "turnover_intercepted",
                     "turnover_pressure",
                     "passes",
+                    "pressure_exposure",
                     "assisted_dunk",
                     "assisted_2pt",
                     "assisted_3pt",

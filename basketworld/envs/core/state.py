@@ -19,6 +19,26 @@ def generate_initial_positions(env) -> List[Tuple[int, int]]:
         for col in range(env.court_width):
             all_cells.append(env._offset_to_axial(col, row))
 
+    boundary_margin = max(0, int(getattr(env, "offense_spawn_boundary_margin", 0)))
+    boundary_distance: dict[Tuple[int, int], int] = {}
+    if boundary_margin > 0:
+        boundary_cells: List[Tuple[int, int]] = []
+        for cell in all_cells:
+            if not env._is_valid_position(*cell):
+                continue
+            for dq, dr in env.hex_directions:
+                nbr = (cell[0] + dq, cell[1] + dr)
+                if not env._is_valid_position(*nbr):
+                    boundary_cells.append(cell)
+                    break
+        if boundary_cells:
+            for cell in all_cells:
+                if not env._is_valid_position(*cell):
+                    continue
+                boundary_distance[cell] = min(
+                    env._hex_distance(cell, boundary) for boundary in boundary_cells
+                )
+
     min_spawn_dist_offense = max(0, env.spawn_distance)
     min_spawn_dist_defense = max(0, env.spawn_distance - 1)
     max_spawn_dist = env.max_spawn_distance
@@ -29,6 +49,9 @@ def generate_initial_positions(env) -> List[Tuple[int, int]]:
             continue
         if not env._is_valid_position(*cell):
             continue
+        if boundary_margin > 0:
+            if boundary_distance.get(cell, 0) < boundary_margin:
+                continue
         dist = env._hex_distance(cell, env.basket_position)
         if dist >= min_spawn_dist_offense:
             if max_spawn_dist is None or dist <= max_spawn_dist:
@@ -108,8 +131,12 @@ def generate_initial_positions(env) -> List[Tuple[int, int]]:
         if len(candidates) == 0:
             raise ValueError("Not enough valid cells to place defense")
 
-        candidates.sort(key=lambda c: env._hex_distance(c, off_pos))
-        chosen = candidates[0]
+        dist_pairs = [(cell, env._hex_distance(cell, off_pos)) for cell in candidates]
+        dist_pairs.sort(key=lambda item: item[1])
+        min_dist = dist_pairs[0][1]
+        closest = [cell for cell, dist in dist_pairs if dist == min_dist]
+        # Randomize tie-breaks among closest cells to avoid directional bias.
+        chosen = closest[int(rng.integers(0, len(closest)))]
         defense_positions.append(tuple(chosen))
         taken_positions.add(tuple(chosen))
 

@@ -113,3 +113,7 @@ class SetOffenseSkillsRequest(BaseModel):
 
 class SetPassTargetStrategyRequest(BaseModel):
     strategy: str
+
+
+class SetPassLogitBiasRequest(BaseModel):
+    bias: float | None = None

@@ -12,6 +12,7 @@ from app.backend.schemas import (
     BatchUpdatePositionRequest,
     SetBallHolderRequest,
     SetOffenseSkillsRequest,
+    SetPassLogitBiasRequest,
     SetPassTargetStrategyRequest,
     SwapPoliciesRequest,
     UpdatePositionRequest,
@@ -111,12 +112,19 @@ def update_player_position(req: UpdatePositionRequest):
 
 @router.post("/api/update_shot_clock")
 def update_shot_clock(req: UpdateShotClockRequest):
-    """Manually set the shot clock to a specific value."""
+    """Adjust the shot clock by a delta (see UpdateShotClockRequest)."""
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     try:
-        new_val = int(req.shot_clock)
-        game_state.env.shot_clock = new_val
+        delta = int(req.delta)
+        current = int(getattr(game_state.env, "shot_clock", 0))
+        max_val = int(getattr(game_state.env, "shot_clock_steps", current))
+        new_val = current + delta
+        if max_val > 0:
+            new_val = max(0, min(max_val, new_val))
+        else:
+            new_val = max(0, new_val)
+        game_state.env.shot_clock = int(new_val)
         return {
             "status": "success",
             "shot_clock": int(game_state.env.shot_clock),
@@ -124,6 +132,12 @@ def update_shot_clock(req: UpdateShotClockRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/set_shot_clock")
+def set_shot_clock(req: UpdateShotClockRequest):
+    """Backwards-compatible alias for update_shot_clock (expects delta)."""
+    return update_shot_clock(req)
 
 
 @router.post("/api/set_ball_holder")
@@ -212,6 +226,38 @@ def set_pass_target_strategy(req: SetPassTargetStrategyRequest):
         return {"status": "success", "pass_target_strategy": strategy}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update pass target strategy: {e}")
+
+
+@router.post("/api/set_pass_logit_bias")
+def set_pass_logit_bias(req: SetPassLogitBiasRequest):
+    """Update pass logit bias for the active policies."""
+    if game_state.unified_policy is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    try:
+        bias = float(req.bias) if req.bias is not None else 0.0
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid pass logit bias: {req.bias}")
+
+    def _apply(policy):
+        policy_obj = getattr(policy, "policy", None)
+        if policy_obj is None:
+            return
+        if hasattr(policy_obj, "set_pass_logit_bias"):
+            policy_obj.set_pass_logit_bias(bias)
+        else:
+            try:
+                setattr(policy_obj, "pass_logit_bias", float(bias))
+            except Exception:
+                pass
+
+    _apply(game_state.unified_policy)
+    if game_state.defense_policy is not None:
+        _apply(game_state.defense_policy)
+
+    return {
+        "status": "success",
+        "state": get_full_game_state(include_policy_probs=True),
+    }
 
 
 @router.post("/api/swap_policies")

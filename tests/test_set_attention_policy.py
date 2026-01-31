@@ -8,7 +8,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from basketworld.policies.set_attention_policy import SetAttentionDualCriticPolicy
 
 
-def _make_obs_space(n_players: int, token_dim: int = 11, globals_dim: int = 3, n_actions: int = 14):
+def _make_obs_space(n_players: int, token_dim: int = 15, globals_dim: int = 3, n_actions: int = 14):
     return spaces.Dict(
         {
             "players": spaces.Box(-np.inf, np.inf, (n_players, token_dim), np.float32),
@@ -22,7 +22,7 @@ def _make_obs_space(n_players: int, token_dim: int = 11, globals_dim: int = 3, n
 
 def _make_obs(
     n_players: int,
-    token_dim: int = 11,
+    token_dim: int = 15,
     globals_dim: int = 3,
     n_actions: int = 14,
     role: float = 1.0,

@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import gymnasium as gym
 import numpy as np
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.envs.basketworld_env_v2 import ActionType, Team
+
+TOKEN_DIM = 15
+GLOBAL_DIM = 4
+TOKEN_Q_IDX = 0
+TOKEN_R_IDX = 1
+TOKEN_ROLE_IDX = 2
+TOKEN_HAS_BALL_IDX = 3
+TOKEN_EP_IDX = 8
+TOKEN_DIST_TO_BALL_IDX = 11
+TOKEN_DIST_TO_BEST_EP_IDX = 12
+TOKEN_DIST_TO_NEAREST_OPP_IDX = 13
+TOKEN_DIST_TO_NEAREST_TEAM_IDX = 14
 
 
 class SetObservationWrapper(gym.ObservationWrapper):
     """Expose set-based player tokens + globals while preserving existing obs keys."""
 
-    _TOKEN_DIM = 11
-    _GLOBAL_DIM = 3
+    _TOKEN_DIM = TOKEN_DIM
+    _GLOBAL_DIM = GLOBAL_DIM
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
@@ -79,14 +91,21 @@ class SetObservationWrapper(gym.ObservationWrapper):
         max_lane_steps = float(getattr(env, "three_second_max_steps", 1) or 1)
         players = np.zeros((n_players, self._TOKEN_DIM), dtype=np.float32)
         offense_ids = set(getattr(env, "offense_ids", []))
+        defense_ids = set(getattr(env, "defense_ids", []))
         expected_points = {}
+        best_ep_pid = None
         try:
             ep_values = env.calculate_expected_points_all_players()
             for idx, pid in enumerate(env.offense_ids):
                 if idx < len(ep_values):
                     expected_points[int(pid)] = float(ep_values[idx])
+            if len(ep_values) > 0:
+                best_ep_idx = int(np.argmax(ep_values))
+                if best_ep_idx < len(env.offense_ids):
+                    best_ep_pid = int(env.offense_ids[best_ep_idx])
         except Exception:
             expected_points = {}
+            best_ep_pid = None
         turnover_probs: dict[int, float] = {}
         steal_risks: dict[int, float] = {}
         try:
@@ -102,8 +121,18 @@ class SetObservationWrapper(gym.ObservationWrapper):
         except Exception:
             turnover_probs = {}
             steal_risks = {}
+        ball_holder = getattr(env, "ball_holder", None)
+        ball_pos = None
+        if ball_holder is not None and 0 <= int(ball_holder) < n_players:
+            ball_pos = tuple(env.positions[int(ball_holder)])
+
+        best_ep_pos = None
+        if best_ep_pid is not None and 0 <= int(best_ep_pid) < n_players:
+            best_ep_pos = tuple(env.positions[int(best_ep_pid)])
+
         for pid in range(n_players):
             q, r = env.positions[pid]
+            pos = tuple(env.positions[pid])
             role = 1.0 if pid in offense_ids else -1.0
             has_ball = 1.0 if env.ball_holder == pid else 0.0
             skill_vec = skills_by_player.get(pid, np.zeros(3, dtype=np.float32))
@@ -117,6 +146,34 @@ class SetObservationWrapper(gym.ObservationWrapper):
             ep_value = expected_points.get(pid, 0.0) if pid in offense_ids else 0.0
             turnover_prob = turnover_probs.get(pid, 0.0) if pid in offense_ids else 0.0
             steal_risk = steal_risks.get(pid, 0.0) if pid in offense_ids else 0.0
+            if ball_pos is not None:
+                dist_to_ball = float(env._hex_distance(pos, ball_pos)) / norm_den
+            else:
+                dist_to_ball = 0.0
+            if best_ep_pos is not None:
+                dist_to_best_ep = float(env._hex_distance(pos, best_ep_pos)) / norm_den
+            else:
+                dist_to_best_ep = 0.0
+            if pid in offense_ids:
+                opponents = defense_ids
+                teammates = offense_ids - {pid}
+            else:
+                opponents = offense_ids
+                teammates = defense_ids - {pid}
+            if opponents:
+                dist_to_nearest_opp = min(
+                    env._hex_distance(pos, tuple(env.positions[opp_id]))
+                    for opp_id in opponents
+                ) / norm_den
+            else:
+                dist_to_nearest_opp = 0.0
+            if teammates:
+                dist_to_nearest_team = min(
+                    env._hex_distance(pos, tuple(env.positions[team_id]))
+                    for team_id in teammates
+                ) / norm_den
+            else:
+                dist_to_nearest_team = 0.0
 
             players[pid] = np.array(
                 [
@@ -131,6 +188,10 @@ class SetObservationWrapper(gym.ObservationWrapper):
                     ep_value,
                     turnover_prob,
                     steal_risk,
+                    dist_to_ball,
+                    dist_to_best_ep,
+                    dist_to_nearest_opp,
+                    dist_to_nearest_team,
                 ],
                 dtype=np.float32,
             )
@@ -139,6 +200,7 @@ class SetObservationWrapper(gym.ObservationWrapper):
         globals_vec = np.array(
             [
                 float(env.shot_clock),
+                float(getattr(env, "pressure_exposure", 0.0)),
                 float(hoop_q) / norm_den,
                 float(hoop_r) / norm_den,
             ],
@@ -147,6 +209,176 @@ class SetObservationWrapper(gym.ObservationWrapper):
         obs_dict["players"] = players
         obs_dict["globals"] = globals_vec
         return obs_dict
+
+
+class MirrorObservationWrapper(gym.Wrapper):
+    """Mirror observations/actions across the basket axis for full-episode augmentation."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        mirror_prob: float = 0.5,
+        seed: int | None = None,
+    ) -> None:
+        super().__init__(env)
+        self.mirror_prob = float(mirror_prob)
+        self._rng = np.random.default_rng(seed)
+        self._mirror_active = False
+        self._action_map = self._build_action_map()
+
+    def reset(self, **kwargs):  # type: ignore[override]
+        seed = kwargs.get("seed")
+        if seed is not None:
+            self._rng = np.random.default_rng(int(seed))
+        obs, info = self.env.reset(**kwargs)
+        self._mirror_active = (
+            self.mirror_prob > 0.0 and self._rng.random() < self.mirror_prob
+        )
+        return self._maybe_mirror_obs(obs), info
+
+    def step(self, action):  # type: ignore[override]
+        if self._mirror_active:
+            action = self._mirror_actions(action)
+        obs, reward, done, truncated, info = self.env.step(action)
+        obs = self._maybe_mirror_obs(obs)
+        if info is not None:
+            info["mirror_episode"] = bool(self._mirror_active)
+        return obs, reward, done, truncated, info
+
+    def _maybe_mirror_obs(self, obs):
+        if not self._mirror_active or not isinstance(obs, dict):
+            return obs
+        obs_dict = dict(obs)
+        players = obs_dict.get("players")
+        if players is not None:
+            obs_dict["players"] = self._mirror_players(np.asarray(players, dtype=np.float32))
+        action_mask = obs_dict.get("action_mask")
+        if action_mask is not None:
+            obs_dict["action_mask"] = self._remap_action_mask(
+                np.asarray(action_mask, dtype=np.int32)
+            )
+        return obs_dict
+
+    def _mirror_players(self, players: np.ndarray) -> np.ndarray:
+        env = self.env.unwrapped
+        norm_den = float(max(env.court_width, env.court_height)) or 1.0
+        if not getattr(env, "normalize_obs", True):
+            norm_den = 1.0
+        basket_q, basket_r = env.basket_position
+        q = players[:, TOKEN_Q_IDX] * norm_den
+        r = players[:, TOKEN_R_IDX] * norm_den
+        q_rel = q - basket_q
+        r_rel = r - basket_r
+        q_m = q_rel + r_rel
+        r_m = -r_rel
+        players = players.copy()
+        players[:, TOKEN_Q_IDX] = (basket_q + q_m) / norm_den
+        players[:, TOKEN_R_IDX] = (basket_r + r_m) / norm_den
+
+        if players.shape[1] > TOKEN_DIST_TO_NEAREST_TEAM_IDX:
+            coords = np.stack(
+                [
+                    players[:, TOKEN_Q_IDX] * norm_den,
+                    players[:, TOKEN_R_IDX] * norm_den,
+                ],
+                axis=1,
+            )
+            coords = np.rint(coords).astype(int)
+
+            ball_idx = np.where(players[:, TOKEN_HAS_BALL_IDX] > 0.5)[0]
+            ball_pos = tuple(coords[ball_idx[0]]) if ball_idx.size > 0 else None
+
+            offense_idx = np.where(players[:, TOKEN_ROLE_IDX] > 0.0)[0]
+            defense_idx = np.where(players[:, TOKEN_ROLE_IDX] < 0.0)[0]
+            if offense_idx.size > 0:
+                ep_vals = players[offense_idx, TOKEN_EP_IDX]
+                best_off_idx = offense_idx[int(np.argmax(ep_vals))]
+                best_ep_pos = tuple(coords[best_off_idx])
+            else:
+                best_ep_pos = None
+
+            if ball_pos is not None:
+                for i in range(coords.shape[0]):
+                    players[i, TOKEN_DIST_TO_BALL_IDX] = (
+                        float(env._hex_distance(tuple(coords[i]), ball_pos)) / norm_den
+                    )
+            else:
+                players[:, TOKEN_DIST_TO_BALL_IDX] = 0.0
+
+            if best_ep_pos is not None:
+                for i in range(coords.shape[0]):
+                    players[i, TOKEN_DIST_TO_BEST_EP_IDX] = (
+                        float(env._hex_distance(tuple(coords[i]), best_ep_pos)) / norm_den
+                    )
+            else:
+                players[:, TOKEN_DIST_TO_BEST_EP_IDX] = 0.0
+
+            for i in range(coords.shape[0]):
+                if i in offense_idx:
+                    opponents = defense_idx
+                    teammates = [idx for idx in offense_idx if idx != i]
+                else:
+                    opponents = offense_idx
+                    teammates = [idx for idx in defense_idx if idx != i]
+                if opponents.size > 0:
+                    players[i, TOKEN_DIST_TO_NEAREST_OPP_IDX] = (
+                        float(
+                            min(
+                                env._hex_distance(tuple(coords[i]), tuple(coords[j]))
+                                for j in opponents
+                            )
+                        )
+                        / norm_den
+                    )
+                else:
+                    players[i, TOKEN_DIST_TO_NEAREST_OPP_IDX] = 0.0
+                if len(teammates) > 0:
+                    players[i, TOKEN_DIST_TO_NEAREST_TEAM_IDX] = (
+                        float(
+                            min(
+                                env._hex_distance(tuple(coords[i]), tuple(coords[j]))
+                                for j in teammates
+                            )
+                        )
+                        / norm_den
+                    )
+                else:
+                    players[i, TOKEN_DIST_TO_NEAREST_TEAM_IDX] = 0.0
+        return players
+
+    def _mirror_actions(self, action):
+        action_arr = np.asarray(action, dtype=int).copy()
+        if action_arr.ndim == 0:
+            idx = int(action_arr)
+            return self._action_map[idx] if idx < len(self._action_map) else idx
+        for i in range(action_arr.size):
+            idx = int(action_arr.flat[i])
+            if idx < len(self._action_map):
+                action_arr.flat[i] = self._action_map[idx]
+        return action_arr
+
+    def _remap_action_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.shape[-1] < len(self._action_map):
+            return mask
+        remapped = np.zeros_like(mask)
+        for original_idx, mirror_idx in enumerate(self._action_map):
+            if mirror_idx < mask.shape[-1]:
+                remapped[..., original_idx] = mask[..., mirror_idx]
+        return remapped
+
+    @staticmethod
+    def _build_action_map() -> list[int]:
+        size = len(ActionType)
+        mapping = list(range(size))
+        mapping[ActionType.MOVE_NE.value] = ActionType.MOVE_SE.value
+        mapping[ActionType.MOVE_SE.value] = ActionType.MOVE_NE.value
+        mapping[ActionType.MOVE_NW.value] = ActionType.MOVE_SW.value
+        mapping[ActionType.MOVE_SW.value] = ActionType.MOVE_NW.value
+        mapping[ActionType.PASS_NE.value] = ActionType.PASS_SE.value
+        mapping[ActionType.PASS_SE.value] = ActionType.PASS_NE.value
+        mapping[ActionType.PASS_NW.value] = ActionType.PASS_SW.value
+        mapping[ActionType.PASS_SW.value] = ActionType.PASS_NW.value
+        return mapping
 
 
 class RewardAggregationWrapper(gym.Wrapper):
@@ -208,6 +440,7 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._made_2pt = 0.0
         self._made_3pt = 0.0
         self._attempts = 0.0
+        self._pressure_exposure = 0.0
         # Minimal audit
         self._gt_is_three = 0.0
         self._gt_is_dunk = 0.0
@@ -325,6 +558,14 @@ class EpisodeStatsWrapper(gym.Wrapper):
                         and move_res.get("reason") == "occupied_neighbor"
                     ):
                         self._move_rejected_occupied += 1.0
+            if ar.get("defender_pressure"):
+                for pressure_info in ar["defender_pressure"].values():
+                    try:
+                        val = float(pressure_info.get("total_pressure_prob", 0.0))
+                    except Exception:
+                        val = 0.0
+                    if val > 0.0:
+                        self._pressure_exposure += val
         except Exception:
             pass
 
@@ -351,6 +592,10 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt
             info["attempts"] = self._attempts
+            exposure_val = getattr(self.env.unwrapped, "pressure_exposure", None)
+            if exposure_val is None:
+                exposure_val = self._pressure_exposure
+            info["pressure_exposure"] = float(exposure_val)
             info["gt_is_three"] = self._gt_is_three
             info["gt_is_dunk"] = self._gt_is_dunk
             info["gt_points"] = self._gt_points

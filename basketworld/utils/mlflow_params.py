@@ -97,6 +97,12 @@ def get_mlflow_params(
     optional["defender_guard_distance"] = _get_param(
         params, ["defender_guard_distance", "defender-guard-distance"], int, 1
     )
+    optional["offense_spawn_boundary_margin"] = _get_param(
+        params,
+        ["offense_spawn_boundary_margin", "offense-spawn-boundary-margin"],
+        int,
+        0,
+    )
     optional["allow_dunks"] = _get_param(
         params,
         ["allow_dunks", "allow-dunks"],
@@ -533,6 +539,9 @@ def get_mlflow_training_params(
     # Pass Logit Bias
     training_params["pass_logit_bias"] = _get_param(
         params, ["pass_logit_bias", "pass-logit-bias"], float, 0.0
+    )
+    training_params["pass_prob_min"] = _get_param(
+        params, ["pass_prob_min", "pass-prob-min"], float, 0.0
     )
 
     return training_params

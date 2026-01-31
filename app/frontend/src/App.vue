@@ -94,6 +94,8 @@ const mctsOptionsForStep = ref(null);
 const lastMctsResults = ref(null);
 const persistUseMcts = ref(false);
 const isMctsStepRunning = ref(false);
+const isStepRunning = ref(false);
+const isBallHolderUpdating = ref(false);
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -126,6 +128,22 @@ const currentShotClock = computed(() => {
   // Board shows post-action, so highlight matching board value
   // (which represents the next actions to be taken)
   return gameState.value.shot_clock;
+});
+
+const pressureExposure = computed(() => {
+  let total = 0;
+  for (const move of moveHistory.value) {
+    if (!move || move.isEndRow) continue;
+    const pressure = move.actionResults?.defender_pressure;
+    if (!pressure) continue;
+    for (const info of Object.values(pressure)) {
+      const val = Number(info?.total_pressure_prob);
+      if (Number.isFinite(val)) {
+        total += val;
+      }
+    }
+  }
+  return total;
 });
 
 // Evaluation mode state
@@ -277,6 +295,15 @@ async function handleGameStarted(setupData) {
 
 async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
+  if (isStepRunning.value) {
+    console.warn('[App] Step already in progress, ignoring submit.');
+    return;
+  }
+  if (isBallHolderUpdating.value) {
+    console.warn('[App] Ball handler update in progress, ignoring submit.');
+    return;
+  }
+  isStepRunning.value = true;
   const shouldUseMcts = !!(mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts);
   // No loading indicator for steps, feels more responsive
   try {
@@ -373,6 +400,7 @@ async function handleActionsSubmitted(actions) {
     console.error(err);
   } finally {
     isMctsStepRunning.value = false;
+    isStepRunning.value = false;
   }
 }
 
@@ -554,34 +582,41 @@ async function handlePolicySwap({ target, policyName }) {
 }
 
 async function handleMoveRecorded(moveData) {
-    console.log('[App] Recording move:', moveData);
-    
-    // Capture ball holder before the action is taken
-    if (gameState.value && gameState.value.ball_holder !== undefined) {
-        moveData.ballHolder = gameState.value.ball_holder;
-    }
-    
-    // Fetch pass steal probabilities before the action is taken
-    try {
-        const passStealProbs = await getPassStealProbabilities();
-        moveData.passStealProbabilities = passStealProbs;
-        console.log('[App] Added pass steal probs to move:', passStealProbs);
-    } catch (err) {
-        console.warn('[App] Failed to fetch pass steal probs for move:', err);
-        moveData.passStealProbabilities = {};
-    }
-    
-    // Carry forward any MCTS selection info from the controls emit (so Moves table can show icons)
-    if (moveData.mctsPlayers && Array.isArray(moveData.mctsPlayers)) {
-        moveData.mctsPlayers = moveData.mctsPlayers.map(p => Number(p));
-    } else {
-        moveData.mctsPlayers = [];
-    }
-    
-    const stateValues = gameState.value?.state_values;
-    moveData.offensiveValue = stateValues?.offensive_value ?? null;
-    moveData.defensiveValue = stateValues?.defensive_value ?? null;
-    moveHistory.value.push(moveData);
+  console.log('[App] Recording move:', moveData);
+
+  const moveEntry = { ...moveData };
+
+  // Capture pre-step state immediately so async work doesn't race the step response.
+  if (gameState.value && gameState.value.ball_holder !== undefined) {
+    moveEntry.ballHolder = gameState.value.ball_holder;
+  }
+  const stateValues = gameState.value?.state_values;
+  moveEntry.offensiveValue = stateValues?.offensive_value ?? null;
+  moveEntry.defensiveValue = stateValues?.defensive_value ?? null;
+  if (gameState.value && gameState.value.shot_clock !== undefined) {
+    moveEntry.shotClock = gameState.value.shot_clock;
+  }
+
+  // Carry forward any MCTS selection info from the controls emit (so Moves table can show icons)
+  if (moveEntry.mctsPlayers && Array.isArray(moveEntry.mctsPlayers)) {
+    moveEntry.mctsPlayers = moveEntry.mctsPlayers.map(p => Number(p));
+  } else {
+    moveEntry.mctsPlayers = [];
+  }
+
+  // Ensure the row exists before any awaits so later updates can attach to it.
+  moveEntry.passStealProbabilities = {};
+  moveHistory.value.push(moveEntry);
+
+  // Fetch pass steal probabilities before the action is taken (best-effort).
+  try {
+    const passStealProbs = await getPassStealProbabilities();
+    moveEntry.passStealProbabilities = passStealProbs;
+    console.log('[App] Added pass steal probs to move:', passStealProbs);
+  } catch (err) {
+    console.warn('[App] Failed to fetch pass steal probs for move:', err);
+    moveEntry.passStealProbabilities = {};
+  }
 }
 
 // Handler for selections changed from PlayerControls
@@ -1471,6 +1506,7 @@ function onKeydown(e) {
     try { controlsRef.value?.copyStatsMarkdown?.(); } catch (_) {}
   } else if (key === 't') {
     // Submit Turn
+    if (isStepRunning.value || isBallHolderUpdating.value) return;
     try { controlsRef.value?.submitActions?.(); } catch (_) {}
   } else if (key === 'arrowright') {
     // Step forward in manual replay
@@ -1584,12 +1620,14 @@ onBeforeUnmount(() => {
           :opponent-deterministic="opponentDeterministic"
           :move-history="moveHistory"
           :current-shot-clock="currentShotClock"
+          :pressure-exposure="pressureExposure"
           :external-selections="isSelfPlaying ? currentSelections : null"
           :eval-config="evalConfig"
           :eval-num-episodes="evalNumEpisodes"
           :per-player-eval-stats="perPlayerEvalStats"
           @actions-submitted="handleActionsSubmitted" 
           @move-recorded="handleMoveRecorded"
+          @ball-holder-updating="isBallHolderUpdating = $event"
           @policy-swap-requested="handlePolicySwap"
           @selections-changed="handleSelectionsChanged"
           @refresh-policies="handleRefreshPolicies"
@@ -1606,7 +1644,7 @@ onBeforeUnmount(() => {
           <button 
             @click="controlsRef?.submitActions?.()" 
             class="action-button submit-button" 
-            :disabled="gameState.done || liveButtonsDisabled"
+            :disabled="gameState.done || liveButtonsDisabled || isStepRunning || isBallHolderUpdating"
           >
             {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
           </button>

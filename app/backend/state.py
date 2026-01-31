@@ -192,7 +192,9 @@ def get_full_game_state(
                     tokens = torch.cat([players_t, g], dim=-1)
                     emb = extractor.token_mlp(tokens)
                     cls_tokens = getattr(extractor, "cls_tokens", None)
+                    cls_tokens_list = None
                     if cls_tokens is not None:
+                        cls_tokens_list = cls_tokens.detach().cpu().tolist()
                         cls = cls_tokens.unsqueeze(0).expand(emb.size(0), -1, -1)
                         emb = torch.cat([emb, cls], dim=1)
                     _, attn_weights = extractor.attn(
@@ -210,16 +212,24 @@ def get_full_game_state(
                     else:
                         labels.append(f"P{pid}")
                 num_cls = int(getattr(extractor, "num_cls_tokens", 0))
+                cls_labels = []
                 if num_cls >= 1:
                     labels.append("CLS_OFF")
+                    cls_labels.append("CLS_OFF")
                 if num_cls >= 2:
                     labels.append("CLS_DEF")
+                    cls_labels.append("CLS_DEF")
+                if cls_tokens_list is not None and len(cls_labels) != len(cls_tokens_list):
+                    cls_labels = [f"CLS_{idx + 1}" for idx in range(len(cls_tokens_list))]
                 attention_payload = {
                     "weights_avg": avg_weights,
                     "weights_heads": per_head_weights,
                     "labels": labels,
                     "heads": int(getattr(extractor.attn, "num_heads", 0)),
                 }
+                if cls_tokens_list is not None:
+                    attention_payload["cls_tokens"] = cls_tokens_list
+                    attention_payload["cls_labels"] = cls_labels
         except Exception:
             attention_payload = None
 
@@ -347,6 +357,9 @@ def get_full_game_state(
         ),
         "defender_spawn_distance": int(getattr(game_state.env, "defender_spawn_distance", 0)),
         "defender_guard_distance": int(getattr(game_state.env, "defender_guard_distance", 1)),
+        "offense_spawn_boundary_margin": int(
+            getattr(game_state.env, "offense_spawn_boundary_margin", 0)
+        ),
         "shot_pressure_enabled": bool(
             getattr(game_state.env, "shot_pressure_enabled", True)
         ),

@@ -49,6 +49,10 @@ Use one schema for all players. For fields that only apply to one side:
 - `expected_points`: offense uses EP for that player; defense uses 0.
 - `turnover_prob`: offense ball handler turnover probability; defense uses 0.
 - `steal_risk`: offense non-ball-handler steal risk on pass; defense uses 0.
+- `dist_to_ball_handler_norm`: hex distance to ball handler (0 for ball handler).
+- `dist_to_best_ep_norm`: hex distance to the highest-EP offense player (0 for that player).
+- `dist_to_nearest_opponent_norm`: hex distance to nearest opponent.
+- `dist_to_nearest_teammate_norm`: hex distance to nearest teammate (0 if no teammates).
 - Any offense-only field not listed above should be set to 0 for defense (and vice-versa)
   to keep a consistent token shape.
 
@@ -82,6 +86,9 @@ Use one schema for all players. For fields that only apply to one side:
 ### Phase 3: Training/Eval integration
 
 - Update `train/env_factory.py` to apply the set wrapper when flag enabled.
+- Add optional **episode-level mirroring** for symmetry:
+  - Mirror `players` coords + action masks and remap actions for the full episode.
+  - Enabled via `--mirror-episode-prob` (set-obs only).
 - Update `train/train.py` and `train/policy_utils.py` to register the new policy.
 - Ensure `basketworld/utils/self_play_wrapper.py` passes through the new dict obs.
 - Log set-attention hyperparameters to MLflow (`set_embed_dim`, `set_heads`, `set_token_mlp_dim`, `set_cls_tokens`).
@@ -91,6 +98,7 @@ Use one schema for all players. For fields that only apply to one side:
 - Unit tests for wrapper:
   - Shape checks for `(n_players, F)` and `(G,)`.
   - Deterministic values from a fixed env state.
+  - Mirror wrapper test: mirrored coords remap correctly and action masks round-trip.
 - Model tests:
   - Token permutation test: reorder player tokens and confirm logits are unchanged
     (up to permutation for non-self tokens).

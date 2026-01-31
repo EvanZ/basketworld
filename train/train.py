@@ -48,7 +48,6 @@ from basketworld.utils.callbacks import MLflowCallback
 from basketworld.utils.schedule_state import (
     save_schedule_metadata,
     load_schedule_metadata,
-    calculate_continued_total_timesteps,
 )
 from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
@@ -254,8 +253,13 @@ def main(args):
             mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
             mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
             mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
-            mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
-            mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
+        mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
+        mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
+        mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
+        mlflow.log_param(
+            "offense_spawn_boundary_margin",
+            getattr(args, "offense_spawn_boundary_margin", 0),
+        )
         
         print(f"MLflow Run ID: {run.info.run_id}")
 
@@ -316,6 +320,7 @@ def main(args):
                 f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
                 f"token_activation={policy_kwargs['token_activation']}",
                 f"head_activation={policy_kwargs['head_activation']}",
+                f"mirror_episode_prob={getattr(args, 'mirror_episode_prob', 0.0)}",
             )
         else:
             # Prevent the policy from learning directly from action_mask
@@ -421,6 +426,13 @@ def main(args):
                     pass
         temp_env.close()
 
+        if getattr(args, "pass_prob_min", None) is not None:
+            try:
+                if hasattr(unified_policy.policy, "set_pass_prob_min"):
+                    unified_policy.policy.set_pass_prob_min(args.pass_prob_min)
+            except Exception:
+                pass
+
         # --- Log the actual network architecture used ---
         # This ensures we capture the default if no custom arch is provided.
         actual_net_arch = str(unified_policy.policy.net_arch)
@@ -472,35 +484,16 @@ def main(args):
         entropy_callback = None
         beta_callback = None
 
-        # Determine effective steps-per-alternation schedule parameters
-        # Check if continuing from a previous run with spa schedule
+        spa_start, spa_end, spa_schedule, spa_offset, spa_total_alternations = resolve_spa_schedule(
+            args, schedule_mode, previous_schedule_meta, base_alt_idx
+        )
         if (
             args.continue_run_id
             and schedule_mode == "extend"
             and previous_schedule_meta
             and "spa_start" in previous_schedule_meta
         ):
-            # Use previous spa schedule if it exists
-            spa_start = previous_schedule_meta.get("spa_start", args.steps_per_alternation)
-            spa_end = previous_schedule_meta.get(
-                "spa_end",
-                args.steps_per_alternation_end
-                if args.steps_per_alternation_end is not None
-                else args.steps_per_alternation,
-            )
-            spa_schedule = previous_schedule_meta.get(
-                "spa_schedule", args.steps_per_alternation_schedule
-            )
             print(f"  Using previous SPA schedule: {spa_start} → {spa_end} ({spa_schedule})")
-        else:
-            # Fresh start or no previous spa schedule
-            spa_start = args.steps_per_alternation
-            spa_end = (
-                args.steps_per_alternation_end
-                if args.steps_per_alternation_end is not None
-                else args.steps_per_alternation
-            )
-            spa_schedule = args.steps_per_alternation_schedule
 
         # Calculate total planned timesteps for this training session
         new_training_timesteps = calculate_total_timesteps_with_schedule(
@@ -510,6 +503,8 @@ def main(args):
             spa_schedule,
             args.num_envs,
             args.n_steps,
+            offset=spa_offset,
+            schedule_total_alternations=spa_total_alternations,
         )
 
         # Print and log SPA schedule info if not constant
@@ -520,15 +515,20 @@ def main(args):
             # Generate full schedule table
             schedule_lines = []
             schedule_lines.append(f"Steps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
-            schedule_lines.append(f"Total alternations: {args.alternations}")
+            schedule_lines.append(f"Segment alternations: {args.alternations}")
+            if spa_total_alternations != args.alternations:
+                schedule_lines.append(f"Schedule total alternations: {spa_total_alternations}")
             schedule_lines.append(f"Total timesteps: {new_training_timesteps:,}")
             schedule_lines.append("")
             schedule_lines.append("| Alternation | Steps |")
             schedule_lines.append("|-------------|-------|")
             
             for i in range(args.alternations):
-                steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                schedule_lines.append(f"| {i + 1:11d} | {steps:5d} |")
+                global_alt = spa_offset + i + 1
+                steps = get_steps_for_alternation(
+                    i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                )
+                schedule_lines.append(f"| {global_alt:11d} | {steps:5d} |")
             
             schedule_table = "\n".join(schedule_lines)
             
@@ -541,13 +541,19 @@ def main(args):
                 print("|-------------|-------|")
                 # First 5
                 for i in range(min(5, args.alternations)):
-                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                    print(f"| {i + 1:11d} | {steps:5d} |")
+                    global_alt = spa_offset + i + 1
+                    steps = get_steps_for_alternation(
+                        i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                    )
+                    print(f"| {global_alt:11d} | {steps:5d} |")
                 print("|     ...     |  ...  |")
                 # Last 5
                 for i in range(max(5, args.alternations - 5), args.alternations):
-                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                    print(f"| {i + 1:11d} | {steps:5d} |")
+                    global_alt = spa_offset + i + 1
+                    steps = get_steps_for_alternation(
+                        i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                    )
+                    print(f"| {global_alt:11d} | {steps:5d} |")
                 print(f"\n(Full schedule logged to MLflow artifacts)")
             
             # Log schedule to MLflow as artifact
@@ -563,10 +569,6 @@ def main(args):
 
         # Log total planned timesteps as a parameter (useful for web UI)
         mlflow.log_param("total_timesteps_planned", new_training_timesteps)
-
-        spa_start, spa_end, spa_schedule = resolve_spa_schedule(
-            args, schedule_mode, previous_schedule_meta, base_alt_idx
-        )
         # Determine schedule parameters based on continuation mode (entropy)
         if (
             args.continue_run_id
@@ -587,16 +589,7 @@ def main(args):
 
             original_total = previous_schedule_meta.get("total_planned_timesteps", 0)
             original_current = previous_schedule_meta.get("current_timesteps", 0)
-            total_planned_ts = calculate_continued_total_timesteps(
-                original_total,
-                original_current,
-                args.alternations,
-                spa_start,
-                spa_end,
-                spa_schedule,
-                args.num_envs,
-                args.n_steps,
-            )
+            total_planned_ts = original_total + new_training_timesteps
             print(f"  Extended total timesteps: {total_planned_ts}")
         elif (
             args.continue_run_id
@@ -671,7 +664,7 @@ def main(args):
             global_alt = base_alt_idx + i + 1
             # Calculate steps for this alternation based on schedule
             current_spa = get_steps_for_alternation(
-                i, args.alternations, spa_start, spa_end, spa_schedule
+                i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
             )
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             if spa_start != spa_end:

@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setBallHolder } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setPassLogitBias, setBallHolder } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -58,6 +58,11 @@ const props = defineProps({
     default: null,
     required: false,
   },
+  // Cumulative defender pressure exposure for the current episode
+  pressureExposure: {
+    type: Number,
+    default: 0,
+  },
   // When provided, overrides internal selections to reflect actual applied actions
   externalSelections: {
     type: Object,
@@ -111,11 +116,15 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating']);
 
 const selectedActions = ref({});
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
+const pressureExposureDisplay = computed(() => {
+  const val = Number(props.pressureExposure);
+  return Number.isFinite(val) ? val.toFixed(3) : '0.000';
+});
 
 // Debug: Watch for any changes to selectedActions
 watch(selectedActions, (newActions, oldActions) => {
@@ -206,6 +215,10 @@ const skillsUpdating = ref(false);
 const skillsError = ref(null);
 const passStrategyUpdating = ref(false);
 const passStrategyError = ref(null);
+const passLogitBiasInput = ref(0);
+const passLogitBiasDefault = 0.0;
+const passLogitBiasUpdating = ref(false);
+const passLogitBiasError = ref(null);
 const PASS_TARGET_STRATEGIES = [
   { value: 'nearest', label: 'Nearest (legacy)' },
   { value: 'best_ev', label: 'Best EV' },
@@ -248,6 +261,14 @@ watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
     fillOffenseSkills(offenseSkillSampled, skills);
   }
 }, { deep: true });
+
+watch(() => props.gameState?.pass_logit_bias, (val) => {
+  if (val === null || val === undefined) return;
+  if (!passLogitBiasUpdating.value) {
+    const num = Number(val);
+    passLogitBiasInput.value = Number.isFinite(num) ? num : 0;
+  }
+}, { immediate: true });
 
 const offenseSkillRows = computed(() => {
   const ids = props.gameState?.offense_ids || [];
@@ -514,6 +535,37 @@ async function handlePassTargetStrategyChange(event) {
   }
 }
 
+function normalizePassLogitBias(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0.0;
+}
+
+async function applyPassLogitBiasOverride() {
+  if (!props.gameState) return;
+  passLogitBiasUpdating.value = true;
+  passLogitBiasError.value = null;
+  try {
+    const bias = normalizePassLogitBias(passLogitBiasInput.value);
+    const res = await setPassLogitBias(bias);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update pass logit bias');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update pass logit bias', err);
+    passLogitBiasError.value = err?.message || 'Failed to update pass logit bias';
+  } finally {
+    passLogitBiasUpdating.value = false;
+  }
+}
+
+async function resetPassLogitBiasDefault() {
+  if (!props.gameState) return;
+  passLogitBiasInput.value = passLogitBiasDefault;
+  await applyPassLogitBiasOverride();
+}
+
 async function handleBallHolderChange(val) {
   if (val === null || val === undefined) return;
   const pid = Number(val);
@@ -522,6 +574,7 @@ async function handleBallHolderChange(val) {
   }
   if (!props.gameState || props.isEvaluating || props.isReplaying) return;
   ballHolderUpdating.value = true;
+  emit('ball-holder-updating', true);
   ballHolderError.value = null;
   try {
     const res = await setBallHolder(pid);
@@ -535,6 +588,7 @@ async function handleBallHolderChange(val) {
     ballHolderError.value = err?.message || 'Failed to set ball holder';
   } finally {
     ballHolderUpdating.value = false;
+    emit('ball-holder-updating', false);
   }
 }
 
@@ -1857,8 +1911,12 @@ const tokenFeatureLabels = [
   'EP',
   'tov%',
   'stl%',
+  'dist_to_ball',
+  'dist_to_best_ep',
+  'dist_to_nearest_opp',
+  'dist_to_nearest_team',
 ];
-const tokenGlobalLabels = ['shot_clock', 'hoop_q_norm', 'hoop_r_norm'];
+const tokenGlobalLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
 
 const tokenPlayers = computed(() => {
   const players = obsTokens.value?.players;
@@ -2576,6 +2634,10 @@ const stealRisks = computed(() => {
     <div v-if="activeTab === 'moves'" class="tab-content">
       <div class="moves-section">
         <h4>Team Moves History ({{ props.gameState?.user_team_name || 'Unknown' }})</h4>
+        <div class="moves-summary">
+          <span class="summary-label">Pressure exposure:</span>
+          <span class="summary-value">{{ pressureExposureDisplay }}</span>
+        </div>
         <div v-if="props.moveHistory.length === 0" class="no-moves">
           No moves recorded yet.
         </div>
@@ -2970,6 +3032,10 @@ const stealRisks = computed(() => {
               <span class="param-name">Defender spawn distance:</span>
               <span class="param-value">{{ props.gameState.defender_spawn_distance || 'N/A' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Keep offense spawns away from the court boundary by this many hex rings (0 = no restriction)">
+              <span class="param-name">Offense boundary margin:</span>
+              <span class="param-value">{{ props.gameState.offense_spawn_boundary_margin ?? 'N/A' }}</span>
+            </div>
             <div class="param-item" data-tooltip="Hex distance (N) within which a defender reset their lane counter if guarding an offensive player while in the lane. 0 disables guarding resets.">
               <span class="param-name">Defender guard distance:</span>
               <span class="param-value">{{ props.gameState.defender_guard_distance || 'N/A' }}</span>
@@ -3028,7 +3094,42 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Bias added to pass action logits in the policy network. Positive = encourage passing.">
               <span class="param-name">Pass logit bias:</span>
-              <span class="param-value">{{ props.gameState.pass_logit_bias != null ? props.gameState.pass_logit_bias.toFixed(2) : 'N/A' }}</span>
+            </div>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header">
+                <span>Setting</span>
+                <span>Bias</span>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="offense-skills-row">
+                <span class="skills-player">Pass logit bias</span>
+                <div class="offense-skill-input">
+                  <input type="number" step="0.05" v-model.number="passLogitBiasInput" :disabled="passLogitBiasUpdating" />
+                  <span class="offense-skill-default">Default {{ passLogitBiasDefault.toFixed(2) }}</span>
+                </div>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="offense-skill-actions">
+                <button
+                  class="refresh-policies-btn"
+                  @click="resetPassLogitBiasDefault"
+                  :disabled="passLogitBiasUpdating"
+                >
+                  Reset to Default
+                </button>
+                <button
+                  class="refresh-policies-btn"
+                  @click="applyPassLogitBiasOverride"
+                  :disabled="passLogitBiasUpdating"
+                >
+                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply Bias' }}
+                </button>
+              </div>
+              <div class="policy-status error" v-if="passLogitBiasError">
+                {{ passLogitBiasError }}
+              </div>
             </div>
           </div>
 
@@ -3419,34 +3520,36 @@ const stealRisks = computed(() => {
             No token data available.
           </div>
           <div v-else class="token-table-wrapper">
-            <table class="observation-table token-table">
-              <thead>
-                <tr>
-                  <th>Player</th>
-                  <th>Team</th>
-                  <th v-for="label in tokenFeatureLabels" :key="`token-head-${label}`">
-                    {{ label }}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="row in tokenRows"
-                  :key="`token-${row.playerId}`"
-                  :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
-                >
-                  <td>Player {{ row.playerId }}</td>
-                  <td>{{ row.teamLabel }}</td>
-                  <td
-                    v-for="(label, fIdx) in tokenFeatureLabels"
-                    :key="`token-${row.playerId}-${label}`"
-                    class="value-mono"
+            <div class="token-table-scroll">
+              <table class="observation-table token-table">
+                <thead>
+                  <tr>
+                    <th>Player</th>
+                    <th>Team</th>
+                    <th v-for="label in tokenFeatureLabels" :key="`token-head-${label}`">
+                      {{ label }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in tokenRows"
+                    :key="`token-${row.playerId}`"
+                    :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
                   >
-                    {{ formatTokenValue(row.features[fIdx]) }}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+                    <td>Player {{ row.playerId }}</td>
+                    <td>{{ row.teamLabel }}</td>
+                    <td
+                      v-for="(label, fIdx) in tokenFeatureLabels"
+                      :key="`token-${row.playerId}-${label}`"
+                      class="value-mono"
+                    >
+                      {{ formatTokenValue(row.features[fIdx]) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
 
             <h5 class="token-subtitle">Globals</h5>
             <table class="observation-table token-table">
@@ -3485,29 +3588,31 @@ const stealRisks = computed(() => {
                 <div class="token-attn-note" v-if="tokenAttentionSubtitle">
                   {{ tokenAttentionSubtitle }}
                 </div>
-                <table class="observation-table token-table token-attn-table">
-                  <thead>
-                    <tr>
-                      <th>From \ To</th>
-                      <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
-                        {{ label }}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
-                      <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
-                      <td
-                        v-for="(val, cIdx) in row"
-                        :key="`attn-${rIdx}-${cIdx}`"
-                        class="value-mono"
-                        :style="attentionCellStyle(val)"
-                      >
-                        {{ formatTokenValue(val) }}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+                <div class="token-table-scroll">
+                  <table class="observation-table token-table token-attn-table">
+                    <thead>
+                      <tr>
+                        <th>From \ To</th>
+                        <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
+                          {{ label }}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
+                        <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
+                        <td
+                          v-for="(val, cIdx) in row"
+                          :key="`attn-${rIdx}-${cIdx}`"
+                          class="value-mono"
+                          :style="attentionCellStyle(val)"
+                        >
+                          {{ formatTokenValue(val) }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>
@@ -4029,6 +4134,26 @@ const stealRisks = computed(() => {
   padding: 0.5rem;
 }
 
+.moves-summary {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0.8rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.moves-summary .summary-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.moves-summary .summary-value {
+  color: var(--app-accent);
+  font-family: 'Courier New', monospace;
+  font-weight: 600;
+}
+
 .moves-table {
   width: 100%;
   border-collapse: collapse;
@@ -4459,6 +4584,15 @@ const stealRisks = computed(() => {
 
 .token-table {
   font-size: 0.9em;
+}
+
+.token-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.token-table-scroll .token-table {
+  min-width: max-content;
 }
 
 .token-ball-holder {

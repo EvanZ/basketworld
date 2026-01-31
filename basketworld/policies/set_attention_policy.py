@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Type
 
 import torch as th
@@ -22,7 +23,34 @@ def _resolve_activation(name: str, fallback: str) -> Type[nn.Module]:
 
 
 class SetAttentionExtractor(BaseFeaturesExtractor):
-    """Encode player tokens with shared MLP + self-attention, return flattened tokens."""
+    """Encode per-player tokens with shared MLP + self-attention.
+
+    Inputs (from set-observation wrapper):
+      - obs["players"]: float tensor of shape (B, P, T)
+        B = batch size, P = number of players, T = per-player token features.
+      - obs["globals"]: float tensor of shape (B, G)
+        G = number of global features (shot clock, hoop coords, etc.).
+
+    Pipeline (with shapes):
+      1) Broadcast globals to each player:
+         globals -> (B, 1, G) -> (B, P, G)
+      2) Concatenate player+global features:
+         tokens = concat(players, globals) -> (B, P, T+G)
+      3) Shared token MLP:
+         token_mlp: (B, P, T+G) -> (B, P, D)
+         D = embed_dim
+      4) Optional learned CLS tokens:
+         cls_tokens: (C, D) where C = num_cls_tokens
+         append -> (B, P+C, D)
+      5) Multihead self-attention + residual + LayerNorm:
+         attn_out -> (B, P+C, D)
+      6) Flatten for SB3 compatibility:
+         output -> (B, (P+C) * D)
+
+    Note: although SB3 expects a flat feature vector, we preserve token
+    structure internally in the policy by reshaping the flattened output
+    back to (B, P+C, D) for action/value heads.
+    """
 
     def __init__(
         self,
@@ -63,6 +91,15 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             self.cls_tokens = None
 
     def forward(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        """Compute flattened token embeddings from a set observation.
+
+        Args:
+            obs: dict with "players" (B, P, T) and "globals" (B, G).
+
+        Returns:
+            Flattened tokens of shape (B, (P + C) * D).
+            This preserves token order: first P player tokens, then C CLS tokens.
+        """
         players = obs["players"]
         globals_vec = obs["globals"]
         g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
@@ -78,7 +115,31 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
 
 
 class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
-    """Dual-critic policy using set attention tokens for action/value heads."""
+    """Dual-critic policy with token-based attention features.
+
+    High-level flow:
+      - Extract tokens with SetAttentionExtractor:
+        latent = (B, (P+C) * D)
+      - Reshape tokens: (B, P+C, D)
+      - Action head(s) use ONLY player tokens (P tokens).
+      - Value heads read CLS tokens (C tokens):
+        CLS_OFF -> offense value, CLS_DEF -> defense value.
+
+    Shapes and roles:
+      - P = number of players (from obs["players"].shape[0]).
+      - C = num_cls_tokens (typically 2: offense + defense).
+      - D = embed_dim.
+      - Action logits per player:
+        (B, P, A) where A = actions_per_player.
+      - Policy output flattened for SB3:
+        (B, P * A)
+
+    net_arch handling:
+      - SB3 normally expects a flat feature vector and builds an MLP.
+      - We bypass that and build optional per-token MLPs ourselves:
+        - net_arch=[64,64] -> shared token MLP for both pi/vf.
+        - net_arch={"pi":[...],"vf":[...]} -> separate token MLPs.
+    """
 
     def __init__(
         self,
@@ -129,6 +190,7 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             raise ValueError("SetAttentionDualCriticPolicy requires uniform action dimensions.")
 
         self.pass_logit_bias: float = 0.0
+        self.pass_prob_min: float = 0.0
         self._pass_indices = self._infer_pass_indices()
 
         self.embed_dim = int(effective_embed_dim)
@@ -210,6 +272,7 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             pass
 
     def _infer_pass_indices(self) -> list[int]:
+        """Infer which action indices correspond to pass actions (per player)."""
         per_dim = int(self.actions_per_player)
         if per_dim <= 0:
             return []
@@ -223,24 +286,68 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         except Exception:
             self.pass_logit_bias = 0.0
 
+    def set_pass_prob_min(self, value: float) -> None:
+        try:
+            self.pass_prob_min = float(value)
+        except Exception:
+            self.pass_prob_min = 0.0
+
     def _apply_pass_bias(self, logits: th.Tensor) -> th.Tensor:
-        if abs(self.pass_logit_bias) <= 1e-12 or not self._pass_indices:
+        base_bias = float(self.pass_logit_bias)
+        pass_prob_min = float(getattr(self, "pass_prob_min", 0.0) or 0.0)
+        if (abs(base_bias) <= 1e-12 and pass_prob_min <= 0.0) or not self._pass_indices:
             return logits
-        bias = th.as_tensor(
-            self.pass_logit_bias, device=logits.device, dtype=logits.dtype
-        )
+        pass_idx = [idx for idx in self._pass_indices if idx < logits.shape[-1]]
+        if not pass_idx:
+            return logits
         adjusted = logits.clone()
-        for idx in self._pass_indices:
-            if idx < adjusted.shape[-1]:
-                adjusted[:, :, idx] = adjusted[:, :, idx] + bias
+        base = th.full(
+            adjusted.shape[:-1], base_bias, device=logits.device, dtype=logits.dtype
+        )
+        total_bias = base
+        if pass_prob_min > 0.0 and len(pass_idx) < logits.shape[-1]:
+            p_min = min(max(float(pass_prob_min), 0.0), 1.0 - 1e-6)
+            pass_logits = logits[..., pass_idx]
+            non_pass_mask = th.ones(logits.shape[-1], dtype=th.bool, device=logits.device)
+            non_pass_mask[pass_idx] = False
+            non_pass_logits = logits[..., non_pass_mask]
+            if non_pass_logits.shape[-1] > 0:
+                log_p = math.log(p_min)
+                log_1mp = math.log1p(-p_min)
+                log_s = th.logsumexp(pass_logits, dim=-1)
+                log_r = th.logsumexp(non_pass_logits, dim=-1)
+                b_needed = log_p + log_r - log_1mp - log_s
+                total_bias = th.maximum(base, b_needed)
+                valid = th.isfinite(log_s) & th.isfinite(log_r)
+                total_bias = th.where(valid, total_bias, base)
+        adjusted[..., pass_idx] = adjusted[..., pass_idx] + total_bias.unsqueeze(-1)
         return adjusted
 
     def _split_tokens(self, latent: th.Tensor) -> th.Tensor:
+        """Reshape flat latent to (B, P+C, D).
+
+        Args:
+            latent: (B, (P+C) * D) from SetAttentionExtractor.
+        """
         batch = latent.shape[0]
         total_tokens = self.token_players + self.num_cls_tokens
         return latent.reshape(batch, total_tokens, self.embed_dim)
 
     def _get_action_logits(self, latent_pi: th.Tensor) -> th.Tensor:
+        """Compute per-player action logits from token embeddings.
+
+        Inputs:
+            latent_pi: (B, (P+C) * D)
+        Steps:
+            1) Reshape -> tokens: (B, P+C, D)
+            2) Slice player tokens: (B, P, D)
+            3) Optional token MLP (pi) -> (B, P, D')
+            4) Action head(s) -> logits: (B, P, A)
+            5) If action space is per-team, select the correct team slice.
+
+        Returns:
+            Flattened logits (B, P*A) or (B, (P/2)*A) depending on action space.
+        """
         tokens = self._split_tokens(latent_pi)
         player_tokens = tokens[:, : self.token_players, :]
         if self.token_head_mlp_pi is not None:
@@ -276,6 +383,21 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         return selected.reshape(selected.size(0), -1)
 
     def _get_value_from_latent(self, latent_vf: th.Tensor, role_flags: th.Tensor) -> th.Tensor:
+        """Compute value estimate from CLS tokens.
+
+        Inputs:
+            latent_vf: (B, (P+C) * D)
+            role_flags: (B, 1) or (B, P, 1) with +1 for offense, -1 for defense.
+
+        Steps:
+            1) Reshape -> tokens: (B, P+C, D)
+            2) Optional token MLP (vf) -> (B, P+C, D')
+            3) Select CLS tokens:
+               - offense_token = tokens[:, P, :]
+               - defense_token = tokens[:, P+1, :]
+            4) Apply value heads -> (B, 1) for each
+            5) Select offense/defense value based on role_flags.
+        """
         tokens = self._split_tokens(latent_vf)
         if self.token_head_mlp_vf is not None:
             tokens = self.token_head_mlp_vf(tokens)
@@ -305,6 +427,11 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         return None
 
     def _build_token_head_mlp(self, input_dim: int, layers: list[int]):
+        """Build a per-token MLP.
+
+        This MLP is applied to each token independently (shared weights across tokens).
+        It does not mix information across tokens; attention already handles that.
+        """
         if not layers:
             return None, input_dim
         modules = []
@@ -314,5 +441,3 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             modules.append(self._head_activation())
             last_dim = int(size)
         return nn.Sequential(*modules), last_dim
-
-    @staticmethod
