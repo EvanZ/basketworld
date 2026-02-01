@@ -160,7 +160,10 @@ def set_ball_holder(req: SetBallHolderRequest):
             "role_flag": game_state.obs.get("role_flag"),
             "skills": game_state.obs.get("skills"),
         }
-        return {"status": "success", "state": get_full_game_state()}
+        updated_state = get_full_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {"status": "success", "state": updated_state}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set ball holder: {e}")
 

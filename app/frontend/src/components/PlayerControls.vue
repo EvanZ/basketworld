@@ -116,11 +116,12 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
 
 const selectedActions = ref({});
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
+const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
 const pressureExposureDisplay = computed(() => {
   const val = Number(props.pressureExposure);
   return Number.isFinite(val) ? val.toFixed(3) : '0.000';
@@ -573,6 +574,8 @@ async function handleBallHolderChange(val) {
     return;
   }
   if (!props.gameState || props.isEvaluating || props.isReplaying) return;
+  const prevBallHolder = props.gameState?.ball_holder;
+  if (prevBallHolder === pid) return;
   ballHolderUpdating.value = true;
   emit('ball-holder-updating', true);
   ballHolderError.value = null;
@@ -580,6 +583,10 @@ async function handleBallHolderChange(val) {
     const res = await setBallHolder(pid);
     if (res?.status === 'success' && res.state) {
       emit('state-updated', res.state);
+      emit('ball-holder-changed', { from: prevBallHolder, to: pid });
+      // Clear any queued selections so we don't treat the manual ball-handler change as an action.
+      selectedActions.value = {};
+      emit('selections-changed', {});
     } else {
       throw new Error(res?.detail || 'Failed to set ball holder');
     }
@@ -996,10 +1003,28 @@ const allPlayerIds = computed(() => {
 const offenseIdsLive = computed(() => props.gameState?.offense_ids || []);
 const ballHolderSelection = computed(() => props.gameState?.ball_holder ?? null);
 
-function computeEntropy(probArray) {
+function normalizeLegalProbs(probArray, actionMask) {
   if (!Array.isArray(probArray)) return null;
+  if (!Array.isArray(actionMask)) return probArray.map((v) => Number(v));
+
+  let total = 0;
+  const masked = probArray.map((raw, idx) => {
+    const p = Number(raw);
+    const allowed = actionMask[idx] > 0;
+    if (!Number.isFinite(p) || p <= 0 || !allowed) return 0;
+    total += p;
+    return p;
+  });
+
+  if (total <= 0) return masked;
+  return masked.map((p) => p / total);
+}
+
+function computeEntropy(probArray, actionMask) {
+  const probs = normalizeLegalProbs(probArray, actionMask);
+  if (!Array.isArray(probs)) return null;
   let entropy = 0;
-  for (const raw of probArray) {
+  for (const raw of probs) {
     const p = Number(raw);
     if (!Number.isFinite(p) || p <= 0) continue;
     entropy -= p * Math.log(p);
@@ -1016,7 +1041,8 @@ const entropyRows = computed(() => {
 
   return allPlayerIds.value.map((pid) => {
     const probs = policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
-    const entropy = computeEntropy(probs);
+    const mask = props.gameState?.action_mask?.[pid];
+    const entropy = computeEntropy(probs, mask);
     const isUserTeam =
       (userTeam === 'OFFENSE' && offenseIds.includes(pid)) ||
       (userTeam === 'DEFENSE' && defenseIds.includes(pid));
@@ -1379,7 +1405,7 @@ function submitActions() {
   console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
   
   // Track moves for the selected team
-  const currentTurn = props.moveHistory.length + 1;
+  const currentTurn = props.moveHistory.filter(m => !m?.isNoteRow).length + 1;
   const teamMoves = {};
   
   for (const playerId of playersToSubmit) {
@@ -2654,7 +2680,13 @@ const stealRisks = computed(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="move in props.moveHistory" :key="move.turn" :class="{ 'current-shot-clock-row': move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done) }">
+            <tr v-for="move in props.moveHistory" :key="move.id || move.turn" :class="{ 'current-shot-clock-row': !move.isNoteRow && (move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done)) }">
+              <template v-if="move.isNoteRow">
+                <td class="moves-note-cell" :colspan="movesColumnCount">
+                  {{ move.noteText || 'Note' }}
+                </td>
+              </template>
+              <template v-else>
               <td>{{ move.turn }}</td>
               <td class="shot-clock-cell">{{ move.shotClock !== undefined ? move.shotClock : '-' }}</td>
               <td v-for="playerId in allPlayerIds" :key="playerId" class="move-cell">
@@ -2676,6 +2708,7 @@ const stealRisks = computed(() => {
               <td class="value-cell">
                 {{ move.defensiveValue !== null && move.defensiveValue !== undefined ? move.defensiveValue.toFixed(3) : '-' }}
               </td>
+              </template>
             </tr>
           </tbody>
         </table>
@@ -4207,6 +4240,14 @@ const stealRisks = computed(() => {
 
 .moves-table tr.current-shot-clock-row td:last-child {
   border-right: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.moves-note-cell {
+  text-align: left;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+  background: rgba(148, 163, 184, 0.06);
 }
 
 .move-cell {

@@ -96,6 +96,11 @@ const persistUseMcts = ref(false);
 const isMctsStepRunning = ref(false);
 const isStepRunning = ref(false);
 const isBallHolderUpdating = ref(false);
+let moveNoteCounter = 0;
+
+function getNextTurnNumber() {
+  return moveHistory.value.filter(m => !m?.isNoteRow).length + 1;
+}
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -382,7 +387,7 @@ async function handleActionsSubmitted(actions) {
             endMoves[`Player ${pid}`] = 'END';
           });
           moveHistory.value.push({
-            turn: moveHistory.value.length + 1,
+            turn: getNextTurnNumber(),
             moves: endMoves,
             shotClock: response.state.shot_clock,
             isEndRow: true,
@@ -619,6 +624,20 @@ async function handleMoveRecorded(moveData) {
   }
 }
 
+function handleBallHolderChanged(payload) {
+  if (!payload) return;
+  moveNoteCounter += 1;
+  const noteText = payload.from !== null && payload.from !== undefined
+    ? `Ball handler changed: Player ${payload.from} → Player ${payload.to}`
+    : `Ball handler set: Player ${payload.to}`;
+  moveHistory.value.push({
+    id: `note-${moveNoteCounter}`,
+    turn: getNextTurnNumber(),
+    isNoteRow: true,
+    noteText,
+  });
+}
+
 // Handler for selections changed from PlayerControls
 function handleSelectionsChanged(selections) {
   userSelections.value = selections;
@@ -821,7 +840,7 @@ async function handleSelfPlay(preselected = null) {
       preselected = null;
       
       // Track moves for AI self-play (even if all players are MCTS)
-      const currentTurn = moveHistory.value.length + 1;
+      const currentTurn = getNextTurnNumber();
       const teamMoves = {};
       const appliedSelections = {};
       const actionNames = [
@@ -921,7 +940,7 @@ async function handleSelfPlay(preselected = null) {
             endMoves[`Player ${pid}`] = 'END';
           });
           moveHistory.value.push({
-            turn: moveHistory.value.length + 1,
+            turn: getNextTurnNumber(),
             moves: endMoves,
             shotClock: response.state.shot_clock,
             isEndRow: true
@@ -1628,6 +1647,7 @@ onBeforeUnmount(() => {
           @actions-submitted="handleActionsSubmitted" 
           @move-recorded="handleMoveRecorded"
           @ball-holder-updating="isBallHolderUpdating = $event"
+          @ball-holder-changed="handleBallHolderChanged"
           @policy-swap-requested="handlePolicySwap"
           @selections-changed="handleSelectionsChanged"
           @refresh-policies="handleRefreshPolicies"
