@@ -38,6 +38,20 @@ function percentToProbClamp(percent) {
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
+const replayPolicyProbsCache = ref(null);
+
+function hasAnyProbabilities(probsByPlayer) {
+  if (!probsByPlayer) return false;
+  const values = Object.values(probsByPlayer);
+  for (const probs of values) {
+    if (!Array.isArray(probs)) continue;
+    for (const raw of probs) {
+      const p = Number(raw);
+      if (Number.isFinite(p) && p > 0) return true;
+    }
+  }
+  return false;
+}
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
@@ -255,6 +269,7 @@ async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
   policyProbs.value = null;
+  replayPolicyProbsCache.value = null;
   lastMctsResults.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
@@ -1386,10 +1401,11 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
         // Keep showing current state (usually the final state), start from end
         currentStepIndex.value = res.states.length - 1;
         // Load policy probs from the final state
-        if (res.states[res.states.length - 1].policy_probabilities) {
+        if (hasAnyProbabilities(res.states[res.states.length - 1].policy_probabilities)) {
           policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
+          replayPolicyProbsCache.value = policyProbs.value;
         } else {
-          policyProbs.value = null;
+          policyProbs.value = replayPolicyProbsCache.value;
           console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
         }
         // Keep current gameState and gameHistory as-is
@@ -1399,10 +1415,11 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
         gameState.value = res.states[0];
         gameHistory.value = [res.states[0]];
         // Load policy probs from the first state
-        if (res.states[0].policy_probabilities) {
+        if (hasAnyProbabilities(res.states[0].policy_probabilities)) {
           policyProbs.value = res.states[0].policy_probabilities;
+          replayPolicyProbsCache.value = policyProbs.value;
         } else {
-          policyProbs.value = null;
+          policyProbs.value = replayPolicyProbsCache.value;
           console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
         }
       }
@@ -1425,12 +1442,13 @@ function stepForward() {
     const currentState = replayStates.value[currentStepIndex.value];
     
     // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (currentState.policy_probabilities) {
+    if (hasAnyProbabilities(currentState.policy_probabilities)) {
       console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
       policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+      replayPolicyProbsCache.value = policyProbs.value;
     } else {
-      console.warn(`[stepForward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
-      policyProbs.value = null;
+      console.warn(`[stepForward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
+      policyProbs.value = replayPolicyProbsCache.value;
     }
     
     // Then update gameState and history
@@ -1448,12 +1466,13 @@ function stepBackward() {
     const currentState = replayStates.value[currentStepIndex.value];
     
     // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (currentState.policy_probabilities) {
+    if (hasAnyProbabilities(currentState.policy_probabilities)) {
       console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
       policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+      replayPolicyProbsCache.value = policyProbs.value;
     } else {
-      console.warn(`[stepBackward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
-      policyProbs.value = null;
+      console.warn(`[stepBackward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
+      policyProbs.value = replayPolicyProbsCache.value;
     }
     
     // Then update gameState and history

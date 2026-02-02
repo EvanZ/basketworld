@@ -1057,6 +1057,8 @@ const entropyRows = computed(() => {
   });
 });
 
+// entropy debug removed
+
 const entropyTotals = computed(() => {
   let playerPolicy = 0;
   let opponentPolicy = 0;
@@ -4054,6 +4056,8 @@ const stealRisks = computed(() => {
   letter-spacing: 0.04em;
   font-size: 0.8rem;
 }
+
+/* entropy debug removed */
 
 .entropy-table tr:nth-child(even) td {
   background: rgba(255, 255, 255, 0.02);

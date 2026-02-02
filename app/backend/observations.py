@@ -84,11 +84,14 @@ def _predict_actions_for_team(
     role_flag_value = _role_flag_value_for_team(team)
     conditioned_obs = _clone_obs_with_role_flag(base_obs, role_flag_value)
 
+    raw_actions = None
     try:
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
     except Exception:
-        return actions_by_player, probs_by_player
+        raw_actions = None
 
+    if raw_actions is None:
+        raw_actions = np.zeros(len(team_ids), dtype=int)
     raw_actions = np.array(raw_actions).reshape(-1)
     action_len = raw_actions.shape[0]
     team_mask = base_obs["action_mask"][team_ids]
@@ -381,8 +384,19 @@ def _compute_policy_probabilities_for_obs(base_obs: dict, env) -> dict | None:
                 probs = raw_probs_main[pid]
             else:
                 probs = raw_probs_opponent[pid]
-            masked = probs * action_mask[pid]
-            total = masked.sum()
+            mask = action_mask[pid]
+            masked = probs * mask
+            total = float(np.sum(masked))
+            if total <= 0:
+                legal = (mask > 0).astype(np.float32)
+                if float(np.sum(legal)) > 0:
+                    raw_total = float(np.sum(probs))
+                    if raw_total > 0:
+                        masked = probs * legal
+                        total = float(np.sum(masked))
+                    if total <= 0:
+                        masked = legal
+                        total = float(np.sum(masked))
             if total > 0:
                 masked = masked / total
             probs_list.append(masked.tolist())
@@ -437,8 +451,19 @@ def compute_policy_probabilities():
             else:
                 probs = raw_probs_opponent[pid]
 
-            masked = probs * action_mask[pid]
-            total = masked.sum()
+            mask = action_mask[pid]
+            masked = probs * mask
+            total = float(np.sum(masked))
+            if total <= 0:
+                legal = (mask > 0).astype(np.float32)
+                if float(np.sum(legal)) > 0:
+                    raw_total = float(np.sum(probs))
+                    if raw_total > 0:
+                        masked = probs * legal
+                        total = float(np.sum(masked))
+                    if total <= 0:
+                        masked = legal
+                        total = float(np.sum(masked))
             if total > 0:
                 masked = masked / total
             probs_list.append(masked.tolist())
