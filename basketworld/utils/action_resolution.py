@@ -18,15 +18,27 @@ def get_policy_action_probabilities(policy, obs) -> Optional[List[np.ndarray]]:
     Expects a PPO/ActorCritic policy with .policy.get_distribution. Returns a list
     of numpy arrays (one per player) or None if retrieval fails.
     """
+    policy_obj = None
     try:
-        obs_tensor = policy.policy.obs_to_tensor(obs)[0]
-        distributions = policy.policy.get_distribution(obs_tensor)
+        policy_obj = getattr(policy, "policy", None)
+        if policy_obj is None:
+            return None
+        if hasattr(policy_obj, "_extract_role_flag") and hasattr(policy_obj, "_current_role_flags"):
+            try:
+                policy_obj._current_role_flags = policy_obj._extract_role_flag(obs)
+            except Exception:
+                policy_obj._current_role_flags = None
+        obs_tensor = policy_obj.obs_to_tensor(obs)[0]
+        distributions = policy_obj.get_distribution(obs_tensor)
         return [
             dist.probs.detach().cpu().numpy().squeeze()
             for dist in distributions.distribution
         ]
     except Exception:
         return None
+    finally:
+        if policy_obj is not None and hasattr(policy_obj, "_current_role_flags"):
+            policy_obj._current_role_flags = None
 
 
 def _choose_legal(

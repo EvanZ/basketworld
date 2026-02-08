@@ -38,6 +38,20 @@ function percentToProbClamp(percent) {
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
+const replayPolicyProbsCache = ref(null);
+
+function hasAnyProbabilities(probsByPlayer) {
+  if (!probsByPlayer) return false;
+  const values = Object.values(probsByPlayer);
+  for (const probs of values) {
+    if (!Array.isArray(probs)) continue;
+    for (const raw of probs) {
+      const p = Number(raw);
+      if (Number.isFinite(p) && p > 0) return true;
+    }
+  }
+  return false;
+}
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
@@ -94,6 +108,13 @@ const mctsOptionsForStep = ref(null);
 const lastMctsResults = ref(null);
 const persistUseMcts = ref(false);
 const isMctsStepRunning = ref(false);
+const isStepRunning = ref(false);
+const isBallHolderUpdating = ref(false);
+let moveNoteCounter = 0;
+
+function getNextTurnNumber() {
+  return moveHistory.value.filter(m => !m?.isNoteRow).length + 1;
+}
 
 async function refreshPolicyOptions(runId) {
   if (!runId) {
@@ -126,6 +147,22 @@ const currentShotClock = computed(() => {
   // Board shows post-action, so highlight matching board value
   // (which represents the next actions to be taken)
   return gameState.value.shot_clock;
+});
+
+const pressureExposure = computed(() => {
+  let total = 0;
+  for (const move of moveHistory.value) {
+    if (!move || move.isEndRow) continue;
+    const pressure = move.actionResults?.defender_pressure;
+    if (!pressure) continue;
+    for (const info of Object.values(pressure)) {
+      const val = Number(info?.total_pressure_prob);
+      if (Number.isFinite(val)) {
+        total += val;
+      }
+    }
+  }
+  return total;
 });
 
 // Evaluation mode state
@@ -232,6 +269,7 @@ async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
   policyProbs.value = null;
+  replayPolicyProbsCache.value = null;
   lastMctsResults.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
@@ -277,6 +315,15 @@ async function handleGameStarted(setupData) {
 
 async function handleActionsSubmitted(actions) {
   if (!gameState.value) return;
+  if (isStepRunning.value) {
+    console.warn('[App] Step already in progress, ignoring submit.');
+    return;
+  }
+  if (isBallHolderUpdating.value) {
+    console.warn('[App] Ball handler update in progress, ignoring submit.');
+    return;
+  }
+  isStepRunning.value = true;
   const shouldUseMcts = !!(mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts);
   // No loading indicator for steps, feels more responsive
   try {
@@ -355,7 +402,7 @@ async function handleActionsSubmitted(actions) {
             endMoves[`Player ${pid}`] = 'END';
           });
           moveHistory.value.push({
-            turn: moveHistory.value.length + 1,
+            turn: getNextTurnNumber(),
             moves: endMoves,
             shotClock: response.state.shot_clock,
             isEndRow: true,
@@ -373,6 +420,7 @@ async function handleActionsSubmitted(actions) {
     console.error(err);
   } finally {
     isMctsStepRunning.value = false;
+    isStepRunning.value = false;
   }
 }
 
@@ -410,6 +458,10 @@ async function handleResetPositions() {
 async function handlePlayerPositionUpdate({ playerId, q, r }) {
   if (!gameState.value || gameState.value.done) {
     console.warn('[App] Cannot update position: game not active or done.');
+    return;
+  }
+  if (isManualStepping.value || isReplaying.value) {
+    console.warn('[App] Ignoring position update during replay/manual stepping.');
     return;
   }
   
@@ -554,34 +606,55 @@ async function handlePolicySwap({ target, policyName }) {
 }
 
 async function handleMoveRecorded(moveData) {
-    console.log('[App] Recording move:', moveData);
-    
-    // Capture ball holder before the action is taken
-    if (gameState.value && gameState.value.ball_holder !== undefined) {
-        moveData.ballHolder = gameState.value.ball_holder;
-    }
-    
-    // Fetch pass steal probabilities before the action is taken
-    try {
-        const passStealProbs = await getPassStealProbabilities();
-        moveData.passStealProbabilities = passStealProbs;
-        console.log('[App] Added pass steal probs to move:', passStealProbs);
-    } catch (err) {
-        console.warn('[App] Failed to fetch pass steal probs for move:', err);
-        moveData.passStealProbabilities = {};
-    }
-    
-    // Carry forward any MCTS selection info from the controls emit (so Moves table can show icons)
-    if (moveData.mctsPlayers && Array.isArray(moveData.mctsPlayers)) {
-        moveData.mctsPlayers = moveData.mctsPlayers.map(p => Number(p));
-    } else {
-        moveData.mctsPlayers = [];
-    }
-    
-    const stateValues = gameState.value?.state_values;
-    moveData.offensiveValue = stateValues?.offensive_value ?? null;
-    moveData.defensiveValue = stateValues?.defensive_value ?? null;
-    moveHistory.value.push(moveData);
+  console.log('[App] Recording move:', moveData);
+
+  const moveEntry = { ...moveData };
+
+  // Capture pre-step state immediately so async work doesn't race the step response.
+  if (gameState.value && gameState.value.ball_holder !== undefined) {
+    moveEntry.ballHolder = gameState.value.ball_holder;
+  }
+  const stateValues = gameState.value?.state_values;
+  moveEntry.offensiveValue = stateValues?.offensive_value ?? null;
+  moveEntry.defensiveValue = stateValues?.defensive_value ?? null;
+  if (gameState.value && gameState.value.shot_clock !== undefined) {
+    moveEntry.shotClock = gameState.value.shot_clock;
+  }
+
+  // Carry forward any MCTS selection info from the controls emit (so Moves table can show icons)
+  if (moveEntry.mctsPlayers && Array.isArray(moveEntry.mctsPlayers)) {
+    moveEntry.mctsPlayers = moveEntry.mctsPlayers.map(p => Number(p));
+  } else {
+    moveEntry.mctsPlayers = [];
+  }
+
+  // Ensure the row exists before any awaits so later updates can attach to it.
+  moveEntry.passStealProbabilities = {};
+  moveHistory.value.push(moveEntry);
+
+  // Fetch pass steal probabilities before the action is taken (best-effort).
+  try {
+    const passStealProbs = await getPassStealProbabilities();
+    moveEntry.passStealProbabilities = passStealProbs;
+    console.log('[App] Added pass steal probs to move:', passStealProbs);
+  } catch (err) {
+    console.warn('[App] Failed to fetch pass steal probs for move:', err);
+    moveEntry.passStealProbabilities = {};
+  }
+}
+
+function handleBallHolderChanged(payload) {
+  if (!payload) return;
+  moveNoteCounter += 1;
+  const noteText = payload.from !== null && payload.from !== undefined
+    ? `Ball handler changed: Player ${payload.from} → Player ${payload.to}`
+    : `Ball handler set: Player ${payload.to}`;
+  moveHistory.value.push({
+    id: `note-${moveNoteCounter}`,
+    turn: getNextTurnNumber(),
+    isNoteRow: true,
+    noteText,
+  });
 }
 
 // Handler for selections changed from PlayerControls
@@ -786,7 +859,7 @@ async function handleSelfPlay(preselected = null) {
       preselected = null;
       
       // Track moves for AI self-play (even if all players are MCTS)
-      const currentTurn = moveHistory.value.length + 1;
+      const currentTurn = getNextTurnNumber();
       const teamMoves = {};
       const appliedSelections = {};
       const actionNames = [
@@ -886,7 +959,7 @@ async function handleSelfPlay(preselected = null) {
             endMoves[`Player ${pid}`] = 'END';
           });
           moveHistory.value.push({
-            turn: moveHistory.value.length + 1,
+            turn: getNextTurnNumber(),
             moves: endMoves,
             shotClock: response.state.shot_clock,
             isEndRow: true
@@ -1332,10 +1405,11 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
         // Keep showing current state (usually the final state), start from end
         currentStepIndex.value = res.states.length - 1;
         // Load policy probs from the final state
-        if (res.states[res.states.length - 1].policy_probabilities) {
+        if (hasAnyProbabilities(res.states[res.states.length - 1].policy_probabilities)) {
           policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
+          replayPolicyProbsCache.value = policyProbs.value;
         } else {
-          policyProbs.value = null;
+          policyProbs.value = replayPolicyProbsCache.value;
           console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
         }
         // Keep current gameState and gameHistory as-is
@@ -1345,10 +1419,11 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
         gameState.value = res.states[0];
         gameHistory.value = [res.states[0]];
         // Load policy probs from the first state
-        if (res.states[0].policy_probabilities) {
+        if (hasAnyProbabilities(res.states[0].policy_probabilities)) {
           policyProbs.value = res.states[0].policy_probabilities;
+          replayPolicyProbsCache.value = policyProbs.value;
         } else {
-          policyProbs.value = null;
+          policyProbs.value = replayPolicyProbsCache.value;
           console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
         }
       }
@@ -1371,12 +1446,13 @@ function stepForward() {
     const currentState = replayStates.value[currentStepIndex.value];
     
     // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (currentState.policy_probabilities) {
+    if (hasAnyProbabilities(currentState.policy_probabilities)) {
       console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
       policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+      replayPolicyProbsCache.value = policyProbs.value;
     } else {
-      console.warn(`[stepForward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
-      policyProbs.value = null;
+      console.warn(`[stepForward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
+      policyProbs.value = replayPolicyProbsCache.value;
     }
     
     // Then update gameState and history
@@ -1394,12 +1470,13 @@ function stepBackward() {
     const currentState = replayStates.value[currentStepIndex.value];
     
     // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (currentState.policy_probabilities) {
+    if (hasAnyProbabilities(currentState.policy_probabilities)) {
       console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
       policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
+      replayPolicyProbsCache.value = policyProbs.value;
     } else {
-      console.warn(`[stepBackward] Step ${currentStepIndex.value} - no policy_probabilities in state`);
-      policyProbs.value = null;
+      console.warn(`[stepBackward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
+      policyProbs.value = replayPolicyProbsCache.value;
     }
     
     // Then update gameState and history
@@ -1471,6 +1548,7 @@ function onKeydown(e) {
     try { controlsRef.value?.copyStatsMarkdown?.(); } catch (_) {}
   } else if (key === 't') {
     // Submit Turn
+    if (isStepRunning.value || isBallHolderUpdating.value) return;
     try { controlsRef.value?.submitActions?.(); } catch (_) {}
   } else if (key === 'arrowright') {
     // Step forward in manual replay
@@ -1584,12 +1662,15 @@ onBeforeUnmount(() => {
           :opponent-deterministic="opponentDeterministic"
           :move-history="moveHistory"
           :current-shot-clock="currentShotClock"
+          :pressure-exposure="pressureExposure"
           :external-selections="isSelfPlaying ? currentSelections : null"
           :eval-config="evalConfig"
           :eval-num-episodes="evalNumEpisodes"
           :per-player-eval-stats="perPlayerEvalStats"
           @actions-submitted="handleActionsSubmitted" 
           @move-recorded="handleMoveRecorded"
+          @ball-holder-updating="isBallHolderUpdating = $event"
+          @ball-holder-changed="handleBallHolderChanged"
           @policy-swap-requested="handlePolicySwap"
           @selections-changed="handleSelectionsChanged"
           @refresh-policies="handleRefreshPolicies"
@@ -1606,7 +1687,7 @@ onBeforeUnmount(() => {
           <button 
             @click="controlsRef?.submitActions?.()" 
             class="action-button submit-button" 
-            :disabled="gameState.done || liveButtonsDisabled"
+            :disabled="gameState.done || liveButtonsDisabled || isStepRunning || isBallHolderUpdating"
           >
             {{ gameState.done ? 'Game Over' : 'Submit Turn' }}
           </button>

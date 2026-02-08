@@ -1,7 +1,7 @@
 import math
 import random
 import torch
-from typing import List
+from typing import List, Optional
 
 
 def get_device(device_arg):
@@ -54,12 +54,23 @@ def calculate_total_timesteps_with_schedule(
     schedule_type: str,
     num_envs: int,
     n_steps: int,
+    offset: int = 0,
+    schedule_total_alternations: Optional[int] = None,
 ) -> int:
-    """Total timesteps across alternations given the step schedule."""
+    """Total timesteps across a segment given the step schedule."""
+    if schedule_total_alternations is None:
+        schedule_total_alternations = total_alternations
+    schedule_total_alternations = max(
+        schedule_total_alternations, total_alternations + max(0, offset)
+    )
     total = 0
     for i in range(total_alternations):
         steps = get_steps_for_alternation(
-            i, total_alternations, start_steps, end_steps, schedule_type
+            i + offset,
+            schedule_total_alternations,
+            start_steps,
+            end_steps,
+            schedule_type,
         )
         total += steps * num_envs * n_steps
     return total
@@ -125,7 +136,7 @@ def resolve_phi_beta_schedule(args, previous_schedule_meta, new_training_timeste
 
 
 def resolve_spa_schedule(args, schedule_mode: str, previous_schedule_meta, base_alt_idx: int):
-    """Resolve steps-per-alternation start/end/schedule based on continuation mode."""
+    """Resolve steps-per-alternation start/end/schedule and continuation offset."""
     if args.continue_run_id and previous_schedule_meta:
         # Use prior schedule metadata if present
         spa_start = previous_schedule_meta.get("spa_start", args.steps_per_alternation)
@@ -138,7 +149,13 @@ def resolve_spa_schedule(args, schedule_mode: str, previous_schedule_meta, base_
         spa_end = args.steps_per_alternation_end if args.steps_per_alternation_end is not None else args.steps_per_alternation
         spa_schedule = args.steps_per_alternation_schedule
 
+    spa_offset = 0
+    spa_total_alternations = args.alternations
+    if args.continue_run_id and schedule_mode == "extend":
+        spa_offset = max(0, base_alt_idx)
+        spa_total_alternations = spa_offset + args.alternations
+
     # If continuing and schedule_mode=constant, lock to last known steps
     if args.continue_run_id and schedule_mode == "constant":
         spa_start = spa_end
-    return spa_start, spa_end, spa_schedule
+    return spa_start, spa_end, spa_schedule, spa_offset, spa_total_alternations

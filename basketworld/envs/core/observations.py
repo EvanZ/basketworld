@@ -153,6 +153,7 @@ def build_observation(env) -> np.ndarray:
     obs.extend(ball_holder_one_hot.tolist())
 
     obs.append(float(env.shot_clock))
+    obs.append(float(getattr(env, "pressure_exposure", 0.0)))
 
     for pid in range(env.n_players):
         if pid in env.offense_ids:

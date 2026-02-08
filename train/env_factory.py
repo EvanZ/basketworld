@@ -11,6 +11,8 @@ from basketworld.utils.wrappers import (
     EpisodeStatsWrapper,
     BetaSetterWrapper,
     EnvIndexWrapper,
+    SetObservationWrapper,
+    MirrorObservationWrapper,
 )
 
 
@@ -49,6 +51,7 @@ def setup_environment(args, training_team, env_idx=None):
         max_spawn_distance=getattr(args, "max_spawn_distance", None),
         defender_spawn_distance=getattr(args, "defender_spawn_distance", 0),
         defender_guard_distance=getattr(args, "defender_guard_distance", 1),
+        offense_spawn_boundary_margin=getattr(args, "offense_spawn_boundary_margin", 0),
         pass_reward=getattr(args, "pass_reward", 0.0),
         turnover_penalty=getattr(args, "turnover_penalty", 0.0),
         violation_reward=getattr(args, "violation_reward", 1.0),
@@ -84,6 +87,11 @@ def setup_environment(args, training_team, env_idx=None):
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
     env = BetaSetterWrapper(env)
+    if getattr(args, "use_set_obs", False):
+        env = SetObservationWrapper(env)
+        mirror_prob = float(getattr(args, "mirror_episode_prob", 0.0))
+        if mirror_prob > 0.0:
+            env = MirrorObservationWrapper(env, mirror_prob=mirror_prob)
     monitored_env = Monitor(
         env,
         info_keywords=(
@@ -110,8 +118,9 @@ def setup_environment(args, training_team, env_idx=None):
             "made_2pt",
             "made_3pt",
             "attempts",
-        "legal_actions_offense",
-        "legal_actions_defense",
+            "pressure_exposure",
+            "legal_actions_offense",
+            "legal_actions_defense",
             "phi_beta",
             "phi_prev",
             "phi_next",

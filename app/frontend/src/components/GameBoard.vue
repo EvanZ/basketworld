@@ -229,6 +229,7 @@ function getSvgPoint(clientX, clientY) {
 
 function onMouseDown(event, player) {
   if (!player) return;
+  if (props.isManualStepping) return;
   event.preventDefault();
   
   draggedPlayerId.value = player.id;
@@ -806,6 +807,47 @@ const courtCenter = computed(() => {
   return {
     x: (Math.min(...xs) + Math.max(...xs)) / 2,
     y: (Math.min(...ys) + Math.max(...ys)) / 2,
+  };
+});
+
+const courtBounds = computed(() => {
+  if (courtLayout.value.length === 0) return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+  const xs = courtLayout.value.map((h) => h.x);
+  const ys = courtLayout.value.map((h) => h.y);
+  return {
+    minX: Math.min(...xs),
+    maxX: Math.max(...xs),
+    minY: Math.min(...ys),
+    maxY: Math.max(...ys),
+  };
+});
+
+const basketMarkerPosition = computed(() => {
+  const basket = basketPosition.value;
+  return {
+    x: basket.x - HEX_RADIUS * 1.4,
+    y: basket.y,
+  };
+});
+
+const halfcourtMarkerPosition = computed(() => {
+  return {
+    x: courtBounds.value.maxX + HEX_RADIUS * 1.4,
+    y: courtCenter.value.y,
+  };
+});
+
+const rightSidelineMarkerPosition = computed(() => {
+  return {
+    x: courtCenter.value.x,
+    y: courtBounds.value.minY - HEX_RADIUS * 1.6,
+  };
+});
+
+const leftSidelineMarkerPosition = computed(() => {
+  return {
+    x: courtCenter.value.x,
+    y: courtBounds.value.maxY + HEX_RADIUS * 1.6,
   };
 });
 
@@ -1786,6 +1828,48 @@ onBeforeUnmount(() => {
           class="three-point-arc"
         />
 
+        <!-- Court reference labels -->
+        <text
+          v-if="currentGameState && courtLayout.length"
+          :x="basketMarkerPosition.x"
+          :y="basketMarkerPosition.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-marker basket-marker"
+        >
+          B
+        </text>
+        <text
+          v-if="currentGameState && courtLayout.length"
+          :x="halfcourtMarkerPosition.x"
+          :y="halfcourtMarkerPosition.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-marker halfcourt-marker"
+        >
+          H
+        </text>
+        <text
+          v-if="currentGameState && courtLayout.length"
+          :x="rightSidelineMarkerPosition.x"
+          :y="rightSidelineMarkerPosition.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-marker sideline-marker"
+        >
+          R
+        </text>
+        <text
+          v-if="currentGameState && courtLayout.length"
+          :x="leftSidelineMarkerPosition.x"
+          :y="leftSidelineMarkerPosition.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-marker sideline-marker"
+        >
+          L
+        </text>
+
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
 
@@ -2499,6 +2583,27 @@ svg {
   font-size: 10px;
   opacity: 0.7;
   stroke-width: 0.2;
+}
+.court-marker {
+  fill: rgba(255, 255, 255, 0.5);
+  font-weight: 700;
+  font-size: 1rem;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.45);
+  stroke-width: 0.08rem;
+  pointer-events: none;
+}
+.basket-marker {
+  font-size: 1.1rem;
+  opacity: 0.7;
+}
+.halfcourt-marker {
+  font-size: 1.1rem;
+  opacity: 0.5;
+}
+.sideline-marker {
+  font-size: 1rem;
+  opacity: 0.55;
 }
 .basket-rim {
   fill: none;

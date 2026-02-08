@@ -1,16 +1,19 @@
 import copy
 import logging
 import os
+from typing import List
 
 from fastapi import APIRouter, HTTPException
 import mlflow
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 from app.backend.schemas import (
     BatchUpdatePositionRequest,
     SetBallHolderRequest,
     SetOffenseSkillsRequest,
+    SetPassLogitBiasRequest,
     SetPassTargetStrategyRequest,
     SwapPoliciesRequest,
     UpdatePositionRequest,
@@ -58,13 +61,16 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
+    updated_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
     return {
         "status": "success",
-        "state": get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        ),
+        "state": updated_state,
     }
 
 
@@ -98,24 +104,34 @@ def update_player_position(req: UpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
+    updated_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
     return {
         "status": "success",
-        "state": get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        ),
+        "state": updated_state,
     }
 
 
 @router.post("/api/update_shot_clock")
 def update_shot_clock(req: UpdateShotClockRequest):
-    """Manually set the shot clock to a specific value."""
+    """Adjust the shot clock by a delta (see UpdateShotClockRequest)."""
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     try:
-        new_val = int(req.shot_clock)
-        game_state.env.shot_clock = new_val
+        delta = int(req.delta)
+        current = int(getattr(game_state.env, "shot_clock", 0))
+        max_val = int(getattr(game_state.env, "shot_clock_steps", current))
+        new_val = current + delta
+        if max_val > 0:
+            new_val = max(0, min(max_val, new_val))
+        else:
+            new_val = max(0, new_val)
+        game_state.env.shot_clock = int(new_val)
         return {
             "status": "success",
             "shot_clock": int(game_state.env.shot_clock),
@@ -123,6 +139,12 @@ def update_shot_clock(req: UpdateShotClockRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/set_shot_clock")
+def set_shot_clock(req: UpdateShotClockRequest):
+    """Backwards-compatible alias for update_shot_clock (expects delta)."""
+    return update_shot_clock(req)
 
 
 @router.post("/api/set_ball_holder")
@@ -145,7 +167,10 @@ def set_ball_holder(req: SetBallHolderRequest):
             "role_flag": game_state.obs.get("role_flag"),
             "skills": game_state.obs.get("skills"),
         }
-        return {"status": "success", "state": get_full_game_state()}
+        updated_state = get_full_game_state(include_policy_probs=True)
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {"status": "success", "state": updated_state}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set ball holder: {e}")
 
@@ -182,9 +207,11 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
             env.offense_three_pt_pct_by_player = copy.deepcopy(game_state.sampled_offense_skills.get("three_pt"))
             env.offense_dunk_pct_by_player = copy.deepcopy(game_state.sampled_offense_skills.get("dunk"))
         else:
-            layup = _normalize(req.layup, "layup")
-            three_pt = _normalize(req.three_pt, "three_pt")
-            dunk = _normalize(req.dunk, "dunk")
+            if not req.skills:
+                raise HTTPException(status_code=400, detail="Missing skills payload.")
+            layup = _normalize(req.skills.layup, "layup")
+            three_pt = _normalize(req.skills.three_pt, "three_pt")
+            dunk = _normalize(req.skills.dunk, "dunk")
 
             env.offense_layup_pct_by_player = layup
             env.offense_three_pt_pct_by_player = three_pt
@@ -213,6 +240,38 @@ def set_pass_target_strategy(req: SetPassTargetStrategyRequest):
         raise HTTPException(status_code=500, detail=f"Failed to update pass target strategy: {e}")
 
 
+@router.post("/api/set_pass_logit_bias")
+def set_pass_logit_bias(req: SetPassLogitBiasRequest):
+    """Update pass logit bias for the active policies."""
+    if game_state.unified_policy is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    try:
+        bias = float(req.bias) if req.bias is not None else 0.0
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid pass logit bias: {req.bias}")
+
+    def _apply(policy):
+        policy_obj = getattr(policy, "policy", None)
+        if policy_obj is None:
+            return
+        if hasattr(policy_obj, "set_pass_logit_bias"):
+            policy_obj.set_pass_logit_bias(bias)
+        else:
+            try:
+                setattr(policy_obj, "pass_logit_bias", float(bias))
+            except Exception:
+                pass
+
+    _apply(game_state.unified_policy)
+    if game_state.defense_policy is not None:
+        _apply(game_state.defense_policy)
+
+    return {
+        "status": "success",
+        "state": get_full_game_state(include_policy_probs=True),
+    }
+
+
 @router.post("/api/swap_policies")
 def swap_policies(req: SwapPoliciesRequest):
     """Swap the active PPO policies without resetting the environment."""
@@ -229,9 +288,10 @@ def swap_policies(req: SwapPoliciesRequest):
 
     client = mlflow.tracking.MlflowClient()
     custom_objects = {
-        "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+        "SetAttentionExtractor": SetAttentionExtractor,
     }
 
     policies_changed = False

@@ -1,6 +1,9 @@
 import copy
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
+import queue
+import sys
+import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import Optional
 
 import numpy as np
@@ -13,15 +16,40 @@ from basketworld.utils.action_resolution import (
     resolve_illegal_actions,
 )
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from stable_baselines3 import PPO
 
 from app.backend.mcts import _run_mcts_advisor
-from app.backend.observations import _predict_policy_actions
+from app.backend.observations import _ensure_set_obs, _predict_policy_actions
 from app.backend.state import game_state
 
 
 # Worker-local storage (each process has its own copy)
 _worker_state = {}
+
+
+def _print_eval_progress(prefix: str, current: int, total: int, start_time: float | None = None) -> None:
+    if total <= 0:
+        return
+    current = min(current, total)
+    pct = (current / total) * 100.0
+    eta_str = ""
+    elapsed_str = ""
+    if start_time is not None and current > 0:
+        elapsed = time.time() - start_time
+        if elapsed > 0:
+            rate = current / elapsed
+            if rate > 0:
+                remaining = max(0.0, (total - current) / rate)
+                eta_str = f" ETA {remaining:.1f}s"
+    if start_time is not None:
+        elapsed_str = f" elapsed {time.time() - start_time:.1f}s"
+    line = f"\r[{prefix}] {current}/{total} ({pct:.1f}%)" + eta_str + elapsed_str
+    sys.stdout.write(line.ljust(80))
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def _init_evaluation_worker(
@@ -32,18 +60,27 @@ def _init_evaluation_worker(
     user_team_name: str,
     role_flag_offense: float,
     role_flag_defense: float,
+    progress_queue=None,
 ):
     """Initialize a worker process with its own environment and policies."""
     global _worker_state
 
     # Import all required modules for worker functions
     import numpy as _np
+    import torch as _torch
     from basketworld.envs.basketworld_env_v2 import Team as _Team
     from basketworld.utils.action_resolution import (
         IllegalActionStrategy as _IllegalActionStrategy,
         get_policy_action_probabilities as _get_policy_action_probabilities,
         resolve_illegal_actions as _resolve_illegal_actions,
     )
+
+    # Avoid thread oversubscription when running multiple workers.
+    try:
+        _torch.set_num_threads(1)
+        _torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
     env = basketworld.HexagonBasketballEnv(
         **required_params,
@@ -52,9 +89,10 @@ def _init_evaluation_worker(
     )
 
     custom_objects = {
-        "policy_class": PassBiasDualCriticPolicy,
         "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
         "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+        "SetAttentionExtractor": SetAttentionExtractor,
     }
     unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
     opponent_policy = (
@@ -77,6 +115,7 @@ def _init_evaluation_worker(
         "IllegalActionStrategy": _IllegalActionStrategy,
         "get_policy_action_probabilities": _get_policy_action_probabilities,
         "resolve_illegal_actions": _resolve_illegal_actions,
+        "progress_queue": progress_queue,
     }
 
 
@@ -99,6 +138,10 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
         cloned["skills"] = _np.copy(skills)
     else:
         cloned["skills"] = None
+    if "players" in obs:
+        cloned["players"] = _np.copy(obs["players"])
+    if "globals" in obs:
+        cloned["globals"] = _np.copy(obs["globals"])
     return cloned
 
 
@@ -121,6 +164,7 @@ def _worker_predict_actions_for_team(
     if policy is None or base_obs is None or env is None:
         return actions_by_player
 
+    base_obs = _ensure_set_obs(policy, env, base_obs)
     team_ids = list(env.offense_ids if team == _Team.OFFENSE else env.defense_ids)
     if not team_ids:
         return actions_by_player
@@ -211,6 +255,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
     _np = _worker_state["np"]
     _Team = _worker_state["Team"]
     _IllegalActionStrategy = _worker_state["IllegalActionStrategy"]
+    progress_queue = _worker_state.get("progress_queue")
 
     results = []
     shot_accumulator: dict[str, list[int]] = {}
@@ -344,6 +389,13 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 "shot_counts": episode_shots,
             }
         )
+        if progress_queue is not None:
+            try:
+                progress_queue.put_nowait(1)
+            except queue.Full:
+                pass
+            except Exception:
+                pass
 
     return {
         "results": results,
@@ -523,6 +575,8 @@ def _run_sequential_evaluation(
 ) -> dict:
     results = []
     per_player_stats = _init_player_stats(env.n_players)
+    progress_start = time.time()
+    progress_every = max(1, num_episodes // 50)
 
     for ep_idx in range(num_episodes):
         reset_opts = _build_reset_options_for_custom_setup(custom_setup, enforce_fixed_skills=True)
@@ -645,6 +699,8 @@ def _run_sequential_evaluation(
                 "shot_counts": episode_shots,
             }
         )
+        if (ep_idx + 1) % progress_every == 0 or (ep_idx + 1) == num_episodes:
+            _print_eval_progress("Evaluation", ep_idx + 1, num_episodes, progress_start)
 
     return {
         "results": results,
@@ -674,7 +730,8 @@ def _run_parallel_evaluation(
     num_workers = min(num_workers, num_episodes)
 
     episode_specs = [(i, int(np.random.randint(0, 2**31 - 1))) for i in range(num_episodes)]
-    batch_size = (num_episodes + num_workers - 1) // num_workers
+    target_batches = max(1, num_workers * 4)
+    batch_size = max(1, (num_episodes + target_batches - 1) // target_batches)
     batches = []
     for i in range(0, num_episodes, batch_size):
         batch = episode_specs[i : i + batch_size]
@@ -686,6 +743,9 @@ def _run_parallel_evaluation(
     )
 
     ctx = mp.get_context("spawn")
+    progress_queue = ctx.Queue()
+    progress_start = time.time()
+    completed = 0
 
     with ProcessPoolExecutor(
         max_workers=num_workers,
@@ -699,9 +759,54 @@ def _run_parallel_evaluation(
             user_team_name,
             role_flag_offense,
             role_flag_defense,
+            progress_queue,
         ),
     ) as executor:
-        batch_results = list(executor.map(_run_episode_batch_worker, batches))
+        futures = {}
+        for batch in batches:
+            future = executor.submit(_run_episode_batch_worker, batch)
+            futures[future] = len(batch[0])
+        batch_results = []
+        pending = set(futures.keys())
+        done_reported = False
+
+        def report_progress() -> None:
+            nonlocal done_reported
+            if completed >= num_episodes:
+                if done_reported:
+                    return
+                done_reported = True
+            _print_eval_progress("Parallel Eval", completed, num_episodes, progress_start)
+
+        report_progress()
+        while pending:
+            done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+            drained = False
+            while True:
+                try:
+                    completed += int(progress_queue.get_nowait())
+                    drained = True
+                except queue.Empty:
+                    break
+                except Exception:
+                    drained = True
+                    break
+            if drained or not done:
+                report_progress()
+            if not done:
+                continue
+            for future in done:
+                payload = future.result()
+                batch_results.append(payload)
+                report_progress()
+        while True:
+            try:
+                completed += int(progress_queue.get_nowait())
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        report_progress()
 
     results = []
     merged_player_stats: dict = {}
@@ -833,9 +938,10 @@ def run_evaluation(
     if num_workers is None or num_workers <= 1:
         env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
         custom_objects = {
-            "policy_class": PassBiasDualCriticPolicy,
             "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
             "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+            "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+            "SetAttentionExtractor": SetAttentionExtractor,
         }
         unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
         opponent_policy = (

@@ -163,66 +163,140 @@ def load_schedule_metadata(
 
     # Helper to safely extract parameters
     def get_param(key: str, cast_fn=float, default=None):
-        if key in params:
+        if key in params and params[key] != "":
             try:
                 return cast_fn(params[key])
             except (ValueError, TypeError):
                 return default
         return default
 
+    def get_any_param(keys, cast_fn=float, default=None):
+        for key in keys:
+            if key in params and params[key] != "":
+                try:
+                    return cast_fn(params[key])
+                except (ValueError, TypeError):
+                    continue
+        return default
+
     # Load timestep information
-    metadata["total_planned_timesteps"] = get_param(
-        "schedule_total_planned_timesteps", int, 0
-    )
+    total_planned = get_param("schedule_total_planned_timesteps", int, 0)
+    if total_planned <= 0:
+        total_planned = get_any_param(["total_timesteps_planned"], int, total_planned)
+    metadata["total_planned_timesteps"] = total_planned
     metadata["current_timesteps"] = get_param("schedule_current_timesteps", int, 0)
 
     # Load entropy schedule (only include if values exist in MLflow)
     ent_start = get_param("schedule_ent_coef_start")
+    if ent_start is None:
+        ent_start = get_any_param(["ent_coef_start", "ent-coef-start"])
+        ent_end = get_any_param(["ent_coef_end", "ent-coef-end"])
+        ent_schedule = get_any_param(["ent_schedule", "ent-schedule"], str, "linear")
+        ent_bump_updates = get_any_param(
+            ["ent_bump_updates", "ent-bump-updates"], int, 0
+        )
+        ent_bump_multiplier = get_any_param(
+            ["ent_bump_multiplier", "ent-bump-multiplier"], float, 1.0
+        )
+    else:
+        ent_end = get_param("schedule_ent_coef_end")
+        ent_schedule = get_param("schedule_ent_schedule", str, "linear")
+        ent_bump_updates = get_param("schedule_ent_bump_updates", int, 0)
+        ent_bump_multiplier = get_param("schedule_ent_bump_multiplier", float, 1.0)
     if ent_start is not None:
         metadata["ent_coef_start"] = ent_start
-        metadata["ent_coef_end"] = get_param("schedule_ent_coef_end")
-        metadata["ent_schedule"] = get_param("schedule_ent_schedule", str, "linear")
-        metadata["ent_bump_updates"] = get_param("schedule_ent_bump_updates", int, 0)
-        metadata["ent_bump_multiplier"] = get_param(
-            "schedule_ent_bump_multiplier", float, 1.0
-        )
+        metadata["ent_coef_end"] = ent_end if ent_end is not None else 0.0
+        metadata["ent_schedule"] = ent_schedule
+        metadata["ent_bump_updates"] = ent_bump_updates
+        metadata["ent_bump_multiplier"] = ent_bump_multiplier
 
     # Load phi beta schedule (only include if values exist in MLflow)
     phi_beta_start = get_param("schedule_phi_beta_start")
+    if phi_beta_start is None:
+        phi_beta_start = get_any_param(["phi_beta_start", "phi-beta-start"])
+        phi_beta_end = get_any_param(["phi_beta_end", "phi-beta-end"])
+        phi_beta_schedule = get_any_param(
+            ["phi_beta_schedule", "phi-beta-schedule"], str, "exp"
+        )
+        phi_bump_updates = get_any_param(
+            ["phi_bump_updates", "phi-bump-updates"], int, 0
+        )
+        phi_bump_multiplier = get_any_param(
+            ["phi_bump_multiplier", "phi-bump-multiplier"], float, 1.0
+        )
+    else:
+        phi_beta_end = get_param("schedule_phi_beta_end")
+        phi_beta_schedule = get_param("schedule_phi_beta_schedule", str, "exp")
+        phi_bump_updates = get_param("schedule_phi_bump_updates", int, 0)
+        phi_bump_multiplier = get_param("schedule_phi_bump_multiplier", float, 1.0)
     if phi_beta_start is not None:
         metadata["phi_beta_start"] = phi_beta_start
-        metadata["phi_beta_end"] = get_param("schedule_phi_beta_end")
-        metadata["phi_beta_schedule"] = get_param("schedule_phi_beta_schedule", str, "exp")
-        metadata["phi_bump_updates"] = get_param("schedule_phi_bump_updates", int, 0)
-        metadata["phi_bump_multiplier"] = get_param(
-            "schedule_phi_bump_multiplier", float, 1.0
-        )
+        metadata["phi_beta_end"] = phi_beta_end if phi_beta_end is not None else 0.0
+        metadata["phi_beta_schedule"] = phi_beta_schedule
+        metadata["phi_bump_updates"] = phi_bump_updates
+        metadata["phi_bump_multiplier"] = phi_bump_multiplier
 
     # Load pass logit bias schedule (only include if values exist in MLflow)
     pass_logit_bias_start = get_param("schedule_pass_logit_bias_start")
+    if pass_logit_bias_start is None:
+        pass_logit_bias_start = get_any_param(
+            ["pass_logit_bias_start", "pass-logit-bias-start"]
+        )
+        pass_logit_bias_end = get_any_param(
+            ["pass_logit_bias_end", "pass-logit-bias-end"]
+        )
+    else:
+        pass_logit_bias_end = get_param("schedule_pass_logit_bias_end")
     if pass_logit_bias_start is not None:
         metadata["pass_logit_bias_start"] = pass_logit_bias_start
-        metadata["pass_logit_bias_end"] = get_param("schedule_pass_logit_bias_end")
+        metadata["pass_logit_bias_end"] = pass_logit_bias_end
 
     # Load pass curriculum schedule (only include if values exist in MLflow)
     pass_arc_start = get_param("schedule_pass_arc_start")
+    if pass_arc_start is None:
+        pass_arc_start = get_any_param(["pass_arc_start", "pass-arc-start"])
+        pass_arc_end = get_any_param(["pass_arc_end", "pass-arc-end"])
+    else:
+        pass_arc_end = get_param("schedule_pass_arc_end")
     if pass_arc_start is not None:
         metadata["pass_arc_start"] = pass_arc_start
-        metadata["pass_arc_end"] = get_param("schedule_pass_arc_end")
+        metadata["pass_arc_end"] = pass_arc_end
     
     pass_oob_turnover_prob_start = get_param("schedule_pass_oob_turnover_prob_start")
+    if pass_oob_turnover_prob_start is None:
+        pass_oob_turnover_prob_start = get_any_param(
+            ["pass_oob_turnover_prob_start", "pass-oob-turnover-prob-start"]
+        )
+        pass_oob_turnover_prob_end = get_any_param(
+            ["pass_oob_turnover_prob_end", "pass-oob-turnover-prob-end"]
+        )
+    else:
+        pass_oob_turnover_prob_end = get_param("schedule_pass_oob_turnover_prob_end")
     if pass_oob_turnover_prob_start is not None:
         metadata["pass_oob_turnover_prob_start"] = pass_oob_turnover_prob_start
-        metadata["pass_oob_turnover_prob_end"] = get_param(
-            "schedule_pass_oob_turnover_prob_end"
-        )
+        metadata["pass_oob_turnover_prob_end"] = pass_oob_turnover_prob_end
 
     # Load steps per alternation schedule (only include if values exist in MLflow)
     spa_start = get_param("schedule_spa_start", int)
+    if spa_start is None:
+        spa_start = get_any_param(
+            ["steps_per_alternation", "steps-per-alternation"], int
+        )
+        spa_end = get_any_param(
+            ["steps_per_alternation_end", "steps-per-alternation-end"], int, spa_start
+        )
+        spa_schedule = get_any_param(
+            ["steps_per_alternation_schedule", "steps-per-alternation-schedule"],
+            str,
+            "linear",
+        )
+    else:
+        spa_end = get_param("schedule_spa_end", int, spa_start)
+        spa_schedule = get_param("schedule_spa_schedule", str, "linear")
     if spa_start is not None:
         metadata["spa_start"] = spa_start
-        metadata["spa_end"] = get_param("schedule_spa_end", int, spa_start)
-        metadata["spa_schedule"] = get_param("schedule_spa_schedule", str, "linear")
+        metadata["spa_end"] = spa_end if spa_end is not None else spa_start
+        metadata["spa_schedule"] = spa_schedule
 
     return metadata
 

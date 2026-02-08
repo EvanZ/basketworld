@@ -118,8 +118,15 @@ def run_evaluation(request: EvaluationRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to run evaluation: {e}")
 
-    per_player_stats = raw_results.get("per_player_stats", {}) or {} if isinstance(raw_results, dict) else {}
-    episode_payload = raw_results.get("results", []) if isinstance(raw_results, dict) else raw_results
+    if isinstance(raw_results, dict):
+        per_player_stats = raw_results.get("per_player_stats", {}) or {}
+        raw_shots = raw_results.get("shot_accumulator")
+        if isinstance(raw_shots, dict):
+            shot_accumulator = raw_shots
+        episode_payload = raw_results.get("results", [])
+    else:
+        per_player_stats = {}
+        episode_payload = raw_results
 
     elapsed_time = time.time() - start_time
     if elapsed_time > 0:

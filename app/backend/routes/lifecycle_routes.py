@@ -16,6 +16,7 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_training_params,
 )
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 
@@ -132,9 +133,10 @@ async def init_game(request: InitGameRequest):
                 raise HTTPException(status_code=500, detail=f"Failed to download opponent policy: {e}")
 
         custom_objects = {
-            "policy_class": PassBiasDualCriticPolicy,
             "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
             "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+            "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+            "SetAttentionExtractor": SetAttentionExtractor,
         }
         game_state.unified_policy = PPO.load(unified_path, custom_objects=custom_objects)
         game_state.offense_policy = None

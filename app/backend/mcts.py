@@ -12,7 +12,11 @@ from stable_baselines3 import PPO
 
 from basketworld.utils.action_resolution import IllegalActionStrategy
 
-from app.backend.observations import _build_role_conditioned_obs, _predict_policy_actions
+from app.backend.observations import (
+    _build_role_conditioned_obs,
+    _ensure_set_obs,
+    _predict_policy_actions,
+)
 from app.backend.state import game_state
 
 
@@ -126,6 +130,7 @@ class MCTSAdvisor:
         if policy is None or not hasattr(policy, "policy"):
             return 0.0
         try:
+            obs = _ensure_set_obs(policy, env, obs)
             role_flag = (
                 self.role_flag_offense
                 if self.target_player_id in getattr(env, "offense_ids", [])

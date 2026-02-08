@@ -205,6 +205,50 @@ def get_parser() -> argparse.ArgumentParser:
         help="Use separate action networks for offense and defense. Enables distinct strategies for each role. Implies --use-dual-critic.",
     )
     parser.add_argument(
+        "--set-embed-dim",
+        type=int,
+        default=64,
+        help="Set-attention token embedding dimension.",
+    )
+    parser.add_argument(
+        "--set-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads for set-attention policy.",
+    )
+    parser.add_argument(
+        "--set-token-mlp-dim",
+        type=int,
+        default=64,
+        help="Hidden dimension for the set-attention token MLP.",
+    )
+    parser.add_argument(
+        "--set-token-activation",
+        type=str,
+        choices=["tanh", "relu", "gelu", "silu"],
+        default="relu",
+        help="Activation function for the set-attention token MLP.",
+    )
+    parser.add_argument(
+        "--set-head-activation",
+        type=str,
+        choices=["tanh", "relu", "gelu", "silu"],
+        default="tanh",
+        help="Activation function for the post-attention head MLP.",
+    )
+    parser.add_argument(
+        "--set-cls-tokens",
+        type=int,
+        default=2,
+        help="Number of CLS tokens for set-attention policy (2 for dual critics).",
+    )
+    parser.add_argument(
+        "--mirror-episode-prob",
+        type=float,
+        default=0.0,
+        help="Probability of mirroring observations/actions for an entire episode (set-obs only).",
+    )
+    parser.add_argument(
         "--init-critic-from-run",
         type=str,
         default=None,
@@ -360,6 +404,16 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--offense-spawn-boundary-margin",
+        dest="offense_spawn_boundary_margin",
+        type=int,
+        default=0,
+        help=(
+            "Number of hex rings to keep offense spawns away from the court boundary "
+            "(0 = no restriction)."
+        ),
+    )
+    parser.add_argument(
         "--deterministic-opponent",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
@@ -429,6 +483,14 @@ def get_parser() -> argparse.ArgumentParser:
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,
         help="Normalize relative coordinates to roughly [-1,1].",
+    )
+    parser.add_argument(
+        "--use-set-obs",
+        dest="use_set_obs",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Expose set-based token observations under 'players' and 'globals' "
+        "(keeps existing obs keys).",
     )
     parser.add_argument(
         "--mask-occupied-moves",
@@ -731,6 +793,13 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Final additive bias (0 to disable at end).",
+    )
+    parser.add_argument(
+        "--pass-prob-min",
+        dest="pass_prob_min",
+        type=float,
+        default=None,
+        help="Minimum total probability mass assigned to pass actions per player.",
     )
     return parser
 

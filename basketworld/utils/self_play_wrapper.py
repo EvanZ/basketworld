@@ -43,7 +43,21 @@ class SelfPlayEnvWrapper(gym.Wrapper):
     def _ensure_opponent_loaded(self):
         # Allow passing a policy path string to avoid pickling full PPO
         if isinstance(self.opponent_policy, str):
-            self.opponent_policy = PPO.load(self.opponent_policy, device="cpu")
+            from basketworld.utils.policies import (
+                PassBiasDualCriticPolicy,
+                PassBiasMultiInputPolicy,
+            )
+            from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
+
+            custom_objects = {
+                "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+                "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+                "SetAttentionExtractor": SetAttentionExtractor,
+            }
+            self.opponent_policy = PPO.load(
+                self.opponent_policy, device="cpu", custom_objects=custom_objects
+            )
 
     def _set_team_ids(self) -> None:
         if self.env.unwrapped.training_team == Team.OFFENSE:

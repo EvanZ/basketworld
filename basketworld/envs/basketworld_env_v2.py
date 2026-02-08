@@ -133,6 +133,7 @@ class HexagonBasketballEnv(gym.Env):
         max_spawn_distance: Optional[int] = None,
         defender_spawn_distance: int = 0,
         defender_guard_distance: int = 1,
+        offense_spawn_boundary_margin: int = 0,
         # Reward shaping parameters
         pass_reward: float = 0.0,
         turnover_penalty: float = 0.0,
@@ -210,6 +211,7 @@ class HexagonBasketballEnv(gym.Env):
         self.max_spawn_distance = max_spawn_distance
         self.defender_spawn_distance = defender_spawn_distance
         self.defender_guard_distance = max(0, int(defender_guard_distance))
+        self.offense_spawn_boundary_margin = max(0, int(offense_spawn_boundary_margin))
         self.use_egocentric_obs = bool(use_egocentric_obs)
         self.egocentric_rotate_to_hoop = bool(egocentric_rotate_to_hoop)
         self.include_hoop_vector = bool(include_hoop_vector)
@@ -225,6 +227,8 @@ class HexagonBasketballEnv(gym.Env):
             self.illegal_action_policy = IllegalActionPolicy.NOOP
         # Optional per-step action probabilities provided by caller
         self._pending_action_probs: Optional[np.ndarray] = None
+        # Cumulative turnover pressure exposure (sum of per-step pressure probabilities).
+        self.pressure_exposure: float = 0.0
         self._legal_actions_offense: float = 0.0
         self._legal_actions_defense: float = 0.0
         # Honor constructor flag for strict illegal action handling
@@ -320,6 +324,7 @@ class HexagonBasketballEnv(gym.Env):
         lane_steps_extra = self.n_players  # Lane violation counters for all players
         ep_extra = self.players_per_side  # EP for each offensive player
         turnover_risk_extra = self.players_per_side  # Turnover prob per offensive player (0 if not ball holder)
+        pressure_exposure_extra = 1  # Cumulative turnover pressure exposure (global)
         steal_risk_extra = self.players_per_side  # Steal risk per offensive player (0 for ball holder)
         teammate_distance_pairs = (self.players_per_side * (self.players_per_side - 1)) // 2
         teammate_angle_pairs = self.players_per_side * (self.players_per_side - 1)
@@ -335,6 +340,7 @@ class HexagonBasketballEnv(gym.Env):
             + lane_steps_extra
             + ep_extra
             + turnover_risk_extra
+            + pressure_exposure_extra
             + steal_risk_extra
             + teammate_distance_extra
             + teammate_angle_extra
@@ -693,6 +699,7 @@ class HexagonBasketballEnv(gym.Env):
         self.step_count = 0
         self.episode_ended = False
         self.last_action_results = {}
+        self.pressure_exposure = 0.0
         # Track steps in lane for both offensive and defensive players
         self._defender_in_key_steps = {pid: 0 for pid in range(self.n_players)}
         self._offensive_lane_steps = {pid: 0 for pid in range(self.n_players)}
@@ -808,6 +815,10 @@ class HexagonBasketballEnv(gym.Env):
         # Variables needed for action results and turnover logging
         ball_handler_pos = self.positions[self.ball_holder] if self.ball_holder is not None else (0, 0)
         total_pressure_prob = self.calculate_defender_pressure_turnover_probability()
+        try:
+            self.pressure_exposure += float(max(0.0, total_pressure_prob))
+        except Exception:
+            pass
         
         if defender_pressure_info:
             # Check for turnovers

@@ -48,9 +48,9 @@ from basketworld.utils.callbacks import MLflowCallback
 from basketworld.utils.schedule_state import (
     save_schedule_metadata,
     load_schedule_metadata,
-    calculate_continued_total_timesteps,
 )
 from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 import re
 
@@ -234,13 +234,32 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
+        if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
+            print("[Warning] Set-attention policy requires dual critics; enabling use_dual_critic.")
+            args.use_dual_critic = True
+
         # Log policy architecture (single vs dual critic, single vs dual policy)
         mlflow.log_param("use_dual_critic", args.use_dual_critic)
         mlflow.log_param("use_dual_policy", args.use_dual_policy)
-        policy_class_name = "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy"
+        if getattr(args, "use_set_obs", False):
+            policy_class_name = "SetAttentionDualCriticPolicy"
+        else:
+            policy_class_name = "PassBiasDualCriticPolicy" if args.use_dual_critic else "PassBiasMultiInputPolicy"
         if args.use_dual_policy:
             policy_class_name += " (dual_policy=True)"
         mlflow.log_param("policy_class", policy_class_name)
+        if getattr(args, "use_set_obs", False):
+            mlflow.log_param("set_embed_dim", getattr(args, "set_embed_dim", 64))
+            mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
+            mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
+            mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
+        mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
+        mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
+        mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
+        mlflow.log_param(
+            "offense_spawn_boundary_margin",
+            getattr(args, "offense_spawn_boundary_margin", 0),
+        )
         
         print(f"MLflow Run ID: {run.info.run_id}")
 
@@ -280,8 +299,32 @@ def main(args):
             pi_arch = getattr(args, "net_arch_pi", [64, 64])
             vf_arch = getattr(args, "net_arch_vf", [64, 64])
             policy_kwargs["net_arch"] = dict(pi=pi_arch, vf=vf_arch)
-        # Prevent the policy from learning directly from action_mask
-        policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
+        use_set_obs = getattr(args, "use_set_obs", False)
+        if use_set_obs:
+            # Set-attention policy expects tokens and does its own extraction.
+            if args.net_arch is not None:
+                print("[Info] Using --net-arch for set-attention head MLP.")
+            else:
+                print("[Info] Using --net-arch-pi/vf for set-attention head MLP.")
+            policy_kwargs["embed_dim"] = int(getattr(args, "set_embed_dim", 64))
+            policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
+            policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))
+            policy_kwargs["num_cls_tokens"] = int(getattr(args, "set_cls_tokens", 2))
+            policy_kwargs["token_activation"] = str(getattr(args, "set_token_activation", "relu"))
+            policy_kwargs["head_activation"] = str(getattr(args, "set_head_activation", "tanh"))
+            print(
+                "Set-attention config:",
+                f"embed_dim={policy_kwargs['embed_dim']}",
+                f"n_heads={policy_kwargs['n_heads']}",
+                f"token_mlp_dim={policy_kwargs['token_mlp_dim']}",
+                f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
+                f"token_activation={policy_kwargs['token_activation']}",
+                f"head_activation={policy_kwargs['head_activation']}",
+                f"mirror_episode_prob={getattr(args, 'mirror_episode_prob', 0.0)}",
+            )
+        else:
+            # Prevent the policy from learning directly from action_mask
+            policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
         
         # Enable dual policy (separate action networks for offense/defense) if requested
         if args.use_dual_policy:
@@ -312,7 +355,15 @@ def main(args):
                     uni_local = client.download_artifacts(
                         args.continue_run_id, uni_art, tmpd
                     )
-                    unified_policy = PPO.load(uni_local, env=temp_env, device=device)
+                    custom_objects = {
+                        "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+                        "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+                        "SetAttentionExtractor": SetAttentionExtractor,
+                    }
+                    unified_policy = PPO.load(
+                        uni_local, env=temp_env, device=device, custom_objects=custom_objects
+                    )
                     print(
                         f"  - Loaded latest unified policy: {os.path.basename(uni_art)}"
                     )
@@ -328,8 +379,11 @@ def main(args):
                 )
                 initial_ent_coef = float(start)
             
-            # Choose policy class based on --use-dual-critic flag
-            policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
+            # Choose policy class based on flags
+            if getattr(args, "use_set_obs", False):
+                policy_class = SetAttentionDualCriticPolicy
+            else:
+                policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
             
             unified_policy = PPO(
                 policy_class,
@@ -371,6 +425,13 @@ def main(args):
                 except Exception:
                     pass
         temp_env.close()
+
+        if getattr(args, "pass_prob_min", None) is not None:
+            try:
+                if hasattr(unified_policy.policy, "set_pass_prob_min"):
+                    unified_policy.policy.set_pass_prob_min(args.pass_prob_min)
+            except Exception:
+                pass
 
         # --- Log the actual network architecture used ---
         # This ensures we capture the default if no custom arch is provided.
@@ -423,35 +484,16 @@ def main(args):
         entropy_callback = None
         beta_callback = None
 
-        # Determine effective steps-per-alternation schedule parameters
-        # Check if continuing from a previous run with spa schedule
+        spa_start, spa_end, spa_schedule, spa_offset, spa_total_alternations = resolve_spa_schedule(
+            args, schedule_mode, previous_schedule_meta, base_alt_idx
+        )
         if (
             args.continue_run_id
             and schedule_mode == "extend"
             and previous_schedule_meta
             and "spa_start" in previous_schedule_meta
         ):
-            # Use previous spa schedule if it exists
-            spa_start = previous_schedule_meta.get("spa_start", args.steps_per_alternation)
-            spa_end = previous_schedule_meta.get(
-                "spa_end",
-                args.steps_per_alternation_end
-                if args.steps_per_alternation_end is not None
-                else args.steps_per_alternation,
-            )
-            spa_schedule = previous_schedule_meta.get(
-                "spa_schedule", args.steps_per_alternation_schedule
-            )
             print(f"  Using previous SPA schedule: {spa_start} → {spa_end} ({spa_schedule})")
-        else:
-            # Fresh start or no previous spa schedule
-            spa_start = args.steps_per_alternation
-            spa_end = (
-                args.steps_per_alternation_end
-                if args.steps_per_alternation_end is not None
-                else args.steps_per_alternation
-            )
-            spa_schedule = args.steps_per_alternation_schedule
 
         # Calculate total planned timesteps for this training session
         new_training_timesteps = calculate_total_timesteps_with_schedule(
@@ -461,6 +503,8 @@ def main(args):
             spa_schedule,
             args.num_envs,
             args.n_steps,
+            offset=spa_offset,
+            schedule_total_alternations=spa_total_alternations,
         )
 
         # Print and log SPA schedule info if not constant
@@ -471,15 +515,20 @@ def main(args):
             # Generate full schedule table
             schedule_lines = []
             schedule_lines.append(f"Steps-per-alternation schedule: {spa_start} → {spa_end} ({spa_schedule})")
-            schedule_lines.append(f"Total alternations: {args.alternations}")
+            schedule_lines.append(f"Segment alternations: {args.alternations}")
+            if spa_total_alternations != args.alternations:
+                schedule_lines.append(f"Schedule total alternations: {spa_total_alternations}")
             schedule_lines.append(f"Total timesteps: {new_training_timesteps:,}")
             schedule_lines.append("")
             schedule_lines.append("| Alternation | Steps |")
             schedule_lines.append("|-------------|-------|")
             
             for i in range(args.alternations):
-                steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                schedule_lines.append(f"| {i + 1:11d} | {steps:5d} |")
+                global_alt = spa_offset + i + 1
+                steps = get_steps_for_alternation(
+                    i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                )
+                schedule_lines.append(f"| {global_alt:11d} | {steps:5d} |")
             
             schedule_table = "\n".join(schedule_lines)
             
@@ -492,13 +541,19 @@ def main(args):
                 print("|-------------|-------|")
                 # First 5
                 for i in range(min(5, args.alternations)):
-                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                    print(f"| {i + 1:11d} | {steps:5d} |")
+                    global_alt = spa_offset + i + 1
+                    steps = get_steps_for_alternation(
+                        i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                    )
+                    print(f"| {global_alt:11d} | {steps:5d} |")
                 print("|     ...     |  ...  |")
                 # Last 5
                 for i in range(max(5, args.alternations - 5), args.alternations):
-                    steps = get_steps_for_alternation(i, args.alternations, spa_start, spa_end, spa_schedule)
-                    print(f"| {i + 1:11d} | {steps:5d} |")
+                    global_alt = spa_offset + i + 1
+                    steps = get_steps_for_alternation(
+                        i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
+                    )
+                    print(f"| {global_alt:11d} | {steps:5d} |")
                 print(f"\n(Full schedule logged to MLflow artifacts)")
             
             # Log schedule to MLflow as artifact
@@ -514,10 +569,6 @@ def main(args):
 
         # Log total planned timesteps as a parameter (useful for web UI)
         mlflow.log_param("total_timesteps_planned", new_training_timesteps)
-
-        spa_start, spa_end, spa_schedule = resolve_spa_schedule(
-            args, schedule_mode, previous_schedule_meta, base_alt_idx
-        )
         # Determine schedule parameters based on continuation mode (entropy)
         if (
             args.continue_run_id
@@ -538,16 +589,7 @@ def main(args):
 
             original_total = previous_schedule_meta.get("total_planned_timesteps", 0)
             original_current = previous_schedule_meta.get("current_timesteps", 0)
-            total_planned_ts = calculate_continued_total_timesteps(
-                original_total,
-                original_current,
-                args.alternations,
-                spa_start,
-                spa_end,
-                spa_schedule,
-                args.num_envs,
-                args.n_steps,
-            )
+            total_planned_ts = original_total + new_training_timesteps
             print(f"  Extended total timesteps: {total_planned_ts}")
         elif (
             args.continue_run_id
@@ -622,7 +664,7 @@ def main(args):
             global_alt = base_alt_idx + i + 1
             # Calculate steps for this alternation based on schedule
             current_spa = get_steps_for_alternation(
-                i, args.alternations, spa_start, spa_end, spa_schedule
+                i + spa_offset, spa_total_alternations, spa_start, spa_end, spa_schedule
             )
             print(f"Alternation {global_alt} (segment {i + 1} / {args.alternations})")
             if spa_start != spa_end:
@@ -679,6 +721,22 @@ def main(args):
                     )
                     unified_policy.save(fallback_path)
                     opponent_for_offense = fallback_path
+            # Log opponent selection to stdout for quick sanity checks
+            try:
+                if isinstance(opponent_for_offense, list):
+                    from collections import Counter
+                    counts = Counter(
+                        os.path.basename(str(p)) for p in opponent_for_offense
+                    )
+                    print("Opponent selection (per-env):")
+                    for name, count in counts.most_common():
+                        print(f"  {name}: {count} env(s)")
+                else:
+                    print(
+                        f"Opponent selection: {os.path.basename(str(opponent_for_offense))}"
+                    )
+            except Exception:
+                pass
             # Log which opponent checkpoint(s) used this alternation
             try:
                 with tempfile.TemporaryDirectory() as _tmp_note_dir:

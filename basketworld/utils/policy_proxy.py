@@ -19,7 +19,21 @@ class FrozenPolicyProxy:
 
     def _ensure_loaded(self):
         if self._policy is None:
-            self._policy = PPO.load(self.policy_path, device=self.device)
+            from basketworld.utils.policies import (
+                PassBiasDualCriticPolicy,
+                PassBiasMultiInputPolicy,
+            )
+            from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
+
+            custom_objects = {
+                "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
+                "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+                "SetAttentionExtractor": SetAttentionExtractor,
+            }
+            self._policy = PPO.load(
+                self.policy_path, device=self.device, custom_objects=custom_objects
+            )
 
     def predict(self, obs, deterministic: bool = False):
         self._ensure_loaded()

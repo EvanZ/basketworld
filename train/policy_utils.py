@@ -8,6 +8,7 @@ import tempfile
 import torch
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasMultiInputPolicy, PassBiasDualCriticPolicy
+from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 
 def get_random_policy_from_artifacts(
@@ -25,14 +26,16 @@ def get_random_policy_from_artifacts(
     all_artifacts = client.list_artifacts(run_id, artifact_path)
 
     # Extract paths for prefix (e.g., unified)
+    pattern = re.compile(rf"{model_prefix}_(?:alternation|iter)_(\d+)\.zip$")
+
     def sort_key(p):
-        # Expect path like models/{prefix}_alternation_{idx}.zip
-        m = re.search(rf"{model_prefix}_alternation_(\d+)\.zip$", p.path)
+        # Accept models/{prefix}_alternation_{idx}.zip or models/{prefix}_iter_{idx}.zip
+        m = pattern.search(p.path)
         if m:
             return int(m.group(1))
         return -1
 
-    filtered = [p for p in all_artifacts if f"{model_prefix}_alternation_" in p.path]
+    filtered = [p for p in all_artifacts if pattern.search(p.path)]
     filtered = sorted(filtered, key=sort_key)
 
     if not filtered:
@@ -45,7 +48,10 @@ def get_random_policy_from_artifacts(
 
     import random
     if sample_geometric_fn is None:
-        from train.train_utils import sample_geometric
+        try:
+            from train_utils import sample_geometric
+        except ImportError:
+            from train.train_utils import sample_geometric
         sample_geometric_fn = sample_geometric
 
     if random.random() < uniform_eps and len(team_policies) > len(recent_pols):
@@ -74,19 +80,24 @@ def get_opponent_policy_pool_for_envs(
     artifact_path = "models"
     all_artifacts = client.list_artifacts(run_id, artifact_path)
 
+    pattern = re.compile(rf"{team_prefix}_(?:alternation|iter)_(\d+)\.zip$")
+
     def sort_key(p):
-        m = re.search(rf"{team_prefix}_alternation_(\d+)\.zip$", p.path)
+        m = pattern.search(p.path)
         if m:
             return int(m.group(1))
         return -1
 
-    filtered = [p for p in all_artifacts if f"{team_prefix}_alternation_" in p.path]
+    filtered = [p for p in all_artifacts if pattern.search(p.path)]
     filtered = sorted(filtered, key=sort_key)
     if not filtered:
         return []
 
     import random
-    from train.train_utils import sample_geometric
+    try:
+        from train_utils import sample_geometric
+    except ImportError:
+        from train.train_utils import sample_geometric
 
     if per_env_sampling:
         paths = []
@@ -112,13 +123,15 @@ def get_latest_policy_path(client, run_id: str, team_prefix: str) -> Optional[st
     """Return latest policy artifact path for team prefix."""
     artifacts = client.list_artifacts(run_id, "models")
 
+    pattern = re.compile(rf"{team_prefix}_(?:alternation|iter)_(\d+)\.zip$")
+
     def sort_key(p):
-        m = re.search(rf"{team_prefix}_alternation_(\d+)\.zip$", p.path)
+        m = pattern.search(p.path)
         if m:
             return int(m.group(1))
         return -1
 
-    filtered = [p for p in artifacts if f"{team_prefix}_alternation_" in p.path]
+    filtered = [p for p in artifacts if pattern.search(p.path)]
     if not filtered:
         return None
     filtered = sorted(filtered, key=sort_key)
@@ -135,8 +148,9 @@ def get_max_alternation_index(client, run_id: str) -> int:
     """Return max alternation index from saved models in an MLflow run."""
     artifacts = client.list_artifacts(run_id, "models")
     idxs = []
+    pattern = re.compile(r"_(?:alternation|iter)_(\d+)\.zip$")
     for f in artifacts:
-        m = re.search(r"_alternation_(\d+)\.zip$", f.path)
+        m = pattern.search(f.path)
         if m:
             idxs.append(int(m.group(1)))
     return max(idxs) if idxs else 0
@@ -174,6 +188,8 @@ def transfer_critic_weights(args, unified_policy) -> None:
             custom_objects = {
                 "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
                 "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
+                "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
+                "SetAttentionExtractor": SetAttentionExtractor,
             }
             source_policy = PPO.load(local_path, custom_objects=custom_objects)
 

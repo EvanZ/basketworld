@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setBallHolder } from '@/services/api';
+import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setPassLogitBias, setBallHolder } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -58,6 +58,11 @@ const props = defineProps({
     default: null,
     required: false,
   },
+  // Cumulative defender pressure exposure for the current episode
+  pressureExposure: {
+    type: Number,
+    default: 0,
+  },
   // When provided, overrides internal selections to reflect actual applied actions
   externalSelections: {
     type: Object,
@@ -111,11 +116,16 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
 
 const selectedActions = ref({});
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
+const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
+const pressureExposureDisplay = computed(() => {
+  const val = Number(props.pressureExposure);
+  return Number.isFinite(val) ? val.toFixed(3) : '0.000';
+});
 
 // Debug: Watch for any changes to selectedActions
 watch(selectedActions, (newActions, oldActions) => {
@@ -206,6 +216,10 @@ const skillsUpdating = ref(false);
 const skillsError = ref(null);
 const passStrategyUpdating = ref(false);
 const passStrategyError = ref(null);
+const passLogitBiasInput = ref(0);
+const passLogitBiasDefault = 0.0;
+const passLogitBiasUpdating = ref(false);
+const passLogitBiasError = ref(null);
 const PASS_TARGET_STRATEGIES = [
   { value: 'nearest', label: 'Nearest (legacy)' },
   { value: 'best_ev', label: 'Best EV' },
@@ -248,6 +262,14 @@ watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
     fillOffenseSkills(offenseSkillSampled, skills);
   }
 }, { deep: true });
+
+watch(() => props.gameState?.pass_logit_bias, (val) => {
+  if (val === null || val === undefined) return;
+  if (!passLogitBiasUpdating.value) {
+    const num = Number(val);
+    passLogitBiasInput.value = Number.isFinite(num) ? num : 0;
+  }
+}, { immediate: true });
 
 const offenseSkillRows = computed(() => {
   const ids = props.gameState?.offense_ids || [];
@@ -514,6 +536,37 @@ async function handlePassTargetStrategyChange(event) {
   }
 }
 
+function normalizePassLogitBias(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0.0;
+}
+
+async function applyPassLogitBiasOverride() {
+  if (!props.gameState) return;
+  passLogitBiasUpdating.value = true;
+  passLogitBiasError.value = null;
+  try {
+    const bias = normalizePassLogitBias(passLogitBiasInput.value);
+    const res = await setPassLogitBias(bias);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update pass logit bias');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update pass logit bias', err);
+    passLogitBiasError.value = err?.message || 'Failed to update pass logit bias';
+  } finally {
+    passLogitBiasUpdating.value = false;
+  }
+}
+
+async function resetPassLogitBiasDefault() {
+  if (!props.gameState) return;
+  passLogitBiasInput.value = passLogitBiasDefault;
+  await applyPassLogitBiasOverride();
+}
+
 async function handleBallHolderChange(val) {
   if (val === null || val === undefined) return;
   const pid = Number(val);
@@ -521,12 +574,19 @@ async function handleBallHolderChange(val) {
     return;
   }
   if (!props.gameState || props.isEvaluating || props.isReplaying) return;
+  const prevBallHolder = props.gameState?.ball_holder;
+  if (prevBallHolder === pid) return;
   ballHolderUpdating.value = true;
+  emit('ball-holder-updating', true);
   ballHolderError.value = null;
   try {
     const res = await setBallHolder(pid);
     if (res?.status === 'success' && res.state) {
       emit('state-updated', res.state);
+      emit('ball-holder-changed', { from: prevBallHolder, to: pid });
+      // Clear any queued selections so we don't treat the manual ball-handler change as an action.
+      selectedActions.value = {};
+      emit('selections-changed', {});
     } else {
       throw new Error(res?.detail || 'Failed to set ball holder');
     }
@@ -535,6 +595,7 @@ async function handleBallHolderChange(val) {
     ballHolderError.value = err?.message || 'Failed to set ball holder';
   } finally {
     ballHolderUpdating.value = false;
+    emit('ball-holder-updating', false);
   }
 }
 
@@ -942,10 +1003,28 @@ const allPlayerIds = computed(() => {
 const offenseIdsLive = computed(() => props.gameState?.offense_ids || []);
 const ballHolderSelection = computed(() => props.gameState?.ball_holder ?? null);
 
-function computeEntropy(probArray) {
+function normalizeLegalProbs(probArray, actionMask) {
   if (!Array.isArray(probArray)) return null;
+  if (!Array.isArray(actionMask)) return probArray.map((v) => Number(v));
+
+  let total = 0;
+  const masked = probArray.map((raw, idx) => {
+    const p = Number(raw);
+    const allowed = actionMask[idx] > 0;
+    if (!Number.isFinite(p) || p <= 0 || !allowed) return 0;
+    total += p;
+    return p;
+  });
+
+  if (total <= 0) return masked;
+  return masked.map((p) => p / total);
+}
+
+function computeEntropy(probArray, actionMask) {
+  const probs = normalizeLegalProbs(probArray, actionMask);
+  if (!Array.isArray(probs)) return null;
   let entropy = 0;
-  for (const raw of probArray) {
+  for (const raw of probs) {
     const p = Number(raw);
     if (!Number.isFinite(p) || p <= 0) continue;
     entropy -= p * Math.log(p);
@@ -962,7 +1041,8 @@ const entropyRows = computed(() => {
 
   return allPlayerIds.value.map((pid) => {
     const probs = policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
-    const entropy = computeEntropy(probs);
+    const mask = props.gameState?.action_mask?.[pid];
+    const entropy = computeEntropy(probs, mask);
     const isUserTeam =
       (userTeam === 'OFFENSE' && offenseIds.includes(pid)) ||
       (userTeam === 'DEFENSE' && defenseIds.includes(pid));
@@ -976,6 +1056,8 @@ const entropyRows = computed(() => {
     return { playerId: pid, teamLabel, policyOwner, entropy, isUserTeam };
   });
 });
+
+// entropy debug removed
 
 const entropyTotals = computed(() => {
   let playerPolicy = 0;
@@ -1325,7 +1407,7 @@ function submitActions() {
   console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
   
   // Track moves for the selected team
-  const currentTurn = props.moveHistory.length + 1;
+  const currentTurn = props.moveHistory.filter(m => !m?.isNoteRow).length + 1;
   const teamMoves = {};
   
   for (const playerId of playersToSubmit) {
@@ -1675,6 +1757,37 @@ function formatAngleValue(cosAngle) {
   return `${clamped.toFixed(4)} (${degrees.toFixed(1)}°)`;
 }
 
+function formatTokenValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  return numeric.toFixed(4);
+}
+
+function attentionColor(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return { r: 15, g: 23, b: 42, a: 0.0 };
+  }
+  const range = attentionRange.value;
+  const denom = range.max - range.min;
+  const normalized = denom > 0 ? (numeric - range.min) / denom : 0;
+  const intensity = Math.max(0, Math.min(1, normalized));
+  const start = { r: 59, g: 130, b: 246 }; // blue-500
+  const end = { r: 249, g: 115, b: 22 }; // orange-500
+  const r = Math.round(start.r + (end.r - start.r) * intensity);
+  const g = Math.round(start.g + (end.g - start.g) * intensity);
+  const b = Math.round(start.b + (end.b - start.b) * intensity);
+  const a = 0.12 + intensity * 0.75;
+  return { r, g, b, a };
+}
+
+function attentionCellStyle(value) {
+  const color = attentionColor(value);
+  return {
+    backgroundColor: `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a.toFixed(3)})`,
+  };
+}
+
 // Computed properties for observation parsing
 const offenseIds = computed(() => props.gameState?.offense_ids || []);
 const defenseIds = computed(() => props.gameState?.defense_ids || []);
@@ -1811,6 +1924,188 @@ const obsMeta = computed(() => {
     nOffense,
     teammatePairCount,
   };
+});
+
+const obsTokens = computed(() => props.gameState?.obs_tokens || null);
+const tokenFeatureLabels = [
+  'q_norm',
+  'r_norm',
+  'role',
+  'has_ball',
+  'layup%',
+  '3pt%',
+  'dunk%',
+  'steps',
+  'EP',
+  'tov%',
+  'stl%',
+  'dist_to_ball',
+  'dist_to_best_ep',
+  'dist_to_nearest_opp',
+  'dist_to_nearest_team',
+];
+const tokenGlobalLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
+
+const tokenPlayers = computed(() => {
+  const players = obsTokens.value?.players;
+  return Array.isArray(players) ? players : [];
+});
+
+const tokenGlobals = computed(() => {
+  const globals = obsTokens.value?.globals;
+  return Array.isArray(globals) ? globals : [];
+});
+
+const tokenAttention = computed(() => obsTokens.value?.attention || null);
+const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
+const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
+const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
+const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
+const attentionView = ref('avg');
+const attentionHeadOptions = computed(() => {
+  const count = tokenAttentionHeads.value || 0;
+  return Array.from({ length: count }, (_, idx) => idx);
+});
+const tokenAttentionMatrix = computed(() => {
+  if (attentionView.value === 'avg') {
+    return tokenAttentionAvgWeights.value;
+  }
+  const idx = Number(attentionView.value);
+  const heads = tokenAttentionHeadWeights.value;
+  if (!Array.isArray(heads) || !Array.isArray(heads[idx])) {
+    return tokenAttentionAvgWeights.value;
+  }
+  return heads[idx];
+});
+const tokenAttentionSubtitle = computed(() => {
+  const count = tokenAttentionHeads.value;
+  if (!count) return '';
+  if (attentionView.value === 'avg') {
+    return `Average of ${count} heads`;
+  }
+  const idx = Number(attentionView.value);
+  if (!Number.isFinite(idx)) return `Average of ${count} heads`;
+  return `Head ${idx + 1} of ${count}`;
+});
+const attentionRange = computed(() => {
+  const weights = tokenAttentionMatrix.value;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of weights) {
+    if (!Array.isArray(row)) continue;
+    for (const val of row) {
+      const num = Number(val);
+      if (!Number.isFinite(num)) continue;
+      if (num < min) min = num;
+      if (num > max) max = num;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return { min: 0, max: 1 };
+  }
+  if (max <= min) {
+    return { min, max: min + 1 };
+  }
+  return { min, max };
+});
+
+function downloadAttentionPng() {
+  if (!tokenAttentionMatrix.value.length) {
+    alert('No attention data available.');
+    return;
+  }
+  const labels = tokenAttentionLabels.value;
+  const matrix = tokenAttentionMatrix.value;
+  const n = matrix.length;
+
+  const padding = 12;
+  const fontSize = 12;
+  const font = `${fontSize}px "Courier New", monospace`;
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.font = font;
+  let maxLabelWidth = 0;
+  labels.forEach((label) => {
+    const width = ctx.measureText(String(label)).width;
+    if (width > maxLabelWidth) maxLabelWidth = width;
+  });
+  const cellSize = Math.max(36, Math.ceil(maxLabelWidth) + 12);
+  const headerSize = Math.max(cellSize + padding, Math.ceil(maxLabelWidth) + padding * 2);
+  const width = headerSize + cellSize * n;
+  const height = headerSize + cellSize * n;
+
+  const scale = 2;
+  canvas.width = Math.ceil(width * scale);
+  canvas.height = Math.ceil(height * scale);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = '#cbd5f5';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = font;
+
+  for (let c = 0; c < n; c += 1) {
+    const label = labels[c] ?? `T${c}`;
+    const x = headerSize + c * cellSize + cellSize / 2;
+    const y = headerSize / 2;
+    ctx.fillText(String(label), x, y);
+  }
+
+  for (let r = 0; r < n; r += 1) {
+    const label = labels[r] ?? `T${r}`;
+    const x = headerSize / 2;
+    const y = headerSize + r * cellSize + cellSize / 2;
+    ctx.fillText(String(label), x, y);
+  }
+
+  for (let r = 0; r < n; r += 1) {
+    for (let c = 0; c < n; c += 1) {
+      const val = matrix[r]?.[c];
+      const color = attentionColor(val);
+      const x = headerSize + c * cellSize;
+      const y = headerSize + r * cellSize;
+      ctx.fillStyle = `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a})`;
+      ctx.fillRect(x, y, cellSize, cellSize);
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+      ctx.strokeRect(x, y, cellSize, cellSize);
+      ctx.fillStyle = '#0b1020';
+      ctx.font = `10px "Courier New", monospace`;
+      ctx.fillText(formatTokenValue(val), x + cellSize / 2, y + cellSize / 2);
+    }
+  }
+
+  const link = document.createElement('a');
+  link.download = 'attention_map.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+const tokenRows = computed(() => {
+  if (!props.gameState) return [];
+  return tokenPlayers.value.map((row, idx) => {
+    const teamLabel = offenseIds.value.includes(idx)
+      ? 'Offense'
+      : defenseIds.value.includes(idx)
+        ? 'Defense'
+        : 'Unknown';
+    return {
+      playerId: idx,
+      teamLabel,
+      features: Array.isArray(row) ? row : [],
+    };
+  });
+});
+
+const tokenGlobalRows = computed(() => {
+  return tokenGlobals.value.map((value, idx) => ({
+    label: tokenGlobalLabels[idx] || `global_${idx}`,
+    value,
+  }));
 });
 
 const allPairsDistances = computed(() => {
@@ -1994,6 +2289,12 @@ const stealRisks = computed(() => {
       >
         Observation
       </button>
+      <button 
+        :class="{ active: activeTab === 'attention' }"
+        @click="activeTab = 'attention'"
+      >
+        Attention
+      </button>
     </div>
 
     <!-- Controls Tab -->
@@ -2003,7 +2304,7 @@ const stealRisks = computed(() => {
         <select
           :value="ballHolderSelection ?? ''"
           @change="handleBallHolderChange($event.target.value)"
-          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || offenseIdsLive.length === 0"
+          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || props.isManualStepping || offenseIdsLive.length === 0"
         >
           <option v-if="offenseIdsLive.length === 0" disabled value="">No offense players</option>
           <option v-for="pid in offenseIdsLive" :key="`bh-${pid}`" :value="pid">Player {{ pid }}</option>
@@ -2361,6 +2662,10 @@ const stealRisks = computed(() => {
     <div v-if="activeTab === 'moves'" class="tab-content">
       <div class="moves-section">
         <h4>Team Moves History ({{ props.gameState?.user_team_name || 'Unknown' }})</h4>
+        <div class="moves-summary">
+          <span class="summary-label">Pressure exposure:</span>
+          <span class="summary-value">{{ pressureExposureDisplay }}</span>
+        </div>
         <div v-if="props.moveHistory.length === 0" class="no-moves">
           No moves recorded yet.
         </div>
@@ -2377,7 +2682,13 @@ const stealRisks = computed(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="move in props.moveHistory" :key="move.turn" :class="{ 'current-shot-clock-row': move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done) }">
+            <tr v-for="move in props.moveHistory" :key="move.id || move.turn" :class="{ 'current-shot-clock-row': !move.isNoteRow && (move.shotClock === props.currentShotClock || (move.isEndRow && props.gameState?.done)) }">
+              <template v-if="move.isNoteRow">
+                <td class="moves-note-cell" :colspan="movesColumnCount">
+                  {{ move.noteText || 'Note' }}
+                </td>
+              </template>
+              <template v-else>
               <td>{{ move.turn }}</td>
               <td class="shot-clock-cell">{{ move.shotClock !== undefined ? move.shotClock : '-' }}</td>
               <td v-for="playerId in allPlayerIds" :key="playerId" class="move-cell">
@@ -2399,6 +2710,7 @@ const stealRisks = computed(() => {
               <td class="value-cell">
                 {{ move.defensiveValue !== null && move.defensiveValue !== undefined ? move.defensiveValue.toFixed(3) : '-' }}
               </td>
+              </template>
             </tr>
           </tbody>
         </table>
@@ -2755,6 +3067,10 @@ const stealRisks = computed(() => {
               <span class="param-name">Defender spawn distance:</span>
               <span class="param-value">{{ props.gameState.defender_spawn_distance || 'N/A' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Keep offense spawns away from the court boundary by this many hex rings (0 = no restriction)">
+              <span class="param-name">Offense boundary margin:</span>
+              <span class="param-value">{{ props.gameState.offense_spawn_boundary_margin ?? 'N/A' }}</span>
+            </div>
             <div class="param-item" data-tooltip="Hex distance (N) within which a defender reset their lane counter if guarding an offensive player while in the lane. 0 disables guarding resets.">
               <span class="param-name">Defender guard distance:</span>
               <span class="param-value">{{ props.gameState.defender_guard_distance || 'N/A' }}</span>
@@ -2813,7 +3129,42 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Bias added to pass action logits in the policy network. Positive = encourage passing.">
               <span class="param-name">Pass logit bias:</span>
-              <span class="param-value">{{ props.gameState.pass_logit_bias != null ? props.gameState.pass_logit_bias.toFixed(2) : 'N/A' }}</span>
+            </div>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header">
+                <span>Setting</span>
+                <span>Bias</span>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="offense-skills-row">
+                <span class="skills-player">Pass logit bias</span>
+                <div class="offense-skill-input">
+                  <input type="number" step="0.05" v-model.number="passLogitBiasInput" :disabled="passLogitBiasUpdating" />
+                  <span class="offense-skill-default">Default {{ passLogitBiasDefault.toFixed(2) }}</span>
+                </div>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="offense-skill-actions">
+                <button
+                  class="refresh-policies-btn"
+                  @click="resetPassLogitBiasDefault"
+                  :disabled="passLogitBiasUpdating"
+                >
+                  Reset to Default
+                </button>
+                <button
+                  class="refresh-policies-btn"
+                  @click="applyPassLogitBiasOverride"
+                  :disabled="passLogitBiasUpdating"
+                >
+                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply Bias' }}
+                </button>
+              </div>
+              <div class="policy-status error" v-if="passLogitBiasError">
+                {{ passLogitBiasError }}
+              </div>
             </div>
           </div>
 
@@ -3190,6 +3541,116 @@ const stealRisks = computed(() => {
               </tr>
             </tbody>
           </table>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Attention Tab -->
+    <div v-if="activeTab === 'attention'" class="tab-content">
+      <div class="observation-section">
+        <div class="token-section">
+          <h4>Token View (Set-Observation)</h4>
+          <div v-if="!obsTokens" class="no-data">
+            No token data available.
+          </div>
+          <div v-else class="token-table-wrapper">
+            <div class="token-table-scroll">
+              <table class="observation-table token-table">
+                <thead>
+                  <tr>
+                    <th>Player</th>
+                    <th>Team</th>
+                    <th v-for="label in tokenFeatureLabels" :key="`token-head-${label}`">
+                      {{ label }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in tokenRows"
+                    :key="`token-${row.playerId}`"
+                    :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
+                  >
+                    <td>Player {{ row.playerId }}</td>
+                    <td>{{ row.teamLabel }}</td>
+                    <td
+                      v-for="(label, fIdx) in tokenFeatureLabels"
+                      :key="`token-${row.playerId}-${label}`"
+                      class="value-mono"
+                    >
+                      {{ formatTokenValue(row.features[fIdx]) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <h5 class="token-subtitle">Globals</h5>
+            <table class="observation-table token-table">
+              <thead>
+                <tr>
+                  <th>Global</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in tokenGlobalRows" :key="`token-global-${row.label}`">
+                  <td>{{ row.label }}</td>
+                  <td class="value-mono">{{ formatTokenValue(row.value) }}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="token-attn-section">
+              <h5 class="token-subtitle">Attention Map</h5>
+              <div v-if="tokenAttentionMatrix.length === 0" class="no-data">
+                Attention weights are not available.
+              </div>
+              <div v-else class="token-table-wrapper">
+                <div class="token-attn-controls" v-if="tokenAttentionHeads">
+                  <label for="token-attn-view">View:</label>
+                  <select id="token-attn-view" v-model="attentionView">
+                    <option value="avg">Average</option>
+                    <option v-for="idx in attentionHeadOptions" :key="`head-${idx}`" :value="String(idx)">
+                      Head {{ idx + 1 }}
+                    </option>
+                  </select>
+                  <button class="token-attn-download" type="button" @click="downloadAttentionPng">
+                    Download PNG
+                  </button>
+                </div>
+                <div class="token-attn-note" v-if="tokenAttentionSubtitle">
+                  {{ tokenAttentionSubtitle }}
+                </div>
+                <div class="token-table-scroll">
+                  <table class="observation-table token-table token-attn-table">
+                    <thead>
+                      <tr>
+                        <th>From \ To</th>
+                        <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
+                          {{ label }}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
+                        <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
+                        <td
+                          v-for="(val, cIdx) in row"
+                          :key="`attn-${rIdx}-${cIdx}`"
+                          class="value-mono"
+                          :style="attentionCellStyle(val)"
+                        >
+                          {{ formatTokenValue(val) }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -3596,6 +4057,8 @@ const stealRisks = computed(() => {
   font-size: 0.8rem;
 }
 
+/* entropy debug removed */
+
 .entropy-table tr:nth-child(even) td {
   background: rgba(255, 255, 255, 0.02);
 }
@@ -3708,6 +4171,26 @@ const stealRisks = computed(() => {
   padding: 0.5rem;
 }
 
+.moves-summary {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0.8rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.moves-summary .summary-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.moves-summary .summary-value {
+  color: var(--app-accent);
+  font-family: 'Courier New', monospace;
+  font-weight: 600;
+}
+
 .moves-table {
   width: 100%;
   border-collapse: collapse;
@@ -3761,6 +4244,14 @@ const stealRisks = computed(() => {
 
 .moves-table tr.current-shot-clock-row td:last-child {
   border-right: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.moves-note-cell {
+  text-align: left;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+  background: rgba(148, 163, 184, 0.06);
 }
 
 .move-cell {
@@ -4124,6 +4615,87 @@ const stealRisks = computed(() => {
 
 .observation-table tbody tr:hover {
   background-color: rgba(255, 255, 255, 0.03);
+}
+
+.token-section {
+  margin-top: 1.5rem;
+}
+
+.token-table-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.token-table {
+  font-size: 0.9em;
+}
+
+.token-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.token-table-scroll .token-table {
+  min-width: max-content;
+}
+
+.token-ball-holder {
+  background-color: rgba(251, 191, 36, 0.12);
+}
+
+.token-subtitle {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+  color: var(--app-text-muted);
+}
+
+.token-attn-section {
+  margin-top: 0.75rem;
+}
+
+.token-attn-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+  flex-wrap: wrap;
+}
+
+.token-attn-controls select {
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--app-text);
+  font-size: 0.85rem;
+}
+
+.token-attn-download {
+  margin-left: auto;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--app-text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.token-attn-download:hover {
+  background: rgba(59, 130, 246, 0.2);
+}
+
+.token-attn-note {
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+.token-attn-table th,
+.token-attn-table td {
+  text-align: center;
+  white-space: nowrap;
 }
 
 .group-label {
