@@ -460,6 +460,10 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
     console.warn('[App] Cannot update position: game not active or done.');
     return;
   }
+  if (isManualStepping.value || isReplaying.value) {
+    console.warn('[App] Ignoring position update during replay/manual stepping.');
+    return;
+  }
   
   try {
     console.log(`[App] Updating position for Player ${playerId} to (${q}, ${r})`);

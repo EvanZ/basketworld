@@ -229,6 +229,7 @@ function getSvgPoint(clientX, clientY) {
 
 function onMouseDown(event, player) {
   if (!player) return;
+  if (props.isManualStepping) return;
   event.preventDefault();
   
   draggedPlayerId.value = player.id;

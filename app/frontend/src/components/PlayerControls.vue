@@ -2304,7 +2304,7 @@ const stealRisks = computed(() => {
         <select
           :value="ballHolderSelection ?? ''"
           @change="handleBallHolderChange($event.target.value)"
-          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || offenseIdsLive.length === 0"
+          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || props.isManualStepping || offenseIdsLive.length === 0"
         >
           <option v-if="offenseIdsLive.length === 0" disabled value="">No offense players</option>
           <option v-for="pid in offenseIdsLive" :key="`bh-${pid}`" :value="pid">Player {{ pid }}</option>

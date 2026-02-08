@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+from typing import List
 
 from fastapi import APIRouter, HTTPException
 import mlflow
@@ -60,13 +61,16 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
+    updated_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
     return {
         "status": "success",
-        "state": get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        ),
+        "state": updated_state,
     }
 
 
@@ -100,13 +104,16 @@ def update_player_position(req: UpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
+    updated_state = get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
     return {
         "status": "success",
-        "state": get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        ),
+        "state": updated_state,
     }
 
 
@@ -160,7 +167,7 @@ def set_ball_holder(req: SetBallHolderRequest):
             "role_flag": game_state.obs.get("role_flag"),
             "skills": game_state.obs.get("skills"),
         }
-        updated_state = get_full_game_state()
+        updated_state = get_full_game_state(include_policy_probs=True)
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
         return {"status": "success", "state": updated_state}
@@ -200,9 +207,11 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
             env.offense_three_pt_pct_by_player = copy.deepcopy(game_state.sampled_offense_skills.get("three_pt"))
             env.offense_dunk_pct_by_player = copy.deepcopy(game_state.sampled_offense_skills.get("dunk"))
         else:
-            layup = _normalize(req.layup, "layup")
-            three_pt = _normalize(req.three_pt, "three_pt")
-            dunk = _normalize(req.dunk, "dunk")
+            if not req.skills:
+                raise HTTPException(status_code=400, detail="Missing skills payload.")
+            layup = _normalize(req.skills.layup, "layup")
+            three_pt = _normalize(req.skills.three_pt, "three_pt")
+            dunk = _normalize(req.skills.dunk, "dunk")
 
             env.offense_layup_pct_by_player = layup
             env.offense_three_pt_pct_by_player = three_pt
