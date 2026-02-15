@@ -39,6 +39,10 @@ const props = defineProps({
     type: Number,
     default: 1,
   },
+  passAnimationStyle: {
+    type: String,
+    default: 'projectile',
+  },
   shotChartLabel: {
     type: String,
     default: '',
@@ -133,9 +137,16 @@ const passStealProbs = ref({});
 const ballColor = '#ffa500';
 const PASS_FLASH_DURATION_MS = 1100;
 const SHOT_FLASH_DURATION_MS = 1100;
+const PROJECTILE_ARROW_LENGTH_SCALE = 0.5;
 const passFlash = ref(null);
+let passFlashSerial = 0;
+const passFlashNowMs = ref(0);
+const passFlashRaf = ref(null);
 const passFlashTimeout = ref(null);
 const shotFlash = ref(null);
+let shotFlashSerial = 0;
+const shotFlashNowMs = ref(0);
+const shotFlashRaf = ref(null);
 const shotFlashTimeout = ref(null);
 const shotJumpPlayerId = ref(null);
 const shotJumpTimeout = ref(null);
@@ -580,7 +591,7 @@ function getActionIndicator(playerId, playerX, playerY, hasBall) {
     };
   }
   
-  if (action.startsWith('PASS_') && hasBall) {
+  if (action.startsWith('PASS_') && (hasBall || props.disableTransitions)) {
     const posAngle = POSITION_ANGLES[action];
     const rad = posAngle * Math.PI / 180;
     return {
@@ -591,7 +602,7 @@ function getActionIndicator(playerId, playerX, playerY, hasBall) {
     };
   }
   
-  if (action === 'SHOOT' && hasBall) {
+  if (action === 'SHOOT' && (hasBall || props.disableTransitions)) {
     // Point toward basket
     const basket = basketPosition.value;
     const dx = basket.x - playerX;
@@ -1192,8 +1203,19 @@ const passTargetPreview = computed(() => {
   const gs = currentGameState.value;
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return null;
 
-  const passerId = gs.ball_holder;
-  const action = props.selectedActions?.[passerId];
+  let passerId = gs.ball_holder;
+  let action = props.selectedActions?.[passerId];
+  // During capture, selected actions are historical actions_taken for the rendered step.
+  // A successful pass changes ball_holder, so recover passer from selected actions.
+  if (props.disableTransitions && props.selectedActions) {
+    const passEntries = Object.entries(props.selectedActions).filter(
+      ([, act]) => typeof act === 'string' && act.startsWith('PASS_')
+    );
+    if (passEntries.length === 1) {
+      passerId = Number(passEntries[0][0]);
+      action = passEntries[0][1];
+    }
+  }
   if (!action || !action.startsWith('PASS_')) return null;
 
   const dirIdx = PASS_ACTION_TO_DIR[action];
@@ -1282,11 +1304,135 @@ const passTargetPreview = computed(() => {
   };
 });
 
+const normalizedPassAnimationStyle = computed(() => {
+  const mode = String(props.passAnimationStyle || 'projectile').toLowerCase();
+  return mode === 'ray' ? 'ray' : 'projectile';
+});
+
+const passFlashProgress = computed(() => {
+  const flash = passFlash.value;
+  if (!flash) return 0;
+  if (props.disableTransitions) {
+    return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
+  }
+  const startedAt = Number(flash.startedAtMs ?? passFlashNowMs.value ?? performance.now());
+  const elapsed = Math.max(0, Number(passFlashNowMs.value ?? performance.now()) - startedAt);
+  return Math.max(0, Math.min(1, elapsed / PASS_FLASH_DURATION_MS));
+});
+
+const passFlashOpacity = computed(() => {
+  const t = passFlashProgress.value;
+  if (t <= 0.75) return 1;
+  return Math.max(0, 1 - (t - 0.75) / 0.25);
+});
+
+const passProjectile = computed(() => {
+  const flash = passFlash.value;
+  if (!flash) return null;
+
+  const dx = flash.x2 - flash.x1;
+  const dy = flash.y2 - flash.y1;
+  const dist = Math.hypot(dx, dy);
+  if (!Number.isFinite(dist) || dist < 1e-6) return null;
+
+  const ux = dx / dist;
+  const uy = dy / dist;
+  const px = -uy;
+  const py = ux;
+
+  const t = passFlashProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+  const tipX = flash.x1 + dx * eased;
+  const tipY = flash.y1 + dy * eased;
+
+  const headLength = Math.min(HEX_RADIUS * 0.92, dist * 0.20) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const headHalfWidth = headLength * 0.58;
+  const headBaseX = tipX - ux * headLength;
+  const headBaseY = tipY - uy * headLength;
+
+  const leftX = headBaseX + px * headHalfWidth;
+  const leftY = headBaseY + py * headHalfWidth;
+  const rightX = headBaseX - px * headHalfWidth;
+  const rightY = headBaseY - py * headHalfWidth;
+
+  const shaftLength = Math.min(HEX_RADIUS * 1.45, dist * 0.30) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const shaftX1 = headBaseX;
+  const shaftY1 = headBaseY;
+  const shaftX2 = headBaseX - ux * shaftLength;
+  const shaftY2 = headBaseY - uy * shaftLength;
+
+  const impactPhase = Math.max(0, Math.min(1, (eased - 0.82) / 0.18));
+  const impactOpacity = impactPhase > 0 ? (1 - impactPhase) * passFlashOpacity.value : 0;
+  const impactRadius = HEX_RADIUS * (0.35 + impactPhase * 1.05);
+
+  return {
+    laneOpacity: 0.22 + passFlashOpacity.value * 0.28,
+    projectileOpacity: 0.35 + passFlashOpacity.value * 0.65,
+    shaftX1,
+    shaftY1,
+    shaftX2,
+    shaftY2,
+    headPoints: `${tipX},${tipY} ${leftX},${leftY} ${rightX},${rightY}`,
+    impactX: flash.x2,
+    impactY: flash.y2,
+    impactOpacity,
+    impactRadius,
+  };
+});
+
+const passBallOutline = computed(() => {
+  const flash = passFlash.value;
+  if (!flash) return null;
+
+  const dx = flash.x2 - flash.x1;
+  const dy = flash.y2 - flash.y1;
+  const dist = Math.hypot(dx, dy);
+  if (!Number.isFinite(dist) || dist < 1e-6) return null;
+
+  const t = passFlashProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+  const x = flash.x1 + dx * eased;
+  const y = flash.y1 + dy * eased;
+  const radius = HEX_RADIUS * (0.7 + 0.06 * Math.sin(Math.PI * t));
+  const edgeFade = Math.max(0, Math.min(1, t / 0.12, (1 - t) / 0.12));
+  const opacity = edgeFade * (0.6 + 0.4 * passFlashOpacity.value);
+  const dashOffset = (1 - t) * 22;
+
+  return {
+    x,
+    y,
+    radius,
+    opacity,
+    dashOffset,
+  };
+});
+
+function stopPassFlashClock() {
+  if (passFlashRaf.value !== null) {
+    cancelAnimationFrame(passFlashRaf.value);
+    passFlashRaf.value = null;
+  }
+}
+
+function startPassFlashClock() {
+  stopPassFlashClock();
+  const tick = (ts) => {
+    passFlashNowMs.value = ts;
+    if (passFlash.value && !props.disableTransitions) {
+      passFlashRaf.value = requestAnimationFrame(tick);
+    } else {
+      passFlashRaf.value = null;
+    }
+  };
+  passFlashRaf.value = requestAnimationFrame(tick);
+}
+
 function clearPassFlash() {
   if (passFlashTimeout.value) {
     clearTimeout(passFlashTimeout.value);
     passFlashTimeout.value = null;
   }
+  stopPassFlashClock();
   passFlash.value = null;
 }
 
@@ -1296,7 +1442,11 @@ function triggerPassFlash(passerId, receiverId, start, end) {
     passFlashTimeout.value = null;
   }
 
+  const startedAtMs = performance.now();
+  passFlashNowMs.value = startedAtMs;
   passFlash.value = {
+    flashKey: ++passFlashSerial,
+    startedAtMs,
     passerId,
     receiverId,
     x1: start.x,
@@ -1306,6 +1456,9 @@ function triggerPassFlash(passerId, receiverId, start, end) {
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
+  if (!props.disableTransitions) {
+    startPassFlashClock();
+  }
 
   passFlashTimeout.value = setTimeout(() => {
     passFlash.value = null;
@@ -1313,7 +1466,7 @@ function triggerPassFlash(passerId, receiverId, start, end) {
   }, PASS_FLASH_DURATION_MS);
 }
 
-function buildShotArcPath(start, end) {
+function buildShotArcGeometry(start, end) {
   const dx = end.x - start.x;
   const dy = end.y - start.y;
   const distance = Math.hypot(dx, dy) || 1;
@@ -1333,7 +1486,147 @@ function buildShotArcPath(start, end) {
   const controlX = midX + perpX * arcHeight * sideSign;
   const controlY = midY + perpY * arcHeight * sideSign;
 
-  return `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`;
+  return {
+    path: `M ${start.x} ${start.y} Q ${controlX} ${controlY} ${end.x} ${end.y}`,
+    controlX,
+    controlY,
+  };
+}
+
+function quadraticBezierPoint(start, control, end, t) {
+  const clampedT = Math.max(0, Math.min(1, t));
+  const oneMinusT = 1 - clampedT;
+  return {
+    x:
+      oneMinusT * oneMinusT * start.x +
+      2 * oneMinusT * clampedT * control.x +
+      clampedT * clampedT * end.x,
+    y:
+      oneMinusT * oneMinusT * start.y +
+      2 * oneMinusT * clampedT * control.y +
+      clampedT * clampedT * end.y,
+  };
+}
+
+function quadraticBezierTangent(start, control, end, t) {
+  const clampedT = Math.max(0, Math.min(1, t));
+  return {
+    x: 2 * (1 - clampedT) * (control.x - start.x) + 2 * clampedT * (end.x - control.x),
+    y: 2 * (1 - clampedT) * (control.y - start.y) + 2 * clampedT * (end.y - control.y),
+  };
+}
+
+const shotFlashProgress = computed(() => {
+  const flash = shotFlash.value;
+  if (!flash) return 0;
+  if (props.disableTransitions) {
+    return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
+  }
+  const startedAt = Number(flash.startedAtMs ?? shotFlashNowMs.value ?? performance.now());
+  const elapsed = Math.max(0, Number(shotFlashNowMs.value ?? performance.now()) - startedAt);
+  return Math.max(0, Math.min(1, elapsed / SHOT_FLASH_DURATION_MS));
+});
+
+const shotFlashOpacity = computed(() => {
+  const t = shotFlashProgress.value;
+  if (t <= 0.75) return 1;
+  return Math.max(0, 1 - (t - 0.75) / 0.25);
+});
+
+const shotLaneOpacity = computed(() => 0.22 + shotFlashOpacity.value * 0.28);
+
+const shotProjectile = computed(() => {
+  const flash = shotFlash.value;
+  if (!flash) return null;
+
+  const start = { x: flash.x1, y: flash.y1 };
+  const control = { x: flash.controlX, y: flash.controlY };
+  const end = { x: flash.x2, y: flash.y2 };
+  const t = shotFlashProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+
+  const tip = quadraticBezierPoint(start, control, end, eased);
+  const tangent = quadraticBezierTangent(start, control, end, eased);
+  const tangentNorm = Math.hypot(tangent.x, tangent.y) || 1;
+  const ux = tangent.x / tangentNorm;
+  const uy = tangent.y / tangentNorm;
+  const px = -uy;
+  const py = ux;
+
+  const totalDist = Math.hypot(end.x - start.x, end.y - start.y);
+  const headLength = Math.min(HEX_RADIUS * 0.95, totalDist * 0.18) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const headHalfWidth = headLength * 0.56;
+  const headBaseX = tip.x - ux * headLength;
+  const headBaseY = tip.y - uy * headLength;
+  const leftX = headBaseX + px * headHalfWidth;
+  const leftY = headBaseY + py * headHalfWidth;
+  const rightX = headBaseX - px * headHalfWidth;
+  const rightY = headBaseY - py * headHalfWidth;
+
+  const shaftLength = Math.min(HEX_RADIUS * 1.5, totalDist * 0.28) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const shaftX1 = headBaseX;
+  const shaftY1 = headBaseY;
+  const shaftX2 = headBaseX - ux * shaftLength;
+  const shaftY2 = headBaseY - uy * shaftLength;
+
+  const impactPhase = Math.max(0, Math.min(1, (eased - 0.82) / 0.18));
+  const impactOpacity = impactPhase > 0 ? (1 - impactPhase) * shotFlashOpacity.value : 0;
+  const impactRadius = HEX_RADIUS * (0.35 + impactPhase * 1.0);
+
+  return {
+    projectileOpacity: 0.35 + shotFlashOpacity.value * 0.65,
+    shaftX1,
+    shaftY1,
+    shaftX2,
+    shaftY2,
+    headPoints: `${tip.x},${tip.y} ${leftX},${leftY} ${rightX},${rightY}`,
+    impactX: end.x,
+    impactY: end.y,
+    impactOpacity,
+    impactRadius,
+  };
+});
+
+const shotBallOutline = computed(() => {
+  const flash = shotFlash.value;
+  if (!flash) return null;
+
+  const start = { x: flash.x1, y: flash.y1 };
+  const control = { x: flash.controlX, y: flash.controlY };
+  const end = { x: flash.x2, y: flash.y2 };
+  const t = shotFlashProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+  const point = quadraticBezierPoint(start, control, end, eased);
+  const edgeFade = Math.max(0, Math.min(1, t / 0.12, (1 - t) / 0.12));
+  const opacity = edgeFade * (0.6 + 0.4 * shotFlashOpacity.value);
+
+  return {
+    x: point.x,
+    y: point.y,
+    radius: HEX_RADIUS * (0.69 + 0.06 * Math.sin(Math.PI * t)),
+    opacity,
+    dashOffset: (1 - t) * 22,
+  };
+});
+
+function stopShotFlashClock() {
+  if (shotFlashRaf.value !== null) {
+    cancelAnimationFrame(shotFlashRaf.value);
+    shotFlashRaf.value = null;
+  }
+}
+
+function startShotFlashClock() {
+  stopShotFlashClock();
+  const tick = (ts) => {
+    shotFlashNowMs.value = ts;
+    if (shotFlash.value && !props.disableTransitions) {
+      shotFlashRaf.value = requestAnimationFrame(tick);
+    } else {
+      shotFlashRaf.value = null;
+    }
+  };
+  shotFlashRaf.value = requestAnimationFrame(tick);
 }
 
 function clearShotFlash() {
@@ -1341,6 +1634,7 @@ function clearShotFlash() {
     clearTimeout(shotFlashTimeout.value);
     shotFlashTimeout.value = null;
   }
+  stopShotFlashClock();
   shotFlash.value = null;
 }
 
@@ -1372,15 +1666,26 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false) {
     shotFlashTimeout.value = null;
   }
 
+  const startedAtMs = performance.now();
+  shotFlashNowMs.value = startedAtMs;
+  const arc = buildShotArcGeometry(start, end);
+
   shotFlash.value = {
+    flashKey: ++shotFlashSerial,
+    startedAtMs,
     shooterId,
     x1: start.x,
     y1: start.y,
     x2: end.x,
     y2: end.y,
+    controlX: arc.controlX,
+    controlY: arc.controlY,
     color: success ? '#22c55e' : '#ef4444',
-    path: buildShotArcPath(start, end),
+    path: arc.path,
   };
+  if (!props.disableTransitions) {
+    startShotFlashClock();
+  }
 
   shotFlashTimeout.value = setTimeout(() => {
     shotFlash.value = null;
@@ -1405,8 +1710,9 @@ watch(
 
     let successfulPass = null;
     for (const [passerId, passResult] of Object.entries(passes)) {
-      if (passResult && passResult.success && typeof passResult.target === 'number') {
-        successfulPass = { passerId: Number(passerId), receiverId: Number(passResult.target) };
+      const targetId = Number(passResult?.target);
+      if (passResult && passResult.success && Number.isFinite(targetId)) {
+        successfulPass = { passerId: Number(passerId), receiverId: targetId };
         break;
       }
     }
@@ -1428,6 +1734,23 @@ watch(
     triggerPassFlash(successfulPass.passerId, successfulPass.receiverId, start, end);
   },
   { immediate: true }
+);
+
+watch(
+  () => props.disableTransitions,
+  (disabled) => {
+    if (disabled) {
+      stopPassFlashClock();
+      stopShotFlashClock();
+      return;
+    }
+    if (passFlash.value) {
+      startPassFlashClock();
+    }
+    if (shotFlash.value) {
+      startShotFlashClock();
+    }
+  }
 );
 
 watch(
@@ -1488,6 +1811,7 @@ async function downloadBoardAsImage() {
       const computed = window.getComputedStyle(source);
       const properties = [
         'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
+        'stroke-linecap', 'stroke-opacity',
         'opacity', 'font-family', 'font-size', 'font-weight',
         'text-anchor', 'dominant-baseline', 'paint-order',
         'transform', 'transform-origin', 'transform-box'
@@ -1617,6 +1941,7 @@ async function renderStateToPng() {
       const computed = window.getComputedStyle(source);
       const properties = [
         'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
+        'stroke-linecap', 'stroke-opacity',
         'opacity', 'font-family', 'font-size', 'font-weight',
         'text-anchor', 'dominant-baseline', 'paint-order',
         'transform', 'transform-origin', 'transform-box'
@@ -2024,7 +2349,7 @@ onBeforeUnmount(() => {
             </text>
             <!-- Ball handler indicator -->
             <circle 
-                v-if="player.hasBall && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id" 
+                v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id" 
                 :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
                 :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
                 :r="HEX_RADIUS * 0.9" 
@@ -2131,14 +2456,56 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Flash effect for completed passes -->
-        <g v-if="passFlash && showPlayers" class="pass-flash-group">
+        <g v-if="passFlash && showPlayers" :key="`pass-flash-${passFlash.flashKey}`" class="pass-flash-group">
+          <template v-if="normalizedPassAnimationStyle === 'projectile' && passProjectile">
+            <line
+              :x1="passFlash.x1"
+              :y1="passFlash.y1"
+              :x2="passFlash.x2"
+              :y2="passFlash.y2"
+              class="pass-projectile-lane"
+              :opacity="passProjectile.laneOpacity"
+            />
+            <line
+              :x1="passProjectile.shaftX1"
+              :y1="passProjectile.shaftY1"
+              :x2="passProjectile.shaftX2"
+              :y2="passProjectile.shaftY2"
+              class="pass-projectile-shaft"
+              :opacity="passProjectile.projectileOpacity"
+            />
+            <polygon
+              :points="passProjectile.headPoints"
+              class="pass-projectile-head"
+              :opacity="passProjectile.projectileOpacity"
+            />
+            <circle
+              v-if="passProjectile.impactOpacity > 0.01"
+              :cx="passProjectile.impactX"
+              :cy="passProjectile.impactY"
+              :r="passProjectile.impactRadius"
+              class="pass-projectile-impact"
+              :opacity="passProjectile.impactOpacity"
+            />
+          </template>
+          <circle
+            v-if="passBallOutline"
+            :cx="passBallOutline.x"
+            :cy="passBallOutline.y"
+            :r="passBallOutline.radius"
+            class="pass-ball-outline"
+            :opacity="passBallOutline.opacity"
+            :style="{ strokeDashoffset: `${passBallOutline.dashOffset}` }"
+          />
           <line
+            v-if="normalizedPassAnimationStyle !== 'projectile' || !passProjectile"
             :x1="passFlash.x1"
             :y1="passFlash.y1"
             :x2="passFlash.x2"
             :y2="passFlash.y2"
             :stroke="ballColor"
             class="pass-flash-line"
+            :opacity="passFlashOpacity"
           />
           <text
             :x="passFlash.labelX"
@@ -2147,19 +2514,56 @@ onBeforeUnmount(() => {
             dominant-baseline="middle"
             :fill="ballColor"
             class="pass-flash-text"
+            :opacity="passFlashOpacity"
           >
             PASS {{ passFlash.passerId }} -> {{ passFlash.receiverId }}
           </text>
         </g>
 
         <!-- Flash effect for shot attempts -->
-        <g v-if="shotFlash && showPlayers" class="shot-flash-group">
+        <g v-if="shotFlash && showPlayers" :key="`shot-flash-${shotFlash.flashKey}`" class="shot-flash-group">
           <path
             :d="shotFlash.path"
             :stroke="shotFlash.color"
             class="shot-flash-line"
             fill="none"
+            :opacity="shotLaneOpacity"
             :style="{ filter: `drop-shadow(0 0 10px ${shotFlash.color})` }"
+          />
+          <line
+            v-if="shotProjectile"
+            :x1="shotProjectile.shaftX1"
+            :y1="shotProjectile.shaftY1"
+            :x2="shotProjectile.shaftX2"
+            :y2="shotProjectile.shaftY2"
+            class="shot-projectile-shaft"
+            :stroke="shotFlash.color"
+            :opacity="shotProjectile.projectileOpacity"
+          />
+          <polygon
+            v-if="shotProjectile"
+            :points="shotProjectile.headPoints"
+            class="shot-projectile-head"
+            :fill="shotFlash.color"
+            :opacity="shotProjectile.projectileOpacity"
+          />
+          <circle
+            v-if="shotBallOutline"
+            :cx="shotBallOutline.x"
+            :cy="shotBallOutline.y"
+            :r="shotBallOutline.radius"
+            class="shot-ball-outline"
+            :opacity="shotBallOutline.opacity"
+            :style="{ strokeDashoffset: `${shotBallOutline.dashOffset}` }"
+          />
+          <circle
+            v-if="shotProjectile && shotProjectile.impactOpacity > 0.01"
+            :cx="shotProjectile.impactX"
+            :cy="shotProjectile.impactY"
+            :r="shotProjectile.impactRadius"
+            class="shot-projectile-impact"
+            :stroke="shotFlash.color"
+            :opacity="shotProjectile.impactOpacity"
           />
         </g>
         
@@ -2829,11 +3233,46 @@ svg {
   pointer-events: none;
 }
 
+.pass-flash-group {
+  pointer-events: none;
+}
+
 .pass-flash-line {
-  stroke-width: 8;
+  stroke-width: 7;
+  stroke-dasharray: 10 7;
+  stroke-opacity: 0.85;
   stroke-linecap: round;
-  filter: drop-shadow(0 0 8px rgba(255, 165, 0, 0.6));
-  animation: pass-flash-line 1s ease-out forwards;
+}
+
+.pass-projectile-lane {
+  stroke: rgba(255, 200, 80, 0.65);
+  stroke-width: 4.5;
+  stroke-linecap: round;
+  stroke-dasharray: 12 8;
+}
+
+.pass-projectile-shaft {
+  stroke: #ffe6a7;
+  stroke-width: 7.5;
+  stroke-linecap: round;
+}
+
+.pass-projectile-head {
+  fill: #ff9f1c;
+}
+
+.pass-projectile-impact {
+  fill: none;
+  stroke: #ffd27a;
+  stroke-width: 3;
+}
+
+.pass-ball-outline {
+  fill: none;
+  stroke: #ffa500;
+  stroke-width: 4.2;
+  stroke-dasharray: 8 6;
+  stroke-linecap: round;
 }
 
 .pass-flash-text {
@@ -2843,19 +3282,12 @@ svg {
   stroke: #0a0f1e;
   stroke-width: 3px;
   letter-spacing: 0.5px;
-  animation: pass-flash-text 1s ease-out forwards;
 }
 
 @keyframes pass-flash-line {
   0% { opacity: 1; stroke-width: 10; }
   60% { opacity: 0.75; stroke-width: 6; }
   100% { opacity: 0; stroke-width: 2; }
-}
-
-@keyframes pass-flash-text {
-  0% { opacity: 1; transform: scale(1); }
-  70% { opacity: 0.85; transform: scale(1.06); }
-  100% { opacity: 0; transform: scale(1.08); }
 }
 
 @keyframes dribble-bounce {
@@ -2874,9 +3306,31 @@ svg {
 }
 
 .shot-flash-line {
-  stroke-width: 10;
+  stroke-width: 4.5;
+  stroke-dasharray: 12 8;
   stroke-linecap: round;
-  animation: pass-flash-line 1s ease-out forwards;
+}
+
+.shot-projectile-shaft {
+  stroke-width: 7.5;
+  stroke-linecap: round;
+}
+
+.shot-projectile-head {
+  stroke: none;
+}
+
+.shot-ball-outline {
+  fill: none;
+  stroke: #ffa500;
+  stroke-width: 4.2;
+  stroke-dasharray: 8 6;
+  stroke-linecap: round;
+}
+
+.shot-projectile-impact {
+  fill: none;
+  stroke-width: 3;
 }
 
 </style>

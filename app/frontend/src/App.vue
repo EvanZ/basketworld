@@ -688,6 +688,23 @@ function handleActiveTabChanged(tab) {
 // (because actions_taken in state N shows what was done to GET to N, but we want to show
 // what will be done FROM the current state N, which is stored in state N+1)
 const boardSelectedActions = computed(() => {
+  // During GIF capture, render action overlays from the state currently visible
+  // on the board so transition frames don't show "next-step" action previews.
+  if (disableTransitionsForCapture.value) {
+    const visibleState =
+      (gameHistory.value.length > 0
+        ? gameHistory.value[gameHistory.value.length - 1]
+        : gameState.value) || null;
+    if (visibleState?.actions_taken) {
+      const actions = {};
+      for (const [pid, action] of Object.entries(visibleState.actions_taken)) {
+        actions[parseInt(pid, 10)] = action;
+      }
+      return actions;
+    }
+    return {};
+  }
+
   // During animated replay, show the actions that led to the current state
   if (isReplaying.value && gameState.value?.actions_taken) {
     const actions = {};
@@ -1216,7 +1233,10 @@ function stateHasAnimatedFlash(state) {
   const hasPass =
     results.passes &&
     Object.values(results.passes).some(
-      (passRes) => passRes && passRes.success && typeof passRes.target === 'number'
+      (passRes) =>
+        passRes &&
+        passRes.success &&
+        Number.isFinite(Number(passRes.target))
     );
 
   return Boolean(hasShot || hasPass);
