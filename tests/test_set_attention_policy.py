@@ -5,7 +5,11 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from basketworld.policies.set_attention_policy import SetAttentionDualCriticPolicy
+from basketworld.policies.set_attention_policy import (
+    PointerTargetedMultiCategoricalDistribution,
+    SetAttentionDualCriticPolicy,
+)
+from basketworld.envs.basketworld_env_v2 import ActionType
 
 
 def _make_obs_space(n_players: int, token_dim: int = 15, globals_dim: int = 3, n_actions: int = 14):
@@ -152,6 +156,170 @@ def test_set_attention_policy_permutation_equivariance():
     perm_reordered = perm_logits[:, inv_perm, :]
     np.testing.assert_allclose(logits, perm_reordered, atol=1e-5)
     np.testing.assert_allclose(values.cpu().numpy(), perm_values.cpu().numpy(), atol=1e-5)
+
+
+def test_pointer_targeted_log_prob_matches_action_probabilities():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+    )
+    policy.set_pass_mode("pointer_targeted")
+
+    obs = _make_obs(n_players, n_actions=n_actions, role=1.0)
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    distribution = policy.get_distribution(tensor_obs)
+
+    actions = th.tensor(
+        [[ActionType.MOVE_E.value, ActionType.PASS_E.value, ActionType.PASS_NE.value]],
+        dtype=th.long,
+    )
+    log_prob = distribution.log_prob(actions)
+    probs = distribution.action_probabilities()
+    manual = th.log(
+        probs[0, th.arange(players_per_side), actions[0]] + 1e-12
+    ).sum().unsqueeze(0)
+    assert th.allclose(log_prob, manual, atol=1e-5)
+
+
+def test_pointer_targeted_pass_prob_floor_applies_to_pass_mass():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+    )
+    policy.set_pass_mode("pointer_targeted")
+    policy.set_pass_prob_min(0.35)
+    policy.set_pass_logit_bias(0.0)
+
+    obs = _make_obs(n_players, n_actions=n_actions, role=1.0)
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    distribution = policy.get_distribution(tensor_obs)
+    probs = distribution.action_probabilities()
+    pass_mass = probs[
+        ...,
+        ActionType.PASS_E.value : ActionType.PASS_SE.value + 1,
+    ].sum(dim=-1)
+
+    assert th.all(pass_mass >= (0.35 - 1e-4))
+
+
+def test_pointer_targeted_dual_policy_defense_smoke():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        use_dual_policy=True,
+    )
+    policy.set_pass_mode("pointer_targeted")
+
+    obs = _make_obs(n_players, n_actions=n_actions, role=-1.0)
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    actions, values, log_prob = policy.forward(tensor_obs, deterministic=True)
+
+    assert actions.shape == (1, players_per_side)
+    assert values.shape == (1, 1)
+    assert log_prob.shape == (1,)
+    assert th.all(actions >= 0)
+    assert th.all(actions < n_actions)
+
+
+def test_set_attention_policy_load_state_dict_allows_missing_pointer_keys():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+    )
+
+    full_state = policy.state_dict()
+    legacy_state = {k: v for k, v in full_state.items() if not k.startswith("pointer_")}
+    result = policy.load_state_dict(legacy_state, strict=True)
+    assert all(str(k).startswith("pointer_") for k in result.missing_keys)
+
+
+def test_pointer_targeted_backward_pass_no_inplace_error():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+    )
+    policy.set_pass_mode("pointer_targeted")
+    policy.set_pass_prob_min(0.35)
+
+    obs = _make_obs(n_players, n_actions=n_actions, role=1.0)
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    actions, _, _ = policy.forward(tensor_obs, deterministic=False)
+    values, log_prob, entropy = policy.evaluate_actions(tensor_obs, actions)
+
+    loss = -(log_prob.mean() + 0.01 * entropy.mean()) + 0.1 * values.mean()
+    loss.backward()
+
+    grads = [p.grad for p in policy.parameters() if p.requires_grad]
+    assert any(g is not None for g in grads)
+
+
+def test_pointer_targeted_mode_uses_joint_action_argmax():
+    # non-pass actions are 0..7, pass slots are 8..13
+    dist = PointerTargetedMultiCategoricalDistribution(
+        action_dim=14,
+        non_pass_action_indices=list(range(8)),
+        pass_action_indices=list(range(8, 14)),
+    )
+
+    # Build a case where PASS type has highest type-probability,
+    # but each individual PASS action has lower probability than SHOOT (7).
+    # If mode() incorrectly does hierarchical argmax, it would select PASS.
+    type_probs = np.array(
+        [0.037, 0.037, 0.037, 0.037, 0.037, 0.037, 0.038, 0.34, 0.40],
+        dtype=np.float32,
+    )
+    slot_probs = np.array([0.30, 0.20, 0.10, 0.10, 0.15, 0.15], dtype=np.float32)
+
+    action_type_logits = th.log(th.as_tensor(type_probs)).view(1, 1, -1)
+    pass_target_logits = th.log(th.as_tensor(slot_probs)).view(1, 1, -1)
+
+    dist = dist.proba_distribution(
+        action_type_logits=action_type_logits,
+        pass_target_logits=pass_target_logits,
+    )
+    actions = dist.mode()
+    probs = dist.action_probabilities()
+    expected = th.argmax(probs, dim=-1)
+
+    assert actions.shape == (1, 1)
+    assert actions.item() == int(expected.item())
+    # Explicitly check we picked SHOOT (action 7), not PASS slots.
+    assert actions.item() == 7
 
 
 def test_set_attention_policy_ppo_smoke_step():

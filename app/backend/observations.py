@@ -16,6 +16,8 @@ from basketworld.utils.wrappers import SetObservationWrapper
 
 from .state import GameState, _role_flag_value_for_team, game_state
 
+_predict_failure_count = 0
+
 
 def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
     cloned = {
@@ -28,10 +30,12 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
         cloned["skills"] = np.copy(skills)
     else:
         cloned["skills"] = None
-    if "players" in obs:
-        cloned["players"] = np.copy(obs["players"])
-    if "globals" in obs:
-        cloned["globals"] = np.copy(obs["globals"])
+    players = obs.get("players") if isinstance(obs, dict) else None
+    globals_vec = obs.get("globals") if isinstance(obs, dict) else None
+    if players is not None:
+        cloned["players"] = np.copy(players)
+    if globals_vec is not None:
+        cloned["globals"] = np.copy(globals_vec)
     return cloned
 
 
@@ -87,7 +91,15 @@ def _predict_actions_for_team(
     raw_actions = None
     try:
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
-    except Exception:
+    except Exception as err:
+        global _predict_failure_count
+        _predict_failure_count += 1
+        if _predict_failure_count <= 5:
+            team_name = getattr(team, "name", str(team))
+            print(
+                f"[OBS][WARN] policy.predict failed for team={team_name} "
+                f"(deterministic={deterministic}) count={_predict_failure_count}: {err}"
+            )
         raw_actions = None
 
     if raw_actions is None:
@@ -115,13 +127,37 @@ def _predict_actions_for_team(
     else:
         team_probs = None
 
-    resolved_actions = resolve_illegal_actions(
-        np.array(team_pred_actions),
-        team_mask,
-        strategy,
-        deterministic,
-        team_probs,
-    )
+    # Deterministic policy execution should select argmax among legal actions from
+    # the model's probability distribution directly. This avoids edge cases where
+    # policy.predict(..., deterministic=True) may not match joint action argmax.
+    if deterministic and team_probs is not None and len(team_probs) == len(team_ids):
+        resolved_actions = np.zeros(len(team_ids), dtype=int)
+        for idx in range(len(team_ids)):
+            legal = np.where(team_mask[idx] == 1)[0]
+            if len(legal) == 0:
+                resolved_actions[idx] = 0
+                continue
+            p = np.asarray(team_probs[idx], dtype=np.float32)
+            if p.shape[0] <= int(np.max(legal)):
+                # Fallback to existing resolver if probability vector is malformed.
+                resolved_actions = resolve_illegal_actions(
+                    np.array(team_pred_actions),
+                    team_mask,
+                    strategy,
+                    deterministic,
+                    team_probs,
+                )
+                break
+            masked = p[legal]
+            resolved_actions[idx] = int(legal[int(np.argmax(masked))])
+    else:
+        resolved_actions = resolve_illegal_actions(
+            np.array(team_pred_actions),
+            team_mask,
+            strategy,
+            deterministic,
+            team_probs,
+        )
 
     for idx, pid in enumerate(team_ids):
         actions_by_player[int(pid)] = int(resolved_actions[idx])
@@ -218,10 +254,12 @@ def _build_role_conditioned_obs(base_obs: dict | None, role_flag_value: float):
         "role_flag": np.array([role_flag_value], dtype=np.float32),
         "skills": np.copy(base_obs.get("skills")) if base_obs.get("skills") is not None else None,
     }
-    if "players" in base_obs:
-        conditioned["players"] = np.copy(base_obs["players"])
-    if "globals" in base_obs:
-        conditioned["globals"] = np.copy(base_obs["globals"])
+    players = base_obs.get("players") if isinstance(base_obs, dict) else None
+    globals_vec = base_obs.get("globals") if isinstance(base_obs, dict) else None
+    if players is not None:
+        conditioned["players"] = np.copy(players)
+    if globals_vec is not None:
+        conditioned["globals"] = np.copy(globals_vec)
     return conditioned
 
 
@@ -323,10 +361,12 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             "role_flag": np.array([role_flag_value], dtype=np.float32),
             "skills": np.copy(next_obs.get("skills")) if next_obs.get("skills") is not None else None,
         }
-        if "players" in next_obs:
-            conditioned_next_obs["players"] = np.copy(next_obs["players"])
-        if "globals" in next_obs:
-            conditioned_next_obs["globals"] = np.copy(next_obs["globals"])
+        players = next_obs.get("players") if isinstance(next_obs, dict) else None
+        globals_vec = next_obs.get("globals") if isinstance(next_obs, dict) else None
+        if players is not None:
+            conditioned_next_obs["players"] = np.copy(players)
+        if globals_vec is not None:
+            conditioned_next_obs["globals"] = np.copy(globals_vec)
 
         next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
         with torch.no_grad():

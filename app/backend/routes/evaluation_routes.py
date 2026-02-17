@@ -120,12 +120,14 @@ def run_evaluation(request: EvaluationRequest):
 
     if isinstance(raw_results, dict):
         per_player_stats = raw_results.get("per_player_stats", {}) or {}
+        eval_diagnostics = raw_results.get("eval_diagnostics", {}) or {}
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
             shot_accumulator = raw_shots
         episode_payload = raw_results.get("results", [])
     else:
         per_player_stats = {}
+        eval_diagnostics = {}
         episode_payload = raw_results
 
     elapsed_time = time.time() - start_time
@@ -143,6 +145,9 @@ def run_evaluation(request: EvaluationRequest):
             "last_action_results": {
                 "shots": outcome_info.get("shots", {}),
                 "turnovers": outcome_info.get("turnovers", []),
+                "defensive_lane_violations": outcome_info.get(
+                    "defensive_lane_violations", []
+                ),
             },
             "shot_clock": outcome_info.get("shot_clock", 0),
             "three_point_distance": outcome_info.get("three_point_distance", 4.0),
@@ -181,4 +186,5 @@ def run_evaluation(request: EvaluationRequest):
         "current_state": current_game_state,
         "shot_accumulator": shot_accumulator,
         "per_player_stats": per_player_stats,
+        "eval_diagnostics": eval_diagnostics,
     }

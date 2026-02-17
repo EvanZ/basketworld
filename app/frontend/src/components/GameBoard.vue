@@ -118,6 +118,46 @@ function hexDistance(a, b) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
+function isPointerPassMode(gs) {
+  return String(gs?.pass_mode || 'directional').toLowerCase() === 'pointer_targeted';
+}
+
+function getPointerPassTeammates(gs, passerId) {
+  if (!gs || passerId === null || passerId === undefined) return [];
+  const pid = Number(passerId);
+  const offense = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const defense = Array.isArray(gs.defense_ids) ? gs.defense_ids : [];
+  const team = offense.includes(pid) ? offense : defense.includes(pid) ? defense : [];
+  return team
+    .filter((tid) => Number(tid) !== pid)
+    .map((tid) => Number(tid))
+    .filter((tid) => Number.isFinite(tid))
+    .sort((a, b) => a - b)
+    .slice(0, 6);
+}
+
+function resolvePassTargetFromAction(gs, passerId, action) {
+  if (!gs || !action || passerId === null || passerId === undefined) return null;
+
+  const directMatch = String(action).match(/^PASS->(\d+)$/);
+  if (directMatch) {
+    const targetId = Number(directMatch[1]);
+    return Number.isFinite(targetId) ? targetId : null;
+  }
+
+  if (!String(action).startsWith('PASS_')) return null;
+
+  if (isPointerPassMode(gs)) {
+    const slotIdx = PASS_ACTION_TO_DIR[action];
+    if (slotIdx === undefined) return null;
+    const teammates = getPointerPassTeammates(gs, passerId);
+    if (slotIdx < 0 || slotIdx >= teammates.length) return null;
+    return teammates[slotIdx];
+  }
+
+  return null;
+}
+
 function getRenderablePlayers(gameState) {
   if (!gameState || !gameState.positions) return [];
   return gameState.positions.map((pos, index) => {
@@ -575,10 +615,31 @@ const ICON_ROTATIONS = {
 
 // Get action indicator data for a player
 function getActionIndicator(playerId, playerX, playerY, hasBall) {
-  const action = props.selectedActions[playerId];
+  const rawAction = props.selectedActions[playerId];
+  const action = typeof rawAction === 'string' ? rawAction : null;
   if (!action || action === 'NOOP') return null;
   
   const indicatorRadius = HEX_RADIUS * 0.55; // Distance from player center to indicator
+
+  const gs = currentGameState.value;
+  const resolvedTargetId = resolvePassTargetFromAction(gs, playerId, action);
+  if (resolvedTargetId !== null && (hasBall || props.disableTransitions)) {
+    const targetId = Number(resolvedTargetId);
+    const targetPos = currentGameState.value?.positions?.[targetId];
+    if (targetPos) {
+      const target = axialToCartesian(targetPos[0], targetPos[1]);
+      const dx = target.x - playerX;
+      const dy = target.y - playerY;
+      const rad = Math.atan2(dy, dx);
+      const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+      return {
+        type: 'pass',
+        x: playerX + indicatorRadius * Math.cos(rad),
+        y: playerY + indicatorRadius * Math.sin(rad),
+        rotation: angleDeg + 90,
+      };
+    }
+  }
   
   if (action.startsWith('MOVE_')) {
     const posAngle = POSITION_ANGLES[action];
@@ -1209,14 +1270,38 @@ const passTargetPreview = computed(() => {
   // A successful pass changes ball_holder, so recover passer from selected actions.
   if (props.disableTransitions && props.selectedActions) {
     const passEntries = Object.entries(props.selectedActions).filter(
-      ([, act]) => typeof act === 'string' && act.startsWith('PASS_')
+      ([, act]) => typeof act === 'string' && /^PASS(?:_|->)/.test(act)
     );
     if (passEntries.length === 1) {
       passerId = Number(passEntries[0][0]);
       action = passEntries[0][1];
     }
   }
-  if (!action || !action.startsWith('PASS_')) return null;
+  if (!action || !/^PASS(?:_|->)/.test(action)) return null;
+
+  const pointerTargetId = resolvePassTargetFromAction(gs, passerId, action);
+  if (pointerTargetId !== null) {
+    const passerPos = gs.positions?.[passerId];
+    const recvPos = gs.positions?.[pointerTargetId];
+    if (!passerPos || !recvPos) return null;
+    const passerCoords = axialToCartesian(passerPos[0], passerPos[1]);
+    const recvCoords = axialToCartesian(recvPos[0], recvPos[1]);
+    return {
+      passerId,
+      receiverId: pointerTargetId,
+      start: passerCoords,
+      end: recvCoords,
+      strategy: 'pointer_targeted',
+      distance: hexDistance(passerPos, recvPos),
+      value: null,
+      stealProb: (passStealProbs.value?.[pointerTargetId] ?? null),
+      ep: (gs.ep_by_player && gs.ep_by_player[pointerTargetId] !== undefined)
+        ? Number(gs.ep_by_player[pointerTargetId])
+        : null,
+    };
+  }
+
+  if (!action.startsWith('PASS_')) return null;
 
   const dirIdx = PASS_ACTION_TO_DIR[action];
   if (dirIdx === undefined) return null;

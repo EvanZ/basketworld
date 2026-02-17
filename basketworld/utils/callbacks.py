@@ -175,10 +175,12 @@ class MLflowCallback(BaseCallback):
                         m2 = float(ep.get("made_2pt", 0.0))
                         m3 = float(ep.get("made_3pt", 0.0))
                         md = float(ep.get("made_dunk", 0.0))
+                        # Defensive 3-second violation awards offense 1 point.
+                        lane_violation_pts = float(ep.get("defensive_lane_violation", 0.0))
                         att = float(ep.get("attempts", 0.0))
                         tov = float(ep.get("turnover", 0.0))
-                        n = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
-                        d = max(1.0, att + tov)
+                        n = (2.0 * m2) + (3.0 * m3) + (2.0 * md) + lane_violation_pts
+                        d = max(1.0, att + tov + lane_violation_pts)
                         numer.append(n / d)
                     return float(np.mean(numer)) if numer else default
 
@@ -441,16 +443,32 @@ class AccumulativeMetricsCallback(BaseCallback):
             "turnover_intercepted": float(ep.get("turnover_intercepted", 0.0)),
             "turnover_pressure": float(ep.get("turnover_pressure", 0.0)),
             "turnover_offensive_lane": float(ep.get("turnover_offensive_lane", 0.0)),
+            "turnover_move_oob": float(ep.get("turnover_move_oob", 0.0)),
+            "turnover_other": float(ep.get("turnover_other", 0.0)),
             "defensive_lane_violation": float(ep.get("defensive_lane_violation", 0.0)),
             "move_rejected_occupied": float(ep.get("move_rejected_occupied", 0.0)),
             "made_dunk": float(ep.get("made_dunk", 0.0)),
             "made_2pt": float(ep.get("made_2pt", 0.0)),
             "made_3pt": float(ep.get("made_3pt", 0.0)),
             "attempts": float(ep.get("attempts", 0.0)),
+            "expected_points": float(ep.get("expected_points", 0.0)),
             "pressure_exposure": float(ep.get("pressure_exposure", 0.0)),
             "phi_beta": float(ep.get("phi_beta", 0.0)),
             "phi_prev": float(ep.get("phi_prev", 0.0)),
             "phi_next": float(ep.get("phi_next", 0.0)),
+            "pointer_pass_attempts": float(ep.get("pointer_pass_attempts", 0.0)),
+            "pointer_pass_intent_match_rate": float(
+                ep.get("pointer_pass_intent_match_rate", 0.0)
+            ),
+            "pointer_pass_target_entropy": float(
+                ep.get("pointer_pass_target_entropy", 0.0)
+            ),
+            "pointer_pass_target_entropy_norm": float(
+                ep.get("pointer_pass_target_entropy_norm", 0.0)
+            ),
+            "pointer_pass_target_kl_uniform": float(
+                ep.get("pointer_pass_target_kl_uniform", 0.0)
+            ),
         }
 
     def reset(self):
@@ -538,6 +556,8 @@ class AccumulativeMetricsCallback(BaseCallback):
         mlflow.log_metric(f"{team_label} Turnover Intercepted", mean_key("turnover_intercepted"), step=global_step)
         mlflow.log_metric(f"{team_label} Turnover Pressure", mean_key("turnover_pressure"), step=global_step)
         mlflow.log_metric(f"{team_label} 3-Second Violation", mean_key("turnover_offensive_lane"), step=global_step)
+        mlflow.log_metric(f"{team_label} Turnover Move OOB", mean_key("turnover_move_oob"), step=global_step)
+        mlflow.log_metric(f"{team_label} Turnover Other", mean_key("turnover_other"), step=global_step)
         mlflow.log_metric(f"{team_label} Illegal Defense Violation", mean_key("defensive_lane_violation"), step=global_step)
         mlflow.log_metric(f"{team_label} Rejected Move Occupied", mean_key("move_rejected_occupied"), step=global_step)
         legal_key = "legal_actions_offense" if str(team_name).lower() == "offense" else "legal_actions_defense"
@@ -545,23 +565,68 @@ class AccumulativeMetricsCallback(BaseCallback):
         
         # PPP (Points Per Possession)
         ppp_values = []
+        expected_ppp_values = []
         for ep in episodes:
             m2 = float(ep.get("made_2pt", 0.0))
             m3 = float(ep.get("made_3pt", 0.0))
             md = float(ep.get("made_dunk", 0.0))
+            # Defensive 3-second violation awards offense 1 point.
+            lane_violation_pts = float(ep.get("defensive_lane_violation", 0.0))
             att = float(ep.get("attempts", 0.0))
             tov = float(ep.get("turnover", 0.0))
-            points = (2.0 * m2) + (3.0 * m3) + (2.0 * md)
-            possessions = max(1.0, att + tov)
+            points = (2.0 * m2) + (3.0 * m3) + (2.0 * md) + lane_violation_pts
+            possessions = max(1.0, att + tov + lane_violation_pts)
             ppp_values.append(points / possessions)
+            expected_points = float(ep.get("expected_points", 0.0)) + lane_violation_pts
+            expected_ppp_values.append(expected_points / possessions)
         ppp_mean = float(np.mean(ppp_values)) if ppp_values else 0.0
+        expected_ppp_mean = (
+            float(np.mean(expected_ppp_values)) if expected_ppp_values else 0.0
+        )
         mlflow.log_metric(f"{team_label} PPP", ppp_mean, step=global_step)
+        mlflow.log_metric(
+            f"{team_label} Expected PPP", expected_ppp_mean, step=global_step
+        )
+        mlflow.log_metric(
+            f"{team_label} Expected Points / Episode",
+            mean_key("expected_points"),
+            step=global_step,
+        )
         
         # Phi diagnostics
         try:
             mlflow.log_metric(f"{team_label} Phi Beta", mean_key("phi_beta"), step=global_step)
             mlflow.log_metric(f"{team_label} Phi Prev", mean_key("phi_prev"), step=global_step)
             mlflow.log_metric(f"{team_label} Phi Next", mean_key("phi_next"), step=global_step)
+        except Exception:
+            pass
+        # Pointer-targeted pass diagnostics (0.0 for directional runs)
+        try:
+            mlflow.log_metric(
+                f"{team_label} Pass Attempts Pointer",
+                mean_key("pointer_pass_attempts"),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                f"{team_label} Pass IntentVsOutcomeMatch",
+                mean_key("pointer_pass_intent_match_rate"),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                f"{team_label} Pass Target Entropy",
+                mean_key("pointer_pass_target_entropy"),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                f"{team_label} Pass Target Entropy Norm",
+                mean_key("pointer_pass_target_entropy_norm"),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                f"{team_label} Pass Target KL Uniform",
+                mean_key("pointer_pass_target_kl_uniform"),
+                step=global_step,
+            )
         except Exception:
             pass
 
@@ -873,8 +938,11 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
                 mlflow.log_metric(
                     "Passing Arc Degrees", float(arc), step=t + self.timestep_offset
                 )
+                # Configured curriculum knob (not observed turnover frequency).
                 mlflow.log_metric(
-                    "Pass OOB Turnover Prob", float(oob), step=t + self.timestep_offset
+                    "Pass OOB Turnover Prob (Config)",
+                    float(oob),
+                    step=t + self.timestep_offset,
                 )
             except Exception:
                 pass
@@ -904,6 +972,7 @@ class EpisodeSampleLogger(BaseCallback):
     def __init__(self, team_name: str, alternation_id: int, sample_prob: float = 1e-4) -> None:
         super().__init__()
         self.team_name = team_name
+        self._team_key = str(team_name).strip().lower()
         self.alternation_id = int(alternation_id)
         self.sample_prob = float(sample_prob)
         self.update_index = 0
@@ -920,6 +989,9 @@ class EpisodeSampleLogger(BaseCallback):
             for env_idx in range(n):
                 if env_idx < len(dones) and dones[env_idx]:
                     info = infos[env_idx] or {}
+                    info_team = str(info.get("training_team", "")).strip().lower()
+                    if info_team and info_team != self._team_key:
+                        continue
                     if random.random() < self.sample_prob:
                         shot_type = (
                             "dunk"
@@ -945,6 +1017,8 @@ class EpisodeSampleLogger(BaseCallback):
                             info.get("turnover_intercepted", 0.0)
                         )
                         turnover_pressure = float(info.get("turnover_pressure", 0.0))
+                        turnover_move_oob = float(info.get("turnover_move_oob", 0.0))
+                        turnover_other = float(info.get("turnover_other", 0.0))
                         row = {
                             "team": self.team_name,
                             "alternation": self.alternation_id,
@@ -957,7 +1031,14 @@ class EpisodeSampleLogger(BaseCallback):
                             "turnover_pass_oob": turnover_pass_oob,
                             "turnover_intercepted": turnover_intercepted,
                             "turnover_pressure": turnover_pressure,
+                            "turnover_move_oob": turnover_move_oob,
+                            "turnover_other": turnover_other,
                             "passes": float(info.get("passes", 0.0)),
+                            "potential_assisted_dunk": float(info.get("potential_assisted_dunk", 0.0)),
+                            "potential_assisted_2pt": float(info.get("potential_assisted_2pt", 0.0)),
+                            "potential_assisted_3pt": float(info.get("potential_assisted_3pt", 0.0)),
+                            "potential_assists": float(info.get("potential_assists", 0.0)),
+                            "expected_points": float(info.get("expected_points", 0.0)),
                             "pressure_exposure": float(info.get("pressure_exposure", 0.0)),
                             "assisted_dunk": float(info.get("assisted_dunk", 0.0)),
                             "assisted_2pt": float(info.get("assisted_2pt", 0.0)),
@@ -999,7 +1080,14 @@ class EpisodeSampleLogger(BaseCallback):
                     "turnover_pass_oob",
                     "turnover_intercepted",
                     "turnover_pressure",
+                    "turnover_move_oob",
+                    "turnover_other",
                     "passes",
+                    "potential_assisted_dunk",
+                    "potential_assisted_2pt",
+                    "potential_assisted_3pt",
+                    "potential_assists",
+                    "expected_points",
                     "pressure_exposure",
                     "assisted_dunk",
                     "assisted_2pt",

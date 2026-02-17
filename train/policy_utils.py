@@ -21,7 +21,10 @@ def get_random_policy_from_artifacts(
     uniform_eps: float = 0.0,
     sample_geometric_fn: Callable[[List[int], float], int] | None = None,
 ):
-    """Sample an opponent checkpoint using a geometric decay over recent K snapshots."""
+    """Sample an opponent checkpoint using a geometric decay over recent K snapshots.
+
+    Returns None when no matching artifacts exist yet (e.g., first alternation of a fresh run).
+    """
     artifact_path = "models"
     all_artifacts = client.list_artifacts(run_id, artifact_path)
 
@@ -39,7 +42,7 @@ def get_random_policy_from_artifacts(
     filtered = sorted(filtered, key=sort_key)
 
     if not filtered:
-        raise ValueError(f"No artifacts found for prefix '{model_prefix}'")
+        return None
 
     # Use geometric decay over last K checkpoints
     recent_pols = filtered[-K:]

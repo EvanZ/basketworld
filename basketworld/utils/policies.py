@@ -69,6 +69,7 @@ class PassBiasMultiInputPolicy(MultiInputActorCriticPolicy):
         # Scalar bias added to each PASS logit (same for all players). 0.0 disables.
         self.pass_logit_bias: float = 0.0
         self.pass_prob_min: float = 0.0
+        self.pass_mode: str = "directional"
         # Cache per-dimension sizes from MultiDiscrete
         try:
             self._nvec: List[int] = list(self.action_space.nvec)
@@ -97,6 +98,11 @@ class PassBiasMultiInputPolicy(MultiInputActorCriticPolicy):
             self.pass_prob_min = float(value)
         except Exception:
             self.pass_prob_min = 0.0
+
+    def set_pass_mode(self, mode: str) -> None:
+        normalized = str(mode).lower()
+        if normalized in ("directional", "pointer_targeted"):
+            self.pass_mode = normalized
 
     def _apply_pass_bias(self, action_logits: th.Tensor) -> th.Tensor:
         base_bias = float(self.pass_logit_bias)
@@ -154,6 +160,7 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         # Scalar bias added to each PASS logit (same for all players). 0.0 disables.
         self.pass_logit_bias: float = 0.0
         self.pass_prob_min: float = 0.0
+        self.pass_mode: str = "directional"
         # Cache per-dimension sizes from MultiDiscrete
         try:
             self._nvec: List[int] = list(self.action_space.nvec)
@@ -182,6 +189,11 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
             self.pass_prob_min = float(value)
         except Exception:
             self.pass_prob_min = 0.0
+
+    def set_pass_mode(self, mode: str) -> None:
+        normalized = str(mode).lower()
+        if normalized in ("directional", "pointer_targeted"):
+            self.pass_mode = normalized
 
     def _apply_pass_bias(self, action_logits: th.Tensor) -> th.Tensor:
         """
@@ -238,5 +250,4 @@ class PassBiasDualCriticPolicy(DualCriticActorCriticPolicy):
         biased_logits = self._apply_pass_bias(action_logits)
         
         return self.action_dist.proba_distribution(action_logits=biased_logits)
-
 

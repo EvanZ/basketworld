@@ -433,6 +433,13 @@ def main(args):
             except Exception:
                 pass
 
+        try:
+            policy_obj = getattr(unified_policy, "policy", None)
+            if policy_obj is not None and hasattr(policy_obj, "set_pass_mode"):
+                policy_obj.set_pass_mode(getattr(args, "pass_mode", "directional"))
+        except Exception:
+            pass
+
         # --- Log the actual network architecture used ---
         # This ensures we capture the default if no custom arch is provided.
         actual_net_arch = str(unified_policy.policy.net_arch)

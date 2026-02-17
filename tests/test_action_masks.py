@@ -26,3 +26,18 @@ def test_action_masks_with_occupied_moves():
     masks = env._get_action_masks()
     blocked_idx = ActionType.MOVE_E.value
     assert masks[0, blocked_idx] == 0  # move into occupied hex blocked
+
+
+def test_pointer_targeted_mode_disables_directional_pass_gating():
+    env = HexagonBasketballEnv(
+        players=2,
+        render_mode=None,
+        pass_mode="pointer_targeted",
+        enable_pass_gating=True,
+    )
+    env.reset(seed=7)
+    env.ball_holder = env.offense_ids[0]
+
+    masks = env._get_action_masks()
+    pass_slice = masks[env.ball_holder, ActionType.PASS_E.value : ActionType.PASS_SE.value + 1]
+    assert pass_slice.tolist() == [1, 0, 0, 0, 0, 0]

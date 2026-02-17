@@ -197,22 +197,14 @@ def get_shot_probability(player_id: int):
         player_pos = game_state.env.positions[player_id]
         basket_pos = game_state.env.basket_position
         distance = game_state.env._hex_distance(player_pos, basket_pos)
-        d0 = 1
-        d1 = max(game_state.env.three_point_distance, d0 + 1)
-        p0 = game_state.env.layup_pct
-        p1 = game_state.env.three_pt_pct
-        if distance <= d0:
-            base_prob = p0
-        else:
-            t = (distance - d0) / (d1 - d0)
-            base_prob = p0 + (p1 - p0) * t
+        base_prob = game_state.env._calculate_base_shot_probability(player_id, distance)
         final_prob = game_state.env._calculate_shot_probability(player_id, distance)
         return {
             "player_id": player_id,
             "shot_probability": float(base_prob),
             "shot_probability_final": float(final_prob),
             "distance": int(distance),
+            "is_three": bool(game_state.env._is_three_point_hex(tuple(player_pos))),
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
-

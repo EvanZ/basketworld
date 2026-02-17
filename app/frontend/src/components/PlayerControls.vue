@@ -2,7 +2,18 @@
 import { ref, computed, watch, onMounted, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
-import { getActionValues, getRewards, mctsAdvise, setOffenseSkills, setPassTargetStrategy, setPassLogitBias, setBallHolder } from '@/services/api';
+import {
+  getActionValues,
+  getRewards,
+  mctsAdvise,
+  setOffenseSkills,
+  setPassTargetStrategy,
+  setPassLogitBias,
+  setBallHolder,
+  setShotPressureParams,
+  setPassInterceptionParams,
+  setDefenderPressureParams,
+} from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
 // Import API_BASE_URL for policy probabilities fetch
@@ -119,6 +130,108 @@ const props = defineProps({
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
 
 const selectedActions = ref({});
+const selectedPassTargets = ref({});
+const passMode = computed(() => String(props.gameState?.pass_mode || 'directional').toLowerCase());
+const isPointerPassMode = computed(() => passMode.value === 'pointer_targeted');
+const POINTER_PASS_SLOT_ACTIONS = ['PASS_E', 'PASS_NE', 'PASS_NW', 'PASS_W', 'PASS_SW', 'PASS_SE'];
+const selectionDebugVersion = 'seldbg-v3';
+
+function isBallHolderPlayer(playerId) {
+  const bh = props.gameState?.ball_holder;
+  if (bh === null || bh === undefined) return false;
+  return String(playerId) === String(bh);
+}
+
+function getPointerPassTeammatesForPlayer(playerId) {
+  const pid = Number(playerId);
+  if (!Number.isFinite(pid)) return [];
+  const offense = props.gameState?.offense_ids || [];
+  const defense = props.gameState?.defense_ids || [];
+  const sameTeam = offense.includes(pid) ? offense : defense.includes(pid) ? defense : [];
+  const teammates = sameTeam
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id !== pid);
+  teammates.sort((a, b) => a - b);
+  return teammates.slice(0, POINTER_PASS_SLOT_ACTIONS.length);
+}
+
+function resolvePointerPassTarget(playerId, actionName) {
+  if (!isPointerPassMode.value) return null;
+  const pid = Number(playerId);
+  if (!Number.isFinite(pid)) return null;
+  const teammates = getPointerPassTeammatesForPlayer(pid);
+  const isValidTarget = (targetId) => teammates.includes(Number(targetId));
+
+  const action = typeof actionName === 'string' ? actionName : '';
+  if (action.startsWith('PASS->')) {
+    const parsed = Number(action.replace('PASS->', ''));
+    return Number.isFinite(parsed) && isValidTarget(parsed) ? parsed : null;
+  }
+  if (!action.startsWith('PASS_')) return null;
+
+  const explicitTarget = selectedPassTargets.value?.[pid];
+  if (Number.isFinite(Number(explicitTarget)) && isValidTarget(explicitTarget)) {
+    return Number(explicitTarget);
+  }
+
+  const slotIdx = POINTER_PASS_SLOT_ACTIONS.indexOf(action);
+  if (slotIdx < 0) return null;
+  if (slotIdx >= teammates.length) return null;
+  return Number(teammates[slotIdx]);
+}
+
+function getResolvedPointerPassTarget(playerId) {
+  const effectiveAction = getEffectiveSelectedAction(playerId);
+  return resolvePointerPassTarget(playerId, effectiveAction);
+}
+
+const activeResolvedPassTarget = computed(() => {
+  const active = props.activePlayerId;
+  if (active === null || active === undefined) return null;
+  const resolved = getResolvedPointerPassTarget(active);
+  return Number.isFinite(Number(resolved)) ? Number(resolved) : null;
+});
+
+const activeEffectiveAction = computed(() => {
+  const active = props.activePlayerId;
+  if (active === null || active === undefined) return '';
+  return String(getEffectiveSelectedAction(active) || '');
+});
+
+const activeHasPassSelection = computed(() => {
+  const action = activeEffectiveAction.value;
+  return action.startsWith('PASS_') || action.startsWith('PASS->');
+});
+
+function isPointerPassButtonSelected(targetId) {
+  if (!activeHasPassSelection.value) return false;
+  return activeResolvedPassTarget.value !== null && activeResolvedPassTarget.value === Number(targetId);
+}
+
+function buildDisplaySelections(selections) {
+  const displaySelections = {};
+  for (const [pid, actionName] of Object.entries(selections || {})) {
+    const action = typeof actionName === 'string' ? actionName : '';
+    const isPassAction = action.startsWith('PASS_') || action.startsWith('PASS->');
+    const numericPid = Number(pid);
+    if (!isPassAction) {
+      displaySelections[pid] = actionName;
+      continue;
+    }
+
+    if (isPointerPassMode.value && !isBallHolderPlayer(pid)) {
+      continue;
+    }
+
+    const resolvedTarget = resolvePointerPassTarget(numericPid, action);
+    if (Number.isFinite(Number(resolvedTarget))) {
+      displaySelections[pid] = `PASS->${Number(resolvedTarget)}`;
+    } else {
+      displaySelections[pid] = action;
+    }
+  }
+  return displaySelections;
+}
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
 const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
@@ -130,7 +243,11 @@ const pressureExposureDisplay = computed(() => {
 // Debug: Watch for any changes to selectedActions
 watch(selectedActions, (newActions, oldActions) => {
   console.log('[PlayerControls] 🔍 selectedActions changed from:', oldActions, 'to:', newActions);
-  emit('selections-changed', { ...newActions });
+  emit('selections-changed', buildDisplaySelections(newActions));
+}, { deep: true });
+
+watch(selectedPassTargets, () => {
+  emit('selections-changed', buildDisplaySelections(selectedActions.value));
 }, { deep: true });
 
 const actionValues = ref(null);
@@ -220,6 +337,50 @@ const passLogitBiasInput = ref(0);
 const passLogitBiasDefault = 0.0;
 const passLogitBiasUpdating = ref(false);
 const passLogitBiasError = ref(null);
+const pressureParamsInput = ref({
+  three_pt_extra_hex_decay: 0.05,
+  shot_pressure_enabled: true,
+  shot_pressure_max: 0.5,
+  shot_pressure_lambda: 1.0,
+  shot_pressure_arc_degrees: 60.0,
+  base_steal_rate: 0.35,
+  steal_perp_decay: 1.5,
+  steal_distance_factor: 0.08,
+  steal_position_weight_min: 0.3,
+  defender_pressure_distance: 1,
+  defender_pressure_turnover_chance: 0.05,
+  defender_pressure_decay_lambda: 1.0,
+});
+const pressureParamsUpdating = ref(false);
+const pressureParamsError = ref(null);
+const pendingPressureSyncKeys = ref(null);
+const suppressNextPressurePropsSync = ref(false);
+const activePressureUpdateSection = ref(null);
+const SHOT_PRESSURE_PARAM_KEYS = [
+  'three_pt_extra_hex_decay',
+  'shot_pressure_enabled',
+  'shot_pressure_max',
+  'shot_pressure_lambda',
+  'shot_pressure_arc_degrees',
+];
+const DEFENDER_PRESSURE_PARAM_KEYS = [
+  'defender_pressure_distance',
+  'defender_pressure_turnover_chance',
+  'defender_pressure_decay_lambda',
+];
+const PASS_INTERCEPTION_PARAM_KEYS = [
+  'base_steal_rate',
+  'steal_perp_decay',
+  'steal_distance_factor',
+  'steal_position_weight_min',
+];
+
+function isPressureSectionUpdating(section) {
+  return (
+    pressureParamsUpdating.value &&
+    activePressureUpdateSection.value === section
+  );
+}
 const PASS_TARGET_STRATEGIES = [
   { value: 'nearest', label: 'Nearest (legacy)' },
   { value: 'best_ev', label: 'Best EV' },
@@ -270,6 +431,65 @@ watch(() => props.gameState?.pass_logit_bias, (val) => {
     passLogitBiasInput.value = Number.isFinite(num) ? num : 0;
   }
 }, { immediate: true });
+
+function syncPressureParamsInputs(state) {
+  const src = state || {};
+  const nextValues = {
+    three_pt_extra_hex_decay: Number(src.three_pt_extra_hex_decay ?? 0.05),
+    shot_pressure_enabled: Boolean(src.shot_pressure_enabled ?? true),
+    shot_pressure_max: Number(src.shot_pressure_max ?? 0.5),
+    shot_pressure_lambda: Number(src.shot_pressure_lambda ?? 1.0),
+    shot_pressure_arc_degrees: Number(src.shot_pressure_arc_degrees ?? 60.0),
+    base_steal_rate: Number(src.base_steal_rate ?? 0.35),
+    steal_perp_decay: Number(src.steal_perp_decay ?? 1.5),
+    steal_distance_factor: Number(src.steal_distance_factor ?? 0.08),
+    steal_position_weight_min: Number(src.steal_position_weight_min ?? 0.3),
+    defender_pressure_distance: Number(src.defender_pressure_distance ?? 1),
+    defender_pressure_turnover_chance: Number(src.defender_pressure_turnover_chance ?? 0.05),
+    defender_pressure_decay_lambda: Number(src.defender_pressure_decay_lambda ?? 1.0),
+  };
+  const scopedKeys = Array.isArray(pendingPressureSyncKeys.value)
+    ? pendingPressureSyncKeys.value
+    : null;
+  if (scopedKeys && scopedKeys.length > 0) {
+    const merged = { ...(pressureParamsInput.value || {}) };
+    for (const key of scopedKeys) {
+      if (Object.prototype.hasOwnProperty.call(nextValues, key)) {
+        merged[key] = nextValues[key];
+      }
+    }
+    pressureParamsInput.value = merged;
+    pendingPressureSyncKeys.value = null;
+    return;
+  }
+  pressureParamsInput.value = nextValues;
+}
+
+watch(
+  () => [
+    props.gameState?.three_pt_extra_hex_decay,
+    props.gameState?.shot_pressure_enabled,
+    props.gameState?.shot_pressure_max,
+    props.gameState?.shot_pressure_lambda,
+    props.gameState?.shot_pressure_arc_degrees,
+    props.gameState?.base_steal_rate,
+    props.gameState?.steal_perp_decay,
+    props.gameState?.steal_distance_factor,
+    props.gameState?.steal_position_weight_min,
+    props.gameState?.defender_pressure_distance,
+    props.gameState?.defender_pressure_turnover_chance,
+    props.gameState?.defender_pressure_decay_lambda,
+  ],
+  () => {
+    if (suppressNextPressurePropsSync.value) {
+      suppressNextPressurePropsSync.value = false;
+      return;
+    }
+    if (pressureParamsUpdating.value && !pendingPressureSyncKeys.value) return;
+    syncPressureParamsInputs(props.gameState || {});
+  },
+  { immediate: true }
+);
 
 const offenseSkillRows = computed(() => {
   const ids = props.gameState?.offense_ids || [];
@@ -567,6 +787,183 @@ async function resetPassLogitBiasDefault() {
   await applyPassLogitBiasOverride();
 }
 
+function _normalizePressurePayload(input) {
+  return {
+    three_pt_extra_hex_decay: Number(input?.three_pt_extra_hex_decay ?? 0.05),
+    shot_pressure_enabled: Boolean(input?.shot_pressure_enabled),
+    shot_pressure_max: Number(input?.shot_pressure_max ?? 0.5),
+    shot_pressure_lambda: Number(input?.shot_pressure_lambda ?? 1.0),
+    shot_pressure_arc_degrees: Number(input?.shot_pressure_arc_degrees ?? 60.0),
+    base_steal_rate: Number(input?.base_steal_rate ?? 0.35),
+    steal_perp_decay: Number(input?.steal_perp_decay ?? 1.5),
+    steal_distance_factor: Number(input?.steal_distance_factor ?? 0.08),
+    steal_position_weight_min: Number(input?.steal_position_weight_min ?? 0.3),
+    defender_pressure_distance: Math.round(Number(input?.defender_pressure_distance ?? 1)),
+    defender_pressure_turnover_chance: Number(input?.defender_pressure_turnover_chance ?? 0.05),
+    defender_pressure_decay_lambda: Number(input?.defender_pressure_decay_lambda ?? 1.0),
+  };
+}
+
+function _buildPressureSubsetPayload(keys) {
+  const normalized = _normalizePressurePayload(pressureParamsInput.value);
+  const payload = {};
+  for (const key of keys || []) {
+    if (Object.prototype.hasOwnProperty.call(normalized, key)) {
+      payload[key] = normalized[key];
+    }
+  }
+  return payload;
+}
+
+function _buildSectionResetPayload(keys) {
+  const defaults = props.gameState?.mlflow_env_defaults || {};
+  const fallbackState = props.gameState || {};
+  const payload = {};
+  for (const key of keys || []) {
+    const defaultVal = defaults[key];
+    if (defaultVal !== undefined && defaultVal !== null) {
+      payload[key] = defaultVal;
+      continue;
+    }
+    const stateVal = fallbackState[key];
+    if (stateVal !== undefined && stateVal !== null) {
+      payload[key] = stateVal;
+    }
+  }
+  return payload;
+}
+
+async function _submitPressureParams(
+  requestFn,
+  payload,
+  fallbackErrorMessage,
+  syncKeys = null,
+  section = null
+) {
+  if (!props.gameState) return;
+  if (pressureParamsUpdating.value) return;
+  pressureParamsUpdating.value = true;
+  pressureParamsError.value = null;
+  activePressureUpdateSection.value = section || null;
+  pendingPressureSyncKeys.value = Array.isArray(syncKeys) ? [...syncKeys] : null;
+  try {
+    const reqPayload = payload || {};
+    const res = await requestFn(reqPayload);
+    if (res?.status === 'success' && res.state) {
+      // Ignore the immediate props-sync from this emitted state update.
+      // We explicitly sync only the intended section below.
+      suppressNextPressurePropsSync.value = true;
+      emit('state-updated', res.state);
+      syncPressureParamsInputs(res.state);
+    } else {
+      throw new Error(res?.detail || fallbackErrorMessage);
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update pressure parameters', err);
+    pressureParamsError.value = err?.message || fallbackErrorMessage;
+    pendingPressureSyncKeys.value = null;
+  } finally {
+    activePressureUpdateSection.value = null;
+    pressureParamsUpdating.value = false;
+  }
+}
+
+async function applyPressureParameterOverrides() {
+  const payload = _buildPressureSubsetPayload(SHOT_PRESSURE_PARAM_KEYS);
+  await _submitPressureParams(
+    setShotPressureParams,
+    payload,
+    'Failed to update shot pressure parameters',
+    SHOT_PRESSURE_PARAM_KEYS,
+    'shot'
+  );
+}
+
+async function resetPressureParametersToMlflowDefaults() {
+  const payload = _buildSectionResetPayload(SHOT_PRESSURE_PARAM_KEYS);
+  if (Object.keys(payload).length > 0) {
+    await _submitPressureParams(
+      setShotPressureParams,
+      payload,
+      'Failed to reset shot pressure parameters',
+      SHOT_PRESSURE_PARAM_KEYS,
+      'shot'
+    );
+    return;
+  }
+  await _submitPressureParams(
+    setShotPressureParams,
+    { reset_to_mlflow_defaults: true },
+    'Failed to reset shot pressure parameters',
+    SHOT_PRESSURE_PARAM_KEYS,
+    'shot'
+  );
+}
+
+async function applyDefenderTurnoverPressureOverrides() {
+  const payload = _buildPressureSubsetPayload(DEFENDER_PRESSURE_PARAM_KEYS);
+  await _submitPressureParams(
+    setDefenderPressureParams,
+    payload,
+    'Failed to update defender turnover pressure parameters',
+    DEFENDER_PRESSURE_PARAM_KEYS,
+    'defender'
+  );
+}
+
+async function resetDefenderTurnoverPressureToMlflowDefaults() {
+  const payload = _buildSectionResetPayload(DEFENDER_PRESSURE_PARAM_KEYS);
+  if (Object.keys(payload).length > 0) {
+    await _submitPressureParams(
+      setDefenderPressureParams,
+      payload,
+      'Failed to reset defender turnover pressure parameters',
+      DEFENDER_PRESSURE_PARAM_KEYS,
+      'defender'
+    );
+    return;
+  }
+  await _submitPressureParams(
+    setDefenderPressureParams,
+    { reset_to_mlflow_defaults: true },
+    'Failed to reset defender turnover pressure parameters',
+    DEFENDER_PRESSURE_PARAM_KEYS,
+    'defender'
+  );
+}
+
+async function applyPassInterceptionOverrides() {
+  const payload = _buildPressureSubsetPayload(PASS_INTERCEPTION_PARAM_KEYS);
+  await _submitPressureParams(
+    setPassInterceptionParams,
+    payload,
+    'Failed to update pass interception parameters',
+    PASS_INTERCEPTION_PARAM_KEYS,
+    'pass'
+  );
+}
+
+async function resetPassInterceptionToMlflowDefaults() {
+  const payload = _buildSectionResetPayload(PASS_INTERCEPTION_PARAM_KEYS);
+  if (Object.keys(payload).length > 0) {
+    await _submitPressureParams(
+      setPassInterceptionParams,
+      payload,
+      'Failed to reset pass interception parameters',
+      PASS_INTERCEPTION_PARAM_KEYS,
+      'pass'
+    );
+    return;
+  }
+  await _submitPressureParams(
+    setPassInterceptionParams,
+    { reset_to_mlflow_defaults: true },
+    'Failed to reset pass interception parameters',
+    PASS_INTERCEPTION_PARAM_KEYS,
+    'pass'
+  );
+}
+
 async function handleBallHolderChange(val) {
   if (val === null || val === undefined) return;
   const pid = Number(val);
@@ -586,6 +983,7 @@ async function handleBallHolderChange(val) {
       emit('ball-holder-changed', { from: prevBallHolder, to: pid });
       // Clear any queued selections so we don't treat the manual ball-handler change as an action.
       selectedActions.value = {};
+      selectedPassTargets.value = {};
       emit('selections-changed', {});
     } else {
       throw new Error(res?.detail || 'Failed to set ball holder');
@@ -688,9 +1086,142 @@ const totalPotentialAssists = computed(() => (
   + statsState.value.twoPt.potentialAssists
   + statsState.value.threePt.potentialAssists
 ));
+const totalViolations = computed(() => (
+  Number(statsState.value?.violations?.defensiveLane || 0)
+  + Number(statsState.value?.violations?.offensiveThreeSeconds || 0)
+));
 const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
+
+function ensureStatsDiagnosticFields(target) {
+  if (!target || typeof target !== 'object') return;
+  if (!target.turnoverReasons || typeof target.turnoverReasons !== 'object') {
+    target.turnoverReasons = {};
+  }
+  if (!target.actionMix || typeof target.actionMix !== 'object') {
+    target.actionMix = {};
+  }
+  if (!target.rewardBreakdown || typeof target.rewardBreakdown !== 'object') {
+    target.rewardBreakdown = {};
+  }
+  target.actionMix.noop = Number(target.actionMix.noop || 0);
+  target.actionMix.move = Number(target.actionMix.move || 0);
+  target.actionMix.shoot = Number(target.actionMix.shoot || 0);
+  target.actionMix.pass = Number(target.actionMix.pass || 0);
+  target.actionMix.other = Number(target.actionMix.other || 0);
+  target.actionMix.total = Number(target.actionMix.total || 0);
+  target.rewardBreakdown.totalReward = Number(target.rewardBreakdown.totalReward || 0);
+  target.rewardBreakdown.expectedPoints = Number(target.rewardBreakdown.expectedPoints || 0);
+  target.rewardBreakdown.passReward = Number(target.rewardBreakdown.passReward || 0);
+  target.rewardBreakdown.violationReward = Number(target.rewardBreakdown.violationReward || 0);
+  target.rewardBreakdown.assistPotential = Number(target.rewardBreakdown.assistPotential || 0);
+  target.rewardBreakdown.assistFullBonus = Number(target.rewardBreakdown.assistFullBonus || 0);
+  target.rewardBreakdown.phiShaping = Number(target.rewardBreakdown.phiShaping || 0);
+  target.rewardBreakdown.unexplained = Number(target.rewardBreakdown.unexplained || 0);
+}
+
+ensureStatsDiagnosticFields(statsState.value);
+
+function formatTurnoverReason(reason) {
+  const map = {
+    intercepted: 'Intercepted',
+    steal: 'Intercepted',
+    defender_pressure: 'Pressure',
+    pass_out_of_bounds: 'Pass OOB',
+    move_out_of_bounds: 'Move OOB',
+    offensive_three_seconds: 'Offensive 3-second violation',
+    shot_clock_violation: 'Shot Clock',
+  };
+  return map[String(reason)] || String(reason || 'unknown');
+}
+
+function getTurnoverReasonTooltip(reason) {
+  const map = {
+    intercepted: 'A defender intercepted a pass before it reached the target.',
+    steal: 'Legacy label for an intercepted pass turnover.',
+    defender_pressure: 'The ball handler turned it over due to defender pressure probability.',
+    pass_out_of_bounds: 'The selected pass trajectory went out of bounds.',
+    move_out_of_bounds: 'The ball handler moved out of bounds.',
+    offensive_three_seconds: 'An offensive player stayed in the lane longer than the 3-second limit.',
+    shot_clock_violation: 'Possession ended because the shot clock expired.',
+  };
+  return map[String(reason)] || 'Turnover category reported by the environment.';
+}
+
+function getActionMixTooltip(key) {
+  const map = {
+    noop: 'Player selected NOOP (no action this step).',
+    move: 'Player selected one of the six movement directions.',
+    shoot: 'Player selected SHOOT.',
+    pass: 'Player selected a PASS action.',
+    other: 'Any non-standard action id outside NOOP/MOVE/SHOOT/PASS buckets.',
+  };
+  return map[String(key)] || 'Action category count and rate over evaluated decisions.';
+}
+
+function getRewardBreakdownTooltip(key) {
+  const map = {
+    totalReward: 'Sum of all user-team rewards across evaluated episodes.',
+    expectedPoints: 'Shot expected-points term (shot value × pressure-adjusted make probability).',
+    passReward: 'Reward term from successful passes.',
+    assistPotential: 'Potential-assist shaping reward component.',
+    assistFullBonus: 'Full-assist bonus reward component.',
+    violationReward: 'Reward term from defensive-lane violations.',
+    phiShaping: 'Potential-based shaping component (if phi shaping is enabled).',
+    unexplained: 'Residual: totalReward minus tracked components.',
+  };
+  return map[String(key)] || 'Reward component contribution.';
+}
+
+const turnoverReasonRows = computed(() => {
+  const rows = Object.entries(statsState.value?.turnoverReasons || {}).map(([reason, count]) => ({
+    reason,
+    label: formatTurnoverReason(reason),
+    count: Number(count || 0),
+  }));
+  rows.sort((a, b) => b.count - a.count);
+  return rows;
+});
+
+const actionMixRows = computed(() => {
+  const mix = statsState.value?.actionMix || {};
+  const total = Number(mix.total || 0);
+  const asRow = (key, label) => {
+    const count = Number(mix[key] || 0);
+    return {
+      key,
+      label,
+      count,
+      rate: total > 0 ? (count / total) * 100 : 0,
+    };
+  };
+  return {
+    total,
+    rows: [
+      asRow('noop', 'NOOP'),
+      asRow('move', 'MOVE'),
+      asRow('shoot', 'SHOOT'),
+      asRow('pass', 'PASS'),
+      asRow('other', 'OTHER'),
+    ],
+  };
+});
+
+const rewardBreakdownRows = computed(() => {
+  const rb = statsState.value?.rewardBreakdown || {};
+  return [
+    { key: 'totalReward', label: 'Total reward', value: Number(rb.totalReward || 0) },
+    { key: 'expectedPoints', label: 'Expected points', value: Number(rb.expectedPoints || 0) },
+    { key: 'passReward', label: 'Pass reward', value: Number(rb.passReward || 0) },
+    { key: 'assistPotential', label: 'Potential assist', value: Number(rb.assistPotential || 0) },
+    { key: 'assistFullBonus', label: 'Full assist bonus', value: Number(rb.assistFullBonus || 0) },
+    { key: 'violationReward', label: 'Violation reward', value: Number(rb.violationReward || 0) },
+    { key: 'phiShaping', label: 'Phi shaping', value: Number(rb.phiShaping || 0) },
+    { key: 'unexplained', label: 'Unexplained', value: Number(rb.unexplained || 0) },
+  ];
+});
+
 const selectedShotChartTarget = ref('team');
 const offensePlayerIdsForStats = computed(() => {
   const fromEval = Object.keys(props.perPlayerEvalStats || {}).map((k) => Number(k)).filter((n) => !Number.isNaN(n));
@@ -855,6 +1386,7 @@ const shotChartConfig = computed(() => {
 
 async function recordEpisodeStats(finalState, skipApiCall = false, episodeData = null) {
   console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
+  ensureStatsDiagnosticFields(statsState.value);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
   const shots = results?.shots || {};
@@ -892,16 +1424,36 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   }
 
   // Turnovers at termination (array contains a single turnover if present)
-  const tovCount = Array.isArray(results?.turnovers) ? results.turnovers.length : 0;
+  const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
+  const tovCount = turnovers.length;
   statsState.value.turnovers += Number(tovCount || 0);
+  for (const turnover of turnovers) {
+    const reason = String(turnover?.reason || 'unknown');
+    statsState.value.turnoverReasons[reason] = Number(statsState.value.turnoverReasons[reason] || 0) + 1;
+  }
+  if (!statsState.value.violations) {
+    statsState.value.violations = { defensiveLane: 0, offensiveThreeSeconds: 0 };
+  }
+  const defensiveLaneCount = Array.isArray(results?.defensive_lane_violations)
+    ? results.defensive_lane_violations.length
+    : 0;
+  const offensiveThreeCount = turnovers.filter(
+    (turnover) => String(turnover?.reason || '') === 'offensive_three_seconds'
+  ).length;
+  // Defensive 3-second violation awards offense 1 point.
+  statsState.value.points += Number(defensiveLaneCount || 0);
+  statsState.value.violations.defensiveLane += Number(defensiveLaneCount || 0);
+  statsState.value.violations.offensiveThreeSeconds += Number(offensiveThreeCount || 0);
 
   // Add episode reward for user's team
+  let episodeRewardAdded = 0;
   // If episodeData is provided (from evaluation), use it directly
   // Otherwise, fetch from API if not skipping
   if (episodeData && episodeData.episode_rewards && episodeData.steps !== undefined) {
     const ep = episodeData.episode_rewards;
     const userTeam = finalState?.user_team_name || 'OFFENSE';
-    statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+    episodeRewardAdded = Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+    statsState.value.rewardSum += episodeRewardAdded;
     statsState.value.episodeStepsSum += Number(episodeData.steps || 0);
     console.log('[Stats] Using episodeData - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', episodeData.steps);
   } else if (!skipApiCall) {
@@ -909,16 +1461,159 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
       const data = await getRewards();
       const ep = data?.episode_rewards || { offense: 0.0, defense: 0.0 };
       const userTeam = finalState?.user_team_name || 'OFFENSE';
-      statsState.value.rewardSum += Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+      episodeRewardAdded = Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
+      statsState.value.rewardSum += episodeRewardAdded;
       const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
       statsState.value.episodeStepsSum += Number(steps || 0);
       console.log('[Stats] Using API data - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', steps);
     } catch (_) { /* ignore */ }
   }
+  statsState.value.rewardBreakdown.totalReward += Number(episodeRewardAdded || 0);
+  statsState.value.rewardBreakdown.unexplained += Number(episodeRewardAdded || 0);
 
   // Increment episode count last
   statsState.value.episodes += 1;
   console.log('[Stats] recordEpisodeStats completed - new episodes:', statsState.value.episodes);
+  saveStats(statsState.value);
+}
+
+function applyEvaluationStats(
+  episodeResults = [],
+  perPlayerStats = {},
+  userTeamName = 'OFFENSE',
+  evalDiagnostics = null,
+) {
+  const next = resetStatsStorage();
+  ensureStatsDiagnosticFields(next);
+  const statsByPlayer = perPlayerStats || {};
+
+  const offenseIds = (props.gameState?.offense_ids || []).map((id) => Number(id));
+  const defenseIds = (props.gameState?.defense_ids || []).map((id) => Number(id));
+
+  let teamIds = userTeamName === 'DEFENSE' ? defenseIds : offenseIds;
+  if (!Array.isArray(teamIds) || teamIds.length === 0) {
+    const allIds = Object.keys(statsByPlayer)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+    const half = Math.floor(allIds.length / 2);
+    teamIds = userTeamName === 'DEFENSE' ? allIds.slice(half) : allIds.slice(0, half);
+  }
+
+  for (const pid of teamIds) {
+    const entry = statsByPlayer?.[pid] || statsByPlayer?.[String(pid)] || null;
+    if (!entry) continue;
+
+    const shotTypes = entry.shot_types || {};
+    const assistByType = entry.assist_full_by_type || {};
+
+    const dunk = shotTypes.dunk || [0, 0];
+    const two = shotTypes.two || [0, 0];
+    const three = shotTypes.three || [0, 0];
+
+    next.dunk.attempts += Number(dunk[0] || 0);
+    next.dunk.made += Number(dunk[1] || 0);
+    next.dunk.assists += Number(assistByType.dunk || 0);
+
+    next.twoPt.attempts += Number(two[0] || 0);
+    next.twoPt.made += Number(two[1] || 0);
+    next.twoPt.assists += Number(assistByType.two || 0);
+
+    next.threePt.attempts += Number(three[0] || 0);
+    next.threePt.made += Number(three[1] || 0);
+    next.threePt.assists += Number(assistByType.three || 0);
+
+    next.turnovers += Number(entry.turnovers || 0);
+    next.points += Number(entry.points || 0);
+  }
+
+  const teamIdSet = new Set(teamIds.map((id) => Number(id)));
+  for (const row of episodeResults || []) {
+    const shots = row?.final_state?.last_action_results?.shots || {};
+    for (const [shooterRaw, shot] of Object.entries(shots)) {
+      const shooterId = Number(shooterRaw);
+      if (!Number.isFinite(shooterId) || !teamIdSet.has(shooterId)) continue;
+      const made = Boolean(shot?.success);
+      const potentialAssisted = Boolean(shot?.assist_potential) && !made;
+      if (!potentialAssisted) continue;
+      const distance = Number(shot?.distance ?? 9999);
+      const isDunk = distance === 0;
+      const isThree = !isDunk && distance >= Number(row?.final_state?.three_point_distance ?? 4);
+      if (isDunk) {
+        next.dunk.potentialAssists += 1;
+      } else if (isThree) {
+        next.threePt.potentialAssists += 1;
+      } else {
+        next.twoPt.potentialAssists += 1;
+      }
+    }
+  }
+
+  let defensiveLaneCount = 0;
+  let offensiveThreeCount = 0;
+  for (const row of episodeResults || []) {
+    const results = row?.final_state?.last_action_results || {};
+    const defLane = Array.isArray(results?.defensive_lane_violations)
+      ? results.defensive_lane_violations.length
+      : 0;
+    defensiveLaneCount += Number(defLane || 0);
+    const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
+    offensiveThreeCount += turnovers.filter(
+      (turnover) => String(turnover?.reason || '') === 'offensive_three_seconds'
+    ).length;
+  }
+
+  next.violations = {
+    defensiveLane: Number(defensiveLaneCount || 0),
+    offensiveThreeSeconds: Number(offensiveThreeCount || 0),
+  };
+  // Defensive lane violation awards one point to offense.
+  if (String(userTeamName || 'OFFENSE').toUpperCase() === 'OFFENSE') {
+    next.points += Number(defensiveLaneCount || 0);
+  }
+
+  for (const row of episodeResults || []) {
+    next.episodes += 1;
+    next.episodeStepsSum += Number(row?.steps || 0);
+    const epRewards = row?.episode_rewards || {};
+    const rewardVal = userTeamName === 'DEFENSE' ? epRewards?.defense : epRewards?.offense;
+    next.rewardSum += Number(rewardVal || 0);
+  }
+
+  if (evalDiagnostics && typeof evalDiagnostics === 'object') {
+    const reasonsRaw = evalDiagnostics.turnover_reasons || {};
+    next.turnoverReasons = {};
+    for (const [reason, count] of Object.entries(reasonsRaw)) {
+      next.turnoverReasons[String(reason)] = Number(count || 0);
+    }
+
+    const mixRaw = evalDiagnostics.action_mix || {};
+    next.actionMix = {
+      noop: Number(mixRaw.noop || 0),
+      move: Number(mixRaw.move || 0),
+      shoot: Number(mixRaw.shoot || 0),
+      pass: Number(mixRaw.pass || 0),
+      other: Number(mixRaw.other || 0),
+      total: Number(mixRaw.total || 0),
+    };
+
+    const rbRaw = evalDiagnostics.reward_breakdown || {};
+    next.rewardBreakdown = {
+      totalReward: Number(rbRaw.total_reward ?? next.rewardSum ?? 0),
+      expectedPoints: Number(rbRaw.expected_points || 0),
+      passReward: Number(rbRaw.pass_reward || 0),
+      violationReward: Number(rbRaw.violation_reward || 0),
+      assistPotential: Number(rbRaw.assist_potential || 0),
+      assistFullBonus: Number(rbRaw.assist_full_bonus || 0),
+      phiShaping: Number(rbRaw.phi_shaping || 0),
+      unexplained: Number(rbRaw.unexplained ?? next.rewardSum ?? 0),
+    };
+  } else {
+    next.rewardBreakdown.totalReward = Number(next.rewardSum || 0);
+    next.rewardBreakdown.unexplained = Number(next.rewardSum || 0);
+  }
+
+  statsState.value = next;
   saveStats(statsState.value);
 }
 
@@ -929,6 +1624,7 @@ function resetStats() {
 async function copyStatsMarkdown() {
   try {
     const s = statsState.value;
+    ensureStatsDiagnosticFields(s);
     const fg = (made, att) => (safeDiv(made, Math.max(1, att)) * 100).toFixed(1) + '%';
     const summary = [
       ['Episodes', String(s.episodes)],
@@ -938,6 +1634,35 @@ async function copyStatsMarkdown() {
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
       ['Total potential assists', String(s.dunk.potentialAssists + s.twoPt.potentialAssists + s.threePt.potentialAssists)],
       ['Total turnovers', String(s.turnovers)],
+      ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
+      ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
+      ['Offensive 3-second violations', String(s.violations?.offensiveThreeSeconds || 0)],
+    ];
+    const turnoverRows = Object.entries(s.turnoverReasons || {})
+      .map(([reason, count]) => [formatTurnoverReason(reason), String(Number(count || 0))])
+      .sort((a, b) => Number(b[1]) - Number(a[1]));
+    const actionTotal = Number(s.actionMix?.total || 0);
+    const actionRows = [
+      ['NOOP', Number(s.actionMix?.noop || 0)],
+      ['MOVE', Number(s.actionMix?.move || 0)],
+      ['SHOOT', Number(s.actionMix?.shoot || 0)],
+      ['PASS', Number(s.actionMix?.pass || 0)],
+      ['OTHER', Number(s.actionMix?.other || 0)],
+    ].map(([label, count]) => [
+      label,
+      String(count),
+      `${(actionTotal > 0 ? (Number(count) / actionTotal) * 100 : 0).toFixed(1)}%`,
+    ]);
+    const rb = s.rewardBreakdown || {};
+    const rewardRows = [
+      ['Total reward', Number(rb.totalReward || 0).toFixed(2)],
+      ['Expected points', Number(rb.expectedPoints || 0).toFixed(2)],
+      ['Pass reward', Number(rb.passReward || 0).toFixed(2)],
+      ['Potential assist', Number(rb.assistPotential || 0).toFixed(2)],
+      ['Full assist bonus', Number(rb.assistFullBonus || 0).toFixed(2)],
+      ['Violation reward', Number(rb.violationReward || 0).toFixed(2)],
+      ['Phi shaping', Number(rb.phiShaping || 0).toFixed(2)],
+      ['Unexplained', Number(rb.unexplained || 0).toFixed(2)],
     ];
     const shotsHeader = ['Type', 'Attempts', 'Made', 'FG%', 'Assists', 'Potential assists (missed)'];
     const shotsRows = [
@@ -956,6 +1681,21 @@ async function copyStatsMarkdown() {
       `| ${shotsHeader.join(' | ')} |`,
       `| ${shotsHeader.map(()=>'---').join(' | ')} |`,
       table(shotsRows),
+      '',
+      '## Turnovers by Reason',
+      '| Reason | Count |',
+      '| --- | --- |',
+      table(turnoverRows.length ? turnoverRows : [['(none)', '0']]),
+      '',
+      '## Action Mix',
+      '| Action | Count | Rate |',
+      '| --- | --- | --- |',
+      table(actionRows),
+      '',
+      '## Reward Decomposition',
+      '| Component | Value |',
+      '| --- | --- |',
+      table(rewardRows),
       '',
     ].join('\n');
     if (navigator?.clipboard?.writeText) {
@@ -977,7 +1717,7 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats, getSelectedActions });
+defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats, applyEvaluationStats, getSelectedActions });
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -1134,6 +1874,19 @@ function sampleFromProbabilities(probabilities) {
   return 0; // Fallback to NOOP
 }
 
+function hasAnyProbabilities(probsByPlayer) {
+  if (!probsByPlayer) return false;
+  const values = Object.values(probsByPlayer);
+  for (const probs of values) {
+    if (!Array.isArray(probs)) continue;
+    for (const raw of probs) {
+      const p = Number(raw);
+      if (Number.isFinite(p) && p > 0) return true;
+    }
+  }
+  return false;
+}
+
 // Fetch action values for all players (needed for AI mode and display)
 async function fetchAllActionValues() {
   if (!props.gameState || (props.gameState.done && !props.isManualStepping)) {
@@ -1192,6 +1945,12 @@ watch(() => props.gameState, async (newGameState) => {
     consumedStoredProbs = true;
   }
 
+  if (!consumedStoredProbs && props.storedPolicyProbs && hasAnyProbabilities(props.storedPolicyProbs)) {
+    policyProbabilities.value = props.storedPolicyProbs;
+    consumedStoredProbs = true;
+    console.log('[PlayerControls] Applying stored policy probabilities from parent prop');
+  }
+
   const allowApiFetch = !props.isManualStepping && !props.isReplaying;
   const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
   const shouldFetchActionValues = shouldFetchAIData && allowApiFetch && !consumedStoredValues;
@@ -1228,10 +1987,9 @@ watch(() => props.gameState, async (newGameState) => {
 
 // Watch for stored policy probs from parent (during manual stepping)
 watch(() => props.storedPolicyProbs, (newStoredProbs) => {
-  if (props.isManualStepping && newStoredProbs) {
-    console.log('[PlayerControls] Using stored policy probabilities from replay state:', JSON.stringify(newStoredProbs).substring(0, 150));
-    policyProbabilities.value = newStoredProbs;
-  }
+  if (!newStoredProbs || !hasAnyProbabilities(newStoredProbs)) return;
+  console.log('[PlayerControls] Using stored policy probabilities from parent:', JSON.stringify(newStoredProbs).substring(0, 150));
+  policyProbabilities.value = newStoredProbs;
 }, { immediate: true });
 
 
@@ -1312,6 +2070,11 @@ function getLegalActions(playerId) {
       legalActions.push(actionNames[i]);
     }
   }
+
+  // Hard invariant for UI correctness: only current ball holder can shoot/pass.
+  if (!isBallHolderPlayer(playerId)) {
+    return legalActions.filter((action) => action !== 'SHOOT' && !action.startsWith('PASS_'));
+  }
   
   // Debug logging for SHOOT/PASS actions
   const hasShoot = legalActions.includes('SHOOT');
@@ -1321,6 +2084,116 @@ function getLegalActions(playerId) {
   }
   
   return legalActions;
+}
+
+function sanitizeSelectionsToCurrentLegality() {
+  if (!props.gameState?.action_mask) return;
+  const nextSelections = { ...selectedActions.value };
+  const nextTargets = { ...selectedPassTargets.value };
+  let changed = false;
+
+  for (const [rawPid, rawAction] of Object.entries(nextSelections)) {
+    const pid = Number(rawPid);
+    const action = typeof rawAction === 'string' ? rawAction : '';
+    if (!Number.isFinite(pid) || !action) {
+      delete nextSelections[rawPid];
+      delete nextTargets[rawPid];
+      changed = true;
+      continue;
+    }
+
+    const legal = getLegalActions(pid);
+    const legalPassExists = legal.some((a) => a.startsWith('PASS_'));
+    const isPassAction = action.startsWith('PASS_') || action.startsWith('PASS->');
+
+    if (isPassAction) {
+      if (isPointerPassMode.value && !isBallHolderPlayer(pid)) {
+        delete nextSelections[rawPid];
+        delete nextTargets[rawPid];
+        changed = true;
+        continue;
+      }
+      if (!legalPassExists) {
+        delete nextSelections[rawPid];
+        delete nextTargets[rawPid];
+        changed = true;
+        continue;
+      }
+      if (isPointerPassMode.value) {
+        const resolvedTarget = resolvePointerPassTarget(pid, action);
+        if (!Number.isFinite(Number(resolvedTarget))) {
+          delete nextSelections[rawPid];
+          delete nextTargets[rawPid];
+          changed = true;
+          continue;
+        }
+        if (Number(nextTargets[rawPid]) !== Number(resolvedTarget)) {
+          nextTargets[rawPid] = Number(resolvedTarget);
+          changed = true;
+        }
+      } else if (!legal.includes(action)) {
+        delete nextSelections[rawPid];
+        delete nextTargets[rawPid];
+        changed = true;
+      }
+      continue;
+    }
+
+    if (!legal.includes(action)) {
+      delete nextSelections[rawPid];
+      delete nextTargets[rawPid];
+      changed = true;
+    }
+  }
+
+  for (const rawPid of Object.keys(nextTargets)) {
+    const action = String(nextSelections[rawPid] || '');
+    if (!action.startsWith('PASS')) {
+      delete nextTargets[rawPid];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    selectedActions.value = nextSelections;
+    selectedPassTargets.value = nextTargets;
+  }
+}
+
+function isSelectionLegalForPlayer(playerId, actionName) {
+  const pid = Number(playerId);
+  const action = typeof actionName === 'string' ? actionName : '';
+  if (!Number.isFinite(pid) || !action) return false;
+  if (action === 'SHOOT' && !isBallHolderPlayer(pid)) {
+    return false;
+  }
+
+  const legal = getLegalActions(pid);
+  if (!legal.length) return false;
+
+  const isPassAction = action.startsWith('PASS_') || action.startsWith('PASS->');
+  if (!isPassAction) {
+    return legal.includes(action);
+  }
+
+  if (!isPointerPassMode.value) {
+    return legal.includes(action);
+  }
+
+  if (!isBallHolderPlayer(pid)) {
+    return false;
+  }
+
+  const hasLegalPass = legal.some((a) => a.startsWith('PASS_'));
+  if (!hasLegalPass) return false;
+  const resolvedTarget = resolvePointerPassTarget(pid, action);
+  return Number.isFinite(Number(resolvedTarget));
+}
+
+function getEffectiveSelectedAction(playerId) {
+  const selection = selectedActions.value?.[playerId];
+  if (!selection) return '';
+  return isSelectionLegalForPlayer(playerId, selection) ? selection : '';
 }
 
 function getPassStealProbability(move, playerId) {
@@ -1353,8 +2226,12 @@ function handleActionSelected(action) {
     // If the same action is clicked again, deselect it. Otherwise, select the new one.
     if (selectedActions.value[props.activePlayerId] === action) {
       delete selectedActions.value[props.activePlayerId];
+      delete selectedPassTargets.value[props.activePlayerId];
     } else {
       selectedActions.value[props.activePlayerId] = action;
+      if (!action.startsWith('PASS_') || !isPointerPassMode.value) {
+        delete selectedPassTargets.value[props.activePlayerId];
+      }
       // Optional: automatically switch to next player only when a new action is chosen
       const currentIndex = userControlledPlayerIds.value.indexOf(props.activePlayerId);
       const nextIndex = (currentIndex + 1) % userControlledPlayerIds.value.length;
@@ -1366,6 +2243,104 @@ function handleActionSelected(action) {
       // Parent reads this indirectly by starting self-play; on manual override we stop mirroring
     }
   }
+}
+
+const activePassTargets = computed(() => {
+  const active = props.activePlayerId;
+  if (active === null || active === undefined) return [];
+  return getPointerPassTeammatesForPlayer(active);
+});
+
+const activeCanSelectPointerPass = computed(() => {
+  if (!isPointerPassMode.value) return false;
+  if (props.activePlayerId === null || props.activePlayerId === undefined) return false;
+  if (!isBallHolderPlayer(props.activePlayerId)) return false;
+  const legal = getLegalActions(props.activePlayerId);
+  return legal.some(action => action.startsWith('PASS_'));
+});
+
+const selectionDebugRows = computed(() => {
+  return (allPlayerIds.value || []).map((pid) => ({
+    pid: Number(pid),
+    isBallHolder: isBallHolderPlayer(pid),
+    raw: String(selectedActions.value?.[pid] ?? ''),
+    effective: String(getEffectiveSelectedAction(pid) ?? ''),
+    target: selectedPassTargets.value?.[pid] ?? null,
+    rawMaskHasPass: Array.isArray(props.gameState?.action_mask?.[pid])
+      ? props.gameState.action_mask[pid].slice(8, 14).some((v) => Number(v) === 1)
+      : false,
+    uiHasPass: getLegalActions(pid).some((a) => a.startsWith('PASS_')),
+  }));
+});
+
+const activeSelectionDebug = computed(() => {
+  const pid = props.activePlayerId;
+  if (pid === null || pid === undefined) return null;
+  const raw = String(selectedActions.value?.[pid] ?? '');
+  const effective = String(getEffectiveSelectedAction(pid) ?? '');
+  const display = String(getSelectedActionDisplay(pid) ?? '');
+  return {
+    pid: Number(pid),
+    ballHolder: props.gameState?.ball_holder,
+    isBallHolder: isBallHolderPlayer(pid),
+    raw,
+    effective,
+    display,
+    resolvedPassTarget: activeResolvedPassTarget.value,
+    activeHasPassSelection: activeHasPassSelection.value,
+    passMode: passMode.value,
+  };
+});
+
+watch(
+  [
+    () => props.activePlayerId,
+    () => props.gameState?.ball_holder,
+    selectedActions,
+    selectedPassTargets,
+    isPointerPassMode,
+  ],
+  () => {
+    const dbg = activeSelectionDebug.value;
+    if (!dbg) return;
+    console.log('[SelectionDebug][active]', dbg);
+    const effectiveIsPass = dbg.effective.startsWith('PASS_') || dbg.effective.startsWith('PASS->');
+    const displayIsPass = dbg.display.startsWith('PASS->') || dbg.display.startsWith('PASS_');
+    if (displayIsPass && !effectiveIsPass) {
+      console.error('[SelectionDebug][ghost-pass-display]', {
+        ...dbg,
+        selectedPassTarget: selectedPassTargets.value?.[dbg.pid] ?? null,
+      });
+    }
+  },
+  { deep: true }
+);
+
+function handlePointerPassTargetSelected(targetId) {
+  if (props.disabled || !isPointerPassMode.value) return;
+  if (props.activePlayerId === null || props.activePlayerId === undefined) return;
+  const pid = Number(props.activePlayerId);
+  const tid = Number(targetId);
+  if (!Number.isFinite(tid)) return;
+  if (!activeCanSelectPointerPass.value) return;
+
+  const alreadySelected = (
+    selectedActions.value[pid]
+    && selectedActions.value[pid].startsWith('PASS_')
+    && Number(selectedPassTargets.value[pid]) === tid
+  );
+  if (alreadySelected) {
+    delete selectedActions.value[pid];
+    delete selectedPassTargets.value[pid];
+    return;
+  }
+
+  selectedActions.value[pid] = 'PASS_E';
+  selectedPassTargets.value[pid] = tid;
+
+  const currentIndex = userControlledPlayerIds.value.indexOf(pid);
+  const nextIndex = (currentIndex + 1) % userControlledPlayerIds.value.length;
+  emit('update:activePlayerId', userControlledPlayerIds.value[nextIndex]);
 }
 
 function buildMctsOptions() {
@@ -1399,9 +2374,18 @@ function submitActions() {
     // If a selection exists, use it. Otherwise send 0 (NOOP).
     // Note: In AI mode, selections are pre-filled. In Manual mode, they are filled by click.
     // If unselected in manual mode, it defaults to NOOP (0), which allows manual override of opponents.
-    const actionName = selectedActions.value[playerId] || 'NOOP';
-    const actionIndex = actionNames.indexOf(actionName);
-    actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
+    const actionName = getEffectiveSelectedAction(playerId) || 'NOOP';
+    const pointerTarget = resolvePointerPassTarget(playerId, actionName);
+    const hasPointerTarget = Number.isFinite(Number(pointerTarget));
+    if (isPointerPassMode.value && actionName.startsWith('PASS_') && hasPointerTarget) {
+      actionsToSubmit[playerId] = {
+        type: 'PASS',
+        target: Number(pointerTarget),
+      };
+    } else {
+      const actionIndex = actionNames.indexOf(actionName);
+      actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
+    }
   }
   
   console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
@@ -1411,8 +2395,14 @@ function submitActions() {
   const teamMoves = {};
   
   for (const playerId of playersToSubmit) {
-    const actionName = selectedActions.value[playerId] || 'NOOP';
-    teamMoves[`Player ${playerId}`] = actionName;
+    const actionName = getEffectiveSelectedAction(playerId) || 'NOOP';
+    const pointerTarget = resolvePointerPassTarget(playerId, actionName);
+    const hasPointerTarget = Number.isFinite(Number(pointerTarget));
+    if (isPointerPassMode.value && actionName.startsWith('PASS_') && hasPointerTarget) {
+      teamMoves[`Player ${playerId}`] = `PASS->${Number(pointerTarget)}`;
+    } else {
+      teamMoves[`Player ${playerId}`] = actionName;
+    }
   }
   
   emit('move-recorded', {
@@ -1426,21 +2416,49 @@ function submitActions() {
   // Emit current MCTS options (or null) so parent can include in step
   emit('mcts-options-changed', buildMctsOptions());
   
-  if (!props.aiMode) {
-    // Only clear selections in manual mode
-    selectedActions.value = {};
-    // Reset to first available player (prefer user team)
-    if (userControlledPlayerIds.value.length > 0) {
-      emit('update:activePlayerId', userControlledPlayerIds.value[0]);
-    } else if (allPlayerIds.value.length > 0) {
-      emit('update:activePlayerId', allPlayerIds.value[0]);
-    }
+  // Clear local selections after submit; next state/policy snapshot repopulates as needed.
+  selectedActions.value = {};
+  selectedPassTargets.value = {};
+  // Reset to first available player (prefer user team)
+  if (userControlledPlayerIds.value.length > 0) {
+    emit('update:activePlayerId', userControlledPlayerIds.value[0]);
+  } else if (allPlayerIds.value.length > 0) {
+    emit('update:activePlayerId', allPlayerIds.value[0]);
   }
 }
 
 function getSelectedActions() {
   // Return current selections for parent to use
   return { ...selectedActions.value };
+}
+
+function getControlPadLegalActions(playerId) {
+  const legal = getLegalActions(playerId);
+  if (!isPointerPassMode.value) return legal;
+  return legal.filter(action => !action.startsWith('PASS_'));
+}
+
+function getSelectedActionDisplay(playerId) {
+  const selection = getEffectiveSelectedAction(playerId);
+  if (!selection || selection === 'NOOP') return '';
+  const isPassAction = selection.startsWith('PASS_') || selection.startsWith('PASS->');
+  if (!isPassAction) {
+    return selection;
+  }
+  const target = resolvePointerPassTarget(playerId, selection);
+  if (Number.isFinite(Number(target))) {
+    return `PASS->${Number(target)}`;
+  }
+  return selection;
+}
+
+function getSelectedActionBadge(playerId) {
+  const label = getSelectedActionDisplay(playerId);
+  if (!label) return '';
+  if (label.startsWith('MOVE_')) return 'M';
+  if (label.startsWith('PASS->')) return `P${label.replace('PASS->', '')}`;
+  if (label.startsWith('PASS_')) return 'P';
+  return label;
 }
 
 function getAdvisorTargets() {
@@ -1508,7 +2526,7 @@ function applyAdvisorAction() {
     newSelections[pid] = actionName;
   }
   selectedActions.value = newSelections;
-  emit('selections-changed', { ...selectedActions.value });
+  emit('selections-changed', buildDisplaySelections(selectedActions.value));
   advisorError.value = errorMsg;
 }
 
@@ -1584,11 +2602,13 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
       }
       
       selectedActions.value = newSelections;
+      selectedPassTargets.value = {};
       console.log('[PlayerControls] 📝 Updated selectedActions via AI mode:', selectedActions.value);
     } else {
       // Clear selections when AI mode is disabled
       console.log('[PlayerControls] Clearing AI mode selections');
       selectedActions.value = {};
+      selectedPassTargets.value = {};
     }
   } catch (error) {
     console.error('[PlayerControls] Error in AI mode watch:', error);
@@ -1651,6 +2671,7 @@ watch(() => policyProbabilities.value, () => {
 
     if (Object.keys(newSelections).length > 0) {
       selectedActions.value = newSelections;
+      selectedPassTargets.value = {};
     }
   } catch (error) {
     console.error('[PlayerControls] Error in policyProbabilities watch:', error);
@@ -1723,6 +2744,28 @@ watch(() => props.externalSelections, (newSelections) => {
   if (newSelections && typeof newSelections === 'object') {
     // Replace entire selection map to match applied actions
     selectedActions.value = { ...newSelections };
+    selectedPassTargets.value = {};
+    sanitizeSelectionsToCurrentLegality();
+  }
+});
+
+watch(
+  [
+    () => props.gameState?.action_mask,
+    () => props.gameState?.ball_holder,
+    () => props.gameState?.offense_ids,
+    () => props.gameState?.defense_ids,
+    isPointerPassMode,
+  ],
+  () => {
+    sanitizeSelectionsToCurrentLegality();
+  },
+  { deep: true }
+);
+
+watch(isPointerPassMode, (enabled) => {
+  if (!enabled) {
+    selectedPassTargets.value = {};
   }
 });
 
@@ -2322,25 +3365,60 @@ const stealRisks = computed(() => {
               :disabled="false"
           >
               Player {{ playerId }}
-              <span v-if="selectedActions[playerId]">
-                ({{ selectedActions[playerId].startsWith('MOVE') ? 'M' : selectedActions[playerId].startsWith('PASS') ? 'P' : selectedActions[playerId] }})
+              <span v-if="getSelectedActionDisplay(playerId)">
+                ({{ getSelectedActionBadge(playerId) }})
               </span>
           </button>
       </div>
       
       <div class="control-pad-wrapper" v-if="activePlayerId !== null">
           <HexagonControlPad 
-              :legal-actions="getLegalActions(activePlayerId)"
-              :selected-action="selectedActions[activePlayerId]"
+              :legal-actions="getControlPadLegalActions(activePlayerId)"
+              :selected-action="getEffectiveSelectedAction(activePlayerId)"
               :pass-probabilities="passProbabilities"
               @action-selected="handleActionSelected"
               :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
               :value-range="valueRange"
               :is-defense="isDefense"
           />
-          <p v-if="selectedActions[activePlayerId]">
-              Selected for Player {{ activePlayerId }}: <strong>{{ selectedActions[activePlayerId] }}</strong>
+          <div v-if="isPointerPassMode" class="pointer-pass-controls" :class="{ 'has-pass-selection': activeHasPassSelection }">
+            <p class="pointer-pass-label">Pass Target</p>
+            <p v-if="props.gameState && !isBallHolderPlayer(activePlayerId)" class="pointer-pass-note">
+              Select the ball handler to choose a teammate target.
+            </p>
+            <p v-else-if="!activeCanSelectPointerPass" class="pointer-pass-note">
+              Passing is not legal from this state.
+            </p>
+            <div v-else class="pointer-pass-buttons">
+              <button
+                v-for="targetId in activePassTargets"
+                :key="`pass-target-${activePlayerId}-${targetId}`"
+                class="pointer-pass-button"
+                :class="{ selected: isPointerPassButtonSelected(targetId) }"
+                :disabled="props.disabled"
+                @click="handlePointerPassTargetSelected(targetId)"
+              >
+                Player {{ targetId }}
+              </button>
+            </div>
+            <p class="pointer-pass-note selection-debug-inline" v-if="activePassTargets.length">
+              btns: {{ activePassTargets.map((tid) => `${tid}:${isPointerPassButtonSelected(tid) ? 1 : 0}`).join(' ') }}
+            </p>
+          </div>
+          <p v-if="getSelectedActionDisplay(activePlayerId)">
+              Selected for Player {{ activePlayerId }}: <strong>{{ getSelectedActionDisplay(activePlayerId) }}</strong>
           </p>
+          <div class="selection-debug">
+            <div class="selection-debug-title">
+              {{ selectionDebugVersion }} | BH={{ props.gameState?.ball_holder }} | Active={{ activePlayerId }}
+            </div>
+            <div v-if="activeSelectionDebug" class="selection-debug-active">
+              ACTIVE pid={{ activeSelectionDebug.pid }} bh={{ activeSelectionDebug.ballHolder }} isBH={{ activeSelectionDebug.isBallHolder ? 1 : 0 }} mode={{ activeSelectionDebug.passMode }} raw={{ activeSelectionDebug.raw || '∅' }} eff={{ activeSelectionDebug.effective || '∅' }} disp={{ activeSelectionDebug.display || '∅' }} hasPass={{ activeSelectionDebug.activeHasPassSelection ? 1 : 0 }} resolved={{ activeSelectionDebug.resolvedPassTarget ?? '∅' }}
+            </div>
+            <div v-for="row in selectionDebugRows" :key="`sel-debug-${row.pid}`" class="selection-debug-row">
+              P{{ row.pid }} bh={{ row.isBallHolder ? 1 : 0 }} rawMaskPass={{ row.rawMaskHasPass ? 1 : 0 }} uiPass={{ row.uiHasPass ? 1 : 0 }} raw={{ row.raw || '∅' }} eff={{ row.effective || '∅' }} tgt={{ row.target ?? '∅' }}
+            </div>
+          </div>
       </div>
     </div>
 
@@ -2568,38 +3646,138 @@ const stealRisks = computed(() => {
         <h4>Episode Stats</h4>
         <div class="parameters-grid">
           <div class="param-category">
-            <h5>Totals</h5>
-            <div class="param-item"><span class="param-name">Episodes played:</span><span class="param-value">{{ statsState.episodes }}</span></div>
-            <div class="param-item"><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
-            <div class="param-item"><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
-            <div class="param-item"><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
-            <div class="param-item"><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
-            <div class="param-item"><span class="param-name">Avg reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
-            <div class="param-item"><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
+            <h5>
+              Totals
+              <span
+                class="category-help"
+                title="Aggregate metrics across all evaluated episodes for the user-controlled team."
+                aria-label="Totals help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Number of evaluated episodes included in these stats."><span class="param-name">Episodes played:</span><span class="param-value">{{ statsState.episodes }}</span></div>
+            <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
+            <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
+            <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
+            <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
+            <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
+            <div class="param-item" data-tooltip="Offense kept a player in the lane beyond the 3-second limit, causing turnovers."><span class="param-name">Offensive 3-second violations:</span><span class="param-value">{{ statsState.violations?.offensiveThreeSeconds || 0 }}</span></div>
+            <div class="param-item" data-tooltip="Points per possession proxy here: total points scored by user team divided by episodes."><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
+            <div class="param-item" data-tooltip="Average total episode reward for the user team."><span class="param-name">Avg reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
+            <div class="param-item" data-tooltip="Average number of steps per episode."><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
           </div>
           <div class="param-category">
-            <h5>Dunks</h5>
-            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.dunk.attempts }}</span></div>
-            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.dunk.made }}</span></div>
-            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.dunk.made, Math.max(1, statsState.dunk.attempts)) * 100).toFixed(1) }}%</span></div>
-            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.dunk.assists }}</span></div>
-            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.dunk.potentialAssists }}</span></div>
+            <h5>
+              Turnovers by Reason
+              <span
+                class="category-help"
+                title="Counts user-team turnovers grouped by turnover reason from action resolution."
+                aria-label="Turnovers by reason help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in turnoverReasonRows"
+              :key="`turnover-reason-${row.reason}`"
+              class="param-item"
+              :data-tooltip="getTurnoverReasonTooltip(row.reason)"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.count }}</span>
+            </div>
+            <div v-if="turnoverReasonRows.length === 0" class="param-item" data-tooltip="No turnovers recorded for the user team in this evaluation window.">
+              <span class="param-name">(none)</span>
+              <span class="param-value">0</span>
+            </div>
           </div>
           <div class="param-category">
-            <h5>2PT</h5>
-            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.twoPt.attempts }}</span></div>
-            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.twoPt.made }}</span></div>
-            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.twoPt.made, Math.max(1, statsState.twoPt.attempts)) * 100).toFixed(1) }}%</span></div>
-            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.twoPt.assists }}</span></div>
-            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.twoPt.potentialAssists }}</span></div>
+            <h5>
+              Action Mix
+              <span
+                class="category-help"
+                title="Distribution of selected actions for the user team across all evaluated timesteps."
+                aria-label="Action mix help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total number of user-team action selections counted in this evaluation."><span class="param-name">Total decisions:</span><span class="param-value">{{ actionMixRows.total }}</span></div>
+            <div
+              v-for="row in actionMixRows.rows"
+              :key="`action-mix-${row.key}`"
+              class="param-item"
+              :data-tooltip="getActionMixTooltip(row.key)"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.count }} ({{ row.rate.toFixed(1) }}%)</span>
+            </div>
           </div>
           <div class="param-category">
-            <h5>3PT</h5>
-            <div class="param-item"><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.threePt.attempts }}</span></div>
-            <div class="param-item"><span class="param-name">Made:</span><span class="param-value">{{ statsState.threePt.made }}</span></div>
-            <div class="param-item"><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.threePt.made, Math.max(1, statsState.threePt.attempts)) * 100).toFixed(1) }}%</span></div>
-            <div class="param-item"><span class="param-name">Assists:</span><span class="param-value">{{ statsState.threePt.assists }}</span></div>
-            <div class="param-item"><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.threePt.potentialAssists }}</span></div>
+            <h5>
+              Reward Decomposition
+              <span
+                class="category-help"
+                title="Breakdown of total user-team reward into environment reward components (expected points, pass, assist, violations, phi shaping)."
+                aria-label="Reward decomposition help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in rewardBreakdownRows"
+              :key="`reward-breakdown-${row.key}`"
+              class="param-item"
+              :data-tooltip="getRewardBreakdownTooltip(row.key)"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value.toFixed(2) }}</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
+              Dunks
+              <span
+                class="category-help"
+                title="Dunk-only shot statistics for the user team."
+                aria-label="Dunks help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total dunk attempts by the user team."><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.dunk.attempts }}</span></div>
+            <div class="param-item" data-tooltip="Made dunks by the user team."><span class="param-name">Made:</span><span class="param-value">{{ statsState.dunk.made }}</span></div>
+            <div class="param-item" data-tooltip="Dunk field-goal percentage: made / attempts."><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.dunk.made, Math.max(1, statsState.dunk.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Made dunks that were credited with a full assist."><span class="param-name">Assists:</span><span class="param-value">{{ statsState.dunk.assists }}</span></div>
+            <div class="param-item" data-tooltip="Missed dunks that still qualified as potential assists."><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.dunk.potentialAssists }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>
+              2PT
+              <span
+                class="category-help"
+                title="Two-point, non-dunk shot statistics for the user team."
+                aria-label="2PT help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total two-point (non-dunk) attempts by the user team."><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.twoPt.attempts }}</span></div>
+            <div class="param-item" data-tooltip="Made two-point (non-dunk) shots by the user team."><span class="param-name">Made:</span><span class="param-value">{{ statsState.twoPt.made }}</span></div>
+            <div class="param-item" data-tooltip="2PT field-goal percentage: made / attempts."><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.twoPt.made, Math.max(1, statsState.twoPt.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Made 2PT shots that were credited with a full assist."><span class="param-name">Assists:</span><span class="param-value">{{ statsState.twoPt.assists }}</span></div>
+            <div class="param-item" data-tooltip="Missed 2PT shots that still qualified as potential assists."><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.twoPt.potentialAssists }}</span></div>
+          </div>
+          <div class="param-category">
+            <h5>
+              3PT
+              <span
+                class="category-help"
+                title="Three-point shot statistics for the user team."
+                aria-label="3PT help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total three-point attempts by the user team."><span class="param-name">Attempts:</span><span class="param-value">{{ statsState.threePt.attempts }}</span></div>
+            <div class="param-item" data-tooltip="Made three-point shots by the user team."><span class="param-name">Made:</span><span class="param-value">{{ statsState.threePt.made }}</span></div>
+            <div class="param-item" data-tooltip="3PT field-goal percentage: made / attempts."><span class="param-name">FG%:</span><span class="param-value">{{ (safeDiv(statsState.threePt.made, Math.max(1, statsState.threePt.attempts)) * 100).toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Made 3PT shots that were credited with a full assist."><span class="param-name">Assists:</span><span class="param-value">{{ statsState.threePt.assists }}</span></div>
+            <div class="param-item" data-tooltip="Missed 3PT shots that still qualified as potential assists."><span class="param-name">Potential assists (missed):</span><span class="param-value">{{ statsState.threePt.potentialAssists }}</span></div>
           </div>
         </div>
         <div style="display:flex; gap: 0.5rem;">
@@ -2924,7 +4102,7 @@ const stealRisks = computed(() => {
                 title="Refresh policy list from MLflow"
               >
                 <span v-if="policiesLoading">⟳ Loading...</span>
-                <span v-else>⟳ Refresh Policies</span>
+                <span v-else>⟳ Refresh </span>
               </button>
             </div>
             <div class="policy-status" v-if="policiesLoading">
@@ -2949,6 +4127,10 @@ const stealRisks = computed(() => {
               <div class="param-item" data-tooltip="Mean (average) base probability for three-point shots">
                 <span class="param-name">Three-point &mu;:</span>
                 <span class="param-value">{{ (props.gameState.shot_params.three_pt_pct * 100).toFixed(1) }}%</span>
+              </div>
+              <div class="param-item" data-tooltip="Absolute FG% penalty per extra hex beyond (three_point_distance + 1). Example: 5% = -0.05 per extra hex.">
+                <span class="param-name">3PT extra decay / hex:</span>
+                <span class="param-value">{{ ((props.gameState.shot_params.three_pt_extra_hex_decay ?? 0) * 100).toFixed(1) }}%</span>
               </div>
               <div class="param-item" data-tooltip="Standard deviation for sampling individual player three-point skill. Higher = more variance between players.">
                 <span class="param-name">Three-point &sigma;:</span>
@@ -3004,14 +4186,14 @@ const stealRisks = computed(() => {
                   :disabled="skillsUpdating || !offenseSkillRows.length"
                   title="Reset to the values sampled when this game was created"
                 >
-                  Reset to Sampled
+                  Reset 
                 </button>
                 <button 
                   class="refresh-policies-btn" 
                   @click="applyOffenseSkillOverrides" 
                   :disabled="skillsUpdating || !offenseSkillRows.length"
                 >
-                  {{ skillsUpdating ? 'Saving...' : 'Apply Overrides' }}
+                  {{ skillsUpdating ? 'Saving...' : 'Apply ' }}
                 </button>
               </div>
               <div class="policy-status error" v-if="skillsError">
@@ -3023,34 +4205,120 @@ const stealRisks = computed(() => {
             <h5>Defender Turnover Pressure</h5>
             <div class="param-item" data-tooltip="Maximum hex distance at which defenders can apply turnover pressure to the ball handler">
               <span class="param-name">Pressure distance:</span>
-              <span class="param-value">{{ props.gameState.defender_pressure_distance || 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                step="1"
+                v-model.number="pressureParamsInput.defender_pressure_distance"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="Base probability of turnover when a defender is adjacent (distance=1) to ball handler">
               <span class="param-name">Turnover chance:</span>
-              <span class="param-value">{{ props.gameState.defender_pressure_turnover_chance || 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="pressureParamsInput.defender_pressure_turnover_chance"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="Exponential decay rate for pressure. Higher values = pressure drops off faster with distance.">
               <span class="param-name">Decay lambda:</span>
-              <span class="param-value">{{ props.gameState.defender_pressure_decay_lambda || 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                step="0.01"
+                v-model.number="pressureParamsInput.defender_pressure_decay_lambda"
+                :disabled="pressureParamsUpdating"
+              />
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="resetDefenderTurnoverPressureToMlflowDefaults"
+                :disabled="isPressureSectionUpdating('defender')"
+                title="Reset defender turnover pressure values to MLflow defaults for this run"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyDefenderTurnoverPressureOverrides"
+                :disabled="isPressureSectionUpdating('defender')"
+              >
+                {{ isPressureSectionUpdating('defender') ? 'Saving...' : 'Apply' }}
+              </button>
             </div>
           </div>
           <div class="param-category">
             <h5>Pass Interception (Line-of-Sight)</h5>
             <div class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line">
               <span class="param-name">Base steal rate:</span>
-              <span class="param-value">{{ props.gameState.base_steal_rate ?? 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="pressureParamsInput.base_steal_rate"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="How quickly steal probability drops as defender is further from pass line. Higher = faster decay.">
               <span class="param-name">Perpendicular decay:</span>
-              <span class="param-value">{{ props.gameState.steal_perp_decay ?? 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                step="0.01"
+                v-model.number="pressureParamsInput.steal_perp_decay"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="How pass distance affects interception chance. Longer passes are easier to intercept.">
               <span class="param-name">Distance factor:</span>
-              <span class="param-value">{{ props.gameState.steal_distance_factor ?? 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                step="0.01"
+                v-model.number="pressureParamsInput.steal_distance_factor"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver)">
               <span class="param-name">Position weight min:</span>
-              <span class="param-value">{{ props.gameState.steal_position_weight_min ?? 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="pressureParamsInput.steal_position_weight_min"
+                :disabled="pressureParamsUpdating"
+              />
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="resetPassInterceptionToMlflowDefaults"
+                :disabled="isPressureSectionUpdating('pass')"
+                title="Reset pass interception values to MLflow defaults for this run"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyPassInterceptionOverrides"
+                :disabled="isPressureSectionUpdating('pass')"
+              >
+                {{ isPressureSectionUpdating('pass') ? 'Saving...' : 'Apply' }}
+              </button>
             </div>
           </div>
           <div class="param-category">
@@ -3078,21 +4346,83 @@ const stealRisks = computed(() => {
           </div>
           <div class="param-category">
             <h5>Shot Pressure</h5>
+            <div class="param-item" data-tooltip="Absolute FG% penalty applied per extra hex beyond (three_point_distance + 1). Example: 0.05 = minus 5 percentage points per extra hex.">
+              <span class="param-name">3PT extra decay / hex:</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="pressureParamsInput.three_pt_extra_hex_decay"
+                :disabled="pressureParamsUpdating"
+              />
+            </div>
             <div class="param-item" data-tooltip="Whether nearby defenders reduce shot accuracy">
               <span class="param-name">Pressure enabled:</span>
-              <span class="param-value">{{ props.gameState.shot_pressure_enabled || 'N/A' }}</span>
+              <label class="inline-label env-checkbox">
+                <input
+                  type="checkbox"
+                  v-model="pressureParamsInput.shot_pressure_enabled"
+                  :disabled="pressureParamsUpdating"
+                />
+                {{ pressureParamsInput.shot_pressure_enabled ? 'Enabled' : 'Disabled' }}
+              </label>
             </div>
             <div class="param-item" data-tooltip="Maximum percentage reduction in shot accuracy from defender pressure (e.g., 0.3 = up to 30% reduction)">
               <span class="param-name">Max pressure:</span>
-              <span class="param-value">{{ props.gameState.shot_pressure_max || 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                v-model.number="pressureParamsInput.shot_pressure_max"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="Exponential decay rate for shot pressure over distance. Higher = pressure drops faster.">
               <span class="param-name">Pressure lambda:</span>
-              <span class="param-value">{{ props.gameState.shot_pressure_lambda || 'N/A' }}</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                step="0.01"
+                v-model.number="pressureParamsInput.shot_pressure_lambda"
+                :disabled="pressureParamsUpdating"
+              />
             </div>
             <div class="param-item" data-tooltip="Angular width of the defensive pressure cone. Defenders outside this arc apply less pressure.">
               <span class="param-name">Pressure arc degrees:</span>
-              <span class="param-value">{{ props.gameState.shot_pressure_arc_degrees || 'N/A' }}°</span>
+              <input
+                class="env-param-input"
+                type="number"
+                min="0"
+                max="360"
+                step="1"
+                v-model.number="pressureParamsInput.shot_pressure_arc_degrees"
+                :disabled="pressureParamsUpdating"
+              />
+            </div>
+            <div class="offense-skill-actions">
+                <button
+                  class="refresh-policies-btn"
+                  @click="resetPressureParametersToMlflowDefaults"
+                  :disabled="isPressureSectionUpdating('shot')"
+                  title="Reset shot-distance decay and shot pressure values to MLflow defaults for this run"
+                >
+                  Reset
+                </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyPressureParameterOverrides"
+                :disabled="isPressureSectionUpdating('shot')"
+              >
+                {{ isPressureSectionUpdating('shot') ? 'Saving...' : 'Apply ' }}
+              </button>
+            </div>
+            <div class="policy-status error" v-if="pressureParamsError">
+              {{ pressureParamsError }}
             </div>
           </div>
 
@@ -3131,7 +4461,8 @@ const stealRisks = computed(() => {
               <span class="param-name">Pass logit bias:</span>
             </div>
             <div class="offense-skills-editor">
-              <div class="offense-skills-row header">
+              <div class="offense-skills-row header">`
+                `
                 <span>Setting</span>
                 <span>Bias</span>
                 <span></span>
@@ -3152,14 +4483,14 @@ const stealRisks = computed(() => {
                   @click="resetPassLogitBiasDefault"
                   :disabled="passLogitBiasUpdating"
                 >
-                  Reset to Default
+                  Reset 
                 </button>
                 <button
                   class="refresh-policies-btn"
                   @click="applyPassLogitBiasOverride"
                   :disabled="passLogitBiasUpdating"
                 >
-                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply Bias' }}
+                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply ' }}
                 </button>
               </div>
               <div class="policy-status error" v-if="passLogitBiasError">
@@ -4160,6 +5491,92 @@ const stealRisks = computed(() => {
   border: 1px solid var(--app-panel-border);
 }
 
+.pointer-pass-controls {
+  width: 100%;
+  max-width: 360px;
+}
+
+.pointer-pass-label {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--app-text-muted);
+}
+
+.pointer-pass-note {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+.pointer-pass-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.pointer-pass-button {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.75);
+  color: var(--app-text);
+  padding: 0.45rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.pointer-pass-button:hover:not(:disabled) {
+  border-color: var(--app-accent);
+}
+
+.pointer-pass-button.selected {
+  border-color: var(--app-accent);
+  background: rgba(14, 116, 144, 0.35);
+  color: #e0f2fe;
+}
+
+/* Fail-safe: when no pass is selected, never render highlighted target buttons. */
+.pointer-pass-controls:not(.has-pass-selection) .pointer-pass-button.selected {
+  border-color: rgba(148, 163, 184, 0.35);
+  background: rgba(30, 41, 59, 0.75);
+  color: var(--app-text);
+}
+
+.pointer-pass-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.selection-debug {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.55);
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.72rem;
+  line-height: 1.25;
+}
+
+.selection-debug-title {
+  margin-bottom: 0.25rem;
+  color: #93c5fd;
+}
+
+.selection-debug-active {
+  margin-bottom: 0.25rem;
+  color: #fcd34d;
+  font-weight: 600;
+}
+
+.selection-debug-row {
+  white-space: nowrap;
+}
+
 .disabled {
   opacity: 0.5;
   pointer-events: none;
@@ -4327,6 +5744,24 @@ const stealRisks = computed(() => {
   letter-spacing: 0.05em;
 }
 
+.category-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.45rem;
+  width: 15px;
+  height: 15px;
+  font-size: 0.68rem;
+  line-height: 1;
+  border-radius: 50%;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--app-accent);
+  text-transform: none;
+  cursor: help;
+  vertical-align: middle;
+}
+
 .param-item {
   display: flex;
   justify-content: space-between;
@@ -4335,6 +5770,31 @@ const stealRisks = computed(() => {
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   position: relative;
   cursor: help;
+}
+
+.env-param-input {
+  width: 110px;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 6px;
+  background: rgba(13, 20, 38, 0.85);
+  color: var(--app-text);
+  font-size: 0.85rem;
+  text-align: right;
+}
+
+.env-param-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.env-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--app-text);
+  font-size: 0.85rem;
+  cursor: pointer;
 }
 
 /* Tooltip styles */

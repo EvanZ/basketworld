@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 import torch as th
 from torch import nn
+from torch.distributions import Categorical
 from gymnasium import spaces
+from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from basketworld.policies.dual_critic_policy import DualCriticActorCriticPolicy
@@ -114,6 +116,226 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         return attn_out.reshape(attn_out.size(0), -1)
 
 
+class PointerTargetedMultiCategoricalDistribution(Distribution):
+    """Factorized action distribution for pointer-targeted passing.
+
+    This models each player's action as:
+      1) `action_type` over non-pass actions + PASS
+      2) `pass_target` over pass slots, conditioned on action_type=PASS
+
+    It returns sampled actions in the original discrete action space (e.g. 0..13),
+    so SB3 rollout buffers and env stepping stay unchanged.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        non_pass_action_indices: List[int],
+        pass_action_indices: List[int],
+    ):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.non_pass_action_indices = [int(i) for i in non_pass_action_indices]
+        self.pass_action_indices = [int(i) for i in pass_action_indices]
+        self.pass_type_index = len(self.non_pass_action_indices)
+
+        if self.action_dim <= 0:
+            raise ValueError("action_dim must be positive.")
+        if len(self.non_pass_action_indices) == 0:
+            raise ValueError("Pointer distribution requires at least one non-pass action.")
+        if len(self.pass_action_indices) == 0:
+            raise ValueError("Pointer distribution requires at least one pass action slot.")
+
+        self._action_type_distribution: Optional[Categorical] = None
+        self._pass_target_distribution: Optional[Categorical] = None
+
+        # Lookup tensors initialized on first proba_distribution() call.
+        self._non_pass_action_tensor: Optional[th.Tensor] = None
+        self._pass_action_tensor: Optional[th.Tensor] = None
+        self._action_to_type: Optional[th.Tensor] = None
+        self._action_to_pass_slot: Optional[th.Tensor] = None
+        self._action_is_pass: Optional[th.Tensor] = None
+
+    def _ensure_lookup_tensors(self, device: th.device) -> None:
+        if self._action_to_type is not None and self._action_to_type.device == device:
+            return
+
+        non_pass = th.as_tensor(
+            self.non_pass_action_indices,
+            dtype=th.long,
+            device=device,
+        )
+        pass_actions = th.as_tensor(
+            self.pass_action_indices,
+            dtype=th.long,
+            device=device,
+        )
+        action_to_type = th.full(
+            (self.action_dim,),
+            fill_value=-1,
+            dtype=th.long,
+            device=device,
+        )
+        action_to_pass_slot = th.zeros((self.action_dim,), dtype=th.long, device=device)
+        action_is_pass = th.zeros((self.action_dim,), dtype=th.bool, device=device)
+
+        for type_idx, action_idx in enumerate(self.non_pass_action_indices):
+            if 0 <= action_idx < self.action_dim:
+                action_to_type[action_idx] = int(type_idx)
+        for slot_idx, action_idx in enumerate(self.pass_action_indices):
+            if 0 <= action_idx < self.action_dim:
+                action_to_type[action_idx] = int(self.pass_type_index)
+                action_to_pass_slot[action_idx] = int(slot_idx)
+                action_is_pass[action_idx] = True
+
+        self._non_pass_action_tensor = non_pass
+        self._pass_action_tensor = pass_actions
+        self._action_to_type = action_to_type
+        self._action_to_pass_slot = action_to_pass_slot
+        self._action_is_pass = action_is_pass
+
+    def _check_ready(self) -> None:
+        if self._action_type_distribution is None or self._pass_target_distribution is None:
+            raise RuntimeError("Pointer distribution parameters are not initialized.")
+
+    def proba_distribution_net(self, *args, **kwargs):
+        raise NotImplementedError(
+            "PointerTargetedMultiCategoricalDistribution does not expose a single logits net."
+        )
+
+    def proba_distribution(
+        self,
+        action_type_logits: th.Tensor,
+        pass_target_logits: th.Tensor,
+    ) -> "PointerTargetedMultiCategoricalDistribution":
+        if action_type_logits.ndim != 3:
+            raise ValueError("Expected action_type_logits shape (B, P, T).")
+        if pass_target_logits.ndim != 3:
+            raise ValueError("Expected pass_target_logits shape (B, P, S).")
+        if action_type_logits.shape[:2] != pass_target_logits.shape[:2]:
+            raise ValueError("action_type_logits and pass_target_logits must share (B, P).")
+        if action_type_logits.shape[-1] != (self.pass_type_index + 1):
+            raise ValueError("Unexpected action_type logits dimension.")
+        if pass_target_logits.shape[-1] != len(self.pass_action_indices):
+            raise ValueError("Unexpected pass_target logits dimension.")
+
+        self._ensure_lookup_tensors(action_type_logits.device)
+        self._action_type_distribution = Categorical(logits=action_type_logits)
+        self._pass_target_distribution = Categorical(logits=pass_target_logits)
+
+        action_probs = self.action_probabilities()
+        # Keep compatibility with existing code that expects a list of per-player Categoricals.
+        self.distribution = [
+            Categorical(probs=action_probs[:, dim_idx, :])
+            for dim_idx in range(action_probs.shape[1])
+        ]
+        return self
+
+    def action_probabilities(self) -> th.Tensor:
+        self._check_ready()
+        assert self._action_type_distribution is not None
+        assert self._pass_target_distribution is not None
+        assert self._non_pass_action_tensor is not None
+        assert self._pass_action_tensor is not None
+
+        type_probs = self._action_type_distribution.probs
+        pass_probs = self._pass_target_distribution.probs
+        out = type_probs.new_zeros(*type_probs.shape[:-1], self.action_dim)
+
+        out[..., self._non_pass_action_tensor] = type_probs[..., : self.pass_type_index]
+        pass_mass = type_probs[..., self.pass_type_index : self.pass_type_index + 1] * pass_probs
+        out[..., self._pass_action_tensor] = pass_mass
+        return out
+
+    def _map_actions(self, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        self._check_ready()
+        assert self._action_to_type is not None
+        assert self._action_to_pass_slot is not None
+        assert self._action_is_pass is not None
+
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0)
+        actions = actions.long()
+        safe_actions = actions.clamp(min=0, max=self.action_dim - 1)
+
+        type_actions = self._action_to_type[safe_actions]
+        pass_slots = self._action_to_pass_slot[safe_actions]
+        is_pass = self._action_is_pass[safe_actions]
+        valid = type_actions >= 0
+        safe_type_actions = th.where(valid, type_actions, th.zeros_like(type_actions))
+        return safe_type_actions, pass_slots, is_pass, valid
+
+    def log_prob(self, actions: th.Tensor) -> th.Tensor:
+        self._check_ready()
+        assert self._action_type_distribution is not None
+        assert self._pass_target_distribution is not None
+
+        type_actions, pass_slots, is_pass, valid = self._map_actions(actions)
+        log_prob_type = self._action_type_distribution.log_prob(type_actions)
+        log_prob_pass = self._pass_target_distribution.log_prob(pass_slots)
+        total = log_prob_type + th.where(is_pass, log_prob_pass, th.zeros_like(log_prob_pass))
+        invalid_penalty = th.full_like(total, -1e9)
+        total = th.where(valid, total, invalid_penalty)
+        return total.sum(dim=1)
+
+    def entropy(self) -> th.Tensor:
+        self._check_ready()
+        assert self._action_type_distribution is not None
+        assert self._pass_target_distribution is not None
+        type_entropy = self._action_type_distribution.entropy()
+        pass_entropy = self._pass_target_distribution.entropy()
+        pass_prob = self._action_type_distribution.probs[..., self.pass_type_index]
+        return (type_entropy + pass_prob * pass_entropy).sum(dim=1)
+
+    def _compose_actions(self, type_choice: th.Tensor, pass_choice: th.Tensor) -> th.Tensor:
+        assert self._non_pass_action_tensor is not None
+        assert self._pass_action_tensor is not None
+
+        non_pass_idx = type_choice.clamp(max=self.pass_type_index - 1)
+        non_pass_actions = self._non_pass_action_tensor[non_pass_idx]
+        pass_actions = self._pass_action_tensor[pass_choice]
+        is_pass = type_choice == self.pass_type_index
+        return th.where(is_pass, pass_actions, non_pass_actions)
+
+    def sample(self) -> th.Tensor:
+        self._check_ready()
+        assert self._action_type_distribution is not None
+        assert self._pass_target_distribution is not None
+        type_choice = self._action_type_distribution.sample()
+        pass_choice = self._pass_target_distribution.sample()
+        return self._compose_actions(type_choice, pass_choice)
+
+    def mode(self) -> th.Tensor:
+        # Deterministic action must maximize the FINAL action probabilities.
+        # In the factorized parameterization, argmax(action_type) + argmax(slot)
+        # can be wrong because pass action mass is split across slots:
+        #   P(PASS->k) = P(type=PASS) * P(slot=k)
+        # so the joint per-action argmax is not always the hierarchical argmax.
+        probs = self.action_probabilities()
+        return th.argmax(probs, dim=-1)
+
+    def actions_from_params(
+        self,
+        action_type_logits: th.Tensor,
+        pass_target_logits: th.Tensor,
+        deterministic: bool = False,
+    ) -> th.Tensor:
+        self.proba_distribution(action_type_logits=action_type_logits, pass_target_logits=pass_target_logits)
+        return self.get_actions(deterministic=deterministic)
+
+    def log_prob_from_params(
+        self,
+        action_type_logits: th.Tensor,
+        pass_target_logits: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        actions = self.actions_from_params(
+            action_type_logits=action_type_logits,
+            pass_target_logits=pass_target_logits,
+            deterministic=False,
+        )
+        return actions, self.log_prob(actions)
+
+
 class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
     """Dual-critic policy with token-based attention features.
 
@@ -191,7 +413,16 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
 
         self.pass_logit_bias: float = 0.0
         self.pass_prob_min: float = 0.0
+        self.pass_mode: str = "directional"
         self._pass_indices = self._infer_pass_indices()
+        pass_index_set = set(self._pass_indices)
+        self._non_pass_action_indices = [
+            i for i in range(self.actions_per_player) if i not in pass_index_set
+        ]
+        self._pointer_pass_indices = list(self._pass_indices)
+        self._pointer_pass_type_index = len(self._non_pass_action_indices)
+        self._pointer_action_type_dim = self._pointer_pass_type_index + 1
+        self._pointer_neg_inf = -1e9
 
         self.embed_dim = int(effective_embed_dim)
         if self.embed_dim <= 0:
@@ -225,11 +456,37 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         if self.use_dual_policy:
             self.action_head_offense = nn.Linear(self.pi_embed_dim, self.actions_per_player)
             self.action_head_defense = nn.Linear(self.pi_embed_dim, self.actions_per_player)
+            self.pointer_action_type_head_offense = nn.Linear(
+                self.pi_embed_dim, self._pointer_action_type_dim
+            )
+            self.pointer_action_type_head_defense = nn.Linear(
+                self.pi_embed_dim, self._pointer_action_type_dim
+            )
+            self.pointer_query_head_offense = nn.Linear(
+                self.pi_embed_dim, self.pi_embed_dim, bias=False
+            )
+            self.pointer_query_head_defense = nn.Linear(
+                self.pi_embed_dim, self.pi_embed_dim, bias=False
+            )
+            self.pointer_key_head_offense = nn.Linear(
+                self.pi_embed_dim, self.pi_embed_dim, bias=False
+            )
+            self.pointer_key_head_defense = nn.Linear(
+                self.pi_embed_dim, self.pi_embed_dim, bias=False
+            )
         else:
             self.action_head = nn.Linear(self.pi_embed_dim, self.actions_per_player)
+            self.pointer_action_type_head = nn.Linear(
+                self.pi_embed_dim, self._pointer_action_type_dim
+            )
+            self.pointer_query_head = nn.Linear(self.pi_embed_dim, self.pi_embed_dim, bias=False)
+            self.pointer_key_head = nn.Linear(self.pi_embed_dim, self.pi_embed_dim, bias=False)
 
         self.value_net_offense = nn.Linear(self.vf_embed_dim, 1)
         self.value_net_defense = nn.Linear(self.vf_embed_dim, 1)
+
+        pointer_slot_table = self._build_pointer_slot_target_ids()
+        self.register_buffer("pointer_slot_target_ids", pointer_slot_table, persistent=False)
 
         if self.ortho_init:
             for net, gain in [
@@ -239,12 +496,28 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
                 nn.init.orthogonal_(net.weight, gain=gain)
                 nn.init.constant_(net.bias, 0)
             if self.use_dual_policy:
-                for net in [self.action_head_offense, self.action_head_defense]:
+                for net in [
+                    self.action_head_offense,
+                    self.action_head_defense,
+                    self.pointer_action_type_head_offense,
+                    self.pointer_action_type_head_defense,
+                ]:
                     nn.init.orthogonal_(net.weight, gain=0.01)
                     nn.init.constant_(net.bias, 0)
+                for net in [
+                    self.pointer_query_head_offense,
+                    self.pointer_query_head_defense,
+                    self.pointer_key_head_offense,
+                    self.pointer_key_head_defense,
+                ]:
+                    nn.init.orthogonal_(net.weight, gain=0.01)
             else:
                 nn.init.orthogonal_(self.action_head.weight, gain=0.01)
                 nn.init.constant_(self.action_head.bias, 0)
+                nn.init.orthogonal_(self.pointer_action_type_head.weight, gain=0.01)
+                nn.init.constant_(self.pointer_action_type_head.bias, 0)
+                nn.init.orthogonal_(self.pointer_query_head.weight, gain=0.01)
+                nn.init.orthogonal_(self.pointer_key_head.weight, gain=0.01)
 
         # Rebuild optimizer so newly created heads are trainable.
         try:
@@ -292,6 +565,140 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         except Exception:
             self.pass_prob_min = 0.0
 
+    def set_pass_mode(self, mode: str) -> None:
+        normalized = str(mode).lower()
+        if normalized in ("directional", "pointer_targeted"):
+            self.pass_mode = normalized
+
+    def _use_pointer_factorization(self) -> bool:
+        return (
+            str(getattr(self, "pass_mode", "directional")).lower() == "pointer_targeted"
+            and len(self._pointer_pass_indices) > 0
+            and len(self._non_pass_action_indices) > 0
+        )
+
+    def _build_pointer_slot_target_ids(self) -> th.Tensor:
+        """Build [player_id, pass_slot] -> teammate_id lookup (-1 for invalid slots)."""
+        slot_count = max(1, len(self._pointer_pass_indices))
+        table = th.full(
+            (self.token_players, slot_count),
+            fill_value=-1,
+            dtype=th.long,
+        )
+        half = self.token_players // 2
+        for pid in range(self.token_players):
+            if self.token_players % 2 == 0:
+                team_ids = list(range(0, half)) if pid < half else list(range(half, self.token_players))
+            else:
+                team_ids = list(range(self.token_players))
+            teammates = [tid for tid in team_ids if tid != pid][:slot_count]
+            for slot_idx, tid in enumerate(teammates):
+                table[pid, slot_idx] = int(tid)
+        return table
+
+    def _extract_pi_player_tokens(self, latent_pi: th.Tensor) -> th.Tensor:
+        tokens = self._split_tokens(latent_pi)
+        player_tokens = tokens[:, : self.token_players, :]
+        if self.token_head_mlp_pi is not None:
+            player_tokens = self.token_head_mlp_pi(player_tokens)
+        return player_tokens
+
+    def _select_action_player_indices(self, batch_size: int, device: th.device) -> th.Tensor:
+        if self.action_players == self.token_players:
+            return th.arange(self.token_players, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        if self.action_players == (self.token_players // 2):
+            half = self.action_players
+            offense_ids = th.arange(half, device=device)
+            defense_ids = th.arange(half, half * 2, device=device)
+            if self._current_role_flags is None:
+                return offense_ids.unsqueeze(0).expand(batch_size, -1)
+            role_flags = self._current_role_flags.to(device)
+            is_offense = role_flags.squeeze(-1) > 0.0
+            return th.where(
+                is_offense.unsqueeze(-1),
+                offense_ids.unsqueeze(0).expand(batch_size, -1),
+                defense_ids.unsqueeze(0).expand(batch_size, -1),
+            )
+
+        raise ValueError(
+            "Action space size must match all tokens or one team (players_per_side)."
+        )
+
+    @staticmethod
+    def _gather_players(values: th.Tensor, player_ids: th.Tensor) -> th.Tensor:
+        gather_idx = player_ids.unsqueeze(-1).expand(-1, -1, values.size(-1))
+        return th.gather(values, dim=1, index=gather_idx)
+
+    def _get_all_directional_logits(self, player_tokens: th.Tensor) -> th.Tensor:
+        if self.use_dual_policy:
+            logits_off = self.action_head_offense(player_tokens)
+            logits_def = self.action_head_defense(player_tokens)
+            if self._current_role_flags is None:
+                return logits_off
+            role_flags = self._current_role_flags.to(player_tokens.device)
+            is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1).unsqueeze(-1)
+            return th.where(is_offense, logits_off, logits_def)
+        return self.action_head(player_tokens)
+
+    def _get_pointer_qk(self, player_tokens: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        if self.use_dual_policy:
+            q_off = self.pointer_query_head_offense(player_tokens)
+            k_off = self.pointer_key_head_offense(player_tokens)
+            q_def = self.pointer_query_head_defense(player_tokens)
+            k_def = self.pointer_key_head_defense(player_tokens)
+            if self._current_role_flags is None:
+                return q_off, k_off
+            role_flags = self._current_role_flags.to(player_tokens.device)
+            is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1).unsqueeze(-1)
+            q = th.where(is_offense, q_off, q_def)
+            k = th.where(is_offense, k_off, k_def)
+            return q, k
+        return self.pointer_query_head(player_tokens), self.pointer_key_head(player_tokens)
+
+    def _get_pointer_action_type_logits(self, selected_tokens: th.Tensor) -> th.Tensor:
+        if self.use_dual_policy:
+            logits_off = self.pointer_action_type_head_offense(selected_tokens)
+            logits_def = self.pointer_action_type_head_defense(selected_tokens)
+            if self._current_role_flags is None:
+                return logits_off
+            role_flags = self._current_role_flags.to(selected_tokens.device)
+            is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1).unsqueeze(-1)
+            return th.where(is_offense, logits_off, logits_def)
+        return self.pointer_action_type_head(selected_tokens)
+
+    def _get_pointer_pass_slot_logits(
+        self,
+        player_tokens: th.Tensor,
+        selected_player_ids: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        q_all, k_all = self._get_pointer_qk(player_tokens)
+        scale = math.sqrt(float(q_all.shape[-1])) if q_all.shape[-1] > 0 else 1.0
+        pair_scores = th.matmul(q_all, k_all.transpose(-1, -2)) / scale
+
+        slot_table = self.pointer_slot_target_ids.to(player_tokens.device)
+        slot_target_ids = slot_table[selected_player_ids]  # (B, P, S)
+        valid_slots = slot_target_ids >= 0
+        safe_target_ids = slot_target_ids.clamp(min=0)
+
+        batch_size, action_players, slot_count = slot_target_ids.shape
+        batch_idx = (
+            th.arange(batch_size, device=player_tokens.device)
+            .view(batch_size, 1, 1)
+            .expand(batch_size, action_players, slot_count)
+        )
+        passer_idx = selected_player_ids.unsqueeze(-1).expand(batch_size, action_players, slot_count)
+
+        slot_logits = pair_scores[batch_idx, passer_idx, safe_target_ids]
+        neg_inf = th.full_like(slot_logits, self._pointer_neg_inf)
+        slot_logits = th.where(valid_slots, slot_logits, neg_inf)
+
+        valid_any = valid_slots.any(dim=-1)  # (B, P)
+        fallback = th.full_like(slot_logits, self._pointer_neg_inf)
+        fallback[..., 0] = 0.0
+        slot_logits = th.where(valid_any.unsqueeze(-1), slot_logits, fallback)
+        return slot_logits, valid_any
+
     def _apply_pass_bias(self, logits: th.Tensor) -> th.Tensor:
         base_bias = float(self.pass_logit_bias)
         pass_prob_min = float(getattr(self, "pass_prob_min", 0.0) or 0.0)
@@ -323,6 +730,39 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         adjusted[..., pass_idx] = adjusted[..., pass_idx] + total_bias.unsqueeze(-1)
         return adjusted
 
+    def _apply_pointer_pass_bias(
+        self,
+        action_type_logits: th.Tensor,
+        valid_pass_target: th.Tensor,
+    ) -> th.Tensor:
+        """Apply pass bias/floor to action_type PASS logit in pointer mode."""
+        adjusted = action_type_logits.clone()
+        pass_idx = int(self._pointer_pass_type_index)
+        pass_logit = adjusted[..., pass_idx]
+        neg_inf = th.full_like(pass_logit, self._pointer_neg_inf)
+        pass_logit = th.where(valid_pass_target, pass_logit, neg_inf)
+
+        base_bias = float(self.pass_logit_bias)
+        pass_prob_min = float(getattr(self, "pass_prob_min", 0.0) or 0.0)
+        if abs(base_bias) > 1e-12:
+            pass_logit = th.where(valid_pass_target, pass_logit + base_bias, pass_logit)
+
+        if pass_prob_min > 0.0:
+            p_min = min(max(pass_prob_min, 0.0), 1.0 - 1e-6)
+            # Use the original logits tensor (not `adjusted`) to avoid
+            # autograd versioning issues from later in-place updates.
+            non_pass_logits = action_type_logits[..., :pass_idx]
+            if non_pass_logits.shape[-1] > 0:
+                log_p = math.log(p_min)
+                log_1mp = math.log1p(-p_min)
+                log_r = th.logsumexp(non_pass_logits, dim=-1)
+                b_needed = log_p + log_r - log_1mp - pass_logit
+                finite = valid_pass_target & th.isfinite(log_r) & th.isfinite(pass_logit)
+                pass_logit = th.where(finite, pass_logit + b_needed.clamp(min=0.0), pass_logit)
+
+        adjusted[..., pass_idx] = pass_logit
+        return adjusted
+
     def _split_tokens(self, latent: th.Tensor) -> th.Tensor:
         """Reshape flat latent to (B, P+C, D).
 
@@ -348,39 +788,51 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         Returns:
             Flattened logits (B, P*A) or (B, (P/2)*A) depending on action space.
         """
-        tokens = self._split_tokens(latent_pi)
-        player_tokens = tokens[:, : self.token_players, :]
-        if self.token_head_mlp_pi is not None:
-            player_tokens = self.token_head_mlp_pi(player_tokens)
-        if self.use_dual_policy and self._current_role_flags is not None:
-            role_flags = self._current_role_flags.to(tokens.device)
-            logits_off = self.action_head_offense(player_tokens)
-            logits_def = self.action_head_defense(player_tokens)
-            is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1).unsqueeze(-1)
-            logits = th.where(is_offense.expand_as(logits_off), logits_off, logits_def)
-        else:
-            logits = self.action_head(player_tokens)
-
-        logits = self._apply_pass_bias(logits)
-
-        if self.action_players == self.token_players:
-            selected = logits
-        elif self.action_players == (self.token_players // 2):
-            if self._current_role_flags is None:
-                selected = logits[:, : self.action_players, :]
-            else:
-                role_flags = self._current_role_flags.to(tokens.device)
-                is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1).unsqueeze(-1)
-                offense_logits = logits[:, : self.action_players, :]
-                defense_logits = logits[:, self.action_players :, :]
-                selected = th.where(
-                    is_offense.expand_as(offense_logits), offense_logits, defense_logits
-                )
-        else:
-            raise ValueError(
-                "Action space size must match all tokens or one team (players_per_side)."
-            )
+        player_tokens = self._extract_pi_player_tokens(latent_pi)
+        logits_all = self._get_all_directional_logits(player_tokens)
+        logits_all = self._apply_pass_bias(logits_all)
+        selected_ids = self._select_action_player_indices(
+            batch_size=player_tokens.shape[0],
+            device=player_tokens.device,
+        )
+        selected = self._gather_players(logits_all, selected_ids)
         return selected.reshape(selected.size(0), -1)
+
+    def _get_action_dist_from_latent(
+        self,
+        latent_pi: th.Tensor,
+        latent_sde: Optional[th.Tensor] = None,
+    ) -> Distribution:
+        del latent_sde  # unused for this policy
+        if not self._use_pointer_factorization():
+            directional_logits = self._get_action_logits(latent_pi)
+            return self.action_dist.proba_distribution(action_logits=directional_logits)
+
+        player_tokens = self._extract_pi_player_tokens(latent_pi)
+        selected_ids = self._select_action_player_indices(
+            batch_size=player_tokens.shape[0],
+            device=player_tokens.device,
+        )
+        selected_tokens = self._gather_players(player_tokens, selected_ids)
+        pass_slot_logits, valid_any_pass_slot = self._get_pointer_pass_slot_logits(
+            player_tokens,
+            selected_ids,
+        )
+        action_type_logits = self._get_pointer_action_type_logits(selected_tokens)
+        action_type_logits = self._apply_pointer_pass_bias(
+            action_type_logits,
+            valid_any_pass_slot,
+        )
+
+        dist = PointerTargetedMultiCategoricalDistribution(
+            action_dim=self.actions_per_player,
+            non_pass_action_indices=self._non_pass_action_indices,
+            pass_action_indices=self._pointer_pass_indices,
+        )
+        return dist.proba_distribution(
+            action_type_logits=action_type_logits,
+            pass_target_logits=pass_slot_logits,
+        )
 
     def _get_value_from_latent(self, latent_vf: th.Tensor, role_flags: th.Tensor) -> th.Tensor:
         """Compute value estimate from CLS tokens.
@@ -411,6 +863,23 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         role_flags = role_flags.to(latent_vf.device)
         is_offense = (role_flags.squeeze(-1) > 0.0).unsqueeze(-1)
         return th.where(is_offense, values_off, values_def)
+
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        """Allow backward-compatible loads that predate pointer-targeted heads."""
+        if not strict:
+            return super().load_state_dict(state_dict, strict=False)
+
+        result = super().load_state_dict(state_dict, strict=False)
+        missing = [key for key in result.missing_keys if not str(key).startswith("pointer_")]
+        unexpected = [key for key in result.unexpected_keys if not str(key).startswith("pointer_")]
+        if missing or unexpected:
+            missing_msg = ", ".join(missing) if missing else "None"
+            unexpected_msg = ", ".join(unexpected) if unexpected else "None"
+            raise RuntimeError(
+                "Error(s) in loading state_dict for SetAttentionDualCriticPolicy: "
+                f"Missing key(s): {missing_msg}; Unexpected key(s): {unexpected_msg}"
+            )
+        return result
 
     @staticmethod
     def _normalize_head_arch(net_arch: Optional[Any]) -> Optional[Dict[str, list[int]]]:

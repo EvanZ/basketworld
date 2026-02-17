@@ -35,6 +35,48 @@ function percentToProbClamp(percent) {
   return clamped / 100;
 }
 
+function formatActionForDisplay(actionName, actionMeta) {
+  const name = typeof actionName === 'string' ? actionName : 'NOOP';
+  const metaType = String(actionMeta?.type || '').toUpperCase();
+  if ((metaType === 'PASS' || name.startsWith('PASS')) && actionMeta?.target !== undefined && actionMeta?.target !== null) {
+    const target = Number(actionMeta.target);
+    if (Number.isFinite(target)) {
+      return `PASS->${target}`;
+    }
+  }
+  return name;
+}
+
+function buildDisplayActions(actionsTaken, actionsTakenMeta = null) {
+  const mapped = {};
+  if (!actionsTaken || typeof actionsTaken !== 'object') {
+    return mapped;
+  }
+  for (const [pid, actionName] of Object.entries(actionsTaken)) {
+    const meta = actionsTakenMeta && typeof actionsTakenMeta === 'object'
+      ? actionsTakenMeta[pid]
+      : null;
+    mapped[`Player ${pid}`] = formatActionForDisplay(actionName, meta);
+  }
+  return mapped;
+}
+
+function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
+  const mapped = {};
+  if (!actionsTaken || typeof actionsTaken !== 'object') {
+    return mapped;
+  }
+  for (const [pid, actionName] of Object.entries(actionsTaken)) {
+    const numericPid = Number(pid);
+    if (!Number.isFinite(numericPid)) continue;
+    const meta = actionsTakenMeta && typeof actionsTakenMeta === 'object'
+      ? actionsTakenMeta[pid]
+      : null;
+    mapped[numericPid] = formatActionForDisplay(actionName, meta);
+  }
+  return mapped;
+}
+
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
@@ -365,12 +407,10 @@ async function handleActionsSubmitted(actions) {
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
               console.log('[App] Actions taken:', response.actions_taken);
-              // Create a new object for reactivity
-              const newMoves = { ...lastMove.moves };
-              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
-                  newMoves[`Player ${pid}`] = actionName;
-              }
-              // Replace the whole object
+              const newMoves = {
+                ...lastMove.moves,
+                ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
+              };
               lastMove.moves = newMoves;
           }
           // Store shot clock when action was decided (before execution): board + 1
@@ -696,22 +736,20 @@ const boardSelectedActions = computed(() => {
         ? gameHistory.value[gameHistory.value.length - 1]
         : gameState.value) || null;
     if (visibleState?.actions_taken) {
-      const actions = {};
-      for (const [pid, action] of Object.entries(visibleState.actions_taken)) {
-        actions[parseInt(pid, 10)] = action;
-      }
-      return actions;
+      return buildBoardSelectionActions(
+        visibleState.actions_taken,
+        visibleState.actions_taken_meta,
+      );
     }
     return {};
   }
 
   // During animated replay, show the actions that led to the current state
   if (isReplaying.value && gameState.value?.actions_taken) {
-    const actions = {};
-    for (const [pid, action] of Object.entries(gameState.value.actions_taken)) {
-      actions[parseInt(pid, 10)] = action;
-    }
-    return actions;
+    return buildBoardSelectionActions(
+      gameState.value.actions_taken,
+      gameState.value.actions_taken_meta,
+    );
   }
   // During replay/manual stepping, show the stored actions from the next step
   if (isManualStepping.value && replayStates.value.length > 0) {
@@ -722,12 +760,10 @@ const boardSelectedActions = computed(() => {
     }
     const nextState = replayStates.value[nextIndex];
     if (nextState && nextState.actions_taken) {
-      // Convert string keys to number keys for player IDs
-      const actions = {};
-      for (const [pid, action] of Object.entries(nextState.actions_taken)) {
-        actions[parseInt(pid)] = action;
-      }
-      return actions;
+      return buildBoardSelectionActions(
+        nextState.actions_taken,
+        nextState.actions_taken_meta,
+      );
     }
     return {};
   }
@@ -798,6 +834,7 @@ async function handleSelfPlay(preselected = null) {
           }
           const probs = policyProbs.value[playerId];
           const actionMask = gameState.value.action_mask[playerId];
+          const ballHolder = Number(gameState.value?.ball_holder);
 
           // If this is the first loop iteration and preselected is provided, honor it
           if (preselected && preselected[`$${playerId}`] === undefined && preselected[playerId] === undefined) {
@@ -823,15 +860,22 @@ async function handleSelfPlay(preselected = null) {
           }
           
           if (Array.isArray(probs) && Array.isArray(actionMask)) {
+            const effectiveMask = [...actionMask];
+            // Mirror frontend controls invariant: only current ball handler can SHOOT/PASS.
+            if (Number.isFinite(ballHolder) && Number(playerId) !== ballHolder) {
+              for (let idx = 7; idx <= 13 && idx < effectiveMask.length; idx += 1) {
+                effectiveMask[idx] = 0;
+              }
+            }
             let selectedActionIndex = 0;
             
             if (playerDeterministic.value) {
               // Deterministic: Pick action with highest probability (argmax) among LEGAL actions only
               let bestProb = -1;
               
-              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
+              for (let i = 0; i < probs.length && i < effectiveMask.length; i++) {
                 // Only consider legal actions (action_mask[i] === 1)
-                if (actionMask[i] === 1 && probs[i] > bestProb) {
+                if (effectiveMask[i] === 1 && probs[i] > bestProb) {
                   bestProb = probs[i];
                   selectedActionIndex = i;
                 }
@@ -842,8 +886,8 @@ async function handleSelfPlay(preselected = null) {
               const legalIndices = [];
               const legalProbs = [];
               
-              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
-                if (actionMask[i] === 1) {
+              for (let i = 0; i < probs.length && i < effectiveMask.length; i++) {
+                if (effectiveMask[i] === 1) {
                   legalIndices.push(i);
                   legalProbs.push(probs[i]);
                 }
@@ -946,12 +990,10 @@ async function handleSelfPlay(preselected = null) {
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
               console.log('[App] Actions taken:', response.actions_taken);
-              // Create a new object for reactivity
-              const newMoves = { ...lastMove.moves };
-              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
-                  newMoves[`Player ${pid}`] = actionName;
-              }
-              // Replace the whole object
+              const newMoves = {
+                ...lastMove.moves,
+                ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
+              };
               lastMove.moves = newMoves;
           }
           // Store shot clock when action was decided (before execution): board + 1
@@ -1159,26 +1201,49 @@ async function handleEvaluation() {
     
   if (response.status === 'success' && Array.isArray(response.results)) {
     console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
-    
-    // Process all episode results and update stats immediately
-    let lastEpisodeState = null;
-      
+
+    const lastEpisodeState = response.results.length > 0
+      ? response.results[response.results.length - 1]?.final_state
+      : null;
+
+    if (controlsRef.value?.applyEvaluationStats) {
+      const teamName =
+        response?.current_state?.user_team_name
+        || gameState.value?.user_team_name
+        || 'OFFENSE';
+      controlsRef.value.applyEvaluationStats(
+        response.results,
+        response.per_player_stats || {},
+        teamName,
+        response.eval_diagnostics || {}
+      );
+    } else {
       for (const result of response.results) {
-        // Save the last episode state for display
-        lastEpisodeState = result.final_state;
-        
-        // Record stats for this episode (skip API calls for speed)
         if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
           await controlsRef.value.recordEpisodeStats(result.final_state, true, result);
         }
       }
-      
-      console.log('[App] All stats recorded');
+    }
+
+    console.log('[App] Evaluation stats hydrated');
       if (!response.shot_accumulator) {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
       perPlayerEvalStats.value = response.per_player_stats || {};
+      try {
+        const totals = Object.values(perPlayerEvalStats.value || {}).reduce(
+          (acc, row) => {
+            acc.shots += Number(row?.shots || 0);
+            acc.makes += Number(row?.makes || 0);
+            return acc;
+          },
+          { shots: 0, makes: 0 },
+        );
+        console.log('[App] Eval aggregate (all players):', totals);
+      } catch (_) {
+        // no-op
+      }
       console.log('[App] Shot accumulator keys:', Object.keys(shotAccumulator.value || {}).length, 'data:', shotAccumulator.value);
       
       // Update game state to the fresh state from backend (after evaluation reset)

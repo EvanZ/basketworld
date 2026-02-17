@@ -95,9 +95,15 @@ def has_teammate_in_pass_arc(env, passer_id: int, direction_idx: int) -> bool:
     return False
 
 
-def attempt_pass(env, passer_id: int, direction_idx: int, results: Dict) -> None:
+def attempt_pass(
+    env,
+    passer_id: int,
+    direction_idx: int,
+    results: Dict,
+    explicit_target_id: Optional[int] = None,
+) -> None:
     """
-    Arc-based passing with line-of-sight steal mechanics.
+    Passing with support for directional and explicit-target modes.
     """
     passer_pos = env.positions[passer_id]
     dir_dq, dir_dr = env.hex_directions[direction_idx]
@@ -117,77 +123,124 @@ def attempt_pass(env, passer_id: int, direction_idx: int, results: Dict) -> None
         cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
         return cosang >= cos_threshold
 
+    team_ids = env.offense_ids if passer_id in env.offense_ids else env.defense_ids
+    opponent_ids = env.defense_ids if passer_id in env.offense_ids else env.offense_ids
+    pass_mode = str(getattr(env, "pass_mode", "directional")).lower()
+
+    recv_id = None
+    recv_dist = None
+    recv_value = None
+    intended_target: Optional[int] = None
+
+    strategy = getattr(env, "pass_target_strategy", "nearest")
+    strategy = strategy if strategy in ("nearest", "best_ev") else "nearest"
+
+    if pass_mode == "pointer_targeted":
+        try:
+            intended_target = (
+                int(explicit_target_id) if explicit_target_id is not None else None
+            )
+        except Exception:
+            intended_target = None
+
+        if intended_target is None:
+            results["passes"][passer_id] = {
+                "success": False,
+                "reason": "missing_target",
+                "intended_target": None,
+            }
+            return
+
+        if (
+            intended_target == passer_id
+            or intended_target < 0
+            or intended_target >= int(getattr(env, "n_players", 0))
+            or intended_target not in team_ids
+        ):
+            results["passes"][passer_id] = {
+                "success": False,
+                "reason": "illegal_target",
+                "intended_target": intended_target,
+            }
+            return
+
+        recv_id = int(intended_target)
+        recv_dist = float(env._hex_distance(passer_pos, env.positions[recv_id]))
+        strategy = "explicit_target"
+    else:
+        candidate_data: List[Dict[str, Union[int, float]]] = []
+        for pid in team_ids:
+            if pid == passer_id:
+                continue
+            tq, tr = env.positions[pid]
+            if not in_arc(tq, tr):
+                continue
+            d = env._hex_distance(passer_pos, (tq, tr))
+            if strategy == "nearest":
+                if recv_id is None or d < recv_dist:
+                    recv_id = pid
+                    recv_dist = d
+            else:
+                steal_prob, _ = env._calculate_steal_probability_for_pass(
+                    passer_pos, (tq, tr), passer_id
+                )
+                ep = float(env._calculate_expected_points_for_player(pid))
+                value = (1.0 - float(steal_prob)) * ep
+                candidate_data.append(
+                    {
+                        "pid": pid,
+                        "distance": float(d),
+                        "steal_prob": float(steal_prob),
+                        "ep": ep,
+                        "value": value,
+                    }
+                )
+        if strategy == "best_ev" and candidate_data:
+            candidate_data.sort(
+                key=lambda c: (
+                    -c.get("value", -1e9),
+                    c.get("distance", float("inf")),
+                    c.get("pid", 0),
+                )
+            )
+            top = candidate_data[0]
+            recv_id = int(top["pid"])
+            recv_dist = float(top["distance"])
+            recv_value = float(top.get("value", 0.0))
+
+        if recv_id is None:
+            if getattr(env, "pass_oob_turnover_prob", 0.0) > 0.0:
+                if env._rng.random() < float(env.pass_oob_turnover_prob):
+                    env._turnover_to_defense(passer_id)
+                    results["turnovers"].append(
+                        {
+                            "player_id": passer_id,
+                            "reason": "pass_out_of_bounds",
+                            "turnover_pos": tuple(env.positions[passer_id]),
+                            "intended_target": intended_target,
+                        }
+                    )
+                    return
+            return
+
+    recv_pos = env.positions[recv_id]
+    pass_distance = env._hex_distance(passer_pos, recv_pos)
+
+    line_q = recv_pos[0] - passer_pos[0]
+    line_r = recv_pos[1] - passer_pos[1]
+    line_x, line_y = env._axial_to_cartesian(line_q, line_r)
+    line_norm = math.hypot(line_x, line_y) or 1.0
+
     def in_defender_arc(to_q: int, to_r: int) -> bool:
         vx, vy = env._axial_to_cartesian(to_q - passer_pos[0], to_r - passer_pos[1])
         vnorm = math.hypot(vx, vy)
         if vnorm == 0:
             return False
-        cosang = (vx * dir_x + vy * dir_y) / (vnorm * dir_norm)
+        cosang = (vx * line_x + vy * line_y) / (vnorm * line_norm)
         return cosang >= 0.0
 
-    team_ids = env.offense_ids if passer_id in env.offense_ids else env.defense_ids
-    recv_id = None
-    recv_dist = None
-    recv_value = None
-    strategy = getattr(env, "pass_target_strategy", "nearest")
-    strategy = strategy if strategy in ("nearest", "best_ev") else "nearest"
-    candidate_data: List[Dict[str, Union[int, float]]] = []
-    for pid in team_ids:
-        if pid == passer_id:
-            continue
-        tq, tr = env.positions[pid]
-        if not in_arc(tq, tr):
-            continue
-        d = env._hex_distance(passer_pos, (tq, tr))
-        if strategy == "nearest":
-            if recv_id is None or d < recv_dist:
-                recv_id = pid
-                recv_dist = d
-        else:
-            steal_prob, _ = env._calculate_steal_probability_for_pass(passer_pos, (tq, tr), passer_id)
-            ep = float(env._calculate_expected_points_for_player(pid))
-            value = (1.0 - float(steal_prob)) * ep
-            candidate_data.append(
-                {
-                    "pid": pid,
-                    "distance": float(d),
-                    "steal_prob": float(steal_prob),
-                    "ep": ep,
-                    "value": value,
-                }
-            )
-    if strategy == "best_ev" and candidate_data:
-        candidate_data.sort(
-            key=lambda c: (
-                -c.get("value", -1e9),
-                c.get("distance", float("inf")),
-                c.get("pid", 0),
-            )
-        )
-        top = candidate_data[0]
-        recv_id = int(top["pid"])
-        recv_dist = float(top["distance"])
-        recv_value = float(top.get("value", 0.0))
-
-    if recv_id is None:
-        if getattr(env, "pass_oob_turnover_prob", 0.0) > 0.0:
-            if env._rng.random() < float(env.pass_oob_turnover_prob):
-                env._turnover_to_defense(passer_id)
-                results["turnovers"].append(
-                    {
-                        "player_id": passer_id,
-                        "reason": "pass_out_of_bounds",
-                        "turnover_pos": tuple(env.positions[passer_id]),
-                    }
-                )
-                return
-        return
-
-    recv_pos = env.positions[recv_id]
-    pass_distance = env._hex_distance(passer_pos, recv_pos)
-
     forward_defenders = []
-    for did in env.defense_ids:
+    for did in opponent_ids:
         if did == passer_id or did == recv_id:
             continue
         def_pos = env.positions[did]
@@ -200,7 +253,9 @@ def attempt_pass(env, passer_id: int, direction_idx: int, results: Dict) -> None
     defender_contributions: List[Tuple[int, float, float, float]] = []
     if forward_defenders:
         def_pos_list = [env.positions[d] for d in forward_defenders]
-        perp_dists = [env._point_to_line_distance(p, passer_pos, recv_pos) for p in def_pos_list]
+        perp_dists = [
+            env._point_to_line_distance(p, passer_pos, recv_pos) for p in def_pos_list
+        ]
         pos_on_line = [env._get_position_on_line(p, passer_pos, recv_pos) for p in def_pos_list]
         for idx, did in enumerate(forward_defenders):
             perp_dist = perp_dists[idx]
@@ -231,6 +286,7 @@ def attempt_pass(env, passer_id: int, direction_idx: int, results: Dict) -> None
                     "stolen_by": stealing_defender,
                     "turnover_pos": tuple(env.positions[passer_id]),
                     "pass_target": recv_id,
+                    "intended_target": intended_target,
                     "pass_distance": pass_distance,
                     "total_steal_prob": total_steal_prob,
                     "defenders_evaluated": [
@@ -250,6 +306,7 @@ def attempt_pass(env, passer_id: int, direction_idx: int, results: Dict) -> None
     results["passes"][passer_id] = {
         "success": True,
         "target": recv_id,
+        "intended_target": intended_target,
         "pass_distance": pass_distance,
         "target_strategy": strategy,
         "target_value": recv_value,

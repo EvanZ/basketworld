@@ -395,3 +395,42 @@ export async function setPassLogitBias(bias) {
   }
   return response.json();
 }
+
+export async function setShotPressureParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_shot_pressure_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update shot pressure parameters');
+  }
+  return response.json();
+}
+
+export async function setPassInterceptionParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_pass_interception_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update pass interception parameters');
+  }
+  return response.json();
+}
+
+export async function setDefenderPressureParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_defender_pressure_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update defender pressure parameters');
+  }
+  return response.json();
+}

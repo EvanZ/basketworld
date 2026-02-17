@@ -4,10 +4,21 @@ import math
 from typing import Dict, Optional, Tuple
 
 
-def calculate_shot_probability(env, shooter_id: int, distance: int) -> float:
-    """Calculate shot make probability with defender pressure applied."""
+def calculate_base_shot_probability(
+    env,
+    shooter_id: int,
+    distance: int,
+    shooter_pos: Optional[Tuple[int, int]] = None,
+) -> float:
+    """Calculate unpressured shot make probability for a shooter.
+
+    Uses per-player offense skills when available.
+    Probability decays linearly from layup% at distance=1 toward three-pt%
+    at distance=(three_point_distance + 1.0). Beyond that, an additional
+    absolute penalty is applied per extra hex via `three_pt_extra_hex_decay`.
+    """
     d0 = 1
-    d1 = max(float(env.three_point_distance), float(d0 + 1))
+    d1 = max(float(env.three_point_distance) + 1.0, float(d0 + 1))
 
     if shooter_id in env.offense_ids:
         idx = int(shooter_id)
@@ -24,11 +35,34 @@ def calculate_shot_probability(env, shooter_id: int, distance: int) -> float:
     elif distance <= d0:
         prob = p0
     else:
+        # Transition smoothly from layup->3PT profile and clamp beyond endpoint.
         t = (distance - d0) / (d1 - d0)
+        t = max(0.0, min(1.0, t))
         prob = p0 + (p1 - p0) * t
 
+        # Additional distance decay beyond (three_point_distance + 1.0):
+        # subtract an absolute amount per extra hex.
+        if distance > d1:
+            per_hex_decay = max(0.0, float(getattr(env, "three_pt_extra_hex_decay", 0.0)))
+            decay_start_hex = int(math.floor(d1))
+            extra_hexes = max(0, int(distance) - decay_start_hex)
+            prob -= per_hex_decay * float(extra_hexes)
+
+    prob = max(0.01, min(0.99, prob))
+    return float(prob)
+
+
+def calculate_shot_probability(env, shooter_id: int, distance: int) -> float:
+    """Calculate shot make probability with defender pressure applied."""
+    shooter_pos = tuple(env.positions[int(shooter_id)])
+    prob = calculate_base_shot_probability(
+        env,
+        shooter_id=int(shooter_id),
+        distance=int(distance),
+        shooter_pos=shooter_pos,
+    )
+
     if env.shot_pressure_enabled and shooter_id is not None:
-        shooter_pos = env.positions[shooter_id]
         pressure_mult = compute_shot_pressure_multiplier(env, shooter_id, shooter_pos, distance)
         prob *= pressure_mult
 
@@ -94,25 +128,12 @@ def attempt_shot(env, shooter_id: int) -> Dict:
 
     shot_success_prob = calculate_shot_probability(env, shooter_id, distance)
 
-    d0 = 1
-    d1 = max(env.three_point_distance, d0 + 1)
-    if shooter_id in env.offense_ids:
-        idx = int(shooter_id)
-        dunk_p = env.offense_dunk_pct_by_player[idx]
-        layup_p = env.offense_layup_pct_by_player[idx]
-        three_p = env.offense_three_pt_pct_by_player[idx]
-    else:
-        dunk_p = env.dunk_pct
-        layup_p = env.layup_pct
-        three_p = env.three_pt_pct
-    if env.allow_dunks and distance == 0:
-        base_prob = dunk_p
-    elif distance <= d0:
-        base_prob = layup_p
-    else:
-        t = (distance - d0) / (d1 - d0)
-        base_prob = layup_p + (three_p - layup_p) * t
-    base_prob = max(0.01, min(0.99, base_prob))
+    base_prob = calculate_base_shot_probability(
+        env,
+        shooter_id=int(shooter_id),
+        distance=int(distance),
+        shooter_pos=tuple(shooter_pos),
+    )
 
     pressure_mult = compute_shot_pressure_multiplier(env, shooter_id, shooter_pos, distance)
 

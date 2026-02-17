@@ -151,11 +151,27 @@ async def init_game(request: InitGameRequest):
             **optional_params,
             render_mode="rgb_array",
         )
+
+        def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
+            policy = getattr(policy_obj, "policy", None)
+            if policy is None:
+                return
+            if hasattr(policy, "set_pass_mode"):
+                try:
+                    policy.set_pass_mode(mode_value)
+                except Exception:
+                    pass
+
+        current_pass_mode = str(getattr(game_state.env, "pass_mode", "directional"))
+        _apply_policy_pass_mode(game_state.unified_policy, current_pass_mode)
+        _apply_policy_pass_mode(game_state.defense_policy, current_pass_mode)
+
         game_state.obs, _ = game_state.env.reset()
         game_state.prev_obs = None
 
         game_state.env_required_params = copy.deepcopy(required_params)
         game_state.env_optional_params = copy.deepcopy(optional_params)
+        game_state.mlflow_env_optional_defaults = copy.deepcopy(optional_params)
         game_state.unified_policy_path = unified_path
         game_state.opponent_policy_path = opponent_unified_path
 
@@ -262,9 +278,22 @@ async def init_game(request: InitGameRequest):
     }
 
 
-def _normalize_action_overrides(raw_actions, n_players: int) -> dict[int, int]:
-    """Convert legacy payloads (dicts with nested action fields) into player->action overrides."""
+def _coerce_action_index(raw_action) -> int | None:
+    """Convert incoming action representation to an action index when possible."""
+    if isinstance(raw_action, str):
+        token = raw_action.strip().upper()
+        if token in ActionType.__members__:
+            return int(ActionType[token].value)
+    try:
+        return int(raw_action)
+    except Exception:
+        return None
+
+
+def _normalize_action_overrides(raw_actions, n_players: int) -> tuple[dict[int, int], dict[int, dict]]:
+    """Normalize payloads into numeric action overrides and optional per-player metadata."""
     overrides: dict[int, int] = {}
+    meta: dict[int, dict] = {}
     if isinstance(raw_actions, dict):
         for k, v in raw_actions.items():
             try:
@@ -274,23 +303,33 @@ def _normalize_action_overrides(raw_actions, n_players: int) -> dict[int, int]:
             if idx < 0 or idx >= n_players:
                 continue
             if isinstance(v, dict):
+                action_type = str(v.get("type", "")).upper()
+                if action_type == "PASS" and "target" in v:
+                    action_idx = int(ActionType.PASS_E.value)
+                    try:
+                        target_id = int(v.get("target"))
+                    except Exception:
+                        target_id = v.get("target")
+                    overrides[idx] = action_idx
+                    meta[idx] = {"type": "PASS", "target": target_id}
+                    continue
                 if "action" in v:
                     v = v["action"]
                 elif "selected_action" in v:
                     v = v["selected_action"]
-            try:
-                overrides[idx] = int(v)
-            except Exception:
+            action_idx = _coerce_action_index(v)
+            if action_idx is None:
                 continue
+            overrides[idx] = action_idx
     elif isinstance(raw_actions, (list, tuple, np.ndarray)):
         for idx, v in enumerate(raw_actions):
             if idx >= n_players:
                 break
-            try:
-                overrides[idx] = int(v)
-            except Exception:
+            action_idx = _coerce_action_index(v)
+            if action_idx is None:
                 continue
-    return overrides
+            overrides[idx] = action_idx
+    return overrides, meta
 
 
 @router.post("/api/step")
@@ -380,7 +419,21 @@ def step(request: ActionRequest):
 
     # Combine user and AI actions
     full_action = np.zeros(getattr(game_state.env, "n_players", 0), dtype=int)
-    overrides = _normalize_action_overrides(request.actions, getattr(game_state.env, "n_players", 0))
+    overrides, action_meta = _normalize_action_overrides(
+        request.actions,
+        getattr(game_state.env, "n_players", 0),
+    )
+
+    pointer_targets: dict[int, int] = {}
+    for pid, meta in action_meta.items():
+        if str(meta.get("type", "")).upper() != "PASS":
+            continue
+        try:
+            pointer_targets[int(pid)] = int(meta.get("target"))
+        except Exception:
+            continue
+    if hasattr(game_state.env, "set_pointer_pass_targets"):
+        game_state.env.set_pointer_pass_targets(pointer_targets)
 
     for i in range(getattr(game_state.env, "n_players", 0)):
         if i in overrides:
@@ -650,8 +703,64 @@ def step(request: ActionRequest):
 
     action_names = [a.name for a in ActionType]
     actions_taken = {}
+    actions_taken_meta = {}
     for pid, act_idx in enumerate(full_action):
-        actions_taken[str(pid)] = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
+        action_name = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
+        actions_taken[str(pid)] = action_name
+        actions_taken_meta[str(pid)] = {"type": action_name}
+
+    is_pointer_mode = str(getattr(game_state.env, "pass_mode", "directional")).lower() == "pointer_targeted"
+    if is_pointer_mode:
+        for pid, act_idx in enumerate(full_action):
+            action_name = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
+            if not str(action_name).startswith("PASS"):
+                continue
+
+            intended_target = None
+            meta = action_meta.get(pid)
+            if isinstance(meta, dict) and str(meta.get("type", "")).upper() == "PASS":
+                try:
+                    intended_target = int(meta.get("target"))
+                except Exception:
+                    intended_target = None
+
+            if intended_target is None:
+                pass_entry = action_results.get("passes", {}).get(pid)
+                if pass_entry is None:
+                    pass_entry = action_results.get("passes", {}).get(str(pid))
+                if isinstance(pass_entry, dict):
+                    raw_target = pass_entry.get("intended_target")
+                    if raw_target is None:
+                        raw_target = pass_entry.get("target")
+                    try:
+                        intended_target = int(raw_target)
+                    except Exception:
+                        intended_target = None
+
+            if intended_target is None:
+                for turnover in action_results.get("turnovers", []):
+                    try:
+                        turnover_pid = int(turnover.get("player_id"))
+                    except Exception:
+                        continue
+                    if turnover_pid != int(pid):
+                        continue
+                    raw_target = turnover.get("intended_target")
+                    if raw_target is None:
+                        raw_target = turnover.get("pass_target")
+                    try:
+                        intended_target = int(raw_target)
+                    except Exception:
+                        intended_target = None
+                    break
+
+            if intended_target is not None:
+                actions_taken_meta[str(pid)] = {
+                    "type": "PASS",
+                    "target": intended_target,
+                }
+            else:
+                actions_taken_meta[str(pid)] = {"type": "PASS"}
 
     try:
         state_with_actions = get_full_game_state(
@@ -660,6 +769,7 @@ def step(request: ActionRequest):
             include_state_values=True,
         )
         state_with_actions["actions_taken"] = actions_taken
+        state_with_actions["actions_taken_meta"] = actions_taken_meta
         game_state.episode_states.append(state_with_actions)
     except Exception as e:
         print(f"[get_full_game_state] Failed to capture episode state: {e}")
@@ -673,6 +783,8 @@ def step(request: ActionRequest):
             include_policy_probs=True,
             include_state_values=True,
         )
+        state_with_policy["actions_taken"] = actions_taken
+        state_with_policy["actions_taken_meta"] = actions_taken_meta
     except Exception as e:
         print(f"[get_full_game_state] Failed to build response state: {e}")
         state_with_policy = {}
@@ -681,6 +793,7 @@ def step(request: ActionRequest):
         "status": "success",
         "state": state_with_policy,
         "actions_taken": actions_taken,
+        "actions_taken_meta": actions_taken_meta,
         "step_rewards": {
             "offense": float(step_rewards["offense"]),
             "defense": float(step_rewards["defense"]),

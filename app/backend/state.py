@@ -57,6 +57,8 @@ class GameState:
         # Parallel evaluation support - store params/paths for worker recreation
         self.env_required_params: dict | None = None
         self.env_optional_params: dict | None = None
+        # Immutable copy of MLflow-loaded environment options for UI reset actions.
+        self.mlflow_env_optional_defaults: dict | None = None
         self.unified_policy_path: str | None = None
         self.opponent_policy_path: str | None = None
 
@@ -330,6 +332,9 @@ def get_full_game_state(
         "shot_params": {
             "layup_pct": float(getattr(game_state.env, "layup_pct", 0.0)),
             "three_pt_pct": float(getattr(game_state.env, "three_pt_pct", 0.0)),
+            "three_pt_extra_hex_decay": float(
+                getattr(game_state.env, "three_pt_extra_hex_decay", 0.05)
+            ),
             "dunk_pct": float(getattr(game_state.env, "dunk_pct", 0.0)),
             "layup_std": float(getattr(game_state.env, "layup_std", 0.0)),
             "three_pt_std": float(getattr(game_state.env, "three_pt_std", 0.0)),
@@ -369,6 +374,9 @@ def get_full_game_state(
         ),
         "shot_pressure_arc_degrees": float(
             getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)
+        ),
+        "three_pt_extra_hex_decay": float(
+            getattr(game_state.env, "three_pt_extra_hex_decay", 0.05)
         ),
         "mask_occupied_moves": bool(
             getattr(game_state.env, "mask_occupied_moves", False)
@@ -412,6 +420,7 @@ def get_full_game_state(
             getattr(game_state.env, "pass_oob_turnover_prob", 1.0)
         ),
         "pass_target_strategy": getattr(game_state.env, "pass_target_strategy", "nearest"),
+        "pass_mode": getattr(game_state.env, "pass_mode", "directional"),
         "illegal_action_policy": (
             getattr(game_state.env, "illegal_action_policy", None).value
             if getattr(game_state.env, "illegal_action_policy", None)
@@ -426,6 +435,9 @@ def get_full_game_state(
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),
         "training_params": getattr(game_state, "mlflow_training_params", None),
+        "mlflow_env_defaults": (
+            dict(getattr(game_state, "mlflow_env_optional_defaults", {}) or {})
+        ),
         "unified_policy_name": getattr(game_state, "unified_policy_key", None),
         "opponent_unified_policy_name": getattr(
             game_state, "opponent_unified_policy_key", None
