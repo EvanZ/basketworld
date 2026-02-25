@@ -188,6 +188,7 @@ let shotFlashSerial = 0;
 const shotFlashNowMs = ref(0);
 const shotFlashRaf = ref(null);
 const shotFlashTimeout = ref(null);
+const lastShotAnimationKey = ref(null);
 const shotJumpPlayerId = ref(null);
 const shotJumpTimeout = ref(null);
 const shotJumpIsDunk = ref(false);
@@ -1844,6 +1845,7 @@ watch(
     if (!state) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1851,6 +1853,7 @@ watch(
     if (!shots || Object.keys(shots).length === 0) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1873,6 +1876,7 @@ watch(
     if (!shooterPos || !basketPos) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1882,6 +1886,23 @@ watch(
     const isDunk =
       (shotData.result && typeof shotData.result.is_dunk === 'boolean' && shotData.result.is_dunk) ||
       hexDistance(shooterPos, basketPos) === 0;
+
+    const shotAnimationKey = [
+      Number(state.shot_clock ?? -1),
+      Number(shotData.shooterId),
+      success ? 1 : 0,
+      isDunk ? 1 : 0,
+      Number(shotData.result?.distance ?? -1),
+      Number(shooterPos[0]),
+      Number(shooterPos[1]),
+      Number(basketPos[0]),
+      Number(basketPos[1]),
+    ].join('|');
+    if (shotAnimationKey === lastShotAnimationKey.value) {
+      return;
+    }
+    lastShotAnimationKey.value = shotAnimationKey;
+
     triggerShotFlash(shotData.shooterId, start, end, success, isDunk);
   },
   { immediate: true }

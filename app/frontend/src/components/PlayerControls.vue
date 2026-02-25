@@ -16,9 +16,6 @@ import {
 } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
-// Import API_BASE_URL for policy probabilities fetch
-const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
-
 function formatParamCount(n) {
   if (n === null || n === undefined) return 'N/A';
   const num = Number(n);
@@ -79,11 +76,6 @@ const props = defineProps({
     type: Object,
     default: null,
   },
-  // When provided (during manual stepping), use these stored policy probs instead of fetching
-  storedPolicyProbs: {
-    type: Object,
-    default: null,
-  },
   policyOptions: {
     type: Array,
     default: () => [],
@@ -134,7 +126,6 @@ const selectedPassTargets = ref({});
 const passMode = computed(() => String(props.gameState?.pass_mode || 'directional').toLowerCase());
 const isPointerPassMode = computed(() => passMode.value === 'pointer_targeted');
 const POINTER_PASS_SLOT_ACTIONS = ['PASS_E', 'PASS_NE', 'PASS_NW', 'PASS_W', 'PASS_SW', 'PASS_SE'];
-const selectionDebugVersion = 'seldbg-v3';
 
 function isBallHolderPlayer(playerId) {
   const bh = props.gameState?.ball_holder;
@@ -240,9 +231,7 @@ const pressureExposureDisplay = computed(() => {
   return Number.isFinite(val) ? val.toFixed(3) : '0.000';
 });
 
-// Debug: Watch for any changes to selectedActions
-watch(selectedActions, (newActions, oldActions) => {
-  console.log('[PlayerControls] 🔍 selectedActions changed from:', oldActions, 'to:', newActions);
+watch(selectedActions, (newActions) => {
   emit('selections-changed', buildDisplaySelections(newActions));
 }, { deep: true });
 
@@ -1385,7 +1374,6 @@ const shotChartConfig = computed(() => {
 });
 
 async function recordEpisodeStats(finalState, skipApiCall = false, episodeData = null) {
-  console.log('[Stats] recordEpisodeStats called - current episodes:', statsState.value.episodes);
   ensureStatsDiagnosticFields(statsState.value);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
@@ -1455,7 +1443,6 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
     episodeRewardAdded = Number(userTeam === 'OFFENSE' ? ep.offense : ep.defense) || 0;
     statsState.value.rewardSum += episodeRewardAdded;
     statsState.value.episodeStepsSum += Number(episodeData.steps || 0);
-    console.log('[Stats] Using episodeData - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', episodeData.steps);
   } else if (!skipApiCall) {
     try {
       const data = await getRewards();
@@ -1465,7 +1452,6 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
       statsState.value.rewardSum += episodeRewardAdded;
       const steps = Array.isArray(data?.reward_history) ? data.reward_history.length : 0;
       statsState.value.episodeStepsSum += Number(steps || 0);
-      console.log('[Stats] Using API data - reward:', userTeam === 'OFFENSE' ? ep.offense : ep.defense, 'steps:', steps);
     } catch (_) { /* ignore */ }
   }
   statsState.value.rewardBreakdown.totalReward += Number(episodeRewardAdded || 0);
@@ -1473,7 +1459,6 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
 
   // Increment episode count last
   statsState.value.episodes += 1;
-  console.log('[Stats] recordEpisodeStats completed - new episodes:', statsState.value.episodes);
   saveStats(statsState.value);
 }
 
@@ -1826,33 +1811,6 @@ const hasEntropyData = computed(() => entropyRows.value.some((row) => row.entrop
 
 // Shot probability display is handled on the board
 
-// Fetch policy probabilities for probabilistic action sampling
-async function fetchPolicyProbabilities() {
-  if (!props.gameState || (props.gameState.done && !props.isManualStepping)) {
-    console.log('[PlayerControls] Skipping fetchPolicyProbabilities - no game state or game done');
-    return;
-  }
-  
-  console.log('[PlayerControls] Attempting to fetch policy probabilities from:', `${API_BASE_URL}/api/policy_probabilities`);
-  
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/policy_probabilities`);
-    console.log('[PlayerControls] Response status:', response.status, response.statusText);
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to fetch policy probabilities: ${response.status} ${response.statusText} - ${errorText}`);
-    }
-    
-    const probs = await response.json();
-    policyProbabilities.value = probs;
-    console.log('[PlayerControls] Fetched policy probabilities:', probs);
-  } catch (error) {
-    console.error('[PlayerControls] Failed to fetch policy probabilities:', error);
-    policyProbabilities.value = null;
-  }
-}
-
 // Sample an action from probability distribution
 function sampleFromProbabilities(probabilities) {
   const cumSum = [];
@@ -1890,14 +1848,11 @@ function hasAnyProbabilities(probsByPlayer) {
 // Fetch action values for all players (needed for AI mode and display)
 async function fetchAllActionValues() {
   if (!props.gameState || (props.gameState.done && !props.isManualStepping)) {
-    console.log('[PlayerControls] Skipping fetchAllActionValues - no game state or game done');
     return;
   }
   
   const allValues = {};
   const allIds = allPlayerIds.value;
-  
-  console.log('[PlayerControls] Fetching action values for all players:', allIds);
   
   // Also calculate min/max for color scaling
   let allNumericValues = [];
@@ -1915,7 +1870,6 @@ async function fetchAllActionValues() {
   }
   
   actionValues.value = allValues;
-  console.log('[PlayerControls] All action values:', allValues);
   
   // Set min/max for color scaling
   if (allNumericValues.length > 0) {
@@ -1930,66 +1884,34 @@ async function fetchAllActionValues() {
 
 // Watch for game state changes to fetch all action values when needed
 watch(() => props.gameState, async (newGameState) => {
-  console.log('[PlayerControls] Game state changed, fetching AI data... Ball holder:', newGameState?.ball_holder, 'Manual stepping:', props.isManualStepping, 'Replaying:', props.isReplaying);
-  
   let consumedStoredValues = false;
-  let consumedStoredProbs = false;
   if (newGameState && newGameState.action_values) {
-    console.log('[PlayerControls] Applying stored action values from game state snapshot');
     applyStoredActionValues(newGameState.action_values);
     consumedStoredValues = true;
   }
-  if (newGameState && newGameState.policy_probabilities) {
-    console.log('[PlayerControls] Applying stored policy probabilities from game state snapshot');
-    policyProbabilities.value = newGameState.policy_probabilities;
-    consumedStoredProbs = true;
-  }
-
-  if (!consumedStoredProbs && props.storedPolicyProbs && hasAnyProbabilities(props.storedPolicyProbs)) {
-    policyProbabilities.value = props.storedPolicyProbs;
-    consumedStoredProbs = true;
-    console.log('[PlayerControls] Applying stored policy probabilities from parent prop');
+  const snapshotProbs = newGameState?.policy_probabilities;
+  if (hasAnyProbabilities(snapshotProbs)) {
+    policyProbabilities.value = snapshotProbs;
+  } else {
+    policyProbabilities.value = null;
   }
 
   const allowApiFetch = !props.isManualStepping && !props.isReplaying;
   const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
   const shouldFetchActionValues = shouldFetchAIData && allowApiFetch && !consumedStoredValues;
-  const shouldFetchPolicyProbs = shouldFetchAIData && allowApiFetch && !consumedStoredProbs;
-
-  if (shouldFetchActionValues || shouldFetchPolicyProbs) {
+  if (shouldFetchActionValues) {
     try {
-      if (shouldFetchActionValues) {
-        console.log('[PlayerControls] Starting to fetch action values for ball holder:', newGameState.ball_holder);
-        await fetchAllActionValues();
-      }
-      
-      if (shouldFetchPolicyProbs) {
-        console.log('[PlayerControls] Fetching policy probabilities from API for ball holder:', newGameState.ball_holder);
-        await fetchPolicyProbabilities();
-        console.log('[PlayerControls] Policy probabilities fetch completed for ball holder:', newGameState.ball_holder);
-      } else if (consumedStoredProbs) {
-        console.log('[PlayerControls] Skipping policy probability fetch - using stored snapshot');
-      }
+      await fetchAllActionValues();
     } catch (error) {
       console.error('[PlayerControls] Error during AI data fetch:', error);
     }
   } else if (!newGameState) {
-    console.log('[PlayerControls] Clearing AI data - no game state');
     actionValues.value = null;
     if (!props.isManualStepping) {
       policyProbabilities.value = null;
     }
     valueRange.value = { min: 0, max: 0 };
-  } else if (!consumedStoredValues) {
-    console.log('[PlayerControls] Game ended - retaining last action values and policy probabilities');
   }
-}, { immediate: true });
-
-// Watch for stored policy probs from parent (during manual stepping)
-watch(() => props.storedPolicyProbs, (newStoredProbs) => {
-  if (!newStoredProbs || !hasAnyProbabilities(newStoredProbs)) return;
-  console.log('[PlayerControls] Using stored policy probabilities from parent:', JSON.stringify(newStoredProbs).substring(0, 150));
-  policyProbabilities.value = newStoredProbs;
 }, { immediate: true });
 
 
@@ -2060,7 +1982,6 @@ const actionNames = Object.values({
 
 function getLegalActions(playerId) {
   if (!props.gameState.action_mask || !props.gameState.action_mask[playerId]) {
-    console.log(`[getLegalActions] No action mask for player ${playerId}`);
     return [];
   }
   const mask = props.gameState.action_mask[playerId];
@@ -2074,13 +1995,6 @@ function getLegalActions(playerId) {
   // Hard invariant for UI correctness: only current ball holder can shoot/pass.
   if (!isBallHolderPlayer(playerId)) {
     return legalActions.filter((action) => action !== 'SHOOT' && !action.startsWith('PASS_'));
-  }
-  
-  // Debug logging for SHOOT/PASS actions
-  const hasShoot = legalActions.includes('SHOOT');
-  const hasPass = legalActions.some(action => action.startsWith('PASS_'));
-  if (hasShoot || hasPass) {
-    console.log(`[getLegalActions] 🚨 Player ${playerId} has SHOOT: ${hasShoot}, PASS: ${hasPass}, Ball holder: ${props.gameState.ball_holder}, Action mask:`, mask);
   }
   
   return legalActions;
@@ -2259,63 +2173,6 @@ const activeCanSelectPointerPass = computed(() => {
   return legal.some(action => action.startsWith('PASS_'));
 });
 
-const selectionDebugRows = computed(() => {
-  return (allPlayerIds.value || []).map((pid) => ({
-    pid: Number(pid),
-    isBallHolder: isBallHolderPlayer(pid),
-    raw: String(selectedActions.value?.[pid] ?? ''),
-    effective: String(getEffectiveSelectedAction(pid) ?? ''),
-    target: selectedPassTargets.value?.[pid] ?? null,
-    rawMaskHasPass: Array.isArray(props.gameState?.action_mask?.[pid])
-      ? props.gameState.action_mask[pid].slice(8, 14).some((v) => Number(v) === 1)
-      : false,
-    uiHasPass: getLegalActions(pid).some((a) => a.startsWith('PASS_')),
-  }));
-});
-
-const activeSelectionDebug = computed(() => {
-  const pid = props.activePlayerId;
-  if (pid === null || pid === undefined) return null;
-  const raw = String(selectedActions.value?.[pid] ?? '');
-  const effective = String(getEffectiveSelectedAction(pid) ?? '');
-  const display = String(getSelectedActionDisplay(pid) ?? '');
-  return {
-    pid: Number(pid),
-    ballHolder: props.gameState?.ball_holder,
-    isBallHolder: isBallHolderPlayer(pid),
-    raw,
-    effective,
-    display,
-    resolvedPassTarget: activeResolvedPassTarget.value,
-    activeHasPassSelection: activeHasPassSelection.value,
-    passMode: passMode.value,
-  };
-});
-
-watch(
-  [
-    () => props.activePlayerId,
-    () => props.gameState?.ball_holder,
-    selectedActions,
-    selectedPassTargets,
-    isPointerPassMode,
-  ],
-  () => {
-    const dbg = activeSelectionDebug.value;
-    if (!dbg) return;
-    console.log('[SelectionDebug][active]', dbg);
-    const effectiveIsPass = dbg.effective.startsWith('PASS_') || dbg.effective.startsWith('PASS->');
-    const displayIsPass = dbg.display.startsWith('PASS->') || dbg.display.startsWith('PASS_');
-    if (displayIsPass && !effectiveIsPass) {
-      console.error('[SelectionDebug][ghost-pass-display]', {
-        ...dbg,
-        selectedPassTarget: selectedPassTargets.value?.[dbg.pid] ?? null,
-      });
-    }
-  },
-  { deep: true }
-);
-
 function handlePointerPassTargetSelected(targetId) {
   if (props.disabled || !isPointerPassMode.value) return;
   if (props.activePlayerId === null || props.activePlayerId === undefined) return;
@@ -2387,8 +2244,6 @@ function submitActions() {
       actionsToSubmit[playerId] = actionIndex !== -1 ? actionIndex : 0;
     }
   }
-  
-  console.log('[PlayerControls] Emitting actions-submitted with payload:', actionsToSubmit);
   
   // Track moves for the selected team
   const currentTurn = props.moveHistory.filter(m => !m?.isNoteRow).length + 1;
@@ -2603,10 +2458,8 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
       
       selectedActions.value = newSelections;
       selectedPassTargets.value = {};
-      console.log('[PlayerControls] 📝 Updated selectedActions via AI mode:', selectedActions.value);
     } else {
       // Clear selections when AI mode is disabled
-      console.log('[PlayerControls] Clearing AI mode selections');
       selectedActions.value = {};
       selectedPassTargets.value = {};
     }
@@ -2691,7 +2544,6 @@ const fetchRewards = async () => {
     episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
     rewardParams.value = data.reward_params || null;
     mlflowPhiParams.value = data.mlflow_phi_params || null;
-    console.log('[Rewards] Fetched rewards. History length:', rewardHistory.value.length, 'Episode totals:', episodeRewards.value, 'MLflow phi params:', mlflowPhiParams.value);
   } catch (error) {
     console.error('Failed to fetch rewards:', error);
   }
@@ -2700,7 +2552,6 @@ const fetchRewards = async () => {
 // Watch for game state changes to update rewards and clear moves
 watch(() => props.gameState, (newState, oldState) => {
   if (newState) {
-    console.log('[Rewards] Game state changed, fetching rewards. Done:', newState.done);
     fetchRewards();
     
     // Move history clearing is now handled by parent component
@@ -2710,7 +2561,6 @@ watch(() => props.gameState, (newState, oldState) => {
 // Watch for when user switches to Rewards tab
 watch(() => activeTab.value, (newTab) => {
   if (newTab === 'rewards') {
-    console.log('[Rewards] Switched to Rewards tab, fetching rewards');
     fetchRewards();
   }
 });
@@ -2723,9 +2573,7 @@ onMounted(() => {
 
 // Record stats once on episode completion (but skip during evaluation mode)
 watch(() => props.gameState?.done, async (done, prevDone) => {
-  console.log('[Stats] Watch triggered - done:', done, 'prevDone:', prevDone, 'isReplaying:', props.isReplaying, 'isEvaluating:', props.isEvaluating);
   if (done && !prevDone && props.gameState && !props.isReplaying && !props.isEvaluating) {
-    console.log('[Stats] Watch conditions met - recording stats from watch');
     try { await recordEpisodeStats(props.gameState); } catch (e) { console.warn('[Stats] record failed', e); }
   }
 });
@@ -3401,24 +3249,10 @@ const stealRisks = computed(() => {
                 Player {{ targetId }}
               </button>
             </div>
-            <p class="pointer-pass-note selection-debug-inline" v-if="activePassTargets.length">
-              btns: {{ activePassTargets.map((tid) => `${tid}:${isPointerPassButtonSelected(tid) ? 1 : 0}`).join(' ') }}
-            </p>
           </div>
           <p v-if="getSelectedActionDisplay(activePlayerId)">
               Selected for Player {{ activePlayerId }}: <strong>{{ getSelectedActionDisplay(activePlayerId) }}</strong>
           </p>
-          <div class="selection-debug">
-            <div class="selection-debug-title">
-              {{ selectionDebugVersion }} | BH={{ props.gameState?.ball_holder }} | Active={{ activePlayerId }}
-            </div>
-            <div v-if="activeSelectionDebug" class="selection-debug-active">
-              ACTIVE pid={{ activeSelectionDebug.pid }} bh={{ activeSelectionDebug.ballHolder }} isBH={{ activeSelectionDebug.isBallHolder ? 1 : 0 }} mode={{ activeSelectionDebug.passMode }} raw={{ activeSelectionDebug.raw || '∅' }} eff={{ activeSelectionDebug.effective || '∅' }} disp={{ activeSelectionDebug.display || '∅' }} hasPass={{ activeSelectionDebug.activeHasPassSelection ? 1 : 0 }} resolved={{ activeSelectionDebug.resolvedPassTarget ?? '∅' }}
-            </div>
-            <div v-for="row in selectionDebugRows" :key="`sel-debug-${row.pid}`" class="selection-debug-row">
-              P{{ row.pid }} bh={{ row.isBallHolder ? 1 : 0 }} rawMaskPass={{ row.rawMaskHasPass ? 1 : 0 }} uiPass={{ row.uiHasPass ? 1 : 0 }} raw={{ row.raw || '∅' }} eff={{ row.effective || '∅' }} tgt={{ row.target ?? '∅' }}
-            </div>
-          </div>
       </div>
     </div>
 
@@ -5548,33 +5382,6 @@ const stealRisks = computed(() => {
 .pointer-pass-button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
-}
-
-.selection-debug {
-  margin-top: 0.6rem;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.55);
-  color: #cbd5e1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  font-size: 0.72rem;
-  line-height: 1.25;
-}
-
-.selection-debug-title {
-  margin-bottom: 0.25rem;
-  color: #93c5fd;
-}
-
-.selection-debug-active {
-  margin-bottom: 0.25rem;
-  color: #fcd34d;
-  font-weight: 600;
-}
-
-.selection-debug-row {
-  white-space: nowrap;
 }
 
 .disabled {

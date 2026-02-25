@@ -5,7 +5,7 @@ import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -80,7 +80,6 @@ function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
-const replayPolicyProbsCache = ref(null);
 
 function hasAnyProbabilities(probsByPlayer) {
   if (!probsByPlayer) return false;
@@ -94,6 +93,12 @@ function hasAnyProbabilities(probsByPlayer) {
   }
   return false;
 }
+
+function syncPolicyProbsFromState(state) {
+  const snapshotProbs = state?.policy_probabilities;
+  policyProbs.value = hasAnyProbabilities(snapshotProbs) ? snapshotProbs : null;
+}
+
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
@@ -244,24 +249,7 @@ const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
-    if (newState?.policy_probabilities) {
-        policyProbs.value = newState.policy_probabilities;
-    }
-
-    // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
-    if (newState && !newState.done && !isManualStepping.value && !isReplaying.value) {
-        try {
-            console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
-            const response = await getPolicyProbs();
-            policyProbs.value = response;
-        } catch (err) {
-            console.error('[App] Failed to fetch policy probs:', err);
-        }
-    } else if (newState && !newState.done && isManualStepping.value) {
-        console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
-    } else if (newState && !newState.done && isReplaying.value) {
-        console.log('[App] Skipping policy probs fetch during replay - using stored probabilities in snapshots');
-    }
+    syncPolicyProbsFromState(newState);
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
@@ -311,7 +299,6 @@ async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
   policyProbs.value = null;
-  replayPolicyProbsCache.value = null;
   lastMctsResults.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
@@ -376,9 +363,6 @@ async function handleActionsSubmitted(actions) {
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
-      if (response.state?.policy_probabilities) {
-        policyProbs.value = response.state.policy_probabilities;
-      }
       lastMctsResults.value = response.mcts || null;
       
         // Update the last move with action results, shot clock, and state values BEFORE action
@@ -485,8 +469,6 @@ async function handleResetPositions() {
       gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
     }
 
-    const probs = await getPolicyProbs();
-    policyProbs.value = probs;
   } catch (err) {
     console.error('[App] Failed to reset turn via backend:', err);
     alert(`Failed to reset turn: ${err.message}`);
@@ -521,9 +503,6 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
         gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
       }
       
-      // Also refresh policy probs since state changed
-      const probs = await getPolicyProbs();
-      policyProbs.value = probs;
     }
   } catch (err) {
     console.error('[App] Failed to update player position:', err);
@@ -540,9 +519,7 @@ function handlePatchedGameState(newState) {
   } else {
     gameHistory.value = [clonedState];
   }
-  if (newState.policy_probabilities) {
-    policyProbs.value = { ...newState.policy_probabilities };
-  }
+  syncPolicyProbsFromState(newState);
 }
 
 async function handleShotClockAdjustment(delta) {
@@ -564,8 +541,6 @@ async function handleShotClockAdjustment(delta) {
       if (gameHistory.value.length > 0) {
         gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
       }
-      const probs = await getPolicyProbs();
-      policyProbs.value = probs;
     }
   } catch (err) {
     console.error('[App] Failed to adjust shot clock:', err);
@@ -609,16 +584,7 @@ async function handlePolicySwap({ target, policyName }) {
         gameHistory.value = [clonedState];
       }
 
-      if (newState.policy_probabilities) {
-        policyProbs.value = newState.policy_probabilities;
-      } else {
-        try {
-          const probs = await getPolicyProbs();
-          policyProbs.value = probs;
-        } catch (err) {
-          console.warn('[App] Failed to refresh policy probabilities after swap:', err);
-        }
-      }
+      syncPolicyProbsFromState(newState);
 
       // Update initialSetup so new games use the updated policy
       if (initialSetup.value) {
@@ -972,9 +938,6 @@ async function handleSelfPlay(preselected = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
-        if (response.state?.policy_probabilities) {
-          policyProbs.value = response.state.policy_probabilities;
-        }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -1489,28 +1452,13 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
       if (keepCurrentView) {
         // Keep showing current state (usually the final state), start from end
         currentStepIndex.value = res.states.length - 1;
-        // Load policy probs from the final state
-        if (hasAnyProbabilities(res.states[res.states.length - 1].policy_probabilities)) {
-          policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
-          replayPolicyProbsCache.value = policyProbs.value;
-        } else {
-          policyProbs.value = replayPolicyProbsCache.value;
-          console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
-        }
-        // Keep current gameState and gameHistory as-is
+        gameState.value = res.states[currentStepIndex.value];
+        gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
       } else {
         // Reset to beginning
         currentStepIndex.value = 0;
         gameState.value = res.states[0];
         gameHistory.value = [res.states[0]];
-        // Load policy probs from the first state
-        if (hasAnyProbabilities(res.states[0].policy_probabilities)) {
-          policyProbs.value = res.states[0].policy_probabilities;
-          replayPolicyProbsCache.value = policyProbs.value;
-        } else {
-          policyProbs.value = replayPolicyProbsCache.value;
-          console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
-        }
       }
     } else {
       throw new Error('Invalid replay response');
@@ -1529,22 +1477,10 @@ function stepForward() {
   if (currentStepIndex.value < replayStates.value.length - 1) {
     currentStepIndex.value += 1;
     const currentState = replayStates.value[currentStepIndex.value];
-    
-    // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (hasAnyProbabilities(currentState.policy_probabilities)) {
-      console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
-      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
-      replayPolicyProbsCache.value = policyProbs.value;
-    } else {
-      console.warn(`[stepForward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
-      policyProbs.value = replayPolicyProbsCache.value;
-    }
-    
-    // Then update gameState and history
+
+    // Update gameState and history from the same replay snapshot.
     gameState.value = currentState;
     gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
-    
-    console.log(`[stepForward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -1553,22 +1489,10 @@ function stepBackward() {
   if (currentStepIndex.value > 0) {
     currentStepIndex.value -= 1;
     const currentState = replayStates.value[currentStepIndex.value];
-    
-    // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (hasAnyProbabilities(currentState.policy_probabilities)) {
-      console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
-      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
-      replayPolicyProbsCache.value = policyProbs.value;
-    } else {
-      console.warn(`[stepBackward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
-      policyProbs.value = replayPolicyProbsCache.value;
-    }
-    
-    // Then update gameState and history
+
+    // Update gameState and history from the same replay snapshot.
     gameState.value = currentState;
     gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
-    
-    console.log(`[stepBackward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -1738,7 +1662,6 @@ onBeforeUnmount(() => {
             :policy-options="policyOptions"
             :policies-loading="policiesLoading"
             :policy-load-error="policyLoadError"
-            :stored-policy-probs="policyProbs"
             :mcts-results="lastMctsResults"
             :initial-use-mcts="persistUseMcts"
           :mcts-step-running="isMctsStepRunning"

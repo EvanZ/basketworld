@@ -37,7 +37,7 @@ from app.backend.schemas import (
 from app.backend.state import (
     _capture_turn_start_snapshot,
     game_state,
-    get_full_game_state,
+    get_ui_game_state,
 )
 from fastapi.encoders import jsonable_encoder
 
@@ -204,11 +204,7 @@ async def init_game(request: InitGameRequest):
         except Exception:
             pass
 
-        initial_state = get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        )
+        initial_state = get_ui_game_state()
         game_state.episode_states.append(initial_state)
 
         # Record initial phi entry (step 0) for Rewards tab calculations
@@ -273,7 +269,7 @@ async def init_game(request: InitGameRequest):
 
     return {
         "status": "success",
-        "state": get_full_game_state(include_state_values=True),
+        "state": get_ui_game_state(),
         "seed": int(np.random.randint(0, 2**31 - 1)),
     }
 
@@ -762,32 +758,18 @@ def step(request: ActionRequest):
             else:
                 actions_taken_meta[str(pid)] = {"type": "PASS"}
 
+    state_with_policy = {}
     try:
-        state_with_actions = get_full_game_state(
-            include_policy_probs=True,
-            include_action_values=True,
-            include_state_values=True,
-        )
-        state_with_actions["actions_taken"] = actions_taken
-        state_with_actions["actions_taken_meta"] = actions_taken_meta
-        game_state.episode_states.append(state_with_actions)
+        state_with_policy = get_ui_game_state()
+        state_with_policy["actions_taken"] = actions_taken
+        state_with_policy["actions_taken_meta"] = actions_taken_meta
+        game_state.episode_states.append(dict(state_with_policy))
     except Exception as e:
         print(f"[get_full_game_state] Failed to capture episode state: {e}")
 
     _capture_turn_start_snapshot()
     if game_state.self_play_active and done:
         game_state.self_play_active = False
-
-    try:
-        state_with_policy = get_full_game_state(
-            include_policy_probs=True,
-            include_state_values=True,
-        )
-        state_with_policy["actions_taken"] = actions_taken
-        state_with_policy["actions_taken_meta"] = actions_taken_meta
-    except Exception as e:
-        print(f"[get_full_game_state] Failed to build response state: {e}")
-        state_with_policy = {}
 
     return {
         "status": "success",
@@ -891,16 +873,12 @@ def start_self_play():
     except Exception:
         pass
 
-    initial_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    initial_state = get_ui_game_state()
     game_state.episode_states.append(initial_state)
 
     return {
         "status": "success",
-        "state": get_full_game_state(include_state_values=True),
+        "state": get_ui_game_state(),
         "seed": episode_seed,
     }
 
@@ -942,11 +920,7 @@ def reset_turn_state():
 
         return {
             "status": "success",
-            "state": get_full_game_state(
-                include_policy_probs=True,
-                include_action_values=True,
-                include_state_values=True,
-            ),
+            "state": get_ui_game_state(),
         }
     except Exception as e:
         import traceback

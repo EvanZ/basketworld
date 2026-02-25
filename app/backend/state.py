@@ -493,3 +493,12 @@ def get_full_game_state(
             state["state_values"] = state_values
 
     return state
+
+
+def get_ui_game_state():
+    """Build the canonical backend snapshot expected by frontend game/replay views."""
+    return get_full_game_state(
+        include_policy_probs=True,
+        include_action_values=True,
+        include_state_values=True,
+    )

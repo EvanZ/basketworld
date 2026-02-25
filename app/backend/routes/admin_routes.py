@@ -21,7 +21,7 @@ from app.backend.schemas import (
     UpdatePositionRequest,
     UpdateShotClockRequest,
 )
-from app.backend.state import get_full_game_state, game_state
+from app.backend.state import get_ui_game_state, game_state
 from app.backend.policies import _compute_param_counts_from_policy, get_unified_policy_path
 from basketworld.envs.basketworld_env_v2 import Team
 
@@ -63,11 +63,7 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
     return {
@@ -106,11 +102,7 @@ def update_player_position(req: UpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
     return {
@@ -137,7 +129,7 @@ def update_shot_clock(req: UpdateShotClockRequest):
         return {
             "status": "success",
             "shot_clock": int(game_state.env.shot_clock),
-            "state": get_full_game_state(),
+            "state": get_ui_game_state(),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -169,7 +161,7 @@ def set_ball_holder(req: SetBallHolderRequest):
             "role_flag": game_state.obs.get("role_flag"),
             "skills": game_state.obs.get("skills"),
         }
-        updated_state = get_full_game_state(include_policy_probs=True)
+        updated_state = get_ui_game_state()
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
         return {"status": "success", "state": updated_state}
@@ -221,7 +213,7 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
 
         return {
             "status": "success",
-            "state": get_full_game_state(include_policy_probs=True),
+            "state": get_ui_game_state(),
         }
     except HTTPException:
         raise
@@ -270,7 +262,7 @@ def set_pass_logit_bias(req: SetPassLogitBiasRequest):
 
     return {
         "status": "success",
-        "state": get_full_game_state(include_policy_probs=True),
+        "state": get_ui_game_state(),
     }
 
 
@@ -418,7 +410,7 @@ def _set_pressure_params_impl(
             "status": "no_change",
             "updated_keys": [],
             "applied_scope": active_scope or "all",
-            "state": get_full_game_state(include_policy_probs=True),
+            "state": get_ui_game_state(),
         }
 
     def _as_bool(v, key: str) -> bool:
@@ -568,7 +560,7 @@ def _set_pressure_params_impl(
             "skills": prior_obs.get("skills"),
         }
 
-        updated_state = get_full_game_state(include_policy_probs=True)
+        updated_state = get_ui_game_state()
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
         return {
@@ -695,18 +687,10 @@ def swap_policies(req: SwapPoliciesRequest):
     if not policies_changed:
         return {
             "status": "no_change",
-            "state": get_full_game_state(
-                include_policy_probs=True,
-                include_action_values=True,
-                include_state_values=True,
-            ),
+            "state": get_ui_game_state(),
         }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
 

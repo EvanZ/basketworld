@@ -10,7 +10,7 @@ from app.backend.evaluation import (
     validate_custom_eval_setup as eval_validate_custom_eval_setup,
 )
 from app.backend.schemas import EvaluationRequest, PassStealPreviewRequest
-from app.backend.state import game_state, get_full_game_state
+from app.backend.state import game_state, get_ui_game_state
 
 
 router = APIRouter()
@@ -163,7 +163,7 @@ def run_evaluation(request: EvaluationRequest):
             }
         )
 
-    current_game_state = get_full_game_state(include_policy_probs=True, include_state_values=True)
+    current_game_state = get_ui_game_state()
     game_state.episode_states = []
     game_state.frames = []
 

@@ -14,6 +14,7 @@ You can even run thousands of episodes of self-play and look at a detailed stati
 ## What's new
 - **Absolute-coordinate observations**: Egocentric rotation is gone; models need retraining. Ball handler position, hoop location, EP/risk features, and action masks are all absolute-court based.
 - **Unified policy pipeline**: Training saves `unified_*.zip` checkpoints with optional dual-critic/dual-policy heads and pass-logit bias. Role flags encode offense/defense so one network drives both teams.
+- **Pointer-targeted passing mode**: In addition to directional passing, runs can use `--pass-mode pointer_targeted` for explicit teammate-target pass intent with replay/debug visibility (`PASS->id`, `intended_target`).
 - **Interactive stack refresh**: Backend loads policies directly from MLflow by `run_id`, supports policy swapping, evaluation batches, MCTS advice, phi shaping, skill overrides, replays, and shot/pass diagnostics surfaced in the Vue UI.
 - **MLflow-first configuration**: Environment/training params and role-flag encoding are read from MLflow for faithful evaluation; optional `.env.aws` enables S3 artifacts without touching global AWS config.
 
@@ -110,4 +111,6 @@ uvicorn app.backend.main:app --host 0.0.0.0 --port 8080 --reload
 - Train: `python train/train.py ...` (see `train/train.py` for full CLI)
 - Backend: `uvicorn app.backend.main:app --port 8080`
 - Frontend: `npm run dev` in `app/frontend` with `VITE_API_BASE_URL` set
+- Pointer passing doc: `readmes/POINTER_TARGETED_PASS_MODE.md`
+- Set-attention policy/value diagram: `readmes/SET_ATTENTION_POLICY_VALUE_ARCHITECTURE.md`
 - Docs: `readmes/` (obs migration, EP refactors, phi shaping, coordinate systems) and `docs/` (opponent sampling, schedule continuation)

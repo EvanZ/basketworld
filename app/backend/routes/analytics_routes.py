@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from app.backend.state import game_state, get_full_game_state
+from app.backend.state import game_state, get_ui_game_state
 from app.backend.observations import calculate_phi_from_ep_data
 
 
@@ -112,7 +112,7 @@ def replay_last_episode():
     }
     obs, _ = game_state.env.reset(seed=game_state.replay_seed, options=options)
 
-    states = [get_full_game_state(include_state_values=True)]
+    states = [get_ui_game_state()]
     for action in game_state.actions_log:
         obs, _, _, _, _ = game_state.env.step(action)
         try:
@@ -121,7 +121,7 @@ def replay_last_episode():
                 game_state.frames.append(frame)
         except Exception:
             pass
-        states.append(get_full_game_state(include_state_values=True))
+        states.append(get_ui_game_state())
 
     game_state.obs = obs
     return {"status": "success", "states": states}
@@ -211,6 +211,44 @@ def get_rewards():
         mlflow_phi_potential_values = [0.0] * len(game_state.reward_history)
 
     serialized_history = []
+    initial_shot_clock = None
+    try:
+        episode_states = getattr(game_state, "episode_states", None) or []
+        if episode_states:
+            first_state = episode_states[0] or {}
+            if first_state.get("shot_clock") is not None:
+                initial_shot_clock = int(first_state.get("shot_clock"))
+    except Exception:
+        initial_shot_clock = None
+
+    if initial_shot_clock is None:
+        try:
+            if game_state.phi_log and len(game_state.phi_log) > 0:
+                first_phi = game_state.phi_log[0] or {}
+                if first_phi.get("step") == 0 and first_phi.get("shot_clock") is not None:
+                    initial_shot_clock = int(first_phi.get("shot_clock"))
+        except Exception:
+            initial_shot_clock = None
+
+    if initial_shot_clock is None:
+        try:
+            replay_clock = getattr(game_state, "replay_shot_clock", None)
+            if replay_clock is not None:
+                initial_shot_clock = int(replay_clock)
+        except Exception:
+            initial_shot_clock = None
+
+    if initial_shot_clock is None:
+        env = getattr(game_state, "env", None)
+        if env is not None:
+            try:
+                initial_shot_clock = int(
+                    getattr(env, "shot_clock_steps", getattr(env, "shot_clock", 24))
+                )
+            except Exception:
+                initial_shot_clock = 24
+        else:
+            initial_shot_clock = 24
 
     if mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False):
         initial_phi = 0.0
@@ -228,7 +266,7 @@ def get_rewards():
         serialized_history.append(
             {
                 "step": 0,
-                "shot_clock": 24,
+                "shot_clock": int(initial_shot_clock),
                 "offense": 0.0,
                 "defense": 0.0,
                 "offense_reason": "Initial State",
@@ -311,4 +349,3 @@ def get_rewards():
         "reward_params": reward_params,
         "mlflow_phi_params": mlflow_phi_params_serialized,
     }
-
