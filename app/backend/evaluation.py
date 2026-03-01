@@ -369,6 +369,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
             last_action_results = action_results
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+            _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
             for shooter_id, shot_res in shots_for_step.items():
                 try:
                     sid = int(shooter_id)
@@ -543,6 +544,10 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
 def _init_eval_diagnostics() -> dict:
     return {
         "turnover_reasons": {},
+        "assist_links": {},
+        "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
+        "potential_assist_links": {},
+        "potential_assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
         "action_mix": {
             "noop": 0,
             "move": 0,
@@ -575,6 +580,38 @@ def _merge_eval_diagnostics(dest: dict | None, src: dict | None) -> dict:
         dest["turnover_reasons"][key] = int(dest["turnover_reasons"].get(key, 0)) + int(
             count or 0
         )
+
+    for link_key, count in (src.get("assist_links") or {}).items():
+        key = str(link_key)
+        dest["assist_links"][key] = int(dest["assist_links"].get(key, 0)) + int(
+            count or 0
+        )
+
+    for link_key, count in (src.get("potential_assist_links") or {}).items():
+        key = str(link_key)
+        dest["potential_assist_links"][key] = int(
+            dest["potential_assist_links"].get(key, 0)
+        ) + int(count or 0)
+
+    for shot_type in ("dunk", "two", "three"):
+        dest.setdefault("assist_links_by_type", {}).setdefault(shot_type, {})
+        src_map = (src.get("assist_links_by_type") or {}).get(shot_type, {}) or {}
+        for link_key, count in src_map.items():
+            key = str(link_key)
+            dest["assist_links_by_type"][shot_type][key] = int(
+                dest["assist_links_by_type"][shot_type].get(key, 0)
+            ) + int(count or 0)
+
+    for shot_type in ("dunk", "two", "three"):
+        dest.setdefault("potential_assist_links_by_type", {}).setdefault(shot_type, {})
+        src_map = (src.get("potential_assist_links_by_type") or {}).get(
+            shot_type, {}
+        ) or {}
+        for link_key, count in src_map.items():
+            key = str(link_key)
+            dest["potential_assist_links_by_type"][shot_type][key] = int(
+                dest["potential_assist_links_by_type"][shot_type].get(key, 0)
+            ) + int(count or 0)
 
     for key in ("noop", "move", "shoot", "pass", "other", "total"):
         dest["action_mix"][key] = int(dest["action_mix"].get(key, 0)) + int(
@@ -646,6 +683,79 @@ def _accumulate_turnover_reasons(
             continue
         reason = str(turnover.get("reason") or "unknown")
         turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
+
+
+def _accumulate_assist_links(
+    eval_diagnostics: dict, shots_for_step, user_team_ids_set: set[int], env=None
+) -> None:
+    assist_links = eval_diagnostics.setdefault("assist_links", {})
+    potential_assist_links = eval_diagnostics.setdefault("potential_assist_links", {})
+    assist_links_by_type = eval_diagnostics.setdefault(
+        "assist_links_by_type", {"dunk": {}, "two": {}, "three": {}}
+    )
+    potential_assist_links_by_type = eval_diagnostics.setdefault(
+        "potential_assist_links_by_type", {"dunk": {}, "two": {}, "three": {}}
+    )
+    for shot_type in ("dunk", "two", "three"):
+        assist_links_by_type.setdefault(shot_type, {})
+        potential_assist_links_by_type.setdefault(shot_type, {})
+    if not isinstance(shots_for_step, dict):
+        return
+
+    for shooter_raw, shot_res in shots_for_step.items():
+        if not isinstance(shot_res, dict):
+            continue
+        assist_potential = bool(shot_res.get("assist_potential", False))
+        assist_full = bool(shot_res.get("assist_full", False))
+        if not assist_potential and not assist_full:
+            continue
+        passer_raw = shot_res.get("assist_passer_id")
+        if passer_raw is None:
+            continue
+        try:
+            shooter_id = int(shooter_raw)
+            passer_id = int(passer_raw)
+        except Exception:
+            continue
+        if shooter_id == passer_id:
+            continue
+        if (
+            shooter_id not in user_team_ids_set
+            or passer_id not in user_team_ids_set
+        ):
+            continue
+
+        shot_type = "two"
+        try:
+            distance = int(shot_res.get("distance"))
+        except Exception:
+            distance = None
+        try:
+            is_three_raw = shot_res.get("is_three")
+            is_three = bool(is_three_raw) if is_three_raw is not None else None
+        except Exception:
+            is_three = None
+        if distance == 0 and bool(getattr(env, "allow_dunks", True)):
+            shot_type = "dunk"
+        elif is_three is True:
+            shot_type = "three"
+        elif is_three is False:
+            shot_type = "two"
+        elif distance is not None:
+            three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+            shot_type = "three" if distance >= three_point_distance else "two"
+
+        key = f"{passer_id}->{shooter_id}"
+        if assist_full:
+            assist_links[key] = int(assist_links.get(key, 0)) + 1
+            assist_links_by_type[shot_type][key] = int(
+                assist_links_by_type[shot_type].get(key, 0)
+            ) + 1
+        if assist_potential and not assist_full:
+            potential_assist_links[key] = int(potential_assist_links.get(key, 0)) + 1
+            potential_assist_links_by_type[shot_type][key] = int(
+                potential_assist_links_by_type[shot_type].get(key, 0)
+            ) + 1
 
 
 def _accumulate_reward_breakdown(
@@ -893,6 +1003,7 @@ def _run_sequential_evaluation(
             last_action_results = action_results
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+            _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
             for shooter_id, shot_res in shots_for_step.items():
                 try:
                     sid = int(shooter_id)

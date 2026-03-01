@@ -56,6 +56,10 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  showOpponentActions: {
+    type: Boolean,
+    default: true,
+  },
   moveHistory: {
     type: Array,
     default: () => [],
@@ -1725,6 +1729,14 @@ const allPlayerIds = computed(() => {
   }
   return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
 });
+
+const controlsTabPlayerIds = computed(() => {
+  if (props.showOpponentActions) {
+    return allPlayerIds.value;
+  }
+  return userControlledPlayerIds.value;
+});
+
 const offenseIdsLive = computed(() => props.gameState?.offense_ids || []);
 const ballHolderSelection = computed(() => props.gameState?.ball_holder ?? null);
 
@@ -1924,6 +1936,17 @@ watch(allPlayerIds, (newPlayerIds) => {
         emit('update:activePlayerId', firstUser);
     }
 }, { immediate: true });
+
+watch(
+  [controlsTabPlayerIds, () => props.activePlayerId],
+  ([visibleIds, activePlayerId]) => {
+    if (!Array.isArray(visibleIds) || visibleIds.length === 0) return;
+    if (activePlayerId === null || activePlayerId === undefined || !visibleIds.includes(activePlayerId)) {
+      emit('update:activePlayerId', visibleIds[0]);
+    }
+  },
+  { immediate: true },
+);
 
 watch(allPlayerIds, (newPlayerIds) => {
   if (!newPlayerIds || !newPlayerIds.length) {
@@ -2314,6 +2337,12 @@ function getSelectedActionBadge(playerId) {
   if (label.startsWith('PASS->')) return `P${label.replace('PASS->', '')}`;
   if (label.startsWith('PASS_')) return 'P';
   return label;
+}
+
+function shouldDisplaySelectedAction(playerId) {
+  if (playerId === null || playerId === undefined) return false;
+  if (props.showOpponentActions) return true;
+  return userControlledPlayerIds.value.includes(Number(playerId));
 }
 
 function getAdvisorTargets() {
@@ -2722,27 +2751,31 @@ const ballHolderOHE = computed(() => {
 });
 
 const shotClockValue = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return 0;
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const idx = nPlayers * 2 + nPlayers;
-  return obs[idx] || 0;
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return 0;
+  return Number(obs[meta.shotClockIdx] || 0);
+});
+
+const pressureExposureObsValue = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.pressureExposureIdx === null) return 0;
+  return Number(obs[meta.pressureExposureIdx] || 0);
 });
 
 const teamEncodingRows = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const idx = nPlayers * 2 + nPlayers + 1;
-  return obs.slice(idx, idx + nPlayers);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(meta.teamEncodingStart, meta.teamEncodingStart + meta.nPlayers);
 });
 
 const ballHandlerPositionRows = computed(() => {
-  if (!props.gameState || !props.gameState.obs) return [];
-  const obs = props.gameState.obs;
-  const nPlayers = (props.gameState.offense_ids?.length || 0) + (props.gameState.defense_ids?.length || 0);
-  const idx = nPlayers * 2 + nPlayers + 1 + nPlayers; // +nPlayers for team encoding
-  return obs.slice(idx, idx + 2);
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return [];
+  return obs.slice(meta.ballHandlerStart, meta.ballHandlerStart + 2);
 });
 
 const hoopVectorRows = computed(() => {
@@ -2769,6 +2802,9 @@ const obsMeta = computed(() => {
   offset += nPlayers; // ball holder one-hot
   const shotClockIdx = offset;
   offset += 1;
+  // Pressure exposure was inserted after shot clock in the flat observation schema.
+  const pressureExposureIdx = offset;
+  offset += 1;
   const teamEncodingStart = offset;
   offset += nPlayers;
   const ballHandlerStart = offset;
@@ -2794,7 +2830,9 @@ const obsMeta = computed(() => {
   offset += nOffense;
   const stealStart = offset;
   return {
+    nPlayers,
     shotClockIdx,
+    pressureExposureIdx,
     teamEncodingStart,
     ballHandlerStart,
     hoopStart,
@@ -3206,23 +3244,23 @@ const stealRisks = computed(() => {
 
       <div class="player-tabs">
           <button 
-              v-for="playerId in allPlayerIds" 
+              v-for="playerId in controlsTabPlayerIds" 
               :key="playerId"
               :class="{ active: activePlayerId === playerId }"
               @click="$emit('update:activePlayerId', playerId)"
               :disabled="false"
           >
               Player {{ playerId }}
-              <span v-if="getSelectedActionDisplay(playerId)">
+              <span v-if="shouldDisplaySelectedAction(playerId) && getSelectedActionDisplay(playerId)">
                 ({{ getSelectedActionBadge(playerId) }})
               </span>
           </button>
       </div>
       
-      <div class="control-pad-wrapper" v-if="activePlayerId !== null">
+      <div class="control-pad-wrapper" v-if="activePlayerId !== null && controlsTabPlayerIds.includes(activePlayerId)">
           <HexagonControlPad 
               :legal-actions="getControlPadLegalActions(activePlayerId)"
-              :selected-action="getEffectiveSelectedAction(activePlayerId)"
+              :selected-action="shouldDisplaySelectedAction(activePlayerId) ? getEffectiveSelectedAction(activePlayerId) : ''"
               :pass-probabilities="passProbabilities"
               @action-selected="handleActionSelected"
               :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
@@ -3250,7 +3288,7 @@ const stealRisks = computed(() => {
               </button>
             </div>
           </div>
-          <p v-if="getSelectedActionDisplay(activePlayerId)">
+          <p v-if="shouldDisplaySelectedAction(activePlayerId) && getSelectedActionDisplay(activePlayerId)">
               Selected for Player {{ activePlayerId }}: <strong>{{ getSelectedActionDisplay(activePlayerId) }}</strong>
           </p>
       </div>
@@ -3781,14 +3819,21 @@ const stealRisks = computed(() => {
             <input type="checkbox" :checked="evalPlacementEditing" @change="toggleEvalPlacement($event.target.checked)" />
             Edit starting positions on board
           </label>
-          <button class="ghost-btn" @click="seedEvalConfigFromGameState(false)">
+          <button class="ghost-btn" @click="seedEvalConfigFromGameState(false)" :disabled="!evalPlacementEditing">
             Use current board positions
           </button>
+          <span v-if="!evalPlacementEditing" class="status-note">
+            Spawn and ball handler randomize each episode
+          </span>
         </div>
 
         <div class="eval-row">
           <label>Ball starts with</label>
-          <select :value="evalConfigSafe.ballHolder ?? ''" @change="setEvalBallHolder($event.target.value ? Number($event.target.value) : null)">
+          <select
+            :value="evalConfigSafe.ballHolder ?? ''"
+            :disabled="!evalPlacementEditing"
+            @change="setEvalBallHolder($event.target.value ? Number($event.target.value) : null)"
+          >
             <option v-if="!ballStartOptions.length" disabled value="">No offense players</option>
             <option v-for="pid in ballStartOptions" :key="`ball-${pid}`" :value="pid">Player {{ pid }}</option>
           </select>
@@ -4593,6 +4638,14 @@ const stealRisks = computed(() => {
                 <td>-</td>
                 <td class="value-mono">{{ shotClockValue }}</td>
                 <td class="notes">Current shot clock</td>
+              </tr>
+
+              <!-- Pressure Exposure -->
+              <tr class="group-pressure-exposure">
+                <td class="group-label">Pressure Exposure</td>
+                <td>-</td>
+                <td class="value-mono">{{ pressureExposureObsValue.toFixed(4) }}</td>
+                <td class="notes">Cumulative defender-pressure turnover probability</td>
               </tr>
 
               <!-- Team Encoding -->

@@ -1018,10 +1018,11 @@ class HexagonBasketballEnv(gym.Env):
                 "total_pressure_prob": total_pressure_prob,
             }
 
-        # Update illegal defense counters based on resulting positions
-        # Defenders cannot camp in the full lane area (not just basket)
-        # Check for defensive 3-second violations BEFORE calculating rewards
-        if self.illegal_defense_enabled:
+        # Update illegal defense counters based on resulting positions.
+        # Defensive lane violations are only evaluated on non-shot steps.
+        # This keeps stats/rewards aligned with _check_termination_and_rewards,
+        # which applies violation effects only when no shot occurred.
+        if self.illegal_defense_enabled and not action_results.get("shots"):
             for did in self.defense_ids:
                 if self.positions and tuple(self.positions[did]) in self.defensive_lane_hexes:
                     if self._defender_is_guarding_offense(did):

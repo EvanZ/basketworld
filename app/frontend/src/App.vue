@@ -3,6 +3,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
@@ -105,6 +106,59 @@ const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
 const shotChartTarget = ref('team');
+const assistLinksByPair = ref({});
+const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const potentialAssistLinksByPair = ref({});
+const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const sankeyFlowMode = ref('assisted');
+const sankeyShotType = ref('all');
+
+const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
+
+function emptyAssistLinkTypeMap() {
+  return { dunk: {}, two: {}, three: {} };
+}
+
+function parseAssistLinkKey(rawKey) {
+  const match = String(rawKey ?? '').match(/^\s*(-?\d+)\s*->\s*(-?\d+)\s*$/);
+  if (!match) return null;
+  const source = Number(match[1]);
+  const target = Number(match[2]);
+  if (!Number.isFinite(source) || !Number.isFinite(target)) return null;
+  return { source, target };
+}
+
+function normalizeAssistLinkMap(rawMap) {
+  if (!rawMap || typeof rawMap !== 'object') return {};
+  const out = {};
+  for (const [rawKey, rawCount] of Object.entries(rawMap)) {
+    const parsed = parseAssistLinkKey(rawKey);
+    if (!parsed) continue;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    const key = `${parsed.source}->${parsed.target}`;
+    out[key] = (out[key] || 0) + count;
+  }
+  return out;
+}
+
+function normalizeAssistLinkMapByType(rawByType) {
+  const out = emptyAssistLinkTypeMap();
+  if (!rawByType || typeof rawByType !== 'object') return out;
+  for (const shotType of ASSIST_SHOT_TYPES) {
+    out[shotType] = normalizeAssistLinkMap(rawByType[shotType]);
+  }
+  return out;
+}
+
+function hasPositiveLinkCount(rawMap) {
+  if (!rawMap || typeof rawMap !== 'object') return false;
+  for (const value of Object.values(rawMap)) {
+    if (Number(value) > 0) return true;
+  }
+  return false;
+}
+
 const shotAccumulatorForBoard = computed(() => {
   if (shotChartTarget.value === 'team' || !shotChartTarget.value) {
     return shotAccumulator.value || {};
@@ -141,6 +195,7 @@ const phiRef = vueRef(null);
 const aiMode = ref(true);
 const playerDeterministic = ref(false);
 const opponentDeterministic = ref(true);
+const showOpponentActions = ref(false);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
@@ -237,7 +292,101 @@ const shotChartOptions = computed(() => {
   }
   return opts;
 });
-const showShotChartSelector = computed(() => !isEvalPlacementMode.value && !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0);
+const hasShotChartData = computed(
+  () => !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0,
+);
+const hasAssistSankeyData = computed(
+  () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
+);
+const showShotChartSelector = computed(
+  () => !isEvalPlacementMode.value && hasShotChartData.value,
+);
+const showSankeySelector = computed(
+  () => !isEvalPlacementMode.value && hasAssistSankeyData.value,
+);
+const boardShotChartLabel = computed(() =>
+  hasShotChartData.value
+    ? (shotChartOptions.value.find((o) => o.value === shotChartTarget.value)?.label || '')
+    : '',
+);
+
+const selectedSankeyLinkMap = computed(() => {
+  const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
+  const typeMode = ASSIST_SHOT_TYPES.includes(sankeyShotType.value) ? sankeyShotType.value : 'all';
+
+  if (flowMode === 'potential') {
+    if (typeMode === 'all') return potentialAssistLinksByPair.value || {};
+    return potentialAssistLinksByType.value?.[typeMode] || {};
+  }
+  if (typeMode === 'all') return assistLinksByPair.value || {};
+  return assistLinksByType.value?.[typeMode] || {};
+});
+
+const assistSankeyTitle = computed(() => {
+  const flowLabel = sankeyFlowMode.value === 'potential'
+    ? 'Potential Assist Flows (Missed)'
+    : 'Assist Flows (Made)';
+  const typeLabel = sankeyShotType.value === 'all'
+    ? 'All Shot Types'
+    : (sankeyShotType.value === 'dunk'
+      ? 'Dunks'
+      : (sankeyShotType.value === 'two' ? '2PT' : '3PT'));
+  return `${flowLabel} • ${typeLabel}`;
+});
+const assistSankeyTotalLabel = computed(() =>
+  sankeyFlowMode.value === 'potential' ? 'Potential assists (missed)' : 'Assisted makes',
+);
+
+const assistSankeyPlayerIds = computed(() => {
+  const state = gameState.value;
+  const userTeam = String(state?.user_team_name || 'OFFENSE').toUpperCase();
+  const ids = userTeam === 'DEFENSE'
+    ? (state?.defense_ids || [])
+    : (state?.offense_ids || []);
+  const normalized = ids
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  const fallback = new Set();
+  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value]) {
+    for (const key of Object.keys(rawMap || {})) {
+      const parsed = parseAssistLinkKey(key);
+      if (!parsed) continue;
+      fallback.add(parsed.source);
+      fallback.add(parsed.target);
+    }
+  }
+  return Array.from(fallback).sort((a, b) => a - b);
+});
+
+const assistSankeyLinks = computed(() => {
+  const raw = selectedSankeyLinkMap.value || {};
+  const allowedIds = assistSankeyPlayerIds.value;
+  const allowedSet = allowedIds.length > 0 ? new Set(allowedIds) : null;
+  const out = [];
+  for (const [key, rawCount] of Object.entries(raw)) {
+    const parsed = parseAssistLinkKey(key);
+    if (!parsed) continue;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    if (
+      allowedSet
+      && (!allowedSet.has(parsed.source) || !allowedSet.has(parsed.target))
+    ) {
+      continue;
+    }
+    out.push({
+      source: parsed.source,
+      target: parsed.target,
+      count,
+    });
+  }
+  out.sort((a, b) => b.count - a.count || a.source - b.source || a.target - b.target);
+  return out;
+});
 
 const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
 const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
@@ -282,6 +431,12 @@ async function handleGameStarted(setupData) {
   // Clear move history for new game
   moveHistory.value = [];
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   // Clear any self-play selections state
   currentSelections.value = null;
   userSelections.value = {};
@@ -739,6 +894,35 @@ const boardSelectedActions = computed(() => {
   return userSelections.value;
 });
 
+const visibleBoardSelectedActions = computed(() => {
+  const selections = boardSelectedActions.value || {};
+  if (showOpponentActions.value) return selections;
+
+  const state = gameState.value;
+  if (!state) return selections;
+
+  const userTeamName = String(state.user_team_name || 'OFFENSE').toUpperCase();
+  const userTeamIds = userTeamName === 'DEFENSE'
+    ? (state.defense_ids || [])
+    : (state.offense_ids || []);
+  const allowedIds = new Set(
+    userTeamIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id)),
+  );
+
+  if (allowedIds.size === 0) return selections;
+
+  const filtered = {};
+  for (const [pid, action] of Object.entries(selections)) {
+    const numericPid = Number(pid);
+    if (!Number.isFinite(numericPid) || allowedIds.has(numericPid)) {
+      filtered[pid] = action;
+    }
+  }
+  return filtered;
+});
+
 // Handler for Self-Play button click
 function handleSelfPlayButton() {
   if (activeControlsTab.value === 'eval') {
@@ -1075,24 +1259,31 @@ function handleEvalPlacementUpdate({ playerId, q, r }) {
 
 function buildCustomEvalSetup() {
   if (!gameState.value || evalConfig.value.mode !== 'custom') return null;
-  const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
-  let positions = Array.isArray(evalConfig.value.positions) ? evalConfig.value.positions : [];
-  if (positions.length !== nPlayers && gameState.value.positions) {
-    positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
-  }
-  if (positions.length !== nPlayers) {
-    throw new Error(`Custom setup requires ${nPlayers} positions (found ${positions.length}).`);
-  }
-  const offenseIds = gameState.value.offense_ids || [];
-  const defaultBall = offenseIds.length ? offenseIds[0] : 0;
-  const rawBh = evalConfig.value.ballHolder ?? gameState.value.ball_holder ?? defaultBall;
-  const ballHolder = offenseIds.includes(rawBh) ? rawBh : defaultBall;
+  const usePinnedPlacement = !!evalConfig.value.placementEditing;
   const shootingMode = evalConfig.value.shootingMode || 'random';
   const payload = {
-    initial_positions: positions,
-    ball_holder: ballHolder,
     shooting_mode: shootingMode,
   };
+
+  // In custom eval mode, placement editing controls whether we pin placement.
+  // If disabled, backend reset uses randomized spawn positions + random offensive ball handler.
+  if (usePinnedPlacement) {
+    const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+    let positions = Array.isArray(evalConfig.value.positions) ? evalConfig.value.positions : [];
+    if (positions.length !== nPlayers && gameState.value.positions) {
+      positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
+    }
+    if (positions.length !== nPlayers) {
+      throw new Error(`Custom setup requires ${nPlayers} positions (found ${positions.length}).`);
+    }
+    const offenseIds = gameState.value.offense_ids || [];
+    const defaultBall = offenseIds.length ? offenseIds[0] : 0;
+    const rawBh = evalConfig.value.ballHolder ?? gameState.value.ball_holder ?? defaultBall;
+    const ballHolder = offenseIds.includes(rawBh) ? rawBh : defaultBall;
+    payload.initial_positions = positions;
+    payload.ball_holder = ballHolder;
+  }
+
   if (shootingMode === 'fixed') {
     const offenseCount = gameState.value.offense_ids?.length || 0;
     const skills = evalConfig.value.skills || {};
@@ -1126,6 +1317,12 @@ async function handleEvaluation() {
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   perPlayerEvalStats.value = {};
   
   // Reset stats at the beginning
@@ -1193,6 +1390,15 @@ async function handleEvaluation() {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      const evalDiagnostics = response.eval_diagnostics || {};
+      assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
+      assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
+      potentialAssistLinksByPair.value = normalizeAssistLinkMap(
+        evalDiagnostics.potential_assist_links,
+      );
+      potentialAssistLinksByType.value = normalizeAssistLinkMapByType(
+        evalDiagnostics.potential_assist_links_by_type,
+      );
       perPlayerEvalStats.value = response.per_player_stats || {};
       try {
         const totals = Object.values(perPlayerEvalStats.value || {}).reduce(
@@ -1501,6 +1707,12 @@ function handlePlayAgain() {
   gameHistory.value = [];
   policyProbs.value = null;
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   placementPassPreview.value = {};
   evalConfig.value = defaultEvalConfig();
   activePlayerId.value = null;
@@ -1610,6 +1822,10 @@ onBeforeUnmount(() => {
             <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Opponent Deterministic</span>
           </button>
+          <button class="toggle-btn" @click="showOpponentActions = !showOpponentActions">
+            <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+            <span class="toggle-label">Show Opponent Actions</span>
+          </button>
         </div>
 
       </div>
@@ -1618,13 +1834,29 @@ onBeforeUnmount(() => {
     <div v-if="gameState" class="game-container">
       <div class="board-area">
         <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
-        <div v-if="showShotChartSelector" class="shot-chart-selector">
-          <label>Shot chart:</label>
-          <select v-model="shotChartTarget">
-            <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
-              {{ opt.label }}
-            </option>
-          </select>
+        <div v-if="showShotChartSelector || showSankeySelector" class="shot-chart-selector">
+          <template v-if="showShotChartSelector">
+            <label>Shot chart:</label>
+            <select v-model="shotChartTarget">
+              <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+          </template>
+          <template v-if="showSankeySelector">
+            <label>Sankey:</label>
+            <select v-model="sankeyFlowMode">
+              <option value="assisted">Assisted makes</option>
+              <option value="potential">Potential assists (missed)</option>
+            </select>
+            <label>Type:</label>
+            <select v-model="sankeyShotType">
+              <option value="all">All</option>
+              <option value="dunk">Dunk</option>
+              <option value="two">2PT</option>
+              <option value="three">3PT</option>
+            </select>
+          </template>
         </div>
         <GameBoard 
           ref="gameBoardRef"
@@ -1632,9 +1864,9 @@ onBeforeUnmount(() => {
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
-          :selected-actions="boardSelectedActions"
+          :selected-actions="visibleBoardSelectedActions"
           :shot-accumulator="shotAccumulatorForBoard"
-          :shot-chart-label="shotChartOptions.find(o => o.value === shotChartTarget)?.label || ''"
+          :shot-chart-label="boardShotChartLabel"
           :placement-mode="isEvalPlacementMode"
           :placement-editable="evalConfig.placementEditing"
           :placement-positions="evalConfig.positions"
@@ -1646,6 +1878,13 @@ onBeforeUnmount(() => {
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
+        />
+        <AssistSankey
+          v-if="!isEvalPlacementMode && hasAssistSankeyData"
+          :links="assistSankeyLinks"
+          :player-ids="assistSankeyPlayerIds"
+          :title="assistSankeyTitle"
+          :total-label="assistSankeyTotalLabel"
         />
         <KeyboardLegend />
       </div>
@@ -1668,6 +1907,7 @@ onBeforeUnmount(() => {
           :ai-mode="aiMode"
           :deterministic="playerDeterministic"
           :opponent-deterministic="opponentDeterministic"
+          :show-opponent-actions="showOpponentActions"
           :move-history="moveHistory"
           :current-shot-clock="currentShotClock"
           :pressure-exposure="pressureExposure"
@@ -1958,6 +2198,8 @@ header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 .shot-chart-selector label {
   color: var(--app-text-muted);

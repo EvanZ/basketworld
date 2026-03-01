@@ -2,6 +2,8 @@ import time
 import multiprocessing as mp
 
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
+import numpy as np
 from basketworld.envs.basketworld_env_v2 import Team
 
 from app.backend.evaluation import (
@@ -14,6 +16,18 @@ from app.backend.state import game_state, get_ui_game_state
 
 
 router = APIRouter()
+
+
+_NUMPY_SAFE_ENCODER = {
+    np.integer: int,
+    np.floating: float,
+    np.bool_: bool,
+}
+
+
+def _to_jsonable(value):
+    """Force NumPy-safe, JSON-serializable payloads for FastAPI responses."""
+    return jsonable_encoder(value, custom_encoder=_NUMPY_SAFE_ENCODER)
 
 
 @router.post("/api/pass_steal_preview")
@@ -143,10 +157,10 @@ def run_evaluation(request: EvaluationRequest):
         outcome_info = r.get("outcome_info", {}) if isinstance(r, dict) else {}
         final_state = {
             "last_action_results": {
-                "shots": outcome_info.get("shots", {}),
-                "turnovers": outcome_info.get("turnovers", []),
-                "defensive_lane_violations": outcome_info.get(
-                    "defensive_lane_violations", []
+                "shots": _to_jsonable(outcome_info.get("shots", {})),
+                "turnovers": _to_jsonable(outcome_info.get("turnovers", [])),
+                "defensive_lane_violations": _to_jsonable(
+                    outcome_info.get("defensive_lane_violations", [])
                 ),
             },
             "shot_clock": outcome_info.get("shot_clock", 0),
@@ -179,7 +193,7 @@ def run_evaluation(request: EvaluationRequest):
     except Exception:
         pass
 
-    return {
+    return _to_jsonable({
         "status": "success",
         "num_episodes": len(episode_results),
         "results": episode_results,
@@ -187,4 +201,4 @@ def run_evaluation(request: EvaluationRequest):
         "shot_accumulator": shot_accumulator,
         "per_player_stats": per_player_stats,
         "eval_diagnostics": eval_diagnostics,
-    }
+    })
