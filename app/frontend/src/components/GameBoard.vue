@@ -67,6 +67,22 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  allowShotClockAdjustment: {
+    type: Boolean,
+    default: true,
+  },
+  disableBackendValueFetches: {
+    type: Boolean,
+    default: false,
+  },
+  allowPositionDrag: {
+    type: Boolean,
+    default: true,
+  },
+  minimalChrome: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
@@ -118,6 +134,30 @@ function hexDistance(a, b) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
+function toIdSet(values) {
+  const out = new Set();
+  if (!Array.isArray(values)) return out;
+  for (const raw of values) {
+    const pid = Number(raw);
+    if (Number.isFinite(pid)) out.add(pid);
+  }
+  return out;
+}
+
+function getPlayableOwnershipSets(gameState) {
+  const userIds = toIdSet(gameState?.playable_user_ids);
+  const aiIds = toIdSet(gameState?.playable_ai_ids);
+  return { userIds, aiIds };
+}
+
+function getPlayerOwner(gameState, playerId) {
+  if (!gameState) return null;
+  const { userIds, aiIds } = getPlayableOwnershipSets(gameState);
+  if (userIds.has(playerId)) return 'user';
+  if (aiIds.has(playerId)) return 'ai';
+  return null;
+}
+
 function isPointerPassMode(gs) {
   return String(gs?.pass_mode || 'directional').toLowerCase() === 'pointer_targeted';
 }
@@ -165,7 +205,8 @@ function getRenderablePlayers(gameState) {
     const { x, y } = axialToCartesian(q, r);
     const isOffense = gameState.offense_ids.includes(index);
     const hasBall = gameState.ball_holder === index;
-    return { id: index, x, y, isOffense, hasBall };
+    const owner = getPlayerOwner(gameState, index);
+    return { id: index, x, y, isOffense, hasBall, owner };
   });
 }
 
@@ -374,6 +415,7 @@ function getSvgPoint(clientX, clientY) {
 
 function onMouseDown(event, player) {
   if (!player) return;
+  if (!props.allowPositionDrag) return;
   if (props.isManualStepping) return;
   event.preventDefault();
   
@@ -854,7 +896,9 @@ const shotClockMax = computed(() => {
   if (!Number.isNaN(current)) candidates.push(current);
   return Math.max(...candidates);
 });
-const isShotClockEditable = computed(() => !!currentGameState.value && !currentGameState.value.done);
+const isShotClockEditable = computed(
+  () => !!props.allowShotClockAdjustment && !!currentGameState.value && !currentGameState.value.done
+);
 const canIncrementShotClock = computed(
   () => isShotClockEditable.value && !props.isShotClockUpdating && shotClockValue.value < shotClockMax.value
 );
@@ -892,6 +936,11 @@ watch(currentGameState, async (newState) => {
   if (newState.pass_steal_probabilities) {
     passStealProbs.value = newState.pass_steal_probabilities;
     console.log('[GameBoard] Using stored pass steal probabilities from state:', newState.pass_steal_probabilities);
+    return;
+  }
+
+  if (props.disableBackendValueFetches) {
+    passStealProbs.value = {};
     return;
   }
   
@@ -1175,8 +1224,17 @@ function offenseShellColor(playerId) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+function playerTeamClass(player) {
+  if (player?.owner === 'user') return 'player-user';
+  if (player?.owner === 'ai') return 'player-ai';
+  return player?.isOffense ? 'player-offense' : 'player-defense';
+}
+
 function playerCircleStyle(player) {
   const style = { cursor: 'grab' };
+  if (player?.owner === 'user' || player?.owner === 'ai') {
+    return style;
+  }
   if (player?.isOffense) {
     style.fill = offenseShellColor(player.id);
   }
@@ -1454,12 +1512,18 @@ async function fetchBallHandlerMakeProb() {
     return;
   }
   
-  // During manual stepping (replay), use the stored shot probability from the state
-  if (props.isManualStepping && typeof gs.ball_handler_shot_probability === 'number') {
+  // Prefer the backend-provided state value when available.
+  if (typeof gs.ball_handler_shot_probability === 'number') {
     ballHandlerMakeProb.value = gs.ball_handler_shot_probability;
     // Replay snapshots currently store final probability only.
     ballHandlerBaseProb.value = null;
-    console.log('[GameBoard] Using stored shot probability from replay state:', gs.ball_handler_shot_probability);
+    console.log('[GameBoard] Using stored shot probability from state:', gs.ball_handler_shot_probability);
+    return;
+  }
+
+  if (props.disableBackendValueFetches) {
+    ballHandlerMakeProb.value = null;
+    ballHandlerBaseProb.value = null;
     return;
   }
   
@@ -1584,6 +1648,10 @@ const playerTransitions = computed(() => {
         const endY = isLastStep && progress < 1 ? startY + (fullEndY - startY) * progress : fullEndY;
         
         const isOffense = currentGameState.offense_ids.includes(playerId);
+        const owner = getPlayerOwner(currentGameState, playerId);
+        const arrowTone = owner === 'user' || owner === 'ai'
+          ? owner
+          : (isOffense ? 'user' : 'ai');
 
         transitions.push({
           key: `arrow-${step}-${playerId}`,
@@ -1593,6 +1661,7 @@ const playerTransitions = computed(() => {
           endY,
           opacity,
           isOffense,
+          arrowTone,
         });
       }
     }
@@ -1600,7 +1669,7 @@ const playerTransitions = computed(() => {
   return transitions;
 });
 
-// Compute pass rays from ball handler to teammates with steal probabilities
+// Compute pass rays from ball handler to teammates with pass success probabilities
 const passRays = computed(() => {
   const gs = currentGameState.value;
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return [];
@@ -1632,10 +1701,13 @@ const passRays = computed(() => {
     // In live mode, if no probability is available, skip drawing this ray (preserves old behavior)
     if (!hasProb && !usePlacementPreview) continue;
     const stealProb = hasProb ? Number(stealProbRaw) : 0;
-    const probFraction = stealProb > 1 ? stealProb / 100 : stealProb;
-    const stealPercent = hasProb ? probFraction * 100 : null;
-    const stealLabel = hasProb ? `${stealPercent.toFixed(1)}%` : '—';
-    const stealOpacity = hasProb ? probToStealAlpha(probFraction) : 0.3;
+    const stealFraction = Math.max(0, Math.min(1, stealProb > 1 ? stealProb / 100 : stealProb));
+    const passSuccessFraction = 1 - stealFraction;
+    const passSuccessPercent = hasProb ? passSuccessFraction * 100 : null;
+    const passSuccessLabel = hasProb ? `${passSuccessPercent.toFixed(1)}%` : '—';
+    // Keep original visual emphasis behavior (based on steal probability),
+    // while displaying pass-success percentage text.
+    const passSuccessOpacity = hasProb ? probToStealAlpha(stealFraction) : 0.3;
     
     // Calculate midpoint for label placement
     const midX = (bhCoords.x + tmCoords.x) / 2;
@@ -1648,9 +1720,9 @@ const passRays = computed(() => {
       y2: tmCoords.y,
       midX,
       midY,
-      stealProb: stealPercent, // Rounded to nearest percent (nullable)
-      stealLabel,
-      stealOpacity,
+      passSuccessProb: passSuccessPercent, // Rounded to nearest percent (nullable)
+      passSuccessLabel,
+      passSuccessOpacity,
       teammateId,
     });
   }
@@ -2576,7 +2648,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="game-board-container" :class="{ 'no-move-transitions': disableTransitions }">
+  <div
+    class="game-board-container"
+    :class="{
+      'no-move-transitions': disableTransitions,
+      'minimal-chrome': minimalChrome,
+    }"
+  >
     <div class="board-toolbar">
       <div class="download-menu" ref="downloadMenuRef">
         <button
@@ -2605,6 +2683,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <button
+        v-if="!minimalChrome"
         class="toggle-btn board-toggle-btn"
         @click="toggleAllPolicies"
         :aria-pressed="allPoliciesVisible"
@@ -2613,7 +2692,7 @@ onBeforeUnmount(() => {
         <font-awesome-icon :icon="allPoliciesVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
         <span class="toggle-label">Show Policies</span>
       </button>
-      <div class="pressure-controls-row">
+      <div v-if="!minimalChrome" class="pressure-controls-row">
         <button
           class="toggle-btn board-toggle-btn"
           @click="showShotPressureRing = !showShotPressureRing"
@@ -2701,7 +2780,7 @@ onBeforeUnmount(() => {
 
         <!-- Court reference labels -->
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="basketMarkerPosition.x"
           :y="basketMarkerPosition.y"
           dy=".35em"
@@ -2711,7 +2790,7 @@ onBeforeUnmount(() => {
           B
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="halfcourtMarkerPosition.x"
           :y="halfcourtMarkerPosition.y"
           dy=".35em"
@@ -2721,7 +2800,7 @@ onBeforeUnmount(() => {
           H
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="rightSidelineMarkerPosition.x"
           :y="rightSidelineMarkerPosition.y"
           dy=".35em"
@@ -2731,7 +2810,7 @@ onBeforeUnmount(() => {
           R
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="leftSidelineMarkerPosition.x"
           :y="leftSidelineMarkerPosition.y"
           dy=".35em"
@@ -2757,7 +2836,7 @@ onBeforeUnmount(() => {
               :cx="player.x" 
               :cy="player.y" 
               :r="HEX_RADIUS * 0.8" 
-              :class="player.isOffense ? 'player-offense' : 'player-defense'"
+              :class="playerTeamClass(player)"
               class="ghost"
             />
             <text 
@@ -2780,9 +2859,9 @@ onBeforeUnmount(() => {
             :y1="move.startY"
             :x2="move.endX"
             :y2="move.endY"
-            :stroke="move.isOffense ? '#007bff' : '#dc3545'"
+            :stroke="move.arrowTone === 'user' ? '#007bff' : '#dc3545'"
             stroke-width="3"
-            :marker-end="move.isOffense ? 'url(#arrowhead-offense)' : 'url(#arrowhead-defense)'"
+            :marker-end="move.arrowTone === 'user' ? 'url(#arrowhead-offense)' : 'url(#arrowhead-defense)'"
           />
         </g>
 
@@ -2867,7 +2946,7 @@ onBeforeUnmount(() => {
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
               :r="HEX_RADIUS * 0.8" 
               :class="[
-                player.isOffense ? 'player-offense' : 'player-defense',
+                playerTeamClass(player),
                 { 'dragging': draggedPlayerId === player.id },
                 { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id }
               ]"
@@ -2881,7 +2960,7 @@ onBeforeUnmount(() => {
               </title>
             </circle>
             <circle
-              v-if="player.isOffense"
+              v-if="player.isOffense && !player.owner"
               :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
               :r="HEX_RADIUS * 0.67"
@@ -3033,7 +3112,7 @@ onBeforeUnmount(() => {
           </text>
         </g>
         
-        <!-- Draw Pass Rays (ball handler to teammates with steal probabilities) - drawn after players for visibility -->
+        <!-- Draw Pass Rays (ball handler to teammates with pass success probabilities) - drawn after players for visibility -->
         <g v-if="showPlayers" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
           <line
             :x1="ray.x1"
@@ -3041,7 +3120,7 @@ onBeforeUnmount(() => {
             :x2="ray.x2"
             :y2="ray.y2"
             class="pass-ray"
-            :opacity="ray.stealOpacity"
+            :opacity="ray.passSuccessOpacity"
           />
           <text
             :x="ray.midX"
@@ -3049,9 +3128,9 @@ onBeforeUnmount(() => {
             text-anchor="middle"
             dominant-baseline="middle"
             class="steal-prob-label"
-            :opacity="ray.stealOpacity"
+            :opacity="ray.passSuccessOpacity"
           >
-            {{ ray.stealLabel }}
+            {{ ray.passSuccessLabel }}
           </text>
         </g>
 
@@ -3211,7 +3290,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- State-value overlay -->
-        <g v-if="(offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
+        <g v-if="!minimalChrome && (offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
           <rect
             :x="stateValueAnchor.x"
             :y="stateValueAnchor.y"
@@ -3311,7 +3390,7 @@ onBeforeUnmount(() => {
 
       <!-- MLflow Run ID label (top-left, outside transformed group) -->
       <text
-        v-if="currentGameState && currentGameState.run_id"
+        v-if="!minimalChrome && currentGameState && currentGameState.run_id"
         :x="parseFloat(viewBox.split(' ')[0]) + 100"
         :y="parseFloat(viewBox.split(' ')[1]) + 10"
         text-anchor="start"
@@ -3325,7 +3404,7 @@ onBeforeUnmount(() => {
       <div class="shot-clock-overlay">
         {{ displayedShotClockValue }}
       </div>
-      <div class="shot-clock-controls">
+      <div v-if="allowShotClockAdjustment" class="shot-clock-controls">
         <button
           class="shot-clock-button"
           :disabled="!canIncrementShotClock"
@@ -3359,6 +3438,11 @@ onBeforeUnmount(() => {
   background: radial-gradient(circle at 30% 50%, #0f172a, #01010a 70%);
   border: 1px solid rgba(148, 163, 184, 0.35);
   box-shadow: 0 20px 45px rgba(2, 6, 23, 0.65);
+}
+
+.game-board-container.minimal-chrome {
+  border: none;
+  box-shadow: none;
 }
 
 .shot-clock-overlay {
@@ -3600,11 +3684,23 @@ onBeforeUnmount(() => {
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease, fill 0.2s ease;
 }
+.player-user {
+  fill: #007bff;
+  stroke: white;
+  stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
 .player-offense-core {
   fill: #007bff;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 .player-defense {
+  fill: #dc3545;
+  stroke: white;
+  stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
+.player-ai {
   fill: #dc3545;
   stroke: white;
   stroke-width: 0.05rem;
@@ -3802,8 +3898,10 @@ onBeforeUnmount(() => {
 }
 
 .no-move-transitions .player-offense,
+.no-move-transitions .player-user,
 .no-move-transitions .player-offense-core,
 .no-move-transitions .player-defense,
+.no-move-transitions .player-ai,
 .no-move-transitions .player-text,
 .no-move-transitions .shot-prob-text,
 .no-move-transitions .noop-prob-text,

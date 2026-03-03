@@ -447,3 +447,62 @@ export async function setDefenderPressureParams(payload = {}) {
   }
   return response.json();
 }
+
+export async function getPlayableOptions() {
+  const response = await fetch(`${API_BASE_URL}/api/playable/options`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch playable options');
+  }
+  return response.json();
+}
+
+export async function startPlayableGame(playersPerSide, difficulty) {
+  const response = await fetch(`${API_BASE_URL}/api/playable/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      players_per_side: Number(playersPerSide),
+      difficulty: String(difficulty || '').toLowerCase(),
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start playable game');
+  }
+  return response.json();
+}
+
+export async function newPlayableGame() {
+  const response = await fetch(`${API_BASE_URL}/api/playable/new_game`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start a new playable game');
+  }
+  return response.json();
+}
+
+export async function stepPlayableGame(actions = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/playable/step`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actions }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to process playable step');
+  }
+  return response.json();
+}
+
+export async function getPlayableState() {
+  const response = await fetch(`${API_BASE_URL}/api/playable/state`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch playable state');
+  }
+  return response.json();
+}
