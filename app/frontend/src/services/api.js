@@ -171,6 +171,29 @@ export async function saveEpisodeFromPngs(frames, durations, stepDurationMs) {
     return response.json();
 }
 
+export async function renderGifFromPngs(frames, durations, stepDurationMs) {
+    const payload = { frames };
+    if (Array.isArray(durations)) {
+        payload.durations = durations;
+    }
+    if (typeof stepDurationMs === 'number') {
+        payload.step_duration_ms = stepDurationMs;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/render_gif_from_pngs`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to render GIF from PNGs' }));
+        console.error('[API] renderGifFromPngs failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to render GIF from PNGs');
+    }
+    return response.blob();
+}
+
 export async function startSelfPlay() {
     const response = await fetch(`${API_BASE_URL}/api/start_self_play`, {
         method: 'POST'
