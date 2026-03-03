@@ -101,6 +101,17 @@ def _init_evaluation_worker(
         else None
     )
 
+    pass_mode = str(optional_params.get("pass_mode", "directional"))
+    for policy_obj in (unified_policy, opponent_policy):
+        policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
+        if policy is None:
+            continue
+        if hasattr(policy, "set_pass_mode"):
+            try:
+                policy.set_pass_mode(pass_mode)
+            except Exception:
+                pass
+
     user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
 
     _worker_state = {
@@ -138,10 +149,12 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
         cloned["skills"] = _np.copy(skills)
     else:
         cloned["skills"] = None
-    if "players" in obs:
-        cloned["players"] = _np.copy(obs["players"])
-    if "globals" in obs:
-        cloned["globals"] = _np.copy(obs["globals"])
+    players = obs.get("players") if isinstance(obs, dict) else None
+    globals_vec = obs.get("globals") if isinstance(obs, dict) else None
+    if players is not None:
+        cloned["players"] = _np.copy(players)
+    if globals_vec is not None:
+        cloned["globals"] = _np.copy(globals_vec)
     return cloned
 
 
@@ -174,7 +187,15 @@ def _worker_predict_actions_for_team(
 
     try:
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
-    except Exception:
+    except Exception as err:
+        err_count = int(_worker_state.get("predict_failure_count", 0)) + 1
+        _worker_state["predict_failure_count"] = err_count
+        if err_count <= 5:
+            team_name = getattr(team, "name", str(team))
+            print(
+                f"[EvalWorker][WARN] policy.predict failed for team={team_name} "
+                f"(deterministic={deterministic}) count={err_count}: {err}"
+            )
         return actions_by_player
 
     raw_actions = _np.array(raw_actions).reshape(-1)
@@ -198,13 +219,37 @@ def _worker_predict_actions_for_team(
     else:
         team_probs = None
 
-    resolved_actions = _resolve_illegal_actions(
-        _np.array(team_pred_actions),
-        team_mask,
-        strategy,
-        deterministic,
-        team_probs,
-    )
+    # Deterministic policy execution should select argmax among legal actions from
+    # the model's probability distribution directly. This keeps worker eval
+    # behavior consistent with live/sequential inference paths.
+    if deterministic and team_probs is not None and len(team_probs) == len(team_ids):
+        resolved_actions = _np.zeros(len(team_ids), dtype=int)
+        for idx in range(len(team_ids)):
+            legal = _np.where(team_mask[idx] == 1)[0]
+            if len(legal) == 0:
+                resolved_actions[idx] = 0
+                continue
+            p = _np.asarray(team_probs[idx], dtype=_np.float32)
+            if p.shape[0] <= int(_np.max(legal)):
+                # Fallback to resolver if probability vector is malformed.
+                resolved_actions = _resolve_illegal_actions(
+                    _np.array(team_pred_actions),
+                    team_mask,
+                    strategy,
+                    deterministic,
+                    team_probs,
+                )
+                break
+            masked = p[legal]
+            resolved_actions[idx] = int(legal[int(_np.argmax(masked))])
+    else:
+        resolved_actions = _resolve_illegal_actions(
+            _np.array(team_pred_actions),
+            team_mask,
+            strategy,
+            deterministic,
+            team_probs,
+        )
 
     for idx, pid in enumerate(team_ids):
         actions_by_player[int(pid)] = int(resolved_actions[idx])
@@ -260,6 +305,9 @@ def _run_episode_batch_worker(args: tuple) -> dict:
     results = []
     shot_accumulator: dict[str, list[int]] = {}
     per_player_stats = _init_player_stats(env.n_players)
+    eval_diagnostics = _init_eval_diagnostics()
+    user_team_ids = list(env.offense_ids if user_team == _Team.OFFENSE else env.defense_ids)
+    user_team_ids_set = {int(pid) for pid in user_team_ids}
 
     for ep_idx, seed in batch_specs:
         # Custom reset options per episode
@@ -311,6 +359,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 full_action[env.defense_ids] = actions_player[env.defense_ids]
                 full_action[env.offense_ids] = actions_opponent[env.offense_ids]
 
+            _accumulate_action_mix(eval_diagnostics, full_action, user_team_ids)
             obs, reward, terminated, truncated, info = env.step(full_action)
             action_results = info.get("action_results", {}) if info else {}
             if not action_results:
@@ -320,6 +369,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
             last_action_results = action_results
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+            _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
             for shooter_id, shot_res in shots_for_step.items():
                 try:
                     sid = int(shooter_id)
@@ -356,6 +406,15 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                         _record_turnover_for_stats(per_player_stats, t.get("player_id"))
                     except Exception:
                         continue
+            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_reward_breakdown(
+                eval_diagnostics,
+                env,
+                action_results if isinstance(action_results, dict) else {},
+                info if isinstance(info, dict) else {},
+                reward,
+                user_team,
+            )
 
             # Update role_flag for next step
             obs["role_flag"] = _np.array([role_flag_offense if user_team == _Team.OFFENSE else role_flag_defense], dtype=_np.float32)
@@ -383,6 +442,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 "outcome_info": {
                     "shots": last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {},
                     "turnovers": last_action_results.get("turnovers", []) if isinstance(last_action_results, dict) else [],
+                    "defensive_lane_violations": last_action_results.get("defensive_lane_violations", []) if isinstance(last_action_results, dict) else [],
                     "shot_clock": shot_clock,
                     "three_point_distance": three_point_distance,
                 },
@@ -401,6 +461,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": per_player_stats,
+        "eval_diagnostics": eval_diagnostics,
     }
 
 
@@ -478,6 +539,309 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
         for key in ("dunk", "two", "three"):
             dst_un[key] = dst_un.get(key, 0) + int(src_un.get(key, 0) or 0)
     return dest
+
+
+def _init_eval_diagnostics() -> dict:
+    return {
+        "turnover_reasons": {},
+        "assist_links": {},
+        "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
+        "potential_assist_links": {},
+        "potential_assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
+        "action_mix": {
+            "noop": 0,
+            "move": 0,
+            "shoot": 0,
+            "pass": 0,
+            "other": 0,
+            "total": 0,
+        },
+        "reward_breakdown": {
+            "total_reward": 0.0,
+            "expected_points": 0.0,
+            "pass_reward": 0.0,
+            "violation_reward": 0.0,
+            "assist_potential": 0.0,
+            "assist_full_bonus": 0.0,
+            "phi_shaping": 0.0,
+            "unexplained": 0.0,
+        },
+    }
+
+
+def _merge_eval_diagnostics(dest: dict | None, src: dict | None) -> dict:
+    if dest is None:
+        dest = _init_eval_diagnostics()
+    if not src:
+        return dest
+
+    for reason, count in (src.get("turnover_reasons") or {}).items():
+        key = str(reason) if reason is not None else "unknown"
+        dest["turnover_reasons"][key] = int(dest["turnover_reasons"].get(key, 0)) + int(
+            count or 0
+        )
+
+    for link_key, count in (src.get("assist_links") or {}).items():
+        key = str(link_key)
+        dest["assist_links"][key] = int(dest["assist_links"].get(key, 0)) + int(
+            count or 0
+        )
+
+    for link_key, count in (src.get("potential_assist_links") or {}).items():
+        key = str(link_key)
+        dest["potential_assist_links"][key] = int(
+            dest["potential_assist_links"].get(key, 0)
+        ) + int(count or 0)
+
+    for shot_type in ("dunk", "two", "three"):
+        dest.setdefault("assist_links_by_type", {}).setdefault(shot_type, {})
+        src_map = (src.get("assist_links_by_type") or {}).get(shot_type, {}) or {}
+        for link_key, count in src_map.items():
+            key = str(link_key)
+            dest["assist_links_by_type"][shot_type][key] = int(
+                dest["assist_links_by_type"][shot_type].get(key, 0)
+            ) + int(count or 0)
+
+    for shot_type in ("dunk", "two", "three"):
+        dest.setdefault("potential_assist_links_by_type", {}).setdefault(shot_type, {})
+        src_map = (src.get("potential_assist_links_by_type") or {}).get(
+            shot_type, {}
+        ) or {}
+        for link_key, count in src_map.items():
+            key = str(link_key)
+            dest["potential_assist_links_by_type"][shot_type][key] = int(
+                dest["potential_assist_links_by_type"][shot_type].get(key, 0)
+            ) + int(count or 0)
+
+    for key in ("noop", "move", "shoot", "pass", "other", "total"):
+        dest["action_mix"][key] = int(dest["action_mix"].get(key, 0)) + int(
+            (src.get("action_mix") or {}).get(key, 0) or 0
+        )
+
+    for key in (
+        "total_reward",
+        "expected_points",
+        "pass_reward",
+        "violation_reward",
+        "assist_potential",
+        "assist_full_bonus",
+        "phi_shaping",
+        "unexplained",
+    ):
+        dest["reward_breakdown"][key] = float(dest["reward_breakdown"].get(key, 0.0)) + float(
+            (src.get("reward_breakdown") or {}).get(key, 0.0) or 0.0
+        )
+
+    return dest
+
+
+def _is_offense_team(team) -> bool:
+    return str(getattr(team, "name", team)).upper() == "OFFENSE"
+
+
+def _action_bucket(action_id: int) -> str:
+    aid = int(action_id)
+    if aid == 0:
+        return "noop"
+    if 1 <= aid <= 6:
+        return "move"
+    if aid == 7:
+        return "shoot"
+    if 8 <= aid <= 13:
+        return "pass"
+    return "other"
+
+
+def _accumulate_action_mix(eval_diagnostics: dict, full_action, user_team_ids: list[int]) -> None:
+    action_mix = eval_diagnostics.setdefault("action_mix", {})
+    for pid in user_team_ids:
+        try:
+            action_id = int(full_action[int(pid)])
+        except Exception:
+            action_id = 0
+        bucket = _action_bucket(action_id)
+        action_mix[bucket] = int(action_mix.get(bucket, 0)) + 1
+        action_mix["total"] = int(action_mix.get("total", 0)) + 1
+
+
+def _accumulate_turnover_reasons(
+    eval_diagnostics: dict, turnovers_raw_step, user_team_ids_set: set[int]
+) -> None:
+    turnover_reasons = eval_diagnostics.setdefault("turnover_reasons", {})
+    if not isinstance(turnovers_raw_step, (list, tuple)):
+        return
+    for turnover in turnovers_raw_step:
+        if not isinstance(turnover, dict):
+            continue
+        pid = turnover.get("player_id")
+        if pid is None:
+            continue
+        try:
+            if int(pid) not in user_team_ids_set:
+                continue
+        except Exception:
+            continue
+        reason = str(turnover.get("reason") or "unknown")
+        turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
+
+
+def _accumulate_assist_links(
+    eval_diagnostics: dict, shots_for_step, user_team_ids_set: set[int], env=None
+) -> None:
+    assist_links = eval_diagnostics.setdefault("assist_links", {})
+    potential_assist_links = eval_diagnostics.setdefault("potential_assist_links", {})
+    assist_links_by_type = eval_diagnostics.setdefault(
+        "assist_links_by_type", {"dunk": {}, "two": {}, "three": {}}
+    )
+    potential_assist_links_by_type = eval_diagnostics.setdefault(
+        "potential_assist_links_by_type", {"dunk": {}, "two": {}, "three": {}}
+    )
+    for shot_type in ("dunk", "two", "three"):
+        assist_links_by_type.setdefault(shot_type, {})
+        potential_assist_links_by_type.setdefault(shot_type, {})
+    if not isinstance(shots_for_step, dict):
+        return
+
+    for shooter_raw, shot_res in shots_for_step.items():
+        if not isinstance(shot_res, dict):
+            continue
+        assist_potential = bool(shot_res.get("assist_potential", False))
+        assist_full = bool(shot_res.get("assist_full", False))
+        if not assist_potential and not assist_full:
+            continue
+        passer_raw = shot_res.get("assist_passer_id")
+        if passer_raw is None:
+            continue
+        try:
+            shooter_id = int(shooter_raw)
+            passer_id = int(passer_raw)
+        except Exception:
+            continue
+        if shooter_id == passer_id:
+            continue
+        if (
+            shooter_id not in user_team_ids_set
+            or passer_id not in user_team_ids_set
+        ):
+            continue
+
+        shot_type = "two"
+        try:
+            distance = int(shot_res.get("distance"))
+        except Exception:
+            distance = None
+        try:
+            is_three_raw = shot_res.get("is_three")
+            is_three = bool(is_three_raw) if is_three_raw is not None else None
+        except Exception:
+            is_three = None
+        if distance == 0 and bool(getattr(env, "allow_dunks", True)):
+            shot_type = "dunk"
+        elif is_three is True:
+            shot_type = "three"
+        elif is_three is False:
+            shot_type = "two"
+        elif distance is not None:
+            three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+            shot_type = "three" if distance >= three_point_distance else "two"
+
+        key = f"{passer_id}->{shooter_id}"
+        if assist_full:
+            assist_links[key] = int(assist_links.get(key, 0)) + 1
+            assist_links_by_type[shot_type][key] = int(
+                assist_links_by_type[shot_type].get(key, 0)
+            ) + 1
+        if assist_potential and not assist_full:
+            potential_assist_links[key] = int(potential_assist_links.get(key, 0)) + 1
+            potential_assist_links_by_type[shot_type][key] = int(
+                potential_assist_links_by_type[shot_type].get(key, 0)
+            ) + 1
+
+
+def _accumulate_reward_breakdown(
+    eval_diagnostics: dict,
+    env,
+    action_results: dict,
+    info: dict,
+    reward,
+    user_team,
+) -> None:
+    reward_breakdown = eval_diagnostics.setdefault("reward_breakdown", {})
+    is_offense_user = _is_offense_team(user_team)
+    offense_sign = 1.0 if is_offense_user else -1.0
+    user_team_ids = env.offense_ids if is_offense_user else env.defense_ids
+
+    team_reward = float(np.sum(reward[user_team_ids]))
+    reward_breakdown["total_reward"] = float(reward_breakdown.get("total_reward", 0.0)) + team_reward
+
+    step_known = 0.0
+
+    pass_successes = 0
+    for pass_result in (action_results.get("passes", {}) or {}).values():
+        if isinstance(pass_result, dict) and pass_result.get("success"):
+            pass_successes += 1
+    pass_amt = offense_sign * float(getattr(env, "pass_reward", 0.0)) * float(pass_successes)
+    reward_breakdown["pass_reward"] = float(reward_breakdown.get("pass_reward", 0.0)) + pass_amt
+    step_known += pass_amt
+
+    shots = action_results.get("shots", {}) or {}
+    for shot_result in shots.values():
+        if not isinstance(shot_result, dict):
+            continue
+        expected_points = float(shot_result.get("expected_points", 0.0) or 0.0)
+        expected_amt = offense_sign * expected_points
+        reward_breakdown["expected_points"] = float(reward_breakdown.get("expected_points", 0.0)) + expected_amt
+        step_known += expected_amt
+
+        if bool(shot_result.get("assist_potential", False)):
+            pot_pct = getattr(env, "potential_assist_pct", None)
+            if pot_pct is not None:
+                potential_amt = max(0.0, float(pot_pct) * expected_points)
+            else:
+                potential_amt = float(getattr(env, "potential_assist_reward", 0.0))
+            potential_term = offense_sign * potential_amt
+            reward_breakdown["assist_potential"] = float(
+                reward_breakdown.get("assist_potential", 0.0)
+            ) + potential_term
+            step_known += potential_term
+
+        if bool(shot_result.get("assist_full", False)):
+            full_pct = getattr(env, "full_assist_bonus_pct", None)
+            if full_pct is not None:
+                full_amt = max(0.0, float(full_pct) * expected_points)
+            else:
+                full_amt = float(getattr(env, "full_assist_bonus", 0.0))
+            full_term = offense_sign * full_amt
+            reward_breakdown["assist_full_bonus"] = float(
+                reward_breakdown.get("assist_full_bonus", 0.0)
+            ) + full_term
+            step_known += full_term
+
+    if (action_results.get("defensive_lane_violations") or []) and not shots:
+        violation_count = len(action_results.get("defensive_lane_violations") or [])
+        violation_amt = offense_sign * float(getattr(env, "violation_reward", 0.0)) * float(
+            violation_count
+        )
+        reward_breakdown["violation_reward"] = float(
+            reward_breakdown.get("violation_reward", 0.0)
+        ) + violation_amt
+        step_known += violation_amt
+
+    phi_team_amt = 0.0
+    if isinstance(info, dict) and info.get("phi_r_shape") is not None:
+        try:
+            phi_per_player = float(info.get("phi_r_shape") or 0.0)
+            phi_team_amt = offense_sign * phi_per_player * float(
+                max(1, int(getattr(env, "players_per_side", 1)))
+            )
+        except Exception:
+            phi_team_amt = 0.0
+    reward_breakdown["phi_shaping"] = float(reward_breakdown.get("phi_shaping", 0.0)) + phi_team_amt
+    step_known += phi_team_amt
+
+    reward_breakdown["unexplained"] = float(reward_breakdown.get("unexplained", 0.0)) + (
+        team_reward - step_known
+    )
 
 
 def _record_shot_for_stats(stats: dict, shooter_id: int, env, success: bool, assist_full: bool = False):
@@ -575,6 +939,9 @@ def _run_sequential_evaluation(
 ) -> dict:
     results = []
     per_player_stats = _init_player_stats(env.n_players)
+    eval_diagnostics = _init_eval_diagnostics()
+    user_team_ids = list(env.offense_ids if user_team == Team.OFFENSE else env.defense_ids)
+    user_team_ids_set = {int(pid) for pid in user_team_ids}
     progress_start = time.time()
     progress_every = max(1, num_episodes // 50)
 
@@ -622,6 +989,7 @@ def _run_sequential_evaluation(
                 full_action[env.defense_ids] = actions_player[0][env.defense_ids] if isinstance(actions_player, tuple) else actions_player[env.defense_ids]
                 full_action[env.offense_ids] = actions_opponent[0][env.offense_ids] if isinstance(actions_opponent, tuple) else actions_opponent[env.offense_ids]
 
+            _accumulate_action_mix(eval_diagnostics, full_action, user_team_ids)
             obs, reward, terminated, truncated, info = env.step(full_action)
             action_results = (
                 info.get("action_results", {})
@@ -635,6 +1003,7 @@ def _run_sequential_evaluation(
             last_action_results = action_results
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+            _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
             for shooter_id, shot_res in shots_for_step.items():
                 try:
                     sid = int(shooter_id)
@@ -671,6 +1040,15 @@ def _run_sequential_evaluation(
                         _record_turnover_for_stats(per_player_stats, t.get("player_id"))
                     except Exception:
                         continue
+            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_reward_breakdown(
+                eval_diagnostics,
+                env,
+                action_results if isinstance(action_results, dict) else {},
+                info if isinstance(info, dict) else {},
+                reward,
+                user_team,
+            )
 
             obs["role_flag"] = np.array([role_flag_offense if user_team == Team.OFFENSE else role_flag_defense], dtype=np.float32)
 
@@ -693,6 +1071,7 @@ def _run_sequential_evaluation(
                 "outcome_info": {
                     "shots": last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {},
                     "turnovers": last_action_results.get("turnovers", []) if isinstance(last_action_results, dict) else [],
+                    "defensive_lane_violations": last_action_results.get("defensive_lane_violations", []) if isinstance(last_action_results, dict) else [],
                     "shot_clock": shot_clock,
                     "three_point_distance": three_point_distance,
                 },
@@ -706,6 +1085,7 @@ def _run_sequential_evaluation(
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": per_player_stats,
+        "eval_diagnostics": eval_diagnostics,
     }
 
 
@@ -810,6 +1190,7 @@ def _run_parallel_evaluation(
 
     results = []
     merged_player_stats: dict = {}
+    merged_eval_diagnostics: dict = _init_eval_diagnostics()
     for payload in batch_results:
         if not payload:
             continue
@@ -829,6 +1210,9 @@ def _run_parallel_evaluation(
                     shot_accumulator[key][0] += att
                     shot_accumulator[key][1] += mk
             merged_player_stats = _merge_player_stats(merged_player_stats, payload.get("per_player_stats") or {})
+            merged_eval_diagnostics = _merge_eval_diagnostics(
+                merged_eval_diagnostics, payload.get("eval_diagnostics") or {}
+            )
         elif isinstance(payload, list):
             results.extend(payload)
 
@@ -836,6 +1220,7 @@ def _run_parallel_evaluation(
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": merged_player_stats,
+        "eval_diagnostics": merged_eval_diagnostics,
     }
 
 
@@ -949,6 +1334,16 @@ def run_evaluation(
             if opponent_policy_path
             else None
         )
+        pass_mode = str(optional_params.get("pass_mode", "directional"))
+        for policy_obj in (unified_policy, opponent_policy):
+            policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
+            if policy is None:
+                continue
+            if hasattr(policy, "set_pass_mode"):
+                try:
+                    policy.set_pass_mode(pass_mode)
+                except Exception:
+                    pass
         user_team = Team.OFFENSE if user_team_name == "OFFENSE" else Team.DEFENSE
 
         return _run_sequential_evaluation(

@@ -15,10 +15,18 @@ class DummyEnv:
         self.training_team = None
         self.ball_holder = 0
         self.shot_clock = 24
+        self.pass_mode = "directional"
+        self.pointer_targets = {}
+
+    def set_pointer_pass_targets(self, targets):
+        self.pointer_targets = dict(targets or {})
 
     def step(self, actions):
         # Return numpy-heavy structures to exercise JSON encoding
-        obs = {"obs": np.array([[1, 2], [3, 4]]), "action_mask": np.ones((self.n_players, 2))}
+        obs = {
+            "obs": np.array([[1, 2], [3, 4]]),
+            "action_mask": np.ones((self.n_players, len(lifecycle_routes.ActionType))),
+        }
         reward = [0.1] * self.n_players
         done = False
         info = {"phi_ep_by_player": np.array([0.5] * self.n_players)}
@@ -29,7 +37,10 @@ class DummyEnv:
 def setup_dummy_env():
     # Reset game_state to a minimal dummy env before each test
     game_state.env = DummyEnv(n_players=2)
-    game_state.obs = {"obs": np.zeros((2, 2)), "action_mask": np.ones((2, 2))}
+    game_state.obs = {
+        "obs": np.zeros((2, 2)),
+        "action_mask": np.ones((2, len(lifecycle_routes.ActionType))),
+    }
     game_state.prev_obs = None
     game_state.reward_history = []
     game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
@@ -64,3 +75,29 @@ def test_step_route_handles_legacy_action_payloads_and_serializes_response():
     # Step rewards/episode rewards should be JSON-friendly
     assert isinstance(body["step_rewards"]["offense"], float)
     assert isinstance(body["step_rewards"]["defense"], float)
+
+
+def test_step_route_accepts_structured_pointer_pass_payload():
+    game_state.env.pass_mode = "pointer_targeted"
+
+    app = FastAPI()
+    app.include_router(lifecycle_routes.router)
+    client = TestClient(app)
+
+    payload = {
+        "actions": {
+            "0": {"type": "PASS", "target": 1},
+            "1": 0,
+        },
+        "team": "OFFENSE",
+    }
+
+    resp = client.post("/api/step", json=payload)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["status"] == "success"
+    assert body["actions_taken"]["0"].startswith("PASS")
+    assert body["actions_taken_meta"]["0"]["type"] == "PASS"
+    assert body["actions_taken_meta"]["0"]["target"] == 1
+    assert game_state.env.pointer_targets.get(0) == 1

@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 import os
 from typing import List
 
@@ -14,12 +15,13 @@ from app.backend.schemas import (
     SetBallHolderRequest,
     SetOffenseSkillsRequest,
     SetPassLogitBiasRequest,
+    SetPressureParamsRequest,
     SetPassTargetStrategyRequest,
     SwapPoliciesRequest,
     UpdatePositionRequest,
     UpdateShotClockRequest,
 )
-from app.backend.state import get_full_game_state, game_state
+from app.backend.state import get_ui_game_state, game_state
 from app.backend.policies import _compute_param_counts_from_policy, get_unified_policy_path
 from basketworld.envs.basketworld_env_v2 import Team
 
@@ -61,11 +63,7 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
     return {
@@ -104,11 +102,7 @@ def update_player_position(req: UpdatePositionRequest):
         "skills": game_state.obs.get("skills"),
     }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
     return {
@@ -135,7 +129,7 @@ def update_shot_clock(req: UpdateShotClockRequest):
         return {
             "status": "success",
             "shot_clock": int(game_state.env.shot_clock),
-            "state": get_full_game_state(),
+            "state": get_ui_game_state(),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -167,7 +161,7 @@ def set_ball_holder(req: SetBallHolderRequest):
             "role_flag": game_state.obs.get("role_flag"),
             "skills": game_state.obs.get("skills"),
         }
-        updated_state = get_full_game_state(include_policy_probs=True)
+        updated_state = get_ui_game_state()
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
         return {"status": "success", "state": updated_state}
@@ -219,7 +213,7 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
 
         return {
             "status": "success",
-            "state": get_full_game_state(include_policy_probs=True),
+            "state": get_ui_game_state(),
         }
     except HTTPException:
         raise
@@ -268,8 +262,344 @@ def set_pass_logit_bias(req: SetPassLogitBiasRequest):
 
     return {
         "status": "success",
-        "state": get_full_game_state(include_policy_probs=True),
+        "state": get_ui_game_state(),
     }
+
+
+def _set_pressure_params_impl(
+    req: SetPressureParamsRequest, forced_scope: str | None = None
+):
+    """Internal implementation for pressure/interception parameter updates."""
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    env = game_state.env
+
+    mlflow_defaults = (
+        game_state.mlflow_env_optional_defaults
+        or game_state.env_optional_params
+        or {}
+    )
+    all_param_keys = {
+        "three_pt_extra_hex_decay",
+        "shot_pressure_enabled",
+        "shot_pressure_max",
+        "shot_pressure_lambda",
+        "shot_pressure_arc_degrees",
+        "base_steal_rate",
+        "steal_perp_decay",
+        "steal_distance_factor",
+        "steal_position_weight_min",
+        "defender_pressure_distance",
+        "defender_pressure_turnover_chance",
+        "defender_pressure_decay_lambda",
+    }
+    scoped_param_keys = {
+        "all": set(all_param_keys),
+        "shot_pressure": {
+            "three_pt_extra_hex_decay",
+            "shot_pressure_enabled",
+            "shot_pressure_max",
+            "shot_pressure_lambda",
+            "shot_pressure_arc_degrees",
+        },
+        "pass_interception": {
+            "base_steal_rate",
+            "steal_perp_decay",
+            "steal_distance_factor",
+            "steal_position_weight_min",
+        },
+        "defender_pressure": {
+            "defender_pressure_distance",
+            "defender_pressure_turnover_chance",
+            "defender_pressure_decay_lambda",
+        },
+    }
+    requested_scope = (
+        str(forced_scope).strip().lower()
+        if forced_scope is not None
+        else str(req.scope or req.reset_group or "").strip().lower()
+    )
+    if requested_scope and requested_scope not in scoped_param_keys:
+        raise HTTPException(status_code=400, detail=f"Unknown scope: {requested_scope}")
+    active_scope = requested_scope or ""
+
+    if req.reset_to_mlflow_defaults:
+        def _default_value(key: str, fallback):
+            val = mlflow_defaults.get(key, fallback)
+            return fallback if val is None else val
+
+        default_payload = {
+            "three_pt_extra_hex_decay": _default_value(
+                "three_pt_extra_hex_decay", getattr(env, "three_pt_extra_hex_decay", 0.05)
+            ),
+            "shot_pressure_enabled": _default_value(
+                "shot_pressure_enabled", getattr(env, "shot_pressure_enabled", True)
+            ),
+            "shot_pressure_max": _default_value(
+                "shot_pressure_max", getattr(env, "shot_pressure_max", 0.5)
+            ),
+            "shot_pressure_lambda": _default_value(
+                "shot_pressure_lambda", getattr(env, "shot_pressure_lambda", 1.0)
+            ),
+            "shot_pressure_arc_degrees": _default_value(
+                "shot_pressure_arc_degrees", getattr(env, "shot_pressure_arc_degrees", 60.0)
+            ),
+            "base_steal_rate": _default_value(
+                "base_steal_rate", getattr(env, "base_steal_rate", 0.35)
+            ),
+            "steal_perp_decay": _default_value(
+                "steal_perp_decay", getattr(env, "steal_perp_decay", 1.5)
+            ),
+            "steal_distance_factor": _default_value(
+                "steal_distance_factor", getattr(env, "steal_distance_factor", 0.08)
+            ),
+            "steal_position_weight_min": _default_value(
+                "steal_position_weight_min", getattr(env, "steal_position_weight_min", 0.3)
+            ),
+            "defender_pressure_distance": _default_value(
+                "defender_pressure_distance", getattr(env, "defender_pressure_distance", 1)
+            ),
+            "defender_pressure_turnover_chance": _default_value(
+                "defender_pressure_turnover_chance",
+                getattr(env, "defender_pressure_turnover_chance", 0.05),
+            ),
+            "defender_pressure_decay_lambda": _default_value(
+                "defender_pressure_decay_lambda",
+                getattr(env, "defender_pressure_decay_lambda", 1.0),
+            ),
+        }
+        if active_scope:
+            selected_keys = set(scoped_param_keys[active_scope])
+        elif req.reset_keys is not None:
+            selected_keys = {str(k) for k in req.reset_keys}
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="reset_to_mlflow_defaults requires scope/reset_group or reset_keys",
+            )
+
+        unknown_keys = sorted(selected_keys - set(all_param_keys))
+        if unknown_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown reset_keys: {', '.join(unknown_keys)}",
+            )
+        payload = {k: v for k, v in default_payload.items() if k in selected_keys}
+    else:
+        payload = {
+            "three_pt_extra_hex_decay": req.three_pt_extra_hex_decay,
+            "shot_pressure_enabled": req.shot_pressure_enabled,
+            "shot_pressure_max": req.shot_pressure_max,
+            "shot_pressure_lambda": req.shot_pressure_lambda,
+            "shot_pressure_arc_degrees": req.shot_pressure_arc_degrees,
+            "base_steal_rate": req.base_steal_rate,
+            "steal_perp_decay": req.steal_perp_decay,
+            "steal_distance_factor": req.steal_distance_factor,
+            "steal_position_weight_min": req.steal_position_weight_min,
+            "defender_pressure_distance": req.defender_pressure_distance,
+            "defender_pressure_turnover_chance": req.defender_pressure_turnover_chance,
+            "defender_pressure_decay_lambda": req.defender_pressure_decay_lambda,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        if active_scope and active_scope != "all":
+            allowed = scoped_param_keys[active_scope]
+            payload = {k: v for k, v in payload.items() if k in allowed}
+
+    if not payload:
+        return {
+            "status": "no_change",
+            "updated_keys": [],
+            "applied_scope": active_scope or "all",
+            "state": get_ui_game_state(),
+        }
+
+    def _as_bool(v, key: str) -> bool:
+        if isinstance(v, bool):
+            return v
+        if v in (0, 1):
+            return bool(v)
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
+
+    def _as_float(v, key: str) -> float:
+        try:
+            return float(v)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be a number.")
+
+    def _as_int(v, key: str) -> int:
+        try:
+            return int(v)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be an integer.")
+
+    def _validate_range(v: float, key: str, lo: float, hi: float) -> float:
+        if v < lo or v > hi:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} must be between {lo} and {hi}.",
+            )
+        return v
+
+    def _validate_min(v: float, key: str, lo: float) -> float:
+        if v < lo:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} must be >= {lo}.",
+            )
+        return v
+
+    normalized = {}
+    if "three_pt_extra_hex_decay" in payload:
+        normalized["three_pt_extra_hex_decay"] = _validate_range(
+            _as_float(payload["three_pt_extra_hex_decay"], "three_pt_extra_hex_decay"),
+            "three_pt_extra_hex_decay",
+            0.0,
+            1.0,
+        )
+
+    if "shot_pressure_enabled" in payload:
+        normalized["shot_pressure_enabled"] = _as_bool(
+            payload["shot_pressure_enabled"], "shot_pressure_enabled"
+        )
+    if "shot_pressure_max" in payload:
+        normalized["shot_pressure_max"] = _validate_range(
+            _as_float(payload["shot_pressure_max"], "shot_pressure_max"),
+            "shot_pressure_max",
+            0.0,
+            1.0,
+        )
+    if "shot_pressure_lambda" in payload:
+        normalized["shot_pressure_lambda"] = _validate_min(
+            _as_float(payload["shot_pressure_lambda"], "shot_pressure_lambda"),
+            "shot_pressure_lambda",
+            0.0,
+        )
+    if "shot_pressure_arc_degrees" in payload:
+        normalized["shot_pressure_arc_degrees"] = _validate_range(
+            _as_float(payload["shot_pressure_arc_degrees"], "shot_pressure_arc_degrees"),
+            "shot_pressure_arc_degrees",
+            0.0,
+            360.0,
+        )
+
+    if "base_steal_rate" in payload:
+        normalized["base_steal_rate"] = _validate_range(
+            _as_float(payload["base_steal_rate"], "base_steal_rate"),
+            "base_steal_rate",
+            0.0,
+            1.0,
+        )
+    if "steal_perp_decay" in payload:
+        normalized["steal_perp_decay"] = _validate_min(
+            _as_float(payload["steal_perp_decay"], "steal_perp_decay"),
+            "steal_perp_decay",
+            0.0,
+        )
+    if "steal_distance_factor" in payload:
+        normalized["steal_distance_factor"] = _validate_min(
+            _as_float(payload["steal_distance_factor"], "steal_distance_factor"),
+            "steal_distance_factor",
+            0.0,
+        )
+    if "steal_position_weight_min" in payload:
+        normalized["steal_position_weight_min"] = _validate_range(
+            _as_float(payload["steal_position_weight_min"], "steal_position_weight_min"),
+            "steal_position_weight_min",
+            0.0,
+            1.0,
+        )
+
+    if "defender_pressure_distance" in payload:
+        normalized["defender_pressure_distance"] = _as_int(
+            payload["defender_pressure_distance"], "defender_pressure_distance"
+        )
+        if normalized["defender_pressure_distance"] < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="defender_pressure_distance must be >= 0.",
+            )
+    if "defender_pressure_turnover_chance" in payload:
+        normalized["defender_pressure_turnover_chance"] = _validate_range(
+            _as_float(
+                payload["defender_pressure_turnover_chance"],
+                "defender_pressure_turnover_chance",
+            ),
+            "defender_pressure_turnover_chance",
+            0.0,
+            1.0,
+        )
+    if "defender_pressure_decay_lambda" in payload:
+        normalized["defender_pressure_decay_lambda"] = _validate_min(
+            _as_float(
+                payload["defender_pressure_decay_lambda"],
+                "defender_pressure_decay_lambda",
+            ),
+            "defender_pressure_decay_lambda",
+            0.0,
+        )
+
+    try:
+        for key, val in normalized.items():
+            setattr(env, key, val)
+        if "shot_pressure_arc_degrees" in normalized:
+            env.shot_pressure_arc_rad = math.radians(
+                float(normalized["shot_pressure_arc_degrees"])
+            )
+
+        if game_state.env_optional_params is None:
+            game_state.env_optional_params = {}
+        game_state.env_optional_params.update(normalized)
+
+        obs_vec = env._get_observation()
+        action_mask = env._get_action_masks()
+        prior_obs = game_state.obs or {}
+        game_state.obs = {
+            "obs": obs_vec,
+            "action_mask": action_mask,
+            "role_flag": prior_obs.get("role_flag"),
+            "skills": prior_obs.get("skills"),
+        }
+
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {
+            "status": "success",
+            "updated_keys": sorted(normalized.keys()),
+            "applied_scope": active_scope or "all",
+            "state": updated_state,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update pressure/interception parameters: {e}",
+        )
+
+
+@router.post("/api/set_pressure_params")
+def set_pressure_params(req: SetPressureParamsRequest):
+    """Backward-compatible catchall endpoint for pressure/interception settings."""
+    return _set_pressure_params_impl(req)
+
+
+@router.post("/api/set_shot_pressure_params")
+def set_shot_pressure_params(req: SetPressureParamsRequest):
+    """Update only shot-pressure and shot-distance-decay parameters."""
+    return _set_pressure_params_impl(req, forced_scope="shot_pressure")
+
+
+@router.post("/api/set_pass_interception_params")
+def set_pass_interception_params(req: SetPressureParamsRequest):
+    """Update only pass-interception parameters."""
+    return _set_pressure_params_impl(req, forced_scope="pass_interception")
+
+
+@router.post("/api/set_defender_pressure_params")
+def set_defender_pressure_params(req: SetPressureParamsRequest):
+    """Update only defender turnover-pressure parameters."""
+    return _set_pressure_params_impl(req, forced_scope="defender_pressure")
 
 
 @router.post("/api/swap_policies")
@@ -294,12 +624,24 @@ def swap_policies(req: SwapPoliciesRequest):
         "SetAttentionExtractor": SetAttentionExtractor,
     }
 
+    def _apply_pass_mode(policy_obj) -> None:
+        policy = getattr(policy_obj, "policy", None)
+        if policy is None:
+            return
+        mode_value = str(getattr(game_state.env, "pass_mode", "directional"))
+        if hasattr(policy, "set_pass_mode"):
+            try:
+                policy.set_pass_mode(mode_value)
+            except Exception:
+                pass
+
     policies_changed = False
 
     if requested_user_policy is not None and requested_user_policy != game_state.unified_policy_key:
         try:
             user_path = get_unified_policy_path(client, game_state.run_id, requested_user_policy)
             game_state.unified_policy = PPO.load(user_path, custom_objects=custom_objects)
+            _apply_pass_mode(game_state.unified_policy)
             game_state.unified_policy_key = os.path.basename(user_path)
             game_state.unified_policy_path = user_path
             try:
@@ -326,6 +668,7 @@ def swap_policies(req: SwapPoliciesRequest):
             try:
                 opp_path = get_unified_policy_path(client, game_state.run_id, requested_opponent_policy)
                 game_state.defense_policy = PPO.load(opp_path, custom_objects=custom_objects)
+                _apply_pass_mode(game_state.defense_policy)
                 game_state.opponent_unified_policy_key = os.path.basename(opp_path)
                 game_state.opponent_policy_path = opp_path
                 try:
@@ -344,18 +687,10 @@ def swap_policies(req: SwapPoliciesRequest):
     if not policies_changed:
         return {
             "status": "no_change",
-            "state": get_full_game_state(
-                include_policy_probs=True,
-                include_action_values=True,
-                include_state_values=True,
-            ),
+            "state": get_ui_game_state(),
         }
 
-    updated_state = get_full_game_state(
-        include_policy_probs=True,
-        include_action_values=True,
-        include_state_values=True,
-    )
+    updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state
 

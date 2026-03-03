@@ -38,7 +38,7 @@ class PassStealPreviewRequest(BaseModel):
 
 
 class ActionRequest(BaseModel):
-    actions: dict[str, object]  # Accept nested dicts or ints; normalized in the route.
+    actions: dict[str, object]  # Accept ints, action names, or structured payloads like {type:"PASS", target:id}.
     player_deterministic: bool | None = None
     opponent_deterministic: bool | None = None
     use_mcts: bool | None = None
@@ -117,3 +117,26 @@ class SetPassTargetStrategyRequest(BaseModel):
 
 class SetPassLogitBiasRequest(BaseModel):
     bias: float | None = None
+
+
+class SetPressureParamsRequest(BaseModel):
+    reset_to_mlflow_defaults: bool = False
+    scope: str | None = None
+    reset_group: str | None = None
+    reset_keys: List[str] | None = None
+    # Shot make probability distance decay
+    three_pt_extra_hex_decay: float | None = None
+    # Shot pressure
+    shot_pressure_enabled: bool | None = None
+    shot_pressure_max: float | None = None
+    shot_pressure_lambda: float | None = None
+    shot_pressure_arc_degrees: float | None = None
+    # Pass interception
+    base_steal_rate: float | None = None
+    steal_perp_decay: float | None = None
+    steal_distance_factor: float | None = None
+    steal_position_weight_min: float | None = None
+    # Defender turnover pressure
+    defender_pressure_distance: int | None = None
+    defender_pressure_turnover_chance: float | None = None
+    defender_pressure_decay_lambda: float | None = None

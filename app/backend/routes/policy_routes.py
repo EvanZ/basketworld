@@ -4,7 +4,6 @@ from fastapi.encoders import jsonable_encoder
 from app.backend.observations import (
     _compute_q_values_for_player,
     _compute_state_values_from_obs,
-    compute_policy_probabilities,
 )
 from app.backend.schemas import SetPhiParamsRequest
 from app.backend.state import game_state
@@ -72,26 +71,6 @@ def get_phi_log():
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized")
     return {"phi_log": list(game_state.phi_log)}
-
-
-@router.get("/api/policy_probabilities")
-def get_policy_probabilities():
-    """Get action probabilities from the policy for the user's team."""
-    if not game_state.env or not game_state.user_team:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-    try:
-        response = compute_policy_probabilities()
-        if response is None:
-            raise HTTPException(
-                status_code=500, detail="Failed to compute policy probabilities"
-            )
-        return jsonable_encoder(response)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to get policy probabilities: {e}"
-        )
 
 
 @router.get("/api/debug/action_masks")
@@ -197,22 +176,14 @@ def get_shot_probability(player_id: int):
         player_pos = game_state.env.positions[player_id]
         basket_pos = game_state.env.basket_position
         distance = game_state.env._hex_distance(player_pos, basket_pos)
-        d0 = 1
-        d1 = max(game_state.env.three_point_distance, d0 + 1)
-        p0 = game_state.env.layup_pct
-        p1 = game_state.env.three_pt_pct
-        if distance <= d0:
-            base_prob = p0
-        else:
-            t = (distance - d0) / (d1 - d0)
-            base_prob = p0 + (p1 - p0) * t
+        base_prob = game_state.env._calculate_base_shot_probability(player_id, distance)
         final_prob = game_state.env._calculate_shot_probability(player_id, distance)
         return {
             "player_id": player_id,
             "shot_probability": float(base_prob),
             "shot_probability_final": float(final_prob),
             "distance": int(distance),
+            "is_three": bool(game_state.env._is_three_point_hex(tuple(player_pos))),
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}
-

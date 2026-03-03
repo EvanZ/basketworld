@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import gymnasium as gym
 import numpy as np
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
@@ -434,12 +435,15 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._turnover_intercepted = 0.0
         self._turnover_pressure = 0.0
         self._turnover_offensive_lane = 0.0
+        self._turnover_move_oob = 0.0
+        self._turnover_other = 0.0
         self._defensive_lane_violation = 0.0
         self._move_rejected_occupied = 0.0
         self._made_dunk = 0.0
         self._made_2pt = 0.0
         self._made_3pt = 0.0
         self._attempts = 0.0
+        self._expected_points = 0.0
         self._pressure_exposure = 0.0
         # Minimal audit
         self._gt_is_three = 0.0
@@ -453,6 +457,29 @@ class EpisodeStatsWrapper(gym.Wrapper):
         self._basket_r = 0.0
         # Pressure-adjusted FG% at time of shot (for CSV logging)
         self._shooter_fg_pct = -1.0
+        # Pointer-targeted pass diagnostics
+        self._pointer_pass_attempts = 0.0
+        self._pointer_pass_intent_match_sum = 0.0
+        self._pointer_pass_target_counts: dict[int, int] = {}
+
+    @staticmethod
+    def _pointer_entropy_and_kl_uniform(
+        target_counts: dict[int, int], support_size: int
+    ) -> tuple[float, float, float]:
+        """Return (entropy, normalized_entropy, KL(empirical||uniform))."""
+        if support_size <= 1 or not target_counts:
+            return 0.0, 0.0, 0.0
+        total = float(sum(max(0, int(v)) for v in target_counts.values()))
+        if total <= 0.0:
+            return 0.0, 0.0, 0.0
+        probs = [float(v) / total for v in target_counts.values() if int(v) > 0]
+        if not probs:
+            return 0.0, 0.0, 0.0
+        entropy = -sum(p * math.log(max(1e-12, p)) for p in probs)
+        max_entropy = math.log(float(support_size))
+        entropy_norm = float(entropy / max_entropy) if max_entropy > 0.0 else 0.0
+        kl_uniform = float(max_entropy - entropy)
+        return float(entropy), float(entropy_norm), float(kl_uniform)
 
     def reset(self, **kwargs):  # type: ignore[override]
         self._reset_stats()
@@ -460,10 +487,45 @@ class EpisodeStatsWrapper(gym.Wrapper):
 
     def step(self, action):  # type: ignore[override]
         obs, reward, done, truncated, info = self.env.step(action)
+        pointer_mode = (
+            str(getattr(self.env.unwrapped, "pass_mode", "directional")).lower()
+            == "pointer_targeted"
+        )
         try:
             ar = info.get("action_results", {}) if info else {}
             if ar.get("passes"):
                 self._passes += int(len(ar["passes"]))
+                if pointer_mode:
+                    for pass_res in ar["passes"].values():
+                        self._pointer_pass_attempts += 1.0
+                        intended = pass_res.get("intended_target")
+                        actual = pass_res.get("target")
+                        success = bool(pass_res.get("success", False))
+                        try:
+                            intended_id = (
+                                int(intended) if intended is not None else None
+                            )
+                        except Exception:
+                            intended_id = None
+                        try:
+                            actual_id = int(actual) if actual is not None else None
+                        except Exception:
+                            actual_id = None
+
+                        if (
+                            intended_id is not None
+                            and success
+                            and actual_id is not None
+                            and intended_id == actual_id
+                        ):
+                            self._pointer_pass_intent_match_sum += 1.0
+                        if (
+                            intended_id is not None
+                            and 0 <= intended_id < int(self.env.unwrapped.n_players)
+                        ):
+                            self._pointer_pass_target_counts[intended_id] = (
+                                self._pointer_pass_target_counts.get(intended_id, 0) + 1
+                            )
 
             if ar.get("shots"):
                 shot_res = list(ar["shots"].values())[0]
@@ -473,14 +535,18 @@ class EpisodeStatsWrapper(gym.Wrapper):
                     shooter_pos, self.env.unwrapped.basket_position
                 )
                 is_dunk = dist == 0
-                potential_assist = bool(shot_res.get("assist_potential")) and not bool(
-                    shot_res.get("success")
-                )
+                # "assist_potential" should be counted whenever a qualifying pass
+                # led to this shot attempt (made or missed).
+                potential_assist = bool(shot_res.get("assist_potential"))
                 if "is_three" in shot_res:
                     is_three = bool(shot_res["is_three"])
                 else:
                     is_three = self.env.unwrapped.is_three_point_location(shooter_pos)
                 self._attempts = 1.0
+                try:
+                    self._expected_points = float(shot_res.get("expected_points", 0.0))
+                except Exception:
+                    self._expected_points = 0.0
                 self._gt_is_three = 1.0 if (not is_dunk and is_three) else 0.0
                 self._gt_is_dunk = 1.0 if is_dunk else 0.0
                 self._gt_points = 2.0 if (is_dunk or not is_three) else 3.0
@@ -541,12 +607,38 @@ class EpisodeStatsWrapper(gym.Wrapper):
                     reason = turnover.get("reason", "")
                     if reason == "pass_out_of_bounds":
                         self._turnover_pass_oob = 1.0
-                    elif reason == "intercepted":
+                    elif reason in {"intercepted", "steal"}:
                         self._turnover_intercepted = 1.0
                     elif reason == "defender_pressure":
                         self._turnover_pressure = 1.0
                     elif reason == "offensive_three_seconds":
                         self._turnover_offensive_lane = 1.0
+                    elif reason == "move_out_of_bounds":
+                        self._turnover_move_oob = 1.0
+                    else:
+                        self._turnover_other = 1.0
+                    if pointer_mode and reason in {"steal", "pass_out_of_bounds"}:
+                        # In pointer mode, these turnovers can come from pass attempts
+                        # that never produce a successful pass record.
+                        intended = turnover.get("intended_target")
+                        try:
+                            intended_id = (
+                                int(intended) if intended is not None else None
+                            )
+                        except Exception:
+                            intended_id = None
+                        if intended_id is not None:
+                            self._pointer_pass_attempts += 1.0
+                            if (
+                                0 <= intended_id
+                                < int(self.env.unwrapped.n_players)
+                            ):
+                                self._pointer_pass_target_counts[intended_id] = (
+                                    self._pointer_pass_target_counts.get(
+                                        intended_id, 0
+                                    )
+                                    + 1
+                                )
             
             # Track defensive lane violations (separate from turnovers)
             if ar.get("defensive_lane_violations"):
@@ -586,12 +678,15 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["turnover_intercepted"] = self._turnover_intercepted
             info["turnover_pressure"] = self._turnover_pressure
             info["turnover_offensive_lane"] = self._turnover_offensive_lane
+            info["turnover_move_oob"] = self._turnover_move_oob
+            info["turnover_other"] = self._turnover_other
             info["defensive_lane_violation"] = self._defensive_lane_violation
             info["move_rejected_occupied"] = self._move_rejected_occupied
             info["made_dunk"] = self._made_dunk
             info["made_2pt"] = self._made_2pt
             info["made_3pt"] = self._made_3pt
             info["attempts"] = self._attempts
+            info["expected_points"] = self._expected_points
             exposure_val = getattr(self.env.unwrapped, "pressure_exposure", None)
             if exposure_val is None:
                 exposure_val = self._pressure_exposure
@@ -606,6 +701,32 @@ class EpisodeStatsWrapper(gym.Wrapper):
             info["basket_q"] = self._basket_q
             info["basket_r"] = self._basket_r
             info["shooter_fg_pct"] = self._shooter_fg_pct
+            # Pointer-targeted pass metrics (mode-aware)
+            support_size = int(
+                min(
+                    max(
+                        1,
+                        int(getattr(self.env.unwrapped, "players_per_side", 1)) - 1,
+                    ),
+                    6,
+                )
+            )
+            intent_match_rate = (
+                float(self._pointer_pass_intent_match_sum / self._pointer_pass_attempts)
+                if self._pointer_pass_attempts > 0.0
+                else 0.0
+            )
+            target_entropy, target_entropy_norm, target_kl_uniform = (
+                self._pointer_entropy_and_kl_uniform(
+                    self._pointer_pass_target_counts,
+                    support_size=support_size,
+                )
+            )
+            info["pointer_pass_attempts"] = float(self._pointer_pass_attempts)
+            info["pointer_pass_intent_match_rate"] = float(intent_match_rate)
+            info["pointer_pass_target_entropy"] = float(target_entropy)
+            info["pointer_pass_target_entropy_norm"] = float(target_entropy_norm)
+            info["pointer_pass_target_kl_uniform"] = float(target_kl_uniform)
             # (Reverted) keep only the original episode summary fields
         return obs, reward, done, truncated, info
 

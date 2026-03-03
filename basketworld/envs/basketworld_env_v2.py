@@ -101,6 +101,7 @@ class HexagonBasketballEnv(gym.Env):
         steal_position_weight_min: float = 0.3,
         three_point_distance: float = 4.0,
         three_point_short_distance: Optional[float] = None,
+        three_pt_extra_hex_decay: float = 0.05,
         layup_pct: float = 0.60,
         three_pt_pct: float = 0.37,
         # Baseline shooting variability (per-player, sampled each episode)
@@ -127,6 +128,7 @@ class HexagonBasketballEnv(gym.Env):
         pass_arc_degrees: float = 60.0,
         pass_oob_turnover_prob: float = 1.0,
         pass_target_strategy: str = "nearest",
+        pass_mode: str = "directional",
         enable_profiling: bool = False,
         profiling_sample_rate: float = 1.0,  # Fraction of episodes to profile (0.0-1.0)
         spawn_distance: int = 3,
@@ -220,6 +222,10 @@ class HexagonBasketballEnv(gym.Env):
         self.mask_occupied_moves = bool(mask_occupied_moves)
         # Pass gating: mask out passes without teammates in arc
         self.enable_pass_gating = bool(enable_pass_gating)
+        normalized_pass_mode = str(pass_mode).lower()
+        if normalized_pass_mode not in ("directional", "pointer_targeted"):
+            normalized_pass_mode = "directional"
+        self.pass_mode = normalized_pass_mode
         # Illegal action handling configuration/state
         try:
             self.illegal_action_policy = IllegalActionPolicy(illegal_action_policy)
@@ -227,6 +233,8 @@ class HexagonBasketballEnv(gym.Env):
             self.illegal_action_policy = IllegalActionPolicy.NOOP
         # Optional per-step action probabilities provided by caller
         self._pending_action_probs: Optional[np.ndarray] = None
+        # Optional explicit pass targets consumed by the next step.
+        self._pending_pointer_pass_targets: Dict[int, int] = {}
         # Cumulative turnover pressure exposure (sum of per-step pressure probabilities).
         self.pressure_exposure: float = 0.0
         self._legal_actions_offense: float = 0.0
@@ -240,6 +248,9 @@ class HexagonBasketballEnv(gym.Env):
             if three_point_short_distance is not None
             else None
         )
+        # Absolute make-probability decay applied per extra hex beyond
+        # (three_point_distance + 1.0).
+        self.three_pt_extra_hex_decay = max(0.0, float(three_pt_extra_hex_decay))
         self.layup_pct = float(layup_pct)
         self.three_pt_pct = float(three_pt_pct)
         # Std deviations for per-player variability (sampled each episode)
@@ -915,6 +926,8 @@ class HexagonBasketballEnv(gym.Env):
                         except Exception:
                             pass
 
+                    self._pending_action_probs = None
+                    self._pending_pointer_pass_targets = {}
                     return obs, rewards, done, False, info
 
                 # break  # Only check the first defender applying pressure each step
@@ -1005,10 +1018,11 @@ class HexagonBasketballEnv(gym.Env):
                 "total_pressure_prob": total_pressure_prob,
             }
 
-        # Update illegal defense counters based on resulting positions
-        # Defenders cannot camp in the full lane area (not just basket)
-        # Check for defensive 3-second violations BEFORE calculating rewards
-        if self.illegal_defense_enabled:
+        # Update illegal defense counters based on resulting positions.
+        # Defensive lane violations are only evaluated on non-shot steps.
+        # This keeps stats/rewards aligned with _check_termination_and_rewards,
+        # which applies violation effects only when no shot occurred.
+        if self.illegal_defense_enabled and not action_results.get("shots"):
             for did in self.defense_ids:
                 if self.positions and tuple(self.positions[did]) in self.defensive_lane_hexes:
                     if self._defender_is_guarding_offense(did):
@@ -1048,6 +1062,7 @@ class HexagonBasketballEnv(gym.Env):
 
         # Clear per-step external probabilities after use to avoid reuse
         self._pending_action_probs = None
+        self._pending_pointer_pass_targets = {}
 
         obs = {
             "obs": self._get_observation(),
@@ -1140,21 +1155,69 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             self._pending_action_probs = None
 
+    @profile_section("set_pointer_pass_targets")
+    def set_pointer_pass_targets(self, targets: Optional[Dict[int, int]]) -> None:
+        """Set explicit pass targets for the next step in pointer_targeted mode."""
+        if not targets:
+            self._pending_pointer_pass_targets = {}
+            return
+        cleaned: Dict[int, int] = {}
+        for k, v in targets.items():
+            try:
+                pid = int(k)
+                tid = int(v)
+            except Exception:
+                continue
+            cleaned[pid] = tid
+        self._pending_pointer_pass_targets = cleaned
+
     @profile_section("action_masks")
     def _get_action_masks(self) -> np.ndarray:
         """Generate a mask of legal actions for each player."""
         from basketworld.envs.core import actions as actions_core
 
-        return actions_core.build_action_masks(
+        masks = actions_core.build_action_masks(
             n_players=self.n_players,
             positions=self.positions,
             ball_holder=self.ball_holder,
             move_mask_by_cell=self._move_mask_by_cell,
             hex_directions=self.hex_directions,
             mask_occupied_moves=self.mask_occupied_moves,
-            enable_pass_gating=self.enable_pass_gating,
+            enable_pass_gating=(self.enable_pass_gating and self.pass_mode == "directional"),
             has_teammate_in_pass_arc=self._has_teammate_in_pass_arc,
         )
+
+        if self.pass_mode == "pointer_targeted" and self.ball_holder is not None:
+            bh = int(self.ball_holder)
+            teammates = self._get_pointer_pass_teammates(bh)
+            pass_start = ActionType.PASS_E.value
+            pass_end = ActionType.PASS_SE.value + 1
+            masks[bh, pass_start:pass_end] = 0
+            for slot_idx, _ in enumerate(teammates):
+                masks[bh, pass_start + slot_idx] = 1
+
+        return masks
+
+    def _get_pointer_pass_teammates(self, passer_id: int) -> List[int]:
+        """Return teammate IDs in deterministic slot order for pointer pass mode."""
+        team_ids = self.offense_ids if passer_id in self.offense_ids else self.defense_ids
+        teammates = [int(pid) for pid in team_ids if int(pid) != int(passer_id)]
+        teammates.sort()
+        # PASS_E..PASS_SE gives 6 fixed slots.
+        return teammates[:6]
+
+    def _get_pointer_pass_target_for_slot(self, passer_id: int, slot_idx: int) -> Optional[int]:
+        """Resolve pointer pass slot index (0..5) to teammate ID."""
+        try:
+            slot = int(slot_idx)
+        except Exception:
+            return None
+        if slot < 0:
+            return None
+        teammates = self._get_pointer_pass_teammates(passer_id)
+        if slot >= len(teammates):
+            return None
+        return int(teammates[slot])
 
     @profile_section("_generate_initial_positions")
     def _generate_initial_positions(self) -> List[Tuple[int, int]]:
@@ -1279,7 +1342,19 @@ class HexagonBasketballEnv(gym.Env):
                 results["shots"][player_id] = self._attempt_shot(player_id)
             elif "PASS" in action.name and player_id == self.ball_holder:
                 direction_idx = action.value - ActionType.PASS_E.value
-                self._attempt_pass(player_id, direction_idx, results)
+                explicit_target_id = None
+                if self.pass_mode == "pointer_targeted":
+                    explicit_target_id = self._pending_pointer_pass_targets.get(player_id)
+                    if explicit_target_id is None:
+                        explicit_target_id = self._get_pointer_pass_target_for_slot(
+                            player_id, direction_idx
+                        )
+                self._attempt_pass(
+                    player_id,
+                    direction_idx,
+                    results,
+                    explicit_target_id=explicit_target_id,
+                )
 
         movement_core.resolve_movement(self, actions, results, current_positions)
 
@@ -1309,7 +1384,13 @@ class HexagonBasketballEnv(gym.Env):
         return passing_core.has_teammate_in_pass_arc(self, passer_id, direction_idx)
 
     @profile_section("_attempt_pass")
-    def _attempt_pass(self, passer_id: int, direction_idx: int, results: Dict) -> None:
+    def _attempt_pass(
+        self,
+        passer_id: int,
+        direction_idx: int,
+        results: Dict,
+        explicit_target_id: Optional[int] = None,
+    ) -> None:
         """
         Arc-based passing with line-of-sight steal mechanics:
         
@@ -1329,7 +1410,13 @@ class HexagonBasketballEnv(gym.Env):
            - Defender with highest contribution gets the ball if interception occurs
         5. If no defenders in forward hemisphere between passer and receiver, pass always succeeds
         """
-        return passing_core.attempt_pass(self, passer_id, direction_idx, results)
+        return passing_core.attempt_pass(
+            self,
+            passer_id,
+            direction_idx,
+            results,
+            explicit_target_id=explicit_target_id,
+        )
 
     @profile_section("_compute_shot_pressure_multiplier")
     def _compute_shot_pressure_multiplier(
@@ -1372,6 +1459,10 @@ class HexagonBasketballEnv(gym.Env):
     @profile_section("_calculate_shot_probability")
     def _calculate_shot_probability(self, shooter_id: int, distance: int) -> float:
         return shooting_core.calculate_shot_probability(self, shooter_id, distance)
+
+    @profile_section("_calculate_base_shot_probability")
+    def _calculate_base_shot_probability(self, shooter_id: int, distance: int) -> float:
+        return shooting_core.calculate_base_shot_probability(self, shooter_id, distance)
 
     @profile_section("_check_termination_and_rewards")
     def _check_termination_and_rewards(
@@ -1443,6 +1534,15 @@ class HexagonBasketballEnv(gym.Env):
             normalized = str(strategy).lower()
             if normalized in ("nearest", "best_ev"):
                 self.pass_target_strategy = normalized
+        except Exception:
+            pass
+
+    @profile_section("set_pass_mode")
+    def set_pass_mode(self, mode: str) -> None:
+        try:
+            normalized = str(mode).lower()
+            if normalized in ("directional", "pointer_targeted"):
+                self.pass_mode = normalized
         except Exception:
             pass
 

@@ -73,6 +73,12 @@ def get_mlflow_params(
         lambda v: None if v == "" or v == "None" else float(v),
         None,
     )
+    optional["three_pt_extra_hex_decay"] = _get_param(
+        params,
+        ["three_pt_extra_hex_decay", "three-pt-extra-hex-decay"],
+        float,
+        0.05,
+    )
     optional["layup_pct"] = _get_param(params, ["layup_pct", "layup-pct"], float, 0.60)
     optional["three_pt_pct"] = _get_param(
         params, ["three_pt_pct", "three-pt-pct"], float, 0.37
@@ -289,6 +295,9 @@ def get_mlflow_params(
     )
     optional["pass_oob_turnover_prob"] = _get_param(
         params, ["pass_oob_turnover_prob", "pass-oob-turnover-prob"], float, 1.0
+    )
+    optional["pass_mode"] = _get_param(
+        params, ["pass_mode", "pass-mode"], str, "directional"
     )
     optional["enable_pass_gating"] = _get_param(
         params,
@@ -542,6 +551,9 @@ def get_mlflow_training_params(
     )
     training_params["pass_prob_min"] = _get_param(
         params, ["pass_prob_min", "pass-prob-min"], float, 0.0
+    )
+    training_params["pass_mode"] = _get_param(
+        params, ["pass_mode", "pass-mode"], str, "directional"
     )
 
     return training_params

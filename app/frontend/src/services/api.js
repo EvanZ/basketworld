@@ -76,16 +76,6 @@ export async function mctsAdvise(options = {}) {
   return response.json();
 }
 
-export async function getPolicyProbs() {
-    const response = await fetch(`${API_BASE_URL}/api/policy_probabilities`);
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ detail: 'Failed to fetch policy probabilities' }));
-        console.error('[API] getPolicyProbs failed:', response.status, errorData);
-        throw new Error(errorData.detail || 'Failed to fetch policy probabilities');
-    }
-    return response.json();
-}
-
 export async function getActionValues(playerId) {
     const response = await fetch(`${API_BASE_URL}/api/action_values/${playerId}`);
     if (!response.ok) {
@@ -179,6 +169,29 @@ export async function saveEpisodeFromPngs(frames, durations, stepDurationMs) {
         throw new Error(errorData.detail || 'Failed to save episode from PNGs');
     }
     return response.json();
+}
+
+export async function renderGifFromPngs(frames, durations, stepDurationMs) {
+    const payload = { frames };
+    if (Array.isArray(durations)) {
+        payload.durations = durations;
+    }
+    if (typeof stepDurationMs === 'number') {
+        payload.step_duration_ms = stepDurationMs;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/render_gif_from_pngs`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to render GIF from PNGs' }));
+        console.error('[API] renderGifFromPngs failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to render GIF from PNGs');
+    }
+    return response.blob();
 }
 
 export async function startSelfPlay() {
@@ -392,6 +405,45 @@ export async function setPassLogitBias(bias) {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to update pass logit bias');
+  }
+  return response.json();
+}
+
+export async function setShotPressureParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_shot_pressure_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update shot pressure parameters');
+  }
+  return response.json();
+}
+
+export async function setPassInterceptionParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_pass_interception_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update pass interception parameters');
+  }
+  return response.json();
+}
+
+export async function setDefenderPressureParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_defender_pressure_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update defender pressure parameters');
   }
   return response.json();
 }

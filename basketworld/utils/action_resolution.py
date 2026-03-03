@@ -30,6 +30,14 @@ def get_policy_action_probabilities(policy, obs) -> Optional[List[np.ndarray]]:
                 policy_obj._current_role_flags = None
         obs_tensor = policy_obj.obs_to_tensor(obs)[0]
         distributions = policy_obj.get_distribution(obs_tensor)
+        if hasattr(distributions, "action_probabilities"):
+            probs = distributions.action_probabilities()
+            if probs.ndim == 2:
+                probs = probs.unsqueeze(0)
+            return [
+                probs[:, i, :].detach().cpu().numpy().squeeze()
+                for i in range(probs.shape[1])
+            ]
         return [
             dist.probs.detach().cpu().numpy().squeeze()
             for dist in distributions.distribution

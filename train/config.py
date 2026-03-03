@@ -51,6 +51,15 @@ def get_parser() -> argparse.ArgumentParser:
         help="Optional short corner distance for 3pt line (like NBA). If None, uses circular arc.",
     )
     parser.add_argument(
+        "--three-pt-extra-hex-decay",
+        type=float,
+        default=0.05,
+        help=(
+            "Absolute FG% decay applied per hex beyond (three_point_distance + 1). "
+            "Example: 0.05 = minus 5 percentage points per extra hex."
+        ),
+    )
+    parser.add_argument(
         "--players", type=int, default=2, help="Number of players per side."
     )
     parser.add_argument(
@@ -574,7 +583,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--violation-reward",
         dest="violation_reward",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Reward for violation (team-averaged).",
     )
     parser.add_argument(
@@ -800,6 +809,14 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Minimum total probability mass assigned to pass actions per player.",
+    )
+    parser.add_argument(
+        "--pass-mode",
+        dest="pass_mode",
+        type=str,
+        choices=["directional", "pointer_targeted"],
+        default="directional",
+        help="Passing mode. 'directional' uses pass direction resolution; 'pointer_targeted' supports explicit teammate targets.",
     )
     return parser
 

@@ -39,6 +39,26 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         self.deterministic_opponent = bool(deterministic_opponent)
         self._set_team_ids()
         self._configure_action_space()
+        self._apply_pass_mode_to_policy(self.opponent_policy)
+
+    def _current_pass_mode(self) -> str:
+        try:
+            return str(getattr(self.env.unwrapped, "pass_mode", "directional")).lower()
+        except Exception:
+            return "directional"
+
+    def _apply_pass_mode_to_policy(self, policy_obj: Any) -> None:
+        if policy_obj is None:
+            return
+        try:
+            mode = self._current_pass_mode()
+            policy = getattr(policy_obj, "policy", None)
+            if policy is None:
+                policy = policy_obj
+            if hasattr(policy, "set_pass_mode"):
+                policy.set_pass_mode(mode)
+        except Exception:
+            pass
 
     def _ensure_opponent_loaded(self):
         # Allow passing a policy path string to avoid pickling full PPO
@@ -58,6 +78,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             self.opponent_policy = PPO.load(
                 self.opponent_policy, device="cpu", custom_objects=custom_objects
             )
+        self._apply_pass_mode_to_policy(self.opponent_policy)
 
     def _set_team_ids(self) -> None:
         if self.env.unwrapped.training_team == Team.OFFENSE:
@@ -89,6 +110,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             self._set_team_ids()
             # Ensure action space matches the (potentially updated) training team
             self._configure_action_space()
+            self._apply_pass_mode_to_policy(self.opponent_policy)
             return obs, info
         except Exception as e:
             # Provide detailed context so SubprocVecEnv surfaces useful diagnostics
@@ -122,6 +144,19 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 f"SelfPlayEnvWrapper.step opponent predict failed: {type(e).__name__}: {e}"
             ) from e
 
+        opp_actions_raw = np.array(opp_actions_raw, dtype=int).reshape(-1)
+        action_len = int(opp_actions_raw.shape[0])
+        action_mask = np.asarray(action_mask)
+
+        # Legacy checkpoints may emit full n_players actions while newer set-attention
+        # checkpoints emit players_per_side actions. Normalize both to opponent team size.
+        if action_len == len(self.opponent_player_ids):
+            opp_pred_actions = opp_actions_raw
+        elif action_len == int(getattr(self.env.unwrapped, "n_players", action_len)):
+            opp_pred_actions = opp_actions_raw[self._opponent_player_indices]
+        else:
+            opp_pred_actions = opp_actions_raw[: len(self.opponent_player_ids)]
+
         # Resolve opponent illegal actions using only their players
         opponent_mask = action_mask[self._opponent_player_indices]
         try:
@@ -144,7 +179,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 opponent_probs = opp_probs_full[: len(self.opponent_player_ids)]
 
         opp_actions = resolve_illegal_actions(
-            np.array(opp_actions_raw),
+            np.array(opp_pred_actions),
             opponent_mask,
             self.opponent_strategy,
             self.deterministic_opponent,

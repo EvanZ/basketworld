@@ -3,9 +3,10 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, getPolicyProbs, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -35,10 +36,51 @@ function percentToProbClamp(percent) {
   return clamped / 100;
 }
 
+function formatActionForDisplay(actionName, actionMeta) {
+  const name = typeof actionName === 'string' ? actionName : 'NOOP';
+  const metaType = String(actionMeta?.type || '').toUpperCase();
+  if ((metaType === 'PASS' || name.startsWith('PASS')) && actionMeta?.target !== undefined && actionMeta?.target !== null) {
+    const target = Number(actionMeta.target);
+    if (Number.isFinite(target)) {
+      return `PASS->${target}`;
+    }
+  }
+  return name;
+}
+
+function buildDisplayActions(actionsTaken, actionsTakenMeta = null) {
+  const mapped = {};
+  if (!actionsTaken || typeof actionsTaken !== 'object') {
+    return mapped;
+  }
+  for (const [pid, actionName] of Object.entries(actionsTaken)) {
+    const meta = actionsTakenMeta && typeof actionsTakenMeta === 'object'
+      ? actionsTakenMeta[pid]
+      : null;
+    mapped[`Player ${pid}`] = formatActionForDisplay(actionName, meta);
+  }
+  return mapped;
+}
+
+function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
+  const mapped = {};
+  if (!actionsTaken || typeof actionsTaken !== 'object') {
+    return mapped;
+  }
+  for (const [pid, actionName] of Object.entries(actionsTaken)) {
+    const numericPid = Number(pid);
+    if (!Number.isFinite(numericPid)) continue;
+    const meta = actionsTakenMeta && typeof actionsTakenMeta === 'object'
+      ? actionsTakenMeta[pid]
+      : null;
+    mapped[numericPid] = formatActionForDisplay(actionName, meta);
+  }
+  return mapped;
+}
+
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
-const replayPolicyProbsCache = ref(null);
 
 function hasAnyProbabilities(probsByPlayer) {
   if (!probsByPlayer) return false;
@@ -52,12 +94,71 @@ function hasAnyProbabilities(probsByPlayer) {
   }
   return false;
 }
+
+function syncPolicyProbsFromState(state) {
+  const snapshotProbs = state?.policy_probabilities;
+  policyProbs.value = hasAnyProbabilities(snapshotProbs) ? snapshotProbs : null;
+}
+
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
 const shotChartTarget = ref('team');
+const assistLinksByPair = ref({});
+const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const potentialAssistLinksByPair = ref({});
+const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const sankeyFlowMode = ref('assisted');
+const sankeyShotType = ref('all');
+
+const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
+
+function emptyAssistLinkTypeMap() {
+  return { dunk: {}, two: {}, three: {} };
+}
+
+function parseAssistLinkKey(rawKey) {
+  const match = String(rawKey ?? '').match(/^\s*(-?\d+)\s*->\s*(-?\d+)\s*$/);
+  if (!match) return null;
+  const source = Number(match[1]);
+  const target = Number(match[2]);
+  if (!Number.isFinite(source) || !Number.isFinite(target)) return null;
+  return { source, target };
+}
+
+function normalizeAssistLinkMap(rawMap) {
+  if (!rawMap || typeof rawMap !== 'object') return {};
+  const out = {};
+  for (const [rawKey, rawCount] of Object.entries(rawMap)) {
+    const parsed = parseAssistLinkKey(rawKey);
+    if (!parsed) continue;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    const key = `${parsed.source}->${parsed.target}`;
+    out[key] = (out[key] || 0) + count;
+  }
+  return out;
+}
+
+function normalizeAssistLinkMapByType(rawByType) {
+  const out = emptyAssistLinkTypeMap();
+  if (!rawByType || typeof rawByType !== 'object') return out;
+  for (const shotType of ASSIST_SHOT_TYPES) {
+    out[shotType] = normalizeAssistLinkMap(rawByType[shotType]);
+  }
+  return out;
+}
+
+function hasPositiveLinkCount(rawMap) {
+  if (!rawMap || typeof rawMap !== 'object') return false;
+  for (const value of Object.values(rawMap)) {
+    if (Number(value) > 0) return true;
+  }
+  return false;
+}
+
 const shotAccumulatorForBoard = computed(() => {
   if (shotChartTarget.value === 'team' || !shotChartTarget.value) {
     return shotAccumulator.value || {};
@@ -94,6 +195,7 @@ const phiRef = vueRef(null);
 const aiMode = ref(true);
 const playerDeterministic = ref(false);
 const opponentDeterministic = ref(true);
+const showOpponentActions = ref(false);
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
@@ -190,7 +292,101 @@ const shotChartOptions = computed(() => {
   }
   return opts;
 });
-const showShotChartSelector = computed(() => !isEvalPlacementMode.value && !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0);
+const hasShotChartData = computed(
+  () => !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0,
+);
+const hasAssistSankeyData = computed(
+  () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
+);
+const showShotChartSelector = computed(
+  () => !isEvalPlacementMode.value && hasShotChartData.value,
+);
+const showSankeySelector = computed(
+  () => !isEvalPlacementMode.value && hasAssistSankeyData.value,
+);
+const boardShotChartLabel = computed(() =>
+  hasShotChartData.value
+    ? (shotChartOptions.value.find((o) => o.value === shotChartTarget.value)?.label || '')
+    : '',
+);
+
+const selectedSankeyLinkMap = computed(() => {
+  const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
+  const typeMode = ASSIST_SHOT_TYPES.includes(sankeyShotType.value) ? sankeyShotType.value : 'all';
+
+  if (flowMode === 'potential') {
+    if (typeMode === 'all') return potentialAssistLinksByPair.value || {};
+    return potentialAssistLinksByType.value?.[typeMode] || {};
+  }
+  if (typeMode === 'all') return assistLinksByPair.value || {};
+  return assistLinksByType.value?.[typeMode] || {};
+});
+
+const assistSankeyTitle = computed(() => {
+  const flowLabel = sankeyFlowMode.value === 'potential'
+    ? 'Potential Assist Flows (Missed)'
+    : 'Assist Flows (Made)';
+  const typeLabel = sankeyShotType.value === 'all'
+    ? 'All Shot Types'
+    : (sankeyShotType.value === 'dunk'
+      ? 'Dunks'
+      : (sankeyShotType.value === 'two' ? '2PT' : '3PT'));
+  return `${flowLabel} • ${typeLabel}`;
+});
+const assistSankeyTotalLabel = computed(() =>
+  sankeyFlowMode.value === 'potential' ? 'Potential assists (missed)' : 'Assisted makes',
+);
+
+const assistSankeyPlayerIds = computed(() => {
+  const state = gameState.value;
+  const userTeam = String(state?.user_team_name || 'OFFENSE').toUpperCase();
+  const ids = userTeam === 'DEFENSE'
+    ? (state?.defense_ids || [])
+    : (state?.offense_ids || []);
+  const normalized = ids
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  const fallback = new Set();
+  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value]) {
+    for (const key of Object.keys(rawMap || {})) {
+      const parsed = parseAssistLinkKey(key);
+      if (!parsed) continue;
+      fallback.add(parsed.source);
+      fallback.add(parsed.target);
+    }
+  }
+  return Array.from(fallback).sort((a, b) => a - b);
+});
+
+const assistSankeyLinks = computed(() => {
+  const raw = selectedSankeyLinkMap.value || {};
+  const allowedIds = assistSankeyPlayerIds.value;
+  const allowedSet = allowedIds.length > 0 ? new Set(allowedIds) : null;
+  const out = [];
+  for (const [key, rawCount] of Object.entries(raw)) {
+    const parsed = parseAssistLinkKey(key);
+    if (!parsed) continue;
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    if (
+      allowedSet
+      && (!allowedSet.has(parsed.source) || !allowedSet.has(parsed.target))
+    ) {
+      continue;
+    }
+    out.push({
+      source: parsed.source,
+      target: parsed.target,
+      count,
+    });
+  }
+  out.sort((a, b) => b.count - a.count || a.source - b.source || a.target - b.target);
+  return out;
+});
 
 const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
 const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
@@ -202,24 +398,7 @@ const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
-    if (newState?.policy_probabilities) {
-        policyProbs.value = newState.policy_probabilities;
-    }
-
-    // Only fetch policy probs if NOT in manual stepping mode (to avoid overwriting stored historical probs)
-    if (newState && !newState.done && !isManualStepping.value && !isReplaying.value) {
-        try {
-            console.log('[App] Fetching policy probs from API (not in manual stepping mode)');
-            const response = await getPolicyProbs();
-            policyProbs.value = response;
-        } catch (err) {
-            console.error('[App] Failed to fetch policy probs:', err);
-        }
-    } else if (newState && !newState.done && isManualStepping.value) {
-        console.log('[App] Skipping policy probs fetch - in manual stepping mode, using stored probs');
-    } else if (newState && !newState.done && isReplaying.value) {
-        console.log('[App] Skipping policy probs fetch during replay - using stored probabilities in snapshots');
-    }
+    syncPolicyProbsFromState(newState);
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
@@ -252,6 +431,12 @@ async function handleGameStarted(setupData) {
   // Clear move history for new game
   moveHistory.value = [];
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   // Clear any self-play selections state
   currentSelections.value = null;
   userSelections.value = {};
@@ -269,7 +454,6 @@ async function handleGameStarted(setupData) {
   isLoading.value = true;
   error.value = null;
   policyProbs.value = null;
-  replayPolicyProbsCache.value = null;
   lastMctsResults.value = null;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
@@ -334,9 +518,6 @@ async function handleActionsSubmitted(actions) {
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
-      if (response.state?.policy_probabilities) {
-        policyProbs.value = response.state.policy_probabilities;
-      }
       lastMctsResults.value = response.mcts || null;
       
         // Update the last move with action results, shot clock, and state values BEFORE action
@@ -365,12 +546,10 @@ async function handleActionsSubmitted(actions) {
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
               console.log('[App] Actions taken:', response.actions_taken);
-              // Create a new object for reactivity
-              const newMoves = { ...lastMove.moves };
-              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
-                  newMoves[`Player ${pid}`] = actionName;
-              }
-              // Replace the whole object
+              const newMoves = {
+                ...lastMove.moves,
+                ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
+              };
               lastMove.moves = newMoves;
           }
           // Store shot clock when action was decided (before execution): board + 1
@@ -445,8 +624,6 @@ async function handleResetPositions() {
       gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
     }
 
-    const probs = await getPolicyProbs();
-    policyProbs.value = probs;
   } catch (err) {
     console.error('[App] Failed to reset turn via backend:', err);
     alert(`Failed to reset turn: ${err.message}`);
@@ -481,9 +658,6 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
         gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
       }
       
-      // Also refresh policy probs since state changed
-      const probs = await getPolicyProbs();
-      policyProbs.value = probs;
     }
   } catch (err) {
     console.error('[App] Failed to update player position:', err);
@@ -500,9 +674,7 @@ function handlePatchedGameState(newState) {
   } else {
     gameHistory.value = [clonedState];
   }
-  if (newState.policy_probabilities) {
-    policyProbs.value = { ...newState.policy_probabilities };
-  }
+  syncPolicyProbsFromState(newState);
 }
 
 async function handleShotClockAdjustment(delta) {
@@ -524,8 +696,6 @@ async function handleShotClockAdjustment(delta) {
       if (gameHistory.value.length > 0) {
         gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
       }
-      const probs = await getPolicyProbs();
-      policyProbs.value = probs;
     }
   } catch (err) {
     console.error('[App] Failed to adjust shot clock:', err);
@@ -569,16 +739,7 @@ async function handlePolicySwap({ target, policyName }) {
         gameHistory.value = [clonedState];
       }
 
-      if (newState.policy_probabilities) {
-        policyProbs.value = newState.policy_probabilities;
-      } else {
-        try {
-          const probs = await getPolicyProbs();
-          policyProbs.value = probs;
-        } catch (err) {
-          console.warn('[App] Failed to refresh policy probabilities after swap:', err);
-        }
-      }
+      syncPolicyProbsFromState(newState);
 
       // Update initialSetup so new games use the updated policy
       if (initialSetup.value) {
@@ -696,22 +857,20 @@ const boardSelectedActions = computed(() => {
         ? gameHistory.value[gameHistory.value.length - 1]
         : gameState.value) || null;
     if (visibleState?.actions_taken) {
-      const actions = {};
-      for (const [pid, action] of Object.entries(visibleState.actions_taken)) {
-        actions[parseInt(pid, 10)] = action;
-      }
-      return actions;
+      return buildBoardSelectionActions(
+        visibleState.actions_taken,
+        visibleState.actions_taken_meta,
+      );
     }
     return {};
   }
 
   // During animated replay, show the actions that led to the current state
   if (isReplaying.value && gameState.value?.actions_taken) {
-    const actions = {};
-    for (const [pid, action] of Object.entries(gameState.value.actions_taken)) {
-      actions[parseInt(pid, 10)] = action;
-    }
-    return actions;
+    return buildBoardSelectionActions(
+      gameState.value.actions_taken,
+      gameState.value.actions_taken_meta,
+    );
   }
   // During replay/manual stepping, show the stored actions from the next step
   if (isManualStepping.value && replayStates.value.length > 0) {
@@ -722,12 +881,10 @@ const boardSelectedActions = computed(() => {
     }
     const nextState = replayStates.value[nextIndex];
     if (nextState && nextState.actions_taken) {
-      // Convert string keys to number keys for player IDs
-      const actions = {};
-      for (const [pid, action] of Object.entries(nextState.actions_taken)) {
-        actions[parseInt(pid)] = action;
-      }
-      return actions;
+      return buildBoardSelectionActions(
+        nextState.actions_taken,
+        nextState.actions_taken_meta,
+      );
     }
     return {};
   }
@@ -735,6 +892,35 @@ const boardSelectedActions = computed(() => {
     return currentSelections.value;
   }
   return userSelections.value;
+});
+
+const visibleBoardSelectedActions = computed(() => {
+  const selections = boardSelectedActions.value || {};
+  if (showOpponentActions.value) return selections;
+
+  const state = gameState.value;
+  if (!state) return selections;
+
+  const userTeamName = String(state.user_team_name || 'OFFENSE').toUpperCase();
+  const userTeamIds = userTeamName === 'DEFENSE'
+    ? (state.defense_ids || [])
+    : (state.offense_ids || []);
+  const allowedIds = new Set(
+    userTeamIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id)),
+  );
+
+  if (allowedIds.size === 0) return selections;
+
+  const filtered = {};
+  for (const [pid, action] of Object.entries(selections)) {
+    const numericPid = Number(pid);
+    if (!Number.isFinite(numericPid) || allowedIds.has(numericPid)) {
+      filtered[pid] = action;
+    }
+  }
+  return filtered;
 });
 
 // Handler for Self-Play button click
@@ -798,6 +984,7 @@ async function handleSelfPlay(preselected = null) {
           }
           const probs = policyProbs.value[playerId];
           const actionMask = gameState.value.action_mask[playerId];
+          const ballHolder = Number(gameState.value?.ball_holder);
 
           // If this is the first loop iteration and preselected is provided, honor it
           if (preselected && preselected[`$${playerId}`] === undefined && preselected[playerId] === undefined) {
@@ -823,15 +1010,22 @@ async function handleSelfPlay(preselected = null) {
           }
           
           if (Array.isArray(probs) && Array.isArray(actionMask)) {
+            const effectiveMask = [...actionMask];
+            // Mirror frontend controls invariant: only current ball handler can SHOOT/PASS.
+            if (Number.isFinite(ballHolder) && Number(playerId) !== ballHolder) {
+              for (let idx = 7; idx <= 13 && idx < effectiveMask.length; idx += 1) {
+                effectiveMask[idx] = 0;
+              }
+            }
             let selectedActionIndex = 0;
             
             if (playerDeterministic.value) {
               // Deterministic: Pick action with highest probability (argmax) among LEGAL actions only
               let bestProb = -1;
               
-              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
+              for (let i = 0; i < probs.length && i < effectiveMask.length; i++) {
                 // Only consider legal actions (action_mask[i] === 1)
-                if (actionMask[i] === 1 && probs[i] > bestProb) {
+                if (effectiveMask[i] === 1 && probs[i] > bestProb) {
                   bestProb = probs[i];
                   selectedActionIndex = i;
                 }
@@ -842,8 +1036,8 @@ async function handleSelfPlay(preselected = null) {
               const legalIndices = [];
               const legalProbs = [];
               
-              for (let i = 0; i < probs.length && i < actionMask.length; i++) {
-                if (actionMask[i] === 1) {
+              for (let i = 0; i < probs.length && i < effectiveMask.length; i++) {
+                if (effectiveMask[i] === 1) {
                   legalIndices.push(i);
                   legalProbs.push(probs[i]);
                 }
@@ -928,9 +1122,6 @@ async function handleSelfPlay(preselected = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
-        if (response.state?.policy_probabilities) {
-          policyProbs.value = response.state.policy_probabilities;
-        }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -946,12 +1137,10 @@ async function handleSelfPlay(preselected = null) {
           // Update moves with actual actions taken (including opponent)
           if (response.actions_taken) {
               console.log('[App] Actions taken:', response.actions_taken);
-              // Create a new object for reactivity
-              const newMoves = { ...lastMove.moves };
-              for (const [pid, actionName] of Object.entries(response.actions_taken)) {
-                  newMoves[`Player ${pid}`] = actionName;
-              }
-              // Replace the whole object
+              const newMoves = {
+                ...lastMove.moves,
+                ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
+              };
               lastMove.moves = newMoves;
           }
           // Store shot clock when action was decided (before execution): board + 1
@@ -1070,24 +1259,31 @@ function handleEvalPlacementUpdate({ playerId, q, r }) {
 
 function buildCustomEvalSetup() {
   if (!gameState.value || evalConfig.value.mode !== 'custom') return null;
-  const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
-  let positions = Array.isArray(evalConfig.value.positions) ? evalConfig.value.positions : [];
-  if (positions.length !== nPlayers && gameState.value.positions) {
-    positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
-  }
-  if (positions.length !== nPlayers) {
-    throw new Error(`Custom setup requires ${nPlayers} positions (found ${positions.length}).`);
-  }
-  const offenseIds = gameState.value.offense_ids || [];
-  const defaultBall = offenseIds.length ? offenseIds[0] : 0;
-  const rawBh = evalConfig.value.ballHolder ?? gameState.value.ball_holder ?? defaultBall;
-  const ballHolder = offenseIds.includes(rawBh) ? rawBh : defaultBall;
+  const usePinnedPlacement = !!evalConfig.value.placementEditing;
   const shootingMode = evalConfig.value.shootingMode || 'random';
   const payload = {
-    initial_positions: positions,
-    ball_holder: ballHolder,
     shooting_mode: shootingMode,
   };
+
+  // In custom eval mode, placement editing controls whether we pin placement.
+  // If disabled, backend reset uses randomized spawn positions + random offensive ball handler.
+  if (usePinnedPlacement) {
+    const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+    let positions = Array.isArray(evalConfig.value.positions) ? evalConfig.value.positions : [];
+    if (positions.length !== nPlayers && gameState.value.positions) {
+      positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
+    }
+    if (positions.length !== nPlayers) {
+      throw new Error(`Custom setup requires ${nPlayers} positions (found ${positions.length}).`);
+    }
+    const offenseIds = gameState.value.offense_ids || [];
+    const defaultBall = offenseIds.length ? offenseIds[0] : 0;
+    const rawBh = evalConfig.value.ballHolder ?? gameState.value.ball_holder ?? defaultBall;
+    const ballHolder = offenseIds.includes(rawBh) ? rawBh : defaultBall;
+    payload.initial_positions = positions;
+    payload.ball_holder = ballHolder;
+  }
+
   if (shootingMode === 'fixed') {
     const offenseCount = gameState.value.offense_ids?.length || 0;
     const skills = evalConfig.value.skills || {};
@@ -1121,6 +1317,12 @@ async function handleEvaluation() {
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   perPlayerEvalStats.value = {};
   
   // Reset stats at the beginning
@@ -1159,26 +1361,58 @@ async function handleEvaluation() {
     
   if (response.status === 'success' && Array.isArray(response.results)) {
     console.log(`[App] Evaluation completed: ${response.results.length} episodes - processing all results immediately`);
-    
-    // Process all episode results and update stats immediately
-    let lastEpisodeState = null;
-      
+
+    const lastEpisodeState = response.results.length > 0
+      ? response.results[response.results.length - 1]?.final_state
+      : null;
+
+    if (controlsRef.value?.applyEvaluationStats) {
+      const teamName =
+        response?.current_state?.user_team_name
+        || gameState.value?.user_team_name
+        || 'OFFENSE';
+      controlsRef.value.applyEvaluationStats(
+        response.results,
+        response.per_player_stats || {},
+        teamName,
+        response.eval_diagnostics || {}
+      );
+    } else {
       for (const result of response.results) {
-        // Save the last episode state for display
-        lastEpisodeState = result.final_state;
-        
-        // Record stats for this episode (skip API calls for speed)
         if (controlsRef.value?.recordEpisodeStats && result.final_state?.done) {
           await controlsRef.value.recordEpisodeStats(result.final_state, true, result);
         }
       }
-      
-      console.log('[App] All stats recorded');
+    }
+
+    console.log('[App] Evaluation stats hydrated');
       if (!response.shot_accumulator) {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      const evalDiagnostics = response.eval_diagnostics || {};
+      assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
+      assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
+      potentialAssistLinksByPair.value = normalizeAssistLinkMap(
+        evalDiagnostics.potential_assist_links,
+      );
+      potentialAssistLinksByType.value = normalizeAssistLinkMapByType(
+        evalDiagnostics.potential_assist_links_by_type,
+      );
       perPlayerEvalStats.value = response.per_player_stats || {};
+      try {
+        const totals = Object.values(perPlayerEvalStats.value || {}).reduce(
+          (acc, row) => {
+            acc.shots += Number(row?.shots || 0);
+            acc.makes += Number(row?.makes || 0);
+            return acc;
+          },
+          { shots: 0, makes: 0 },
+        );
+        console.log('[App] Eval aggregate (all players):', totals);
+      } catch (_) {
+        // no-op
+      }
       console.log('[App] Shot accumulator keys:', Object.keys(shotAccumulator.value || {}).length, 'data:', shotAccumulator.value);
       
       // Update game state to the fresh state from backend (after evaluation reset)
@@ -1424,28 +1658,13 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
       if (keepCurrentView) {
         // Keep showing current state (usually the final state), start from end
         currentStepIndex.value = res.states.length - 1;
-        // Load policy probs from the final state
-        if (hasAnyProbabilities(res.states[res.states.length - 1].policy_probabilities)) {
-          policyProbs.value = res.states[res.states.length - 1].policy_probabilities;
-          replayPolicyProbsCache.value = policyProbs.value;
-        } else {
-          policyProbs.value = replayPolicyProbsCache.value;
-          console.warn('[handleManualReplay] No policy_probabilities in final state - episode may have been recorded before backend changes');
-        }
-        // Keep current gameState and gameHistory as-is
+        gameState.value = res.states[currentStepIndex.value];
+        gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
       } else {
         // Reset to beginning
         currentStepIndex.value = 0;
         gameState.value = res.states[0];
         gameHistory.value = [res.states[0]];
-        // Load policy probs from the first state
-        if (hasAnyProbabilities(res.states[0].policy_probabilities)) {
-          policyProbs.value = res.states[0].policy_probabilities;
-          replayPolicyProbsCache.value = policyProbs.value;
-        } else {
-          policyProbs.value = replayPolicyProbsCache.value;
-          console.warn('[handleManualReplay] No policy_probabilities in first state - episode may have been recorded before backend changes');
-        }
       }
     } else {
       throw new Error('Invalid replay response');
@@ -1464,22 +1683,10 @@ function stepForward() {
   if (currentStepIndex.value < replayStates.value.length - 1) {
     currentStepIndex.value += 1;
     const currentState = replayStates.value[currentStepIndex.value];
-    
-    // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (hasAnyProbabilities(currentState.policy_probabilities)) {
-      console.log(`[stepForward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
-      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
-      replayPolicyProbsCache.value = policyProbs.value;
-    } else {
-      console.warn(`[stepForward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
-      policyProbs.value = replayPolicyProbsCache.value;
-    }
-    
-    // Then update gameState and history
+
+    // Update gameState and history from the same replay snapshot.
     gameState.value = currentState;
     gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
-    
-    console.log(`[stepForward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -1488,22 +1695,10 @@ function stepBackward() {
   if (currentStepIndex.value > 0) {
     currentStepIndex.value -= 1;
     const currentState = replayStates.value[currentStepIndex.value];
-    
-    // Update policy probabilities BEFORE gameState to avoid race conditions
-    if (hasAnyProbabilities(currentState.policy_probabilities)) {
-      console.log(`[stepBackward] Step ${currentStepIndex.value} - updating policy probs FIRST:`, JSON.stringify(currentState.policy_probabilities).substring(0, 150));
-      policyProbs.value = { ...currentState.policy_probabilities }; // Create new object to trigger reactivity
-      replayPolicyProbsCache.value = policyProbs.value;
-    } else {
-      console.warn(`[stepBackward] Step ${currentStepIndex.value} - missing/empty policy_probabilities in state; using cache`);
-      policyProbs.value = replayPolicyProbsCache.value;
-    }
-    
-    // Then update gameState and history
+
+    // Update gameState and history from the same replay snapshot.
     gameState.value = currentState;
     gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
-    
-    console.log(`[stepBackward] Step ${currentStepIndex.value} complete. policyProbs ref value:`, JSON.stringify(policyProbs.value).substring(0, 100));
   }
 }
 
@@ -1512,6 +1707,12 @@ function handlePlayAgain() {
   gameHistory.value = [];
   policyProbs.value = null;
   shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
   placementPassPreview.value = {};
   evalConfig.value = defaultEvalConfig();
   activePlayerId.value = null;
@@ -1621,6 +1822,10 @@ onBeforeUnmount(() => {
             <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Opponent Deterministic</span>
           </button>
+          <button class="toggle-btn" @click="showOpponentActions = !showOpponentActions">
+            <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+            <span class="toggle-label">Show Opponent Actions</span>
+          </button>
         </div>
 
       </div>
@@ -1629,13 +1834,29 @@ onBeforeUnmount(() => {
     <div v-if="gameState" class="game-container">
       <div class="board-area">
         <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
-        <div v-if="showShotChartSelector" class="shot-chart-selector">
-          <label>Shot chart:</label>
-          <select v-model="shotChartTarget">
-            <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
-              {{ opt.label }}
-            </option>
-          </select>
+        <div v-if="showShotChartSelector || showSankeySelector" class="shot-chart-selector">
+          <template v-if="showShotChartSelector">
+            <label>Shot chart:</label>
+            <select v-model="shotChartTarget">
+              <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+          </template>
+          <template v-if="showSankeySelector">
+            <label>Sankey:</label>
+            <select v-model="sankeyFlowMode">
+              <option value="assisted">Assisted makes</option>
+              <option value="potential">Potential assists (missed)</option>
+            </select>
+            <label>Type:</label>
+            <select v-model="sankeyShotType">
+              <option value="all">All</option>
+              <option value="dunk">Dunk</option>
+              <option value="two">2PT</option>
+              <option value="three">3PT</option>
+            </select>
+          </template>
         </div>
         <GameBoard 
           ref="gameBoardRef"
@@ -1643,9 +1864,9 @@ onBeforeUnmount(() => {
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="policyProbs"
           :is-manual-stepping="isManualStepping"
-          :selected-actions="boardSelectedActions"
+          :selected-actions="visibleBoardSelectedActions"
           :shot-accumulator="shotAccumulatorForBoard"
-          :shot-chart-label="shotChartOptions.find(o => o.value === shotChartTarget)?.label || ''"
+          :shot-chart-label="boardShotChartLabel"
           :placement-mode="isEvalPlacementMode"
           :placement-editable="evalConfig.placementEditing"
           :placement-positions="evalConfig.positions"
@@ -1657,6 +1878,13 @@ onBeforeUnmount(() => {
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
+        />
+        <AssistSankey
+          v-if="!isEvalPlacementMode && hasAssistSankeyData"
+          :links="assistSankeyLinks"
+          :player-ids="assistSankeyPlayerIds"
+          :title="assistSankeyTitle"
+          :total-label="assistSankeyTotalLabel"
         />
         <KeyboardLegend />
       </div>
@@ -1673,13 +1901,13 @@ onBeforeUnmount(() => {
             :policy-options="policyOptions"
             :policies-loading="policiesLoading"
             :policy-load-error="policyLoadError"
-            :stored-policy-probs="policyProbs"
             :mcts-results="lastMctsResults"
             :initial-use-mcts="persistUseMcts"
           :mcts-step-running="isMctsStepRunning"
           :ai-mode="aiMode"
           :deterministic="playerDeterministic"
           :opponent-deterministic="opponentDeterministic"
+          :show-opponent-actions="showOpponentActions"
           :move-history="moveHistory"
           :current-shot-clock="currentShotClock"
           :pressure-exposure="pressureExposure"
@@ -1970,6 +2198,8 @@ header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 .shot-chart-selector label {
   color: var(--app-text-muted);

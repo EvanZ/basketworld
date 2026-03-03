@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
-import { getShotProbability, getPassStealProbabilities } from '@/services/api';
+import { getShotProbability, getPassStealProbabilities, renderGifFromPngs } from '@/services/api';
 
 const props = defineProps({
   gameHistory: {
@@ -118,6 +118,46 @@ function hexDistance(a, b) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
+function isPointerPassMode(gs) {
+  return String(gs?.pass_mode || 'directional').toLowerCase() === 'pointer_targeted';
+}
+
+function getPointerPassTeammates(gs, passerId) {
+  if (!gs || passerId === null || passerId === undefined) return [];
+  const pid = Number(passerId);
+  const offense = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const defense = Array.isArray(gs.defense_ids) ? gs.defense_ids : [];
+  const team = offense.includes(pid) ? offense : defense.includes(pid) ? defense : [];
+  return team
+    .filter((tid) => Number(tid) !== pid)
+    .map((tid) => Number(tid))
+    .filter((tid) => Number.isFinite(tid))
+    .sort((a, b) => a - b)
+    .slice(0, 6);
+}
+
+function resolvePassTargetFromAction(gs, passerId, action) {
+  if (!gs || !action || passerId === null || passerId === undefined) return null;
+
+  const directMatch = String(action).match(/^PASS->(\d+)$/);
+  if (directMatch) {
+    const targetId = Number(directMatch[1]);
+    return Number.isFinite(targetId) ? targetId : null;
+  }
+
+  if (!String(action).startsWith('PASS_')) return null;
+
+  if (isPointerPassMode(gs)) {
+    const slotIdx = PASS_ACTION_TO_DIR[action];
+    if (slotIdx === undefined) return null;
+    const teammates = getPointerPassTeammates(gs, passerId);
+    if (slotIdx < 0 || slotIdx >= teammates.length) return null;
+    return teammates[slotIdx];
+  }
+
+  return null;
+}
+
 function getRenderablePlayers(gameState) {
   if (!gameState || !gameState.positions) return [];
   return gameState.positions.map((pos, index) => {
@@ -148,6 +188,7 @@ let shotFlashSerial = 0;
 const shotFlashNowMs = ref(0);
 const shotFlashRaf = ref(null);
 const shotFlashTimeout = ref(null);
+const lastShotAnimationKey = ref(null);
 const shotJumpPlayerId = ref(null);
 const shotJumpTimeout = ref(null);
 const shotJumpIsDunk = ref(false);
@@ -159,7 +200,12 @@ const shotInFlightPlayerId = computed(() => {
   const shooterId = Number(entry[0]);
   return Number.isNaN(shooterId) ? null : shooterId;
 });
+const showShotPressureRing = ref(true);
+const showDefenderPressureShake = ref(true);
 const policyVisibility = ref(new Set()); // Player IDs with policy overlays shown
+const showDownloadMenu = ref(false);
+const downloadMenuRef = ref(null);
+const isDownloadRunning = ref(false);
 const clickTimeout = ref(null);
 const SINGLE_CLICK_DELAY = 220;
 const DRIBBLE_PERIOD_SECONDS = 0.5;
@@ -175,6 +221,94 @@ function clearClickTimeout() {
     clearTimeout(clickTimeout.value);
     clickTimeout.value = null;
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function closeDownloadMenu() {
+  showDownloadMenu.value = false;
+}
+
+function toggleDownloadMenu() {
+  if (isDownloadRunning.value) return;
+  showDownloadMenu.value = !showDownloadMenu.value;
+}
+
+function onGlobalMouseDown(event) {
+  if (!showDownloadMenu.value) return;
+  const root = downloadMenuRef.value;
+  if (!root) return;
+  if (root.contains(event.target)) return;
+  closeDownloadMenu();
+}
+
+async function downloadBoardAsGif() {
+  if (isDownloadRunning.value) return;
+  isDownloadRunning.value = true;
+
+  try {
+    const targetDurationMs = 840; // Keep similar overall speed as prior single-step GIF capture.
+    const frameCount = 24;
+    const targetStepDurationMs = targetDurationMs / Math.max(1, frameCount - 1);
+    const capturedFrames = [];
+    const durations = [];
+    const captureStartMs = performance.now();
+
+    for (let i = 0; i < frameCount; i += 1) {
+      const targetCaptureMs = captureStartMs + (i * targetStepDurationMs);
+      const waitMs = targetCaptureMs - performance.now();
+      if (waitMs > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(waitMs);
+      }
+
+      const capturedAtMs = performance.now();
+      // eslint-disable-next-line no-await-in-loop
+      const pngDataUrl = await renderStateToPng();
+      if (pngDataUrl) {
+        capturedFrames.push({ pngDataUrl, capturedAtMs });
+      }
+    }
+
+    if (capturedFrames.length < 2) {
+      throw new Error('Not enough frames to build GIF');
+    }
+
+    const frames = capturedFrames.map((f) => f.pngDataUrl);
+    for (let i = 0; i < capturedFrames.length - 1; i += 1) {
+      const deltaMs = Math.max(
+        10,
+        Number(capturedFrames[i + 1].capturedAtMs) - Number(capturedFrames[i].capturedAtMs),
+      );
+      durations.push(deltaMs / 1000);
+    }
+    durations.push(durations.length > 0 ? durations[durations.length - 1] : (targetStepDurationMs / 1000));
+
+    const gifBlob = await renderGifFromPngs(frames, durations, targetStepDurationMs);
+    const url = URL.createObjectURL(gifBlob);
+    const link = document.createElement('a');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    link.download = `basketworld-board-${timestamp}.gif`;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    console.error('[GameBoard] Failed to download GIF:', err);
+    alert('Failed to download animated GIF');
+  } finally {
+    isDownloadRunning.value = false;
+  }
+}
+
+async function handleDownloadChoice(format) {
+  closeDownloadMenu();
+  if (format === 'gif') {
+    await downloadBoardAsGif();
+    return;
+  }
+  await downloadBoardAsImage();
 }
 
 function togglePolicyVisibility(playerId) {
@@ -575,10 +709,31 @@ const ICON_ROTATIONS = {
 
 // Get action indicator data for a player
 function getActionIndicator(playerId, playerX, playerY, hasBall) {
-  const action = props.selectedActions[playerId];
+  const rawAction = props.selectedActions[playerId];
+  const action = typeof rawAction === 'string' ? rawAction : null;
   if (!action || action === 'NOOP') return null;
   
   const indicatorRadius = HEX_RADIUS * 0.55; // Distance from player center to indicator
+
+  const gs = currentGameState.value;
+  const resolvedTargetId = resolvePassTargetFromAction(gs, playerId, action);
+  if (resolvedTargetId !== null && (hasBall || props.disableTransitions)) {
+    const targetId = Number(resolvedTargetId);
+    const targetPos = currentGameState.value?.positions?.[targetId];
+    if (targetPos) {
+      const target = axialToCartesian(targetPos[0], targetPos[1]);
+      const dx = target.x - playerX;
+      const dy = target.y - playerY;
+      const rad = Math.atan2(dy, dx);
+      const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+      return {
+        type: 'pass',
+        x: playerX + indicatorRadius * Math.cos(rad),
+        y: playerY + indicatorRadius * Math.sin(rad),
+        rotation: angleDeg + 90,
+      };
+    }
+  }
   
   if (action.startsWith('MOVE_')) {
     const posAngle = POSITION_ANGLES[action];
@@ -992,17 +1147,318 @@ const ballHandlerShotProb = computed(() => {
 
 // Backend-calculated conditional make probability for the ball handler (pressure-adjusted)
 const ballHandlerMakeProb = ref(null);
+const ballHandlerBaseProb = ref(null);
+const DEFENDER_PRESSURE_SHAKE_EPS = 0.001;
+const OFFENSE_SHELL_LOW = [17, 60, 131];
+const OFFENSE_SHELL_HIGH = [30, 192, 30];
+const OFFENSE_EP_COLOR_MIN = 0.5;
+const OFFENSE_EP_COLOR_MAX = 2;
+
+function clamp01(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.min(1, num));
+}
+
+function lerpChannel(a, b, t) {
+  return Math.round(a + ((b - a) * t));
+}
+
+function offenseShellColor(playerId) {
+  const epRaw = Number(currentGameState.value?.ep_by_player?.[playerId]);
+  const ep = Number.isFinite(epRaw) ? epRaw : 0;
+  const epRange = Math.max(1e-9, OFFENSE_EP_COLOR_MAX - OFFENSE_EP_COLOR_MIN);
+  const t = clamp01((ep - OFFENSE_EP_COLOR_MIN) / epRange);
+  const r = lerpChannel(OFFENSE_SHELL_LOW[0], OFFENSE_SHELL_HIGH[0], t);
+  const g = lerpChannel(OFFENSE_SHELL_LOW[1], OFFENSE_SHELL_HIGH[1], t);
+  const b = lerpChannel(OFFENSE_SHELL_LOW[2], OFFENSE_SHELL_HIGH[2], t);
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function playerCircleStyle(player) {
+  const style = { cursor: 'grab' };
+  if (player?.isOffense) {
+    style.fill = offenseShellColor(player.id);
+  }
+  return style;
+}
+
+function shotPressureColor(pressureReduction, maxReduction = 1) {
+  const denom = Number.isFinite(Number(maxReduction)) && Number(maxReduction) > 0
+    ? Number(maxReduction)
+    : 1;
+  const p = clamp01(Number(pressureReduction) / denom);
+  // 0.0 => orange (low pressure), 1.0 => red (high pressure)
+  const hue = 28 * (1 - p);
+  return `hsl(${hue}, 92%, 54%)`;
+}
+
+const dominantShotPressureDefender = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return null;
+
+  const shooterId = Number(gs.ball_holder);
+  if (!Number.isFinite(shooterId)) return null;
+
+  const positions = Array.isArray(gs.positions) ? gs.positions : null;
+  const shooterPos = positions?.[shooterId];
+  const basketPos = Array.isArray(gs.basket_position) ? gs.basket_position : null;
+  if (!Array.isArray(shooterPos) || !Array.isArray(basketPos)) return null;
+
+  const dir = axialToCartesian(
+    Number(basketPos[0]) - Number(shooterPos[0]),
+    Number(basketPos[1]) - Number(shooterPos[1]),
+  );
+  const dirNorm = Math.hypot(dir.x, dir.y) || 1;
+  const arcDegRaw = Number(gs.shot_pressure_arc_degrees ?? 60);
+  const arcDeg = Number.isFinite(arcDegRaw) ? Math.max(1, Math.min(360, arcDegRaw)) : 60;
+  const cosThreshold = Math.cos((arcDeg * Math.PI) / 360);
+  const distanceToBasket = hexDistance(shooterPos, basketPos);
+
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids : [];
+  const opponentIds = offenseIds.includes(shooterId) ? defenseIds : offenseIds;
+
+  const maxRaw = Number(gs.shot_pressure_max ?? 0.5);
+  const shotPressureMax = Number.isFinite(maxRaw) ? Math.max(0, maxRaw) : 0.5;
+  const lambdaRaw = Number(gs.shot_pressure_lambda ?? 1.0);
+  const shotPressureLambda = Number.isFinite(lambdaRaw) ? Math.max(0, lambdaRaw) : 1.0;
+
+  let best = null;
+  for (const rawDefenderId of opponentIds) {
+    const defenderId = Number(rawDefenderId);
+    if (!Number.isFinite(defenderId)) continue;
+    const defenderPos = positions?.[defenderId];
+    if (!Array.isArray(defenderPos)) continue;
+
+    const dq = Number(defenderPos[0]) - Number(shooterPos[0]);
+    const dr = Number(defenderPos[1]) - Number(shooterPos[1]);
+    const v = axialToCartesian(dq, dr);
+    const vNorm = Math.hypot(v.x, v.y);
+    if (vNorm === 0) continue;
+
+    const cosang = (v.x * dir.x + v.y * dir.y) / (vNorm * dirNorm);
+    const dDef = hexDistance(shooterPos, defenderPos);
+    if (cosang < cosThreshold || dDef > distanceToBasket) continue;
+
+    const angleFactor = cosThreshold < 1 ? (cosang - cosThreshold) / (1 - cosThreshold) : 1;
+    const distanceReduction = shotPressureMax * Math.exp(-shotPressureLambda * (dDef - 1));
+    const reduction = clamp01(distanceReduction * (angleFactor ** 2));
+
+    if (!best || reduction > best.reduction) {
+      best = { defenderId, reduction };
+    }
+  }
+  return best;
+});
+
+const ballHandlerPressureReduction = computed(() => {
+  const rawReduction = clamp01(Number(dominantShotPressureDefender.value?.reduction ?? 0));
+  // Treat tiny numeric noise as no pressure so the ring disappears cleanly.
+  return rawReduction <= 0.01 ? 0 : rawReduction;
+});
+
+const ballHandlerShotPressureRing = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || !showShotPressureRing.value) return null;
+  if (!gs.shot_pressure_enabled) return null;
+  if (gs.ball_holder === null || gs.ball_holder === undefined) return null;
+
+  const pressureReduction = Number(ballHandlerPressureReduction.value);
+  if (!Number.isFinite(pressureReduction) || pressureReduction <= 0) return null;
+
+  const pid = Number(dominantShotPressureDefender.value?.defenderId);
+  if (!Number.isFinite(pid)) return null;
+
+  const scaleDenom = Number(gs.shot_pressure_max);
+  const normalizedPressure = clamp01(
+    pressureReduction / (Number.isFinite(scaleDenom) && scaleDenom > 0 ? scaleDenom : 1),
+  );
+  const opacity = 0.35 + (0.55 * normalizedPressure);
+  const strokeWidth = HEX_RADIUS * (0.065 + 0.1 * normalizedPressure);
+  const playerMarkerRadius = HEX_RADIUS * 0.8;
+  const ringGapPx = 1.0;
+  const ringRadius = playerMarkerRadius + ringGapPx + (strokeWidth / 2);
+  const pressurePct = pressureReduction * 100;
+  const pulseEnabled = normalizedPressure >= 0.2;
+  const pulseDurationSec = 1.7 - (0.9 * normalizedPressure);
+  const pulseScale = 1.0 + (0.02 + 0.05 * normalizedPressure);
+  const basePct = Number.isFinite(Number(ballHandlerBaseProb.value))
+    ? Number(ballHandlerBaseProb.value) * 100
+    : null;
+  const finalPct = Number.isFinite(Number(ballHandlerMakeProb.value))
+    ? Number(ballHandlerMakeProb.value) * 100
+    : null;
+
+  return {
+    playerId: pid,
+    color: shotPressureColor(pressureReduction, scaleDenom),
+    opacity,
+    strokeWidth,
+    radius: ringRadius,
+    normalizedPressure,
+    pulseEnabled,
+    pulseDurationSec,
+    pulseScale,
+    pressurePct,
+    basePct,
+    finalPct,
+  };
+});
+
+const defenderTurnoverPressureById = computed(() => {
+  const out = {};
+  const gs = currentGameState.value;
+  if (!gs) return out;
+
+  const setPressure = (defenderId, turnoverProb) => {
+    const did = Number(defenderId);
+    const prob = clamp01(Number(turnoverProb));
+    if (!Number.isFinite(did) || prob <= DEFENDER_PRESSURE_SHAKE_EPS) return;
+    const existing = Number(out[did] || 0);
+    out[did] = Math.max(existing, prob);
+  };
+
+  // Primary source: backend's per-step defender pressure diagnostics.
+  const pressureByBallHandler = gs.last_action_results?.defender_pressure;
+  if (pressureByBallHandler && typeof pressureByBallHandler === 'object') {
+    const ballHolderId = gs.ball_holder;
+    const ballHolderNum = Number(ballHolderId);
+    const ballHandlerPressure = pressureByBallHandler[ballHolderId]
+      ?? pressureByBallHandler[String(ballHolderId)]
+      ?? (Number.isFinite(ballHolderNum) ? pressureByBallHandler[ballHolderNum] : null);
+    const defenders = Array.isArray(ballHandlerPressure?.defenders) ? ballHandlerPressure.defenders : [];
+    for (const defenderInfo of defenders) {
+      setPressure(defenderInfo?.defender_id, defenderInfo?.turnover_prob);
+    }
+  }
+
+  // Fallback source: replicate backend geometry so pressure is still visible
+  // if last_action_results is stale or missing in the current render frame.
+  const ballHolderId = Number(gs.ball_holder);
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids.map(Number) : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids.map(Number) : [];
+  const positions = Array.isArray(gs.positions) ? gs.positions : null;
+  const basketPos = Array.isArray(gs.basket_position) ? gs.basket_position : null;
+  if (!Number.isFinite(ballHolderId) || !positions || !Array.isArray(basketPos)) return out;
+  if (!offenseIds.includes(ballHolderId)) return out;
+  const ballPos = positions?.[ballHolderId];
+  if (!Array.isArray(ballPos)) return out;
+
+  const toBasket = axialToCartesian(
+    Number(basketPos[0]) - Number(ballPos[0]),
+    Number(basketPos[1]) - Number(ballPos[1]),
+  );
+  const basketNorm = Math.hypot(toBasket.x, toBasket.y);
+  if (basketNorm <= 0) return out;
+
+  const distLimitRaw = Number(gs.defender_pressure_distance ?? 1);
+  const distLimit = Number.isFinite(distLimitRaw) ? Math.max(0, distLimitRaw) : 1;
+  const baseTurnoverRaw = Number(gs.defender_pressure_turnover_chance ?? 0.05);
+  const baseTurnover = Number.isFinite(baseTurnoverRaw) ? Math.max(0, baseTurnoverRaw) : 0.05;
+  const decayRaw = Number(gs.defender_pressure_decay_lambda ?? 1.0);
+  const decayLambda = Number.isFinite(decayRaw) ? Math.max(0, decayRaw) : 1.0;
+
+  for (const defenderIdRaw of defenseIds) {
+    const defenderId = Number(defenderIdRaw);
+    if (!Number.isFinite(defenderId)) continue;
+    const defenderPos = positions?.[defenderId];
+    if (!Array.isArray(defenderPos)) continue;
+
+    const dDef = hexDistance(ballPos, defenderPos);
+    if (!Number.isFinite(dDef) || dDef > distLimit) continue;
+
+    const toDefender = axialToCartesian(
+      Number(defenderPos[0]) - Number(ballPos[0]),
+      Number(defenderPos[1]) - Number(ballPos[1]),
+    );
+    const defenderNorm = Math.hypot(toDefender.x, toDefender.y);
+    if (defenderNorm <= 0) continue;
+
+    const cosAngle = ((toBasket.x * toDefender.x) + (toBasket.y * toDefender.y)) / (basketNorm * defenderNorm);
+    if (!Number.isFinite(cosAngle) || cosAngle < 0) continue;
+
+    const turnoverProb = baseTurnover * Math.exp(-decayLambda * Math.max(0, dDef - 1));
+    setPressure(defenderId, turnoverProb);
+  }
+
+  return out;
+});
+
+function getDefenderTurnoverPressure(playerId) {
+  const pressure = Number(
+    defenderTurnoverPressureById.value[playerId]
+      ?? defenderTurnoverPressureById.value[String(playerId)]
+      ?? 0,
+  );
+  return Number.isFinite(pressure) ? Math.max(0, pressure) : 0;
+}
+
+function getDefenderPressureNormalized(turnoverPressure) {
+  const gs = currentGameState.value;
+  const base = Number(gs?.defender_pressure_turnover_chance);
+  const denom = Number.isFinite(base) && base > 0 ? base : 0.05;
+  return clamp01(Number(turnoverPressure) / denom);
+}
+
+function getDefenderPressureShakeStyle(playerId) {
+  const turnoverPressure = getDefenderTurnoverPressure(playerId);
+  if (turnoverPressure <= DEFENDER_PRESSURE_SHAKE_EPS) return {};
+
+  const normalized = getDefenderPressureNormalized(turnoverPressure);
+  const ampPx = 0.55 + (2.4 * normalized);
+  const durationSec = 0.40 - (0.12 * normalized);
+  const rotDeg = 0.18 + (0.95 * normalized);
+
+  return {
+    '--defender-pressure-shake-amp': `${ampPx.toFixed(2)}px`,
+    '--defender-pressure-shake-duration': `${Math.max(0.20, durationSec).toFixed(3)}s`,
+    '--defender-pressure-shake-rot': `${rotDeg.toFixed(2)}deg`,
+  };
+}
+
+function formatShotPressureRingTitle(ring) {
+  if (!ring) return '';
+  const pressure = Number(ring.pressurePct);
+  const basePct = Number(ring.basePct);
+  const finalPct = Number(ring.finalPct);
+  const defenderLabel = `Defender ${Number(ring.playerId)}`;
+  if (Number.isFinite(basePct) && Number.isFinite(finalPct)) {
+    return `${defenderLabel} pressure ${pressure.toFixed(1)}% (${basePct.toFixed(1)}% -> ${finalPct.toFixed(1)}%)`;
+  }
+  return `${defenderLabel} pressure ${pressure.toFixed(1)}%`;
+}
+
+function formatDefenderTurnoverPressureTitle(playerId) {
+  const pressure = getDefenderTurnoverPressure(playerId);
+  if (!Number.isFinite(pressure) || pressure <= DEFENDER_PRESSURE_SHAKE_EPS) return '';
+  return `Turnover pressure ${(pressure * 100).toFixed(1)}%`;
+}
+
+function formatPlayerTooltipTitle(playerId) {
+  const parts = [];
+  const ring = ballHandlerShotPressureRing.value;
+  if (ring && Number(ring.playerId) === Number(playerId)) {
+    parts.push(formatShotPressureRingTitle(ring));
+  }
+  const turnoverLabel = formatDefenderTurnoverPressureTitle(playerId);
+  if (turnoverLabel) parts.push(turnoverLabel);
+  return parts.join(' | ');
+}
 
 async function fetchBallHandlerMakeProb() {
   const gs = currentGameState.value;
   if (!gs || gs.ball_holder === null) {
     ballHandlerMakeProb.value = null;
+    ballHandlerBaseProb.value = null;
     return;
   }
   
   // During manual stepping (replay), use the stored shot probability from the state
   if (props.isManualStepping && typeof gs.ball_handler_shot_probability === 'number') {
     ballHandlerMakeProb.value = gs.ball_handler_shot_probability;
+    // Replay snapshots currently store final probability only.
+    ballHandlerBaseProb.value = null;
     console.log('[GameBoard] Using stored shot probability from replay state:', gs.ball_handler_shot_probability);
     return;
   }
@@ -1010,16 +1466,20 @@ async function fetchBallHandlerMakeProb() {
   // Otherwise, fetch from API (live gameplay)
   try {
     const resp = await getShotProbability(gs.ball_holder);
+    const base = resp?.shot_probability ?? null;
     const p = resp?.shot_probability_final ?? resp?.shot_probability ?? null;
+    ballHandlerBaseProb.value = typeof base === 'number' ? base : null;
     ballHandlerMakeProb.value = typeof p === 'number' ? p : null;
   } catch (e) {
     console.warn('[GameBoard] Failed to fetch ball-handler make prob', e);
     ballHandlerMakeProb.value = null;
+    ballHandlerBaseProb.value = null;
   }
 }
 
 onMounted(() => {
   fetchBallHandlerMakeProb();
+  window.addEventListener('mousedown', onGlobalMouseDown);
 });
 
 watch(
@@ -1209,14 +1669,38 @@ const passTargetPreview = computed(() => {
   // A successful pass changes ball_holder, so recover passer from selected actions.
   if (props.disableTransitions && props.selectedActions) {
     const passEntries = Object.entries(props.selectedActions).filter(
-      ([, act]) => typeof act === 'string' && act.startsWith('PASS_')
+      ([, act]) => typeof act === 'string' && /^PASS(?:_|->)/.test(act)
     );
     if (passEntries.length === 1) {
       passerId = Number(passEntries[0][0]);
       action = passEntries[0][1];
     }
   }
-  if (!action || !action.startsWith('PASS_')) return null;
+  if (!action || !/^PASS(?:_|->)/.test(action)) return null;
+
+  const pointerTargetId = resolvePassTargetFromAction(gs, passerId, action);
+  if (pointerTargetId !== null) {
+    const passerPos = gs.positions?.[passerId];
+    const recvPos = gs.positions?.[pointerTargetId];
+    if (!passerPos || !recvPos) return null;
+    const passerCoords = axialToCartesian(passerPos[0], passerPos[1]);
+    const recvCoords = axialToCartesian(recvPos[0], recvPos[1]);
+    return {
+      passerId,
+      receiverId: pointerTargetId,
+      start: passerCoords,
+      end: recvCoords,
+      strategy: 'pointer_targeted',
+      distance: hexDistance(passerPos, recvPos),
+      value: null,
+      stealProb: (passStealProbs.value?.[pointerTargetId] ?? null),
+      ep: (gs.ep_by_player && gs.ep_by_player[pointerTargetId] !== undefined)
+        ? Number(gs.ep_by_player[pointerTargetId])
+        : null,
+    };
+  }
+
+  if (!action.startsWith('PASS_')) return null;
 
   const dirIdx = PASS_ACTION_TO_DIR[action];
   if (dirIdx === undefined) return null;
@@ -1759,6 +2243,7 @@ watch(
     if (!state) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1766,6 +2251,7 @@ watch(
     if (!shots || Object.keys(shots).length === 0) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1788,6 +2274,7 @@ watch(
     if (!shooterPos || !basketPos) {
       clearShotFlash();
       clearShotJump();
+      lastShotAnimationKey.value = null;
       return;
     }
 
@@ -1797,6 +2284,23 @@ watch(
     const isDunk =
       (shotData.result && typeof shotData.result.is_dunk === 'boolean' && shotData.result.is_dunk) ||
       hexDistance(shooterPos, basketPos) === 0;
+
+    const shotAnimationKey = [
+      Number(state.shot_clock ?? -1),
+      Number(shotData.shooterId),
+      success ? 1 : 0,
+      isDunk ? 1 : 0,
+      Number(shotData.result?.distance ?? -1),
+      Number(shooterPos[0]),
+      Number(shooterPos[1]),
+      Number(basketPos[0]),
+      Number(basketPos[1]),
+    ].join('|');
+    if (shotAnimationKey === lastShotAnimationKey.value) {
+      return;
+    }
+    lastShotAnimationKey.value = shotAnimationKey;
+
     triggerShotFlash(shotData.shooterId, start, end, success, isDunk);
   },
   { immediate: true }
@@ -2059,7 +2563,9 @@ defineExpose({
 });
 
 onBeforeUnmount(() => {
+  closeDownloadMenu();
   clearClickTimeout();
+  window.removeEventListener('mousedown', onGlobalMouseDown);
   window.removeEventListener('mousemove', onGlobalMouseMove);
   window.removeEventListener('mouseup', onGlobalMouseUp);
   clearPassFlash();
@@ -2072,23 +2578,63 @@ onBeforeUnmount(() => {
 <template>
   <div class="game-board-container" :class="{ 'no-move-transitions': disableTransitions }">
     <div class="board-toolbar">
-      <button 
-        class="download-button" 
-        @click="downloadBoardAsImage"
-        title="Download board as PNG"
-      >
-        📥
-      </button>
+      <div class="download-menu" ref="downloadMenuRef">
+        <button
+          class="download-button"
+          @click="toggleDownloadMenu"
+          :disabled="isDownloadRunning"
+          title="Download board"
+        >
+          📥
+        </button>
+        <div v-if="showDownloadMenu" class="download-menu-popover">
+          <button
+            class="download-menu-item"
+            @click="handleDownloadChoice('png')"
+            :disabled="isDownloadRunning"
+          >
+            Download PNG
+          </button>
+          <button
+            class="download-menu-item"
+            @click="handleDownloadChoice('gif')"
+            :disabled="isDownloadRunning"
+          >
+            Download GIF
+          </button>
+        </div>
+      </div>
       <button
-        class="policy-toggle-button"
+        class="toggle-btn board-toggle-btn"
         @click="toggleAllPolicies"
         :aria-pressed="allPoliciesVisible"
         title="Show or hide policy probabilities for all players"
       >
-        {{ allPoliciesVisible ? 'Hide Policies' : 'Show Policies' }}
+        <font-awesome-icon :icon="allPoliciesVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+        <span class="toggle-label">Show Policies</span>
       </button>
+      <div class="pressure-controls-row">
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="showShotPressureRing = !showShotPressureRing"
+          :aria-pressed="showShotPressureRing"
+          title="Toggle live shot-pressure ring around the ball handler"
+        >
+          <font-awesome-icon :icon="showShotPressureRing ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Shot Pressure</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="showDefenderPressureShake = !showDefenderPressureShake"
+          :aria-pressed="showDefenderPressureShake"
+          title="Toggle defender turnover-pressure shake animation"
+        >
+          <font-awesome-icon :icon="showDefenderPressureShake ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Defender Motion</span>
+        </button>
+      </div>
     </div>
-    <svg :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
+    <svg class="board-svg" :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
       <defs>
         <marker
           id="arrowhead-offense"
@@ -2260,7 +2806,16 @@ onBeforeUnmount(() => {
             'player-group',
             { 'ball-handler-bounce': player.hasBall && draggedPlayerId !== player.id && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id },
             { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
-            { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id }
+            { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id },
+            {
+              'defender-pressure-shake':
+                showDefenderPressureShake
+                && !player.hasBall
+                && draggedPlayerId !== player.id
+                && shotJumpPlayerId !== player.id
+                && shotInFlightPlayerId !== player.id
+                && getDefenderTurnoverPressure(player.id) > DEFENDER_PRESSURE_SHAKE_EPS,
+            },
           ]"
           :style="{
             ...(player.hasBall && draggedPlayerId !== player.id ? {
@@ -2272,24 +2827,66 @@ onBeforeUnmount(() => {
               '--jump-amp': `${shotJumpIsDunk ? SHOOT_DUNK_AMPLITUDE_PX : SHOOT_JUMP_AMPLITUDE_PX}px`,
               '--jump-period': `${SHOOT_JUMP_PERIOD_SECONDS}s`,
               '--jump-scale-peak': `${shotJumpIsDunk ? SHOOT_DUNK_SCALE : SHOOT_JUMP_SCALE}`
-            } : {})
+            } : {}),
+            ...(
+              showDefenderPressureShake
+              && !player.hasBall
+              && draggedPlayerId !== player.id
+              && shotJumpPlayerId !== player.id
+              && shotInFlightPlayerId !== player.id
+                ? getDefenderPressureShakeStyle(player.id)
+                : {}
+            ),
           }"
         >
             <!-- If dragging this player, show it at dragged pos, otherwise at hex pos -->
+            <circle
+              v-if="ballHandlerShotPressureRing && ballHandlerShotPressureRing.playerId === player.id"
+              :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
+              :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+              :r="ballHandlerShotPressureRing.radius"
+              :class="[
+                'shot-pressure-ring',
+                {
+                  'shot-pressure-ring-pulse': ballHandlerShotPressureRing.pulseEnabled && !disableTransitions,
+                },
+              ]"
+              :stroke="ballHandlerShotPressureRing.color"
+              :stroke-opacity="ballHandlerShotPressureRing.opacity"
+              :stroke-width="ballHandlerShotPressureRing.strokeWidth"
+              :style="{
+                pointerEvents: 'none',
+                '--ring-pulse-duration': `${ballHandlerShotPressureRing.pulseDurationSec.toFixed(2)}s`,
+                '--ring-pulse-scale': `${ballHandlerShotPressureRing.pulseScale.toFixed(3)}`,
+              }"
+            >
+              <title>{{ formatShotPressureRingTitle(ballHandlerShotPressureRing) }}</title>
+            </circle>
             <circle 
               :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
               :r="HEX_RADIUS * 0.8" 
               :class="[
                 player.isOffense ? 'player-offense' : 'player-defense',
-                { 'active-player-hex': player.id === activePlayerId },
                 { 'dragging': draggedPlayerId === player.id },
                 { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id }
               ]"
               @mousedown="onMouseDown($event, player)"
               @click="onPlayerClick($event, player)"
               @dblclick.stop="onPlayerDoubleClick($event, player)"
-              style="cursor: grab;"
+              :style="playerCircleStyle(player)"
+            >
+              <title v-if="formatPlayerTooltipTitle(player.id)">
+                {{ formatPlayerTooltipTitle(player.id) }}
+              </title>
+            </circle>
+            <circle
+              v-if="player.isOffense"
+              :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
+              :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+              :r="HEX_RADIUS * 0.67"
+              class="player-offense-core"
+              style="pointer-events: none;"
             />
             <text 
               :transform="playerLabelTransform(player)"
@@ -2297,7 +2894,10 @@ onBeforeUnmount(() => {
               y="0" 
               dy="0.3em" 
               text-anchor="middle" 
-              class="player-text"
+              :class="[
+                'player-text',
+                { 'active-player-text': player.id === activePlayerId },
+              ]"
               style="pointer-events: none;" 
             >{{ player.id }}</text>
             <!-- EP (Expected Points) label above player ID for offensive players -->
@@ -2814,9 +3414,23 @@ onBeforeUnmount(() => {
   top: 10px;
   left: 10px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+  max-width: min(92%, 560px);
   z-index: 12;
+}
+
+.pressure-controls-row {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-basis: 100%;
+}
+
+.download-menu {
+  position: relative;
 }
 
 .download-button {
@@ -2842,17 +3456,69 @@ onBeforeUnmount(() => {
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
-.policy-toggle-button {
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid #ddd;
+.download-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.download-menu-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(15, 23, 42, 0.96);
+  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.55);
+  z-index: 40;
+}
+
+.download-menu-item {
+  border: 1px solid transparent;
   border-radius: 6px;
-  padding: 10px 12px;
+  padding: 8px 10px;
+  background: transparent;
+  color: #e2e8f0;
+  font-size: 0.83rem;
+  text-align: left;
   cursor: pointer;
-  font-size: 0.95rem;
-  color: #0b172d;
-  transition: all 0.2s ease;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-  margin-left: auto;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.download-menu-item:hover:not(:disabled) {
+  border-color: rgba(56, 189, 248, 0.55);
+  color: #f8fafc;
+  background: rgba(30, 41, 59, 0.75);
+}
+
+.download-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.board-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  font-size: 1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 0.15s ease, border 0.15s ease;
+}
+
+.board-toggle-btn :deep(svg) {
+  width: 1.15em;
+  height: 1.15em;
+  flex: 0 0 auto;
 }
 
 .shot-status {
@@ -2873,16 +3539,14 @@ onBeforeUnmount(() => {
   letter-spacing: 0.04em;
 }
 
-.policy-toggle-button:hover {
-  background: #0d59df;
-  color: #f8fafc;
-  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-  transform: translateY(-1px);
+.board-toggle-btn:hover:not(:disabled) {
+  color: var(--app-accent);
+  border-color: var(--app-accent-strong);
 }
 
-.policy-toggle-button:active {
-  transform: translateY(0);
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+.board-toggle-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .state-value-overlay rect {
@@ -2900,7 +3564,7 @@ onBeforeUnmount(() => {
 }
 
 /* Removed rotation; court now renders in original orientation */
-svg {
+.board-svg {
   display: block;
   width: 100%;
   height: auto;
@@ -2932,9 +3596,12 @@ svg {
   stroke-width: 1;
 }
 .player-offense {
-  fill: #007bff;
   stroke: white;
   stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease, fill 0.2s ease;
+}
+.player-offense-core {
+  fill: #007bff;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 .player-defense {
@@ -2947,6 +3614,56 @@ svg {
   transform-origin: center;
   transform-box: fill-box; /* keep scale/translate centered on the marker */
 }
+.shot-pressure-ring {
+  fill: none;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 4px rgba(15, 23, 42, 0.8));
+  transition: cx 0.26s ease, cy 0.26s ease, stroke 0.18s ease, stroke-width 0.18s ease;
+}
+.shot-pressure-ring-pulse {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: shot-pressure-ring-pulse var(--ring-pulse-duration, 1.2s) ease-in-out infinite;
+}
+
+@keyframes shot-pressure-ring-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(var(--ring-pulse-scale, 1.05));
+  }
+}
+
+.defender-pressure-shake {
+  animation: defender-pressure-shake var(--defender-pressure-shake-duration, 0.32s) ease-in-out infinite;
+  will-change: transform;
+}
+
+@keyframes defender-pressure-shake {
+  0%, 100% {
+    transform: translate(0, 0) rotate(0deg);
+  }
+  20% {
+    transform: translate(calc(-1 * var(--defender-pressure-shake-amp, 1px)), 0)
+      rotate(calc(-1 * var(--defender-pressure-shake-rot, 0.5deg)));
+  }
+  40% {
+    transform: translate(0, var(--defender-pressure-shake-amp, 1px))
+      rotate(var(--defender-pressure-shake-rot, 0.5deg));
+  }
+  60% {
+    transform: translate(var(--defender-pressure-shake-amp, 1px), 0)
+      rotate(calc(-1 * var(--defender-pressure-shake-rot, 0.5deg)));
+  }
+  80% {
+    transform: translate(0, calc(-1 * var(--defender-pressure-shake-amp, 1px)))
+      rotate(var(--defender-pressure-shake-rot, 0.5deg));
+  }
+}
+
 .ball-handler-bounce {
   animation: dribble-bounce var(--dribble-period, 0.95s) ease-in-out infinite;
   animation-delay: var(--dribble-delay, 0s);
@@ -2958,10 +3675,6 @@ svg {
 }
 .shoot-jump-dunk {
   animation-name: shoot-jump;
-}
-.active-player-hex {
-  stroke: #62ff3b; /* Bright yellow */
-  stroke-width: 0.15rem; /* Increased width for better visibility */
 }
 .pass-target-preview {
   stroke: #f8e71c;
@@ -2982,6 +3695,9 @@ svg {
   stroke: black;
   stroke-width: 0.1rem;
   transition: transform 0.26s ease;
+}
+.active-player-text {
+  fill: #f8e71c;
 }
 .ghost-text {
   font-size: 10px;
@@ -3086,11 +3802,13 @@ svg {
 }
 
 .no-move-transitions .player-offense,
+.no-move-transitions .player-offense-core,
 .no-move-transitions .player-defense,
 .no-move-transitions .player-text,
 .no-move-transitions .shot-prob-text,
 .no-move-transitions .noop-prob-text,
 .no-move-transitions .ball-indicator,
+.no-move-transitions .shot-pressure-ring,
 .no-move-transitions .action-indicator {
   transition: none !important;
 }

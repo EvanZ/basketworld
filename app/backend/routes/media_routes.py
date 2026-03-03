@@ -1,10 +1,12 @@
 import os
+import io
 from datetime import datetime
 from typing import List
 
 import imageio
 import numpy as np
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 from basketworld.utils.evaluation_helpers import get_outcome_category
 from app.backend.schemas import SaveEpisodeRequest
@@ -12,6 +14,50 @@ from app.backend.state import game_state
 
 
 router = APIRouter()
+
+
+def _decode_png_frames_and_durations(request: SaveEpisodeRequest):
+    import base64
+    from PIL import Image
+
+    if not request.frames or len(request.frames) == 0:
+        raise HTTPException(status_code=400, detail="No frames provided")
+
+    pil_frames = []
+    for base64_frame in request.frames:
+        if "," in base64_frame:
+            base64_frame = base64_frame.split(",")[1]
+        img_bytes = base64.b64decode(base64_frame)
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode == "RGBA":
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        pil_frames.append(img)
+
+    durations_sec = None
+    if request.durations and len(request.durations) > 0:
+        durations_sec = [max(0.01, float(d)) for d in request.durations]
+    elif request.step_duration_ms:
+        dur = max(10.0, float(request.step_duration_ms))
+        durations_sec = [dur / 1000.0] * len(pil_frames)
+    else:
+        durations_sec = [1.0] * len(pil_frames)
+
+    if len(durations_sec) != len(pil_frames):
+        if len(durations_sec) < len(pil_frames):
+            last_d = durations_sec[-1] if durations_sec else 1.0
+            durations_sec.extend([last_d] * (len(pil_frames) - len(durations_sec)))
+        durations_sec = durations_sec[: len(pil_frames)]
+
+    durations_ms = [max(10, int(round(d * 1000))) for d in durations_sec]
+
+    if not pil_frames:
+        raise HTTPException(status_code=400, detail="No frames provided after decoding")
+
+    return pil_frames, durations_ms
 
 
 @router.get("/api/debug/frames")
@@ -109,12 +155,6 @@ def save_episode():
 @router.post("/api/save_episode_from_pngs")
 def save_episode_from_pngs(request: SaveEpisodeRequest):
     """Saves episode from base64-encoded PNG frames sent from frontend."""
-    import base64
-    from PIL import Image
-    import io
-
-    if not request.frames or len(request.frames) == 0:
-        raise HTTPException(status_code=400, detail="No frames provided")
 
     base_dir = "episodes"
     if getattr(game_state, "run_id", None):
@@ -169,39 +209,7 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
     file_path = os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
 
     try:
-        pil_frames = []
-        for base64_frame in request.frames:
-            if "," in base64_frame:
-                base64_frame = base64_frame.split(",")[1]
-            img_bytes = base64.b64decode(base64_frame)
-            img = Image.open(io.BytesIO(img_bytes))
-            if img.mode == "RGBA":
-                background = Image.new("RGB", img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[3])
-                img = background
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            pil_frames.append(img)
-
-        durations_sec = None
-        if request.durations and len(request.durations) > 0:
-            durations_sec = [max(0.01, float(d)) for d in request.durations]
-        elif request.step_duration_ms:
-            dur = max(10.0, float(request.step_duration_ms))
-            durations_sec = [dur / 1000.0] * len(pil_frames)
-        else:
-            durations_sec = [1.0] * len(pil_frames)
-
-        if len(durations_sec) != len(pil_frames):
-            if len(durations_sec) < len(pil_frames):
-                last_d = durations_sec[-1] if durations_sec else 1.0
-                durations_sec.extend([last_d] * (len(pil_frames) - len(durations_sec)))
-            durations_sec = durations_sec[: len(pil_frames)]
-
-        durations_ms = [max(10, int(round(d * 1000))) for d in durations_sec]
-
-        if not pil_frames:
-            raise HTTPException(status_code=400, detail="No frames provided after decoding")
+        pil_frames, durations_ms = _decode_png_frames_and_durations(request)
 
         pil_frames[0].save(
             file_path,
@@ -219,4 +227,30 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to save GIF from PNGs: {e}")
+
+
+@router.post("/api/render_gif_from_pngs")
+def render_gif_from_pngs(request: SaveEpisodeRequest):
+    """Render a GIF from base64-encoded PNG frames and return bytes without persisting."""
+    try:
+        pil_frames, durations_ms = _decode_png_frames_and_durations(request)
+        buffer = io.BytesIO()
+        pil_frames[0].save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=durations_ms,
+            loop=0,
+            optimize=False,
+            disposal=2,
+        )
+        return Response(content=buffer.getvalue(), media_type="image/gif")
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to render GIF from PNGs: {e}")
 
