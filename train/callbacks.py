@@ -79,6 +79,7 @@ def build_pass_bias_callback(args, total_planned_ts, timestep_offset):
         args.pass_logit_bias_start,
         args.pass_logit_bias_end,
         total_planned_timesteps=total_planned_ts,
+        log_freq_rollouts=args.mlflow_schedule_log_every_rollouts,
         timestep_offset=timestep_offset,
     )
 
@@ -122,6 +123,7 @@ def build_pass_curriculum_callback(args, total_planned_ts, timestep_offset):
         total_planned_ts,
         arc_power=arc_power,
         oob_power=oob_power,
+        log_freq_rollouts=args.mlflow_schedule_log_every_rollouts,
         timestep_offset=timestep_offset,
     )
 
@@ -137,9 +139,11 @@ def build_mixed_callbacks(
 ) -> List[BaseCallback]:
     """Assemble callbacks for mixed training."""
     callbacks: List[BaseCallback] = [
-        AccumulativeMetricsCallback(),
+        AccumulativeMetricsCallback(
+            log_freq_rollouts=args.mlflow_episode_log_every_rollouts
+        ),
         offense_timing_cb,
-        GradNormCallback(),
+        GradNormCallback(log_freq_rollouts=args.mlflow_gradnorm_log_every_rollouts),
     ]
     if entropy_cb is not None:
         callbacks.append(entropy_cb)
@@ -167,11 +171,14 @@ def build_mixed_callbacks(
     return callbacks
 
 
-def build_mixed_logger():
+def build_mixed_logger(args):
     """Logger for mixed training (stdout + MLflow)."""
     return Logger(
         folder=None,
-        output_formats=[HumanOutputFormat(sys.stdout), MLflowWriter("Mixed")],
+        output_formats=[
+            HumanOutputFormat(sys.stdout),
+            MLflowWriter("Mixed", log_every_n_writes=args.mlflow_sb3_log_every_writes),
+        ],
     )
 
 

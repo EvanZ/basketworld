@@ -418,8 +418,10 @@ class AccumulativeMetricsCallback(BaseCallback):
     and logs separate metrics for each team.
     """
 
-    def __init__(self, verbose=0):
+    def __init__(self, log_freq_rollouts: int = 1, verbose=0):
         super().__init__(verbose)
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._rollouts = 0
         self._seen_episode_ids = set()
 
     def _extract_episode_metrics(self, ep: dict) -> dict:
@@ -478,6 +480,9 @@ class AccumulativeMetricsCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         """Aggregate and log metrics by team."""
+        self._rollouts += 1
+        if self._rollouts % self.log_freq_rollouts != 0:
+            return
         global_step = self.model.num_timesteps
         
         # Log entropy coefficient (model-level, not per-episode)
@@ -502,6 +507,8 @@ class AccumulativeMetricsCallback(BaseCallback):
                 if team_name not in episodes_by_team:
                     episodes_by_team[team_name] = []
                 episodes_by_team[team_name].append(ep)
+        if len(self._seen_episode_ids) > 200_000:
+            self._seen_episode_ids.clear()
         
         # Log metrics for each team
         global_step = self.model.num_timesteps
@@ -807,28 +814,21 @@ class PassLogitBiasExpScheduleCallback(BaseCallback):
         start: float,
         end: float,
         total_planned_timesteps: int,
+        log_freq_rollouts: int = 1,
         timestep_offset: int = 0,
     ):
         super().__init__()
         self.start = float(start)
         self.end = float(end)
         self.total = int(max(1, total_planned_timesteps))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._rollouts = 0
         self.timestep_offset = int(timestep_offset)
 
     def _scheduled_value(self, t: int) -> float:
         progress = min(1.0, max(0.0, t / float(self.total)))
         # Handle end==0 by decaying toward a tiny epsilon instead of hard 0,
         # so we can observe the decay and avoid collapsing to zero immediately.
-        if self.end <= 0.0:
-            eps = 1e-6
-            current = (
-                float(self.start) * (eps / max(1e-12, float(self.start))) ** progress
-            )
-        else:
-            ratio = float(self.start) / float(self.end)
-            current = float(self.end) * (ratio ** (1.0 - progress))
-        return float(current)
-        progress = min(1.0, max(0.0, t / float(self.total)))
         if self.end <= 0.0:
             eps = 1e-6
             current = (
@@ -872,7 +872,9 @@ class PassLogitBiasExpScheduleCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         self._apply_current()
-        self._log_current()
+        self._rollouts += 1
+        if self._rollouts % self.log_freq_rollouts == 0:
+            self._log_current()
 
     def _on_step(self) -> bool:
         # Throttled: avoid per-step update
@@ -897,6 +899,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
         total_planned_timesteps: int,
         arc_power: float = 2.0,
         oob_power: float = 2.0,
+        log_freq_rollouts: int = 1,
         timestep_offset: int = 0,
     ):
         super().__init__()
@@ -907,6 +910,8 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
         self.total = int(max(1, total_planned_timesteps))
         self.arc_power = float(arc_power)
         self.oob_power = float(oob_power)
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._rollouts = 0
         self.timestep_offset = int(timestep_offset)
 
     def _exp_sched(self, start: float, end: float, t: int, power: float) -> float:
@@ -920,7 +925,7 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
         # power > 1 gives steeper initial decay, power = 1 is linear progress
         return float(end) * (ratio ** ((1.0 - progress) ** power))
 
-    def _apply_current(self):
+    def _apply_current(self, log_to_mlflow: bool = True):
         try:
             t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
             arc = self._exp_sched(self.arc_start, self.arc_end, t, self.arc_power)
@@ -932,31 +937,35 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
                     vecenv.env_method("set_pass_oob_turnover_prob", float(oob))
             except Exception:
                 pass
-            # Log to MLflow
-            try:
-                # Use model.num_timesteps (with offset) for the metric step
-                mlflow.log_metric(
-                    "Passing Arc Degrees", float(arc), step=t + self.timestep_offset
-                )
-                # Configured curriculum knob (not observed turnover frequency).
-                mlflow.log_metric(
-                    "Pass OOB Turnover Prob (Config)",
-                    float(oob),
-                    step=t + self.timestep_offset,
-                )
-            except Exception:
-                pass
+            if log_to_mlflow:
+                # Log to MLflow
+                try:
+                    # Use model.num_timesteps (with offset) for the metric step
+                    mlflow.log_metric(
+                        "Passing Arc Degrees", float(arc), step=t + self.timestep_offset
+                    )
+                    # Configured curriculum knob (not observed turnover frequency).
+                    mlflow.log_metric(
+                        "Pass OOB Turnover Prob (Config)",
+                        float(oob),
+                        step=t + self.timestep_offset,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _on_training_start(self) -> None:
-        self._apply_current()
+        self._apply_current(log_to_mlflow=True)
 
     def _on_rollout_start(self) -> None:
-        self._apply_current()
+        self._apply_current(log_to_mlflow=False)
 
     def _on_rollout_end(self) -> None:
-        self._apply_current()
+        self._rollouts += 1
+        self._apply_current(
+            log_to_mlflow=(self._rollouts % self.log_freq_rollouts == 0)
+        )
 
     def _on_step(self) -> bool:
         # Throttled: avoid per-step update/logging
