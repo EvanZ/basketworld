@@ -21,6 +21,7 @@ const props = defineProps({
     default: null,
   },
 });
+const emit = defineEmits(['shortcut-clicked']);
 
 const displayedShortcuts = computed(() => {
   if (Array.isArray(props.shortcuts) && props.shortcuts.length > 0) {
@@ -28,6 +29,15 @@ const displayedShortcuts = computed(() => {
   }
   return defaultShortcuts;
 });
+
+function isInteractiveShortcut(item) {
+  return Boolean(item && typeof item === 'object' && item.action);
+}
+
+function onShortcutClick(item) {
+  if (!isInteractiveShortcut(item)) return;
+  emit('shortcut-clicked', item);
+}
 </script>
 
 <template>
@@ -36,7 +46,13 @@ const displayedShortcuts = computed(() => {
       <font-awesome-icon :icon="['fas','keyboard']" /> Shortcuts
     </div>
     <ul class="kb-legend-list">
-      <li v-for="item in displayedShortcuts" :key="`${item.key}-${item.label}`" class="kb-item">
+      <li
+        v-for="item in displayedShortcuts"
+        :key="`${item.key}-${item.label}`"
+        class="kb-item"
+        :class="{ interactive: isInteractiveShortcut(item) }"
+        @click="onShortcutClick(item)"
+      >
         <template v-if="item.key === '0-9'">
           <span class="keycap small" aria-hidden="true">0</span>
           <span class="keycap-sep" aria-hidden="true">–</span>
@@ -83,6 +99,9 @@ const displayedShortcuts = computed(() => {
   align-items: center;
 }
 .kb-item { display: flex; align-items: center; gap: 6px; }
+.kb-item.interactive {
+  cursor: pointer;
+}
 .kb-label { white-space: nowrap; }
 
 /* Keycap styling */
@@ -105,4 +124,3 @@ const displayedShortcuts = computed(() => {
 .keycap.arrow-key { font-size: 14px; min-width: 24px; }
 .keycap-sep { margin: 0 4px; color: #666; }
 </style>
-

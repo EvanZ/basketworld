@@ -22,6 +22,150 @@ router = APIRouter()
 
 PLAYABLE_DIFFICULTIES = ("easy", "medium", "hard")
 PLAYABLE_PLAYERS = tuple(range(1, 6))
+PLAYABLE_PERIOD_MODES = ("period", "halves", "quarters")
+PLAYABLE_PERIOD_MODE_TO_COUNT = {
+    "period": 1,
+    "halves": 2,
+    "quarters": 4,
+}
+PLAYABLE_MIN_PERIOD_MINUTES = 1
+PLAYABLE_MAX_PERIOD_MINUTES = 60
+PLAYABLE_CLOCK_TICK_SECONDS = 1
+
+
+def _normalize_period_mode(raw: Any) -> str:
+    mode = str(raw or "period").strip().lower()
+    if mode not in PLAYABLE_PERIOD_MODE_TO_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail="period_mode must be one of: period, halves, quarters.",
+        )
+    return mode
+
+
+def _normalize_period_length_minutes(raw: Any) -> int:
+    minutes = _to_int(raw)
+    if minutes is None:
+        raise HTTPException(status_code=400, detail="period_length_minutes must be an integer.")
+    minutes = int(minutes)
+    if minutes < PLAYABLE_MIN_PERIOD_MINUTES or minutes > PLAYABLE_MAX_PERIOD_MINUTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"period_length_minutes must be between "
+                f"{PLAYABLE_MIN_PERIOD_MINUTES} and {PLAYABLE_MAX_PERIOD_MINUTES}."
+            ),
+        )
+    return minutes
+
+
+def _segment_label_for_mode(mode: str, period_index: int) -> str:
+    idx = max(1, int(period_index))
+    if mode == "halves":
+        return f"Half {idx}"
+    if mode == "quarters":
+        return f"Quarter {idx}"
+    return f"Period {idx}"
+
+
+def _format_clock_display(seconds_remaining: int) -> str:
+    seconds = max(0, int(seconds_remaining))
+    minutes = seconds // 60
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _ensure_playable_game_fields(session: dict[str, Any]) -> None:
+    mode = _normalize_period_mode(session.get("period_mode", "period"))
+    session["period_mode"] = mode
+
+    total_default = int(PLAYABLE_PERIOD_MODE_TO_COUNT.get(mode, 1))
+    total_periods = _to_int(session.get("total_periods"))
+    if total_periods not in (1, 2, 4):
+        total_periods = total_default
+    session["total_periods"] = int(total_periods)
+
+    current_period = _to_int(session.get("current_period"))
+    if current_period is None:
+        current_period = 1
+    current_period = max(1, min(int(total_periods), int(current_period)))
+    session["current_period"] = int(current_period)
+
+    period_length_minutes = _normalize_period_length_minutes(session.get("period_length_minutes", 5))
+    session["period_length_minutes"] = int(period_length_minutes)
+
+    max_seconds = int(period_length_minutes) * 60
+    seconds_remaining = _to_int(session.get("period_seconds_remaining"))
+    if seconds_remaining is None:
+        seconds_remaining = max_seconds
+    seconds_remaining = max(0, min(max_seconds, int(seconds_remaining)))
+    session["period_seconds_remaining"] = int(seconds_remaining)
+    session["game_over"] = bool(session.get("game_over", False))
+
+
+def _build_game_clock_info(session: dict[str, Any]) -> dict[str, Any]:
+    _ensure_playable_game_fields(session)
+    mode = str(session.get("period_mode"))
+    total_periods = int(session.get("total_periods", 1) or 1)
+    current_period = int(session.get("current_period", 1) or 1)
+    period_length_minutes = int(session.get("period_length_minutes", 5) or 5)
+    seconds_remaining = int(session.get("period_seconds_remaining", period_length_minutes * 60) or 0)
+    return {
+        "period_mode": mode,
+        "period_mode_label": {
+            "period": "1 period",
+            "halves": "2 halves",
+            "quarters": "4 quarters",
+        }[mode],
+        "total_periods": max(1, total_periods),
+        "current_period": max(1, current_period),
+        "period_length_minutes": max(1, period_length_minutes),
+        "seconds_remaining": max(0, seconds_remaining),
+        "display": _format_clock_display(seconds_remaining),
+        "segment_label": _segment_label_for_mode(mode, current_period),
+    }
+
+
+def _resolve_game_result(score: dict[str, Any]) -> dict[str, Any]:
+    user_score = int((score or {}).get("user", 0) or 0)
+    ai_score = int((score or {}).get("ai", 0) or 0)
+    if user_score > ai_score:
+        winner = "user"
+        message = f"Game over. You win {user_score}-{ai_score}."
+    elif ai_score > user_score:
+        winner = "ai"
+        message = f"Game over. AI wins {ai_score}-{user_score}."
+    else:
+        winner = "tie"
+        message = f"Game over. Tie game {user_score}-{ai_score}."
+    return {
+        "game_over": True,
+        "winner": winner,
+        "message": message,
+        "score": {
+            "user": user_score,
+            "ai": ai_score,
+        },
+    }
+
+
+def _build_game_result(session: dict[str, Any]) -> dict[str, Any]:
+    if not bool(session.get("game_over", False)):
+        return {
+            "game_over": False,
+            "winner": None,
+            "message": "",
+            "score": _build_score_info(session),
+        }
+    score = session.get("score") if isinstance(session.get("score"), dict) else {"user": 0, "ai": 0}
+    return _resolve_game_result(score)
+
+
+def _tick_game_clock(session: dict[str, Any]) -> int:
+    remaining = int(session.get("period_seconds_remaining", 0) or 0)
+    remaining = max(0, remaining - PLAYABLE_CLOCK_TICK_SECONDS)
+    session["period_seconds_remaining"] = remaining
+    return remaining
 
 
 def _clone_skill_set(raw: Any) -> dict[str, list[float]]:
@@ -485,6 +629,12 @@ def get_playable_options():
         "status": "success",
         "players_per_side": list(PLAYABLE_PLAYERS),
         "difficulties": list(PLAYABLE_DIFFICULTIES),
+        "period_modes": list(PLAYABLE_PERIOD_MODES),
+        "period_length_minutes": {
+            "min": PLAYABLE_MIN_PERIOD_MINUTES,
+            "max": PLAYABLE_MAX_PERIOD_MINUTES,
+            "default": 5,
+        },
         "options": _sanitize_options_for_response(matrix),
     }
 
@@ -493,6 +643,9 @@ def get_playable_options():
 async def start_playable_game(request: PlayableStartRequest):
     players_per_side = int(request.players_per_side)
     difficulty = str(request.difficulty).strip().lower()
+    period_mode = _normalize_period_mode(request.period_mode)
+    period_length_minutes = _normalize_period_length_minutes(request.period_length_minutes)
+    total_periods = int(PLAYABLE_PERIOD_MODE_TO_COUNT[period_mode])
 
     if players_per_side not in PLAYABLE_PLAYERS:
         raise HTTPException(status_code=400, detail="players_per_side must be between 1 and 5.")
@@ -536,6 +689,12 @@ async def start_playable_game(request: PlayableStartRequest):
         "possession_number": 1,
         "user_on_offense": user_starts,
         "side_skills": side_skills,
+        "period_mode": period_mode,
+        "total_periods": total_periods,
+        "current_period": 1,
+        "period_length_minutes": period_length_minutes,
+        "period_seconds_remaining": period_length_minutes * 60,
+        "game_over": False,
     }
 
     session = game_state.playable_session
@@ -546,9 +705,14 @@ async def start_playable_game(request: PlayableStartRequest):
         "state": _map_state_for_playable(state, session),
         "score": _build_score_info(session),
         "possession": _build_possession_info(session),
+        "game_clock": _build_game_clock_info(session),
+        "game_result": _build_game_result(session),
         "config": {
             "players_per_side": players_per_side,
             "difficulty": difficulty,
+            "period_mode": period_mode,
+            "total_periods": total_periods,
+            "period_length_minutes": period_length_minutes,
         },
     }
 
@@ -556,10 +720,20 @@ async def start_playable_game(request: PlayableStartRequest):
 @router.post("/api/playable/new_game")
 def playable_new_game():
     session = _get_playable_session(required=True)
+    period_mode = _normalize_period_mode(session.get("period_mode", "period"))
+    period_length_minutes = _normalize_period_length_minutes(session.get("period_length_minutes", 5))
+    total_periods = int(PLAYABLE_PERIOD_MODE_TO_COUNT.get(period_mode, 1))
+
     session["score"] = {"user": 0, "ai": 0}
     session["possession_number"] = 1
     session["user_on_offense"] = bool(random.getrandbits(1))
     session["side_skills"] = _build_playable_side_skills()
+    session["period_mode"] = period_mode
+    session["total_periods"] = total_periods
+    session["current_period"] = 1
+    session["period_length_minutes"] = period_length_minutes
+    session["period_seconds_remaining"] = period_length_minutes * 60
+    session["game_over"] = False
 
     state = _reset_playable_possession(session)
     return {
@@ -567,12 +741,25 @@ def playable_new_game():
         "state": _map_state_for_playable(state, session),
         "score": _build_score_info(session),
         "possession": _build_possession_info(session),
+        "game_clock": _build_game_clock_info(session),
+        "game_result": _build_game_result(session),
+        "config": {
+            "players_per_side": int(session["players_per_side"]),
+            "difficulty": str(session["difficulty"]),
+            "period_mode": period_mode,
+            "total_periods": total_periods,
+            "period_length_minutes": period_length_minutes,
+        },
     }
 
 
 @router.post("/api/playable/step")
 def playable_step(request: PlayableStepRequest):
     session = _get_playable_session(required=True)
+    _ensure_playable_game_fields(session)
+    if bool(session.get("game_over", False)):
+        raise HTTPException(status_code=400, detail="Game is over. Start a new game.")
+
     players_per_side = int(session["players_per_side"])
 
     env_to_canonical, canonical_to_env = _build_id_maps(
@@ -594,7 +781,7 @@ def playable_step(request: PlayableStepRequest):
         ActionRequest(
             actions=user_actions,
             player_deterministic=True,
-            opponent_deterministic=True,
+            opponent_deterministic=False,
             use_mcts=False,
         )
     )
@@ -607,61 +794,120 @@ def playable_step(request: PlayableStepRequest):
 
     step_state = step_payload.get("state") or {}
     possession_done = bool(step_state.get("done"))
+    offense_is_user = _current_possession_owner_is_user(session)
+    possession_result = None
+    ended_state = None
 
-    if not possession_done:
+    if possession_done:
+        ended_state = _map_state_for_playable(step_state, session)
+        possession_result = _build_possession_result(
+            getattr(game_state.env, "last_action_results", {}) or {},
+            int(getattr(game_state.env, "shot_clock", 0)),
+            offense_is_user,
+            env_to_canonical,
+        )
+
+        points = int(possession_result.get("points", 0) or 0)
+        scoring_team = possession_result.get("scoring_team")
+        if points > 0 and scoring_team in {"user", "ai"}:
+            session["score"][str(scoring_team)] = int(session["score"].get(str(scoring_team), 0)) + points
+
+        # Alternate possession at end of each possession.
+        session["user_on_offense"] = not offense_is_user
+        session["possession_number"] = int(session.get("possession_number", 1)) + 1
+
+    # Every playable tick decrements the game clock by exactly one second.
+    _tick_game_clock(session)
+    period_ended = int(session.get("period_seconds_remaining", 0) or 0) <= 0
+    period_result = None
+
+    next_state_raw = None
+    if period_ended:
+        current_period = int(session.get("current_period", 1) or 1)
+        total_periods = int(session.get("total_periods", 1) or 1)
+        period_mode = str(session.get("period_mode", "period"))
+        ended_segment_label = _segment_label_for_mode(period_mode, current_period)
+
+        if current_period >= total_periods:
+            session["game_over"] = True
+            period_result = {
+                "type": "final_buzzer",
+                "message": f"End of {ended_segment_label}.",
+            }
+        else:
+            session["current_period"] = current_period + 1
+            period_minutes = int(session.get("period_length_minutes", 5) or 5)
+            session["period_seconds_remaining"] = period_minutes * 60
+            if not possession_done:
+                # Force a fresh possession at the start of a new segment.
+                session["possession_number"] = int(session.get("possession_number", 1)) + 1
+            period_result = {
+                "type": "period_end",
+                "message": f"End of {ended_segment_label}.",
+            }
+            next_state_raw = _reset_playable_possession(session)
+
+    if bool(session.get("game_over", False)):
+        # Preserve the final board state at the buzzer.
+        final_state = _map_state_for_playable(step_state, session)
         return {
             "status": "success",
-            "state": _map_state_for_playable(step_state, session),
+            "state": final_state,
+            "ended_state": ended_state,
             "actions_taken": actions_taken,
             "actions_taken_meta": actions_taken_meta,
             "score": _build_score_info(session),
             "possession": _build_possession_info(session),
-            "possession_ended": False,
-            "possession_result": None,
+            "game_clock": _build_game_clock_info(session),
+            "game_result": _build_game_result(session),
+            "possession_ended": bool(possession_done),
+            "possession_result": possession_result,
+            "period_ended": bool(period_ended),
+            "period_result": period_result,
         }
 
-    offense_is_user = _current_possession_owner_is_user(session)
-    ended_state = _map_state_for_playable(step_state, session)
-    possession_result = _build_possession_result(
-        getattr(game_state.env, "last_action_results", {}) or {},
-        int(getattr(game_state.env, "shot_clock", 0)),
-        offense_is_user,
-        env_to_canonical,
-    )
-
-    points = int(possession_result.get("points", 0) or 0)
-    scoring_team = possession_result.get("scoring_team")
-    if points > 0 and scoring_team in {"user", "ai"}:
-        session["score"][str(scoring_team)] = int(session["score"].get(str(scoring_team), 0)) + points
-
-    # Alternate possession and spawn a new one immediately.
-    session["user_on_offense"] = not offense_is_user
-    session["possession_number"] = int(session.get("possession_number", 1)) + 1
-
-    next_state = _reset_playable_possession(session)
+    if next_state_raw is None:
+        if possession_done:
+            next_state_raw = _reset_playable_possession(session)
+        else:
+            next_state_raw = step_state
 
     return {
         "status": "success",
-        "state": _map_state_for_playable(next_state, session),
-        "ended_state": ended_state,
+        "state": _map_state_for_playable(next_state_raw, session),
+        "ended_state": ended_state if possession_done else None,
         "actions_taken": actions_taken,
         "actions_taken_meta": actions_taken_meta,
         "score": _build_score_info(session),
         "possession": _build_possession_info(session),
-        "possession_ended": True,
+        "game_clock": _build_game_clock_info(session),
+        "game_result": _build_game_result(session),
+        "possession_ended": bool(possession_done),
         "possession_result": possession_result,
+        "period_ended": bool(period_ended),
+        "period_result": period_result,
     }
 
 
 @router.get("/api/playable/state")
 def get_playable_state():
     session = _get_playable_session(required=True)
+    _ensure_playable_game_fields(session)
     state = get_ui_game_state()
     return {
         "status": "success",
         "state": _map_state_for_playable(state, session),
         "score": _build_score_info(session),
         "possession": _build_possession_info(session),
+        "game_clock": _build_game_clock_info(session),
+        "game_result": _build_game_result(session),
+        "config": {
+            "players_per_side": int(session["players_per_side"]),
+            "difficulty": str(session["difficulty"]),
+            "period_mode": _normalize_period_mode(session.get("period_mode", "period")),
+            "total_periods": int(session.get("total_periods", 1) or 1),
+            "period_length_minutes": _normalize_period_length_minutes(session.get("period_length_minutes", 5)),
+        },
     }
 
 

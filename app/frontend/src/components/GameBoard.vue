@@ -1003,7 +1003,7 @@ const viewBox = computed(() => {
     const allX = courtLayout.value.map(h => h.x);
     const allY = courtLayout.value.map(h => h.y);
     
-    const margin = HEX_RADIUS * 3; // Increased margin for more padding
+    const margin = props.minimalChrome ? HEX_RADIUS * 1.8 : HEX_RADIUS * 3;
     const minX = Math.min(...allX) - margin;
     const maxX = Math.max(...allX) + margin;
     const minY = Math.min(...allY) - margin;
@@ -2889,6 +2889,7 @@ onBeforeUnmount(() => {
             {
               'defender-pressure-shake':
                 showDefenderPressureShake
+                && !player.isOffense
                 && !player.hasBall
                 && draggedPlayerId !== player.id
                 && shotJumpPlayerId !== player.id
@@ -2909,6 +2910,7 @@ onBeforeUnmount(() => {
             } : {}),
             ...(
               showDefenderPressureShake
+              && !player.isOffense
               && !player.hasBall
               && draggedPlayerId !== player.id
               && shotJumpPlayerId !== player.id

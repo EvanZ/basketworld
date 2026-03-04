@@ -1,7 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GameBoard from './components/GameBoard.vue';
-import KeyboardLegend from './components/KeyboardLegend.vue';
 import PlayableControls from './components/PlayableControls.vue';
 import PlayableEnvironmentInfo from './components/PlayableEnvironmentInfo.vue';
 import basketworldLogo from './assets/basketworld-logo.jpg';
@@ -15,10 +14,13 @@ import {
 const optionsLoading = ref(false);
 const actionLoading = ref(false);
 const error = ref('');
+const isDevBuild = Boolean(import.meta.env?.DEV);
 
 const optionsPayload = ref(null);
 const selectedPlayersPerSide = ref(1);
 const selectedDifficulty = ref('easy');
+const selectedPeriodMode = ref('period');
+const selectedPeriodLengthMinutes = ref(5);
 
 const gameState = ref(null);
 const gameHistory = ref([]);
@@ -29,9 +31,74 @@ const controlsRef = ref(null);
 const score = ref({ user: 0, ai: 0 });
 const possession = ref(null);
 const sessionConfig = ref(null);
+function createDefaultGameClock() {
+  return {
+    period_mode: 'period',
+    total_periods: 1,
+    current_period: 1,
+    period_length_minutes: 5,
+    seconds_remaining: 300,
+    display: '05:00',
+    segment_label: 'Period 1',
+  };
+}
+
+function createDefaultGameResult() {
+  return {
+    game_over: false,
+    winner: null,
+    message: '',
+    score: { user: 0, ai: 0 },
+  };
+}
+
+const gameClock = ref(createDefaultGameClock());
+const gameResult = ref(createDefaultGameResult());
 const lastPossessionResult = ref(null);
 const transitionRunning = ref(false);
+const forceGameOverPreview = ref(false);
+const passChordPPressed = ref(false);
+const periodModeLabelMap = {
+  period: '1 period',
+  halves: '2 halves',
+  quarters: '4 quarters',
+};
 const playableKeyboardShortcuts = [
+  {
+    key: 'Q',
+    label: 'Move NW',
+    action: 'MOVE_NW',
+  },
+  {
+    key: 'A',
+    label: 'Move W',
+    action: 'MOVE_W',
+  },
+  {
+    key: 'Z',
+    label: 'Move SW',
+    action: 'MOVE_SW',
+  },
+  {
+    key: 'E',
+    label: 'Move NE',
+    action: 'MOVE_NE',
+  },
+  {
+    key: 'D',
+    label: 'Move E',
+    action: 'MOVE_E',
+  },
+  {
+    key: 'C',
+    label: 'Move SE',
+    action: 'MOVE_SE',
+  },
+  {
+    key: 'S',
+    label: 'Shoot',
+    action: 'SHOOT',
+  },
   {
     key: 'N',
     label: 'New Game',
@@ -41,10 +108,84 @@ const playableKeyboardShortcuts = [
     label: 'Submit Turn',
   },
   {
+    key: 'P+0-9',
+    label: 'Pass Target',
+  },
+  {
     key: '0-9',
-    label: 'Select Player or Pass Target (by ID, top row or numpad)',
+    label: 'Player ID',
   },
 ];
+const MOVE_HOTKEY_ACTIONS = {
+  q: 'MOVE_NW',
+  a: 'MOVE_W',
+  z: 'MOVE_SW',
+  e: 'MOVE_NE',
+  d: 'MOVE_E',
+  c: 'MOVE_SE',
+  s: 'SHOOT',
+};
+const MOVE_HOTKEY_ACTIONS_BY_CODE = {
+  KeyQ: 'MOVE_NW',
+  KeyA: 'MOVE_W',
+  KeyZ: 'MOVE_SW',
+  KeyE: 'MOVE_NE',
+  KeyD: 'MOVE_E',
+  KeyC: 'MOVE_SE',
+  KeyS: 'SHOOT',
+};
+
+function formatClockDisplay(rawSeconds) {
+  const total = Math.max(0, Number(rawSeconds || 0));
+  const minutes = Math.floor(total / 60);
+  const seconds = Math.floor(total % 60);
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function segmentLabelForMode(mode, currentPeriod) {
+  const idx = Math.max(1, Number(currentPeriod || 1));
+  if (mode === 'halves') return `Half ${idx}`;
+  if (mode === 'quarters') return `Quarter ${idx}`;
+  return `Period ${idx}`;
+}
+
+function normalizeGameClock(raw) {
+  const mode = ['period', 'halves', 'quarters'].includes(String(raw?.period_mode || '').toLowerCase())
+    ? String(raw.period_mode).toLowerCase()
+    : 'period';
+  const totalDefault = mode === 'halves' ? 2 : (mode === 'quarters' ? 4 : 1);
+  const totalPeriods = Math.max(1, Number(raw?.total_periods || totalDefault));
+  const currentPeriod = Math.min(totalPeriods, Math.max(1, Number(raw?.current_period || 1)));
+  const periodLengthMinutes = Math.max(1, Number(raw?.period_length_minutes || selectedPeriodLengthMinutes.value || 5));
+  const secondsRemaining = Math.max(0, Number(raw?.seconds_remaining ?? periodLengthMinutes * 60));
+  const display = String(raw?.display || formatClockDisplay(secondsRemaining));
+  const segmentLabel = String(raw?.segment_label || segmentLabelForMode(mode, currentPeriod));
+  return {
+    period_mode: mode,
+    total_periods: totalPeriods,
+    current_period: currentPeriod,
+    period_length_minutes: periodLengthMinutes,
+    seconds_remaining: secondsRemaining,
+    display,
+    segment_label: segmentLabel,
+  };
+}
+
+function normalizeGameResult(raw) {
+  const gameOver = Boolean(raw?.game_over);
+  const winnerRaw = String(raw?.winner || '').toLowerCase();
+  const winner = ['user', 'ai', 'tie'].includes(winnerRaw) ? winnerRaw : null;
+  const scoreRaw = raw?.score && typeof raw.score === 'object' ? raw.score : {};
+  return {
+    game_over: gameOver,
+    winner,
+    message: gameOver ? String(raw?.message || 'Game over.') : '',
+    score: {
+      user: Number(scoreRaw.user ?? score.value.user ?? 0) || 0,
+      ai: Number(scoreRaw.ai ?? score.value.ai ?? 0) || 0,
+    },
+  };
+}
 
 function createShotLine() {
   return { attempts: 0, made: 0 };
@@ -111,9 +252,16 @@ function createPlayableStats() {
 }
 
 const playableStats = ref(createPlayableStats());
+const playablePlayByPlay = ref([]);
+const playByPlayEventCounter = ref(1);
 
 function resetPlayableStats() {
   playableStats.value = createPlayableStats();
+}
+
+function resetPlayablePlayByPlay() {
+  playablePlayByPlay.value = [];
+  playByPlayEventCounter.value = 1;
 }
 
 function toIdSet(values) {
@@ -282,6 +430,193 @@ function recordPlayableStepStats(payload, context = {}) {
   }
 }
 
+const PLAY_BY_PLAY_MAX_ROWS = 240;
+
+function asTeamLabel(teamKey) {
+  if (teamKey === 'user') return 'YOU';
+  if (teamKey === 'ai') return 'AI';
+  return '-';
+}
+
+function formatTurnoverReason(reasonRaw) {
+  const reason = String(reasonRaw || '').trim().toLowerCase();
+  if (!reason) return 'turnover';
+  if (reason === 'defender_pressure') return 'defender pressure';
+  if (reason === 'offensive_three_seconds') return 'offensive 3-second violation';
+  if (reason === 'move_out_of_bounds') return 'out of bounds';
+  if (reason === 'pass_out_of_bounds') return 'pass out of bounds';
+  return reason.replace(/_/g, ' ');
+}
+
+function getStepResults(payload) {
+  const fromEnded = payload?.ended_state?.last_action_results;
+  const fromState = payload?.state?.last_action_results;
+  if (payload?.possession_ended && fromEnded && typeof fromEnded === 'object') return fromEnded;
+  if (fromState && typeof fromState === 'object') return fromState;
+  return null;
+}
+
+function nextPlayByPlayEntry(base = {}) {
+  return {
+    id: playByPlayEventCounter.value++,
+    period: String(base.period || '-'),
+    clock: String(base.clock || '--:--'),
+    team: String(base.team || '-'),
+    score: String(base.score || '0-0'),
+    event: String(base.event || ''),
+  };
+}
+
+function formatPlayByPlayScore(rawScore) {
+  const scoreObj = rawScore && typeof rawScore === 'object' ? rawScore : {};
+  const user = Number(scoreObj.user ?? score.value?.user ?? 0) || 0;
+  const ai = Number(scoreObj.ai ?? score.value?.ai ?? 0) || 0;
+  return `${user}-${ai}`;
+}
+
+function appendPlayByPlayEntries(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const valid = rows.filter((row) => row && typeof row.event === 'string' && row.event.trim().length > 0);
+  if (valid.length === 0) return;
+  playablePlayByPlay.value = [...valid, ...playablePlayByPlay.value].slice(0, PLAY_BY_PLAY_MAX_ROWS);
+}
+
+function recordPlayableStartPlayByPlay(payload) {
+  const possessionInfo = payload?.possession || {};
+  const offenseTeam = possessionInfo.offense_team === 'ai' ? 'AI' : 'YOU';
+  const clockInfo = payload?.game_clock || {};
+  const scoreLabel = formatPlayByPlayScore(payload?.score);
+  appendPlayByPlayEntries([
+    nextPlayByPlayEntry({
+      period: String(clockInfo.segment_label || 'Period 1'),
+      clock: String(clockInfo.display || '00:00'),
+      team: offenseTeam,
+      score: scoreLabel,
+      event: `${offenseTeam} won the tip and starts with possession.`,
+    }),
+  ]);
+}
+
+function recordPlayableStepPlayByPlay(payload, context = {}) {
+  const userIds = context.userIds instanceof Set ? context.userIds : new Set();
+  const aiIds = context.aiIds instanceof Set ? context.aiIds : new Set();
+  const resolveTeam = (playerId) => resolveTeamKey(Number(playerId), userIds, aiIds);
+  const clockInfo = payload?.game_clock || {};
+  let period = String(clockInfo.segment_label || gameClock.value?.segment_label || '-');
+  const baseClock = String(clockInfo.display || gameClock.value?.display || '--:--');
+  const clock = payload?.period_ended ? '00:00' : baseClock;
+  const periodMessage = String(payload?.period_result?.message || '');
+  if (payload?.period_ended && periodMessage) {
+    const periodMatch = periodMessage.match(/^End of\s+(.+?)\.?$/i);
+    if (periodMatch?.[1]) {
+      period = String(periodMatch[1]).trim();
+    }
+  }
+  const scoreLabel = formatPlayByPlayScore(payload?.score);
+  const rows = [];
+  const pushEvent = (teamKey, eventText) => {
+    rows.push(
+      nextPlayByPlayEntry({
+        period,
+        clock,
+        team: asTeamLabel(teamKey),
+        score: scoreLabel,
+        event: eventText,
+      }),
+    );
+  };
+
+  const stepResults = getStepResults(payload);
+  if (stepResults && typeof stepResults === 'object') {
+    const shots = stepResults?.shots && typeof stepResults.shots === 'object' ? stepResults.shots : {};
+    for (const [shooterRaw, shotRaw] of Object.entries(shots)) {
+      const shooterId = Number(shooterRaw);
+      if (!Number.isFinite(shooterId)) continue;
+      const shot = shotRaw && typeof shotRaw === 'object' ? shotRaw : {};
+      const isDunk = Boolean(shot.is_dunk) || Number(shot.distance) === 0;
+      const isThree = !isDunk && Boolean(shot.is_three);
+      const shotLabel = isDunk ? 'Dunk' : (isThree ? '3pt shot' : '2pt shot');
+      let event = `${shotLabel} ${Boolean(shot.success) ? 'made' : 'missed'} by Player ${shooterId}.`;
+      const assistPasserId = Number(shot.assist_passer_id);
+      if (Boolean(shot.success) && Boolean(shot.assist_full) && Number.isFinite(assistPasserId)) {
+        event = `${event.slice(0, -1)} (assist: Player ${assistPasserId}).`;
+      }
+      pushEvent(resolveTeam(shooterId), event);
+    }
+
+    const passes = stepResults?.passes && typeof stepResults.passes === 'object' ? stepResults.passes : {};
+    for (const [passerRaw, passRaw] of Object.entries(passes)) {
+      const passerId = Number(passerRaw);
+      if (!Number.isFinite(passerId)) continue;
+      const passInfo = passRaw && typeof passRaw === 'object' ? passRaw : {};
+      if (Boolean(passInfo.success)) {
+        const targetId = Number(passInfo.target);
+        if (Number.isFinite(targetId)) {
+          pushEvent(resolveTeam(passerId), `Pass completed: Player ${passerId} to Player ${targetId}.`);
+        } else {
+          pushEvent(resolveTeam(passerId), `Pass completed by Player ${passerId}.`);
+        }
+      }
+    }
+
+    const turnovers = Array.isArray(stepResults?.turnovers) ? stepResults.turnovers : [];
+    for (const turnover of turnovers) {
+      const playerId = Number(turnover?.player_id);
+      if (!Number.isFinite(playerId)) continue;
+      const stolenBy = Number(turnover?.stolen_by);
+      const reason = formatTurnoverReason(turnover?.reason);
+      if (Number.isFinite(stolenBy)) {
+        pushEvent(resolveTeam(stolenBy), `Steal by Player ${stolenBy} from Player ${playerId}.`);
+      } else {
+        pushEvent(resolveTeam(playerId), `Turnover by Player ${playerId} (${reason}).`);
+      }
+    }
+
+    const defensiveViolations = Array.isArray(stepResults?.defensive_lane_violations)
+      ? stepResults.defensive_lane_violations
+      : [];
+    for (const violation of defensiveViolations) {
+      const playerId = Number(violation?.player_id);
+      if (!Number.isFinite(playerId)) continue;
+      const scoringTeam = String(payload?.possession_result?.scoring_team || '').toLowerCase();
+      const bonusTeam = scoringTeam === 'user' || scoringTeam === 'ai'
+        ? ` (+1 ${asTeamLabel(scoringTeam)})`
+        : '';
+      pushEvent(resolveTeam(playerId), `Defensive lane violation by Player ${playerId}.${bonusTeam}`);
+    }
+
+    const offensiveViolations = Array.isArray(stepResults?.offensive_lane_violations)
+      ? stepResults.offensive_lane_violations
+      : [];
+    for (const violation of offensiveViolations) {
+      const playerId = Number(violation?.player_id);
+      if (!Number.isFinite(playerId)) continue;
+      pushEvent(resolveTeam(playerId), `Offensive lane violation by Player ${playerId}.`);
+    }
+  }
+
+  if (rows.length === 0) {
+    const possessionMessage = String(payload?.possession_result?.message || '').trim();
+    if (possessionMessage) {
+      const scoringTeam = String(payload?.possession_result?.scoring_team || '').toLowerCase();
+      const teamKey = scoringTeam === 'user' || scoringTeam === 'ai' ? scoringTeam : null;
+      pushEvent(teamKey, possessionMessage);
+    }
+  }
+
+  if (payload?.period_ended && payload?.period_result?.message) {
+    pushEvent(null, String(payload.period_result.message));
+  }
+
+  if (payload?.game_result?.game_over) {
+    const winner = String(payload?.game_result?.winner || '').toLowerCase();
+    const winnerTeam = winner === 'user' || winner === 'ai' ? winner : null;
+    pushEvent(winnerTeam, String(payload?.game_result?.message || 'Game over.'));
+  }
+
+  appendPlayByPlayEntries(rows);
+}
+
 const playerChoices = computed(() => {
   const values = optionsPayload.value?.players_per_side;
   if (!Array.isArray(values) || values.length === 0) return [1, 2, 3, 4, 5];
@@ -292,6 +627,30 @@ const difficultyChoices = computed(() => {
   const values = optionsPayload.value?.difficulties;
   if (!Array.isArray(values) || values.length === 0) return ['easy', 'medium', 'hard'];
   return values.map((v) => String(v || '').toLowerCase());
+});
+
+const periodModeChoices = computed(() => {
+  const values = optionsPayload.value?.period_modes;
+  const fallback = ['period', 'halves', 'quarters'];
+  const modes = Array.isArray(values) && values.length > 0 ? values : fallback;
+  return modes
+    .map((v) => String(v || '').toLowerCase())
+    .filter((v) => ['period', 'halves', 'quarters'].includes(v));
+});
+
+const periodLengthBounds = computed(() => {
+  const src = optionsPayload.value?.period_length_minutes || {};
+  const min = Math.max(1, Number(src.min || 1));
+  const max = Math.min(60, Math.max(min, Number(src.max || 60)));
+  return { min, max };
+});
+
+const periodLengthChoices = computed(() => {
+  const out = [];
+  for (let m = periodLengthBounds.value.min; m <= periodLengthBounds.value.max; m += 1) {
+    out.push(m);
+  }
+  return out;
 });
 
 const difficultyEntries = computed(() => {
@@ -311,12 +670,21 @@ const currentDifficultyConfig = computed(() => {
   return difficultyEntries.value.find((entry) => entry.value === selectedDifficulty.value) || null;
 });
 
-const canStartGame = computed(() => {
-  return !optionsLoading.value && !actionLoading.value && !transitionRunning.value && Boolean(currentDifficultyConfig.value?.available);
-});
-
 const hasGame = computed(() => !!gameState.value);
-const controlsDisabled = computed(() => actionLoading.value || transitionRunning.value);
+const isGameOver = computed(() => Boolean(gameResult.value?.game_over));
+const showGameOverOverlay = computed(() => Boolean(isGameOver.value || forceGameOverPreview.value));
+
+const canStartGame = computed(() => {
+  return (
+    !optionsLoading.value
+    && !actionLoading.value
+    && !transitionRunning.value
+    && Boolean(currentDifficultyConfig.value?.available)
+    && (!hasGame.value || isGameOver.value)
+  );
+});
+const controlsDisabled = computed(() => actionLoading.value || transitionRunning.value || isGameOver.value);
+const setupLocked = computed(() => optionsLoading.value || actionLoading.value || transitionRunning.value || (hasGame.value && !isGameOver.value));
 
 const userPlayerIds = computed(() => {
   const ids = gameState.value?.playable_user_ids;
@@ -338,11 +706,51 @@ const possessionSummary = computed(() => {
 
 const selectedModeLabel = computed(() => {
   if (!sessionConfig.value) return '';
-  return `${sessionConfig.value.players_per_side}v${sessionConfig.value.players_per_side} · ${sessionConfig.value.difficulty}`;
+  const modeLabel = periodModeLabelMap[String(sessionConfig.value.period_mode || 'period')] || '1 period';
+  const minutes = Number(sessionConfig.value.period_length_minutes || 5);
+  return (
+    `${sessionConfig.value.players_per_side}v${sessionConfig.value.players_per_side}`
+    + ` · ${sessionConfig.value.difficulty}`
+    + ` · ${modeLabel} x ${minutes} min`
+  );
 });
 
 const formattedUserScore = computed(() => String(Number(score.value?.user || 0)).padStart(2, '0'));
 const formattedAiScore = computed(() => String(Number(score.value?.ai || 0)).padStart(2, '0'));
+const gameClockDisplay = computed(() => String(gameClock.value?.display || '00:00'));
+const gameClockSegmentLabel = computed(() => String(gameClock.value?.segment_label || 'Period 1'));
+const gameOverFinalUserScore = computed(() => Number(gameResult.value?.score?.user ?? score.value?.user ?? 0));
+const gameOverFinalAiScore = computed(() => Number(gameResult.value?.score?.ai ?? score.value?.ai ?? 0));
+
+const gameOverWinnerKey = computed(() => {
+  const winnerRaw = String(gameResult.value?.winner || '').toLowerCase();
+  if (winnerRaw === 'user' || winnerRaw === 'ai' || winnerRaw === 'tie') return winnerRaw;
+  if (gameOverFinalUserScore.value > gameOverFinalAiScore.value) return 'user';
+  if (gameOverFinalAiScore.value > gameOverFinalUserScore.value) return 'ai';
+  return 'tie';
+});
+
+const gameOverWinnerLabel = computed(() => {
+  if (!showGameOverOverlay.value) return '';
+  if (gameOverWinnerKey.value === 'user') return 'YOU WIN';
+  if (gameOverWinnerKey.value === 'ai') return 'AI WINS';
+  return 'TIE GAME';
+});
+
+const gameOverScoreLabel = computed(() => {
+  const user = gameOverFinalUserScore.value;
+  const ai = gameOverFinalAiScore.value;
+  if (gameOverWinnerKey.value === 'user') return `${user}-${ai}`;
+  if (gameOverWinnerKey.value === 'ai') return `${ai}-${user}`;
+  if (user === ai) return `${user}-${ai}`;
+  return `${Math.max(user, ai)}-${Math.min(user, ai)}`;
+});
+
+const gameOverBannerText = computed(() => {
+  if (!showGameOverOverlay.value) return '';
+  const suffix = gameOverWinnerKey.value === 'tie' ? '' : '!';
+  return `${gameOverWinnerLabel.value} ${gameOverScoreLabel.value}${suffix}`;
+});
 
 watch(
   playerChoices,
@@ -372,6 +780,28 @@ watch(
 );
 
 watch(
+  periodModeChoices,
+  (choices) => {
+    if (!choices || choices.length === 0) return;
+    if (!choices.includes(String(selectedPeriodMode.value))) {
+      selectedPeriodMode.value = choices[0];
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  [periodLengthChoices, periodLengthBounds],
+  ([choices, bounds]) => {
+    if (!Array.isArray(choices) || choices.length === 0) return;
+    const current = Number(selectedPeriodLengthMinutes.value || 5);
+    if (choices.includes(current)) return;
+    selectedPeriodLengthMinutes.value = Math.min(bounds.max, Math.max(bounds.min, current));
+  },
+  { immediate: true },
+);
+
+watch(
   userPlayerIds,
   (ids) => {
     if (!ids || ids.length === 0) {
@@ -386,6 +816,7 @@ watch(
 );
 
 function applyStatePayload(payload) {
+  const hadGameBefore = Boolean(gameState.value);
   const state = payload?.state || null;
   gameState.value = state;
   gameHistory.value = state ? [state] : [];
@@ -402,10 +833,70 @@ function applyStatePayload(payload) {
   }
 
   if (payload?.config) {
+    const cfgMode = String(payload.config.period_mode || selectedPeriodMode.value || 'period').toLowerCase();
+    const cfgMinutes = Number(payload.config.period_length_minutes ?? selectedPeriodLengthMinutes.value ?? 5);
     sessionConfig.value = {
       players_per_side: Number(payload.config.players_per_side),
       difficulty: String(payload.config.difficulty || '').toLowerCase(),
+      period_mode: ['period', 'halves', 'quarters'].includes(cfgMode) ? cfgMode : 'period',
+      total_periods: Number(payload.config.total_periods || (cfgMode === 'halves' ? 2 : (cfgMode === 'quarters' ? 4 : 1))),
+      period_length_minutes: Math.max(1, cfgMinutes),
     };
+    selectedPeriodMode.value = sessionConfig.value.period_mode;
+    selectedPeriodLengthMinutes.value = sessionConfig.value.period_length_minutes;
+  }
+
+  if (payload?.game_clock) {
+    gameClock.value = normalizeGameClock(payload.game_clock);
+  } else if (payload?.config) {
+    gameClock.value = normalizeGameClock({
+      period_mode: sessionConfig.value?.period_mode || selectedPeriodMode.value,
+      total_periods: sessionConfig.value?.total_periods,
+      current_period: 1,
+      period_length_minutes: sessionConfig.value?.period_length_minutes || selectedPeriodLengthMinutes.value,
+      seconds_remaining: (sessionConfig.value?.period_length_minutes || selectedPeriodLengthMinutes.value || 5) * 60,
+    });
+  }
+
+  if (payload?.game_result) {
+    gameResult.value = normalizeGameResult(payload.game_result);
+  } else {
+    gameResult.value = normalizeGameResult({
+      game_over: false,
+      score: payload?.score || score.value,
+    });
+  }
+
+  if (!state) {
+    activePlayerId.value = null;
+    return;
+  }
+
+  const userIds = Array.isArray(state?.playable_user_ids)
+    ? state.playable_user_ids
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v))
+      .sort((a, b) => a - b)
+    : [];
+
+  if (userIds.length === 0) {
+    activePlayerId.value = null;
+    return;
+  }
+
+  const currentActive = Number(activePlayerId.value);
+  const hasValidActive = userIds.includes(currentActive);
+  const userOnOffense = Boolean(payload?.possession?.user_on_offense ?? state?.playable_user_on_offense);
+  const ballHolder = Number(state?.ball_holder);
+  const ballHolderIsUser = Number.isFinite(ballHolder) && userIds.includes(ballHolder);
+
+  if (!hadGameBefore && userOnOffense && ballHolderIsUser) {
+    activePlayerId.value = ballHolder;
+    return;
+  }
+
+  if (!hasValidActive) {
+    activePlayerId.value = userOnOffense && ballHolderIsUser ? ballHolder : userIds[0];
   }
 }
 
@@ -456,11 +947,19 @@ async function onStartGame() {
   actionLoading.value = true;
   error.value = '';
   lastPossessionResult.value = null;
+  forceGameOverPreview.value = false;
 
   try {
-    const payload = await startPlayableGame(selectedPlayersPerSide.value, selectedDifficulty.value);
+    const payload = await startPlayableGame(
+      selectedPlayersPerSide.value,
+      selectedDifficulty.value,
+      selectedPeriodMode.value,
+      selectedPeriodLengthMinutes.value,
+    );
     resetPlayableStats();
+    resetPlayablePlayByPlay();
     applyStatePayload(payload);
+    recordPlayableStartPlayByPlay(payload);
     boardSelections.value = {};
   } catch (err) {
     error.value = err?.message || 'Failed to start playable game.';
@@ -474,11 +973,14 @@ async function onNewGame() {
   actionLoading.value = true;
   error.value = '';
   lastPossessionResult.value = null;
+  forceGameOverPreview.value = false;
 
   try {
     const payload = await newPlayableGame();
     resetPlayableStats();
+    resetPlayablePlayByPlay();
     applyStatePayload(payload);
+    recordPlayableStartPlayByPlay(payload);
     boardSelections.value = {};
   } catch (err) {
     error.value = err?.message || 'Failed to reset playable game.';
@@ -487,8 +989,40 @@ async function onNewGame() {
   }
 }
 
+function onResetSetup() {
+  if (actionLoading.value || transitionRunning.value) return;
+
+  error.value = '';
+  lastPossessionResult.value = null;
+  forceGameOverPreview.value = false;
+
+  gameState.value = null;
+  gameHistory.value = [];
+  activePlayerId.value = null;
+  boardSelections.value = {};
+  score.value = { user: 0, ai: 0 };
+  possession.value = null;
+  sessionConfig.value = null;
+
+  const modeRaw = String(selectedPeriodMode.value || 'period').toLowerCase();
+  const periodMode = ['period', 'halves', 'quarters'].includes(modeRaw) ? modeRaw : 'period';
+  const totalPeriods = periodMode === 'halves' ? 2 : (periodMode === 'quarters' ? 4 : 1);
+  const periodLengthMinutes = Math.max(1, Number(selectedPeriodLengthMinutes.value || 5));
+  gameClock.value = normalizeGameClock({
+    period_mode: periodMode,
+    total_periods: totalPeriods,
+    current_period: 1,
+    period_length_minutes: periodLengthMinutes,
+    seconds_remaining: periodLengthMinutes * 60,
+  });
+  gameResult.value = createDefaultGameResult();
+
+  resetPlayableStats();
+  resetPlayablePlayByPlay();
+}
+
 async function onActionsSubmitted(actions) {
-  if (!hasGame.value || actionLoading.value || transitionRunning.value) return;
+  if (!hasGame.value || actionLoading.value || transitionRunning.value || isGameOver.value) return;
   actionLoading.value = true;
   error.value = '';
 
@@ -499,10 +1033,28 @@ async function onActionsSubmitted(actions) {
 
     const payload = await stepPlayableGame(actions || {});
     recordPlayableStepStats(payload, { userIds, aiIds, userOnOffense });
+    recordPlayableStepPlayByPlay(payload, { userIds, aiIds, userOnOffense });
     const possessionEnded = Boolean(payload?.possession_ended);
-    lastPossessionResult.value = possessionEnded ? payload?.possession_result || null : null;
+    const periodEnded = Boolean(payload?.period_ended);
+    const gameEnded = Boolean(payload?.game_result?.game_over);
+    const possessionMessage = String(payload?.possession_result?.message || '').trim();
+    const periodMessage = String(payload?.period_result?.message || '').trim();
 
-    if (possessionEnded && payload?.ended_state) {
+    if (gameEnded) {
+      lastPossessionResult.value = null;
+    } else if (possessionEnded && possessionMessage) {
+      lastPossessionResult.value = {
+        message: periodEnded && periodMessage
+          ? `${possessionMessage} ${periodMessage}`
+          : possessionMessage,
+      };
+    } else if (periodEnded && periodMessage) {
+      lastPossessionResult.value = { message: periodMessage };
+    } else {
+      lastPossessionResult.value = null;
+    }
+
+    if (possessionEnded && payload?.ended_state && !Boolean(payload?.game_result?.game_over)) {
       transitionRunning.value = true;
       gameState.value = payload.ended_state;
       gameHistory.value = [payload.ended_state];
@@ -546,14 +1098,42 @@ function getNumericKeyValue(event) {
   return null;
 }
 
+function getMoveActionFromEvent(event) {
+  const byCode = MOVE_HOTKEY_ACTIONS_BY_CODE[String(event?.code || '')];
+  if (byCode) return byCode;
+  const key = String(event?.key || '').toLowerCase();
+  return MOVE_HOTKEY_ACTIONS[key] || null;
+}
+
 function onGlobalKeydown(event) {
   const tag = String(event?.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (event?.target?.isContentEditable) return;
   const key = String(event?.key || '').toLowerCase();
+  if (key === 'p') {
+    passChordPPressed.value = true;
+    return;
+  }
   const digit = getNumericKeyValue(event);
   if (digit !== null) {
-    const handled = Boolean(controlsRef.value?.applyNumericHotkey?.(digit));
+    if (passChordPPressed.value) {
+      const passHandled = Boolean(controlsRef.value?.applyPointerPassHotkey?.(digit));
+      if (passHandled) {
+        event.preventDefault();
+      }
+      return;
+    }
+
+    const selectHandled = Boolean(controlsRef.value?.applyNumericHotkey?.(digit));
+    if (selectHandled) {
+      event.preventDefault();
+    }
+    return;
+  }
+
+  const moveAction = getMoveActionFromEvent(event);
+  if (moveAction) {
+    const handled = Boolean(controlsRef.value?.applyActionHotkey?.(moveAction));
     if (handled) {
       event.preventDefault();
     }
@@ -580,15 +1160,38 @@ function onGlobalKeydown(event) {
     }
     return;
   }
+
+  if (key === 'g') {
+    if (isDevBuild && hasGame.value && !isGameOver.value) {
+      forceGameOverPreview.value = !forceGameOverPreview.value;
+      event.preventDefault();
+    }
+    return;
+  }
+}
+
+function onGlobalKeyup(event) {
+  const key = String(event?.key || '').toLowerCase();
+  if (key === 'p') {
+    passChordPPressed.value = false;
+  }
+}
+
+function onWindowBlur() {
+  passChordPPressed.value = false;
 }
 
 onMounted(() => {
   window.addEventListener('keydown', onGlobalKeydown);
+  window.addEventListener('keyup', onGlobalKeyup);
+  window.addEventListener('blur', onWindowBlur);
   loadOptions();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKeydown);
+  window.removeEventListener('keyup', onGlobalKeyup);
+  window.removeEventListener('blur', onWindowBlur);
 });
 </script>
 
@@ -603,28 +1206,46 @@ onBeforeUnmount(() => {
     </header>
 
     <section class="setup-panel">
-      <div class="setup-row">
-        <label for="players-select">Players Per Side</label>
-        <select id="players-select" v-model.number="selectedPlayersPerSide" :disabled="optionsLoading || actionLoading">
-          <option v-for="players in playerChoices" :key="`players-${players}`" :value="players">
-            {{ players }}v{{ players }}
-          </option>
-        </select>
-      </div>
+      <div class="setup-settings-row">
+        <div class="setup-item">
+          <label for="players-select">Players Per Side</label>
+          <select id="players-select" v-model.number="selectedPlayersPerSide" :disabled="setupLocked">
+            <option v-for="players in playerChoices" :key="`players-${players}`" :value="players">
+              {{ players }}v{{ players }}
+            </option>
+          </select>
+        </div>
 
-      <div class="setup-row difficulty-row">
-        <span>Difficulty</span>
-        <div class="difficulty-buttons">
-          <button
-            v-for="entry in difficultyEntries"
-            :key="`difficulty-${entry.value}`"
-            class="difficulty-button"
-            :class="{ active: selectedDifficulty === entry.value }"
-            :disabled="!entry.available || optionsLoading || actionLoading"
-            @click="selectedDifficulty = entry.value"
-          >
-            {{ entry.value }}<span v-if="!entry.available"> (unavailable)</span>
-          </button>
+        <div class="setup-item">
+          <label for="difficulty-select">Difficulty</label>
+          <select id="difficulty-select" v-model="selectedDifficulty" :disabled="setupLocked">
+            <option
+              v-for="entry in difficultyEntries"
+              :key="`difficulty-${entry.value}`"
+              :value="entry.value"
+              :disabled="!entry.available"
+            >
+              {{ `${entry.value}${entry.available ? '' : ' (unavailable)'}` }}
+            </option>
+          </select>
+        </div>
+
+        <div class="setup-item">
+          <label for="period-mode-select">Game Format</label>
+          <select id="period-mode-select" v-model="selectedPeriodMode" :disabled="setupLocked">
+            <option v-for="mode in periodModeChoices" :key="`period-mode-${mode}`" :value="mode">
+              {{ periodModeLabelMap[mode] || mode }}
+            </option>
+          </select>
+        </div>
+
+        <div class="setup-item">
+          <label for="period-length-select">Length Per Segment</label>
+          <select id="period-length-select" v-model.number="selectedPeriodLengthMinutes" :disabled="setupLocked">
+            <option v-for="minutes in periodLengthChoices" :key="`period-length-${minutes}`" :value="minutes">
+              {{ minutes }} min
+            </option>
+          </select>
         </div>
       </div>
 
@@ -633,6 +1254,14 @@ onBeforeUnmount(() => {
           {{ actionLoading ? 'Loading...' : 'Start Game' }}
         </button>
         <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onNewGame">New Game</button>
+        <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onResetSetup">Reset</button>
+        <button
+          v-if="isDevBuild && hasGame && !isGameOver"
+          :disabled="actionLoading || transitionRunning"
+          @click="forceGameOverPreview = !forceGameOverPreview"
+        >
+          {{ forceGameOverPreview ? 'Hide End Banner' : 'Preview End Banner' }}
+        </button>
       </div>
 
       <div class="status-row">
@@ -665,10 +1294,19 @@ onBeforeUnmount(() => {
               <span class="score-team">YOU</span>
               <span class="score-digits">{{ formattedUserScore }}</span>
             </div>
-            <span class="score-divider">:</span>
+            <div class="score-center">
+              <span class="score-period-label">{{ gameClockSegmentLabel }}</span>
+              <span class="clock-digits">{{ gameClockDisplay }}</span>
+            </div>
             <div class="score-side">
               <span class="score-team">AI</span>
               <span class="score-digits">{{ formattedAiScore }}</span>
+            </div>
+          </div>
+          <div v-if="showGameOverOverlay" class="playable-gameover-overlay" role="status" aria-live="polite">
+            <div class="playable-gameover-banner" :class="`winner-${gameOverWinnerKey}`">
+              <p class="gameover-banner-main">{{ gameOverBannerText }}</p>
+              <p class="gameover-banner-sub">Final score · Press N for New Game</p>
             </div>
           </div>
         </div>
@@ -683,12 +1321,13 @@ onBeforeUnmount(() => {
           :user-player-ids="userPlayerIds"
           :score="score"
           :stats="playableStats"
+          :play-by-play="playablePlayByPlay"
+          :shortcuts="playableKeyboardShortcuts"
           :disabled="controlsDisabled"
           @update:activePlayerId="activePlayerId = $event"
           @actions-submitted="onActionsSubmitted"
           @selections-changed="onSelectionsChanged"
         />
-        <KeyboardLegend :shortcuts="playableKeyboardShortcuts" class="playable-kb-legend" />
       </div>
     </section>
 
@@ -761,48 +1400,37 @@ onBeforeUnmount(() => {
   padding: 0.95rem 1rem;
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: 0.7rem;
 }
 
-.setup-row {
+.setup-settings-row {
+  display: grid;
+  grid-template-columns: repeat(4, max-content);
+  gap: 0.65rem 0.9rem;
+  align-items: end;
+  justify-content: start;
+}
+
+.setup-item {
   display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 0.32rem;
+  min-width: 0;
 }
 
-.setup-row label,
-.setup-row span {
+.setup-item label,
+.setup-item span {
   font-size: 0.8rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--app-text-muted);
 }
 
-#players-select {
-  min-width: 120px;
-}
-
-.difficulty-row {
-  align-items: flex-start;
-}
-
-.difficulty-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.difficulty-button {
-  text-transform: none;
-  letter-spacing: 0.02em;
-  padding: 0.4rem 0.85rem;
-  font-size: 0.78rem;
-}
-
-.difficulty-button.active {
-  border-color: var(--app-accent-strong);
-  color: var(--app-accent);
+#players-select,
+#difficulty-select,
+#period-mode-select,
+#period-length-select {
+  min-width: 150px;
 }
 
 .setup-actions {
@@ -829,7 +1457,7 @@ onBeforeUnmount(() => {
 
 .playable-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  grid-template-columns: minmax(0, 1fr) minmax(375px, 450px);
   gap: 1rem;
   align-items: start;
   padding: 1rem;
@@ -863,10 +1491,10 @@ onBeforeUnmount(() => {
   transform: translateX(-50%);
   z-index: 13;
   display: inline-flex;
-  align-items: center;
-  gap: 0.95rem;
-  min-width: 300px;
-  padding: 0.55rem 1.05rem;
+  align-items: stretch;
+  gap: 0.8rem;
+  min-width: 380px;
+  padding: 0.48rem 1rem;
   border-radius: 8px;
   border: 1px solid #333;
   background: rgba(26, 26, 26, 0.96);
@@ -874,33 +1502,114 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.playable-gameover-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 14;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: radial-gradient(circle at center, rgba(2, 6, 23, 0.12) 0%, rgba(2, 6, 23, 0.6) 68%);
+}
+
+.playable-gameover-banner {
+  min-width: min(88%, 560px);
+  padding: 0.95rem 1.35rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 77, 77, 0.68);
+  background: rgba(10, 14, 26, 0.9);
+  box-shadow: 0 0 18px rgba(255, 77, 77, 0.22), 0 16px 26px rgba(2, 6, 23, 0.6);
+  text-align: center;
+}
+
+.playable-gameover-banner.winner-user {
+  border-color: rgba(56, 189, 248, 0.78);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.24), 0 16px 26px rgba(2, 6, 23, 0.6);
+}
+
+.playable-gameover-banner.winner-tie {
+  border-color: rgba(148, 163, 184, 0.72);
+  box-shadow: 0 0 14px rgba(148, 163, 184, 0.24), 0 16px 26px rgba(2, 6, 23, 0.6);
+}
+
+.gameover-banner-main {
+  margin: 0;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: clamp(1.55rem, 4.2vw, 2.45rem);
+  line-height: 1.08;
+  color: #ff4d4d;
+  text-shadow: 0 0 6px rgba(255, 77, 77, 0.95), 0 0 14px rgba(255, 77, 77, 0.6);
+  letter-spacing: 0.03em;
+}
+
+.playable-gameover-banner.winner-user .gameover-banner-main {
+  color: #38bdf8;
+  text-shadow: 0 0 6px rgba(56, 189, 248, 0.92), 0 0 14px rgba(56, 189, 248, 0.58);
+}
+
+.playable-gameover-banner.winner-tie .gameover-banner-main {
+  color: #cbd5e1;
+  text-shadow: 0 0 6px rgba(203, 213, 225, 0.82), 0 0 12px rgba(148, 163, 184, 0.45);
+}
+
+.gameover-banner-sub {
+  margin: 0.48rem 0 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.86);
+}
+
 .score-side {
   display: inline-flex;
-  align-items: baseline;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   gap: 0.35rem;
+  min-width: 92px;
 }
 
 .score-team {
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: rgba(226, 232, 240, 0.85);
 }
 
 .score-digits,
-.score-divider {
+.clock-digits {
   font-family: 'DSEG7 Classic', sans-serif;
   color: #ff4d4d;
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d;
 }
 
 .score-digits {
-  font-size: 3rem;
+  font-size: 2.45rem;
   line-height: 1;
 }
 
-.score-divider {
-  font-size: 2.35rem;
+.score-center {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 132px;
+  padding: 0 0.5rem;
+  border-left: 1px solid rgba(148, 163, 184, 0.25);
+  border-right: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.score-period-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.78);
+  margin-bottom: 0.25rem;
+}
+
+.clock-digits {
+  font-size: 2.05rem;
   line-height: 1;
 }
 
@@ -912,15 +1621,17 @@ onBeforeUnmount(() => {
   gap: 0.8rem;
 }
 
-.playable-kb-legend {
-  margin-top: 0.2rem;
-}
-
 .empty-state p {
   margin: 0;
 }
 
 @media (max-width: 1080px) {
+  .setup-settings-row {
+    grid-template-columns: repeat(2, max-content);
+    align-items: end;
+    justify-content: start;
+  }
+
   .playable-layout {
     grid-template-columns: 1fr;
   }
@@ -933,17 +1644,23 @@ onBeforeUnmount(() => {
   }
 
   .playable-scoreboard {
-    min-width: 240px;
+    min-width: 300px;
     gap: 0.7rem;
     padding: 0.4rem 0.8rem;
   }
 
   .score-digits {
-    font-size: 2.3rem;
+    font-size: 2rem;
   }
 
-  .score-divider {
-    font-size: 2rem;
+  .clock-digits {
+    font-size: 1.6rem;
+  }
+}
+
+@media (max-width: 720px) {
+  .setup-settings-row {
+    grid-template-columns: 1fr 1fr;
   }
 }
 </style>

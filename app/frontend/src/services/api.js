@@ -457,13 +457,15 @@ export async function getPlayableOptions() {
   return response.json();
 }
 
-export async function startPlayableGame(playersPerSide, difficulty) {
+export async function startPlayableGame(playersPerSide, difficulty, periodMode = 'period', periodLengthMinutes = 5) {
   const response = await fetch(`${API_BASE_URL}/api/playable/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       players_per_side: Number(playersPerSide),
       difficulty: String(difficulty || '').toLowerCase(),
+      period_mode: String(periodMode || 'period').toLowerCase(),
+      period_length_minutes: Number(periodLengthMinutes),
     }),
   });
   if (!response.ok) {

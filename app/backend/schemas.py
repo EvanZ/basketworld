@@ -145,6 +145,8 @@ class SetPressureParamsRequest(BaseModel):
 class PlayableStartRequest(BaseModel):
     players_per_side: int
     difficulty: Literal["easy", "medium", "hard"]
+    period_mode: Literal["period", "halves", "quarters"] = "period"
+    period_length_minutes: int = 5
 
 
 class PlayableStepRequest(BaseModel):
