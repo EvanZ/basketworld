@@ -3450,7 +3450,7 @@ onBeforeUnmount(() => {
 .shot-clock-overlay {
   position: relative;
   font-family: 'DSEG7 Classic', sans-serif;
-  font-size: 5rem;
+  font-size: 4.1rem;
   color: #ff4d4d; /* Bright red for the LED color */
   background-color: #1a1a1a; /* Dark background for contrast */
   padding: 2px 8px;

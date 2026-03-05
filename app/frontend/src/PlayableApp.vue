@@ -619,8 +619,22 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
 
 const playerChoices = computed(() => {
   const values = optionsPayload.value?.players_per_side;
-  if (!Array.isArray(values) || values.length === 0) return [1, 2, 3, 4, 5];
-  return values.map((v) => Number(v)).filter((v) => Number.isFinite(v));
+  const baseChoices = (
+    Array.isArray(values) && values.length > 0
+      ? values
+      : [1, 2, 3, 4, 5]
+  )
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v));
+
+  const matrix = optionsPayload.value?.options;
+  if (!matrix || typeof matrix !== 'object') return baseChoices;
+
+  return baseChoices.filter((players) => {
+    const row = matrix[String(players)];
+    if (!row || typeof row !== 'object') return false;
+    return Object.values(row).some((cfg) => Boolean(cfg?.available));
+  });
 });
 
 const difficultyChoices = computed(() => {
@@ -1276,6 +1290,20 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-if="hasGame" class="playable-layout">
+      <div class="playable-scoreboard" aria-label="Scoreboard">
+        <div class="score-side">
+          <span class="score-team">YOU</span>
+          <span class="score-digits">{{ formattedUserScore }}</span>
+        </div>
+        <div class="score-center">
+          <span class="score-period-label">{{ gameClockSegmentLabel }}</span>
+          <span class="clock-digits">{{ gameClockDisplay }}</span>
+        </div>
+        <div class="score-side">
+          <span class="score-team">AI</span>
+          <span class="score-digits">{{ formattedAiScore }}</span>
+        </div>
+      </div>
       <div class="board-shell">
         <div class="board-stage">
           <GameBoard
@@ -1289,20 +1317,6 @@ onBeforeUnmount(() => {
             :minimal-chrome="true"
             @update:activePlayerId="activePlayerId = $event"
           />
-          <div class="playable-scoreboard" aria-label="Scoreboard">
-            <div class="score-side">
-              <span class="score-team">YOU</span>
-              <span class="score-digits">{{ formattedUserScore }}</span>
-            </div>
-            <div class="score-center">
-              <span class="score-period-label">{{ gameClockSegmentLabel }}</span>
-              <span class="clock-digits">{{ gameClockDisplay }}</span>
-            </div>
-            <div class="score-side">
-              <span class="score-team">AI</span>
-              <span class="score-digits">{{ formattedAiScore }}</span>
-            </div>
-          </div>
           <div v-if="showGameOverOverlay" class="playable-gameover-overlay" role="status" aria-live="polite">
             <div class="playable-gameover-banner" :class="`winner-${gameOverWinnerKey}`">
               <p class="gameover-banner-main">{{ gameOverBannerText }}</p>
@@ -1485,11 +1499,8 @@ onBeforeUnmount(() => {
 }
 
 .playable-scoreboard {
-  position: absolute;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 13;
+  grid-column: 1 / -1;
+  justify-self: center;
   display: inline-flex;
   align-items: stretch;
   gap: 0.8rem;
@@ -1585,7 +1596,7 @@ onBeforeUnmount(() => {
 }
 
 .score-digits {
-  font-size: 2.45rem;
+  font-size: 3.45rem;
   line-height: 1;
 }
 
@@ -1609,7 +1620,7 @@ onBeforeUnmount(() => {
 }
 
 .clock-digits {
-  font-size: 2.05rem;
+  font-size: 3.05rem;
   line-height: 1;
 }
 
@@ -1644,6 +1655,8 @@ onBeforeUnmount(() => {
   }
 
   .playable-scoreboard {
+    grid-column: auto;
+    justify-self: center;
     min-width: 300px;
     gap: 0.7rem;
     padding: 0.4rem 0.8rem;
