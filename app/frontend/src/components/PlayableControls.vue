@@ -32,6 +32,14 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  playerDisplayNames: {
+    type: Object,
+    default: () => ({}),
+  },
+  playerJerseyNumbers: {
+    type: Object,
+    default: () => ({}),
+  },
   shortcuts: {
     type: Array,
     default: () => [],
@@ -155,6 +163,46 @@ function formatPolicyPercent(value) {
   return `${(prob * 100).toFixed(1)}%`;
 }
 
+function getPlayerSurname(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerDisplayNames && typeof props.playerDisplayNames === 'object'
+    ? props.playerDisplayNames
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function getPlayerJerseyNumber(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerJerseyNumbers && typeof props.playerJerseyNumbers === 'object'
+    ? props.playerJerseyNumbers
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
+  return jersey;
+}
+
+function formatPlayerNameWithId(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return 'Unknown';
+  const surname = getPlayerSurname(id);
+  if (surname) return `${surname} #${id}`;
+  return `Player ${id}`;
+}
+
+function formatPlayerNameWithJersey(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return 'Unknown';
+  const surname = getPlayerSurname(id);
+  const jersey = getPlayerJerseyNumber(id);
+  if (surname && jersey) return `${surname} #${jersey}`;
+  if (surname) return `${surname} #${id}`;
+  if (jersey) return `Player #${jersey}`;
+  return `Player ${id}`;
+}
+
 const statsSafe = computed(() => {
   if (props.stats && typeof props.stats === 'object') return props.stats;
   return makeEmptyStats();
@@ -187,7 +235,7 @@ const boxScoreRows = computed(() => {
       const playerShots = playerLine.shots || {};
       return {
         key: `${teamKey}-player-${pid}`,
-        player: `${pid}`,
+        player: formatPlayerNameWithJersey(pid),
         isTotal: false,
         points: asCount(playerLine.points),
         fg: formatShotCell(playerShots.total),
@@ -570,7 +618,7 @@ defineExpose({
           :disabled="disabled"
           @click="emit('update:activePlayerId', Number(pid))"
         >
-          Player {{ pid }}
+          {{ formatPlayerNameWithId(pid) }}
         </button>
       </div>
 
@@ -588,7 +636,7 @@ defineExpose({
         <div v-if="showPolicyHints" class="ai-hints-panel">
           <p class="ai-hints-title">Policy Hints</p>
           <p class="ai-hints-player">
-            You {{ activePolicyHintRow?.playerId }}
+            You {{ formatPlayerNameWithId(activePolicyHintRow?.playerId) }}
             <span v-if="activePolicyHintRow?.isBallHandler"> (Ball)</span>
           </p>
           <ul v-if="activePolicyHintRow && activePolicyHintRow.hints.length > 0" class="ai-hints-list">
@@ -631,7 +679,7 @@ defineExpose({
             :disabled="disabled || !activeCanSelectPointerPass"
             @click="handlePointerPassTargetSelected(targetId)"
           >
-            Player {{ targetId }}
+            {{ formatPlayerNameWithId(targetId) }}
           </button>
         </div>
         <p v-if="!activeCanSelectPointerPass" class="pointer-pass-help">
@@ -645,7 +693,7 @@ defineExpose({
           :key="`row-${row.playerId}`"
           class="selected-row"
         >
-          <span>Player {{ row.playerId }}</span>
+          <span>{{ formatPlayerNameWithId(row.playerId) }}</span>
           <strong>{{ row.action }}</strong>
         </div>
       </div>

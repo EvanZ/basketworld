@@ -27,6 +27,8 @@ const gameHistory = ref([]);
 const activePlayerId = ref(null);
 const boardSelections = ref({});
 const controlsRef = ref(null);
+const playerDisplayNames = ref({});
+const playerJerseyNumbers = ref({});
 
 const score = ref({ user: 0, ai: 0 });
 const possession = ref(null);
@@ -135,6 +137,91 @@ const MOVE_HOTKEY_ACTIONS_BY_CODE = {
   KeyS: 'SHOOT',
 };
 
+const PLAYABLE_SURNAME_POOL = [
+  'Smith', 'Jones', 'Brown', 'Davis', 'Miller', 'Wilson', 'Moore', 'Taylor',
+  'Thomas', 'White', 'Clark', 'Lewis', 'Lee', 'Walker', 'Hall', 'Allen',
+  'Young', 'King', 'Wright', 'Scott', 'Torres', 'Nguyen', 'Hill', 'Green',
+  'Adams', 'Baker', 'Nelson', 'Carter', 'Perez', 'Turner', 'Parker', 'Evans',
+  'Morris', 'Rogers', 'Reed', 'Cook', 'Morgan', 'Bell', 'Murphy', 'Bailey',
+  'Rivera', 'Cooper', 'Cox', 'Gray', 'James', 'Watson', 'Brooks', 'Kelly',
+  'Price', 'Wood', 'Barnes', 'Ross', 'Cole', 'Perry', 'Powell', 'Long',
+  'Patel', 'Flores', 'Hughes', 'Butler', 'Foster', 'Bryant', 'Diaz', 'Hayes',
+  'Myers', 'Ford', 'Graham', 'Woods', 'West', 'Jordan', 'Owens', 'Fisher',
+  'Ellis', 'Harris', 'Hudson', 'Ryan', 'Porter', 'Hunter', 'Hicks', 'Henry',
+  'Bishop', 'Dean', 'Mason', 'Hart', 'Willis', 'Lane', 'Riley', 'Rose',
+  'Stone', 'Dunn', 'Payne', 'Ray', 'Berry', 'Arnold', 'Wagner', 'Weaver',
+  'Burke', 'Lynch', 'Hanson', 'Day', 'Fox', 'Ramsey', 'Shaw', 'Burns',
+  'Gordon', 'Warren', 'Dixon', 'Ramos', 'Reyes', 'Cruz', 'Ortiz', 'Soto',
+  'Kim', 'Li', 'Ho', 'Tran', 'Pham', 'Le',
+];
+
+const PLAYABLE_JERSEY_NUMBER_WEIGHTS = [
+  { number: '00', weight: 14 },
+  { number: '0', weight: 27 },
+  { number: '1', weight: 24 },
+  { number: '2', weight: 23 },
+  { number: '3', weight: 23 },
+  { number: '4', weight: 23 },
+  { number: '5', weight: 27 },
+  { number: '6', weight: 2 },
+  { number: '7', weight: 20 },
+  { number: '8', weight: 28 },
+  { number: '9', weight: 23 },
+  { number: '10', weight: 19 },
+  { number: '11', weight: 22 },
+  { number: '12', weight: 19 },
+  { number: '13', weight: 23 },
+  { number: '14', weight: 16 },
+  { number: '15', weight: 18 },
+  { number: '16', weight: 7 },
+  { number: '17', weight: 16 },
+  { number: '18', weight: 8 },
+  { number: '19', weight: 5 },
+  { number: '20', weight: 17 },
+  { number: '21', weight: 19 },
+  { number: '22', weight: 24 },
+  { number: '23', weight: 17 },
+  { number: '24', weight: 17 },
+  { number: '25', weight: 15 },
+  { number: '26', weight: 6 },
+  { number: '27', weight: 9 },
+  { number: '28', weight: 8 },
+  { number: '29', weight: 2 },
+  { number: '30', weight: 11 },
+  { number: '31', weight: 7 },
+  { number: '32', weight: 8 },
+  { number: '33', weight: 11 },
+  { number: '34', weight: 6 },
+  { number: '35', weight: 10 },
+  { number: '36', weight: 2 },
+  { number: '37', weight: 1 },
+  { number: '40', weight: 3 },
+  { number: '41', weight: 3 },
+  { number: '42', weight: 3 },
+  { number: '43', weight: 2 },
+  { number: '44', weight: 6 },
+  { number: '45', weight: 5 },
+  { number: '46', weight: 1 },
+  { number: '50', weight: 3 },
+  { number: '54', weight: 1 },
+  { number: '55', weight: 9 },
+  { number: '58', weight: 1 },
+  { number: '61', weight: 1 },
+  { number: '65', weight: 1 },
+  { number: '67', weight: 1 },
+  { number: '71', weight: 1 },
+  { number: '76', weight: 1 },
+  { number: '77', weight: 6 },
+  { number: '88', weight: 4 },
+  { number: '91', weight: 1 },
+  { number: '94', weight: 1 },
+  { number: '99', weight: 1 },
+];
+const PLAYABLE_JERSEY_TOTAL_WEIGHT = PLAYABLE_JERSEY_NUMBER_WEIGHTS.reduce(
+  (acc, row) => acc + Math.max(0, Number(row?.weight || 0)),
+  0,
+);
+
 function formatClockDisplay(rawSeconds) {
   const total = Math.max(0, Number(rawSeconds || 0));
   const minutes = Math.floor(total / 60);
@@ -185,6 +272,236 @@ function normalizeGameResult(raw) {
       ai: Number(scoreRaw.ai ?? score.value.ai ?? 0) || 0,
     },
   };
+}
+
+function shuffleArray(items) {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function getPlayableAllPlayerIds(state) {
+  const userIds = Array.isArray(state?.playable_user_ids) ? state.playable_user_ids : [];
+  const aiIds = Array.isArray(state?.playable_ai_ids) ? state.playable_ai_ids : [];
+  const merged = [...userIds, ...aiIds]
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v));
+  if (merged.length > 0) {
+    return Array.from(new Set(merged)).sort((a, b) => a - b);
+  }
+  const positions = Array.isArray(state?.positions) ? state.positions : [];
+  return Array.from({ length: positions.length }, (_, idx) => idx);
+}
+
+function assignRandomPlayablePlayerNames(state) {
+  const ids = getPlayableAllPlayerIds(state);
+  if (ids.length === 0) {
+    playerDisplayNames.value = {};
+    return;
+  }
+  const shuffled = shuffleArray(PLAYABLE_SURNAME_POOL);
+  const next = {};
+  for (let i = 0; i < ids.length; i += 1) {
+    const pid = ids[i];
+    next[pid] = String(shuffled[i] || `P${pid}`).toUpperCase();
+  }
+  playerDisplayNames.value = next;
+}
+
+function ensurePlayablePlayerNames(state) {
+  const ids = getPlayableAllPlayerIds(state);
+  if (ids.length === 0) {
+    playerDisplayNames.value = {};
+    return;
+  }
+  const current = playerDisplayNames.value && typeof playerDisplayNames.value === 'object'
+    ? playerDisplayNames.value
+    : {};
+  const next = {};
+  const used = new Set();
+  const missing = [];
+
+  for (const pid of ids) {
+    const raw = current[pid] ?? current[String(pid)];
+    const name = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+    if (name) {
+      next[pid] = name;
+      used.add(name);
+    } else {
+      missing.push(pid);
+    }
+  }
+
+  if (missing.length > 0) {
+    const candidates = shuffleArray(
+      PLAYABLE_SURNAME_POOL.filter((name) => !used.has(String(name).toUpperCase())),
+    );
+    for (let i = 0; i < missing.length; i += 1) {
+      const pid = missing[i];
+      const fallback = String(candidates[i] || `P${pid}`).toUpperCase();
+      next[pid] = fallback;
+      used.add(fallback);
+    }
+  }
+
+  playerDisplayNames.value = next;
+}
+
+function getPlayablePlayerName(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = playerDisplayNames.value && typeof playerDisplayNames.value === 'object'
+    ? playerDisplayNames.value
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function formatPlayablePlayerRef(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return 'Unknown';
+  const surname = getPlayablePlayerName(id);
+  if (surname) return `${surname} #${id}`;
+  return `Player ${id}`;
+}
+
+function getWeightedRandomJerseyNumber() {
+  if (PLAYABLE_JERSEY_TOTAL_WEIGHT <= 0) return String(Math.max(0, Number(0)));
+  let draw = Math.random() * PLAYABLE_JERSEY_TOTAL_WEIGHT;
+  for (const row of PLAYABLE_JERSEY_NUMBER_WEIGHTS) {
+    draw -= Math.max(0, Number(row?.weight || 0));
+    if (draw <= 0) return String(row.number);
+  }
+  return String(PLAYABLE_JERSEY_NUMBER_WEIGHTS[PLAYABLE_JERSEY_NUMBER_WEIGHTS.length - 1]?.number || '0');
+}
+
+function drawTeamJerseyNumber(usedByTeam) {
+  const maxTries = 48;
+  for (let i = 0; i < maxTries; i += 1) {
+    const candidate = getWeightedRandomJerseyNumber();
+    if (!usedByTeam.has(candidate)) return candidate;
+  }
+  for (const row of PLAYABLE_JERSEY_NUMBER_WEIGHTS) {
+    const candidate = String(row.number);
+    if (!usedByTeam.has(candidate)) return candidate;
+  }
+  return getWeightedRandomJerseyNumber();
+}
+
+function assignRandomPlayableJerseyNumbers(state) {
+  const ids = getPlayableAllPlayerIds(state);
+  if (ids.length === 0) {
+    playerJerseyNumbers.value = {};
+    return;
+  }
+
+  const userIds = (Array.isArray(state?.playable_user_ids) ? state.playable_user_ids : [])
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+  const aiIds = (Array.isArray(state?.playable_ai_ids) ? state.playable_ai_ids : [])
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+
+  const userSet = new Set(userIds);
+  const aiSet = new Set(aiIds);
+  const next = {};
+  const userUsed = new Set();
+  const aiUsed = new Set();
+
+  for (const pid of userIds) {
+    const jersey = drawTeamJerseyNumber(userUsed);
+    next[pid] = jersey;
+    userUsed.add(jersey);
+  }
+
+  for (const pid of aiIds) {
+    const jersey = drawTeamJerseyNumber(aiUsed);
+    next[pid] = jersey;
+    aiUsed.add(jersey);
+  }
+
+  for (const pid of ids) {
+    if (next[pid] !== undefined) continue;
+    const useUserPool = userSet.has(pid);
+    const useAiPool = aiSet.has(pid);
+    const used = useUserPool ? userUsed : (useAiPool ? aiUsed : new Set());
+    const jersey = drawTeamJerseyNumber(used);
+    next[pid] = jersey;
+    used.add(jersey);
+  }
+
+  playerJerseyNumbers.value = next;
+}
+
+function ensurePlayableJerseyNumbers(state) {
+  const ids = getPlayableAllPlayerIds(state);
+  if (ids.length === 0) {
+    playerJerseyNumbers.value = {};
+    return;
+  }
+
+  const current = playerJerseyNumbers.value && typeof playerJerseyNumbers.value === 'object'
+    ? playerJerseyNumbers.value
+    : {};
+  const userIds = (Array.isArray(state?.playable_user_ids) ? state.playable_user_ids : [])
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+  const aiIds = (Array.isArray(state?.playable_ai_ids) ? state.playable_ai_ids : [])
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+  const userSet = new Set(userIds);
+  const aiSet = new Set(aiIds);
+
+  const next = {};
+  const userUsed = new Set();
+  const aiUsed = new Set();
+
+  const copyExisting = (pid, teamUsed) => {
+    const raw = current[pid] ?? current[String(pid)];
+    const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
+    if (!jersey) return false;
+    if (teamUsed.has(jersey)) return false;
+    next[pid] = jersey;
+    teamUsed.add(jersey);
+    return true;
+  };
+
+  for (const pid of userIds) {
+    if (!copyExisting(pid, userUsed)) {
+      const jersey = drawTeamJerseyNumber(userUsed);
+      next[pid] = jersey;
+      userUsed.add(jersey);
+    }
+  }
+
+  for (const pid of aiIds) {
+    if (!copyExisting(pid, aiUsed)) {
+      const jersey = drawTeamJerseyNumber(aiUsed);
+      next[pid] = jersey;
+      aiUsed.add(jersey);
+    }
+  }
+
+  for (const pid of ids) {
+    if (next[pid] !== undefined) continue;
+    const useUserPool = userSet.has(pid);
+    const useAiPool = aiSet.has(pid);
+    const used = useUserPool ? userUsed : (useAiPool ? aiUsed : new Set());
+    if (!copyExisting(pid, used)) {
+      const jersey = drawTeamJerseyNumber(used);
+      next[pid] = jersey;
+      used.add(jersey);
+    }
+  }
+
+  playerJerseyNumbers.value = next;
 }
 
 function createShotLine() {
@@ -536,10 +853,10 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       const isDunk = Boolean(shot.is_dunk) || Number(shot.distance) === 0;
       const isThree = !isDunk && Boolean(shot.is_three);
       const shotLabel = isDunk ? 'Dunk' : (isThree ? '3pt shot' : '2pt shot');
-      let event = `${shotLabel} ${Boolean(shot.success) ? 'made' : 'missed'} by Player ${shooterId}.`;
+      let event = `${shotLabel} ${Boolean(shot.success) ? 'made' : 'missed'} by ${formatPlayablePlayerRef(shooterId)}.`;
       const assistPasserId = Number(shot.assist_passer_id);
       if (Boolean(shot.success) && Boolean(shot.assist_full) && Number.isFinite(assistPasserId)) {
-        event = `${event.slice(0, -1)} (assist: Player ${assistPasserId}).`;
+        event = `${event.slice(0, -1)} (assist: ${formatPlayablePlayerRef(assistPasserId)}).`;
       }
       pushEvent(resolveTeam(shooterId), event);
     }
@@ -552,9 +869,12 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       if (Boolean(passInfo.success)) {
         const targetId = Number(passInfo.target);
         if (Number.isFinite(targetId)) {
-          pushEvent(resolveTeam(passerId), `Pass completed: Player ${passerId} to Player ${targetId}.`);
+          pushEvent(
+            resolveTeam(passerId),
+            `Pass completed: ${formatPlayablePlayerRef(passerId)} to ${formatPlayablePlayerRef(targetId)}.`,
+          );
         } else {
-          pushEvent(resolveTeam(passerId), `Pass completed by Player ${passerId}.`);
+          pushEvent(resolveTeam(passerId), `Pass completed by ${formatPlayablePlayerRef(passerId)}.`);
         }
       }
     }
@@ -566,9 +886,12 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       const stolenBy = Number(turnover?.stolen_by);
       const reason = formatTurnoverReason(turnover?.reason);
       if (Number.isFinite(stolenBy)) {
-        pushEvent(resolveTeam(stolenBy), `Steal by Player ${stolenBy} from Player ${playerId}.`);
+        pushEvent(
+          resolveTeam(stolenBy),
+          `Steal by ${formatPlayablePlayerRef(stolenBy)} from ${formatPlayablePlayerRef(playerId)}.`,
+        );
       } else {
-        pushEvent(resolveTeam(playerId), `Turnover by Player ${playerId} (${reason}).`);
+        pushEvent(resolveTeam(playerId), `Turnover by ${formatPlayablePlayerRef(playerId)} (${reason}).`);
       }
     }
 
@@ -582,7 +905,10 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       const bonusTeam = scoringTeam === 'user' || scoringTeam === 'ai'
         ? ` (+1 ${asTeamLabel(scoringTeam)})`
         : '';
-      pushEvent(resolveTeam(playerId), `Defensive lane violation by Player ${playerId}.${bonusTeam}`);
+      pushEvent(
+        resolveTeam(playerId),
+        `Defensive lane violation by ${formatPlayablePlayerRef(playerId)}.${bonusTeam}`,
+      );
     }
 
     const offensiveViolations = Array.isArray(stepResults?.offensive_lane_violations)
@@ -591,7 +917,7 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
     for (const violation of offensiveViolations) {
       const playerId = Number(violation?.player_id);
       if (!Number.isFinite(playerId)) continue;
-      pushEvent(resolveTeam(playerId), `Offensive lane violation by Player ${playerId}.`);
+      pushEvent(resolveTeam(playerId), `Offensive lane violation by ${formatPlayablePlayerRef(playerId)}.`);
     }
   }
 
@@ -834,6 +1160,8 @@ function applyStatePayload(payload) {
   const state = payload?.state || null;
   gameState.value = state;
   gameHistory.value = state ? [state] : [];
+  ensurePlayablePlayerNames(state);
+  ensurePlayableJerseyNumbers(state);
 
   if (payload?.score) {
     score.value = {
@@ -973,6 +1301,8 @@ async function onStartGame() {
     resetPlayableStats();
     resetPlayablePlayByPlay();
     applyStatePayload(payload);
+    assignRandomPlayablePlayerNames(payload?.state);
+    assignRandomPlayableJerseyNumbers(payload?.state);
     recordPlayableStartPlayByPlay(payload);
     boardSelections.value = {};
   } catch (err) {
@@ -994,6 +1324,8 @@ async function onNewGame() {
     resetPlayableStats();
     resetPlayablePlayByPlay();
     applyStatePayload(payload);
+    assignRandomPlayablePlayerNames(payload?.state);
+    assignRandomPlayableJerseyNumbers(payload?.state);
     recordPlayableStartPlayByPlay(payload);
     boardSelections.value = {};
   } catch (err) {
@@ -1017,6 +1349,8 @@ function onResetSetup() {
   score.value = { user: 0, ai: 0 };
   possession.value = null;
   sessionConfig.value = null;
+  playerDisplayNames.value = {};
+  playerJerseyNumbers.value = {};
 
   const modeRaw = String(selectedPeriodMode.value || 'period').toLowerCase();
   const periodMode = ['period', 'halves', 'quarters'].includes(modeRaw) ? modeRaw : 'period';
@@ -1309,6 +1643,8 @@ onBeforeUnmount(() => {
           <GameBoard
             :game-history="gameHistory"
             :active-player-id="activePlayerId"
+            :player-display-names="playerDisplayNames"
+            :player-jersey-numbers="playerJerseyNumbers"
             :selected-actions="boardSelections"
             :is-shot-clock-updating="false"
             :allow-shot-clock-adjustment="false"
@@ -1324,7 +1660,11 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-        <PlayableEnvironmentInfo :game-state="gameState" />
+        <PlayableEnvironmentInfo
+          :game-state="gameState"
+          :player-display-names="playerDisplayNames"
+          :player-jersey-numbers="playerJerseyNumbers"
+        />
       </div>
 
       <div class="controls-shell">
@@ -1334,6 +1674,8 @@ onBeforeUnmount(() => {
           :active-player-id="activePlayerId"
           :user-player-ids="userPlayerIds"
           :score="score"
+          :player-display-names="playerDisplayNames"
+          :player-jersey-numbers="playerJerseyNumbers"
           :stats="playableStats"
           :play-by-play="playablePlayByPlay"
           :shortcuts="playableKeyboardShortcuts"

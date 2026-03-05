@@ -6,6 +6,14 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  playerDisplayNames: {
+    type: Object,
+    default: () => ({}),
+  },
+  playerJerseyNumbers: {
+    type: Object,
+    default: () => ({}),
+  },
 });
 
 function asNumber(value) {
@@ -79,6 +87,38 @@ function buildSkillRows(ids, skillSet) {
   }));
 }
 
+function getPlayerSurname(playerId) {
+  const id = asNumber(playerId);
+  if (id === null) return '';
+  const map = props.playerDisplayNames && typeof props.playerDisplayNames === 'object'
+    ? props.playerDisplayNames
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function getPlayerJerseyNumber(playerId) {
+  const id = asNumber(playerId);
+  if (id === null) return '';
+  const map = props.playerJerseyNumbers && typeof props.playerJerseyNumbers === 'object'
+    ? props.playerJerseyNumbers
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
+  return jersey;
+}
+
+function formatPlayerLabel(playerId) {
+  const id = asNumber(playerId);
+  if (id === null) return 'Unknown';
+  const surname = getPlayerSurname(id);
+  const jersey = getPlayerJerseyNumber(id);
+  if (surname && jersey) return `${surname} #${jersey}`;
+  if (surname) return `${surname} #${id}`;
+  if (jersey) return `Player #${jersey}`;
+  return `Player ${id}`;
+}
+
 const userSkillRows = computed(() => buildSkillRows(userIds.value, sampledSideSkills.value.user));
 const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills.value.ai));
 </script>
@@ -141,7 +181,7 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
                 :key="`user-skill-${row.playerId}`"
                 class="skill-row"
               >
-                <span>{{ row.playerId }}</span>
+                <span>{{ formatPlayerLabel(row.playerId) }}</span>
                 <span>{{ formatPercent(row.layup) }}</span>
                 <span>{{ formatPercent(row.threePt) }}</span>
                 <span>{{ formatPercent(row.dunk) }}</span>
@@ -163,7 +203,7 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
                 :key="`ai-skill-${row.playerId}`"
                 class="skill-row"
               >
-                <span>{{ row.playerId }}</span>
+                <span>{{ formatPlayerLabel(row.playerId) }}</span>
                 <span>{{ formatPercent(row.layup) }}</span>
                 <span>{{ formatPercent(row.threePt) }}</span>
                 <span>{{ formatPercent(row.dunk) }}</span>

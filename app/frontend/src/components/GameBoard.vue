@@ -83,6 +83,14 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  playerDisplayNames: {
+    type: Object,
+    default: () => ({}),
+  },
+  playerJerseyNumbers: {
+    type: Object,
+    default: () => ({}),
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
@@ -156,6 +164,33 @@ function getPlayerOwner(gameState, playerId) {
   if (userIds.has(playerId)) return 'user';
   if (aiIds.has(playerId)) return 'ai';
   return null;
+}
+
+function getPlayerDisplayName(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerDisplayNames && typeof props.playerDisplayNames === 'object'
+    ? props.playerDisplayNames
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  if (typeof raw !== 'string') return '';
+  return raw.trim().toUpperCase();
+}
+
+function getPlayerJerseyNumber(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerJerseyNumbers && typeof props.playerJerseyNumbers === 'object'
+    ? props.playerJerseyNumbers
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
+  if (!jersey) return String(id);
+  return jersey;
+}
+
+function expectedValueLabelDy() {
+  return props.minimalChrome ? '1.9em' : '-1.0em';
 }
 
 function isPointerPassMode(gs) {
@@ -2847,7 +2882,7 @@ onBeforeUnmount(() => {
               text-anchor="middle" 
               class="player-text ghost-text"
             >
-              {{ player.id }}
+              {{ getPlayerJerseyNumber(player.id) }}
             </text>
           </g>
         </g>
@@ -2970,23 +3005,44 @@ onBeforeUnmount(() => {
               style="pointer-events: none;"
             />
             <text 
+              v-if="minimalChrome && getPlayerDisplayName(player.id)"
+              :transform="playerLabelTransform(player)"
+              x="0"
+              y="0"
+              dy="-0.85em"
+              text-anchor="middle"
+              class="player-name-text"
+              style="pointer-events: none;"
+            >{{ getPlayerDisplayName(player.id) }}</text>
+            <text
+              v-if="minimalChrome"
+              :x="(draggedPlayerId === player.id ? draggedPlayerPos.x : player.x) - (HEX_RADIUS * 0.6)"
+              :y="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+              dy="0.3em"
+              text-anchor="middle"
+              class="player-index-text"
+              style="pointer-events: none;"
+            >
+              {{ player.id }}
+            </text>
+            <text 
               :transform="playerLabelTransform(player)"
               x="0" 
               y="0" 
-              dy="0.3em" 
+              :dy="minimalChrome && getPlayerDisplayName(player.id) ? '0.48em' : '0.3em'"
               text-anchor="middle" 
               :class="[
                 'player-text',
                 { 'active-player-text': player.id === activePlayerId },
               ]"
               style="pointer-events: none;" 
-            >{{ player.id }}</text>
+            >{{ getPlayerJerseyNumber(player.id) }}</text>
             <!-- EP (Expected Points) label above player ID for offensive players -->
             <text
               v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
-              dy="-1.0em"
+              :dy="expectedValueLabelDy()"
               text-anchor="middle"
               class="noop-prob-text"
             >
@@ -3787,12 +3843,32 @@ onBeforeUnmount(() => {
 }
 .player-text {
   fill: white;
-  font-weight: bold;
-  font-size: 0.85rem;
+  font-weight: 400;
+  font-size: 0.65rem;
   paint-order: stroke;
   stroke: black;
-  stroke-width: 0.1rem;
+  stroke-width: 0.05rem;
   transition: transform 0.26s ease;
+}
+.player-name-text {
+  fill: #dbeafe;
+  font-weight: 500;
+  font-size: 0.45rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.9);
+  stroke-width: 0.04rem;
+  transition: transform 0.26s ease;
+}
+.player-index-text {
+  fill: #111;
+  font-weight: 500;
+  font-size: 0.48rem;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-width: 0.02rem;
+  transition: x 0.26s ease, y 0.26s ease;
 }
 .active-player-text {
   fill: #f8e71c;
@@ -3904,6 +3980,8 @@ onBeforeUnmount(() => {
 .no-move-transitions .player-offense-core,
 .no-move-transitions .player-defense,
 .no-move-transitions .player-ai,
+.no-move-transitions .player-name-text,
+.no-move-transitions .player-index-text,
 .no-move-transitions .player-text,
 .no-move-transitions .shot-prob-text,
 .no-move-transitions .noop-prob-text,
@@ -3914,12 +3992,12 @@ onBeforeUnmount(() => {
 }
 
 .noop-prob-text {
-  font-size: 10px;
-  font-weight: 700;
-  fill: #111;
+  font-size: 0.45rem;
+  font-weight: 500;
+  fill: #f9fcf8;
   paint-order: stroke;
-  stroke: #fff;
-  stroke-width: 0.6px;
+  stroke: rgba(2, 6, 23, 0.85);
+  stroke-width: 0.04rem;
   transition: x 0.26s ease, y 0.26s ease;
 }
 
