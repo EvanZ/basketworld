@@ -845,6 +845,13 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
 
   const stepResults = getStepResults(payload);
   if (stepResults && typeof stepResults === 'object') {
+    const turnovers = Array.isArray(stepResults?.turnovers) ? stepResults.turnovers : [];
+    const turnoverPlayerIds = new Set(
+      turnovers
+        .map((turnover) => Number(turnover?.player_id))
+        .filter((playerId) => Number.isFinite(playerId)),
+    );
+
     const shots = stepResults?.shots && typeof stepResults.shots === 'object' ? stepResults.shots : {};
     for (const [shooterRaw, shotRaw] of Object.entries(shots)) {
       const shooterId = Number(shooterRaw);
@@ -865,6 +872,7 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
     for (const [passerRaw, passRaw] of Object.entries(passes)) {
       const passerId = Number(passerRaw);
       if (!Number.isFinite(passerId)) continue;
+      if (turnoverPlayerIds.has(passerId)) continue;
       const passInfo = passRaw && typeof passRaw === 'object' ? passRaw : {};
       if (Boolean(passInfo.success)) {
         const targetId = Number(passInfo.target);
@@ -879,7 +887,6 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       }
     }
 
-    const turnovers = Array.isArray(stepResults?.turnovers) ? stepResults.turnovers : [];
     for (const turnover of turnovers) {
       const playerId = Number(turnover?.player_id);
       if (!Number.isFinite(playerId)) continue;
