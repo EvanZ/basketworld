@@ -83,3 +83,5 @@ prompts/
 .DS_Store
 
 app/backend/episodes/
+# keep social preview asset in repo
+!app/frontend/public/social-splash.jpg
