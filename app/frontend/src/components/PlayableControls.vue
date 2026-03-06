@@ -228,6 +228,31 @@ const activeCanSelectPointerPass = computed(() => {
   return canPlayerSelectPointerPass(activePlayer.value);
 });
 
+function getNextUnselectedUserPlayerId(currentPlayerId) {
+  const ordered = orderedUserPlayerIds.value;
+  if (!Array.isArray(ordered) || ordered.length === 0) return null;
+  const unselected = ordered.filter((id) => typeof selectedActions.value?.[id] !== 'string');
+  if (unselected.length === 0) return null;
+
+  const current = Number(currentPlayerId);
+  const startIdx = ordered.findIndex((id) => Number(id) === current);
+  if (startIdx < 0) return unselected[0];
+
+  for (let offset = 1; offset <= ordered.length; offset += 1) {
+    const candidate = ordered[(startIdx + offset) % ordered.length];
+    if (typeof selectedActions.value?.[candidate] !== 'string') {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function advanceToNextPlayer(currentPlayerId) {
+  const nextId = getNextUnselectedUserPlayerId(currentPlayerId);
+  if (!Number.isFinite(Number(nextId))) return;
+  emit('update:activePlayerId', Number(nextId));
+}
+
 const activePassSuccessProbabilities = computed(() => {
   if (!activeCanSelectPointerPass.value) return {};
   const gs = props.gameState;
@@ -292,6 +317,7 @@ function handlePointerPassTargetSelected(targetId) {
     ...selectedActions.value,
     [pid]: `PASS->${tid}`,
   };
+  advanceToNextPlayer(pid);
 }
 
 function sanitizeSelections() {
@@ -356,6 +382,7 @@ function selectActionForActivePlayer(actionName) {
     ...selectedActions.value,
     [pid]: actionName,
   };
+  advanceToNextPlayer(pid);
   return true;
 }
 
@@ -394,6 +421,9 @@ function submitActions() {
 
   emit('actions-submitted', payload);
   selectedActions.value = {};
+  if (orderedUserPlayerIds.value.length > 0) {
+    emit('update:activePlayerId', Number(orderedUserPlayerIds.value[0]));
+  }
 }
 
 function applyNumericHotkey(digit) {

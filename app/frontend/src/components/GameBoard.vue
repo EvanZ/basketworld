@@ -1581,6 +1581,56 @@ const defenderTurnoverPressureById = computed(() => {
   return out;
 });
 
+const ballHandlerTurnoverPressureMeter = computed(() => {
+  const gs = currentGameState.value;
+  const ballHolderId = Number(gs?.ball_holder);
+  if (!gs || !Number.isFinite(ballHolderId)) {
+    return {
+      actualProb: 0,
+      normalized: 0,
+      maxPossible: 0,
+      color: '#f59e0b',
+      title: 'Turnover pressure 0.0%',
+    };
+  }
+
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids.map(Number).filter((id) => Number.isFinite(id)) : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids.map(Number).filter((id) => Number.isFinite(id)) : [];
+  const defenderIds = offenseIds.includes(ballHolderId) ? defenseIds : offenseIds;
+
+  const perDefenderMap = defenderTurnoverPressureById.value || {};
+  let complement = 1.0;
+  for (const defenderId of defenderIds) {
+    const p = clamp01(
+      Number(
+        perDefenderMap[defenderId]
+        ?? perDefenderMap[String(defenderId)]
+        ?? 0,
+      ),
+    );
+    complement *= (1.0 - p);
+  }
+  const actualProb = clamp01(1.0 - complement);
+
+  const baseChance = clamp01(Number(gs.defender_pressure_turnover_chance ?? 0.05));
+  const maxPossible = defenderIds.length > 0
+    ? clamp01(1.0 - Math.pow(1.0 - baseChance, defenderIds.length))
+    : 0;
+  const normalized = maxPossible > 1e-6 ? clamp01(actualProb / maxPossible) : 0;
+
+  const hue = Math.round(48 * (1 - normalized)); // yellow -> red as pressure rises
+  const color = `hsl(${hue}, 100%, 58%)`;
+  const title = `Turnover pressure ${(actualProb * 100).toFixed(1)}% (meter ${(normalized * 100).toFixed(1)}% of max ${(maxPossible * 100).toFixed(1)}%)`;
+
+  return {
+    actualProb,
+    normalized,
+    maxPossible,
+    color,
+    title,
+  };
+});
+
 function getDefenderTurnoverPressure(playerId) {
   const pressure = Number(
     defenderTurnoverPressureById.value[playerId]
@@ -1629,6 +1679,39 @@ function formatDefenderTurnoverPressureTitle(playerId) {
   const pressure = getDefenderTurnoverPressure(playerId);
   if (!Number.isFinite(pressure) || pressure <= DEFENDER_PRESSURE_SHAKE_EPS) return '';
   return `Turnover pressure ${(pressure * 100).toFixed(1)}%`;
+}
+
+function getPlayerRenderCenter(player) {
+  if (!player) return { x: 0, y: 0 };
+  if (draggedPlayerId.value === player.id) {
+    return { x: draggedPlayerPos.x, y: draggedPlayerPos.y };
+  }
+  return { x: player.x, y: player.y };
+}
+
+function getBallPressureMeterPath(player) {
+  const center = getPlayerRenderCenter(player);
+  const r = HEX_RADIUS * 0.9;
+  const x = Number(center.x || 0);
+  const y = Number(center.y || 0);
+  return `M ${x} ${y - r} A ${r} ${r} 0 0 1 ${x} ${y + r}`;
+}
+
+function getBallPressureMeterStyle() {
+  const meter = ballHandlerTurnoverPressureMeter.value;
+  const r = HEX_RADIUS * 0.9;
+  const halfCircumference = Math.PI * r;
+  const filled = Math.max(0, Math.min(halfCircumference, halfCircumference * Number(meter?.normalized || 0)));
+  return {
+    stroke: meter?.color || '#f59e0b',
+    strokeDasharray: `${filled.toFixed(2)} ${halfCircumference.toFixed(2)}`,
+  };
+}
+
+function formatBallPressureMeterLabel() {
+  const meter = ballHandlerTurnoverPressureMeter.value;
+  const pct = Math.max(0, Math.min(100, Number(meter?.actualProb || 0) * 100));
+  return `TO ${pct.toFixed(1)}%`;
 }
 
 function formatPlayerTooltipTitle(playerId) {
@@ -3192,7 +3275,8 @@ onBeforeUnmount(() => {
               :class="[
                 playerTeamClass(player),
                 { 'dragging': draggedPlayerId === player.id },
-                { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id }
+                { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id },
+                { 'playable-active-player': minimalChrome && player.id === activePlayerId },
               ]"
               @mousedown="onMouseDown($event, player)"
               @click="onPlayerClick($event, player)"
@@ -3291,15 +3375,42 @@ onBeforeUnmount(() => {
             >
               {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
-            <!-- Ball handler indicator -->
-            <circle 
-                v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id" 
-                :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
-                :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
-                :r="HEX_RADIUS * 0.9" 
-                class="ball-indicator" 
-                style="pointer-events: none;"
-            />
+            <!-- Ball handler indicator / turnover pressure meter -->
+            <g
+              v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id"
+              class="ball-indicator-wrap"
+              style="pointer-events: none;"
+            >
+              <template v-if="minimalChrome">
+                <path
+                  :d="getBallPressureMeterPath(player)"
+                  class="ball-pressure-meter-track"
+                />
+                <path
+                  :d="getBallPressureMeterPath(player)"
+                  class="ball-pressure-meter-fill"
+                  :style="getBallPressureMeterStyle()"
+                />
+                <text
+                  :x="getPlayerRenderCenter(player).x + (HEX_RADIUS * 1.02)"
+                  :y="getPlayerRenderCenter(player).y + (HEX_RADIUS * 0.02)"
+                  text-anchor="start"
+                  dominant-baseline="middle"
+                  class="ball-pressure-meter-label"
+                  :style="{ fill: ballHandlerTurnoverPressureMeter.color }"
+                >
+                  {{ formatBallPressureMeterLabel() }}
+                </text>
+                <title>{{ ballHandlerTurnoverPressureMeter.title }}</title>
+              </template>
+              <circle
+                v-else
+                :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
+                :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+                :r="HEX_RADIUS * 0.9"
+                class="ball-indicator"
+              />
+            </g>
             <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
             <g 
               v-if="draggedPlayerId !== player.id && getActionIndicator(player.id, player.x, player.y, player.hasBall)"
@@ -4050,6 +4161,11 @@ onBeforeUnmount(() => {
   stroke-width: 0.2rem;
   filter: drop-shadow(0 0 6px rgba(248, 231, 28, 0.6));
 }
+.playable-active-player {
+  stroke: #f8e71c;
+  stroke-width: 0.07rem;
+  filter: drop-shadow(0 0 2px rgba(248, 231, 28, 0.7)) drop-shadow(0 0 10px rgba(248, 231, 28, 0.35));
+}
 .dragging {
   opacity: 0.8;
   stroke: white;
@@ -4149,6 +4265,31 @@ onBeforeUnmount(() => {
   stroke-width: 0.25rem;
   stroke-dasharray: 4 8;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
+.ball-indicator-wrap {
+  pointer-events: none;
+}
+.ball-pressure-meter-track {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.45);
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+}
+.ball-pressure-meter-fill {
+  fill: none;
+  stroke: #f59e0b;
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 5px rgba(239, 68, 68, 0.35));
+  transition: stroke-dasharray 0.2s ease, stroke 0.2s ease;
+}
+.ball-pressure-meter-label {
+  font-size: 0.34rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.95);
+  stroke-width: 0.04rem;
 }
 
 /* Action indicator styles */

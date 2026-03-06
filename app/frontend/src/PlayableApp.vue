@@ -119,6 +119,14 @@ const playableKeyboardShortcuts = [
     key: '0-9',
     label: 'Player ID',
   },
+  {
+    key: '←',
+    label: 'Prev Player',
+  },
+  {
+    key: '→',
+    label: 'Next Player',
+  },
 ];
 const MOVE_HOTKEY_ACTIONS = {
   q: 'MOVE_NW',
@@ -1272,7 +1280,6 @@ watch(
 );
 
 function applyStatePayload(payload) {
-  const hadGameBefore = Boolean(gameState.value);
   const state = payload?.state || null;
   gameState.value = state;
   gameHistory.value = state ? [state] : [];
@@ -1344,17 +1351,8 @@ function applyStatePayload(payload) {
 
   const currentActive = Number(activePlayerId.value);
   const hasValidActive = userIds.includes(currentActive);
-  const userOnOffense = Boolean(payload?.possession?.user_on_offense ?? state?.playable_user_on_offense);
-  const ballHolder = Number(state?.ball_holder);
-  const ballHolderIsUser = Number.isFinite(ballHolder) && userIds.includes(ballHolder);
-
-  if (!hadGameBefore && userOnOffense && ballHolderIsUser) {
-    activePlayerId.value = ballHolder;
-    return;
-  }
-
   if (!hasValidActive) {
-    activePlayerId.value = userOnOffense && ballHolderIsUser ? ballHolder : userIds[0];
+    activePlayerId.value = userIds[0];
   }
 }
 
@@ -1573,11 +1571,39 @@ function getMoveActionFromEvent(event) {
   return MOVE_HOTKEY_ACTIONS[key] || null;
 }
 
+function cycleActivePlayer(direction) {
+  if (!hasGame.value || controlsDisabled.value) return false;
+  const ids = Array.isArray(userPlayerIds.value) ? userPlayerIds.value : [];
+  if (ids.length === 0) return false;
+  const current = Number(activePlayerId.value);
+  const currentIdx = ids.findIndex((id) => Number(id) === current);
+  const fallbackIdx = direction < 0 ? ids.length - 1 : 0;
+  const startIdx = currentIdx >= 0 ? currentIdx : fallbackIdx;
+  const step = direction < 0 ? -1 : 1;
+  const nextIdx = (startIdx + step + ids.length) % ids.length;
+  activePlayerId.value = Number(ids[nextIdx]);
+  return true;
+}
+
 function onGlobalKeydown(event) {
   const tag = String(event?.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (event?.target?.isContentEditable) return;
   const key = String(event?.key || '').toLowerCase();
+  if (key === 'arrowleft') {
+    const handled = cycleActivePlayer(-1);
+    if (handled) {
+      event.preventDefault();
+    }
+    return;
+  }
+  if (key === 'arrowright') {
+    const handled = cycleActivePlayer(1);
+    if (handled) {
+      event.preventDefault();
+    }
+    return;
+  }
   if (key === 'p') {
     passChordPPressed.value = true;
     return;
