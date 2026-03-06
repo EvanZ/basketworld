@@ -2,11 +2,20 @@ import copy
 import json
 import os
 import random
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from basketworld.envs.basketworld_env_v2 import Team
+from app.backend.playable_analytics import playable_analytics_emitter
+from app.backend.playable_session_store import (
+    PLAYABLE_SESSION_HEADER,
+    PlayableCapacityError,
+    bind_game_state,
+    playable_session_store,
+)
 from app.backend.routes.lifecycle_routes import init_game as init_game_route
 from app.backend.routes.lifecycle_routes import step as lifecycle_step
 from app.backend.schemas import (
@@ -31,6 +40,116 @@ PLAYABLE_PERIOD_MODE_TO_COUNT = {
 PLAYABLE_MIN_PERIOD_MINUTES = 1
 PLAYABLE_MAX_PERIOD_MINUTES = 60
 PLAYABLE_CLOCK_TICK_SECONDS = 1
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _attach_session_id(
+    payload: dict[str, Any],
+    session_id: str,
+    response: Response | None = None,
+) -> dict[str, Any]:
+    payload["session_id"] = session_id
+    if response is not None:
+        response.headers[PLAYABLE_SESSION_HEADER] = session_id
+    return payload
+
+
+def _resolve_session_state(
+    request: Request,
+    *,
+    require_active: bool,
+) -> tuple[str, Any]:
+    raw_session_id = request.headers.get(PLAYABLE_SESSION_HEADER)
+    if not raw_session_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing {PLAYABLE_SESSION_HEADER} header. Start a new game first.",
+        )
+
+    session_id, target_state = playable_session_store.get(raw_session_id)
+    if not session_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {PLAYABLE_SESSION_HEADER} header. Start a new game.",
+        )
+    if target_state is None:
+        raise HTTPException(status_code=404, detail="Playable session not found. Start a new game.")
+
+    if require_active:
+        session = getattr(target_state, "playable_session", None)
+        if not (isinstance(session, dict) and session.get("active")):
+            raise HTTPException(status_code=400, detail="Playable session is not active.")
+
+    return session_id, target_state
+
+
+def _ensure_playable_analytics_fields(session: dict[str, Any]) -> None:
+    analytics = session.get("analytics")
+    if not isinstance(analytics, dict):
+        analytics = {}
+    game_id = str(analytics.get("game_id") or "").strip() or uuid.uuid4().hex
+    next_seq = _to_int(analytics.get("next_seq"))
+    if next_seq is None or int(next_seq) < 1:
+        next_seq = 1
+    analytics["game_id"] = game_id
+    analytics["next_seq"] = int(next_seq)
+    session["analytics"] = analytics
+
+    turn_index = _to_int(session.get("turn_index"))
+    if turn_index is None or int(turn_index) < 1:
+        session["turn_index"] = 1
+
+
+def _next_playable_analytics_seq(session: dict[str, Any]) -> int:
+    _ensure_playable_analytics_fields(session)
+    analytics = session["analytics"]
+    seq = int(analytics.get("next_seq", 1) or 1)
+    analytics["next_seq"] = seq + 1
+    return seq
+
+
+def _emit_playable_event(
+    *,
+    session_id: str,
+    session: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        seq = _next_playable_analytics_seq(session)
+        env = getattr(game_state, "env", None)
+        pass_mode = str(getattr(env, "pass_mode", "directional")) if env is not None else "unknown"
+        configured_environment = str(os.getenv("BW_ANALYTICS_ENVIRONMENT") or "").strip().lower()
+        environment = configured_environment or ("public" if _is_truthy(os.getenv("BW_PUBLIC_MODE")) else "dev")
+        game_config = {
+            "players_per_side": int(session.get("players_per_side", 0) or 0),
+            "difficulty": str(session.get("difficulty", "")).lower(),
+            "period_mode": str(session.get("period_mode", "period")).lower(),
+            "period_length_minutes": int(session.get("period_length_minutes", 5) or 5),
+            "policy_run_id": str(session.get("run_id", "")),
+            "policy_checkpoint_index": int(session.get("checkpoint_index", 0) or 0),
+            "pass_mode": pass_mode,
+        }
+        event = {
+            "schema_version": "bw.analytics.v1",
+            "event_type": str(event_type),
+            "event_id": uuid.uuid4().hex,
+            "event_ts": _utc_now_iso(),
+            "session_id": str(session_id),
+            "game_id": str(session["analytics"]["game_id"]),
+            "seq": int(seq),
+            "app_mode": "playable",
+            "environment": environment,
+            "game_config": game_config,
+            "payload": payload if isinstance(payload, dict) else {},
+        }
+        playable_analytics_emitter.emit(event)
+    except Exception:
+        # Analytics should never interrupt gameplay.
+        return
 
 
 def _normalize_period_mode(raw: Any) -> str:
@@ -76,6 +195,8 @@ def _format_clock_display(seconds_remaining: int) -> str:
 
 
 def _ensure_playable_game_fields(session: dict[str, Any]) -> None:
+    _ensure_playable_analytics_fields(session)
+
     mode = _normalize_period_mode(session.get("period_mode", "period"))
     session["period_mode"] = mode
 
@@ -625,6 +746,7 @@ def _sanitize_options_for_response(matrix: dict[int, dict[str, dict[str, Any]]])
 @router.get("/api/playable/options")
 def get_playable_options():
     matrix = _load_playable_matrix()
+    runtime_metrics = playable_session_store.metrics()
     return {
         "status": "success",
         "players_per_side": list(PLAYABLE_PLAYERS),
@@ -636,11 +758,19 @@ def get_playable_options():
             "default": 5,
         },
         "options": _sanitize_options_for_response(matrix),
+        "runtime_limits": {
+            "max_active_sessions": int(runtime_metrics["max_active_sessions"]),
+            "session_ttl_minutes": int(runtime_metrics["session_ttl_minutes"]),
+        },
     }
 
 
 @router.post("/api/playable/start")
-async def start_playable_game(request: PlayableStartRequest):
+async def start_playable_game(
+    request: PlayableStartRequest,
+    http_request: Request,
+    http_response: Response,
+):
     players_per_side = int(request.players_per_side)
     difficulty = str(request.difficulty).strip().lower()
     period_mode = _normalize_period_mode(request.period_mode)
@@ -657,264 +787,433 @@ async def start_playable_game(request: PlayableStartRequest):
     if not cfg.get("available"):
         raise HTTPException(status_code=400, detail=f"{players_per_side}v{players_per_side} {difficulty} is unavailable.")
 
-    init_request = InitGameRequest(
-        run_id=str(cfg["run_id"]),
-        user_team_name="OFFENSE",
-        unified_policy_name=str(cfg["policy_name"]),
-        opponent_unified_policy_name=None,
-    )
-
-    await init_game_route(init_request)
-
-    env_players = int(getattr(game_state.env, "players_per_side", 0) or 0)
-    if env_players != players_per_side:
+    try:
+        session_id, target_state, _ = playable_session_store.get_or_create_for_start(
+            http_request.headers.get(PLAYABLE_SESSION_HEADER)
+        )
+    except PlayableCapacityError as exc:
         raise HTTPException(
-            status_code=400,
+            status_code=429,
             detail=(
-                f"Configured playable option expects {players_per_side} players per side, "
-                f"but loaded run provides {env_players}."
+                f"Playable server is full ({exc.max_active} active games). "
+                "Please try again shortly."
             ),
+        ) from exc
+
+    with bind_game_state(target_state):
+        init_request = InitGameRequest(
+            run_id=str(cfg["run_id"]),
+            user_team_name="OFFENSE",
+            unified_policy_name=str(cfg["policy_name"]),
+            opponent_unified_policy_name=None,
         )
 
-    user_starts = bool(random.getrandbits(1))
-    side_skills = _build_playable_side_skills()
-    game_state.playable_session = {
-        "active": True,
-        "players_per_side": players_per_side,
-        "difficulty": difficulty,
-        "run_id": str(cfg["run_id"]),
-        "checkpoint_index": int(cfg["checkpoint_index"]),
-        "policy_name": str(cfg["policy_name"]),
-        "score": {"user": 0, "ai": 0},
-        "possession_number": 1,
-        "user_on_offense": user_starts,
-        "side_skills": side_skills,
-        "period_mode": period_mode,
-        "total_periods": total_periods,
-        "current_period": 1,
-        "period_length_minutes": period_length_minutes,
-        "period_seconds_remaining": period_length_minutes * 60,
-        "game_over": False,
-    }
+        await init_game_route(init_request)
 
-    session = game_state.playable_session
-    state = _reset_playable_possession(session)
+        env_players = int(getattr(game_state.env, "players_per_side", 0) or 0)
+        if env_players != players_per_side:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Configured playable option expects {players_per_side} players per side, "
+                    f"but loaded run provides {env_players}."
+                ),
+            )
 
-    return {
-        "status": "success",
-        "state": _map_state_for_playable(state, session),
-        "score": _build_score_info(session),
-        "possession": _build_possession_info(session),
-        "game_clock": _build_game_clock_info(session),
-        "game_result": _build_game_result(session),
-        "config": {
+        user_starts = bool(random.getrandbits(1))
+        side_skills = _build_playable_side_skills()
+        game_state.playable_session = {
+            "active": True,
             "players_per_side": players_per_side,
             "difficulty": difficulty,
+            "run_id": str(cfg["run_id"]),
+            "checkpoint_index": int(cfg["checkpoint_index"]),
+            "policy_name": str(cfg["policy_name"]),
+            "score": {"user": 0, "ai": 0},
+            "possession_number": 1,
+            "user_on_offense": user_starts,
+            "side_skills": side_skills,
             "period_mode": period_mode,
             "total_periods": total_periods,
+            "current_period": 1,
             "period_length_minutes": period_length_minutes,
-        },
-    }
+            "period_seconds_remaining": period_length_minutes * 60,
+            "game_over": False,
+            "turn_index": 1,
+            "analytics": {
+                "game_id": uuid.uuid4().hex,
+                "next_seq": 1,
+            },
+        }
+
+        session = game_state.playable_session
+        state = _reset_playable_possession(session)
+        game_clock = _build_game_clock_info(session)
+        score = _build_score_info(session)
+        possession = _build_possession_info(session)
+        game_result = _build_game_result(session)
+
+        payload = {
+            "status": "success",
+            "state": _map_state_for_playable(state, session),
+            "score": score,
+            "possession": possession,
+            "game_clock": game_clock,
+            "game_result": game_result,
+            "config": {
+                "players_per_side": players_per_side,
+                "difficulty": difficulty,
+                "period_mode": period_mode,
+                "total_periods": total_periods,
+                "period_length_minutes": period_length_minutes,
+            },
+        }
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="game_started",
+            payload={
+                "source": "start",
+                "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
+                "user_on_offense": bool(session.get("user_on_offense")),
+                "score": score,
+                "possession": possession,
+                "game_clock": game_clock,
+                "game_result": game_result,
+                "sampled_skills": copy.deepcopy(session.get("side_skills") or {}),
+            },
+        )
+    return _attach_session_id(payload, session_id, http_response)
 
 
 @router.post("/api/playable/new_game")
-def playable_new_game():
-    session = _get_playable_session(required=True)
-    period_mode = _normalize_period_mode(session.get("period_mode", "period"))
-    period_length_minutes = _normalize_period_length_minutes(session.get("period_length_minutes", 5))
-    total_periods = int(PLAYABLE_PERIOD_MODE_TO_COUNT.get(period_mode, 1))
+def playable_new_game(http_request: Request, http_response: Response):
+    session_id, target_state = _resolve_session_state(http_request, require_active=True)
+    with bind_game_state(target_state):
+        session = _get_playable_session(required=True)
+        period_mode = _normalize_period_mode(session.get("period_mode", "period"))
+        period_length_minutes = _normalize_period_length_minutes(session.get("period_length_minutes", 5))
+        total_periods = int(PLAYABLE_PERIOD_MODE_TO_COUNT.get(period_mode, 1))
 
-    session["score"] = {"user": 0, "ai": 0}
-    session["possession_number"] = 1
-    session["user_on_offense"] = bool(random.getrandbits(1))
-    session["side_skills"] = _build_playable_side_skills()
-    session["period_mode"] = period_mode
-    session["total_periods"] = total_periods
-    session["current_period"] = 1
-    session["period_length_minutes"] = period_length_minutes
-    session["period_seconds_remaining"] = period_length_minutes * 60
-    session["game_over"] = False
+        session["score"] = {"user": 0, "ai": 0}
+        session["possession_number"] = 1
+        session["user_on_offense"] = bool(random.getrandbits(1))
+        session["side_skills"] = _build_playable_side_skills()
+        session["period_mode"] = period_mode
+        session["total_periods"] = total_periods
+        session["current_period"] = 1
+        session["period_length_minutes"] = period_length_minutes
+        session["period_seconds_remaining"] = period_length_minutes * 60
+        session["game_over"] = False
+        session["turn_index"] = 1
+        session["analytics"] = {
+            "game_id": uuid.uuid4().hex,
+            "next_seq": 1,
+        }
 
-    state = _reset_playable_possession(session)
-    return {
-        "status": "success",
-        "state": _map_state_for_playable(state, session),
-        "score": _build_score_info(session),
-        "possession": _build_possession_info(session),
-        "game_clock": _build_game_clock_info(session),
-        "game_result": _build_game_result(session),
-        "config": {
-            "players_per_side": int(session["players_per_side"]),
-            "difficulty": str(session["difficulty"]),
-            "period_mode": period_mode,
-            "total_periods": total_periods,
-            "period_length_minutes": period_length_minutes,
-        },
-    }
+        state = _reset_playable_possession(session)
+        game_clock = _build_game_clock_info(session)
+        score = _build_score_info(session)
+        possession = _build_possession_info(session)
+        game_result = _build_game_result(session)
+        payload = {
+            "status": "success",
+            "state": _map_state_for_playable(state, session),
+            "score": score,
+            "possession": possession,
+            "game_clock": game_clock,
+            "game_result": game_result,
+            "config": {
+                "players_per_side": int(session["players_per_side"]),
+                "difficulty": str(session["difficulty"]),
+                "period_mode": period_mode,
+                "total_periods": total_periods,
+                "period_length_minutes": period_length_minutes,
+            },
+        }
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="game_started",
+            payload={
+                "source": "new_game",
+                "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
+                "user_on_offense": bool(session.get("user_on_offense")),
+                "score": score,
+                "possession": possession,
+                "game_clock": game_clock,
+                "game_result": game_result,
+                "sampled_skills": copy.deepcopy(session.get("side_skills") or {}),
+            },
+        )
+    return _attach_session_id(payload, session_id, http_response)
 
 
 @router.post("/api/playable/step")
-def playable_step(request: PlayableStepRequest):
-    session = _get_playable_session(required=True)
-    _ensure_playable_game_fields(session)
-    if bool(session.get("game_over", False)):
-        raise HTTPException(status_code=400, detail="Game is over. Start a new game.")
+def playable_step(
+    request: PlayableStepRequest,
+    http_request: Request,
+    http_response: Response,
+):
+    session_id, target_state = _resolve_session_state(http_request, require_active=True)
+    with bind_game_state(target_state):
+        session = _get_playable_session(required=True)
+        _ensure_playable_game_fields(session)
+        if bool(session.get("game_over", False)):
+            raise HTTPException(status_code=400, detail="Game is over. Start a new game.")
 
-    players_per_side = int(session["players_per_side"])
+        players_per_side = int(session["players_per_side"])
 
-    env_to_canonical, canonical_to_env = _build_id_maps(
-        players_per_side,
-        bool(session["user_on_offense"]),
-    )
-
-    user_actions: dict[str, Any] = {}
-    provided = request.actions or {}
-
-    for canonical_pid in range(players_per_side):
-        raw_action = provided.get(str(canonical_pid), provided.get(canonical_pid))
-        if raw_action is None:
-            raw_action = "NOOP"
-        env_pid = canonical_to_env[canonical_pid]
-        user_actions[str(env_pid)] = raw_action
-
-    step_payload = lifecycle_step(
-        ActionRequest(
-            actions=user_actions,
-            player_deterministic=True,
-            opponent_deterministic=False,
-            use_mcts=False,
-        )
-    )
-
-    if not isinstance(step_payload, dict) or step_payload.get("status") != "success":
-        raise HTTPException(status_code=500, detail="Playable step failed.")
-
-    actions_taken = _remap_player_references(step_payload.get("actions_taken") or {}, env_to_canonical)
-    actions_taken_meta = _remap_player_references(step_payload.get("actions_taken_meta") or {}, env_to_canonical)
-
-    step_state = step_payload.get("state") or {}
-    possession_done = bool(step_state.get("done"))
-    offense_is_user = _current_possession_owner_is_user(session)
-    possession_result = None
-    ended_state = None
-
-    if possession_done:
-        ended_state = _map_state_for_playable(step_state, session)
-        possession_result = _build_possession_result(
-            getattr(game_state.env, "last_action_results", {}) or {},
-            int(getattr(game_state.env, "shot_clock", 0)),
-            offense_is_user,
-            env_to_canonical,
+        env_to_canonical, canonical_to_env = _build_id_maps(
+            players_per_side,
+            bool(session["user_on_offense"]),
         )
 
-        points = int(possession_result.get("points", 0) or 0)
-        scoring_team = possession_result.get("scoring_team")
-        if points > 0 and scoring_team in {"user", "ai"}:
-            session["score"][str(scoring_team)] = int(session["score"].get(str(scoring_team), 0)) + points
+        user_actions: dict[str, Any] = {}
+        submitted_actions: dict[str, Any] = {}
+        provided = request.actions or {}
+        turn_index = int(session.get("turn_index", 1) or 1)
+        score_before = _build_score_info(session)
+        game_clock_before = _build_game_clock_info(session)
+        shot_clock_before = int(getattr(game_state.env, "shot_clock", 0) or 0)
 
-        # Alternate possession at end of each possession.
-        session["user_on_offense"] = not offense_is_user
-        session["possession_number"] = int(session.get("possession_number", 1)) + 1
+        for canonical_pid in range(players_per_side):
+            raw_action = provided.get(str(canonical_pid), provided.get(canonical_pid))
+            if raw_action is None:
+                raw_action = "NOOP"
+            env_pid = canonical_to_env[canonical_pid]
+            user_actions[str(env_pid)] = raw_action
+            submitted_actions[str(canonical_pid)] = raw_action
 
-    # Every playable tick decrements the game clock by exactly one second.
-    _tick_game_clock(session)
-    period_ended = int(session.get("period_seconds_remaining", 0) or 0) <= 0
-    period_result = None
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="turn_submitted",
+            payload={
+                "turn_index": int(turn_index),
+                "score_before": score_before,
+                "game_clock_before": game_clock_before,
+                "shot_clock_before": int(shot_clock_before),
+                "submitted_actions": copy.deepcopy(submitted_actions),
+            },
+        )
 
-    next_state_raw = None
-    if period_ended:
-        current_period = int(session.get("current_period", 1) or 1)
-        total_periods = int(session.get("total_periods", 1) or 1)
-        period_mode = str(session.get("period_mode", "period"))
-        ended_segment_label = _segment_label_for_mode(period_mode, current_period)
+        step_payload = lifecycle_step(
+            ActionRequest(
+                actions=user_actions,
+                player_deterministic=True,
+                opponent_deterministic=False,
+                use_mcts=False,
+            )
+        )
 
-        if current_period >= total_periods:
-            session["game_over"] = True
-            period_result = {
-                "type": "final_buzzer",
-                "message": f"End of {ended_segment_label}.",
+        if not isinstance(step_payload, dict) or step_payload.get("status") != "success":
+            raise HTTPException(status_code=500, detail="Playable step failed.")
+
+        actions_taken = _remap_player_references(step_payload.get("actions_taken") or {}, env_to_canonical)
+        actions_taken_meta = _remap_player_references(step_payload.get("actions_taken_meta") or {}, env_to_canonical)
+
+        step_state = step_payload.get("state") or {}
+        possession_done = bool(step_state.get("done"))
+        offense_is_user = _current_possession_owner_is_user(session)
+        possession_result = None
+        ended_state = None
+
+        if possession_done:
+            ended_state = _map_state_for_playable(step_state, session)
+            possession_result = _build_possession_result(
+                getattr(game_state.env, "last_action_results", {}) or {},
+                int(getattr(game_state.env, "shot_clock", 0)),
+                offense_is_user,
+                env_to_canonical,
+            )
+
+            points = int(possession_result.get("points", 0) or 0)
+            scoring_team = possession_result.get("scoring_team")
+            if points > 0 and scoring_team in {"user", "ai"}:
+                session["score"][str(scoring_team)] = int(session["score"].get(str(scoring_team), 0)) + points
+
+            # Alternate possession at end of each possession.
+            session["user_on_offense"] = not offense_is_user
+            session["possession_number"] = int(session.get("possession_number", 1)) + 1
+
+        # Every playable tick decrements the game clock by exactly one second.
+        _tick_game_clock(session)
+        period_ended = int(session.get("period_seconds_remaining", 0) or 0) <= 0
+        period_result = None
+
+        next_state_raw = None
+        if period_ended:
+            current_period = int(session.get("current_period", 1) or 1)
+            total_periods = int(session.get("total_periods", 1) or 1)
+            period_mode = str(session.get("period_mode", "period"))
+            ended_segment_label = _segment_label_for_mode(period_mode, current_period)
+
+            if current_period >= total_periods:
+                session["game_over"] = True
+                period_result = {
+                    "type": "final_buzzer",
+                    "message": f"End of {ended_segment_label}.",
+                }
+            else:
+                session["current_period"] = current_period + 1
+                period_minutes = int(session.get("period_length_minutes", 5) or 5)
+                session["period_seconds_remaining"] = period_minutes * 60
+                if not possession_done:
+                    # Force a fresh possession at the start of a new segment.
+                    session["possession_number"] = int(session.get("possession_number", 1)) + 1
+                period_result = {
+                    "type": "period_end",
+                    "message": f"End of {ended_segment_label}.",
+                }
+                next_state_raw = _reset_playable_possession(session)
+
+        score_after = _build_score_info(session)
+        game_clock_after = _build_game_clock_info(session)
+        shot_clock_after = int(getattr(game_state.env, "shot_clock", 0) or 0)
+        game_result = _build_game_result(session)
+
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="turn_resolved",
+            payload={
+                "turn_index": int(turn_index),
+                "score_before": score_before,
+                "score_after": score_after,
+                "game_clock_before": game_clock_before,
+                "game_clock_after": game_clock_after,
+                "shot_clock_before": int(shot_clock_before),
+                "shot_clock_after": int(shot_clock_after),
+                "submitted_actions": copy.deepcopy(submitted_actions),
+                "actions_taken": copy.deepcopy(actions_taken),
+                "actions_taken_meta": copy.deepcopy(actions_taken_meta),
+                "possession_ended": bool(possession_done),
+                "possession_result": copy.deepcopy(possession_result) if isinstance(possession_result, dict) else possession_result,
+                "period_ended": bool(period_ended),
+                "period_result": copy.deepcopy(period_result) if isinstance(period_result, dict) else period_result,
+                "game_over": bool(session.get("game_over", False)),
+            },
+        )
+
+        if period_ended and not bool(session.get("game_over", False)):
+            _emit_playable_event(
+                session_id=session_id,
+                session=session,
+                event_type="period_ended",
+                payload={
+                    "turn_index": int(turn_index),
+                    "score": score_after,
+                    "game_clock_after": game_clock_after,
+                    "period_result": copy.deepcopy(period_result) if isinstance(period_result, dict) else period_result,
+                },
+            )
+
+        if bool(session.get("game_over", False)):
+            _emit_playable_event(
+                session_id=session_id,
+                session=session,
+                event_type="game_ended",
+                payload={
+                    "turn_index": int(turn_index),
+                    "winner": str(game_result.get("winner")) if isinstance(game_result, dict) else None,
+                    "final_score": score_after,
+                    "game_result": game_result,
+                },
+            )
+
+        session["turn_index"] = int(turn_index) + 1
+
+        if bool(session.get("game_over", False)):
+            # Preserve the final board state at the buzzer.
+            final_state = _map_state_for_playable(step_state, session)
+            payload = {
+                "status": "success",
+                "state": final_state,
+                "ended_state": ended_state,
+                "actions_taken": actions_taken,
+                "actions_taken_meta": actions_taken_meta,
+                "score": score_after,
+                "possession": _build_possession_info(session),
+                "game_clock": game_clock_after,
+                "game_result": game_result,
+                "possession_ended": bool(possession_done),
+                "possession_result": possession_result,
+                "period_ended": bool(period_ended),
+                "period_result": period_result,
             }
-        else:
-            session["current_period"] = current_period + 1
-            period_minutes = int(session.get("period_length_minutes", 5) or 5)
-            session["period_seconds_remaining"] = period_minutes * 60
-            if not possession_done:
-                # Force a fresh possession at the start of a new segment.
-                session["possession_number"] = int(session.get("possession_number", 1)) + 1
-            period_result = {
-                "type": "period_end",
-                "message": f"End of {ended_segment_label}.",
-            }
-            next_state_raw = _reset_playable_possession(session)
+            return _attach_session_id(payload, session_id, http_response)
 
-    if bool(session.get("game_over", False)):
-        # Preserve the final board state at the buzzer.
-        final_state = _map_state_for_playable(step_state, session)
-        return {
+        if next_state_raw is None:
+            if possession_done:
+                next_state_raw = _reset_playable_possession(session)
+            else:
+                next_state_raw = step_state
+
+        payload = {
             "status": "success",
-            "state": final_state,
-            "ended_state": ended_state,
+            "state": _map_state_for_playable(next_state_raw, session),
+            "ended_state": ended_state if possession_done else None,
             "actions_taken": actions_taken,
             "actions_taken_meta": actions_taken_meta,
-            "score": _build_score_info(session),
+            "score": score_after,
             "possession": _build_possession_info(session),
-            "game_clock": _build_game_clock_info(session),
-            "game_result": _build_game_result(session),
+            "game_clock": game_clock_after,
+            "game_result": game_result,
             "possession_ended": bool(possession_done),
             "possession_result": possession_result,
             "period_ended": bool(period_ended),
             "period_result": period_result,
         }
-
-    if next_state_raw is None:
-        if possession_done:
-            next_state_raw = _reset_playable_possession(session)
-        else:
-            next_state_raw = step_state
-
-    return {
-        "status": "success",
-        "state": _map_state_for_playable(next_state_raw, session),
-        "ended_state": ended_state if possession_done else None,
-        "actions_taken": actions_taken,
-        "actions_taken_meta": actions_taken_meta,
-        "score": _build_score_info(session),
-        "possession": _build_possession_info(session),
-        "game_clock": _build_game_clock_info(session),
-        "game_result": _build_game_result(session),
-        "possession_ended": bool(possession_done),
-        "possession_result": possession_result,
-        "period_ended": bool(period_ended),
-        "period_result": period_result,
-    }
+        return _attach_session_id(payload, session_id, http_response)
 
 
 @router.get("/api/playable/state")
-def get_playable_state():
-    session = _get_playable_session(required=True)
-    _ensure_playable_game_fields(session)
-    state = get_ui_game_state()
-    return {
-        "status": "success",
-        "state": _map_state_for_playable(state, session),
-        "score": _build_score_info(session),
-        "possession": _build_possession_info(session),
-        "game_clock": _build_game_clock_info(session),
-        "game_result": _build_game_result(session),
-        "config": {
-            "players_per_side": int(session["players_per_side"]),
-            "difficulty": str(session["difficulty"]),
-            "period_mode": _normalize_period_mode(session.get("period_mode", "period")),
-            "total_periods": int(session.get("total_periods", 1) or 1),
-            "period_length_minutes": _normalize_period_length_minutes(session.get("period_length_minutes", 5)),
-        },
-    }
+def get_playable_state(http_request: Request, http_response: Response):
+    session_id, target_state = _resolve_session_state(http_request, require_active=True)
+    with bind_game_state(target_state):
+        session = _get_playable_session(required=True)
+        _ensure_playable_game_fields(session)
+        state = get_ui_game_state()
+        payload = {
+            "status": "success",
+            "state": _map_state_for_playable(state, session),
+            "score": _build_score_info(session),
+            "possession": _build_possession_info(session),
+            "game_clock": _build_game_clock_info(session),
+            "game_result": _build_game_result(session),
+            "config": {
+                "players_per_side": int(session["players_per_side"]),
+                "difficulty": str(session["difficulty"]),
+                "period_mode": _normalize_period_mode(session.get("period_mode", "period")),
+                "total_periods": int(session.get("total_periods", 1) or 1),
+                "period_length_minutes": _normalize_period_length_minutes(session.get("period_length_minutes", 5)),
+            },
+        }
+    return _attach_session_id(payload, session_id, http_response)
 
 
 @router.get("/api/playable/config")
 def get_playable_runtime_config():
+    runtime_metrics = playable_session_store.metrics()
     return {
         "status": "success",
         "public_mode": _is_truthy(os.getenv("BW_PUBLIC_MODE")),
         "matrix_source_json": bool(os.getenv("BW_PLAYABLE_POLICY_MATRIX_JSON")),
+        "session_header": PLAYABLE_SESSION_HEADER,
+        "active_sessions": int(runtime_metrics["active_sessions"]),
+        "max_active_sessions": int(runtime_metrics["max_active_sessions"]),
+        "session_ttl_minutes": int(runtime_metrics["session_ttl_minutes"]),
+        "analytics": playable_analytics_emitter.runtime_status(),
+    }
+
+
+@router.get("/api/playable/analytics_debug")
+def get_playable_analytics_debug(limit: int = 50):
+    if not _is_truthy(os.getenv("BW_ANALYTICS_DEBUG_ENABLED")):
+        raise HTTPException(status_code=404, detail="Analytics debug endpoint is disabled.")
+    return {
+        "status": "success",
+        "analytics": playable_analytics_emitter.runtime_status(),
+        "debug": playable_analytics_emitter.debug_snapshot(limit=limit),
     }

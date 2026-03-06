@@ -33,6 +33,21 @@ BW_PUBLIC_MODE=true
 # CORS
 BACKEND_CORS_ALLOW_ORIGINS=https://basketworld.toplines.app
 
+# Playable concurrency controls
+BW_PLAYABLE_MAX_ACTIVE_SESSIONS=8
+BW_PLAYABLE_SESSION_TTL_MINUTES=120
+
+# Optional playable analytics export (S3 JSONL batches)
+BW_ANALYTICS_S3_ENABLED=true
+BW_ANALYTICS_S3_BUCKET=basketworld
+BW_ANALYTICS_S3_PREFIX=basketworld/playable-analytics
+BW_ANALYTICS_S3_FLUSH_EVENTS=50
+BW_ANALYTICS_S3_FLUSH_SECONDS=15
+BW_ANALYTICS_S3_MAX_QUEUE_EVENTS=5000
+BW_ANALYTICS_ENVIRONMENT=prod
+BW_ANALYTICS_DEBUG_ENABLED=false
+BW_ANALYTICS_DEBUG_BUFFER_EVENTS=200
+
 # Optional MLflow URI (example)
 MLFLOW_TRACKING_URI=http://127.0.0.1:5001
 ```
@@ -41,6 +56,62 @@ When `BW_PUBLIC_MODE=true`:
 
 - mounted: `/api/playable/*`, media routes
 - not mounted: eval/admin/lifecycle/policy/analytics HTTP routes
+
+## Playable Session Isolation
+
+- each browser client is assigned a playable session ID
+- frontend sends this via `X-Playable-Session-Id` on playable requests
+- backend isolates game state per session ID (no cross-user overwrites)
+- once active sessions hit `BW_PLAYABLE_MAX_ACTIVE_SESSIONS`, `/api/playable/start` returns `429`
+- idle sessions are evicted after `BW_PLAYABLE_SESSION_TTL_MINUTES`
+
+## Playable Analytics Export
+
+- when `BW_ANALYTICS_S3_ENABLED=true`, backend emits analytics events to S3 in `.jsonl.gz` batches
+- credentials follow the same AWS chain already used by MLflow (`MLFLOW_AWS_*` then `AWS_*`, then IAM role)
+- uploads are asynchronous and non-blocking for gameplay
+- object key pattern:
+  - `<prefix>/date=YYYY-MM-DD/hour=HH/events_<epoch_ms>_<host>_<id>.jsonl.gz`
+
+Event envelope (`bw.analytics.v1`):
+
+```json
+{
+  "schema_version": "bw.analytics.v1",
+  "event_type": "turn_resolved",
+  "event_id": "uuid",
+  "event_ts": "2026-03-06T20:40:12.345Z",
+  "session_id": "playable-session-id",
+  "game_id": "uuid",
+  "seq": 42,
+  "app_mode": "playable",
+  "environment": "prod",
+  "game_config": {
+    "players_per_side": 3,
+    "difficulty": "hard",
+    "period_mode": "quarters",
+    "period_length_minutes": 5,
+    "policy_run_id": "<run_id>",
+    "policy_checkpoint_index": 200,
+    "pass_mode": "pointer_targeted"
+  },
+  "payload": {}
+}
+```
+
+Current `event_type` values:
+
+- `game_started`
+- `turn_submitted`
+- `turn_resolved`
+- `period_ended`
+- `game_ended`
+
+Optional local debug endpoint:
+
+- enable with `BW_ANALYTICS_DEBUG_ENABLED=true`
+- inspect recent queued/uploaded events:
+  - `GET /api/playable/analytics_debug?limit=50`
 
 ## Playable Policy Matrix Config
 

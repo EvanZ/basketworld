@@ -5,6 +5,58 @@
 //     You can of course change this to any port that matches your FastAPI server.
 
 const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8080';
+const PLAYABLE_SESSION_HEADER = 'X-Playable-Session-Id';
+const PLAYABLE_SESSION_STORAGE_KEY = 'basketworld.playable.session_id';
+
+let playableSessionIdCache = null;
+
+function getPlayableSessionStorage() {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function getPlayableSessionId() {
+  if (playableSessionIdCache) return playableSessionIdCache;
+  const storage = getPlayableSessionStorage();
+  if (!storage) return null;
+  const fromStorage = String(storage.getItem(PLAYABLE_SESSION_STORAGE_KEY) || '').trim();
+  if (!fromStorage) return null;
+  playableSessionIdCache = fromStorage;
+  return playableSessionIdCache;
+}
+
+function setPlayableSessionId(nextSessionId) {
+  const normalized = String(nextSessionId || '').trim();
+  if (!normalized) return;
+  playableSessionIdCache = normalized;
+  const storage = getPlayableSessionStorage();
+  if (!storage) return;
+  storage.setItem(PLAYABLE_SESSION_STORAGE_KEY, normalized);
+}
+
+function getPlayableSessionHeaders() {
+  const sessionId = getPlayableSessionId();
+  if (!sessionId) return {};
+  return { [PLAYABLE_SESSION_HEADER]: sessionId };
+}
+
+async function parsePlayableJsonResponse(response) {
+  const headerSessionId = String(response.headers?.get(PLAYABLE_SESSION_HEADER) || '').trim();
+  if (headerSessionId) {
+    setPlayableSessionId(headerSessionId);
+  }
+
+  const payload = await response.json();
+  const bodySessionId = String(payload?.session_id || '').trim();
+  if (bodySessionId) {
+    setPlayableSessionId(bodySessionId);
+  }
+  return payload;
+}
 
 export async function initGame(runId, userTeamName, offensePolicyName = null, defensePolicyName = null, unifiedPolicyName = null, opponentUnifiedPolicyName = null) {
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
@@ -460,7 +512,10 @@ export async function getPlayableOptions() {
 export async function startPlayableGame(playersPerSide, difficulty, periodMode = 'period', periodLengthMinutes = 5) {
   const response = await fetch(`${API_BASE_URL}/api/playable/start`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getPlayableSessionHeaders(),
+    },
     body: JSON.stringify({
       players_per_side: Number(playersPerSide),
       difficulty: String(difficulty || '').toLowerCase(),
@@ -472,39 +527,49 @@ export async function startPlayableGame(playersPerSide, difficulty, periodMode =
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to start playable game');
   }
-  return response.json();
+  return parsePlayableJsonResponse(response);
 }
 
 export async function newPlayableGame() {
   const response = await fetch(`${API_BASE_URL}/api/playable/new_game`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getPlayableSessionHeaders(),
+    },
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to start a new playable game');
   }
-  return response.json();
+  return parsePlayableJsonResponse(response);
 }
 
 export async function stepPlayableGame(actions = {}) {
   const response = await fetch(`${API_BASE_URL}/api/playable/step`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getPlayableSessionHeaders(),
+    },
     body: JSON.stringify({ actions }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to process playable step');
   }
-  return response.json();
+  return parsePlayableJsonResponse(response);
 }
 
 export async function getPlayableState() {
-  const response = await fetch(`${API_BASE_URL}/api/playable/state`);
+  const response = await fetch(`${API_BASE_URL}/api/playable/state`, {
+    headers: {
+      ...getPlayableSessionHeaders(),
+    },
+  });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to fetch playable state');
   }
-  return response.json();
+  return parsePlayableJsonResponse(response);
 }
