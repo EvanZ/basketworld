@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayableControls from './components/PlayableControls.vue';
+import PlayableStatsPanel from './components/PlayableStatsPanel.vue';
 import PlayableEnvironmentInfo from './components/PlayableEnvironmentInfo.vue';
 import basketworldLogo from './assets/basketworld-logo.jpg';
 import {
@@ -59,6 +60,7 @@ const gameResult = ref(createDefaultGameResult());
 const lastPossessionResult = ref(null);
 const transitionRunning = ref(false);
 const forceGameOverPreview = ref(false);
+const violationOverlayPreview = ref(null);
 const passChordPPressed = ref(false);
 const periodModeLabelMap = {
   period: '1 period',
@@ -1045,6 +1047,107 @@ const userPlayerIds = computed(() => {
   return Array.from({ length: Math.max(0, players) }, (_, idx) => idx);
 });
 
+const aiPlayerIds = computed(() => {
+  const ids = gameState.value?.playable_ai_ids;
+  if (Array.isArray(ids) && ids.length > 0) {
+    return ids
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v))
+      .sort((a, b) => a - b);
+  }
+  const players = Number(sessionConfig.value?.players_per_side || selectedPlayersPerSide.value || 0);
+  return Array.from({ length: Math.max(0, players) }, (_, idx) => idx + players);
+});
+
+function laneStepValueForPlayer(stepMap, playerId) {
+  if (!stepMap || typeof stepMap !== 'object') return 0;
+  const direct = Number(stepMap[playerId]);
+  if (Number.isFinite(direct)) return Math.max(0, Math.trunc(direct));
+  const byString = Number(stepMap[String(playerId)]);
+  if (Number.isFinite(byString)) return Math.max(0, Math.trunc(byString));
+  return 0;
+}
+
+function buildScoreLaneMeter(teamKey) {
+  const gs = gameState.value;
+  if (!gs || !hasGame.value) {
+    return {
+      role: '-',
+      current: 0,
+      max: 3,
+      violation: false,
+      lights: [],
+      title: 'Lane steps: 0/3',
+    };
+  }
+
+  const maxSteps = Math.max(1, Math.trunc(Number(gs.three_second_max_steps || 3)));
+  const teamIds = (teamKey === 'user' ? userPlayerIds.value : aiPlayerIds.value)
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+  const teamIdSet = new Set(teamIds);
+
+  const offenseIds = (Array.isArray(gs.offense_ids) ? gs.offense_ids : [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+  const defenseIds = (Array.isArray(gs.defense_ids) ? gs.defense_ids : [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id));
+
+  const teamOnOffense = offenseIds.some((id) => teamIdSet.has(id));
+  const role = teamOnOffense ? 'O' : 'D';
+  const sourceMap = teamOnOffense ? gs.offensive_lane_steps : gs.defensive_lane_steps;
+  const roleIds = (teamOnOffense ? offenseIds : defenseIds).filter((id) => teamIdSet.has(id));
+  const idsToRead = roleIds.length > 0 ? roleIds : teamIds;
+
+  let current = 0;
+  for (const pid of idsToRead) {
+    current = Math.max(current, laneStepValueForPlayer(sourceMap, pid));
+  }
+  current = Math.max(0, current);
+
+  const clamped = Math.min(maxSteps, current);
+  const lights = Array.from({ length: maxSteps }, (_, idx) => ({
+    key: `${teamKey}-lane-${idx}`,
+    lit: idx >= (maxSteps - clamped),
+  }));
+
+  return {
+    role,
+    current,
+    max: maxSteps,
+    violation: current >= maxSteps,
+    lights,
+    title: `Lane steps (${role === 'O' ? 'Offense' : 'Defense'}): ${current}/${maxSteps}`,
+  };
+}
+
+const userLaneMeter = computed(() => buildScoreLaneMeter('user'));
+const aiLaneMeter = computed(() => buildScoreLaneMeter('ai'));
+
+const forcedEpisodeOutcomePreview = computed(() => {
+  const mode = String(violationOverlayPreview.value || '').toLowerCase();
+  if (!mode || !hasGame.value || !gameState.value) return null;
+
+  if (mode === 'defensive') {
+    const aiId = aiPlayerIds.value.length > 0 ? Number(aiPlayerIds.value[0]) : null;
+    return {
+      type: 'DEFENSIVE_VIOLATION',
+      playerId: Number.isFinite(aiId) ? aiId : null,
+    };
+  }
+
+  if (mode === 'offensive') {
+    const userId = userPlayerIds.value.length > 0 ? Number(userPlayerIds.value[0]) : null;
+    return {
+      type: 'OFFENSIVE_VIOLATION',
+      playerId: Number.isFinite(userId) ? userId : null,
+    };
+  }
+
+  return null;
+});
+
 const possessionSummary = computed(() => {
   if (!possession.value) return '';
   const offenseTeam = possession.value.offense_team === 'user' ? 'You (Blue)' : 'AI (Red)';
@@ -1098,6 +1201,12 @@ const gameOverBannerText = computed(() => {
   const suffix = gameOverWinnerKey.value === 'tie' ? '' : '!';
   return `${gameOverWinnerLabel.value} ${gameOverScoreLabel.value}${suffix}`;
 });
+
+function toggleViolationOverlayPreview(mode) {
+  const normalized = String(mode || '').toLowerCase();
+  if (!['defensive', 'offensive'].includes(normalized)) return;
+  violationOverlayPreview.value = violationOverlayPreview.value === normalized ? null : normalized;
+}
 
 watch(
   playerChoices,
@@ -1297,6 +1406,7 @@ async function onStartGame() {
   error.value = '';
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
+  violationOverlayPreview.value = null;
 
   try {
     const payload = await startPlayableGame(
@@ -1325,6 +1435,7 @@ async function onNewGame() {
   error.value = '';
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
+  violationOverlayPreview.value = null;
 
   try {
     const payload = await newPlayableGame();
@@ -1348,6 +1459,7 @@ function onResetSetup() {
   error.value = '';
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
+  violationOverlayPreview.value = null;
 
   gameState.value = null;
   gameHistory.value = [];
@@ -1382,6 +1494,7 @@ async function onActionsSubmitted(actions) {
   error.value = '';
 
   try {
+    violationOverlayPreview.value = null;
     const userIds = toIdSet(userPlayerIds.value);
     const aiIds = toIdSet(gameState.value?.playable_ai_ids);
     const userOnOffense = Boolean(possession.value?.user_on_offense);
@@ -1617,11 +1730,27 @@ onBeforeUnmount(() => {
         >
           {{ forceGameOverPreview ? 'Hide End Banner' : 'Preview End Banner' }}
         </button>
+        <button
+          v-if="isDevBuild && hasGame"
+          :disabled="actionLoading || transitionRunning"
+          @click="toggleViolationOverlayPreview('defensive')"
+        >
+          {{ violationOverlayPreview === 'defensive' ? 'Hide Def Violation' : 'Demo Def Violation' }}
+        </button>
+        <button
+          v-if="isDevBuild && hasGame"
+          :disabled="actionLoading || transitionRunning"
+          @click="toggleViolationOverlayPreview('offensive')"
+        >
+          {{ violationOverlayPreview === 'offensive' ? 'Hide Off Violation' : 'Demo Off Violation' }}
+        </button>
       </div>
 
       <div class="status-row">
         <span v-if="selectedModeLabel">Mode: {{ selectedModeLabel }}</span>
         <span v-if="possessionSummary">{{ possessionSummary }}</span>
+        <span v-if="violationOverlayPreview === 'defensive'">Demo: Defensive violation overlay</span>
+        <span v-if="violationOverlayPreview === 'offensive'">Demo: Offensive violation overlay</span>
       </div>
 
       <p v-if="lastPossessionResult" class="possession-result">
@@ -1632,66 +1761,104 @@ onBeforeUnmount(() => {
 
     <section v-if="hasGame" class="playable-layout">
       <div class="playable-scoreboard" aria-label="Scoreboard">
-        <div class="score-side">
-          <span class="score-team">YOU</span>
-          <span class="score-digits">{{ formattedUserScore }}</span>
+        <div class="score-side score-side-you">
+          <div class="score-lane-meter score-lane-meter-left" :title="userLaneMeter.title">
+            <span class="score-lane-role">{{ userLaneMeter.role }}</span>
+            <span
+              v-for="light in userLaneMeter.lights"
+              :key="light.key"
+              class="score-lane-light"
+              :class="{ lit: light.lit, violation: userLaneMeter.violation && light.lit }"
+            />
+          </div>
+          <div class="score-side-main">
+            <span class="score-team">YOU</span>
+            <span class="score-digits">{{ formattedUserScore }}</span>
+          </div>
         </div>
         <div class="score-center">
           <span class="score-period-label">{{ gameClockSegmentLabel }}</span>
           <span class="clock-digits">{{ gameClockDisplay }}</span>
         </div>
-        <div class="score-side">
-          <span class="score-team">AI</span>
-          <span class="score-digits">{{ formattedAiScore }}</span>
+        <div class="score-side score-side-ai">
+          <div class="score-side-main">
+            <span class="score-team">AI</span>
+            <span class="score-digits">{{ formattedAiScore }}</span>
+          </div>
+          <div class="score-lane-meter score-lane-meter-right" :title="aiLaneMeter.title">
+            <span class="score-lane-role">{{ aiLaneMeter.role }}</span>
+            <span
+              v-for="light in aiLaneMeter.lights"
+              :key="light.key"
+              class="score-lane-light"
+              :class="{ lit: light.lit, violation: aiLaneMeter.violation && light.lit }"
+            />
+          </div>
         </div>
       </div>
-      <div class="board-shell">
-        <div class="board-stage">
-          <GameBoard
-            :game-history="gameHistory"
-            :active-player-id="activePlayerId"
-            :player-display-names="playerDisplayNames"
-            :player-jersey-numbers="playerJerseyNumbers"
-            :selected-actions="boardSelections"
-            :is-shot-clock-updating="false"
-            :allow-shot-clock-adjustment="false"
-            :disable-backend-value-fetches="true"
-            :allow-position-drag="false"
-            :minimal-chrome="true"
-            @update:activePlayerId="activePlayerId = $event"
-          />
-          <div v-if="showGameOverOverlay" class="playable-gameover-overlay" role="status" aria-live="polite">
-            <div class="playable-gameover-banner" :class="`winner-${gameOverWinnerKey}`">
-              <p class="gameover-banner-main">{{ gameOverBannerText }}</p>
-              <p class="gameover-banner-sub">Final score · Press N for New Game</p>
+      <div class="left-shell">
+        <div class="board-shell">
+          <div class="board-stage">
+            <GameBoard
+              :game-history="gameHistory"
+              :active-player-id="activePlayerId"
+              :player-display-names="playerDisplayNames"
+              :player-jersey-numbers="playerJerseyNumbers"
+              :forced-episode-outcome="forcedEpisodeOutcomePreview"
+              :selected-actions="boardSelections"
+              :is-shot-clock-updating="false"
+              :allow-shot-clock-adjustment="false"
+              :disable-backend-value-fetches="true"
+              :allow-position-drag="false"
+              :minimal-chrome="true"
+              @update:activePlayerId="activePlayerId = $event"
+            />
+            <div v-if="showGameOverOverlay" class="playable-gameover-overlay" role="status" aria-live="polite">
+              <div class="playable-gameover-banner" :class="`winner-${gameOverWinnerKey}`">
+                <p class="gameover-banner-main">{{ gameOverBannerText }}</p>
+                <p class="gameover-banner-sub">Final score · Press N for New Game</p>
+              </div>
             </div>
           </div>
         </div>
-        <PlayableEnvironmentInfo
-          :game-state="gameState"
-          :player-display-names="playerDisplayNames"
-          :player-jersey-numbers="playerJerseyNumbers"
-        />
+        <div class="environment-shell">
+          <PlayableEnvironmentInfo
+            :game-state="gameState"
+            :player-display-names="playerDisplayNames"
+            :player-jersey-numbers="playerJerseyNumbers"
+          />
+        </div>
       </div>
 
-      <div class="controls-shell">
-        <PlayableControls
-          ref="controlsRef"
-          :game-state="gameState"
-          :active-player-id="activePlayerId"
-          :user-player-ids="userPlayerIds"
-          :score="score"
-          :player-display-names="playerDisplayNames"
-          :player-jersey-numbers="playerJerseyNumbers"
-          :stats="playableStats"
-          :play-by-play="playablePlayByPlay"
-          :shortcuts="playableKeyboardShortcuts"
-          :disabled="controlsDisabled"
-          @update:activePlayerId="activePlayerId = $event"
-          @actions-submitted="onActionsSubmitted"
-          @selections-changed="onSelectionsChanged"
-        />
+      <div class="sidebar-shell">
+        <div class="controls-shell">
+          <PlayableControls
+            ref="controlsRef"
+            :game-state="gameState"
+            :active-player-id="activePlayerId"
+            :user-player-ids="userPlayerIds"
+            :player-display-names="playerDisplayNames"
+            :shortcuts="playableKeyboardShortcuts"
+            :disabled="controlsDisabled"
+            @update:activePlayerId="activePlayerId = $event"
+            @actions-submitted="onActionsSubmitted"
+            @selections-changed="onSelectionsChanged"
+          />
+        </div>
+
+        <div class="stats-shell">
+          <PlayableStatsPanel
+            :game-state="gameState"
+            :user-player-ids="userPlayerIds"
+            :score="score"
+            :stats="playableStats"
+            :play-by-play="playablePlayByPlay"
+            :player-display-names="playerDisplayNames"
+            :player-jersey-numbers="playerJerseyNumbers"
+          />
+        </div>
       </div>
+
     </section>
 
     <section v-else class="empty-state">
@@ -1820,7 +1987,8 @@ onBeforeUnmount(() => {
 
 .playable-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(375px, 450px);
+  grid-template-columns: minmax(0, 1024px) minmax(375px, 450px);
+  justify-content: center;
   gap: 1rem;
   align-items: start;
   padding: 1rem;
@@ -1830,7 +1998,11 @@ onBeforeUnmount(() => {
 }
 
 .board-shell,
+.left-shell,
+.sidebar-shell,
 .controls-shell,
+.stats-shell,
+.environment-shell,
 .empty-state {
   background: transparent;
   border: none;
@@ -1841,6 +2013,15 @@ onBeforeUnmount(() => {
 .board-shell {
   display: flex;
   flex-direction: column;
+}
+
+.left-shell {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  align-self: start;
+  width: min(100%, 1024px);
 }
 
 .board-stage {
@@ -1923,21 +2104,75 @@ onBeforeUnmount(() => {
 
 .score-side {
   display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.52rem;
+  min-width: 92px;
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.score-side-main {
+  display: inline-flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.35rem;
-  min-width: 92px;
+  gap: 0.28rem;
+}
+
+.score-side-you {
+  background: #007bff;
+  border-color: #ffffff;
+}
+
+.score-side-ai {
+  background: #dc3545;
+  border-color: #ffffff;
 }
 
 .score-team {
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(226, 232, 240, 0.85);
+  color: rgba(248, 250, 252, 0.95);
 }
 
-.score-digits,
+.score-lane-meter {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.43rem;
+}
+
+.score-lane-role {
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1;
+  color: rgba(248, 250, 252, 0.95);
+  letter-spacing: 0.08em;
+}
+
+.score-lane-light {
+  width: 0.82rem;
+  height: 0.82rem;
+  border-radius: 999px;
+  border: 1px solid rgba(248, 250, 252, 0.72);
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.score-lane-light.lit {
+  background: #ffffff;
+  border-color: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.95), 0 0 12px rgba(255, 255, 255, 0.55);
+}
+
+.score-lane-light.violation {
+  box-shadow: 0 0 7px rgba(248, 250, 252, 0.9);
+}
+
 .clock-digits {
   font-family: 'DSEG7 Classic', sans-serif;
   color: #ff4d4d;
@@ -1945,6 +2180,9 @@ onBeforeUnmount(() => {
 }
 
 .score-digits {
+  font-family: 'DSEG7 Classic', sans-serif;
+  color: #f8fafc;
+  text-shadow: 0 0 3px rgba(248, 250, 252, 0.65), 0 0 8px rgba(248, 250, 252, 0.2);
   font-size: 3.45rem;
   line-height: 1;
 }
@@ -1974,8 +2212,22 @@ onBeforeUnmount(() => {
 }
 
 .controls-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.sidebar-shell {
+  grid-column: 2;
   padding-left: 1rem;
   border-left: 1px solid rgba(148, 163, 184, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  align-self: start;
+}
+
+.stats-shell {
   display: flex;
   flex-direction: column;
   gap: 0.8rem;
@@ -1996,11 +2248,25 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
   }
 
-  .controls-shell {
+  .left-shell {
+    display: contents;
+  }
+
+  .board-shell {
+    order: 1;
+  }
+
+  .sidebar-shell {
+    order: 2;
+    grid-column: auto;
     padding-left: 0;
     padding-top: 1rem;
     border-left: none;
     border-top: 1px solid rgba(148, 163, 184, 0.3);
+  }
+
+  .environment-shell {
+    order: 3;
   }
 
   .playable-scoreboard {

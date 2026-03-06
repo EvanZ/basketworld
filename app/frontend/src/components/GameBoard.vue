@@ -91,6 +91,10 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  forcedEpisodeOutcome: {
+    type: Object,
+    default: null,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
@@ -920,6 +924,105 @@ const offensiveLaneHexes = computed(() => {
   });
 });
 
+function toFiniteInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.trunc(parsed);
+}
+
+function laneStepMapValue(map, playerId) {
+  if (!map || typeof map !== 'object') return 0;
+  const direct = map[playerId];
+  if (direct !== undefined) return toFiniteInt(direct, 0);
+  const byString = map[String(playerId)];
+  return toFiniteInt(byString, 0);
+}
+
+function sideLaneStepsMax(map, sideIds) {
+  if (!Array.isArray(sideIds) || sideIds.length === 0) return 0;
+  let maxValue = 0;
+  for (const rawId of sideIds) {
+    const pid = toFiniteInt(rawId, Number.NaN);
+    if (!Number.isFinite(pid)) continue;
+    const value = laneStepMapValue(map, pid);
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+  return Math.max(0, maxValue);
+}
+
+const laneStepIndicatorStacks = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || !basketPosition.value) return [];
+
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids : [];
+  if (offenseIds.length === 0 && defenseIds.length === 0) return [];
+
+  const maxSteps = Math.max(1, toFiniteInt(gs.three_second_max_steps, 3));
+  const offenseSteps = sideLaneStepsMax(gs.offensive_lane_steps, offenseIds);
+  const defenseSteps = sideLaneStepsMax(gs.defensive_lane_steps, defenseIds);
+
+  const resolveSideColor = (sideIds, fallbackColor) => {
+    if (!Array.isArray(sideIds)) return fallbackColor;
+    for (const rawId of sideIds) {
+      const pid = toFiniteInt(rawId, Number.NaN);
+      if (!Number.isFinite(pid)) continue;
+      const owner = getPlayerOwner(gs, pid);
+      if (owner === 'user') return '#007bff';
+      if (owner === 'ai') return '#dc3545';
+    }
+    return fallbackColor;
+  };
+
+  const offenseColor = resolveSideColor(offenseIds, '#007bff');
+  const defenseColor = resolveSideColor(defenseIds, '#dc3545');
+
+  const radius = HEX_RADIUS * 0.14;
+  const spacing = HEX_RADIUS * 0.48;
+  const topY = basketPosition.value.y - ((maxSteps - 1) * spacing) / 2;
+  const columnGap = HEX_RADIUS * 0.62;
+  const desiredDefenseX = basketPosition.value.x - HEX_RADIUS * 1.55;
+  const desiredOffenseX = desiredDefenseX + columnGap;
+  const minCenterX = courtBounds.value.minX + (HEX_RADIUS * 0.28);
+  const shiftRight = Math.max(0, minCenterX - desiredDefenseX);
+  const defenseX = desiredDefenseX + shiftRight;
+  const offenseX = desiredOffenseX + shiftRight;
+
+  const buildStack = (key, label, shortLabel, steps, color, x) => {
+    const clamped = Math.max(0, Math.min(maxSteps, steps));
+    const lights = [];
+    for (let i = 0; i < maxSteps; i += 1) {
+      lights.push({
+        key: `${key}-light-${i}`,
+        x,
+        y: topY + (i * spacing),
+        radius,
+        lit: i < clamped,
+        color,
+        violation: steps >= maxSteps,
+      });
+    }
+    return {
+      key,
+      label,
+      shortLabel,
+      color,
+      steps: Math.max(0, steps),
+      maxSteps,
+      labelX: x,
+      labelY: topY - (radius * 2.4),
+      lights,
+    };
+  };
+
+  return [
+    buildStack('offense', 'Offense', 'O', offenseSteps, offenseColor, offenseX),
+    buildStack('defense', 'Defense', 'D', defenseSteps, defenseColor, defenseX),
+  ];
+});
+
 const shotClockValue = computed(() => currentGameState.value?.shot_clock ?? 0);
 const shotClockMax = computed(() => {
   const state = currentGameState.value;
@@ -1594,13 +1697,76 @@ watch(
   { deep: true }
 );
 
+function resolveOutcomePointForPlayer(playerId) {
+    const pid = Number(playerId);
+    if (!Number.isFinite(pid)) return null;
+    const playerPos = currentGameState.value?.positions?.[pid];
+    if (!Array.isArray(playerPos) || playerPos.length < 2) return null;
+    const [pq, pr] = playerPos;
+    return axialToCartesian(pq, pr);
+}
+
+function normalizeForcedEpisodeOutcome(rawOutcome) {
+    if (!rawOutcome || typeof rawOutcome !== 'object' || !currentGameState.value) return null;
+    const type = String(rawOutcome.type || '').trim().toUpperCase();
+    if (!type) return null;
+
+    const allowedTypes = new Set([
+        'DEFENSIVE_VIOLATION',
+        'OFFENSIVE_VIOLATION',
+        'TURNOVER',
+        'SHOT_CLOCK_VIOLATION',
+        'MADE_SHOT',
+        'MISSED_SHOT',
+    ]);
+    if (!allowedTypes.has(type)) return null;
+
+    const outcome = { type };
+    const forcedPlayerId = Number(rawOutcome.playerId ?? rawOutcome.player_id);
+    if (Number.isFinite(forcedPlayerId)) {
+        outcome.playerId = forcedPlayerId;
+    }
+
+    const forcedX = Number(rawOutcome.x);
+    const forcedY = Number(rawOutcome.y);
+    if (Number.isFinite(forcedX) && Number.isFinite(forcedY)) {
+        outcome.x = forcedX;
+        outcome.y = forcedY;
+    } else if (Number.isFinite(forcedPlayerId)) {
+        const point = resolveOutcomePointForPlayer(forcedPlayerId);
+        if (point) {
+            outcome.x = point.x;
+            outcome.y = point.y;
+        }
+    }
+
+    if (type === 'MADE_SHOT' || type === 'MISSED_SHOT') {
+        outcome.isThree = Boolean(rawOutcome.isThree ?? rawOutcome.is_three ?? false);
+        outcome.isDunk = Boolean(rawOutcome.isDunk ?? rawOutcome.is_dunk ?? false);
+    }
+
+    return outcome;
+}
+
 const episodeOutcome = computed(() => {
+    const forcedOutcome = normalizeForcedEpisodeOutcome(props.forcedEpisodeOutcome);
+    if (forcedOutcome) return forcedOutcome;
+
     if (!currentGameState.value || !currentGameState.value.done) {
         return null; // Game is not over
     }
 
     const results = currentGameState.value.last_action_results;
     if (!results) return null;
+
+    const resolveViolationPosition = (violation) => {
+        if (!violation || typeof violation !== 'object') return null;
+        if (Array.isArray(violation.position) && violation.position.length >= 2) {
+            const [vq, vr] = violation.position;
+            return axialToCartesian(vq, vr);
+        }
+        return resolveOutcomePointForPlayer(violation.player_id);
+    };
 
     // Check for shot results
     if (results.shots && Object.keys(results.shots).length > 0) {
@@ -1627,11 +1793,21 @@ const episodeOutcome = computed(() => {
     // Check for defensive lane violations
     if (results.defensive_lane_violations && results.defensive_lane_violations.length > 0) {
         const violation = results.defensive_lane_violations[0];
-        if (violation.position) {
-            const { x, y } = axialToCartesian(violation.position[0], violation.position[1]);
-            return { type: 'DEFENSIVE_VIOLATION', x, y, playerId: violation.player_id };
+        const point = resolveViolationPosition(violation);
+        if (point) {
+            return { type: 'DEFENSIVE_VIOLATION', x: point.x, y: point.y, playerId: violation.player_id };
         }
-        return { type: 'DEFENSIVE_VIOLATION' };
+        return { type: 'DEFENSIVE_VIOLATION', playerId: violation?.player_id };
+    }
+
+    // Check for offensive lane violations
+    if (results.offensive_lane_violations && results.offensive_lane_violations.length > 0) {
+        const violation = results.offensive_lane_violations[0];
+        const point = resolveViolationPosition(violation);
+        if (point) {
+            return { type: 'OFFENSIVE_VIOLATION', x: point.x, y: point.y, playerId: violation.player_id };
+        }
+        return { type: 'OFFENSIVE_VIOLATION', playerId: violation?.player_id };
     }
 
     // Check for turnover results
@@ -2855,6 +3031,37 @@ onBeforeUnmount(() => {
           L
         </text>
 
+        <!-- Lane-step indicators near the basket (live violation risk meter) -->
+        <g v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-indicators">
+          <g
+            v-for="stack in laneStepIndicatorStacks"
+            :key="stack.key"
+            class="lane-step-stack"
+          >
+            <title>{{ `${stack.label} lane steps: ${stack.steps}/${stack.maxSteps}` }}</title>
+            <text
+              :x="stack.labelX"
+              :y="stack.labelY"
+              text-anchor="middle"
+              class="lane-step-label"
+              :fill="stack.color"
+            >
+              {{ stack.shortLabel }}
+            </text>
+            <circle
+              v-for="light in stack.lights"
+              :key="light.key"
+              :cx="light.x"
+              :cy="light.y"
+              :r="light.radius"
+              class="lane-step-light"
+              :class="{ lit: light.lit, violation: light.violation }"
+              :fill="light.lit ? light.color : 'rgba(148, 163, 184, 0.2)'"
+              :stroke="light.lit ? 'rgba(248, 250, 252, 0.9)' : 'rgba(15, 23, 42, 0.8)'"
+            />
+          </g>
+        </g>
+
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
 
@@ -3181,6 +3388,7 @@ onBeforeUnmount(() => {
             :opacity="ray.passSuccessOpacity"
           />
           <text
+            v-if="!minimalChrome"
             :x="ray.midX"
             :y="ray.midY"
             text-anchor="middle"
@@ -3344,7 +3552,10 @@ onBeforeUnmount(() => {
             <text v-if="episodeOutcome.type === 'TURNOVER'" :x="episodeOutcome.x" :y="episodeOutcome.y" class="turnover-x">X</text>
             
             <!-- Defensive Violation indicator -->
-            <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker">!</text>
+            <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker defensive">!</text>
+
+            <!-- Offensive Violation indicator -->
+            <text v-if="episodeOutcome.type === 'OFFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker offensive">!</text>
         </g>
 
         <!-- State-value overlay -->
@@ -3396,6 +3607,10 @@ onBeforeUnmount(() => {
           <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation long-outcome-text">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
               <tspan x="50%" dy="1.2em">Violation - Defense!</tspan>
+          </text>
+          <text v-if="episodeOutcome.type === 'OFFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation-offense long-outcome-text">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan x="50%" dy="1.2em">Violation - Offense!</tspan>
           </text>
       </g>
 
@@ -3899,6 +4114,29 @@ onBeforeUnmount(() => {
   font-size: 1rem;
   opacity: 0.55;
 }
+.lane-step-indicators {
+  pointer-events: none;
+}
+.lane-step-label {
+  font-size: 0.36rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  paint-order: stroke;
+  stroke: rgba(15, 23, 42, 0.95);
+  stroke-width: 0.05rem;
+}
+.lane-step-light {
+  stroke-width: 0.05rem;
+  transition: fill 0.18s ease, opacity 0.18s ease;
+}
+.lane-step-light.lit {
+  opacity: 0.95;
+  filter: drop-shadow(0 0 3px rgba(248, 250, 252, 0.3));
+}
+.lane-step-light.violation {
+  filter: drop-shadow(0 0 5px rgba(248, 250, 252, 0.45));
+}
 .basket-rim {
   fill: none;
   stroke: #ff8c00;
@@ -4075,11 +4313,16 @@ onBeforeUnmount(() => {
 }
 .violation-marker {
     font-size: 48px;
-    fill: orange;
     font-weight: bold;
     text-anchor: middle;
     dominant-baseline: central;
     transform: scale(1, -1); /* Counteract the group flip */
+}
+.violation-marker.defensive {
+    fill: #f59e0b;
+}
+.violation-marker.offensive {
+    fill: #fb7185;
 }
 .outcome-text-group {
     pointer-events: none; /* Make it non-interactive */
@@ -4102,6 +4345,7 @@ onBeforeUnmount(() => {
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
 .violation { fill: orange; }
+.violation-offense { fill: #fb7185; }
 
 /* Pass rays and steal probability labels */
 .pass-ray {

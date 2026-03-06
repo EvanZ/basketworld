@@ -20,23 +20,7 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
-  score: {
-    type: Object,
-    default: () => ({ user: 0, ai: 0 }),
-  },
-  stats: {
-    type: Object,
-    default: null,
-  },
-  playByPlay: {
-    type: Array,
-    default: () => [],
-  },
   playerDisplayNames: {
-    type: Object,
-    default: () => ({}),
-  },
-  playerJerseyNumbers: {
     type: Object,
     default: () => ({}),
   },
@@ -75,88 +59,6 @@ const ACTION_NAMES = [
 const passMode = computed(() => String(props.gameState?.pass_mode || 'directional').toLowerCase());
 const isPointerPassMode = computed(() => passMode.value === 'pointer_targeted');
 
-function makeEmptyShotLine() {
-  return { attempts: 0, made: 0 };
-}
-
-function makeEmptyTeamStats() {
-  return {
-    shots: {
-      total: makeEmptyShotLine(),
-      twoPt: makeEmptyShotLine(),
-      threePt: makeEmptyShotLine(),
-      dunk: makeEmptyShotLine(),
-    },
-    assists: 0,
-    turnovers: 0,
-    defensiveViolations: 0,
-    offensiveViolations: 0,
-    actions: {
-      noop: 0,
-      move: 0,
-      shoot: 0,
-      pass: 0,
-      other: 0,
-      total: 0,
-    },
-    perPlayer: {},
-  };
-}
-
-function makeEmptyPlayerStats() {
-  return {
-    shots: {
-      total: makeEmptyShotLine(),
-      twoPt: makeEmptyShotLine(),
-      threePt: makeEmptyShotLine(),
-      dunk: makeEmptyShotLine(),
-    },
-    assists: 0,
-    turnovers: 0,
-    points: 0,
-    actions: {
-      noop: 0,
-      move: 0,
-      shoot: 0,
-      pass: 0,
-      other: 0,
-      total: 0,
-    },
-  };
-}
-
-function makeEmptyStats() {
-  return {
-    turns: 0,
-    possessions: 0,
-    userOffensiveTurns: 0,
-    userDefensiveTurns: 0,
-    byTeam: {
-      user: makeEmptyTeamStats(),
-      ai: makeEmptyTeamStats(),
-    },
-    turnoverReasons: {},
-  };
-}
-
-function asCount(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-}
-
-function fgPercent(made, attempts) {
-  const mk = asCount(made);
-  const att = asCount(attempts);
-  if (att <= 0) return '0.0';
-  return ((mk / att) * 100).toFixed(1);
-}
-
-function formatShotCell(line) {
-  const made = asCount(line?.made);
-  const attempts = asCount(line?.attempts);
-  return `${made}-${attempts} (${fgPercent(made, attempts)}%)`;
-}
-
 function formatPolicyPercent(value) {
   const prob = Number(value);
   if (!Number.isFinite(prob) || prob <= 0) return '0.0%';
@@ -173,17 +75,6 @@ function getPlayerSurname(playerId) {
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
-function getPlayerJerseyNumber(playerId) {
-  const id = Number(playerId);
-  if (!Number.isFinite(id)) return '';
-  const map = props.playerJerseyNumbers && typeof props.playerJerseyNumbers === 'object'
-    ? props.playerJerseyNumbers
-    : {};
-  const raw = map[id] ?? map[String(id)];
-  const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
-  return jersey;
-}
-
 function formatPlayerNameWithId(playerId) {
   const id = Number(playerId);
   if (!Number.isFinite(id)) return 'Unknown';
@@ -191,97 +82,6 @@ function formatPlayerNameWithId(playerId) {
   if (surname) return `${surname} #${id}`;
   return `Player ${id}`;
 }
-
-function formatPlayerNameWithJersey(playerId) {
-  const id = Number(playerId);
-  if (!Number.isFinite(id)) return 'Unknown';
-  const surname = getPlayerSurname(id);
-  const jersey = getPlayerJerseyNumber(id);
-  if (surname && jersey) return `${surname} #${jersey}`;
-  if (surname) return `${surname} #${id}`;
-  if (jersey) return `Player #${jersey}`;
-  return `Player ${id}`;
-}
-
-const statsSafe = computed(() => {
-  if (props.stats && typeof props.stats === 'object') return props.stats;
-  return makeEmptyStats();
-});
-
-const userPlayerIdsForStats = computed(() => {
-  const ids = Array.isArray(props.userPlayerIds) ? props.userPlayerIds : [];
-  return ids.map((id) => Number(id)).filter((id) => Number.isFinite(id)).sort((a, b) => a - b);
-});
-
-const aiPlayerIdsForStats = computed(() => {
-  const ids = props.gameState?.playable_ai_ids;
-  if (!Array.isArray(ids)) return [];
-  return ids.map((id) => Number(id)).filter((id) => Number.isFinite(id)).sort((a, b) => a - b);
-});
-
-const boxScoreRows = computed(() => {
-  const byTeam = statsSafe.value?.byTeam || {};
-  const getPlayerLine = (teamKey, playerId) => {
-    const team = byTeam[teamKey] || {};
-    const map = team.perPlayer && typeof team.perPlayer === 'object' ? team.perPlayer : {};
-    return map[String(playerId)] || map[playerId] || makeEmptyPlayerStats();
-  };
-
-  const buildRows = (teamKey, playerIds) => {
-    const line = byTeam[teamKey] || makeEmptyTeamStats();
-    const shots = line.shots || {};
-    const rows = playerIds.map((pid) => {
-      const playerLine = getPlayerLine(teamKey, pid);
-      const playerShots = playerLine.shots || {};
-      return {
-        key: `${teamKey}-player-${pid}`,
-        player: formatPlayerNameWithJersey(pid),
-        isTotal: false,
-        points: asCount(playerLine.points),
-        fg: formatShotCell(playerShots.total),
-        twoPt: formatShotCell(playerShots.twoPt),
-        threePt: formatShotCell(playerShots.threePt),
-        dunk: formatShotCell(playerShots.dunk),
-        assists: asCount(playerLine.assists),
-        turnovers: asCount(playerLine.turnovers),
-      };
-    });
-
-    rows.push({
-      key: `${teamKey}-total`,
-      player: teamKey === 'user' ? 'You' : 'AI',
-      isTotal: true,
-      points: asCount(props.score?.[teamKey]),
-      fg: formatShotCell(shots.total),
-      twoPt: formatShotCell(shots.twoPt),
-      threePt: formatShotCell(shots.threePt),
-      dunk: formatShotCell(shots.dunk),
-      assists: asCount(line.assists),
-      turnovers: asCount(line.turnovers),
-    });
-
-    return rows;
-  };
-
-  return [
-    ...buildRows('user', userPlayerIdsForStats.value),
-    ...buildRows('ai', aiPlayerIdsForStats.value),
-  ];
-});
-
-const playByPlayRows = computed(() => {
-  const rows = Array.isArray(props.playByPlay) ? props.playByPlay : [];
-  return rows
-    .map((row, idx) => ({
-      key: row?.id ?? `pbp-${idx}`,
-      period: String(row?.period || '-'),
-      clock: String(row?.clock || '--:--'),
-      team: String(row?.team || '-'),
-      score: String(row?.score || '0-0'),
-      event: String(row?.event || ''),
-    }))
-    .filter((row) => row.event.length > 0);
-});
 
 const policyHintRows = computed(() => {
   const gs = props.gameState;
@@ -427,6 +227,47 @@ const activeCanSelectPointerPass = computed(() => {
   if (activePlayer.value === null || activePlayer.value === undefined) return false;
   return canPlayerSelectPointerPass(activePlayer.value);
 });
+
+const activePassSuccessProbabilities = computed(() => {
+  if (!activeCanSelectPointerPass.value) return {};
+  const gs = props.gameState;
+  if (!gs || typeof gs !== 'object') return {};
+  const rawStealMap = gs.pass_steal_probabilities && typeof gs.pass_steal_probabilities === 'object'
+    ? gs.pass_steal_probabilities
+    : {};
+  const result = {};
+  for (const targetId of activePassTargets.value) {
+    const raw = rawStealMap[targetId] ?? rawStealMap[String(targetId)];
+    if (raw === null || raw === undefined) continue;
+    const stealNum = Number(raw);
+    if (!Number.isFinite(stealNum)) continue;
+    const stealFraction = Math.max(0, Math.min(1, stealNum > 1 ? stealNum / 100 : stealNum));
+    result[targetId] = Math.max(0, Math.min(1, 1 - stealFraction));
+  }
+  return result;
+});
+
+function getActivePassSuccessProbability(targetId) {
+  const tid = Number(targetId);
+  if (!Number.isFinite(tid)) return null;
+  const raw = activePassSuccessProbabilities.value[tid] ?? activePassSuccessProbabilities.value[String(tid)];
+  const prob = Number(raw);
+  return Number.isFinite(prob) ? Math.max(0, Math.min(1, prob)) : null;
+}
+
+function formatPointerPassPercent(targetId) {
+  const prob = getActivePassSuccessProbability(targetId);
+  if (prob === null) return '—';
+  return `${(prob * 100).toFixed(1)}%`;
+}
+
+function pointerPassButtonStyle(targetId) {
+  const prob = getActivePassSuccessProbability(targetId);
+  const fillPct = prob === null ? 0 : Math.max(0, Math.min(100, prob * 100));
+  return {
+    '--pass-fill': `${fillPct.toFixed(1)}%`,
+  };
+}
 
 function isPointerPassButtonSelected(targetId) {
   if (activePlayer.value === null || activePlayer.value === undefined) return false;
@@ -676,10 +517,12 @@ defineExpose({
             :key="`pointer-target-${activePlayer}-${targetId}`"
             class="pointer-pass-btn"
             :class="{ selected: isPointerPassButtonSelected(targetId) }"
+            :style="pointerPassButtonStyle(targetId)"
             :disabled="disabled || !activeCanSelectPointerPass"
             @click="handlePointerPassTargetSelected(targetId)"
           >
-            {{ formatPlayerNameWithId(targetId) }}
+            <span class="pointer-pass-name">{{ formatPlayerNameWithId(targetId) }}</span>
+            <span v-if="activeCanSelectPointerPass" class="pointer-pass-prob">{{ formatPointerPassPercent(targetId) }}</span>
           </button>
         </div>
         <p v-if="!activeCanSelectPointerPass" class="pointer-pass-help">
@@ -707,73 +550,6 @@ defineExpose({
         @shortcut-clicked="onShortcutLegendClicked"
       />
 
-      <h3>Box Score</h3>
-      <div class="table-scroll">
-        <table class="box-score-table">
-          <thead>
-            <tr>
-              <th>Player</th>
-              <th>PTS</th>
-              <th>FG</th>
-              <th>2PT</th>
-              <th>3PT</th>
-              <th>Dunk</th>
-              <th>AST</th>
-              <th>TOV</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="row in boxScoreRows"
-              :key="row.key"
-              :class="{ 'total-row': row.isTotal }"
-            >
-              <td class="player-cell">{{ row.player }}</td>
-              <td>{{ row.points }}</td>
-              <td>{{ row.fg }}</td>
-              <td>{{ row.twoPt }}</td>
-              <td>{{ row.threePt }}</td>
-              <td>{{ row.dunk }}</td>
-              <td>{{ row.assists }}</td>
-              <td>{{ row.turnovers }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3>Play-By-Play</h3>
-      <div class="table-scroll play-by-play-scroll">
-        <table class="play-by-play-table">
-          <thead>
-            <tr>
-              <th>Period</th>
-              <th>Clock</th>
-              <th>Score</th>
-              <th>Team</th>
-              <th>Event</th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-if="playByPlayRows.length === 0">
-              <tr>
-                <td colspan="5" class="play-by-play-empty">No events yet.</td>
-              </tr>
-            </template>
-            <template v-else>
-              <tr
-                v-for="row in playByPlayRows"
-                :key="row.key"
-              >
-                <td>{{ row.period }}</td>
-                <td>{{ row.clock }}</td>
-                <td class="play-by-play-score">{{ row.score }}</td>
-                <td class="play-by-play-team">{{ row.team }}</td>
-                <td class="play-by-play-event">{{ row.event }}</td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
-      </div>
     </div>
   </div>
 </template>
@@ -852,6 +628,13 @@ h3 {
 }
 
 .pointer-pass-btn {
+  --pass-fill: 0%;
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
   border-radius: 999px;
   border: 1px solid rgba(148, 163, 184, 0.4);
   background: transparent;
@@ -862,9 +645,31 @@ h3 {
   letter-spacing: 0.02em;
 }
 
+.pointer-pass-btn::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--pass-fill);
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.08));
+  pointer-events: none;
+}
+
 .pointer-pass-btn.selected {
   border-color: var(--app-accent-strong);
   color: var(--app-accent);
+}
+
+.pointer-pass-name,
+.pointer-pass-prob {
+  position: relative;
+  z-index: 1;
+}
+
+.pointer-pass-prob {
+  font-size: 0.68rem;
+  color: var(--app-accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .pointer-pass-help {
@@ -1044,120 +849,5 @@ h3 {
 
 .playable-shortcuts-legend {
   margin-top: 0.2rem;
-}
-
-.box-score-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.74rem;
-}
-
-.play-by-play-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.72rem;
-}
-
-.table-scroll {
-  width: 100%;
-  overflow-x: auto;
-}
-
-.play-by-play-scroll {
-  max-height: 270px;
-  overflow-y: auto;
-}
-
-.box-score-table th,
-.box-score-table td,
-.play-by-play-table th,
-.play-by-play-table td {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  padding: 0.34rem 0.4rem;
-  text-align: right;
-}
-
-.box-score-table th:first-child,
-.box-score-table td:first-child,
-.play-by-play-table th:first-child,
-.play-by-play-table td:first-child {
-  text-align: left;
-}
-
-.box-score-table th {
-  color: var(--app-text-muted);
-  background: rgba(15, 23, 42, 0.45);
-  font-weight: 600;
-}
-
-.play-by-play-table th {
-  color: var(--app-text-muted);
-  background: rgba(15, 23, 42, 0.45);
-  font-weight: 600;
-}
-
-.box-score-table tbody tr:nth-child(even) {
-  background: rgba(15, 23, 42, 0.25);
-}
-
-.play-by-play-table tbody tr:nth-child(even) {
-  background: rgba(15, 23, 42, 0.25);
-}
-
-.player-cell {
-  letter-spacing: 0.06em;
-  font-weight: 500;
-}
-
-.box-score-table .total-row td {
-  font-weight: 700;
-  background: rgba(59, 130, 246, 0.1);
-}
-
-.play-by-play-table th:nth-child(1),
-.play-by-play-table td:nth-child(1) {
-  min-width: 86px;
-}
-
-.play-by-play-table th:nth-child(2),
-.play-by-play-table td:nth-child(2) {
-  min-width: 62px;
-}
-
-.play-by-play-table th:nth-child(3),
-.play-by-play-table td:nth-child(3) {
-  min-width: 90px;
-  text-align: center;
-}
-
-.play-by-play-table th:nth-child(4),
-.play-by-play-table td:nth-child(4) {
-  min-width: 54px;
-  text-align: center;
-}
-
-.play-by-play-table th:nth-child(5),
-.play-by-play-table td:nth-child(5) {
-  text-align: left;
-}
-
-.play-by-play-team {
-  letter-spacing: 0.06em;
-  font-weight: 600;
-}
-
-.play-by-play-event {
-  white-space: normal;
-  line-height: 1.3;
-}
-
-.play-by-play-score {
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.04em;
-}
-
-.play-by-play-empty {
-  text-align: center !important;
-  color: var(--app-text-muted);
 }
 </style>

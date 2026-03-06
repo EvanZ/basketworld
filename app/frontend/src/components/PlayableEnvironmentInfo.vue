@@ -133,37 +133,6 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
     <div v-if="!gameState" class="env-empty">No environment data available.</div>
 
     <div v-else class="env-grid">
-      <article class="env-card">
-        <h4>Environment Settings</h4>
-        <div class="param-row"><span>Players per side</span><strong>{{ gameState.players_per_side ?? userIds.length }}</strong></div>
-        <div class="param-row"><span>Court dimensions</span><strong>{{ gameState.court_width }}×{{ gameState.court_height }}</strong></div>
-        <div class="param-row"><span>Ball holder</span><strong>Player {{ formatValue(gameState.ball_holder) }}</strong></div>
-        <div class="param-row"><span>Shot clock</span><strong>{{ gameState.shot_clock }}</strong></div>
-        <div class="param-row"><span>Min shot clock at reset</span><strong>{{ formatValue(gameState.min_shot_clock) }}</strong></div>
-        <div class="param-row"><span>Three-point distance</span><strong>{{ formatValue(gameState.three_point_distance) }}</strong></div>
-        <div class="param-row"><span>Three-point short distance</span><strong>{{ formatValue(gameState.three_point_short_distance) }}</strong></div>
-      </article>
-
-      <article class="env-card">
-        <h4>Policies</h4>
-        <div class="param-row"><span>Run ID</span><strong class="mono">{{ formatValue(gameState.run_id) }}</strong></div>
-        <div class="param-row"><span>Unified policy</span><strong class="mono">{{ formatValue(gameState.unified_policy_name) }}</strong></div>
-        <div class="param-row"><span>Pass mode</span><strong>{{ formatValue(gameState.pass_mode) }}</strong></div>
-        <div class="param-row"><span>Pass target strategy</span><strong>{{ formatValue(gameState.pass_target_strategy) }}</strong></div>
-        <div class="param-row"><span>Illegal action policy</span><strong>{{ formatValue(gameState.illegal_action_policy) }}</strong></div>
-      </article>
-
-      <article class="env-card">
-        <h4>Shot Parameters</h4>
-        <div class="param-row"><span>Layup μ</span><strong>{{ formatPercent(gameState.shot_params?.layup_pct) }}</strong></div>
-        <div class="param-row"><span>Layup σ</span><strong>{{ formatPercent(gameState.shot_params?.layup_std) }}</strong></div>
-        <div class="param-row"><span>Three-point μ</span><strong>{{ formatPercent(gameState.shot_params?.three_pt_pct) }}</strong></div>
-        <div class="param-row"><span>Three-point σ</span><strong>{{ formatPercent(gameState.shot_params?.three_pt_std) }}</strong></div>
-        <div class="param-row"><span>Dunk μ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_pct) }}</strong></div>
-        <div class="param-row"><span>Dunk σ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_std) }}</strong></div>
-        <div class="param-row"><span>Dunks allowed</span><strong>{{ gameState.shot_params?.allow_dunks ? 'Yes' : 'No' }}</strong></div>
-      </article>
-
       <article class="env-card env-card-wide">
         <h4>Sampled Shooting Skills (Game Start)</h4>
         <div class="skills-grid">
@@ -269,6 +238,37 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
         <div class="param-row"><span>Offensive 3-sec enabled</span><strong>{{ gameState.offensive_three_seconds_enabled ? 'Yes' : 'No' }}</strong></div>
         <div class="param-row"><span>Illegal defense enabled</span><strong>{{ gameState.illegal_defense_enabled ? 'Yes' : 'No' }}</strong></div>
         <div class="param-row"><span>Lane hexes count</span><strong>{{ Array.isArray(gameState.offensive_lane_hexes) ? gameState.offensive_lane_hexes.length : 0 }}</strong></div>
+      </article>
+
+      <article class="env-card">
+        <h4>Environment Settings</h4>
+        <div class="param-row"><span>Players per side</span><strong>{{ gameState.players_per_side ?? userIds.length }}</strong></div>
+        <div class="param-row"><span>Court dimensions</span><strong>{{ gameState.court_width }}×{{ gameState.court_height }}</strong></div>
+        <div class="param-row"><span>Ball holder</span><strong>Player {{ formatValue(gameState.ball_holder) }}</strong></div>
+        <div class="param-row"><span>Shot clock</span><strong>{{ gameState.shot_clock }}</strong></div>
+        <div class="param-row"><span>Min shot clock at reset</span><strong>{{ formatValue(gameState.min_shot_clock) }}</strong></div>
+        <div class="param-row"><span>Three-point distance</span><strong>{{ formatValue(gameState.three_point_distance) }}</strong></div>
+        <div class="param-row"><span>Three-point short distance</span><strong>{{ formatValue(gameState.three_point_short_distance) }}</strong></div>
+      </article>
+
+      <article class="env-card">
+        <h4>Policies</h4>
+        <div class="param-row"><span>Run ID</span><strong class="mono">{{ formatValue(gameState.run_id) }}</strong></div>
+        <div class="param-row"><span>Unified policy</span><strong class="mono">{{ formatValue(gameState.unified_policy_name) }}</strong></div>
+        <div class="param-row"><span>Pass mode</span><strong>{{ formatValue(gameState.pass_mode) }}</strong></div>
+        <div class="param-row"><span>Pass target strategy</span><strong>{{ formatValue(gameState.pass_target_strategy) }}</strong></div>
+        <div class="param-row"><span>Illegal action policy</span><strong>{{ formatValue(gameState.illegal_action_policy) }}</strong></div>
+      </article>
+
+      <article class="env-card">
+        <h4>Shot Parameters</h4>
+        <div class="param-row"><span>Layup μ</span><strong>{{ formatPercent(gameState.shot_params?.layup_pct) }}</strong></div>
+        <div class="param-row"><span>Layup σ</span><strong>{{ formatPercent(gameState.shot_params?.layup_std) }}</strong></div>
+        <div class="param-row"><span>Three-point μ</span><strong>{{ formatPercent(gameState.shot_params?.three_pt_pct) }}</strong></div>
+        <div class="param-row"><span>Three-point σ</span><strong>{{ formatPercent(gameState.shot_params?.three_pt_std) }}</strong></div>
+        <div class="param-row"><span>Dunk μ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_pct) }}</strong></div>
+        <div class="param-row"><span>Dunk σ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_std) }}</strong></div>
+        <div class="param-row"><span>Dunks allowed</span><strong>{{ gameState.shot_params?.allow_dunks ? 'Yes' : 'No' }}</strong></div>
       </article>
     </div>
   </section>
