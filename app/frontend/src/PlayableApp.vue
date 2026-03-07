@@ -4,7 +4,9 @@ import GameBoard from './components/GameBoard.vue';
 import PlayableControls from './components/PlayableControls.vue';
 import PlayableStatsPanel from './components/PlayableStatsPanel.vue';
 import PlayableEnvironmentInfo from './components/PlayableEnvironmentInfo.vue';
+import TutorialOverlay from './components/TutorialOverlay.vue';
 import basketworldLogo from './assets/basketworld-logo.jpg';
+import { playableTutorialSteps } from './tutorials/playableTutorial';
 import {
   getPlayableOptions,
   newPlayableGame,
@@ -62,6 +64,14 @@ const transitionRunning = ref(false);
 const forceGameOverPreview = ref(false);
 const violationOverlayPreview = ref(null);
 const passChordPPressed = ref(false);
+const tutorialActive = ref(false);
+const tutorialStepIndex = ref(0);
+const tutorialTurnSubmissionCount = ref(0);
+const tutorialRulesModalSeen = ref(false);
+const tutorialCompleted = ref(false);
+const tutorialAutoAdvanceHandle = ref(null);
+const tutorialStorageKey = 'basketworld.playable.tutorial.v1.completed';
+const rulesModalOpen = ref(false);
 const periodModeLabelMap = {
   period: '1 period',
   halves: '2 halves',
@@ -146,6 +156,8 @@ const MOVE_HOTKEY_ACTIONS_BY_CODE = {
   KeyC: 'MOVE_SE',
   KeyS: 'SHOOT',
 };
+
+const tutorialSteps = playableTutorialSteps;
 
 const PLAYABLE_SURNAME_POOL = [
   'Smith', 'Jones', 'Brown', 'Davis', 'Miller', 'Wilson', 'Moore', 'Taylor',
@@ -783,6 +795,36 @@ function getStepResults(payload) {
   return null;
 }
 
+function getSuccessfulUserPassReceiverId(payload, fallbackUserIds = null) {
+  const stepResults = getStepResults(payload);
+  if (!stepResults || typeof stepResults !== 'object') return null;
+  const passes = stepResults?.passes && typeof stepResults.passes === 'object' ? stepResults.passes : {};
+  if (!passes || Object.keys(passes).length === 0) return null;
+
+  const payloadUserIds = Array.isArray(payload?.state?.playable_user_ids)
+    ? payload.state.playable_user_ids
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v))
+    : [];
+  const fallbackIds = fallbackUserIds instanceof Set
+    ? Array.from(fallbackUserIds)
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v))
+    : [];
+  const userIdSet = new Set(payloadUserIds.length > 0 ? payloadUserIds : fallbackIds);
+
+  for (const [passerRaw, passRaw] of Object.entries(passes)) {
+    const passInfo = passRaw && typeof passRaw === 'object' ? passRaw : {};
+    if (!Boolean(passInfo.success)) continue;
+    const passerId = Number(passerRaw);
+    const targetId = Number(passInfo.target);
+    if (!Number.isFinite(passerId) || !Number.isFinite(targetId)) continue;
+    if (userIdSet.size > 0 && (!userIdSet.has(passerId) || !userIdSet.has(targetId))) continue;
+    return targetId;
+  }
+  return null;
+}
+
 function nextPlayByPlayEntry(base = {}) {
   return {
     id: playByPlayEventCounter.value++,
@@ -1066,6 +1108,222 @@ const aiPlayerIds = computed(() => {
   const players = Number(sessionConfig.value?.players_per_side || selectedPlayersPerSide.value || 0);
   return Array.from({ length: Math.max(0, players) }, (_, idx) => idx + players);
 });
+
+const tutorialSelectedActionCount = computed(() => {
+  const selections = boardSelections.value && typeof boardSelections.value === 'object'
+    ? boardSelections.value
+    : {};
+  const userIds = Array.isArray(userPlayerIds.value) ? userPlayerIds.value : [];
+  let count = 0;
+  for (const pid of userIds) {
+    const value = selections[pid] ?? selections[String(pid)];
+    if (typeof value === 'string' && value.trim().length > 0) {
+      count += 1;
+    }
+  }
+  return count;
+});
+
+const tutorialCurrentStep = computed(() => {
+  if (!tutorialActive.value) return null;
+  return tutorialSteps[tutorialStepIndex.value] || null;
+});
+
+const tutorialPredicateValues = computed(() => ({
+  has_game: Boolean(hasGame.value),
+  rules_modal_open: Boolean(rulesModalOpen.value || tutorialRulesModalSeen.value),
+  active_player_zero: Number(activePlayerId.value) === 0,
+  all_actions_selected: (
+    Array.isArray(userPlayerIds.value)
+    && userPlayerIds.value.length > 0
+    && tutorialSelectedActionCount.value >= userPlayerIds.value.length
+  ),
+  turn_submitted: Number(tutorialTurnSubmissionCount.value) > 0,
+}));
+
+const tutorialCurrentStepSatisfied = computed(() => {
+  const step = tutorialCurrentStep.value;
+  if (!step || !step.completeWhen || step.completeWhen === 'manual') return false;
+  return Boolean(tutorialPredicateValues.value[step.completeWhen]);
+});
+
+const tutorialCanGoBack = computed(() => tutorialActive.value && tutorialStepIndex.value > 0);
+const tutorialCanAdvance = computed(() => {
+  const step = tutorialCurrentStep.value;
+  if (!step) return false;
+  if (!step.completeWhen || step.completeWhen === 'manual') return true;
+  return tutorialCurrentStepSatisfied.value;
+});
+
+const tutorialStatusText = computed(() => {
+  const step = tutorialCurrentStep.value;
+  if (!step) return '';
+  if (!step.completeWhen || step.completeWhen === 'manual') return 'Use Next when you are ready.';
+  if (!hasGame.value && step.completeWhen !== 'has_game') {
+    return 'Start a game first to continue this step.';
+  }
+  return tutorialCurrentStepSatisfied.value ? 'Step complete. Click Next to continue.' : 'Complete the highlighted step.';
+});
+
+function formatRulePercent(value, digits = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 'N/A';
+  return `${(parsed * 100).toFixed(digits)}%`;
+}
+
+function formatRuleNumber(value, digits = 2) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 'N/A';
+  return parsed.toFixed(digits);
+}
+
+const rulesSummary = computed(() => {
+  const gs = gameState.value || {};
+  const shootingParams = gs.shooting_params && typeof gs.shooting_params === 'object'
+    ? gs.shooting_params
+    : {};
+  const shotClockSeconds = Math.max(1, Number(gs.shot_clock_steps ?? gs.shot_clock ?? 24));
+  const laneStepLimit = Math.max(1, Number(gs.three_second_max_steps ?? 3));
+  const pressureDistance = Math.max(0, Number(gs.defender_pressure_distance ?? 1));
+  const pressureBase = Number(gs.defender_pressure_turnover_chance ?? 0.05);
+  const pressureDecay = Number(gs.defender_pressure_decay_lambda ?? 1.0);
+  const passBaseSteal = Number(gs.base_steal_rate ?? 0.35);
+  const passPerpDecay = Number(gs.steal_perp_decay ?? 1.5);
+  const passDistanceFactor = Number(gs.steal_distance_factor ?? 0.08);
+  const passPositionWeightMin = Number(gs.steal_position_weight_min ?? 0.3);
+  const passOobTurnover = Number(gs.pass_oob_turnover_prob ?? 1.0);
+  const passMode = String(gs.pass_mode || 'directional').toLowerCase();
+  const passTargetStrategyRaw = String(gs.pass_target_strategy || 'nearest').toLowerCase();
+  const passTargetStrategy = passMode === 'pointer_targeted' ? 'explicit_target' : passTargetStrategyRaw;
+  const usesOutOfBoundsPassTurnovers = passMode !== 'pointer_targeted';
+  const defenderGuardDistance = Math.max(0, Number(gs.defender_guard_distance ?? 1));
+  const illegalDefenseEnabled = Boolean(gs.illegal_defense_enabled ?? false);
+  const offensiveThreeSecondsEnabled = Boolean(gs.offensive_three_seconds_enabled ?? false);
+  const layupMean = Number(shootingParams.layup_pct ?? 0);
+  const threePtMean = Number(shootingParams.three_pt_pct ?? 0);
+  const dunkMean = Number(shootingParams.dunk_pct ?? 0);
+  const layupStd = Number(shootingParams.layup_std ?? 0);
+  const threePtStd = Number(shootingParams.three_pt_std ?? 0);
+  const dunkStd = Number(shootingParams.dunk_std ?? 0);
+  const allowDunks = Boolean(shootingParams.allow_dunks ?? false);
+  const threePointDistance = Number(gs.three_point_distance ?? 4);
+  const threePointBlendEndDistance = threePointDistance + 1.0;
+  const threePtExtraHexDecay = Number(gs.three_pt_extra_hex_decay ?? 0.05);
+  const shotPressureEnabled = Boolean(gs.shot_pressure_enabled ?? true);
+  const shotPressureMax = Number(gs.shot_pressure_max ?? 0.5);
+  const shotPressureLambda = Number(gs.shot_pressure_lambda ?? 1.0);
+  const shotPressureArcDegrees = Number(gs.shot_pressure_arc_degrees ?? 60.0);
+  const users = Number(gs.players_per_side ?? selectedPlayersPerSide.value ?? 1);
+  return {
+    users,
+    shotClockSeconds,
+    laneStepLimit,
+    pressureDistance,
+    pressureBase,
+    pressureDecay,
+    passBaseSteal,
+    passPerpDecay,
+    passDistanceFactor,
+    passPositionWeightMin,
+    passOobTurnover,
+    passMode,
+    passTargetStrategy,
+    usesOutOfBoundsPassTurnovers,
+    defenderGuardDistance,
+    illegalDefenseEnabled,
+    offensiveThreeSecondsEnabled,
+    layupMean,
+    threePtMean,
+    dunkMean,
+    layupStd,
+    threePtStd,
+    dunkStd,
+    allowDunks,
+    threePointDistance,
+    threePointBlendEndDistance,
+    threePtExtraHexDecay,
+    shotPressureEnabled,
+    shotPressureMax,
+    shotPressureLambda,
+    shotPressureArcDegrees,
+  };
+});
+
+function clearTutorialAutoAdvanceTimer() {
+  if (tutorialAutoAdvanceHandle.value) {
+    clearTimeout(tutorialAutoAdvanceHandle.value);
+    tutorialAutoAdvanceHandle.value = null;
+  }
+}
+
+function openRulesModal() {
+  if (!hasGame.value) return;
+  if (tutorialActive.value) {
+    tutorialRulesModalSeen.value = true;
+  }
+  rulesModalOpen.value = true;
+}
+
+function closeRulesModal() {
+  rulesModalOpen.value = false;
+}
+
+function loadTutorialCompletionFlag() {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(tutorialStorageKey) === '1';
+}
+
+function persistTutorialCompletionFlag(done) {
+  if (typeof window === 'undefined') return;
+  if (done) {
+    window.localStorage.setItem(tutorialStorageKey, '1');
+  } else {
+    window.localStorage.removeItem(tutorialStorageKey);
+  }
+}
+
+function startTutorial() {
+  clearTutorialAutoAdvanceTimer();
+  tutorialActive.value = true;
+  tutorialStepIndex.value = 0;
+  tutorialTurnSubmissionCount.value = 0;
+  tutorialRulesModalSeen.value = false;
+}
+
+function endTutorial(markComplete = false) {
+  clearTutorialAutoAdvanceTimer();
+  tutorialActive.value = false;
+  if (markComplete) {
+    tutorialCompleted.value = true;
+    persistTutorialCompletionFlag(true);
+  }
+}
+
+function nextTutorialStep() {
+  if (!tutorialActive.value) return;
+  if (tutorialStepIndex.value >= tutorialSteps.length - 1) {
+    endTutorial(true);
+    return;
+  }
+  tutorialStepIndex.value = Math.min(tutorialSteps.length - 1, tutorialStepIndex.value + 1);
+}
+
+function previousTutorialStep() {
+  if (!tutorialActive.value) return;
+  tutorialStepIndex.value = Math.max(0, tutorialStepIndex.value - 1);
+}
+
+function skipTutorial() {
+  endTutorial(false);
+}
+
+function toggleTutorial() {
+  if (tutorialActive.value) {
+    skipTutorial();
+    return;
+  }
+  startTutorial();
+}
 
 function laneStepValueForPlayer(stepMap, playerId) {
   if (!stepMap || typeof stepMap !== 'object') return 0;
@@ -1402,6 +1660,7 @@ async function onStartGame() {
   if (!canStartGame.value) return;
   actionLoading.value = true;
   error.value = '';
+  tutorialTurnSubmissionCount.value = 0;
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
   violationOverlayPreview.value = null;
@@ -1431,6 +1690,7 @@ async function onNewGame() {
   if (!hasGame.value || actionLoading.value) return;
   actionLoading.value = true;
   error.value = '';
+  tutorialTurnSubmissionCount.value = 0;
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
   violationOverlayPreview.value = null;
@@ -1455,6 +1715,7 @@ function onResetSetup() {
   if (actionLoading.value || transitionRunning.value) return;
 
   error.value = '';
+  tutorialTurnSubmissionCount.value = 0;
   lastPossessionResult.value = null;
   forceGameOverPreview.value = false;
   violationOverlayPreview.value = null;
@@ -1498,6 +1759,8 @@ async function onActionsSubmitted(actions) {
     const userOnOffense = Boolean(possession.value?.user_on_offense);
 
     const payload = await stepPlayableGame(actions || {});
+    const successfulUserPassReceiverId = getSuccessfulUserPassReceiverId(payload, userIds);
+    tutorialTurnSubmissionCount.value = Number(tutorialTurnSubmissionCount.value || 0) + 1;
     recordPlayableStepStats(payload, { userIds, aiIds, userOnOffense });
     recordPlayableStepPlayByPlay(payload, { userIds, aiIds, userOnOffense });
     const possessionEnded = Boolean(payload?.possession_ended);
@@ -1527,12 +1790,32 @@ async function onActionsSubmitted(actions) {
       boardSelections.value = buildBoardSelectionActions(payload?.actions_taken, payload?.actions_taken_meta);
       await sleep(1125);
       applyStatePayload(payload);
+      if (Number.isFinite(successfulUserPassReceiverId)) {
+        const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
+          ? gameState.value.playable_user_ids
+            .map((v) => Number(v))
+            .filter((v) => Number.isFinite(v))
+          : [];
+        if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
+          activePlayerId.value = Number(successfulUserPassReceiverId);
+        }
+      }
       boardSelections.value = {};
       transitionRunning.value = false;
       return;
     }
 
     applyStatePayload(payload);
+    if (Number.isFinite(successfulUserPassReceiverId)) {
+      const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
+        ? gameState.value.playable_user_ids
+          .map((v) => Number(v))
+          .filter((v) => Number.isFinite(v))
+        : [];
+      if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
+        activePlayerId.value = Number(successfulUserPassReceiverId);
+      }
+    }
     boardSelections.value = {};
   } catch (err) {
     error.value = err?.message || 'Failed to process turn.';
@@ -1590,6 +1873,13 @@ function onGlobalKeydown(event) {
   if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
   if (event?.target?.isContentEditable) return;
   const key = String(event?.key || '').toLowerCase();
+  if (rulesModalOpen.value) {
+    if (key === 'escape') {
+      closeRulesModal();
+      event.preventDefault();
+    }
+    return;
+  }
   if (key === 'arrowleft') {
     const handled = cycleActivePlayer(-1);
     if (handled) {
@@ -1679,6 +1969,7 @@ onMounted(() => {
   window.addEventListener('keydown', onGlobalKeydown);
   window.addEventListener('keyup', onGlobalKeyup);
   window.addEventListener('blur', onWindowBlur);
+  tutorialCompleted.value = loadTutorialCompletionFlag();
   loadOptions();
 });
 
@@ -1686,6 +1977,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKeydown);
   window.removeEventListener('keyup', onGlobalKeyup);
   window.removeEventListener('blur', onWindowBlur);
+  clearTutorialAutoAdvanceTimer();
 });
 </script>
 
@@ -1743,12 +2035,22 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div class="setup-actions">
-        <button :disabled="!canStartGame" @click="onStartGame">
+      <div class="setup-actions" data-tutorial-id="setup-actions">
+        <button data-tutorial-id="setup-start-game-btn" :disabled="!canStartGame" @click="onStartGame">
           {{ actionLoading ? 'Loading...' : 'Start Game' }}
         </button>
         <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onNewGame">New Game</button>
         <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onResetSetup">Reset</button>
+        <button :disabled="actionLoading || transitionRunning" @click="toggleTutorial">
+          {{ tutorialActive ? 'Exit Tutorial' : (tutorialCompleted ? 'Replay Tutorial' : 'Tutorial') }}
+        </button>
+        <button
+          data-tutorial-id="setup-rules-physics-btn"
+          :disabled="!hasGame || actionLoading || transitionRunning"
+          @click="openRulesModal"
+        >
+          Rules & Physics
+        </button>
         <button
           v-if="isDevBuild && hasGame && !isGameOver"
           :disabled="actionLoading || transitionRunning"
@@ -1786,7 +2088,7 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-if="hasGame" class="playable-layout">
-      <div class="playable-scoreboard" aria-label="Scoreboard">
+      <div class="playable-scoreboard" data-tutorial-id="playable-scoreboard" aria-label="Scoreboard">
         <div class="score-side score-side-you">
           <div class="score-lane-meter score-lane-meter-left" :title="userLaneMeter.title">
             <span class="score-lane-role">{{ userLaneMeter.role }}</span>
@@ -1890,6 +2192,89 @@ onBeforeUnmount(() => {
     <section v-else class="empty-state">
       <p>Choose a players-per-side and available difficulty, then start a game.</p>
     </section>
+
+    <TutorialOverlay
+      :active="tutorialActive"
+      :step="tutorialCurrentStep"
+      :step-index="tutorialStepIndex"
+      :total-steps="tutorialSteps.length"
+      :can-go-back="tutorialCanGoBack"
+      :can-advance="tutorialCanAdvance"
+      :status-text="tutorialStatusText"
+      @next="nextTutorialStep"
+      @back="previousTutorialStep"
+      @skip="skipTutorial"
+    />
+
+    <Teleport to="body">
+      <div v-if="rulesModalOpen" class="rules-modal-overlay" @click="closeRulesModal">
+        <section class="rules-modal" role="dialog" aria-modal="true" aria-label="Rules and physics" @click.stop>
+          <header class="rules-modal-header">
+            <h3>Rules & Physics</h3>
+            <button class="rules-modal-close" @click="closeRulesModal">Close</button>
+          </header>
+
+          <div class="rules-modal-body">
+            <h4>Game Rules</h4>
+            <ul>
+              <li>You (Blue) play against AI (Red) in {{ rulesSummary.users }}v{{ rulesSummary.users }}.</li>
+              <li>Turns are simultaneous: both teams choose actions before the step resolves.</li>
+              <li>Shot clock is fixed at {{ rulesSummary.shotClockSeconds }} seconds each possession.</li>
+              <li>Possession ends on any shot attempt, turnover, or lane violation.</li>
+              <li>Possession alternates after each possession with random respawn for the next possession.</li>
+              <li>Scoring is standard shot value (2PT/3PT, with dunks counted as 2) plus 1 point for a defensive lane violation.</li>
+              <li>Lane-step counters reset when a player leaves the lane and on each new possession reset.</li>
+              <li v-if="rulesSummary.offensiveThreeSecondsEnabled">
+                Offensive lane: non-ball handlers violate at <code>steps >= {{ rulesSummary.laneStepLimit }}</code>; the ball handler only violates if still in-lane after the limit and not shooting that step.
+              </li>
+              <li v-else>Offensive lane violations are disabled in the current configuration.</li>
+              <li v-if="rulesSummary.illegalDefenseEnabled">
+                Defensive lane: checked only on non-shot steps; defender counter resets when leaving lane or when actively guarding offense (distance ≤ {{ rulesSummary.defenderGuardDistance }}). Violation triggers at <code>steps > {{ rulesSummary.laneStepLimit }}</code>.
+              </li>
+              <li v-else>Defensive lane violations are disabled in the current configuration.</li>
+            </ul>
+
+            <h4>Turnover Pressure Model</h4>
+            <ul>
+              <li>Defender-pressure checks consider defenders within distance ≤ {{ rulesSummary.pressureDistance }} in front of the ball handler.</li>
+              <li>Per-defender turnover probability starts at {{ formatRulePercent(rulesSummary.pressureBase, 1) }} and decays exponentially with distance.</li>
+              <li>Decay uses lambda = {{ formatRuleNumber(rulesSummary.pressureDecay, 2) }} in <code>p = base * exp(-lambda * max(0, d - 1))</code>.</li>
+              <li>Combined pressure is computed as <code>1 - Π(1 - p_i)</code> across applicable defenders.</li>
+            </ul>
+
+            <h4>Passing / Interception Model</h4>
+            <ul>
+              <li>Pass mode: <code>{{ rulesSummary.passMode }}</code>.</li>
+              <li v-if="rulesSummary.passMode === 'pointer_targeted'">
+                Pointer-targeted passing uses an explicit teammate ID; directional strategies such as <code>nearest</code> or <code>best_ev</code> are not used.
+              </li>
+              <li v-else>Directional pass target strategy: <code>{{ rulesSummary.passTargetStrategy }}</code>.</li>
+              <li>Base pass interception rate: {{ formatRulePercent(rulesSummary.passBaseSteal, 1) }}.</li>
+              <li>Interception scaling: perpendicular decay {{ formatRuleNumber(rulesSummary.passPerpDecay, 2) }}, distance factor {{ formatRuleNumber(rulesSummary.passDistanceFactor, 3) }}, min position weight {{ formatRuleNumber(rulesSummary.passPositionWeightMin, 2) }}.</li>
+              <li v-if="rulesSummary.usesOutOfBoundsPassTurnovers">
+                If no in-arc teammate is available, out-of-bounds pass turnover probability is {{ formatRulePercent(rulesSummary.passOobTurnover, 0) }}.
+              </li>
+              <li v-else>Out-of-bounds pass turnovers are not used in pointer-targeted mode.</li>
+            </ul>
+
+            <h4>Shooting Skills & EV</h4>
+            <ul>
+              <li>
+                At game start, each side samples per-player layup/3PT/dunk skills once from truncated normals (means: {{ formatRulePercent(rulesSummary.layupMean, 1) }} / {{ formatRulePercent(rulesSummary.threePtMean, 1) }} / {{ formatRulePercent(rulesSummary.dunkMean, 1) }}, std: {{ formatRulePercent(rulesSummary.layupStd, 1) }} / {{ formatRulePercent(rulesSummary.threePtStd, 1) }} / {{ formatRulePercent(rulesSummary.dunkStd, 1) }}).
+              </li>
+              <li>Those sampled skill sets stay fixed for the game and are reused whenever that side is on offense.</li>
+              <li>Base shot make probability uses layup% at distance ≤ 1, then linearly blends toward 3PT% through distance {{ formatRuleNumber(rulesSummary.threePointBlendEndDistance, 1) }}.</li>
+              <li>Beyond that range, probability drops by {{ formatRulePercent(rulesSummary.threePtExtraHexDecay, 1) }} per extra hex; dunks (distance 0) use dunk% when enabled: <code>{{ rulesSummary.allowDunks ? 'true' : 'false' }}</code>.</li>
+              <li v-if="rulesSummary.shotPressureEnabled">
+                Final make probability = base probability × shot-pressure multiplier (max reduction {{ formatRulePercent(rulesSummary.shotPressureMax, 1) }}, lambda {{ formatRuleNumber(rulesSummary.shotPressureLambda, 2) }}, arc {{ formatRuleNumber(rulesSummary.shotPressureArcDegrees, 0) }}°).
+              </li>
+              <li v-else>Shot-pressure adjustment is disabled, so final make probability equals base make probability.</li>
+              <li>Displayed EV uses <code>shot value × final make probability</code>, where shot value is 2 (layup/dunk) or 3 (3PT).</li>
+            </ul>
+          </div>
+        </section>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1993,6 +2378,84 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+.rules-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 88;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: clamp(4.75rem, 11vh, 8.5rem) 1rem 1.25rem;
+  overflow-y: auto;
+  background: rgba(2, 6, 23, 0.5);
+}
+
+.rules-modal {
+  width: min(880px, 96vw);
+  max-height: min(84vh, 900px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  border: 1px solid var(--app-accent-strong);
+  background: rgba(10, 14, 26, 0.97);
+  box-shadow: 0 20px 42px rgba(2, 6, 23, 0.65);
+}
+
+.rules-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.rules-modal-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--app-accent);
+}
+
+.rules-modal-close {
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: transparent;
+  color: var(--app-text);
+  padding: 0.32rem 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+}
+
+.rules-modal-body {
+  padding: 0.8rem 1rem 0.95rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  color: var(--app-text);
+}
+
+.rules-modal-body h4 {
+  margin: 0.2rem 0 0;
+  color: #7dd3fc;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.78rem;
+}
+
+.rules-modal-body ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.33rem;
+  font-size: 0.86rem;
+  line-height: 1.35;
 }
 
 .status-row {

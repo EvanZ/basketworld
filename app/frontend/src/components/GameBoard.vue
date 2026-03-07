@@ -1697,6 +1697,15 @@ function getBallPressureMeterPath(player) {
   return `M ${x} ${y - r} A ${r} ${r} 0 0 1 ${x} ${y + r}`;
 }
 
+function getBallPressureSeamPath(player) {
+  const center = getPlayerRenderCenter(player);
+  const r = HEX_RADIUS * 0.9;
+  const x = Number(center.x || 0);
+  const y = Number(center.y || 0);
+  // Left-side seam from 6 -> 12 o'clock (opposite the TO meter arc).
+  return `M ${x} ${y + r} A ${r} ${r} 0 0 1 ${x} ${y - r}`;
+}
+
 function getBallPressureMeterStyle() {
   const meter = ballHandlerTurnoverPressureMeter.value;
   const r = HEX_RADIUS * 0.9;
@@ -2552,28 +2561,63 @@ watch(
       return;
     }
 
-    const passes = state.last_action_results?.passes;
-    if (!passes || Object.keys(passes).length === 0) {
+    const actionResults = state.last_action_results;
+    if (!actionResults || typeof actionResults !== 'object') {
       clearPassFlash();
       return;
     }
+    const passes = actionResults?.passes && typeof actionResults.passes === 'object'
+      ? actionResults.passes
+      : {};
 
-    let successfulPass = null;
+    let passAnimation = null;
     for (const [passerId, passResult] of Object.entries(passes)) {
       const targetId = Number(passResult?.target);
       if (passResult && passResult.success && Number.isFinite(targetId)) {
-        successfulPass = { passerId: Number(passerId), receiverId: targetId };
+        passAnimation = { passerId: Number(passerId), receiverId: targetId };
         break;
       }
     }
 
-    if (!successfulPass) {
+    // If pass was intercepted, animate the ball path to the stealing defender.
+    if (!passAnimation) {
+      const turnovers = Array.isArray(actionResults?.turnovers)
+        ? actionResults.turnovers
+        : [];
+      const stealTurnover = turnovers.find((turnover) => {
+        if (!turnover || typeof turnover !== 'object') return false;
+        const reason = String(turnover.reason || '').toLowerCase();
+        if (reason !== 'steal') return false;
+        return Number.isFinite(Number(turnover.player_id)) && Number.isFinite(Number(turnover.stolen_by));
+      });
+      if (stealTurnover) {
+        passAnimation = {
+          passerId: Number(stealTurnover.player_id),
+          receiverId: Number(stealTurnover.stolen_by),
+        };
+      }
+    }
+
+    // Extra fallback: some payloads may encode intercepted passes in the pass record itself.
+    if (!passAnimation) {
+      for (const [passerId, passResult] of Object.entries(passes)) {
+        if (!passResult || typeof passResult !== 'object') continue;
+        const turnoverFlag = Boolean(passResult.turnover) || String(passResult.reason || '').toLowerCase() === 'steal';
+        const stolenBy = Number(passResult.stolen_by);
+        if (turnoverFlag && Number.isFinite(stolenBy)) {
+          passAnimation = { passerId: Number(passerId), receiverId: stolenBy };
+          break;
+        }
+      }
+    }
+
+    if (!passAnimation) {
       clearPassFlash();
       return;
     }
 
-    const passerPos = state.positions?.[successfulPass.passerId];
-    const receiverPos = state.positions?.[successfulPass.receiverId];
+    const passerPos = state.positions?.[passAnimation.passerId];
+    const receiverPos = state.positions?.[passAnimation.receiverId];
     if (!passerPos || !receiverPos) {
       clearPassFlash();
       return;
@@ -2581,7 +2625,7 @@ watch(
 
     const start = axialToCartesian(passerPos[0], passerPos[1]);
     const end = axialToCartesian(receiverPos[0], receiverPos[1]);
-    triggerPassFlash(successfulPass.passerId, successfulPass.receiverId, start, end);
+    triggerPassFlash(passAnimation.passerId, passAnimation.receiverId, start, end);
   },
   { immediate: true }
 );
@@ -3382,6 +3426,10 @@ onBeforeUnmount(() => {
               style="pointer-events: none;"
             >
               <template v-if="minimalChrome">
+                <path
+                  :d="getBallPressureSeamPath(player)"
+                  class="ball-pressure-meter-seam"
+                />
                 <path
                   :d="getBallPressureMeterPath(player)"
                   class="ball-pressure-meter-track"
@@ -4274,6 +4322,13 @@ onBeforeUnmount(() => {
   stroke: rgba(148, 163, 184, 0.45);
   stroke-width: 0.25rem;
   stroke-linecap: round;
+}
+.ball-pressure-meter-seam {
+  fill: none;
+  stroke: orangered;
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+  stroke-dasharray: 3 6;
 }
 .ball-pressure-meter-fill {
   fill: none;

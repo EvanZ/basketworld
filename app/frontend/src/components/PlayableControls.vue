@@ -480,10 +480,11 @@ defineExpose({
     <div class="controls-pane">
       <h3>Turn Controls</h3>
 
-      <div class="player-tabs">
+      <div class="player-tabs" data-tutorial-id="controls-player-tabs">
         <button
           v-for="pid in orderedUserPlayerIds"
           :key="`user-tab-${pid}`"
+          :data-tutorial-id="Number(pid) === 0 ? 'controls-player-zero-btn' : null"
           class="player-tab"
           :class="{ active: Number(activePlayerId) === Number(pid) }"
           :disabled="disabled"
@@ -525,7 +526,7 @@ defineExpose({
           <p class="ai-hints-note">Role: {{ activePolicyHintRow?.roleLabel || 'Offense' }}</p>
         </div>
 
-        <div class="control-pad-wrap">
+        <div class="control-pad-wrap" data-tutorial-id="controls-action-pad">
           <HexagonControlPad
             :legal-actions="getControlPadLegalActions(activePlayer)"
             :selected-action="selectedActions[activePlayer]?.startsWith('PASS->') ? '' : (selectedActions[activePlayer] || '')"
@@ -571,7 +572,12 @@ defineExpose({
         </div>
       </div>
 
-      <button class="submit-btn" :disabled="!canSubmit" @click="submitActions">
+      <button
+        class="submit-btn"
+        data-tutorial-id="controls-submit-turn"
+        :disabled="!canSubmit"
+        @click="submitActions"
+      >
         Submit Turn
       </button>
       <KeyboardLegend
