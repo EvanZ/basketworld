@@ -216,21 +216,6 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
       </article>
 
       <article class="env-card">
-        <h4>Pass & Action Policy</h4>
-        <div class="param-row"><span>Pass arc degrees</span><strong>{{ formatValue(gameState.pass_arc_degrees) }}°</strong></div>
-        <div class="param-row"><span>Pass target strategy</span><strong>{{ formatValue(gameState.pass_target_strategy) }}</strong></div>
-        <div class="param-row"><span>Pass OOB turnover prob</span><strong>{{ formatPercent(gameState.pass_oob_turnover_prob, 0) }}</strong></div>
-        <div class="param-row"><span>Pass logit bias</span><strong>{{ formatValue(gameState.pass_logit_bias) }}</strong></div>
-      </article>
-
-      <article class="env-card">
-        <h4>Team Configuration</h4>
-        <div class="param-row"><span>User team</span><strong>{{ formatValue(gameState.user_team_name) }}</strong></div>
-        <div class="param-row"><span>Offense IDs</span><strong>{{ Array.isArray(gameState.offense_ids) ? gameState.offense_ids.join(', ') : 'N/A' }}</strong></div>
-        <div class="param-row"><span>Defense IDs</span><strong>{{ Array.isArray(gameState.defense_ids) ? gameState.defense_ids.join(', ') : 'N/A' }}</strong></div>
-      </article>
-
-      <article class="env-card">
         <h4>3-Second Violation Rules</h4>
         <div class="param-row"><span>Lane width</span><strong>{{ formatValue(gameState.three_second_lane_width) }}</strong></div>
         <div class="param-row"><span>Lane height</span><strong>{{ formatValue(gameState.three_second_lane_height) }}</strong></div>
