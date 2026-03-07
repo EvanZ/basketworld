@@ -106,6 +106,9 @@ const policyHintRows = computed(() => {
     const probs = policyMap[String(pid)] ?? policyMap[pid];
     const playerMask = Array.isArray(actionMask?.[pid]) ? actionMask[pid] : null;
     const ranked = [];
+    const pointerTargets = isPointerPassMode.value ? getPointerPassTeammatesForPlayer(pid) : [];
+    let pointerPassProbSum = 0;
+    let pointerBestPass = { prob: -1, targetId: null };
 
     if (Array.isArray(probs)) {
       const bound = Math.min(probs.length, ACTION_NAMES.length);
@@ -113,12 +116,35 @@ const policyHintRows = computed(() => {
         if (playerMask && Number(playerMask[idx]) !== 1) continue;
         const prob = Number(probs[idx]);
         if (!Number.isFinite(prob) || prob <= 0) continue;
+        const actionName = ACTION_NAMES[idx];
+        const isPassAction = String(actionName).startsWith('PASS_');
+        if (isPointerPassMode.value && isPassAction) {
+          pointerPassProbSum += prob;
+          const slotIdx = idx - 8; // PASS_E..PASS_SE map to slot 0..5
+          const mappedTarget = Number(pointerTargets?.[slotIdx]);
+          const targetId = Number.isFinite(mappedTarget) ? mappedTarget : null;
+          if (prob > pointerBestPass.prob) {
+            pointerBestPass = { prob, targetId };
+          }
+          continue;
+        }
         ranked.push({
           key: `policy-hint-${pid}-${idx}`,
-          action: ACTION_NAMES[idx],
+          action: actionName,
           prob,
         });
       }
+    }
+
+    if (isPointerPassMode.value && pointerPassProbSum > 0) {
+      const actionLabel = Number.isFinite(Number(pointerBestPass.targetId))
+        ? `PASS->${formatPlayerNameWithId(pointerBestPass.targetId)}`
+        : 'PASS';
+      ranked.push({
+        key: `policy-hint-${pid}-pass-any`,
+        action: actionLabel,
+        prob: pointerPassProbSum,
+      });
     }
 
     ranked.sort((a, b) => b.prob - a.prob);
