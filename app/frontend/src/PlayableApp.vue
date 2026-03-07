@@ -1989,6 +1989,37 @@ onBeforeUnmount(() => {
         <h1>Basketworld</h1>
         <p>Human vs AI with alternating possessions and live score tracking.</p>
       </div>
+      <nav class="header-socials" aria-label="BasketWorld socials">
+        <a class="social-link" href="https://github.com/EvanZ/basketworld" target="_blank" rel="noopener noreferrer">
+          <svg class="social-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill-rule="evenodd"
+              clip-rule="evenodd"
+              d="M12 0.0517578C5.3724 0.0517578 0 5.43256 0 12.0722C0 17.3822 3.438 21.8882 8.2068 23.477C8.8068 23.5874 9.0252 23.2166 9.0252 22.8974C9.0252 22.613 9.0156 21.8558 9.0096 20.8538C5.6712 21.5798 4.9668 19.2422 4.9668 19.2422C4.422 17.8526 3.6348 17.483 3.6348 17.483C2.5452 16.739 3.7176 16.7534 3.7176 16.7534C4.9212 16.8374 5.5548 17.9918 5.5548 17.9918C6.6252 19.8278 8.364 19.2974 9.0468 18.9902C9.1572 18.2138 9.4668 17.6846 9.81 17.3846C7.146 17.081 4.344 16.049 4.344 11.4434C4.344 10.1318 4.812 9.05776 5.5788 8.21776C5.4552 7.91416 5.0436 6.69136 5.6964 5.03776C5.6964 5.03776 6.7044 4.71376 8.9964 6.26896C9.97532 6.00197 10.9853 5.86599 12 5.86456C13.02 5.86936 14.046 6.00256 15.0048 6.26896C17.2956 4.71376 18.3012 5.03656 18.3012 5.03656C18.9564 6.69136 18.5436 7.91416 18.4212 8.21776C19.1892 9.05776 19.6548 10.1318 19.6548 11.4434C19.6548 16.061 16.848 17.0774 14.1756 17.375C14.6064 17.7458 14.9892 18.479 14.9892 19.601C14.9892 21.2066 14.9748 22.5038 14.9748 22.8974C14.9748 23.219 15.1908 23.5934 15.8004 23.4758C18.19 22.6743 20.2672 21.1421 21.7386 19.0958C23.2099 17.0495 24.001 14.5925 24 12.0722C24 5.43256 18.6264 0.0517578 12 0.0517578Z"
+            />
+          </svg>
+          <span>GitHub</span>
+        </a>
+        <a class="social-link" href="https://basketworld.substack.com" target="_blank" rel="noopener noreferrer">
+          <svg class="social-icon social-icon-substack" viewBox="0 0 20 20" aria-hidden="true">
+            <g>
+              <path d="M1.96484 0.624512H18.0354V2.70052H1.96484V0.624512Z" />
+              <path d="M1.96484 4.77655H18.0354V6.85254H1.96484V4.77655Z" />
+              <path d="M1.96484 8.92857V19.9505L10.0001 14.6347L18.0354 19.9505V8.92857H1.96484Z" />
+            </g>
+          </svg>
+          <span>Substack</span>
+        </a>
+        <a class="social-link" href="https://bsky.app/profile/evanzamir.bsky.social" target="_blank" rel="noopener noreferrer">
+          <svg class="social-icon" viewBox="0 0 64 64" aria-hidden="true">
+            <path
+              fill="#006AFF"
+              d="M13.873 3.805C21.21 9.332 29.103 20.537 32 26.55v15.882c0-.338-.13.044-.41.867-1.512 4.456-7.418 21.847-20.923 7.944-7.111-7.32-3.819-14.64 9.125-16.85-7.405 1.264-15.73-.825-18.014-9.015C1.12 23.022 0 8.51 0 6.55 0-3.268 8.579-.182 13.873 3.805ZM50.127 3.805C42.79 9.332 34.897 20.537 32 26.55v15.882c0-.338.13.044.41.867 1.512 4.456 7.418 21.847 20.923 7.944 7.111-7.32 3.819-14.64-9.125-16.85 7.405 1.264 15.73-.825 18.014-9.015C62.88 23.022 64 8.51 64 6.55c0-9.818-8.578-6.732-13.873-2.745Z"
+            />
+          </svg>
+          <span>Bluesky</span>
+        </a>
+      </nav>
     </header>
 
     <section class="setup-panel">
@@ -2287,7 +2318,7 @@ onBeforeUnmount(() => {
 
 .playable-header {
   display: flex;
-  align-items: flex-end;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
@@ -2332,6 +2363,58 @@ onBeforeUnmount(() => {
 
 .header-brand p {
   grid-column: 2;
+}
+
+.header-socials {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  justify-content: flex-end;
+  align-self: center;
+}
+
+.header-socials a {
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: linear-gradient(90deg, rgba(15, 23, 42, 0.9), rgba(30, 41, 59, 0.9));
+  color: var(--app-text);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.42rem;
+  padding: 0.34rem 0.78rem;
+  font-size: 0.74rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  transition: transform 0.15s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.header-socials a:hover,
+.header-socials a:focus-visible {
+  transform: translateY(-1px);
+  border-color: var(--app-accent-strong);
+  color: var(--app-accent);
+  box-shadow: 0 12px 25px rgba(14, 165, 233, 0.35);
+}
+
+.social-icon {
+  width: 0.95rem;
+  height: 0.95rem;
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+
+.social-icon-substack {
+  fill: rgb(255, 103, 25);
+}
+
+@media (max-width: 920px) {
+  .header-socials {
+    width: 100%;
+    justify-content: flex-start;
+    align-self: flex-start;
+  }
 }
 
 .setup-panel {
