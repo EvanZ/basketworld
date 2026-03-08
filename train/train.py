@@ -808,7 +808,7 @@ def main(args):
             unified_policy.set_env(mixed_env)
 
             # Use mixed logger (stdout + MLflow) for PPO metrics
-            unified_policy.set_logger(build_mixed_logger())
+            unified_policy.set_logger(build_mixed_logger(args))
 
             # Bump entropy at the start of each alternation
             if entropy_callback is not None and hasattr(

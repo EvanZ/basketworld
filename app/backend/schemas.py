@@ -140,3 +140,14 @@ class SetPressureParamsRequest(BaseModel):
     defender_pressure_distance: int | None = None
     defender_pressure_turnover_chance: float | None = None
     defender_pressure_decay_lambda: float | None = None
+
+
+class PlayableStartRequest(BaseModel):
+    players_per_side: int
+    difficulty: Literal["easy", "medium", "hard"]
+    period_mode: Literal["period", "halves", "quarters"] = "period"
+    period_length_minutes: int = 5
+
+
+class PlayableStepRequest(BaseModel):
+    actions: dict[str, object]

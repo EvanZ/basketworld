@@ -16,6 +16,10 @@ from app.backend.state import game_state
 router = APIRouter()
 
 
+def _is_public_mode() -> bool:
+    return str(os.getenv("BW_PUBLIC_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _decode_png_frames_and_durations(request: SaveEpisodeRequest):
     import base64
     from PIL import Image
@@ -74,6 +78,9 @@ def debug_frames():
 @router.post("/api/save_episode")
 def save_episode():
     """Saves the recorded episode frames to a GIF in ./episodes and returns the file path."""
+    if _is_public_mode():
+        raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
+
     print(f"[SAVE_EPISODE] Frames count: {len(game_state.frames)}")
     print(f"[SAVE_EPISODE] Env exists: {game_state.env is not None}")
 
@@ -155,6 +162,8 @@ def save_episode():
 @router.post("/api/save_episode_from_pngs")
 def save_episode_from_pngs(request: SaveEpisodeRequest):
     """Saves episode from base64-encoded PNG frames sent from frontend."""
+    if _is_public_mode():
+        raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
 
     base_dir = "episodes"
     if getattr(game_state, "run_id", None):
@@ -253,4 +262,3 @@ def render_gif_from_pngs(request: SaveEpisodeRequest):
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to render GIF from PNGs: {e}")
-

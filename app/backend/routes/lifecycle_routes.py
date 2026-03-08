@@ -15,6 +15,7 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_phi_shaping_params,
     get_mlflow_training_params,
 )
+from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from basketworld.utils.action_resolution import IllegalActionStrategy
@@ -49,9 +50,10 @@ router = APIRouter()
 def list_policies(request: ListPoliciesRequest):
     """Return available unified policy filenames for a run."""
     try:
-        current_uri = mlflow.get_tracking_uri()
-        if "localhost" not in current_uri:
-            mlflow.set_tracking_uri("http://localhost:5000")
+        try:
+            setup_mlflow(verbose=False)
+        except Exception as setup_err:
+            print(f"[list_policies] MLflow setup warning: {setup_err}")
 
         client = mlflow.tracking.MlflowClient()
         try:
@@ -196,6 +198,7 @@ async def init_game(request: InitGameRequest):
         game_state.actions_log = []
         game_state.episode_states = []
         game_state.phi_log = []
+        game_state.playable_session = None
 
         try:
             frame = game_state.env.render()

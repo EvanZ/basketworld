@@ -13,6 +13,8 @@ Options:
     --tracking-uri URI  MLflow tracking URI (default: http://localhost:5000)
     --s3-bucket BUCKET  S3 bucket name (default: basketworld)
     --s3-prefix PREFIX  S3 prefix (default: mlflow-artifacts)
+    --aws-profile NAME  AWS profile name (optional; uses default chain if omitted)
+    --skip-s3           Skip S3 deletion and only remove deleted-run metadata from mlflow.db
 """
 
 import argparse
@@ -24,7 +26,26 @@ from typing import List, Tuple
 import mlflow
 from mlflow.tracking import MlflowClient
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ProfileNotFound
+
+
+def apply_mlflow_aws_env_fallbacks() -> list[str]:
+    """
+    Map MLFLOW_AWS_* vars into AWS_* vars for boto3 if AWS_* are unset.
+    Returns a list of keys that were populated via fallback.
+    """
+    mapped = []
+    fallback_pairs = [
+        ("MLFLOW_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+        ("MLFLOW_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+        ("MLFLOW_AWS_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
+        ("MLFLOW_AWS_DEFAULT_REGION", "AWS_DEFAULT_REGION"),
+    ]
+    for src, dst in fallback_pairs:
+        if not os.environ.get(dst) and os.environ.get(src):
+            os.environ[dst] = os.environ[src]
+            mapped.append(f"{src}->{dst}")
+    return mapped
 
 
 def get_deleted_runs(client: MlflowClient) -> List[Tuple[str, str, str]]:
@@ -194,6 +215,27 @@ def main():
         default="./mlflow.db",
         help="Path to mlflow.db (default: ./mlflow.db)",
     )
+    parser.add_argument(
+        "--aws-profile",
+        type=str,
+        default=os.environ.get("AWS_PROFILE"),
+        help="AWS profile name to use for S3 (default: AWS_PROFILE env or boto3 default chain)",
+    )
+    parser.add_argument(
+        "--aws-region",
+        type=str,
+        default=(
+            os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("MLFLOW_AWS_DEFAULT_REGION")
+            or "us-east-1"
+        ),
+        help="AWS region for S3/STS checks (default: AWS_DEFAULT_REGION or MLFLOW_AWS_DEFAULT_REGION or us-east-1)",
+    )
+    parser.add_argument(
+        "--skip-s3",
+        action="store_true",
+        help="Skip S3 artifact deletion and only clean deleted-run metadata from mlflow.db",
+    )
 
     args = parser.parse_args()
 
@@ -202,12 +244,22 @@ def main():
     print(f"Tracking URI: {args.tracking_uri}")
     print(f"Database: {args.db_path}")
     print(f"S3 Location: s3://{args.s3_bucket}/{args.s3_prefix}/")
+    print(f"AWS Region: {args.aws_region}")
+    if args.skip_s3:
+        print("S3 Mode: skipped (metadata-only cleanup)")
+    elif args.aws_profile:
+        print(f"AWS Profile: {args.aws_profile}")
+
+    mapped_env = apply_mlflow_aws_env_fallbacks()
+    if mapped_env:
+        print("AWS env fallback applied:", ", ".join(mapped_env))
 
     if args.dry_run:
         print("\n⚠️  DRY RUN MODE - No files will be deleted\n")
     else:
         print("\n⚠️  WARNING: This will permanently delete:")
-        print("   - Artifacts from S3")
+        if not args.skip_s3:
+            print("   - Artifacts from S3")
         print("   - Run metadata from mlflow.db")
         response = input("Continue? (yes/no): ")
         if response.lower() not in ["yes", "y"]:
@@ -219,17 +271,46 @@ def main():
     mlflow.set_tracking_uri(args.tracking_uri)
     client = MlflowClient()
 
-    # Connect to S3 using basketworld profile
-    try:
-        # Use basketworld AWS profile (same as training/server)
-        session = boto3.Session(profile_name="basketworld")
-        s3_client = session.client("s3")
-        # Test S3 connection
-        s3_client.head_bucket(Bucket=args.s3_bucket)
-    except Exception as e:
-        print(f"Error: Could not connect to S3 bucket {args.s3_bucket}")
-        print(f"Please ensure AWS credentials are set up: {e}")
-        return
+    s3_client = None
+    if not args.skip_s3:
+        try:
+            session = None
+            used_profile_label = None
+            if args.aws_profile:
+                try:
+                    session = boto3.Session(profile_name=args.aws_profile)
+                    used_profile_label = args.aws_profile
+                except ProfileNotFound:
+                    print(
+                        f"Warning: AWS profile '{args.aws_profile}' was not found. "
+                        "Falling back to default credential chain."
+                    )
+                    # If AWS_PROFILE points to a missing profile, boto3.Session() can
+                    # fail as well, so temporarily clear it for fallback resolution.
+                    saved_aws_profile = os.environ.pop("AWS_PROFILE", None)
+                    try:
+                        session = boto3.Session()
+                        used_profile_label = "default credential chain"
+                    finally:
+                        if saved_aws_profile is not None:
+                            os.environ["AWS_PROFILE"] = saved_aws_profile
+            else:
+                session = boto3.Session()
+                used_profile_label = session.profile_name or "default credential chain"
+
+            print(f"Using AWS auth source: {used_profile_label}")
+            s3_client = session.client("s3", region_name=args.aws_region)
+            # Test S3 connection
+            s3_client.head_bucket(Bucket=args.s3_bucket)
+        except ProfileNotFound as e:
+            print(f"Error: AWS profile '{args.aws_profile}' was not found.")
+            print(f"Please configure it or rerun with --aws-profile <existing-profile> or --skip-s3")
+            print(f"Details: {e}")
+            return
+        except Exception as e:
+            print(f"Error: Could not connect to S3 bucket {args.s3_bucket}")
+            print(f"Please ensure AWS credentials are set up or use --skip-s3: {e}")
+            return
 
     try:
         # Test MLflow connection
@@ -254,11 +335,14 @@ def main():
     for i, (exp_id, run_id, run_name) in enumerate(deleted_runs, 1):
         print(f"{i}. Run: {run_name} (ID: {run_id}, Experiment: {exp_id})")
 
-        # Clean S3 artifacts
-        num_objects = clean_s3_artifacts(
-            s3_client, args.s3_bucket, args.s3_prefix, exp_id, run_id, args.dry_run
-        )
-        total_objects += num_objects
+        if not args.skip_s3:
+            # Clean S3 artifacts
+            num_objects = clean_s3_artifacts(
+                s3_client, args.s3_bucket, args.s3_prefix, exp_id, run_id, args.dry_run
+            )
+            total_objects += num_objects
+        else:
+            print("  - Skipped S3 artifact deletion (--skip-s3)")
 
         # Permanently delete from database
         permanently_delete_run(args.db_path, run_id, args.dry_run)
@@ -268,16 +352,17 @@ def main():
     print(f"{'=' * 80}")
     if args.dry_run:
         print(f"Would delete:")
-        print(f"  - {total_objects} object(s) from S3")
+        if not args.skip_s3:
+            print(f"  - {total_objects} object(s) from S3")
         print(f"  - {len(deleted_runs)} run(s) from database")
         print("\nRun without --dry-run to actually delete.")
     else:
         print(f"✅ Successfully cleaned up:")
-        print(f"  - {total_objects} object(s) from S3")
+        if not args.skip_s3:
+            print(f"  - {total_objects} object(s) from S3")
         print(f"  - {len(deleted_runs)} run(s) from database (permanently)")
         print("\nAll traces of deleted runs have been removed.")
 
 
 if __name__ == "__main__":
     main()
-

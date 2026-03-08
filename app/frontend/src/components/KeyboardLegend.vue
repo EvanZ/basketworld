@@ -1,5 +1,7 @@
 <script setup>
-const shortcuts = [
+import { computed } from 'vue';
+
+const defaultShortcuts = [
   { key: 'N', label: 'New Game' },
   { key: 'P', label: 'Self-Play' },
   { key: 'T', label: 'Submit Turn' },
@@ -12,6 +14,30 @@ const shortcuts = [
   { key: '←', label: 'Step Back (manual replay)', isArrow: true },
   { key: '→', label: 'Step Forward (manual replay)', isArrow: true },
 ];
+
+const props = defineProps({
+  shortcuts: {
+    type: Array,
+    default: null,
+  },
+});
+const emit = defineEmits(['shortcut-clicked']);
+
+const displayedShortcuts = computed(() => {
+  if (Array.isArray(props.shortcuts) && props.shortcuts.length > 0) {
+    return props.shortcuts;
+  }
+  return defaultShortcuts;
+});
+
+function isInteractiveShortcut(item) {
+  return Boolean(item && typeof item === 'object' && item.action);
+}
+
+function onShortcutClick(item) {
+  if (!isInteractiveShortcut(item)) return;
+  emit('shortcut-clicked', item);
+}
 </script>
 
 <template>
@@ -20,7 +46,13 @@ const shortcuts = [
       <font-awesome-icon :icon="['fas','keyboard']" /> Shortcuts
     </div>
     <ul class="kb-legend-list">
-      <li v-for="item in shortcuts" :key="item.key" class="kb-item">
+      <li
+        v-for="item in displayedShortcuts"
+        :key="`${item.key}-${item.label}`"
+        class="kb-item"
+        :class="{ interactive: isInteractiveShortcut(item) }"
+        @click="onShortcutClick(item)"
+      >
         <template v-if="item.key === '0-9'">
           <span class="keycap small" aria-hidden="true">0</span>
           <span class="keycap-sep" aria-hidden="true">–</span>
@@ -67,6 +99,9 @@ const shortcuts = [
   align-items: center;
 }
 .kb-item { display: flex; align-items: center; gap: 6px; }
+.kb-item.interactive {
+  cursor: pointer;
+}
 .kb-label { white-space: nowrap; }
 
 /* Keycap styling */
@@ -89,5 +124,3 @@ const shortcuts = [
 .keycap.arrow-key { font-size: 14px; min-width: 24px; }
 .keycap-sep { margin: 0 4px; color: #666; }
 </style>
-
-

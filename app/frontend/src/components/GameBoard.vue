@@ -67,6 +67,34 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  allowShotClockAdjustment: {
+    type: Boolean,
+    default: true,
+  },
+  disableBackendValueFetches: {
+    type: Boolean,
+    default: false,
+  },
+  allowPositionDrag: {
+    type: Boolean,
+    default: true,
+  },
+  minimalChrome: {
+    type: Boolean,
+    default: false,
+  },
+  playerDisplayNames: {
+    type: Object,
+    default: () => ({}),
+  },
+  playerJerseyNumbers: {
+    type: Object,
+    default: () => ({}),
+  },
+  forcedEpisodeOutcome: {
+    type: Object,
+    default: null,
+  },
 });
 
 const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
@@ -118,6 +146,57 @@ function hexDistance(a, b) {
   return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
+function toIdSet(values) {
+  const out = new Set();
+  if (!Array.isArray(values)) return out;
+  for (const raw of values) {
+    const pid = Number(raw);
+    if (Number.isFinite(pid)) out.add(pid);
+  }
+  return out;
+}
+
+function getPlayableOwnershipSets(gameState) {
+  const userIds = toIdSet(gameState?.playable_user_ids);
+  const aiIds = toIdSet(gameState?.playable_ai_ids);
+  return { userIds, aiIds };
+}
+
+function getPlayerOwner(gameState, playerId) {
+  if (!gameState) return null;
+  const { userIds, aiIds } = getPlayableOwnershipSets(gameState);
+  if (userIds.has(playerId)) return 'user';
+  if (aiIds.has(playerId)) return 'ai';
+  return null;
+}
+
+function getPlayerDisplayName(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerDisplayNames && typeof props.playerDisplayNames === 'object'
+    ? props.playerDisplayNames
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  if (typeof raw !== 'string') return '';
+  return raw.trim().toUpperCase();
+}
+
+function getPlayerJerseyNumber(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return '';
+  const map = props.playerJerseyNumbers && typeof props.playerJerseyNumbers === 'object'
+    ? props.playerJerseyNumbers
+    : {};
+  const raw = map[id] ?? map[String(id)];
+  const jersey = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim();
+  if (!jersey) return String(id);
+  return jersey;
+}
+
+function expectedValueLabelDy() {
+  return props.minimalChrome ? '1.9em' : '-1.0em';
+}
+
 function isPointerPassMode(gs) {
   return String(gs?.pass_mode || 'directional').toLowerCase() === 'pointer_targeted';
 }
@@ -165,7 +244,8 @@ function getRenderablePlayers(gameState) {
     const { x, y } = axialToCartesian(q, r);
     const isOffense = gameState.offense_ids.includes(index);
     const hasBall = gameState.ball_holder === index;
-    return { id: index, x, y, isOffense, hasBall };
+    const owner = getPlayerOwner(gameState, index);
+    return { id: index, x, y, isOffense, hasBall, owner };
   });
 }
 
@@ -374,6 +454,7 @@ function getSvgPoint(clientX, clientY) {
 
 function onMouseDown(event, player) {
   if (!player) return;
+  if (!props.allowPositionDrag) return;
   if (props.isManualStepping) return;
   event.preventDefault();
   
@@ -843,6 +924,105 @@ const offensiveLaneHexes = computed(() => {
   });
 });
 
+function toFiniteInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.trunc(parsed);
+}
+
+function laneStepMapValue(map, playerId) {
+  if (!map || typeof map !== 'object') return 0;
+  const direct = map[playerId];
+  if (direct !== undefined) return toFiniteInt(direct, 0);
+  const byString = map[String(playerId)];
+  return toFiniteInt(byString, 0);
+}
+
+function sideLaneStepsMax(map, sideIds) {
+  if (!Array.isArray(sideIds) || sideIds.length === 0) return 0;
+  let maxValue = 0;
+  for (const rawId of sideIds) {
+    const pid = toFiniteInt(rawId, Number.NaN);
+    if (!Number.isFinite(pid)) continue;
+    const value = laneStepMapValue(map, pid);
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+  return Math.max(0, maxValue);
+}
+
+const laneStepIndicatorStacks = computed(() => {
+  const gs = currentGameState.value;
+  if (!gs || !basketPosition.value) return [];
+
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids : [];
+  if (offenseIds.length === 0 && defenseIds.length === 0) return [];
+
+  const maxSteps = Math.max(1, toFiniteInt(gs.three_second_max_steps, 3));
+  const offenseSteps = sideLaneStepsMax(gs.offensive_lane_steps, offenseIds);
+  const defenseSteps = sideLaneStepsMax(gs.defensive_lane_steps, defenseIds);
+
+  const resolveSideColor = (sideIds, fallbackColor) => {
+    if (!Array.isArray(sideIds)) return fallbackColor;
+    for (const rawId of sideIds) {
+      const pid = toFiniteInt(rawId, Number.NaN);
+      if (!Number.isFinite(pid)) continue;
+      const owner = getPlayerOwner(gs, pid);
+      if (owner === 'user') return '#007bff';
+      if (owner === 'ai') return '#dc3545';
+    }
+    return fallbackColor;
+  };
+
+  const offenseColor = resolveSideColor(offenseIds, '#007bff');
+  const defenseColor = resolveSideColor(defenseIds, '#dc3545');
+
+  const radius = HEX_RADIUS * 0.14;
+  const spacing = HEX_RADIUS * 0.48;
+  const topY = basketPosition.value.y - ((maxSteps - 1) * spacing) / 2;
+  const columnGap = HEX_RADIUS * 0.62;
+  const desiredDefenseX = basketPosition.value.x - HEX_RADIUS * 1.55;
+  const desiredOffenseX = desiredDefenseX + columnGap;
+  const minCenterX = courtBounds.value.minX + (HEX_RADIUS * 0.28);
+  const shiftRight = Math.max(0, minCenterX - desiredDefenseX);
+  const defenseX = desiredDefenseX + shiftRight;
+  const offenseX = desiredOffenseX + shiftRight;
+
+  const buildStack = (key, label, shortLabel, steps, color, x) => {
+    const clamped = Math.max(0, Math.min(maxSteps, steps));
+    const lights = [];
+    for (let i = 0; i < maxSteps; i += 1) {
+      lights.push({
+        key: `${key}-light-${i}`,
+        x,
+        y: topY + (i * spacing),
+        radius,
+        lit: i < clamped,
+        color,
+        violation: steps >= maxSteps,
+      });
+    }
+    return {
+      key,
+      label,
+      shortLabel,
+      color,
+      steps: Math.max(0, steps),
+      maxSteps,
+      labelX: x,
+      labelY: topY - (radius * 2.4),
+      lights,
+    };
+  };
+
+  return [
+    buildStack('offense', 'Offense', 'O', offenseSteps, offenseColor, offenseX),
+    buildStack('defense', 'Defense', 'D', defenseSteps, defenseColor, defenseX),
+  ];
+});
+
 const shotClockValue = computed(() => currentGameState.value?.shot_clock ?? 0);
 const shotClockMax = computed(() => {
   const state = currentGameState.value;
@@ -854,7 +1034,9 @@ const shotClockMax = computed(() => {
   if (!Number.isNaN(current)) candidates.push(current);
   return Math.max(...candidates);
 });
-const isShotClockEditable = computed(() => !!currentGameState.value && !currentGameState.value.done);
+const isShotClockEditable = computed(
+  () => !!props.allowShotClockAdjustment && !!currentGameState.value && !currentGameState.value.done
+);
 const canIncrementShotClock = computed(
   () => isShotClockEditable.value && !props.isShotClockUpdating && shotClockValue.value < shotClockMax.value
 );
@@ -892,6 +1074,11 @@ watch(currentGameState, async (newState) => {
   if (newState.pass_steal_probabilities) {
     passStealProbs.value = newState.pass_steal_probabilities;
     console.log('[GameBoard] Using stored pass steal probabilities from state:', newState.pass_steal_probabilities);
+    return;
+  }
+
+  if (props.disableBackendValueFetches) {
+    passStealProbs.value = {};
     return;
   }
   
@@ -954,7 +1141,7 @@ const viewBox = computed(() => {
     const allX = courtLayout.value.map(h => h.x);
     const allY = courtLayout.value.map(h => h.y);
     
-    const margin = HEX_RADIUS * 3; // Increased margin for more padding
+    const margin = props.minimalChrome ? HEX_RADIUS * 1.8 : HEX_RADIUS * 3;
     const minX = Math.min(...allX) - margin;
     const maxX = Math.max(...allX) + margin;
     const minY = Math.min(...allY) - margin;
@@ -1175,8 +1362,17 @@ function offenseShellColor(playerId) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+function playerTeamClass(player) {
+  if (player?.owner === 'user') return 'player-user';
+  if (player?.owner === 'ai') return 'player-ai';
+  return player?.isOffense ? 'player-offense' : 'player-defense';
+}
+
 function playerCircleStyle(player) {
   const style = { cursor: 'grab' };
+  if (player?.owner === 'user' || player?.owner === 'ai') {
+    return style;
+  }
   if (player?.isOffense) {
     style.fill = offenseShellColor(player.id);
   }
@@ -1385,6 +1581,56 @@ const defenderTurnoverPressureById = computed(() => {
   return out;
 });
 
+const ballHandlerTurnoverPressureMeter = computed(() => {
+  const gs = currentGameState.value;
+  const ballHolderId = Number(gs?.ball_holder);
+  if (!gs || !Number.isFinite(ballHolderId)) {
+    return {
+      actualProb: 0,
+      normalized: 0,
+      maxPossible: 0,
+      color: '#f59e0b',
+      title: 'Turnover pressure 0.0%',
+    };
+  }
+
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids.map(Number).filter((id) => Number.isFinite(id)) : [];
+  const defenseIds = Array.isArray(gs.defense_ids) ? gs.defense_ids.map(Number).filter((id) => Number.isFinite(id)) : [];
+  const defenderIds = offenseIds.includes(ballHolderId) ? defenseIds : offenseIds;
+
+  const perDefenderMap = defenderTurnoverPressureById.value || {};
+  let complement = 1.0;
+  for (const defenderId of defenderIds) {
+    const p = clamp01(
+      Number(
+        perDefenderMap[defenderId]
+        ?? perDefenderMap[String(defenderId)]
+        ?? 0,
+      ),
+    );
+    complement *= (1.0 - p);
+  }
+  const actualProb = clamp01(1.0 - complement);
+
+  const baseChance = clamp01(Number(gs.defender_pressure_turnover_chance ?? 0.05));
+  const maxPossible = defenderIds.length > 0
+    ? clamp01(1.0 - Math.pow(1.0 - baseChance, defenderIds.length))
+    : 0;
+  const normalized = maxPossible > 1e-6 ? clamp01(actualProb / maxPossible) : 0;
+
+  const hue = Math.round(48 * (1 - normalized)); // yellow -> red as pressure rises
+  const color = `hsl(${hue}, 100%, 58%)`;
+  const title = `Turnover pressure ${(actualProb * 100).toFixed(1)}% (meter ${(normalized * 100).toFixed(1)}% of max ${(maxPossible * 100).toFixed(1)}%)`;
+
+  return {
+    actualProb,
+    normalized,
+    maxPossible,
+    color,
+    title,
+  };
+});
+
 function getDefenderTurnoverPressure(playerId) {
   const pressure = Number(
     defenderTurnoverPressureById.value[playerId]
@@ -1435,6 +1681,48 @@ function formatDefenderTurnoverPressureTitle(playerId) {
   return `Turnover pressure ${(pressure * 100).toFixed(1)}%`;
 }
 
+function getPlayerRenderCenter(player) {
+  if (!player) return { x: 0, y: 0 };
+  if (draggedPlayerId.value === player.id) {
+    return { x: draggedPlayerPos.x, y: draggedPlayerPos.y };
+  }
+  return { x: player.x, y: player.y };
+}
+
+function getBallPressureMeterPath(player) {
+  const center = getPlayerRenderCenter(player);
+  const r = HEX_RADIUS * 0.9;
+  const x = Number(center.x || 0);
+  const y = Number(center.y || 0);
+  return `M ${x} ${y - r} A ${r} ${r} 0 0 1 ${x} ${y + r}`;
+}
+
+function getBallPressureSeamPath(player) {
+  const center = getPlayerRenderCenter(player);
+  const r = HEX_RADIUS * 0.9;
+  const x = Number(center.x || 0);
+  const y = Number(center.y || 0);
+  // Left-side seam from 6 -> 12 o'clock (opposite the TO meter arc).
+  return `M ${x} ${y + r} A ${r} ${r} 0 0 1 ${x} ${y - r}`;
+}
+
+function getBallPressureMeterStyle() {
+  const meter = ballHandlerTurnoverPressureMeter.value;
+  const r = HEX_RADIUS * 0.9;
+  const halfCircumference = Math.PI * r;
+  const filled = Math.max(0, Math.min(halfCircumference, halfCircumference * Number(meter?.normalized || 0)));
+  return {
+    stroke: meter?.color || '#f59e0b',
+    strokeDasharray: `${filled.toFixed(2)} ${halfCircumference.toFixed(2)}`,
+  };
+}
+
+function formatBallPressureMeterLabel() {
+  const meter = ballHandlerTurnoverPressureMeter.value;
+  const pct = Math.max(0, Math.min(100, Number(meter?.actualProb || 0) * 100));
+  return `TO ${pct.toFixed(1)}%`;
+}
+
 function formatPlayerTooltipTitle(playerId) {
   const parts = [];
   const ring = ballHandlerShotPressureRing.value;
@@ -1454,12 +1742,18 @@ async function fetchBallHandlerMakeProb() {
     return;
   }
   
-  // During manual stepping (replay), use the stored shot probability from the state
-  if (props.isManualStepping && typeof gs.ball_handler_shot_probability === 'number') {
+  // Prefer the backend-provided state value when available.
+  if (typeof gs.ball_handler_shot_probability === 'number') {
     ballHandlerMakeProb.value = gs.ball_handler_shot_probability;
     // Replay snapshots currently store final probability only.
     ballHandlerBaseProb.value = null;
-    console.log('[GameBoard] Using stored shot probability from replay state:', gs.ball_handler_shot_probability);
+    console.log('[GameBoard] Using stored shot probability from state:', gs.ball_handler_shot_probability);
+    return;
+  }
+
+  if (props.disableBackendValueFetches) {
+    ballHandlerMakeProb.value = null;
+    ballHandlerBaseProb.value = null;
     return;
   }
   
@@ -1495,13 +1789,76 @@ watch(
   { deep: true }
 );
 
+function resolveOutcomePointForPlayer(playerId) {
+    const pid = Number(playerId);
+    if (!Number.isFinite(pid)) return null;
+    const playerPos = currentGameState.value?.positions?.[pid];
+    if (!Array.isArray(playerPos) || playerPos.length < 2) return null;
+    const [pq, pr] = playerPos;
+    return axialToCartesian(pq, pr);
+}
+
+function normalizeForcedEpisodeOutcome(rawOutcome) {
+    if (!rawOutcome || typeof rawOutcome !== 'object' || !currentGameState.value) return null;
+    const type = String(rawOutcome.type || '').trim().toUpperCase();
+    if (!type) return null;
+
+    const allowedTypes = new Set([
+        'DEFENSIVE_VIOLATION',
+        'OFFENSIVE_VIOLATION',
+        'TURNOVER',
+        'SHOT_CLOCK_VIOLATION',
+        'MADE_SHOT',
+        'MISSED_SHOT',
+    ]);
+    if (!allowedTypes.has(type)) return null;
+
+    const outcome = { type };
+    const forcedPlayerId = Number(rawOutcome.playerId ?? rawOutcome.player_id);
+    if (Number.isFinite(forcedPlayerId)) {
+        outcome.playerId = forcedPlayerId;
+    }
+
+    const forcedX = Number(rawOutcome.x);
+    const forcedY = Number(rawOutcome.y);
+    if (Number.isFinite(forcedX) && Number.isFinite(forcedY)) {
+        outcome.x = forcedX;
+        outcome.y = forcedY;
+    } else if (Number.isFinite(forcedPlayerId)) {
+        const point = resolveOutcomePointForPlayer(forcedPlayerId);
+        if (point) {
+            outcome.x = point.x;
+            outcome.y = point.y;
+        }
+    }
+
+    if (type === 'MADE_SHOT' || type === 'MISSED_SHOT') {
+        outcome.isThree = Boolean(rawOutcome.isThree ?? rawOutcome.is_three ?? false);
+        outcome.isDunk = Boolean(rawOutcome.isDunk ?? rawOutcome.is_dunk ?? false);
+    }
+
+    return outcome;
+}
+
 const episodeOutcome = computed(() => {
+    const forcedOutcome = normalizeForcedEpisodeOutcome(props.forcedEpisodeOutcome);
+    if (forcedOutcome) return forcedOutcome;
+
     if (!currentGameState.value || !currentGameState.value.done) {
         return null; // Game is not over
     }
 
     const results = currentGameState.value.last_action_results;
     if (!results) return null;
+
+    const resolveViolationPosition = (violation) => {
+        if (!violation || typeof violation !== 'object') return null;
+        if (Array.isArray(violation.position) && violation.position.length >= 2) {
+            const [vq, vr] = violation.position;
+            return axialToCartesian(vq, vr);
+        }
+        return resolveOutcomePointForPlayer(violation.player_id);
+    };
 
     // Check for shot results
     if (results.shots && Object.keys(results.shots).length > 0) {
@@ -1528,11 +1885,21 @@ const episodeOutcome = computed(() => {
     // Check for defensive lane violations
     if (results.defensive_lane_violations && results.defensive_lane_violations.length > 0) {
         const violation = results.defensive_lane_violations[0];
-        if (violation.position) {
-            const { x, y } = axialToCartesian(violation.position[0], violation.position[1]);
-            return { type: 'DEFENSIVE_VIOLATION', x, y, playerId: violation.player_id };
+        const point = resolveViolationPosition(violation);
+        if (point) {
+            return { type: 'DEFENSIVE_VIOLATION', x: point.x, y: point.y, playerId: violation.player_id };
         }
-        return { type: 'DEFENSIVE_VIOLATION' };
+        return { type: 'DEFENSIVE_VIOLATION', playerId: violation?.player_id };
+    }
+
+    // Check for offensive lane violations
+    if (results.offensive_lane_violations && results.offensive_lane_violations.length > 0) {
+        const violation = results.offensive_lane_violations[0];
+        const point = resolveViolationPosition(violation);
+        if (point) {
+            return { type: 'OFFENSIVE_VIOLATION', x: point.x, y: point.y, playerId: violation.player_id };
+        }
+        return { type: 'OFFENSIVE_VIOLATION', playerId: violation?.player_id };
     }
 
     // Check for turnover results
@@ -1584,6 +1951,10 @@ const playerTransitions = computed(() => {
         const endY = isLastStep && progress < 1 ? startY + (fullEndY - startY) * progress : fullEndY;
         
         const isOffense = currentGameState.offense_ids.includes(playerId);
+        const owner = getPlayerOwner(currentGameState, playerId);
+        const arrowTone = owner === 'user' || owner === 'ai'
+          ? owner
+          : (isOffense ? 'user' : 'ai');
 
         transitions.push({
           key: `arrow-${step}-${playerId}`,
@@ -1593,6 +1964,7 @@ const playerTransitions = computed(() => {
           endY,
           opacity,
           isOffense,
+          arrowTone,
         });
       }
     }
@@ -1600,7 +1972,7 @@ const playerTransitions = computed(() => {
   return transitions;
 });
 
-// Compute pass rays from ball handler to teammates with steal probabilities
+// Compute pass rays from ball handler to teammates with pass success probabilities
 const passRays = computed(() => {
   const gs = currentGameState.value;
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return [];
@@ -1632,10 +2004,13 @@ const passRays = computed(() => {
     // In live mode, if no probability is available, skip drawing this ray (preserves old behavior)
     if (!hasProb && !usePlacementPreview) continue;
     const stealProb = hasProb ? Number(stealProbRaw) : 0;
-    const probFraction = stealProb > 1 ? stealProb / 100 : stealProb;
-    const stealPercent = hasProb ? probFraction * 100 : null;
-    const stealLabel = hasProb ? `${stealPercent.toFixed(1)}%` : '—';
-    const stealOpacity = hasProb ? probToStealAlpha(probFraction) : 0.3;
+    const stealFraction = Math.max(0, Math.min(1, stealProb > 1 ? stealProb / 100 : stealProb));
+    const passSuccessFraction = 1 - stealFraction;
+    const passSuccessPercent = hasProb ? passSuccessFraction * 100 : null;
+    const passSuccessLabel = hasProb ? `${passSuccessPercent.toFixed(1)}%` : '—';
+    // Keep original visual emphasis behavior (based on steal probability),
+    // while displaying pass-success percentage text.
+    const passSuccessOpacity = hasProb ? probToStealAlpha(stealFraction) : 0.3;
     
     // Calculate midpoint for label placement
     const midX = (bhCoords.x + tmCoords.x) / 2;
@@ -1648,9 +2023,9 @@ const passRays = computed(() => {
       y2: tmCoords.y,
       midX,
       midY,
-      stealProb: stealPercent, // Rounded to nearest percent (nullable)
-      stealLabel,
-      stealOpacity,
+      passSuccessProb: passSuccessPercent, // Rounded to nearest percent (nullable)
+      passSuccessLabel,
+      passSuccessOpacity,
       teammateId,
     });
   }
@@ -2186,28 +2561,63 @@ watch(
       return;
     }
 
-    const passes = state.last_action_results?.passes;
-    if (!passes || Object.keys(passes).length === 0) {
+    const actionResults = state.last_action_results;
+    if (!actionResults || typeof actionResults !== 'object') {
       clearPassFlash();
       return;
     }
+    const passes = actionResults?.passes && typeof actionResults.passes === 'object'
+      ? actionResults.passes
+      : {};
 
-    let successfulPass = null;
+    let passAnimation = null;
     for (const [passerId, passResult] of Object.entries(passes)) {
       const targetId = Number(passResult?.target);
       if (passResult && passResult.success && Number.isFinite(targetId)) {
-        successfulPass = { passerId: Number(passerId), receiverId: targetId };
+        passAnimation = { passerId: Number(passerId), receiverId: targetId };
         break;
       }
     }
 
-    if (!successfulPass) {
+    // If pass was intercepted, animate the ball path to the stealing defender.
+    if (!passAnimation) {
+      const turnovers = Array.isArray(actionResults?.turnovers)
+        ? actionResults.turnovers
+        : [];
+      const stealTurnover = turnovers.find((turnover) => {
+        if (!turnover || typeof turnover !== 'object') return false;
+        const reason = String(turnover.reason || '').toLowerCase();
+        if (reason !== 'steal') return false;
+        return Number.isFinite(Number(turnover.player_id)) && Number.isFinite(Number(turnover.stolen_by));
+      });
+      if (stealTurnover) {
+        passAnimation = {
+          passerId: Number(stealTurnover.player_id),
+          receiverId: Number(stealTurnover.stolen_by),
+        };
+      }
+    }
+
+    // Extra fallback: some payloads may encode intercepted passes in the pass record itself.
+    if (!passAnimation) {
+      for (const [passerId, passResult] of Object.entries(passes)) {
+        if (!passResult || typeof passResult !== 'object') continue;
+        const turnoverFlag = Boolean(passResult.turnover) || String(passResult.reason || '').toLowerCase() === 'steal';
+        const stolenBy = Number(passResult.stolen_by);
+        if (turnoverFlag && Number.isFinite(stolenBy)) {
+          passAnimation = { passerId: Number(passerId), receiverId: stolenBy };
+          break;
+        }
+      }
+    }
+
+    if (!passAnimation) {
       clearPassFlash();
       return;
     }
 
-    const passerPos = state.positions?.[successfulPass.passerId];
-    const receiverPos = state.positions?.[successfulPass.receiverId];
+    const passerPos = state.positions?.[passAnimation.passerId];
+    const receiverPos = state.positions?.[passAnimation.receiverId];
     if (!passerPos || !receiverPos) {
       clearPassFlash();
       return;
@@ -2215,7 +2625,7 @@ watch(
 
     const start = axialToCartesian(passerPos[0], passerPos[1]);
     const end = axialToCartesian(receiverPos[0], receiverPos[1]);
-    triggerPassFlash(successfulPass.passerId, successfulPass.receiverId, start, end);
+    triggerPassFlash(passAnimation.passerId, passAnimation.receiverId, start, end);
   },
   { immediate: true }
 );
@@ -2576,7 +2986,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="game-board-container" :class="{ 'no-move-transitions': disableTransitions }">
+  <div
+    class="game-board-container"
+    :class="{
+      'no-move-transitions': disableTransitions,
+      'minimal-chrome': minimalChrome,
+    }"
+  >
     <div class="board-toolbar">
       <div class="download-menu" ref="downloadMenuRef">
         <button
@@ -2605,6 +3021,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <button
+        v-if="!minimalChrome"
         class="toggle-btn board-toggle-btn"
         @click="toggleAllPolicies"
         :aria-pressed="allPoliciesVisible"
@@ -2613,7 +3030,7 @@ onBeforeUnmount(() => {
         <font-awesome-icon :icon="allPoliciesVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
         <span class="toggle-label">Show Policies</span>
       </button>
-      <div class="pressure-controls-row">
+      <div v-if="!minimalChrome" class="pressure-controls-row">
         <button
           class="toggle-btn board-toggle-btn"
           @click="showShotPressureRing = !showShotPressureRing"
@@ -2701,7 +3118,7 @@ onBeforeUnmount(() => {
 
         <!-- Court reference labels -->
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="basketMarkerPosition.x"
           :y="basketMarkerPosition.y"
           dy=".35em"
@@ -2711,7 +3128,7 @@ onBeforeUnmount(() => {
           B
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="halfcourtMarkerPosition.x"
           :y="halfcourtMarkerPosition.y"
           dy=".35em"
@@ -2721,7 +3138,7 @@ onBeforeUnmount(() => {
           H
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="rightSidelineMarkerPosition.x"
           :y="rightSidelineMarkerPosition.y"
           dy=".35em"
@@ -2731,7 +3148,7 @@ onBeforeUnmount(() => {
           R
         </text>
         <text
-          v-if="currentGameState && courtLayout.length"
+          v-if="!minimalChrome && currentGameState && courtLayout.length"
           :x="leftSidelineMarkerPosition.x"
           :y="leftSidelineMarkerPosition.y"
           dy=".35em"
@@ -2757,7 +3174,7 @@ onBeforeUnmount(() => {
               :cx="player.x" 
               :cy="player.y" 
               :r="HEX_RADIUS * 0.8" 
-              :class="player.isOffense ? 'player-offense' : 'player-defense'"
+              :class="playerTeamClass(player)"
               class="ghost"
             />
             <text 
@@ -2768,7 +3185,7 @@ onBeforeUnmount(() => {
               text-anchor="middle" 
               class="player-text ghost-text"
             >
-              {{ player.id }}
+              {{ getPlayerJerseyNumber(player.id) }}
             </text>
           </g>
         </g>
@@ -2780,9 +3197,9 @@ onBeforeUnmount(() => {
             :y1="move.startY"
             :x2="move.endX"
             :y2="move.endY"
-            :stroke="move.isOffense ? '#007bff' : '#dc3545'"
+            :stroke="move.arrowTone === 'user' ? '#007bff' : '#dc3545'"
             stroke-width="3"
-            :marker-end="move.isOffense ? 'url(#arrowhead-offense)' : 'url(#arrowhead-defense)'"
+            :marker-end="move.arrowTone === 'user' ? 'url(#arrowhead-offense)' : 'url(#arrowhead-defense)'"
           />
         </g>
 
@@ -2810,6 +3227,7 @@ onBeforeUnmount(() => {
             {
               'defender-pressure-shake':
                 showDefenderPressureShake
+                && !player.isOffense
                 && !player.hasBall
                 && draggedPlayerId !== player.id
                 && shotJumpPlayerId !== player.id
@@ -2830,6 +3248,7 @@ onBeforeUnmount(() => {
             } : {}),
             ...(
               showDefenderPressureShake
+              && !player.isOffense
               && !player.hasBall
               && draggedPlayerId !== player.id
               && shotJumpPlayerId !== player.id
@@ -2867,9 +3286,10 @@ onBeforeUnmount(() => {
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
               :r="HEX_RADIUS * 0.8" 
               :class="[
-                player.isOffense ? 'player-offense' : 'player-defense',
+                playerTeamClass(player),
                 { 'dragging': draggedPlayerId === player.id },
-                { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id }
+                { 'pass-target-preview': passTargetPreview && passTargetPreview.receiverId === player.id },
+                { 'playable-active-player': minimalChrome && player.id === activePlayerId },
               ]"
               @mousedown="onMouseDown($event, player)"
               @click="onPlayerClick($event, player)"
@@ -2881,7 +3301,7 @@ onBeforeUnmount(() => {
               </title>
             </circle>
             <circle
-              v-if="player.isOffense"
+              v-if="player.isOffense && !player.owner"
               :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
               :r="HEX_RADIUS * 0.67"
@@ -2889,23 +3309,44 @@ onBeforeUnmount(() => {
               style="pointer-events: none;"
             />
             <text 
+              v-if="minimalChrome && getPlayerDisplayName(player.id)"
+              :transform="playerLabelTransform(player)"
+              x="0"
+              y="0"
+              dy="-0.85em"
+              text-anchor="middle"
+              class="player-name-text"
+              style="pointer-events: none;"
+            >{{ getPlayerDisplayName(player.id) }}</text>
+            <text
+              v-if="minimalChrome"
+              :x="(draggedPlayerId === player.id ? draggedPlayerPos.x : player.x) - (HEX_RADIUS * 0.6)"
+              :y="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+              dy="0.3em"
+              text-anchor="middle"
+              class="player-index-text"
+              style="pointer-events: none;"
+            >
+              {{ player.id }}
+            </text>
+            <text 
               :transform="playerLabelTransform(player)"
               x="0" 
               y="0" 
-              dy="0.3em" 
+              :dy="minimalChrome && getPlayerDisplayName(player.id) ? '0.48em' : '0.3em'"
               text-anchor="middle" 
               :class="[
                 'player-text',
                 { 'active-player-text': player.id === activePlayerId },
               ]"
               style="pointer-events: none;" 
-            >{{ player.id }}</text>
+            >{{ getPlayerJerseyNumber(player.id) }}</text>
             <!-- EP (Expected Points) label above player ID for offensive players -->
             <text
               v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined && draggedPlayerId !== player.id"
               :x="player.x"
               :y="player.y"
-              dy="-1.0em"
+              :dy="expectedValueLabelDy()"
               text-anchor="middle"
               class="noop-prob-text"
             >
@@ -2947,15 +3388,46 @@ onBeforeUnmount(() => {
             >
               {{ Math.round(ballHandlerMakeProb * 100) }}%
             </text>
-            <!-- Ball handler indicator -->
-            <circle 
-                v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id" 
-                :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
-                :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
-                :r="HEX_RADIUS * 0.9" 
-                class="ball-indicator" 
-                style="pointer-events: none;"
-            />
+            <!-- Ball handler indicator / turnover pressure meter -->
+            <g
+              v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id"
+              class="ball-indicator-wrap"
+              style="pointer-events: none;"
+            >
+              <template v-if="minimalChrome">
+                <path
+                  :d="getBallPressureSeamPath(player)"
+                  class="ball-pressure-meter-seam"
+                />
+                <path
+                  :d="getBallPressureMeterPath(player)"
+                  class="ball-pressure-meter-track"
+                />
+                <path
+                  :d="getBallPressureMeterPath(player)"
+                  class="ball-pressure-meter-fill"
+                  :style="getBallPressureMeterStyle()"
+                />
+                <text
+                  :x="getPlayerRenderCenter(player).x + (HEX_RADIUS * 1.02)"
+                  :y="getPlayerRenderCenter(player).y + (HEX_RADIUS * 0.02)"
+                  text-anchor="start"
+                  dominant-baseline="middle"
+                  class="ball-pressure-meter-label"
+                  :style="{ fill: ballHandlerTurnoverPressureMeter.color }"
+                >
+                  {{ formatBallPressureMeterLabel() }}
+                </text>
+                <title>{{ ballHandlerTurnoverPressureMeter.title }}</title>
+              </template>
+              <circle
+                v-else
+                :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x"
+                :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y"
+                :r="HEX_RADIUS * 0.9"
+                class="ball-indicator"
+              />
+            </g>
             <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
             <g 
               v-if="draggedPlayerId !== player.id && getActionIndicator(player.id, player.x, player.y, player.hasBall)"
@@ -3033,7 +3505,7 @@ onBeforeUnmount(() => {
           </text>
         </g>
         
-        <!-- Draw Pass Rays (ball handler to teammates with steal probabilities) - drawn after players for visibility -->
+        <!-- Draw Pass Rays (ball handler to teammates with pass success probabilities) - drawn after players for visibility -->
         <g v-if="showPlayers" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
           <line
             :x1="ray.x1"
@@ -3041,17 +3513,18 @@ onBeforeUnmount(() => {
             :x2="ray.x2"
             :y2="ray.y2"
             class="pass-ray"
-            :opacity="ray.stealOpacity"
+            :opacity="ray.passSuccessOpacity"
           />
           <text
+            v-if="!minimalChrome"
             :x="ray.midX"
             :y="ray.midY"
             text-anchor="middle"
             dominant-baseline="middle"
             class="steal-prob-label"
-            :opacity="ray.stealOpacity"
+            :opacity="ray.passSuccessOpacity"
           >
-            {{ ray.stealLabel }}
+            {{ ray.passSuccessLabel }}
           </text>
         </g>
 
@@ -3207,11 +3680,14 @@ onBeforeUnmount(() => {
             <text v-if="episodeOutcome.type === 'TURNOVER'" :x="episodeOutcome.x" :y="episodeOutcome.y" class="turnover-x">X</text>
             
             <!-- Defensive Violation indicator -->
-            <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker">!</text>
+            <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker defensive">!</text>
+
+            <!-- Offensive Violation indicator -->
+            <text v-if="episodeOutcome.type === 'OFFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker offensive">!</text>
         </g>
 
         <!-- State-value overlay -->
-        <g v-if="(offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
+        <g v-if="!minimalChrome && (offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
           <rect
             :x="stateValueAnchor.x"
             :y="stateValueAnchor.y"
@@ -3259,6 +3735,10 @@ onBeforeUnmount(() => {
           <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation long-outcome-text">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
               <tspan x="50%" dy="1.2em">Violation - Defense!</tspan>
+          </text>
+          <text v-if="episodeOutcome.type === 'OFFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation-offense long-outcome-text">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan x="50%" dy="1.2em">Violation - Offense!</tspan>
           </text>
       </g>
 
@@ -3309,23 +3789,31 @@ onBeforeUnmount(() => {
         </text>
       </g>
 
-      <!-- MLflow Run ID label (top-left, outside transformed group) -->
-      <text
-        v-if="currentGameState && currentGameState.run_id"
-        :x="parseFloat(viewBox.split(' ')[0]) + 100"
-        :y="parseFloat(viewBox.split(' ')[1]) + 10"
-        text-anchor="start"
-        dominant-baseline="hanging"
-        class="run-id-label"
-      >
-        {{ currentGameState.run_id }}
-      </text>
     </svg>
     <div class="shot-clock-wrapper" v-if="!hasShotCounts">
+      <div v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-clock-indicators">
+        <div
+          v-for="stack in laneStepIndicatorStacks"
+          :key="`clock-${stack.key}`"
+          class="lane-step-clock-stack"
+          :title="`${stack.label} lane steps: ${stack.steps}/${stack.maxSteps}`"
+        >
+          <span class="lane-step-clock-label" :style="{ color: stack.color }">{{ stack.shortLabel }}</span>
+          <span class="lane-step-clock-lights">
+            <span
+              v-for="light in stack.lights"
+              :key="`clock-${light.key}`"
+              class="lane-step-clock-light"
+              :class="{ lit: light.lit, violation: light.violation }"
+              :style="{ '--lane-color': light.color }"
+            ></span>
+          </span>
+        </div>
+      </div>
       <div class="shot-clock-overlay">
         {{ displayedShotClockValue }}
       </div>
-      <div class="shot-clock-controls">
+      <div v-if="allowShotClockAdjustment" class="shot-clock-controls">
         <button
           class="shot-clock-button"
           :disabled="!canIncrementShotClock"
@@ -3361,10 +3849,15 @@ onBeforeUnmount(() => {
   box-shadow: 0 20px 45px rgba(2, 6, 23, 0.65);
 }
 
+.game-board-container.minimal-chrome {
+  border: none;
+  box-shadow: none;
+}
+
 .shot-clock-overlay {
   position: relative;
   font-family: 'DSEG7 Classic', sans-serif;
-  font-size: 5rem;
+  font-size: 4.1rem;
   color: #ff4d4d; /* Bright red for the LED color */
   background-color: #1a1a1a; /* Dark background for contrast */
   padding: 2px 8px;
@@ -3380,9 +3873,59 @@ onBeforeUnmount(() => {
   top: 5px;
   right: 5px;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 6px;
   z-index: 11;
+}
+
+.lane-step-clock-indicators {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.3rem;
+  margin-right: 2px;
+  pointer-events: none;
+}
+
+.lane-step-clock-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.34rem;
+}
+
+.lane-step-clock-label {
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1;
+  text-shadow: 0 1px 2px rgba(2, 6, 23, 0.75);
+}
+
+.lane-step-clock-lights {
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 1rem;
+}
+
+.lane-step-clock-light {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.2);
+  border: 1px solid rgba(15, 23, 42, 0.75);
+  transition: background 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.lane-step-clock-light.lit {
+  background: #ffffff;
+  border-color: var(--lane-color);
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.95), 0 0 12px var(--lane-color);
+}
+
+.lane-step-clock-light.violation {
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.98), 0 0 16px var(--lane-color);
 }
 
 .shot-clock-controls {
@@ -3600,11 +4143,23 @@ onBeforeUnmount(() => {
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease, fill 0.2s ease;
 }
+.player-user {
+  fill: #007bff;
+  stroke: white;
+  stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
 .player-offense-core {
   fill: #007bff;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 .player-defense {
+  fill: #dc3545;
+  stroke: white;
+  stroke-width: 0.05rem;
+  transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
+.player-ai {
   fill: #dc3545;
   stroke: white;
   stroke-width: 0.05rem;
@@ -3681,6 +4236,11 @@ onBeforeUnmount(() => {
   stroke-width: 0.2rem;
   filter: drop-shadow(0 0 6px rgba(248, 231, 28, 0.6));
 }
+.playable-active-player {
+  stroke: #f8e71c;
+  stroke-width: 0.07rem;
+  filter: drop-shadow(0 0 2px rgba(248, 231, 28, 0.7)) drop-shadow(0 0 10px rgba(248, 231, 28, 0.35));
+}
 .dragging {
   opacity: 0.8;
   stroke: white;
@@ -3689,12 +4249,32 @@ onBeforeUnmount(() => {
 }
 .player-text {
   fill: white;
-  font-weight: bold;
-  font-size: 0.85rem;
+  font-weight: 400;
+  font-size: 0.65rem;
   paint-order: stroke;
   stroke: black;
-  stroke-width: 0.1rem;
+  stroke-width: 0.05rem;
   transition: transform 0.26s ease;
+}
+.player-name-text {
+  fill: #dbeafe;
+  font-weight: 500;
+  font-size: 0.45rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.9);
+  stroke-width: 0.04rem;
+  transition: transform 0.26s ease;
+}
+.player-index-text {
+  fill: #111;
+  font-weight: 500;
+  font-size: 0.48rem;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-width: 0.02rem;
+  transition: x 0.26s ease, y 0.26s ease;
 }
 .active-player-text {
   fill: #f8e71c;
@@ -3725,6 +4305,29 @@ onBeforeUnmount(() => {
   font-size: 1rem;
   opacity: 0.55;
 }
+.lane-step-indicators {
+  pointer-events: none;
+}
+.lane-step-label {
+  font-size: 0.36rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  paint-order: stroke;
+  stroke: rgba(15, 23, 42, 0.95);
+  stroke-width: 0.05rem;
+}
+.lane-step-light {
+  stroke-width: 0.05rem;
+  transition: fill 0.18s ease, opacity 0.18s ease;
+}
+.lane-step-light.lit {
+  opacity: 0.95;
+  filter: drop-shadow(0 0 3px rgba(248, 250, 252, 0.3));
+}
+.lane-step-light.violation {
+  filter: drop-shadow(0 0 5px rgba(248, 250, 252, 0.45));
+}
 .basket-rim {
   fill: none;
   stroke: #ff8c00;
@@ -3737,6 +4340,38 @@ onBeforeUnmount(() => {
   stroke-width: 0.25rem;
   stroke-dasharray: 4 8;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+}
+.ball-indicator-wrap {
+  pointer-events: none;
+}
+.ball-pressure-meter-track {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.45);
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+}
+.ball-pressure-meter-seam {
+  fill: none;
+  stroke: orangered;
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+  stroke-dasharray: 3 6;
+}
+.ball-pressure-meter-fill {
+  fill: none;
+  stroke: #f59e0b;
+  stroke-width: 0.25rem;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 5px rgba(239, 68, 68, 0.35));
+  transition: stroke-dasharray 0.2s ease, stroke 0.2s ease;
+}
+.ball-pressure-meter-label {
+  font-size: 0.34rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.95);
+  stroke-width: 0.04rem;
 }
 
 /* Action indicator styles */
@@ -3802,8 +4437,12 @@ onBeforeUnmount(() => {
 }
 
 .no-move-transitions .player-offense,
+.no-move-transitions .player-user,
 .no-move-transitions .player-offense-core,
 .no-move-transitions .player-defense,
+.no-move-transitions .player-ai,
+.no-move-transitions .player-name-text,
+.no-move-transitions .player-index-text,
 .no-move-transitions .player-text,
 .no-move-transitions .shot-prob-text,
 .no-move-transitions .noop-prob-text,
@@ -3814,12 +4453,12 @@ onBeforeUnmount(() => {
 }
 
 .noop-prob-text {
-  font-size: 10px;
-  font-weight: 700;
-  fill: #111;
+  font-size: 0.45rem;
+  font-weight: 500;
+  fill: #f9fcf8;
   paint-order: stroke;
-  stroke: #fff;
-  stroke-width: 0.6px;
+  stroke: rgba(2, 6, 23, 0.85);
+  stroke-width: 0.04rem;
   transition: x 0.26s ease, y 0.26s ease;
 }
 
@@ -3897,11 +4536,16 @@ onBeforeUnmount(() => {
 }
 .violation-marker {
     font-size: 48px;
-    fill: orange;
     font-weight: bold;
     text-anchor: middle;
     dominant-baseline: central;
     transform: scale(1, -1); /* Counteract the group flip */
+}
+.violation-marker.defensive {
+    fill: #f59e0b;
+}
+.violation-marker.offensive {
+    fill: #fb7185;
 }
 .outcome-text-group {
     pointer-events: none; /* Make it non-interactive */
@@ -3924,6 +4568,7 @@ onBeforeUnmount(() => {
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
 .violation { fill: orange; }
+.violation-offense { fill: #fb7185; }
 
 /* Pass rays and steal probability labels */
 .pass-ray {
@@ -4051,16 +4696,4 @@ onBeforeUnmount(() => {
   stroke-width: 3;
 }
 
-</style>
-
-<style scoped>
-.run-id-label {
-  font-size: 0.8rem;
-  font-weight: normal;
-  fill: white;
-  paint-order: stroke;
-  stroke: black;
-  stroke-width: 0.1rem;
-  pointer-events: none;
-}
 </style>

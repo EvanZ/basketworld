@@ -61,6 +61,8 @@ class GameState:
         self.mlflow_env_optional_defaults: dict | None = None
         self.unified_policy_path: str | None = None
         self.opponent_policy_path: str | None = None
+        # Public/playable mode session metadata.
+        self.playable_session: dict | None = None
 
 
 game_state = GameState()

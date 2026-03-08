@@ -5,13 +5,14 @@ body {
   display: flex;
   justify-content: center;
   align-items: flex-start;
-  padding: 3rem 1.5rem;
+  padding: 1.6rem;
 }
 
 #app {
-  width: min(1400px, 100%);
-  margin: 0 auto;
-  padding: 1.5rem;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 1rem;
   background: rgba(2, 6, 23, 0.45);
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 32px;

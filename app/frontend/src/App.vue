@@ -188,6 +188,7 @@ const isManualStepping = ref(false);
 // Force remount of PlayerControls to clear internal state between games
 const controlsKey = ref(0);
 const controlsRef = ref(null);
+const tabsMountEl = ref(null);
 const gameBoardRef = ref(null);
 const phiRef = vueRef(null);
 
@@ -1832,8 +1833,9 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="gameState" class="game-container">
+      <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
+      <div class="top-row">
       <div class="board-area">
-        <div class="run-title">{{ gameState.run_name || gameState.run_id }}</div>
         <div v-if="showShotChartSelector || showSankeySelector" class="shot-chart-selector">
           <template v-if="showShotChartSelector">
             <label>Shot chart:</label>
@@ -1886,7 +1888,6 @@ onBeforeUnmount(() => {
           :title="assistSankeyTitle"
           :total-label="assistSankeyTotalLabel"
         />
-        <KeyboardLegend />
       </div>
       <div class="controls-area">
         <PlayerControls 
@@ -1915,6 +1916,8 @@ onBeforeUnmount(() => {
           :eval-config="evalConfig"
           :eval-num-episodes="evalNumEpisodes"
           :per-player-eval-stats="perPlayerEvalStats"
+          :tabs-mount-el="tabsMountEl"
+          :tabs-mount-selector="'#dev-bottom-tabs'"
           @actions-submitted="handleActionsSubmitted" 
           @move-recorded="handleMoveRecorded"
           @ball-holder-updating="isBallHolderUpdating = $event"
@@ -2002,6 +2005,9 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <KeyboardLegend />
+
+      </div>
       </div>
     </div>
   </main>
@@ -2178,21 +2184,36 @@ header {
   gap: 1.5rem;
 }
 
+.top-row {
+  order: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
+  align-items: start;
+  gap: 1.5rem;
+}
+
+.bottom-tabs-panel {
+  order: 2;
+  min-height: 2rem;
+  background: var(--app-panel);
+  border: 1px solid var(--app-panel-border);
+  border-radius: 24px;
+  padding: 1rem 1.25rem;
+  box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
+}
+
+.bottom-tabs-panel:empty {
+  display: none;
+}
+
 .board-area {
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
   align-items: center;
+  min-width: 0;
 }
 
-.run-title {
-  font-size: 1.25rem;
-  color: var(--app-text-muted);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  margin-bottom: 0.5rem;
-  text-align: center;
-}
 .shot-chart-selector {
   margin: -0.25rem 0 0.25rem;
   display: flex;
@@ -2217,6 +2238,12 @@ header {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  min-width: 0;
+  background: var(--app-panel);
+  border: 1px solid var(--app-panel-border);
+  border-radius: 24px;
+  padding: 1rem;
+  box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
 }
 
 .action-buttons {
@@ -2307,5 +2334,11 @@ header {
   font-size: 0.85rem;
   min-width: 60px;
   text-align: center;
+}
+
+@media (max-width: 1260px) {
+  .top-row {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

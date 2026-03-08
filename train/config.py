@@ -334,6 +334,30 @@ def get_parser() -> argparse.ArgumentParser:
         "--mlflow-run-name", type=str, default=None, help="Name of the MLflow run."
     )
     parser.add_argument(
+        "--mlflow-sb3-log-every-writes",
+        type=int,
+        default=10,
+        help="Log SB3 scalar dumps to MLflow every N logger writes (default: 10).",
+    )
+    parser.add_argument(
+        "--mlflow-episode-log-every-rollouts",
+        type=int,
+        default=10,
+        help="Log episode-aggregate metrics to MLflow every N rollouts (default: 10).",
+    )
+    parser.add_argument(
+        "--mlflow-gradnorm-log-every-rollouts",
+        type=int,
+        default=10,
+        help="Log gradient norm diagnostics every N rollouts (default: 10).",
+    )
+    parser.add_argument(
+        "--mlflow-schedule-log-every-rollouts",
+        type=int,
+        default=10,
+        help="Log scheduled scalar metrics (pass bias/curriculum) every N rollouts (default: 10).",
+    )
+    parser.add_argument(
         "--num-envs",
         type=int,
         default=8,
