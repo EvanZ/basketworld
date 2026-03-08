@@ -19,6 +19,7 @@ from basketworld.utils.callbacks import (
     PassLogitBiasExpScheduleCallback,
     PassCurriculumExpScheduleCallback,
     EpisodeSampleLogger,
+    IntentDiversityCallback,
 )
 from basketworld.utils.mlflow_logger import MLflowWriter
 
@@ -128,6 +129,27 @@ def build_pass_curriculum_callback(args, total_planned_ts, timestep_offset):
     )
 
 
+def build_intent_diversity_callback(args):
+    """Build intent diversity callback when enabled."""
+    if not getattr(args, "intent_diversity_enabled", False):
+        return None
+    return IntentDiversityCallback(
+        enabled=True,
+        num_intents=getattr(args, "num_intents", 8),
+        beta_target=getattr(args, "intent_diversity_beta_target", 0.05),
+        warmup_steps=getattr(args, "intent_diversity_warmup_steps", 1_000_000),
+        ramp_steps=getattr(args, "intent_diversity_ramp_steps", 1_000_000),
+        bonus_clip=getattr(args, "intent_diversity_clip", 2.0),
+        disc_lr=getattr(args, "intent_disc_lr", 3e-4),
+        disc_batch_size=getattr(args, "intent_disc_batch_size", 256),
+        disc_updates_per_rollout=getattr(args, "intent_disc_updates_per_rollout", 2),
+        disc_hidden_dim=getattr(args, "intent_disc_hidden_dim", 128),
+        disc_dropout=getattr(args, "intent_disc_dropout", 0.1),
+        max_obs_dim=getattr(args, "intent_disc_max_obs_dim", 256),
+        max_action_dim=getattr(args, "intent_disc_max_action_dim", 16),
+    )
+
+
 def build_mixed_callbacks(
     args,
     global_alt: int,
@@ -136,6 +158,7 @@ def build_mixed_callbacks(
     beta_cb: Optional[BaseCallback],
     pass_bias_cb: Optional[BaseCallback],
     pass_curriculum_cb: Optional[BaseCallback],
+    intent_diversity_cb: Optional[BaseCallback],
 ) -> List[BaseCallback]:
     """Assemble callbacks for mixed training."""
     callbacks: List[BaseCallback] = [
@@ -153,6 +176,8 @@ def build_mixed_callbacks(
         callbacks.append(pass_bias_cb)
     if pass_curriculum_cb is not None:
         callbacks.append(pass_curriculum_cb)
+    if intent_diversity_cb is not None:
+        callbacks.append(intent_diversity_cb)
     if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
         callbacks.append(
             EpisodeSampleLogger(

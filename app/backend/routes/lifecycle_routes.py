@@ -907,17 +907,22 @@ def reset_turn_state():
         if game_state.turn_start_shot_clock is not None:
             env.shot_clock = int(game_state.turn_start_shot_clock)
 
-        obs_vec = env._get_observation()
-        action_mask = env._get_action_masks()
-        new_obs_dict = {
-            "obs": obs_vec,
-            "action_mask": action_mask,
-            "role_flag": np.array(
-                [1.0 if env.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": env._get_offense_skills_array(),
-        }
+        role_value = (
+            float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
+            if game_state.obs is not None and game_state.obs.get("role_flag") is not None
+            else (1.0 if env.training_team == Team.OFFENSE else -1.0)
+        )
+        observer_is_offense = bool(role_value > 0.0)
+        if hasattr(env, "_build_observation_dict"):
+            new_obs_dict = env._build_observation_dict(observer_is_offense)
+            new_obs_dict["role_flag"] = np.array([role_value], dtype=np.float32)
+        else:
+            new_obs_dict = {
+                "obs": env._get_observation(),
+                "action_mask": env._get_action_masks(),
+                "role_flag": np.array([role_value], dtype=np.float32),
+                "skills": env._get_offense_skills_array(),
+            }
         game_state.obs = new_obs_dict
         game_state.prev_obs = None
 

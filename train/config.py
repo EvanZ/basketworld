@@ -526,6 +526,133 @@ def get_parser() -> argparse.ArgumentParser:
         "(keeps existing obs keys).",
     )
     parser.add_argument(
+        "--enable-intent-learning",
+        dest="enable_intent_learning",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable latent intent state/features for emergent play learning.",
+    )
+    parser.add_argument(
+        "--num-intents",
+        dest="num_intents",
+        type=int,
+        default=8,
+        help="Number of latent intent categories when intent learning is enabled.",
+    )
+    parser.add_argument(
+        "--intent-commitment-steps",
+        dest="intent_commitment_steps",
+        type=int,
+        default=4,
+        help="Commitment horizon (steps) for an active intent state.",
+    )
+    parser.add_argument(
+        "--intent-null-prob",
+        dest="intent_null_prob",
+        type=float,
+        default=0.2,
+        help="Probability of sampling no active intent for an episode.",
+    )
+    parser.add_argument(
+        "--intent-visible-to-defense-prob",
+        dest="intent_visible_to_defense_prob",
+        type=float,
+        default=0.0,
+        help="Probability that defense-visible intent is exposed in an episode.",
+    )
+    parser.add_argument(
+        "--intent-obs-mode",
+        dest="intent_obs_mode",
+        type=str,
+        choices=["private_offense", "public", "hidden"],
+        default="private_offense",
+        help="Intent observability mode for role-conditioned observations.",
+    )
+    parser.add_argument(
+        "--intent-diversity-enabled",
+        dest="intent_diversity_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable DIAYN-style diversity bonus for latent intent learning.",
+    )
+    parser.add_argument(
+        "--intent-diversity-beta-target",
+        dest="intent_diversity_beta_target",
+        type=float,
+        default=0.05,
+        help="Target scale for intent diversity bonus.",
+    )
+    parser.add_argument(
+        "--intent-diversity-warmup-steps",
+        dest="intent_diversity_warmup_steps",
+        type=int,
+        default=1_000_000,
+        help="Number of timesteps before diversity bonus starts.",
+    )
+    parser.add_argument(
+        "--intent-diversity-ramp-steps",
+        dest="intent_diversity_ramp_steps",
+        type=int,
+        default=1_000_000,
+        help="Timesteps to ramp diversity beta from 0 to target after warmup.",
+    )
+    parser.add_argument(
+        "--intent-diversity-clip",
+        dest="intent_diversity_clip",
+        type=float,
+        default=2.0,
+        help="Clip range for normalized intent bonus.",
+    )
+    parser.add_argument(
+        "--intent-disc-lr",
+        dest="intent_disc_lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate for intent discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-batch-size",
+        dest="intent_disc_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for intent discriminator updates.",
+    )
+    parser.add_argument(
+        "--intent-disc-updates-per-rollout",
+        dest="intent_disc_updates_per_rollout",
+        type=int,
+        default=2,
+        help="Number of discriminator updates at each rollout end.",
+    )
+    parser.add_argument(
+        "--intent-disc-hidden-dim",
+        dest="intent_disc_hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden dimension for MLP discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-dropout",
+        dest="intent_disc_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout for discriminator MLP.",
+    )
+    parser.add_argument(
+        "--intent-disc-max-obs-dim",
+        dest="intent_disc_max_obs_dim",
+        type=int,
+        default=256,
+        help="Max flattened observation features used by discriminator input.",
+    )
+    parser.add_argument(
+        "--intent-disc-max-action-dim",
+        dest="intent_disc_max_action_dim",
+        type=int,
+        default=16,
+        help="Max flattened action features used by discriminator input.",
+    )
+    parser.add_argument(
         "--mask-occupied-moves",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=True,

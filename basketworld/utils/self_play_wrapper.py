@@ -103,6 +103,31 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         training_nvec = [int(base_space.nvec[i]) for i in self.training_player_ids]
         self.action_space = spaces.MultiDiscrete(training_nvec)
 
+    def _recondition_intent_fields_for_role(
+        self, obs_dict: dict, observer_is_offense: bool
+    ) -> None:
+        """Update role-dependent intent fields after role-flag flips."""
+        if not isinstance(obs_dict, dict):
+            return
+        try:
+            env = self.env.unwrapped
+        except Exception:
+            return
+        try:
+            fields = env.get_intent_observation_fields(bool(observer_is_offense))
+        except Exception:
+            fields = {}
+        if fields:
+            for key, value in fields.items():
+                obs_dict[key] = np.array(value, dtype=np.float32, copy=True)
+        if "globals" in obs_dict:
+            try:
+                obs_dict["globals"] = env.patch_globals_with_intent_features(
+                    obs_dict["globals"], bool(observer_is_offense)
+                )
+            except Exception:
+                pass
+
     def reset(self, **kwargs):
         try:
             obs, info = self.env.reset(**kwargs)
@@ -129,6 +154,7 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 if opponent_is_offense
                 else np.array([-1.0], dtype=np.float32)
             )
+            self._recondition_intent_fields_for_role(opponent_obs, opponent_is_offense)
         except Exception:
             pass
 

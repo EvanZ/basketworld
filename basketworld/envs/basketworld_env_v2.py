@@ -164,6 +164,13 @@ class HexagonBasketballEnv(gym.Env):
         mask_occupied_moves: bool = False,
         # Pass gating: mask out passes without teammates in arc
         enable_pass_gating: bool = True,
+        # Intent-learning controls (default-off for backward compatibility)
+        enable_intent_learning: bool = False,
+        num_intents: int = 8,
+        intent_commitment_steps: int = 4,
+        intent_null_prob: float = 0.2,
+        intent_visible_to_defense_prob: float = 0.0,
+        intent_obs_mode: str = "private_offense",  # "private_offense" | "public" | "hidden"
         # Deterministic overrides (optional)
         initial_positions: Optional[List[Tuple[int, int]]] = None,
         initial_ball_holder: Optional[int] = None,
@@ -222,6 +229,23 @@ class HexagonBasketballEnv(gym.Env):
         self.mask_occupied_moves = bool(mask_occupied_moves)
         # Pass gating: mask out passes without teammates in arc
         self.enable_pass_gating = bool(enable_pass_gating)
+        # Intent-learning configuration and runtime state
+        self.enable_intent_learning = bool(enable_intent_learning)
+        self.num_intents = max(1, int(num_intents))
+        self.intent_commitment_steps = max(1, int(intent_commitment_steps))
+        self.intent_null_prob = float(max(0.0, min(1.0, intent_null_prob)))
+        self.intent_visible_to_defense_prob = float(
+            max(0.0, min(1.0, intent_visible_to_defense_prob))
+        )
+        mode = str(intent_obs_mode or "private_offense").lower()
+        if mode not in ("private_offense", "public", "hidden"):
+            mode = "private_offense"
+        self.intent_obs_mode = mode
+        self.intent_index: int = 0
+        self.intent_active: bool = False
+        self.intent_age: int = 0
+        self.intent_commitment_remaining: int = 0
+        self._intent_visible_to_defense: bool = False
         normalized_pass_mode = str(pass_mode).lower()
         if normalized_pass_mode not in ("directional", "pointer_targeted"):
             normalized_pass_mode = "directional"
@@ -375,14 +399,32 @@ class HexagonBasketballEnv(gym.Env):
             shape=(self.players_per_side * 3,),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Dict(
-            {
-                "obs": state_space,
-                "action_mask": action_mask_space,
-                "role_flag": role_flag_space,
-                "skills": skills_space,
-            }
-        )
+        obs_spaces: Dict[str, spaces.Space] = {
+            "obs": state_space,
+            "action_mask": action_mask_space,
+            "role_flag": role_flag_space,
+            "skills": skills_space,
+        }
+        if self.enable_intent_learning:
+            obs_spaces["intent_index"] = spaces.Box(
+                low=0.0,
+                high=float(max(0, self.num_intents - 1)),
+                shape=(1,),
+                dtype=np.float32,
+            )
+            obs_spaces["intent_active"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            obs_spaces["intent_visible"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            obs_spaces["intent_age_norm"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            obs_spaces["intent_commitment_remaining_norm"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+        self.observation_space = spaces.Dict(obs_spaces)
 
         # --- Hexagonal Grid Directions ---
         # These are the 6 axial direction vectors for a pointy-topped hexagonal grid.
@@ -655,8 +697,8 @@ class HexagonBasketballEnv(gym.Env):
 
     @profile_section("_is_between_points")
     def _is_between_points(
-        self,
-        point: Tuple[int, int],
+        self, 
+        point: Tuple[int, int], 
         line_start: Tuple[int, int],
         line_end: Tuple[int, int]
     ) -> bool:
@@ -672,6 +714,121 @@ class HexagonBasketballEnv(gym.Env):
             True if point projects onto the line segment (not just the infinite line)
         """
         return geometry.is_between_points(point, line_start, line_end)
+
+    def _training_observer_is_offense(self) -> bool:
+        return self.training_team == Team.OFFENSE
+
+    def _sample_intent_for_episode(self) -> None:
+        """Sample/initialize latent intent state for the episode."""
+        if not self.enable_intent_learning:
+            self.intent_index = 0
+            self.intent_active = False
+            self.intent_age = 0
+            self.intent_commitment_remaining = 0
+            self._intent_visible_to_defense = False
+            return
+
+        self.intent_active = bool(self._rng.random() >= self.intent_null_prob)
+        self.intent_index = (
+            int(self._rng.integers(0, self.num_intents)) if self.intent_active else 0
+        )
+        self.intent_age = 0
+        self.intent_commitment_remaining = int(self.intent_commitment_steps)
+        self._intent_visible_to_defense = bool(
+            self._rng.random() < self.intent_visible_to_defense_prob
+        )
+
+    def _advance_intent_clock(self) -> None:
+        if not self.enable_intent_learning:
+            return
+        self.intent_age += 1
+        if self.intent_commitment_remaining > 0:
+            self.intent_commitment_remaining -= 1
+
+    def _intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
+        if not self.enable_intent_learning or not self.intent_active:
+            return False
+        if self.intent_obs_mode == "public":
+            return True
+        if self.intent_obs_mode == "hidden":
+            return False
+        if observer_is_offense:
+            return True
+        return bool(self._intent_visible_to_defense)
+
+    def get_intent_observation_fields(
+        self, observer_is_offense: bool
+    ) -> Dict[str, np.ndarray]:
+        """Return role-conditioned intent features as observation fields."""
+        if not self.enable_intent_learning:
+            return {}
+        visible = self._intent_visible_for_observer(bool(observer_is_offense))
+        active = bool(self.intent_active)
+        masked_index = int(self.intent_index) if (active and visible) else 0
+        age_norm = (
+            float(self.intent_age) / float(max(1, self.intent_commitment_steps))
+            if active
+            else 0.0
+        )
+        remaining_norm = (
+            float(self.intent_commitment_remaining)
+            / float(max(1, self.intent_commitment_steps))
+            if active
+            else 0.0
+        )
+        age_norm = float(max(0.0, min(1.0, age_norm)))
+        remaining_norm = float(max(0.0, min(1.0, remaining_norm)))
+        return {
+            "intent_index": np.array([float(masked_index)], dtype=np.float32),
+            "intent_active": np.array([1.0 if active else 0.0], dtype=np.float32),
+            "intent_visible": np.array([1.0 if visible else 0.0], dtype=np.float32),
+            "intent_age_norm": np.array([age_norm], dtype=np.float32),
+            "intent_commitment_remaining_norm": np.array(
+                [remaining_norm], dtype=np.float32
+            ),
+        }
+
+    def get_intent_global_features(self, observer_is_offense: bool) -> np.ndarray:
+        """Return compact intent globals for set-observation pipelines."""
+        if not self.enable_intent_learning:
+            return np.zeros(0, dtype=np.float32)
+        fields = self.get_intent_observation_fields(bool(observer_is_offense))
+        intent_index = float(fields["intent_index"][0])
+        intent_index_norm = (
+            intent_index / float(max(1, self.num_intents - 1))
+            if self.num_intents > 1
+            else intent_index
+        )
+        return np.array(
+            [
+                float(intent_index_norm),
+                float(fields["intent_active"][0]),
+                float(fields["intent_visible"][0]),
+            ],
+            dtype=np.float32,
+        )
+
+    def patch_globals_with_intent_features(
+        self, globals_vec: np.ndarray, observer_is_offense: bool
+    ) -> np.ndarray:
+        """Overwrite trailing globals slots with role-conditioned intent features."""
+        arr = np.asarray(globals_vec, dtype=np.float32).reshape(-1).copy()
+        feats = self.get_intent_global_features(bool(observer_is_offense))
+        if feats.size == 0:
+            return arr
+        if arr.shape[0] >= feats.shape[0]:
+            arr[-feats.shape[0] :] = feats
+        return arr
+
+    def _build_observation_dict(self, observer_is_offense: bool) -> Dict[str, np.ndarray]:
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks(),
+            "role_flag": np.array([1.0 if observer_is_offense else -1.0], dtype=np.float32),
+            "skills": self._get_offense_skills_array(),
+        }
+        obs.update(self.get_intent_observation_fields(observer_is_offense))
+        return obs
 
     @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -724,6 +881,8 @@ class HexagonBasketballEnv(gym.Env):
         self._first_step_after_reset = True
         # Initialize cached phi value (Φ(s₀) = 0 for PBRS)
         self._cached_phi = 0.0
+        # Initialize latent intent state for this episode
+        self._sample_intent_for_episode()
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
@@ -773,15 +932,9 @@ class HexagonBasketballEnv(gym.Env):
             # Random offensive player starts with ball
             self.ball_holder = int(self._rng.choice(self.offense_ids))
 
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks(),
-            "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": self._get_offense_skills_array(),
-        }
+        obs = self._build_observation_dict(
+            observer_is_offense=self._training_observer_is_offense()
+        )
         mask = obs["action_mask"]
         try:
             offense_mask = mask[self.offense_ids]
@@ -808,6 +961,7 @@ class HexagonBasketballEnv(gym.Env):
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
 
         self.step_count += 1
+        self._advance_intent_clock()
 
         # Compute Phi(s) at start of step (for logs and optional shaping)
         # Use cached value from previous step to avoid redundant calculation (telescoping)
@@ -853,15 +1007,9 @@ class HexagonBasketballEnv(gym.Env):
                     done = True
                     self.episode_ended = done
 
-                    obs = {
-                        "obs": self._get_observation(),
-                        "action_mask": self._get_action_masks(),
-                        "role_flag": np.array(
-                            [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                            dtype=np.float32,
-                        ),
-                        "skills": self._get_offense_skills_array(),
-                    }
+                    obs = self._build_observation_dict(
+                        observer_is_offense=self._training_observer_is_offense()
+                    )
                     info = self._attach_legal_action_stats(
                         {
                             "training_team": self.training_team.name,
@@ -1064,15 +1212,9 @@ class HexagonBasketballEnv(gym.Env):
         self._pending_action_probs = None
         self._pending_pointer_pass_targets = {}
 
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks(),
-            "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": self._get_offense_skills_array(),
-        }
+        obs = self._build_observation_dict(
+            observer_is_offense=self._training_observer_is_offense()
+        )
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
@@ -1656,6 +1798,29 @@ class HexagonBasketballEnv(gym.Env):
         info.setdefault(
             "legal_actions_defense",
             float(getattr(self, "_legal_actions_defense", 0.0)),
+        )
+        info = self._attach_intent_stats(info)
+        return info
+
+    def _attach_intent_stats(self, info: Optional[Dict]) -> Dict:
+        if info is None:
+            info = {}
+        training_visible = self._intent_visible_for_observer(
+            self._training_observer_is_offense()
+        )
+        info.setdefault(
+            "intent_index",
+            float(self.intent_index if self.intent_active else 0),
+        )
+        info.setdefault("intent_active", 1.0 if self.intent_active else 0.0)
+        info.setdefault(
+            "intent_visible_training_obs",
+            1.0 if training_visible else 0.0,
+        )
+        info.setdefault("intent_age", float(self.intent_age))
+        info.setdefault(
+            "intent_commitment_remaining",
+            float(self.intent_commitment_remaining),
         )
         return info
 

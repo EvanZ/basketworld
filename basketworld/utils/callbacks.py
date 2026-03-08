@@ -7,7 +7,19 @@ from typing import Optional
 
 import numpy as np
 import mlflow
+import torch
+import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
+
+from basketworld.utils.intent_discovery import (
+    IntentDiscriminator,
+    IntentEpisodeBuffer,
+    IntentTransition,
+    RunningMeanStd,
+    compute_episode_embeddings,
+    extract_action_features_for_env,
+    flatten_observation_for_env,
+)
 
 
 class TimingCallback(BaseCallback):
@@ -637,6 +649,298 @@ class AccumulativeMetricsCallback(BaseCallback):
         except Exception:
             pass
 
+
+
+class IntentDiversityCallback(BaseCallback):
+    """DIAYN-style diversity shaping for latent intent episodes.
+
+    This callback is fully gated by `enabled`; when disabled it is a no-op.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        beta_target: float = 0.05,
+        warmup_steps: int = 1_000_000,
+        ramp_steps: int = 1_000_000,
+        bonus_clip: float = 2.0,
+        disc_lr: float = 3e-4,
+        disc_batch_size: int = 256,
+        disc_updates_per_rollout: int = 2,
+        disc_hidden_dim: int = 128,
+        disc_dropout: float = 0.1,
+        max_obs_dim: int = 256,
+        max_action_dim: int = 16,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.beta_target = float(max(0.0, beta_target))
+        self.warmup_steps = int(max(0, warmup_steps))
+        self.ramp_steps = int(max(1, ramp_steps))
+        self.bonus_clip = float(max(0.0, bonus_clip))
+        self.disc_lr = float(max(1e-8, disc_lr))
+        self.disc_batch_size = int(max(1, disc_batch_size))
+        self.disc_updates_per_rollout = int(max(1, disc_updates_per_rollout))
+        self.disc_hidden_dim = int(max(16, disc_hidden_dim))
+        self.disc_dropout = float(max(0.0, disc_dropout))
+        self.max_obs_dim = int(max(8, max_obs_dim))
+        self.max_action_dim = int(max(1, max_action_dim))
+
+        self._rollout_step_idx = 0
+        self._episodes = IntentEpisodeBuffer()
+        self._bonus_stats = RunningMeanStd()
+        self._disc: Optional[IntentDiscriminator] = None
+        self._disc_opt: Optional[torch.optim.Optimizer] = None
+        self._device = torch.device("cpu")
+        self._warned_recompute = False
+        self._last_disc_loss = 0.0
+        self._last_disc_acc = 0.0
+
+    def _on_training_start(self) -> None:
+        try:
+            policy = getattr(self.model, "policy", None)
+            if policy is not None and hasattr(policy, "device"):
+                self._device = torch.device(policy.device)
+        except Exception:
+            self._device = torch.device("cpu")
+
+    def _on_rollout_start(self) -> None:
+        self._rollout_step_idx = 0
+
+    def _beta_current(self) -> float:
+        t = int(getattr(self.model, "num_timesteps", 0))
+        if t < self.warmup_steps:
+            return 0.0
+        if self.ramp_steps <= 0:
+            return float(self.beta_target)
+        progress = min(1.0, max(0.0, (t - self.warmup_steps) / float(self.ramp_steps)))
+        return float(self.beta_target * progress)
+
+    @staticmethod
+    def _extract_scalar_from_obs(obs_payload, key: str, env_idx: int, default: float = 0.0) -> float:
+        try:
+            if not isinstance(obs_payload, dict):
+                return float(default)
+            if key not in obs_payload:
+                return float(default)
+            arr = np.asarray(obs_payload[key], dtype=np.float32)
+            if arr.ndim == 0:
+                return float(arr)
+            if arr.shape[0] <= int(env_idx):
+                return float(default)
+            return float(arr[int(env_idx)].reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    def _build_transition(
+        self, obs_payload, actions_payload, info: dict, env_idx: int
+    ) -> IntentTransition:
+        obs_feat = flatten_observation_for_env(obs_payload, env_idx)
+        act_feat = extract_action_features_for_env(actions_payload, env_idx)
+        feat = np.zeros(self.max_obs_dim + self.max_action_dim, dtype=np.float32)
+        obs_take = min(self.max_obs_dim, obs_feat.shape[0])
+        if obs_take > 0:
+            feat[:obs_take] = obs_feat[:obs_take]
+        act_take = min(self.max_action_dim, act_feat.shape[0])
+        if act_take > 0:
+            start = self.max_obs_dim
+            feat[start : start + act_take] = act_feat[:act_take]
+
+        role_flag = self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0)
+        intent_active = self._extract_scalar_from_obs(
+            obs_payload,
+            "intent_active",
+            env_idx,
+            default=float(info.get("intent_active", 0.0)),
+        )
+        intent_index = self._extract_scalar_from_obs(
+            obs_payload,
+            "intent_index",
+            env_idx,
+            default=float(info.get("intent_index", 0.0)),
+        )
+
+        return IntentTransition(
+            feature=feat,
+            buffer_step_idx=int(self._rollout_step_idx),
+            env_idx=int(env_idx),
+            role_flag=float(role_flag),
+            intent_active=bool(intent_active > 0.5),
+            intent_index=int(max(0, min(self.num_intents - 1, int(intent_index)))),
+        )
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        actions = self.locals.get("actions", None)
+        obs_payload = self.locals.get("new_obs", None)
+        if obs_payload is None:
+            obs_payload = self.locals.get("obs", None)
+
+        n_envs = len(infos) if isinstance(infos, (list, tuple)) else 0
+        for env_idx in range(n_envs):
+            info = infos[env_idx] or {}
+            tr = self._build_transition(obs_payload, actions, info, env_idx)
+            self._episodes.append(env_idx, tr)
+            if env_idx < len(dones) and bool(dones[env_idx]):
+                self._episodes.close_episode(env_idx)
+
+        self._rollout_step_idx += 1
+        return True
+
+    def _maybe_build_discriminator(self, input_dim: int) -> None:
+        if self._disc is not None:
+            return
+        self._disc = IntentDiscriminator(
+            input_dim=input_dim,
+            hidden_dim=self.disc_hidden_dim,
+            num_intents=self.num_intents,
+            dropout=self.disc_dropout,
+        ).to(self._device)
+        self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=self.disc_lr)
+
+    def _train_discriminator(self, x_np: np.ndarray, y_np: np.ndarray) -> tuple[float, float]:
+        if x_np.shape[0] == 0:
+            return 0.0, 0.0
+        self._maybe_build_discriminator(x_np.shape[1])
+        assert self._disc is not None
+        assert self._disc_opt is not None
+
+        x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+
+        self._disc.train()
+        last_loss = 0.0
+        last_acc = 0.0
+        n = int(x.shape[0])
+        for _ in range(self.disc_updates_per_rollout):
+            if n <= self.disc_batch_size:
+                idx = torch.arange(n, device=self._device)
+            else:
+                idx = torch.randint(0, n, (self.disc_batch_size,), device=self._device)
+            xb = x[idx]
+            yb = y[idx]
+            logits = self._disc(xb)
+            loss = F.cross_entropy(logits, yb)
+            self._disc_opt.zero_grad(set_to_none=True)
+            loss.backward()
+            self._disc_opt.step()
+
+            with torch.no_grad():
+                pred = torch.argmax(logits, dim=-1)
+                acc = (pred == yb).float().mean()
+                last_loss = float(loss.detach().cpu().item())
+                last_acc = float(acc.detach().cpu().item())
+        return last_loss, last_acc
+
+    def _compute_episode_bonus(self, x_np: np.ndarray, y_np: np.ndarray) -> np.ndarray:
+        if x_np.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float32)
+        assert self._disc is not None
+        x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x)
+            log_probs = F.log_softmax(logits, dim=-1)
+            chosen = log_probs[torch.arange(log_probs.shape[0], device=self._device), y]
+            bonus = chosen + float(np.log(float(self.num_intents)))
+        return bonus.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def _recompute_returns_and_advantage(self) -> None:
+        try:
+            rollout_buffer = self.model.rollout_buffer
+            policy = self.model.policy
+            with torch.no_grad():
+                obs_tensor, _ = policy.obs_to_tensor(self.model._last_obs)
+                last_values = policy.predict_values(obs_tensor)
+            rollout_buffer.compute_returns_and_advantage(
+                last_values=last_values,
+                dones=self.model._last_episode_starts,
+            )
+        except Exception as e:
+            if not self._warned_recompute:
+                print(
+                    f"[IntentDiversityCallback] Warning: could not recompute returns/advantages: {e}"
+                )
+                self._warned_recompute = True
+
+    @staticmethod
+    def _usage_entropy(y_np: np.ndarray, num_intents: int) -> tuple[float, float]:
+        if y_np.size == 0:
+            return 0.0, 0.0
+        counts = np.bincount(y_np, minlength=max(1, num_intents)).astype(np.float64)
+        probs = counts / max(1.0, float(np.sum(counts)))
+        probs = np.clip(probs, 1e-12, 1.0)
+        entropy = float(-np.sum(probs * np.log(probs)))
+        min_prob = float(np.min(probs))
+        return entropy, min_prob
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled:
+            return
+
+        episodes = self._episodes.pop_completed(
+            filter_fn=lambda ep: ep.role_is_offense and ep.intent_active and ep.length > 0
+        )
+        if not episodes:
+            return
+        beta = self._beta_current()
+        if beta <= 0.0:
+            return
+
+        x_np, y_np = compute_episode_embeddings(
+            episodes,
+            max_obs_dim=self.max_obs_dim,
+            max_action_dim=self.max_action_dim,
+        )
+        if x_np.shape[0] == 0:
+            return
+
+        self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
+        raw_bonus = self._compute_episode_bonus(x_np, y_np)
+        if raw_bonus.size == 0:
+            return
+
+        self._bonus_stats.update(raw_bonus)
+        norm_bonus = (raw_bonus - float(self._bonus_stats.mean)) / float(self._bonus_stats.std)
+        clipped_bonus = np.clip(norm_bonus, -self.bonus_clip, self.bonus_clip)
+
+        rb = self.model.rollout_buffer
+        for ep_idx, episode in enumerate(episodes):
+            if ep_idx >= clipped_bonus.shape[0]:
+                break
+            per_step = float(beta * clipped_bonus[ep_idx] / max(1, episode.length))
+            for t_idx, env_idx in episode.buffer_indices:
+                if (
+                    0 <= int(t_idx) < rb.rewards.shape[0]
+                    and 0 <= int(env_idx) < rb.rewards.shape[1]
+                ):
+                    rb.rewards[int(t_idx), int(env_idx)] += per_step
+
+        self._recompute_returns_and_advantage()
+
+        try:
+            global_step = int(getattr(self.model, "num_timesteps", 0))
+            mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
+            mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
+            mlflow.log_metric(
+                "intent/bonus_norm_mean", float(np.mean(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_norm_std", float(np.std(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric("intent/beta_current", float(beta), step=global_step)
+            usage_entropy, min_prob = self._usage_entropy(y_np, self.num_intents)
+            mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
+            mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
+        except Exception:
+            pass
 
 
 # --- Entropy Schedules ---

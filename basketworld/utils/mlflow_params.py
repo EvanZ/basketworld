@@ -232,6 +232,43 @@ def get_mlflow_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         True,
     )
+    # Intent-learning controls
+    optional["enable_intent_learning"] = _get_param(
+        params,
+        ["enable_intent_learning", "enable-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["num_intents"] = _get_param(
+        params,
+        ["num_intents", "num-intents"],
+        int,
+        8,
+    )
+    optional["intent_commitment_steps"] = _get_param(
+        params,
+        ["intent_commitment_steps", "intent-commitment-steps"],
+        int,
+        4,
+    )
+    optional["intent_null_prob"] = _get_param(
+        params,
+        ["intent_null_prob", "intent-null-prob"],
+        float,
+        0.2,
+    )
+    optional["intent_visible_to_defense_prob"] = _get_param(
+        params,
+        ["intent_visible_to_defense_prob", "intent-visible-to-defense-prob"],
+        float,
+        0.0,
+    )
+    optional["intent_obs_mode"] = _get_param(
+        params,
+        ["intent_obs_mode", "intent-obs-mode"],
+        str,
+        "private_offense",
+    )
 
     # Reward parameters (to ensure evaluation uses the same reward shaping)
     optional["pass_reward"] = _get_param(

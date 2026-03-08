@@ -6,6 +6,7 @@ from typing import List
 
 from fastapi import APIRouter, HTTPException
 import mlflow
+import numpy as np
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
@@ -28,6 +29,29 @@ from basketworld.envs.basketworld_env_v2 import Team
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _rebuild_cached_obs() -> None:
+    """Rebuild game_state.obs from env while preserving current viewer role."""
+    if not game_state.env:
+        return
+    env = game_state.env
+    role_value = (
+        float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
+        if game_state.obs is not None and game_state.obs.get("role_flag") is not None
+        else (1.0 if env.training_team == Team.OFFENSE else -1.0)
+    )
+    observer_is_offense = bool(role_value > 0.0)
+    if hasattr(env, "_build_observation_dict"):
+        game_state.obs = env._build_observation_dict(observer_is_offense)
+        game_state.obs["role_flag"] = np.array([role_value], dtype=np.float32)
+    else:
+        game_state.obs = {
+            "obs": env._get_observation(),
+            "action_mask": env._get_action_masks(),
+            "role_flag": np.array([role_value], dtype=np.float32),
+            "skills": env._get_offense_skills_array(),
+        }
 
 
 @router.post("/api/batch_update_player_positions")
@@ -54,14 +78,7 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
                 raise HTTPException(status_code=400, detail=f"Position {new_pos} is occupied by Player {i}.")
         game_state.env.positions[pid] = new_pos
 
-    obs_vec = game_state.env._get_observation()
-    action_mask = game_state.env._get_action_masks()
-    game_state.obs = {
-        "obs": obs_vec,
-        "action_mask": action_mask,
-        "role_flag": game_state.obs.get("role_flag"),
-        "skills": game_state.obs.get("skills"),
-    }
+    _rebuild_cached_obs()
 
     updated_state = get_ui_game_state()
     if game_state.episode_states:
@@ -93,14 +110,7 @@ def update_player_position(req: UpdatePositionRequest):
 
     game_state.env.positions[pid] = new_pos
 
-    obs_vec = game_state.env._get_observation()
-    action_mask = game_state.env._get_action_masks()
-    game_state.obs = {
-        "obs": obs_vec,
-        "action_mask": action_mask,
-        "role_flag": game_state.obs.get("role_flag"),
-        "skills": game_state.obs.get("skills"),
-    }
+    _rebuild_cached_obs()
 
     updated_state = get_ui_game_state()
     if game_state.episode_states:
@@ -153,14 +163,7 @@ def set_ball_holder(req: SetBallHolderRequest):
 
     env.ball_holder = int(req.player_id)
     try:
-        obs_vec = env._get_observation()
-        action_mask = env._get_action_masks()
-        game_state.obs = {
-            "obs": obs_vec,
-            "action_mask": action_mask,
-            "role_flag": game_state.obs.get("role_flag"),
-            "skills": game_state.obs.get("skills"),
-        }
+        _rebuild_cached_obs()
         updated_state = get_ui_game_state()
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
@@ -550,15 +553,7 @@ def _set_pressure_params_impl(
             game_state.env_optional_params = {}
         game_state.env_optional_params.update(normalized)
 
-        obs_vec = env._get_observation()
-        action_mask = env._get_action_masks()
-        prior_obs = game_state.obs or {}
-        game_state.obs = {
-            "obs": obs_vec,
-            "action_mask": action_mask,
-            "role_flag": prior_obs.get("role_flag"),
-            "skills": prior_obs.get("skills"),
-        }
+        _rebuild_cached_obs()
 
         updated_state = get_ui_game_state()
         if game_state.episode_states:

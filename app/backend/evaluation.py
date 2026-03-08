@@ -155,6 +155,28 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
         cloned["players"] = _np.copy(players)
     if globals_vec is not None:
         cloned["globals"] = _np.copy(globals_vec)
+    if isinstance(obs, dict):
+        for key, value in obs.items():
+            if key in cloned:
+                continue
+            if isinstance(value, _np.ndarray):
+                cloned[key] = _np.copy(value)
+    observer_is_offense = bool(float(role_flag_value) > 0.0)
+    try:
+        env = _worker_state.get("env")
+        fields = env.get_intent_observation_fields(observer_is_offense)
+    except Exception:
+        fields = {}
+    if fields:
+        for key, value in fields.items():
+            cloned[key] = _np.array(value, dtype=_np.float32, copy=True)
+    if "globals" in cloned:
+        try:
+            cloned["globals"] = _worker_state["env"].patch_globals_with_intent_features(
+                cloned["globals"], observer_is_offense
+            )
+        except Exception:
+            pass
     return cloned
 
 
@@ -1461,18 +1483,19 @@ def pass_steal_preview(env, positions: list[tuple[int, int]], ball_holder: int):
     try:
         env.positions = list(validated_positions)
         env.ball_holder = ball_holder
-        obs_vec = env._get_observation()
-        action_mask = env._get_action_masks()
-
-        dummy_obs = {
-            "obs": obs_vec,
-            "action_mask": action_mask,
-            "role_flag": np.array(
-                [1.0 if env.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": env._get_offense_skills_array(),
-        }
+        observer_is_offense = bool(env.training_team == Team.OFFENSE)
+        if hasattr(env, "_build_observation_dict"):
+            dummy_obs = env._build_observation_dict(observer_is_offense)
+        else:
+            dummy_obs = {
+                "obs": env._get_observation(),
+                "action_mask": env._get_action_masks(),
+                "role_flag": np.array(
+                    [1.0 if env.training_team == Team.OFFENSE else -1.0],
+                    dtype=np.float32,
+                ),
+                "skills": env._get_offense_skills_array(),
+            }
 
         steal_probs = env.calculate_pass_steal_probabilities(ball_holder)
         return {

@@ -19,6 +19,28 @@ from .state import GameState, _role_flag_value_for_team, game_state
 _predict_failure_count = 0
 
 
+def _apply_intent_fields_for_role(cloned: Dict, env, role_flag_value: float) -> Dict:
+    """Recondition role-dependent intent fields for cloned observations."""
+    if env is None:
+        return cloned
+    observer_is_offense = bool(float(role_flag_value) > 0.0)
+    try:
+        fields = env.get_intent_observation_fields(observer_is_offense)
+    except Exception:
+        fields = {}
+    if fields:
+        for key, value in fields.items():
+            cloned[key] = np.array(value, dtype=np.float32, copy=True)
+    if "globals" in cloned:
+        try:
+            cloned["globals"] = env.patch_globals_with_intent_features(
+                cloned["globals"], observer_is_offense
+            )
+        except Exception:
+            pass
+    return cloned
+
+
 def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
     cloned = {
         "obs": np.copy(obs["obs"]),
@@ -36,6 +58,12 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
         cloned["players"] = np.copy(players)
     if globals_vec is not None:
         cloned["globals"] = np.copy(globals_vec)
+    if isinstance(obs, dict):
+        for key, value in obs.items():
+            if key in cloned:
+                continue
+            if isinstance(value, np.ndarray):
+                cloned[key] = np.copy(value)
     return cloned
 
 
@@ -87,6 +115,7 @@ def _predict_actions_for_team(
 
     role_flag_value = _role_flag_value_for_team(team)
     conditioned_obs = _clone_obs_with_role_flag(base_obs, role_flag_value)
+    conditioned_obs = _apply_intent_fields_for_role(conditioned_obs, env, role_flag_value)
 
     raw_actions = None
     try:
@@ -260,6 +289,18 @@ def _build_role_conditioned_obs(base_obs: dict | None, role_flag_value: float):
         conditioned["players"] = np.copy(players)
     if globals_vec is not None:
         conditioned["globals"] = np.copy(globals_vec)
+    if isinstance(base_obs, dict):
+        for key, value in base_obs.items():
+            if key in conditioned:
+                continue
+            if isinstance(value, np.ndarray):
+                conditioned[key] = np.copy(value)
+    try:
+        conditioned = _apply_intent_fields_for_role(
+            conditioned, game_state.env, role_flag_value
+        )
+    except Exception:
+        pass
     return conditioned
 
 
@@ -367,6 +408,15 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             conditioned_next_obs["players"] = np.copy(players)
         if globals_vec is not None:
             conditioned_next_obs["globals"] = np.copy(globals_vec)
+        if isinstance(next_obs, dict):
+            for key, value in next_obs.items():
+                if key in conditioned_next_obs:
+                    continue
+                if isinstance(value, np.ndarray):
+                    conditioned_next_obs[key] = np.copy(value)
+        conditioned_next_obs = _apply_intent_fields_for_role(
+            conditioned_next_obs, temp_env, role_flag_value
+        )
 
         next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
         with torch.no_grad():

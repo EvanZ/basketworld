@@ -108,6 +108,7 @@ try:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_intent_diversity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -145,6 +146,7 @@ except ImportError:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_intent_diversity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -665,6 +667,8 @@ def main(args):
             total_planned_ts,
             timestep_offset,
         )
+        # Optional DIAYN-style intent diversity objective
+        intent_diversity_callback = build_intent_diversity_callback(args)
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -828,6 +832,7 @@ def main(args):
                 beta_callback,
                 pass_bias_callback,
                 pass_curriculum_callback,
+                intent_diversity_callback,
             )
             
             # Single learn() call trains both offense and defense together

@@ -19,3 +19,17 @@ def test_set_observation_wrapper_adds_tokens_and_globals():
 
     assert np.all(np.isfinite(players))
     assert np.all(np.isfinite(globals_vec))
+
+
+def test_set_observation_wrapper_adds_intent_globals_when_enabled():
+    env = SetObservationWrapper(
+        basketworld.HexagonBasketballEnv(
+            players=3,
+            enable_intent_learning=True,
+            intent_null_prob=0.0,
+        )
+    )
+    obs, _ = env.reset(seed=3)
+    globals_vec = obs["globals"]
+    assert globals_vec.shape == (7,)
+    assert np.all(np.isfinite(globals_vec))

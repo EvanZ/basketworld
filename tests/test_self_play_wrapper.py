@@ -16,9 +16,11 @@ class _DummySB3Policy:
     def __init__(self, output_actions):
         self.policy = _DummyInnerPolicy()
         self._output_actions = np.array(output_actions, dtype=int)
+        self.last_obs = None
 
     def predict(self, obs, deterministic=False):
-        del obs, deterministic
+        self.last_obs = obs
+        del deterministic
         return np.array(self._output_actions, dtype=int), None
 
 
@@ -97,3 +99,24 @@ def test_wrapper_applies_pass_mode_when_loading_opponent_from_path(monkeypatch):
     assert fake_loaded.policy.pass_mode_calls, "Expected pass mode to be set on loaded opponent policy."
     assert fake_loaded.policy.pass_mode_calls[-1] == "pointer_targeted"
 
+
+def test_wrapper_reconditions_intent_fields_for_opponent_role():
+    env = HexagonBasketballEnv(
+        players=3,
+        render_mode=None,
+        training_team=Team.DEFENSE,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+        intent_visible_to_defense_prob=0.0,
+    )
+    opponent = _DummySB3Policy(output_actions=[0, 0, 0])
+    wrapped = SelfPlayEnvWrapper(env, opponent_policy=opponent)
+
+    obs, _ = wrapped.reset(seed=5)
+    assert float(obs["intent_active"][0]) == 1.0
+    assert float(obs["intent_visible"][0]) == 0.0
+
+    wrapped.step(np.zeros(env.players_per_side, dtype=int))
+    assert opponent.last_obs is not None
+    assert float(opponent.last_obs["role_flag"][0]) == 1.0
+    assert float(opponent.last_obs["intent_visible"][0]) == 1.0

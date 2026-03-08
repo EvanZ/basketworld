@@ -7,6 +7,7 @@ from basketworld.envs.basketworld_env_v2 import ActionType, Team
 
 TOKEN_DIM = 15
 GLOBAL_DIM = 4
+INTENT_GLOBAL_DIM = 3
 TOKEN_Q_IDX = 0
 TOKEN_R_IDX = 1
 TOKEN_ROLE_IDX = 2
@@ -23,10 +24,17 @@ class SetObservationWrapper(gym.ObservationWrapper):
 
     _TOKEN_DIM = TOKEN_DIM
     _GLOBAL_DIM = GLOBAL_DIM
+    _INTENT_GLOBAL_DIM = INTENT_GLOBAL_DIM
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
         n_players = int(self.env.unwrapped.n_players)
+        self._include_intent_globals = bool(
+            getattr(self.env.unwrapped, "enable_intent_learning", False)
+        )
+        self._global_dim = self._GLOBAL_DIM + (
+            self._INTENT_GLOBAL_DIM if self._include_intent_globals else 0
+        )
 
         if isinstance(env.observation_space, gym.spaces.Dict):
             spaces_dict = dict(env.observation_space.spaces)
@@ -42,7 +50,7 @@ class SetObservationWrapper(gym.ObservationWrapper):
         spaces_dict["globals"] = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self._GLOBAL_DIM,),
+            shape=(self._global_dim,),
             dtype=np.float32,
         )
         self.observation_space = gym.spaces.Dict(spaces_dict)
@@ -207,6 +215,27 @@ class SetObservationWrapper(gym.ObservationWrapper):
             ],
             dtype=np.float32,
         )
+        if self._include_intent_globals:
+            role_flag = np.asarray(
+                obs_dict.get("role_flag", np.array([1.0], dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(role_flag[0] > 0.0) if role_flag.size > 0 else True
+            intent_globals = np.zeros(self._INTENT_GLOBAL_DIM, dtype=np.float32)
+            try:
+                if hasattr(env, "get_intent_global_features"):
+                    raw = np.asarray(
+                        env.get_intent_global_features(observer_is_offense),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    intent_globals[: min(len(raw), self._INTENT_GLOBAL_DIM)] = raw[
+                        : self._INTENT_GLOBAL_DIM
+                    ]
+            except Exception:
+                pass
+            globals_vec = np.concatenate([globals_vec, intent_globals]).astype(
+                np.float32, copy=False
+            )
         obs_dict["players"] = players
         obs_dict["globals"] = globals_vec
         return obs_dict
