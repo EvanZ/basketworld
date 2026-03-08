@@ -370,3 +370,44 @@ Fix:
 3. Defense remains strong when offense intent is unknown (human proxy).
 4. Turning off intent learning returns baseline behavior cleanly.
 5. Playable app and development mode remain functional with legacy non-intent models and unchanged API contracts.
+
+## ChatGPT 5.4 Critique of Plan
+
+1. The biggest gap is backward compatibility. The plan says intent features can be “all zeros or omitted” when disabled, but the current runtime builds fixed observation spaces, and existing checkpoints depend on those exact shapes. See [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L36](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L36), [basketworld_env_v2.py#L316](/home/ubuntu/basketworld/basketworld/envs/basketworld_env_v2.py#L316), and [wrappers.py#L36](/home/ubuntu/basketworld/basketworld/utils/wrappers.py#L36). I would not modify the legacy schema in place. Add an explicit `obs_schema_version` and only construct intent-augmented spaces for intent-enabled runs.
+
+2. The null/unknown encoding is flawed as written. The plan defines `intent_id` in `[0, num_intents-1]` and later uses `intent_id=0` for unknown/no-intent episodes, which collides with a real learned intent. See [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L78](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L78) and [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L117](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L117). Use separate fields like `intent_index`, `intent_active`, and `intent_visible`, or reserve a dedicated null index outside the learned range.
+
+3. The implementation surface is wider than the file plan says. Updating `SelfPlayEnvWrapper` is necessary, but it is not sufficient. The backend has multiple role-conditioned observation clone paths that would also need intent reconditioning and schema awareness: [self_play_wrapper.py#L121](/home/ubuntu/basketworld/basketworld/utils/self_play_wrapper.py#L121), [observations.py#L22](/home/ubuntu/basketworld/app/backend/observations.py#L22), [evaluation.py#L140](/home/ubuntu/basketworld/app/backend/evaluation.py#L140), and [lifecycle_routes.py#L96](/home/ubuntu/basketworld/app/backend/routes/lifecycle_routes.py#L96). The plan should explicitly include these files, plus [mlflow_params.py#L26](/home/ubuntu/basketworld/basketworld/utils/mlflow_params.py#L26), or the backend will reconstruct the wrong env for saved runs.
+
+4. Phase 2 is not implementation-ready yet. “Integrate via callbacks or custom PPO training step” is the hard part, not a small detail. See [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L260](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L260) versus current stock SB3 PPO usage in [train.py#L388](/home/ubuntu/basketworld/train/train.py#L388) and [train.py#L835](/home/ubuntu/basketworld/train/train.py#L835). You need to specify where trajectory windows are stored, when the discriminator is updated, and how the bonus is injected into the rollout buffer.
+
+5. The commitment-window state looks premature for phase 1. With one possession per episode and `intent_id` sampled in `reset()`, `intent_commitment_remaining` has no real effect unless phase 1 also allows mid-possession resampling or a higher-level chooser. See [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L49](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L49), [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L80](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L80), and [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L83](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L83). I would remove it from the first cut.
+
+**Suggestions**
+
+- Split this into `Phase 1A` and `Phase 2`. `Phase 1A`: env state, schema/versioning, backend/wrapper conditioning, logging, tests. No diversity loss yet.
+- For set-attention models, avoid stuffing a large one-hot into `globals` if you can. `globals` gets broadcast to every player token in [set_attention_policy.py#L37](/home/ubuntu/basketworld/basketworld/policies/set_attention_policy.py#L37) and [set_attention_policy.py#L105](/home/ubuntu/basketworld/basketworld/policies/set_attention_policy.py#L105). A compact flag plus learned embedding is cleaner.
+- Add explicit runtime validation that compares model metadata against env schema before the first `predict()`, not just generic shape-mismatch errors.
+- Expand tests to include MLflow param round-trip and backend role-conditioned clone helpers, not just env reset and self-play wrapper tests.
+- Tighten success criteria with thresholds: separability metric, PPP delta vs baseline, and unknown-intent defense degradation budget.
+
+The overall direction is good and it does fit this codebase. I would call it good enough to implement a narrowed phase 1 after the compatibility and schema issues are fixed. I would not start the diversity/discovery phase from this plan as-is.
+
+## Critique from Codex 5.3
+
+**Critical Findings**
+1. `intent_id` semantics conflict: you define `intent_id` in `[0..num_intents-1]`, but later use `intent_id=0` for unknown/no-intent, which collides with a real learned intent ([plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L78), [plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L117)).
+2. Backward-compatibility is under-specified for observation shape. Current env/wrappers use fixed dict spaces and fixed dims; adding intent fields in-place can break legacy checkpoints ([env obs space](/home/ubuntu/basketworld/basketworld/envs/basketworld_env_v2.py#L378), [set wrapper dims](/home/ubuntu/basketworld/basketworld/utils/wrappers.py#L8), [plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L36)).
+3. `SelfPlayEnvWrapper` changes are necessary but not sufficient. Role-conditioned obs cloning also exists in backend inference/eval paths and must be updated too, or you’ll get train/serve mismatch ([self-play wrapper](/home/ubuntu/basketworld/basketworld/utils/self_play_wrapper.py#L121), [backend observations](/home/ubuntu/basketworld/app/backend/observations.py#L22), [backend evaluation](/home/ubuntu/basketworld/app/backend/evaluation.py#L140)).
+4. Diversity objective integration is too vague for implementation. “callbacks or custom PPO step” is the hard part; with current SB3 flow this needs explicit rollout-buffer integration details ([plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L260), [training loop](/home/ubuntu/basketworld/train/train.py#L835)).
+5. Commitment-window state adds complexity without effect in current single-possession episodes; it should be deferred unless you actually resample intent intra-episode ([plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L83), [plan](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L49)).
+
+**What I’d Change**
+1. Split into phases: `Phase 1A` (schema-safe latent plumbing + masking + logging + tests), `Phase 1B` (training mixture schedule), `Phase 2` (diversity/discovery objective).
+2. Introduce explicit observation schema/version metadata and hard validation before `predict()` to prevent silent mismatches.
+3. Replace ambiguous intent encoding with separate fields: `intent_index`, `intent_active`, `intent_visible` (or reserve a dedicated null index outside learned range).
+4. Expand file plan to include backend runtime/config paths (`app/backend/observations.py`, `app/backend/evaluation.py`, `app/backend/routes/lifecycle_routes.py`, `basketworld/utils/mlflow_params.py`), not only env/wrapper/train files.
+5. Add concrete PPO integration design for diversity reward: where trajectory windows live, update frequency, and how bonus enters rollout rewards.
+6. Tighten success criteria with thresholds (separability metric, PPP delta, unknown-intent robustness delta).
+
+The plan is good directionally and implementable after these adjustments. I’d approve starting a narrowed `Phase 1A` now, and block `Phase 2` until the PPO integration spec is concrete.
