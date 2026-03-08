@@ -4,6 +4,7 @@ env/
 # .env
 .env
 .env.aws
+app/backend/.env.app
 
 # MLflow local database files
 mlflow.db
