@@ -121,9 +121,42 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  tabsMountEl: {
+    type: null,
+    default: null,
+  },
+  tabsMountSelector: {
+    type: String,
+    default: '',
+  },
 });
 
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
+
+const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
+const resolvedTabsMount = computed(() => {
+  return String(props.tabsMountSelector || '').trim();
+});
+const tabsTeleportEnabled = ref(false);
+const tabsMountTargetEl = computed(() => props.tabsMountEl || null);
+const resolvedTabsTeleportTarget = computed(() => {
+  return tabsMountTargetEl.value || resolvedTabsMount.value || 'body';
+});
+const useExternalTabsTeleport = computed(() => {
+  return Boolean(tabsMountTargetEl.value) || (hasExternalTabsMount.value && tabsTeleportEnabled.value);
+});
+
+function refreshTabsTeleportTarget() {
+  if (tabsMountTargetEl.value) {
+    tabsTeleportEnabled.value = true;
+    return;
+  }
+  if (!hasExternalTabsMount.value || typeof document === 'undefined') {
+    tabsTeleportEnabled.value = false;
+    return;
+  }
+  tabsTeleportEnabled.value = Boolean(document.querySelector(resolvedTabsMount.value));
+}
 
 const selectedActions = ref({});
 const selectedPassTargets = ref({});
@@ -663,10 +696,14 @@ function handleEvalModeChange(mode) {
       patch.shootingMode = 'fixed';
     }
     emitEvalConfigUpdate(patch);
+    activeTab.value = 'eval';
   } else {
     emitEvalConfigUpdate({ mode: 'default', placementEditing: false });
+    if (activeTab.value === 'eval') {
+      activeTab.value = 'rewards';
+    }
   }
-  emit('active-tab-changed', mode === 'custom' ? 'eval' : 'controls');
+  emit('active-tab-changed', activeTab.value);
 }
 
 const evalOffenseSkillRows = computed(() => {
@@ -991,7 +1028,7 @@ async function handleBallHolderChange(val) {
 }
 
 // Add rewards tracking
-const activeTab = ref('controls');
+const activeTab = ref('environment');
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
@@ -2597,7 +2634,19 @@ watch(() => activeTab.value, (newTab) => {
 onMounted(() => {
   isMounted.value = true;
   fetchRewards();
+  nextTick(() => {
+    refreshTabsTeleportTarget();
+    setTimeout(() => refreshTabsTeleportTarget(), 0);
+  });
   emit('active-tab-changed', activeTab.value);
+});
+
+watch(resolvedTabsMount, () => {
+  nextTick(() => refreshTabsTeleportTarget());
+});
+
+watch(tabsMountTargetEl, () => {
+  nextTick(() => refreshTabsTeleportTarget());
 });
 
 // Record stats once on episode completion (but skip during evaluation mode)
@@ -2643,14 +2692,6 @@ watch(
 watch(isPointerPassMode, (enabled) => {
   if (!enabled) {
     selectedPassTargets.value = {};
-  }
-});
-
-// Ensure Controls tab is visible when active player changes (e.g., from board clicks)
-watch(() => props.activePlayerId, (newVal, oldVal) => {
-  if (newVal !== oldVal) {
-    activeTab.value = 'controls';
-    emit('active-tab-changed', activeTab.value);
   }
 });
 
@@ -3148,15 +3189,85 @@ const stealRisks = computed(() => {
 
 <template>
   <div class="player-controls-container">
-    <h3>Player Controls</h3>
+    <div class="turn-controls-panel">
+      <h3 class="turn-controls-title">Turn Controls</h3>
+      <div class="ball-holder-row">
+        <label>Ball handler</label>
+        <select
+          :value="ballHolderSelection ?? ''"
+          @change="handleBallHolderChange($event.target.value)"
+          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || props.isManualStepping || offenseIdsLive.length === 0"
+        >
+          <option v-if="offenseIdsLive.length === 0" disabled value="">No offense players</option>
+          <option v-for="pid in offenseIdsLive" :key="`bh-${pid}`" :value="pid">Player {{ pid }}</option>
+        </select>
+        <span v-if="ballHolderUpdating" class="status-note">Updating…</span>
+        <span v-if="ballHolderError" class="error-note">{{ ballHolderError }}</span>
+      </div>
+
+      <div class="player-tabs">
+          <button
+              v-for="playerId in controlsTabPlayerIds"
+              :key="playerId"
+              class="player-tab"
+              :class="{ active: activePlayerId === playerId }"
+              @click="$emit('update:activePlayerId', playerId)"
+              :disabled="false"
+          >
+              Player {{ playerId }}
+              <span v-if="shouldDisplaySelectedAction(playerId) && getSelectedActionDisplay(playerId)">
+                ({{ getSelectedActionBadge(playerId) }})
+              </span>
+          </button>
+      </div>
+
+      <div class="control-pad-wrapper" v-if="activePlayerId !== null && controlsTabPlayerIds.includes(activePlayerId)">
+          <HexagonControlPad
+              :legal-actions="getControlPadLegalActions(activePlayerId)"
+              :selected-action="shouldDisplaySelectedAction(activePlayerId) ? getEffectiveSelectedAction(activePlayerId) : ''"
+              :pass-probabilities="passProbabilities"
+              @action-selected="handleActionSelected"
+              :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
+              :value-range="valueRange"
+              :is-defense="isDefense"
+              layout-variant="court"
+          />
+          <div v-if="isPointerPassMode" class="pointer-pass-controls pointer-pass-wrap" :class="{ 'has-pass-selection': activeHasPassSelection }">
+            <p class="pointer-pass-label">Pass Target</p>
+            <p v-if="props.gameState && !isBallHolderPlayer(activePlayerId)" class="pointer-pass-note">
+              Select the ball handler to choose a teammate target.
+            </p>
+            <p v-else-if="!activeCanSelectPointerPass" class="pointer-pass-note">
+              Passing is not legal from this state.
+            </p>
+            <div v-else class="pointer-pass-buttons">
+              <button
+                v-for="targetId in activePassTargets"
+                :key="`pass-target-${activePlayerId}-${targetId}`"
+                class="pointer-pass-button pointer-pass-btn"
+                :class="{ selected: isPointerPassButtonSelected(targetId) }"
+                :disabled="props.disabled"
+                @click="handlePointerPassTargetSelected(targetId)"
+              >
+                Player {{ targetId }}
+              </button>
+            </div>
+          </div>
+          <p v-if="shouldDisplaySelectedAction(activePlayerId) && getSelectedActionDisplay(activePlayerId)">
+              Selected for Player {{ activePlayerId }}: <strong>{{ getSelectedActionDisplay(activePlayerId) }}</strong>
+          </p>
+      </div>
+    </div>
     
+    <Teleport :to="resolvedTabsTeleportTarget" :disabled="!useExternalTabsTeleport">
+      <div class="tabs-content-shell">
     <!-- Tab Navigation -->
     <div class="tab-navigation">
       <button 
-        :class="{ active: activeTab === 'controls' }"
-        @click="activeTab = 'controls'"
+        :class="{ active: activeTab === 'environment' }"
+        @click="activeTab = 'environment'"
       >
-        Controls
+        Environment
       </button>
       <button 
         :class="{ active: activeTab === 'rewards' }"
@@ -3195,12 +3306,6 @@ const stealRisks = computed(() => {
         Eval
       </button>
       <button 
-        :class="{ active: activeTab === 'environment' }"
-        @click="activeTab = 'environment'"
-      >
-        Environment
-      </button>
-      <button 
         :class="{ active: activeTab === 'training' }"
         @click="activeTab = 'training'"
       >
@@ -3224,74 +3329,6 @@ const stealRisks = computed(() => {
       >
         Attention
       </button>
-    </div>
-
-    <!-- Controls Tab -->
-    <div v-if="activeTab === 'controls'" class="tab-content">
-      <div class="ball-holder-row">
-        <label>Ball handler</label>
-        <select
-          :value="ballHolderSelection ?? ''"
-          @change="handleBallHolderChange($event.target.value)"
-          :disabled="ballHolderUpdating || props.isEvaluating || props.isReplaying || props.isManualStepping || offenseIdsLive.length === 0"
-        >
-          <option v-if="offenseIdsLive.length === 0" disabled value="">No offense players</option>
-          <option v-for="pid in offenseIdsLive" :key="`bh-${pid}`" :value="pid">Player {{ pid }}</option>
-        </select>
-        <span v-if="ballHolderUpdating" class="status-note">Updating…</span>
-        <span v-if="ballHolderError" class="error-note">{{ ballHolderError }}</span>
-      </div>
-
-      <div class="player-tabs">
-          <button 
-              v-for="playerId in controlsTabPlayerIds" 
-              :key="playerId"
-              :class="{ active: activePlayerId === playerId }"
-              @click="$emit('update:activePlayerId', playerId)"
-              :disabled="false"
-          >
-              Player {{ playerId }}
-              <span v-if="shouldDisplaySelectedAction(playerId) && getSelectedActionDisplay(playerId)">
-                ({{ getSelectedActionBadge(playerId) }})
-              </span>
-          </button>
-      </div>
-      
-      <div class="control-pad-wrapper" v-if="activePlayerId !== null && controlsTabPlayerIds.includes(activePlayerId)">
-          <HexagonControlPad 
-              :legal-actions="getControlPadLegalActions(activePlayerId)"
-              :selected-action="shouldDisplaySelectedAction(activePlayerId) ? getEffectiveSelectedAction(activePlayerId) : ''"
-              :pass-probabilities="passProbabilities"
-              @action-selected="handleActionSelected"
-              :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
-              :value-range="valueRange"
-              :is-defense="isDefense"
-          />
-          <div v-if="isPointerPassMode" class="pointer-pass-controls" :class="{ 'has-pass-selection': activeHasPassSelection }">
-            <p class="pointer-pass-label">Pass Target</p>
-            <p v-if="props.gameState && !isBallHolderPlayer(activePlayerId)" class="pointer-pass-note">
-              Select the ball handler to choose a teammate target.
-            </p>
-            <p v-else-if="!activeCanSelectPointerPass" class="pointer-pass-note">
-              Passing is not legal from this state.
-            </p>
-            <div v-else class="pointer-pass-buttons">
-              <button
-                v-for="targetId in activePassTargets"
-                :key="`pass-target-${activePlayerId}-${targetId}`"
-                class="pointer-pass-button"
-                :class="{ selected: isPointerPassButtonSelected(targetId) }"
-                :disabled="props.disabled"
-                @click="handlePointerPassTargetSelected(targetId)"
-              >
-                Player {{ targetId }}
-              </button>
-            </div>
-          </div>
-          <p v-if="shouldDisplaySelectedAction(activePlayerId) && getSelectedActionDisplay(activePlayerId)">
-              Selected for Player {{ activePlayerId }}: <strong>{{ getSelectedActionDisplay(activePlayerId) }}</strong>
-          </p>
-      </div>
     </div>
 
     <!-- Advisor Tab -->
@@ -3917,6 +3954,10 @@ const stealRisks = computed(() => {
 
           <div class="param-category">
             <h5>Policies</h5>
+            <div class="param-item" data-tooltip="MLflow run ID used for currently loaded policies/state.">
+              <span class="param-name">Run ID:</span>
+              <span class="param-value">{{ props.gameState.run_id || 'N/A' }}</span>
+            </div>
             <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the player's team">
               <div class="policy-label">
                 Player ({{ props.gameState.user_team_name || 'OFFENSE' }})
@@ -4872,6 +4913,8 @@ const stealRisks = computed(() => {
         </div>
       </div>
     </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -4881,6 +4924,33 @@ const stealRisks = computed(() => {
   flex-direction: column;
   height: 100%;
   min-height: 400px;
+  padding: 0.2rem 0.4rem;
+  gap: 0.9rem;
+}
+
+.player-controls-container > h3 {
+  margin: 0;
+  color: var(--app-accent);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.95rem;
+}
+
+.turn-controls-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  margin-bottom: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 14px;
+  padding: 0.75rem;
+  background: rgba(15, 23, 42, 0.2);
+}
+
+.tabs-content-shell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .controls-wrapper {
@@ -4934,32 +5004,32 @@ const stealRisks = computed(() => {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0;
 }
 
 .player-tabs button {
-  padding: 0.4rem 0.9rem;
-  border: 1px solid var(--app-panel-border);
-  background-color: rgba(15, 23, 42, 0.4);
-  color: var(--app-text-muted);
-  cursor: pointer;
   border-radius: 999px;
-  transition: all 0.2s ease;
-  font-size: 0.8rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: var(--app-text);
+  padding: 0.4rem 0.85rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: border-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .player-tabs button:hover:not(:disabled) {
-  border-color: var(--app-accent);
+  border-color: var(--app-accent-strong);
   color: var(--app-accent);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.16);
 }
 
 .player-tabs button.active {
-  background-color: rgba(56, 189, 248, 0.15);
+  background-color: transparent;
   color: var(--app-accent);
-  border-color: var(--app-accent);
-  box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+  border-color: var(--app-accent-strong);
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.2);
 }
 
 .player-tabs button:disabled {
@@ -5371,65 +5441,69 @@ const stealRisks = computed(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1rem;
-  padding: 1rem;
-  background: rgba(15, 23, 42, 0.4);
-  border-radius: 16px;
-  border: 1px solid var(--app-panel-border);
+  gap: 0.8rem;
+  padding: 0;
+  background: transparent;
+  border: none;
+  width: 100%;
 }
 
 .pointer-pass-controls {
   width: 100%;
-  max-width: 360px;
+  max-width: 100%;
 }
 
 .pointer-pass-label {
-  margin: 0 0 0.5rem;
-  font-size: 0.8rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  margin: 0 0 0.4rem;
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--app-text-muted);
 }
 
 .pointer-pass-note {
   margin: 0;
-  font-size: 0.85rem;
+  font-size: 0.76rem;
   color: var(--app-text-muted);
 }
 
 .pointer-pass-buttons {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.45rem;
 }
 
 .pointer-pass-button {
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 999px;
+  background: transparent;
   color: var(--app-text);
-  padding: 0.45rem 0.7rem;
-  font-size: 0.85rem;
+  padding: 0.32rem 0.72rem;
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .pointer-pass-button:hover:not(:disabled) {
-  border-color: var(--app-accent);
+  border-color: var(--app-accent-strong);
+  color: var(--app-accent);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.14);
 }
 
 .pointer-pass-button.selected {
-  border-color: var(--app-accent);
-  background: rgba(14, 116, 144, 0.35);
-  color: #e0f2fe;
+  border-color: var(--app-accent-strong);
+  background: transparent;
+  color: var(--app-accent);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);
 }
 
 /* Fail-safe: when no pass is selected, never render highlighted target buttons. */
 .pointer-pass-controls:not(.has-pass-selection) .pointer-pass-button.selected {
-  border-color: rgba(148, 163, 184, 0.35);
-  background: rgba(30, 41, 59, 0.75);
+  border-color: rgba(148, 163, 184, 0.4);
+  background: transparent;
   color: var(--app-text);
+  box-shadow: none;
 }
 
 .pointer-pass-button:disabled {
@@ -6030,7 +6104,30 @@ const stealRisks = computed(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: 0;
+  flex-wrap: wrap;
+}
+
+.ball-holder-row label {
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--app-text-muted);
+}
+
+.ball-holder-row select {
+  background: rgba(13, 20, 38, 0.85);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: var(--app-text);
+  border-radius: 999px;
+  padding: 0.28rem 0.6rem;
+  font-size: 0.78rem;
+}
+
+.ball-holder-row select:focus {
+  outline: none;
+  border-color: var(--app-accent-strong);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
 }
 
 .status-note {

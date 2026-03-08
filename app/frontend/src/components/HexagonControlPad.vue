@@ -196,6 +196,11 @@ function getCourtButtonStyle(button) {
   };
 }
 
+function getCourtTileFill() {
+  // Keep court-style tiles outline-only; selection is shown by stroke/glow.
+  return 'transparent';
+}
+
 function selectAction(action) {
   emit('action-selected', action);
 }
@@ -207,7 +212,7 @@ function selectAction(action) {
       <button
         v-for="button in courtButtons"
         :key="button.action"
-        :style="{ ...getCourtButtonStyle(button), '--tile-fill': getActionColor(button.action, button.action === selectedAction) || 'transparent' }"
+        :style="{ ...getCourtButtonStyle(button), '--tile-fill': getCourtTileFill() }"
         @click="selectAction(button.action)"
         class="action-button hex-action-button"
         :class="{ selected: button.action === selectedAction }"

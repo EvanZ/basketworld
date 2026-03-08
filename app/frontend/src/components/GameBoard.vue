@@ -3158,37 +3158,6 @@ onBeforeUnmount(() => {
           L
         </text>
 
-        <!-- Lane-step indicators near the basket (live violation risk meter) -->
-        <g v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-indicators">
-          <g
-            v-for="stack in laneStepIndicatorStacks"
-            :key="stack.key"
-            class="lane-step-stack"
-          >
-            <title>{{ `${stack.label} lane steps: ${stack.steps}/${stack.maxSteps}` }}</title>
-            <text
-              :x="stack.labelX"
-              :y="stack.labelY"
-              text-anchor="middle"
-              class="lane-step-label"
-              :fill="stack.color"
-            >
-              {{ stack.shortLabel }}
-            </text>
-            <circle
-              v-for="light in stack.lights"
-              :key="light.key"
-              :cx="light.x"
-              :cy="light.y"
-              :r="light.radius"
-              class="lane-step-light"
-              :class="{ lit: light.lit, violation: light.violation }"
-              :fill="light.lit ? light.color : 'rgba(148, 163, 184, 0.2)'"
-              :stroke="light.lit ? 'rgba(248, 250, 252, 0.9)' : 'rgba(15, 23, 42, 0.8)'"
-            />
-          </g>
-        </g>
-
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
 
@@ -3820,19 +3789,27 @@ onBeforeUnmount(() => {
         </text>
       </g>
 
-      <!-- MLflow Run ID label (top-left, outside transformed group) -->
-      <text
-        v-if="!minimalChrome && currentGameState && currentGameState.run_id"
-        :x="parseFloat(viewBox.split(' ')[0]) + 100"
-        :y="parseFloat(viewBox.split(' ')[1]) + 10"
-        text-anchor="start"
-        dominant-baseline="hanging"
-        class="run-id-label"
-      >
-        {{ currentGameState.run_id }}
-      </text>
     </svg>
     <div class="shot-clock-wrapper" v-if="!hasShotCounts">
+      <div v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-clock-indicators">
+        <div
+          v-for="stack in laneStepIndicatorStacks"
+          :key="`clock-${stack.key}`"
+          class="lane-step-clock-stack"
+          :title="`${stack.label} lane steps: ${stack.steps}/${stack.maxSteps}`"
+        >
+          <span class="lane-step-clock-label" :style="{ color: stack.color }">{{ stack.shortLabel }}</span>
+          <span class="lane-step-clock-lights">
+            <span
+              v-for="light in stack.lights"
+              :key="`clock-${light.key}`"
+              class="lane-step-clock-light"
+              :class="{ lit: light.lit, violation: light.violation }"
+              :style="{ '--lane-color': light.color }"
+            ></span>
+          </span>
+        </div>
+      </div>
       <div class="shot-clock-overlay">
         {{ displayedShotClockValue }}
       </div>
@@ -3896,9 +3873,59 @@ onBeforeUnmount(() => {
   top: 5px;
   right: 5px;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 6px;
   z-index: 11;
+}
+
+.lane-step-clock-indicators {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.3rem;
+  margin-right: 2px;
+  pointer-events: none;
+}
+
+.lane-step-clock-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.34rem;
+}
+
+.lane-step-clock-label {
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1;
+  text-shadow: 0 1px 2px rgba(2, 6, 23, 0.75);
+}
+
+.lane-step-clock-lights {
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 1rem;
+}
+
+.lane-step-clock-light {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.2);
+  border: 1px solid rgba(15, 23, 42, 0.75);
+  transition: background 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.lane-step-clock-light.lit {
+  background: #ffffff;
+  border-color: var(--lane-color);
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.95), 0 0 12px var(--lane-color);
+}
+
+.lane-step-clock-light.violation {
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.98), 0 0 16px var(--lane-color);
 }
 
 .shot-clock-controls {
@@ -4669,16 +4696,4 @@ onBeforeUnmount(() => {
   stroke-width: 3;
 }
 
-</style>
-
-<style scoped>
-.run-id-label {
-  font-size: 0.8rem;
-  font-weight: normal;
-  fill: white;
-  paint-order: stroke;
-  stroke: black;
-  stroke-width: 0.1rem;
-  pointer-events: none;
-}
 </style>
