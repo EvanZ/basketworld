@@ -108,6 +108,7 @@ try:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_intent_robustness_callback,
         build_intent_diversity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
@@ -146,6 +147,7 @@ except ImportError:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_intent_robustness_callback,
         build_intent_diversity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
@@ -181,6 +183,12 @@ def main(args):
         if not args.use_dual_critic:
             print(f"[Config] Auto-enabling --use-dual-critic due to --init-critic-from-run")
             args.use_dual_critic = True
+
+    # --- Auto-enable dual critic if set-based observations are requested ---
+    # Set-attention policy currently depends on dual critics.
+    if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
+        print("[Config] Auto-enabling --use-dual-critic due to --use-set-obs")
+        args.use_dual_critic = True
 
     # --- Set up Device ---
     device = get_device(args.device)
@@ -236,10 +244,6 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
-        if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
-            print("[Warning] Set-attention policy requires dual critics; enabling use_dual_critic.")
-            args.use_dual_critic = True
-
         # Log policy architecture (single vs dual critic, single vs dual policy)
         mlflow.log_param("use_dual_critic", args.use_dual_critic)
         mlflow.log_param("use_dual_policy", args.use_dual_policy)
@@ -314,6 +318,14 @@ def main(args):
             policy_kwargs["num_cls_tokens"] = int(getattr(args, "set_cls_tokens", 2))
             policy_kwargs["token_activation"] = str(getattr(args, "set_token_activation", "relu"))
             policy_kwargs["head_activation"] = str(getattr(args, "set_head_activation", "tanh"))
+            policy_kwargs["intent_embedding_enabled"] = bool(
+                getattr(args, "set_intent_embedding_enabled", True)
+                and getattr(args, "enable_intent_learning", False)
+            )
+            policy_kwargs["intent_embedding_dim"] = int(
+                getattr(args, "set_intent_embedding_dim", 16)
+            )
+            policy_kwargs["num_intents"] = int(getattr(args, "num_intents", 8))
             print(
                 "Set-attention config:",
                 f"embed_dim={policy_kwargs['embed_dim']}",
@@ -322,6 +334,8 @@ def main(args):
                 f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
                 f"token_activation={policy_kwargs['token_activation']}",
                 f"head_activation={policy_kwargs['head_activation']}",
+                f"intent_embedding_enabled={policy_kwargs['intent_embedding_enabled']}",
+                f"intent_embedding_dim={policy_kwargs['intent_embedding_dim']}",
                 f"mirror_episode_prob={getattr(args, 'mirror_episode_prob', 0.0)}",
             )
         else:
@@ -667,6 +681,12 @@ def main(args):
             total_planned_ts,
             timestep_offset,
         )
+        # Optional intent robustness curriculum (null/visibility probability schedule)
+        intent_robustness_callback = build_intent_robustness_callback(
+            args,
+            total_planned_ts,
+            timestep_offset,
+        )
         # Optional DIAYN-style intent diversity objective
         intent_diversity_callback = build_intent_diversity_callback(args)
 
@@ -832,6 +852,7 @@ def main(args):
                 beta_callback,
                 pass_bias_callback,
                 pass_curriculum_callback,
+                intent_robustness_callback,
                 intent_diversity_callback,
             )
             

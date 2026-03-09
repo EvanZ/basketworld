@@ -22,7 +22,11 @@ from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 
 from app.backend.mcts import _run_mcts_advisor
-from app.backend.observations import _compute_q_values_for_player, _predict_policy_actions
+from app.backend.observations import (
+    _compute_q_values_for_player,
+    _predict_policy_actions,
+    validate_policy_observation_schema,
+)
 from app.backend.policies import (
     _compute_param_counts_from_policy,
     get_latest_policies_from_run,
@@ -169,6 +173,24 @@ async def init_game(request: InitGameRequest):
         _apply_policy_pass_mode(game_state.defense_policy, current_pass_mode)
 
         game_state.obs, _ = game_state.env.reset()
+        try:
+            game_state.obs = validate_policy_observation_schema(
+                game_state.unified_policy,
+                game_state.env,
+                game_state.obs,
+                policy_label="unified_policy",
+            )
+            _ = validate_policy_observation_schema(
+                game_state.defense_policy,
+                game_state.env,
+                game_state.obs,
+                policy_label="opponent_policy",
+            )
+        except ValueError as schema_err:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Observation schema mismatch during init_game: {schema_err}",
+            )
         game_state.prev_obs = None
 
         game_state.env_required_params = copy.deepcopy(required_params)

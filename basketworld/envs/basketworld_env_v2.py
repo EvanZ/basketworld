@@ -1688,6 +1688,20 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
+    @profile_section("set_intent_null_prob")
+    def set_intent_null_prob(self, value: float) -> None:
+        try:
+            self.intent_null_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
+    @profile_section("set_intent_visible_to_defense_prob")
+    def set_intent_visible_to_defense_prob(self, value: float) -> None:
+        try:
+            self.intent_visible_to_defense_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
     @profile_section("_get_player_distances")
     def _get_player_distances(self, base_id: int, target_ids: List[int]) -> np.ndarray:
         """Return hex distances from `base_id` to each ID in `target_ids`."""

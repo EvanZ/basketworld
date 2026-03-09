@@ -41,6 +41,8 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
       3) Shared token MLP:
          token_mlp: (B, P, T+G) -> (B, P, D)
          D = embed_dim
+      3b) Optional intent embedding modulation:
+         intent embedding -> projected to global dim and added to globals
       4) Optional learned CLS tokens:
          cls_tokens: (C, D) where C = num_cls_tokens
          append -> (B, P+C, D)
@@ -62,6 +64,9 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         token_mlp_dim: int = 64,
         num_cls_tokens: int = 2,
         token_activation: str = "relu",
+        intent_embedding_enabled: bool = False,
+        intent_embedding_dim: int = 16,
+        num_intents: int = 8,
     ):
         players_space = observation_space.spaces.get("players")
         globals_space = observation_space.spaces.get("globals")
@@ -75,6 +80,13 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self.token_dim = int(token_dim)
         self.global_dim = int(global_dim)
         self.num_cls_tokens = int(num_cls_tokens)
+        self.intent_embedding_enabled = bool(intent_embedding_enabled)
+        self.intent_embedding_dim = max(1, int(intent_embedding_dim))
+        self.num_intents = max(1, int(num_intents))
+        # Intent globals are currently appended as trailing [index_norm, active, visible].
+        self._intent_globals_dim = 3
+        self._intent_start_idx = max(0, self.global_dim - self._intent_globals_dim)
+        self._has_intent_globals = self.global_dim >= (4 + self._intent_globals_dim)
 
         total_tokens = self.n_players + self.num_cls_tokens
         super().__init__(observation_space, features_dim=total_tokens * self.embed_dim)
@@ -85,6 +97,19 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             token_act(),
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
+        if self.intent_embedding_enabled and self._has_intent_globals:
+            self.intent_embedding = nn.Embedding(
+                num_embeddings=self.num_intents,
+                embedding_dim=self.intent_embedding_dim,
+            )
+            self.intent_to_global = nn.Linear(
+                self.intent_embedding_dim, self.global_dim, bias=False
+            )
+            nn.init.normal_(self.intent_embedding.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.intent_to_global.weight)
+        else:
+            self.intent_embedding = None
+            self.intent_to_global = None
         self.attn = nn.MultiheadAttention(self.embed_dim, n_heads, batch_first=True)
         self.attn_norm = nn.LayerNorm(self.embed_dim)
         if self.num_cls_tokens > 0:
@@ -104,6 +129,26 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         """
         players = obs["players"]
         globals_vec = obs["globals"]
+        if self.intent_embedding is not None and self.intent_to_global is not None:
+            try:
+                start = int(self._intent_start_idx)
+                idx_norm = globals_vec[:, start]
+                active = globals_vec[:, start + 1]
+                visible = globals_vec[:, start + 2]
+                if self.num_intents > 1:
+                    intent_idx = th.round(
+                        idx_norm.clamp(0.0, 1.0) * float(self.num_intents - 1)
+                    ).long()
+                else:
+                    intent_idx = th.zeros_like(idx_norm, dtype=th.long)
+                intent_idx = intent_idx.clamp(min=0, max=self.num_intents - 1)
+                intent_emb = self.intent_embedding(intent_idx)
+                # Do not leak hidden intent through embedding modulation.
+                intent_gate = (active * visible).unsqueeze(-1)
+                intent_delta = self.intent_to_global(intent_emb * intent_gate)
+                globals_vec = globals_vec + intent_delta
+            except Exception:
+                pass
         g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
         tokens = th.cat([players, g], dim=-1)
         emb = self.token_mlp(tokens)
@@ -372,6 +417,9 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         num_cls_tokens: int = 2,
         token_activation: str = "relu",
         head_activation: str = "tanh",
+        intent_embedding_enabled: bool = False,
+        intent_embedding_dim: int = 16,
+        num_intents: int = 8,
         **kwargs,
     ):
         head_arch = kwargs.get("net_arch")
@@ -384,6 +432,13 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         features_extractor_kwargs.setdefault("token_mlp_dim", token_mlp_dim)
         features_extractor_kwargs.setdefault("num_cls_tokens", num_cls_tokens)
         features_extractor_kwargs.setdefault("token_activation", token_activation)
+        features_extractor_kwargs.setdefault(
+            "intent_embedding_enabled", intent_embedding_enabled
+        )
+        features_extractor_kwargs.setdefault(
+            "intent_embedding_dim", intent_embedding_dim
+        )
+        features_extractor_kwargs.setdefault("num_intents", num_intents)
         kwargs["features_extractor_kwargs"] = features_extractor_kwargs
         effective_embed_dim = int(features_extractor_kwargs["embed_dim"])
 
@@ -870,8 +925,21 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             return super().load_state_dict(state_dict, strict=False)
 
         result = super().load_state_dict(state_dict, strict=False)
-        missing = [key for key in result.missing_keys if not str(key).startswith("pointer_")]
-        unexpected = [key for key in result.unexpected_keys if not str(key).startswith("pointer_")]
+        allowed_prefixes = (
+            "pointer_",
+            "features_extractor.intent_embedding",
+            "features_extractor.intent_to_global",
+        )
+        missing = [
+            key
+            for key in result.missing_keys
+            if not str(key).startswith(allowed_prefixes)
+        ]
+        unexpected = [
+            key
+            for key in result.unexpected_keys
+            if not str(key).startswith(allowed_prefixes)
+        ]
         if missing or unexpected:
             missing_msg = ", ".join(missing) if missing else "None"
             unexpected_msg = ", ".join(unexpected) if unexpected else "None"

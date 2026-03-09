@@ -2914,7 +2914,8 @@ const tokenFeatureLabels = [
   'dist_to_nearest_opp',
   'dist_to_nearest_team',
 ];
-const tokenGlobalLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
+const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
+const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible'];
 
 const tokenPlayers = computed(() => {
   const players = obsTokens.value?.players;
@@ -2924,6 +2925,23 @@ const tokenPlayers = computed(() => {
 const tokenGlobals = computed(() => {
   const globals = obsTokens.value?.globals;
   return Array.isArray(globals) ? globals : [];
+});
+
+const tokenGlobalLabels = computed(() => {
+  const provided = obsTokens.value?.globals_labels;
+  if (Array.isArray(provided) && provided.length > 0) {
+    return provided;
+  }
+  const labels = [...tokenGlobalBaseLabels];
+  const extras = Math.max(0, tokenGlobals.value.length - labels.length);
+  if (extras > 0) {
+    const intentTake = Math.min(tokenGlobalIntentLabels.length, extras);
+    labels.push(...tokenGlobalIntentLabels.slice(0, intentTake));
+    for (let idx = intentTake; idx < extras; idx += 1) {
+      labels.push(`global_${tokenGlobalBaseLabels.length + idx}`);
+    }
+  }
+  return labels;
 });
 
 const tokenAttention = computed(() => obsTokens.value?.attention || null);
@@ -3073,7 +3091,7 @@ const tokenRows = computed(() => {
 
 const tokenGlobalRows = computed(() => {
   return tokenGlobals.value.map((value, idx) => ({
-    label: tokenGlobalLabels[idx] || `global_${idx}`,
+    label: tokenGlobalLabels.value[idx] || `global_${idx}`,
     value,
   }));
 });
@@ -4460,6 +4478,58 @@ const stealRisks = computed(() => {
             <div class="param-item" v-if="props.gameState.offensive_lane_hexes" data-tooltip="Total number of hex cells that make up the painted lane area">
               <span class="param-name">Lane hexes count:</span>
               <span class="param-value">{{ props.gameState.offensive_lane_hexes?.length || 0 }} hexes</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Intent Learning</h5>
+            <div class="param-item" data-tooltip="Whether latent intent/play learning is enabled in this environment.">
+              <span class="param-name">Enabled:</span>
+              <span class="param-value">{{ props.gameState.enable_intent_learning ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of latent intent categories available to offense when intent is active.">
+              <span class="param-name">Num intents:</span>
+              <span class="param-value">{{ props.gameState.num_intents ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent observability mode (private_offense, public, hidden).">
+              <span class="param-name">Observation mode:</span>
+              <span class="param-value">{{ props.gameState.intent_obs_mode || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured commitment window for active intent state.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ props.gameState.intent_commitment_steps ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured probability of null/no-intent episodes.">
+              <span class="param-name">Null intent prob:</span>
+              <span class="param-value">{{ props.gameState.intent_null_prob != null ? (props.gameState.intent_null_prob * 100).toFixed(1) + '%' : 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured probability of exposing intent to defense.">
+              <span class="param-name">Visible-to-defense prob:</span>
+              <span class="param-value">{{ props.gameState.intent_visible_to_defense_prob != null ? (props.gameState.intent_visible_to_defense_prob * 100).toFixed(1) + '%' : 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether intent-diversity objective is enabled for the model run loaded in this session.">
+              <span class="param-name">Diversity enabled:</span>
+              <span class="param-value">{{ props.gameState.intent_diversity_enabled == null ? 'N/A' : (props.gameState.intent_diversity_enabled ? '✓ Yes' : '✗ No') }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether current possession has an active latent intent.">
+              <span class="param-name">Current active:</span>
+              <span class="param-value">{{ props.gameState.intent_active_current ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current latent intent index (masked elsewhere when hidden).">
+              <span class="param-name">Current index:</span>
+              <span class="param-value">{{ props.gameState.intent_index_current ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current age of active intent (steps since sampled).">
+              <span class="param-name">Current age:</span>
+              <span class="param-value">{{ props.gameState.intent_age ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Remaining commitment steps before intent can be reconsidered.">
+              <span class="param-name">Commitment remaining:</span>
+              <span class="param-value">{{ props.gameState.intent_commitment_remaining ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether this possession's intent is currently visible to the defense role.">
+              <span class="param-name">Current defense-visible:</span>
+              <span class="param-value">{{ props.gameState.intent_visible_to_defense_current ? '✓ Yes' : '✗ No' }}</span>
             </div>
           </div>
         </div>

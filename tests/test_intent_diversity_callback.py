@@ -116,3 +116,48 @@ def test_intent_diversity_callback_injects_offense_only_bonus():
     assert np.any(model.rollout_buffer.rewards[:, 0] != 0.0)
     assert np.all(model.rollout_buffer.rewards[:, 1] == 0.0)
     assert model.rollout_buffer.recomputed
+
+
+def test_intent_episode_metric_helpers():
+    ep = {
+        "made_2pt": 1.0,
+        "made_3pt": 0.0,
+        "made_dunk": 0.0,
+        "defensive_lane_violation": 0.0,
+        "attempts": 1.0,
+        "turnover": 0.0,
+        "shot_2pt": 1.0,
+        "shot_3pt": 0.0,
+        "shot_dunk": 0.0,
+    }
+    ppp = IntentDiversityCallback._episode_ppp(ep)
+    three_share = IntentDiversityCallback._episode_shot_three_share(ep)
+    assert np.isclose(ppp, 2.0)
+    assert np.isclose(three_share, 0.0)
+
+
+def test_binary_auc_helper():
+    y_true = np.array([0, 0, 1, 1], dtype=np.int64)
+    y_score = np.array([0.1, 0.2, 0.8, 0.9], dtype=np.float64)
+    auc = IntentDiversityCallback._binary_auc_from_scores(y_true, y_score)
+    assert auc is not None
+    assert np.isclose(auc, 1.0)
+
+
+def test_multiclass_auc_ovr_macro_helper():
+    # 3-class logits with clear separation by class.
+    logits = np.array(
+        [
+            [5.0, 0.1, 0.1],  # class 0
+            [0.2, 4.5, 0.1],  # class 1
+            [0.1, 0.2, 4.8],  # class 2
+            [4.2, 0.3, 0.2],  # class 0
+            [0.1, 4.0, 0.1],  # class 1
+            [0.1, 0.2, 4.2],  # class 2
+        ],
+        dtype=np.float64,
+    )
+    y = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+    auc = IntentDiversityCallback._multiclass_auc_ovr_macro(logits, y, num_classes=3)
+    assert auc is not None
+    assert auc > 0.99

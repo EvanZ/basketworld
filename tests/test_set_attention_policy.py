@@ -261,6 +261,67 @@ def test_set_attention_policy_load_state_dict_allows_missing_pointer_keys():
     assert all(str(k).startswith("pointer_") for k in result.missing_keys)
 
 
+def test_set_attention_policy_intent_embedding_smoke():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=12,
+        num_intents=8,
+    )
+
+    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 0.42, 1.0, 1.0], dtype=np.float32)
+    obs = _make_obs(n_players, globals_dim=7, n_actions=n_actions, role=1.0, globals_vec=globals_vec)
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    actions, values, log_prob = policy.forward(tensor_obs, deterministic=True)
+
+    assert actions.shape == (1, players_per_side)
+    assert values.shape == (1, 1)
+    assert log_prob.shape == (1,)
+
+
+def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_keys():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=8,
+        num_intents=8,
+    )
+
+    full_state = policy.state_dict()
+    legacy_state = {
+        k: v
+        for k, v in full_state.items()
+        if not (
+            k.startswith("pointer_")
+            or k.startswith("features_extractor.intent_embedding")
+            or k.startswith("features_extractor.intent_to_global")
+        )
+    }
+    result = policy.load_state_dict(legacy_state, strict=True)
+    allowed_prefixes = (
+        "pointer_",
+        "features_extractor.intent_embedding",
+        "features_extractor.intent_to_global",
+    )
+    assert all(str(k).startswith(allowed_prefixes) for k in result.missing_keys)
+
+
 def test_pointer_targeted_backward_pass_no_inplace_error():
     n_players = 6
     players_per_side = 3

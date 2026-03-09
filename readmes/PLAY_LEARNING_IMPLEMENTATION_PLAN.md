@@ -371,6 +371,69 @@ Fix:
 4. Turning off intent learning returns baseline behavior cleanly.
 5. Playable app and development mode remain functional with legacy non-intent models and unchanged API contracts.
 
+## Future work
+
+### 1) Full DIAYN skill pretraining track
+
+If joint task+diversity training under PPO does not produce strong intent separation, add a two-stage pipeline:
+
+1. Stage A: skill discovery pretraining in the same environment dynamics with task reward disabled (intrinsic-only objective).
+2. Stage B: downstream task training where PPO learns to use discovered skills for scoring/winning.
+
+Design notes:
+
+1. Keep latent skill/intent `z` discrete (`num_intents = K`) with commitment window.
+2. Train discriminator `q(z | trajectory)` and maximize MI-style bonus.
+3. Preserve environment dynamics/opponents/observation schema so transfer is not confounded by distribution shift.
+4. Evaluate pretraining quality before transfer using:
+   - `intent/disc_top1_acc`
+   - `intent/disc_auc_ovr_macro`
+   - `intent/usage_entropy`
+   - per-intent behavior spread metrics.
+5. Transfer options:
+   - Freeze low-level skill-conditioned policy and train only high-level chooser.
+   - Or fine-tune low-level policy with small LR after warmup.
+
+Implementation caution:
+
+1. Canonical DIAYN uses entropy-maximizing actor-critic (often SAC). Since current stack is PPO + discrete actions, this should be treated as a dedicated research branch, not an in-place toggle.
+2. Keep backward compatibility by version-tagging checkpoints and observation schema.
+
+### 2) Defensive latent plays track
+
+Extend latent play learning to defense with its own latent variable, separate from offense.
+
+Core idea:
+
+1. Offense uses `z_off`.
+2. Defense uses `z_def`.
+3. Each side gets its own embedding/discriminator/diversity bonus.
+
+Why separate latents first:
+
+1. Reduces role interference versus forcing one shared latent to serve both teams.
+2. Makes diagnostics clearer (`offense_*` metrics vs `defense_*` metrics).
+
+Proposed training sequence:
+
+1. Stabilize offense-intent learning first.
+2. Enable defense-intent with smaller `beta` and longer warmup/ramp.
+3. Add role-specific monitoring:
+   - `intent/offense_disc_*`, `intent/defense_disc_*`
+   - role-specific usage entropy/min-prob
+   - defense robustness vs unknown offense intent.
+
+Security/observability rule:
+
+1. No privileged leakage across roles:
+   - defense never directly observes offense-private latent embedding;
+   - offense never directly observes defense-private latent embedding unless an explicit experiment enables it.
+
+Longer-term generalization:
+
+1. Explore shared latent space with role conditioning (`z + role_flag`) only after separate-latent baselines are stable.
+2. Compare against separate-latent baseline on robustness and exploitability before adopting shared-latent design.
+
 ## ChatGPT 5.4 Critique of Plan
 
 1. The biggest gap is backward compatibility. The plan says intent features can be “all zeros or omitted” when disabled, but the current runtime builds fixed observation spaces, and existing checkpoints depend on those exact shapes. See [PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L36](/home/ubuntu/basketworld/readmes/PLAY_LEARNING_IMPLEMENTATION_PLAN.md#L36), [basketworld_env_v2.py#L316](/home/ubuntu/basketworld/basketworld/envs/basketworld_env_v2.py#L316), and [wrappers.py#L36](/home/ubuntu/basketworld/basketworld/utils/wrappers.py#L36). I would not modify the legacy schema in place. Add an explicit `obs_schema_version` and only construct intent-augmented spaces for intent-enabled runs.

@@ -20,7 +20,11 @@ from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtra
 from stable_baselines3 import PPO
 
 from app.backend.mcts import _run_mcts_advisor
-from app.backend.observations import _ensure_set_obs, _predict_policy_actions
+from app.backend.observations import (
+    _ensure_set_obs,
+    _predict_policy_actions,
+    validate_policy_observation_schema,
+)
 from app.backend.state import game_state
 
 
@@ -128,6 +132,17 @@ def _init_evaluation_worker(
         "resolve_illegal_actions": _resolve_illegal_actions,
         "progress_queue": progress_queue,
     }
+    # Fail fast on model/env observation schema mismatches.
+    try:
+        obs0, _ = env.reset(seed=0)
+        _ = validate_policy_observation_schema(
+            unified_policy, env, obs0, policy_label="eval_unified_policy"
+        )
+        _ = validate_policy_observation_schema(
+            opponent_policy, env, obs0, policy_label="eval_opponent_policy"
+        )
+    except Exception as e:
+        raise RuntimeError(f"Evaluation worker schema validation failed: {e}") from e
 
 
 def _worker_role_flag_value(team) -> float:

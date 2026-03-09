@@ -273,6 +273,20 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         except Exception:
             pass
 
+    def set_intent_null_prob(self, value: float) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_intent_null_prob(float(value))
+        except Exception:
+            pass
+
+    def set_intent_visible_to_defense_prob(
+        self, value: float
+    ) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_intent_visible_to_defense_prob(float(value))
+        except Exception:
+            pass
+
     def get_profile_stats(self):  # pragma: no cover - thin shim
         try:
             return self.env.unwrapped.get_profile_stats()

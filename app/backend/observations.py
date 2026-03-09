@@ -88,6 +88,68 @@ def _ensure_set_obs(policy: PPO | None, env, obs: dict | None) -> dict | None:
         return obs
 
 
+def validate_policy_observation_schema(
+    policy: PPO | None,
+    env,
+    obs: dict | None,
+    policy_label: str = "policy",
+) -> dict | None:
+    """Validate that the observation payload matches the policy observation space.
+
+    Raises ValueError with actionable details on mismatch.
+    """
+    if policy is None:
+        return obs
+    policy_obj = getattr(policy, "policy", None)
+    if policy_obj is None:
+        return obs
+    obs_space = getattr(policy_obj, "observation_space", None)
+    if obs_space is None:
+        return obs
+
+    prepared_obs = _ensure_set_obs(policy, env, obs)
+
+    if isinstance(obs_space, gym.spaces.Dict):
+        if not isinstance(prepared_obs, dict):
+            raise ValueError(
+                f"{policy_label}: expected dict observation, received {type(prepared_obs).__name__}"
+            )
+        expected_keys = set(obs_space.spaces.keys())
+        actual_keys = set(prepared_obs.keys())
+        missing = sorted(expected_keys - actual_keys)
+        extra = sorted(actual_keys - expected_keys)
+        if missing or extra:
+            raise ValueError(
+                f"{policy_label}: observation keys mismatch. missing={missing} extra={extra}"
+            )
+        for key, space in obs_space.spaces.items():
+            arr = np.asarray(prepared_obs[key])
+            expected_shape = tuple(getattr(space, "shape", ()))
+            actual_shape = tuple(arr.shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"{policy_label}: key='{key}' shape mismatch expected={expected_shape} actual={actual_shape}"
+                )
+        return prepared_obs
+
+    # Non-dict observation spaces: use canonical "obs" key when available.
+    if isinstance(prepared_obs, dict):
+        if "obs" not in prepared_obs:
+            raise ValueError(
+                f"{policy_label}: non-dict policy expects flat obs but payload has no 'obs' key"
+            )
+        arr = np.asarray(prepared_obs["obs"])
+    else:
+        arr = np.asarray(prepared_obs)
+    expected_shape = tuple(getattr(obs_space, "shape", ()))
+    actual_shape = tuple(arr.shape)
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"{policy_label}: observation shape mismatch expected={expected_shape} actual={actual_shape}"
+        )
+    return prepared_obs
+
+
 def _team_player_ids(env, team: Team) -> List[int]:
     if team == Team.OFFENSE:
         return list(getattr(env, "offense_ids", []))

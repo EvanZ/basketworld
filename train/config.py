@@ -252,6 +252,23 @@ def get_parser() -> argparse.ArgumentParser:
         help="Number of CLS tokens for set-attention policy (2 for dual critics).",
     )
     parser.add_argument(
+        "--set-intent-embedding-enabled",
+        dest="set_intent_embedding_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help=(
+            "Enable explicit learned intent embedding in set-attention extractor "
+            "(applies only when intent globals are present)."
+        ),
+    )
+    parser.add_argument(
+        "--set-intent-embedding-dim",
+        dest="set_intent_embedding_dim",
+        type=int,
+        default=16,
+        help="Embedding dimension for latent intent conditioning in set-attention extractor.",
+    )
+    parser.add_argument(
         "--mirror-episode-prob",
         type=float,
         default=0.0,
@@ -559,6 +576,26 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Probability that defense-visible intent is exposed in an episode.",
+    )
+    parser.add_argument(
+        "--intent-null-prob-end",
+        dest="intent_null_prob_end",
+        type=float,
+        default=None,
+        help=(
+            "Optional target for scheduling intent null probability over training. "
+            "If omitted, intent_null_prob remains constant."
+        ),
+    )
+    parser.add_argument(
+        "--intent-visible-to-defense-prob-end",
+        dest="intent_visible_to_defense_prob_end",
+        type=float,
+        default=None,
+        help=(
+            "Optional target for scheduling defense-visible intent probability over training. "
+            "If omitted, intent_visible_to_defense_prob remains constant."
+        ),
     )
     parser.add_argument(
         "--intent-obs-mode",

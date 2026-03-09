@@ -592,5 +592,11 @@ def get_mlflow_training_params(
     training_params["pass_mode"] = _get_param(
         params, ["pass_mode", "pass-mode"], str, "directional"
     )
+    training_params["intent_diversity_enabled"] = _get_param(
+        params,
+        ["intent_diversity_enabled", "intent-diversity-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
 
     return training_params

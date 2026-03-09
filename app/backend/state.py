@@ -121,6 +121,29 @@ def get_full_game_state(
         game_state.env.last_action_results, custom_encoder=custom_encoder
     )
 
+    def _set_global_labels(obs_tokens_dict: dict, globals_like) -> None:
+        if globals_like is None or obs_tokens_dict is None:
+            return
+        try:
+            globals_arr = np.asarray(globals_like, dtype=np.float32).reshape(-1)
+            n = int(globals_arr.shape[0])
+        except Exception:
+            return
+        if n <= 0:
+            return
+        labels = []
+        base_labels = ["shot_clock", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
+        base_take = min(len(base_labels), n)
+        labels.extend(base_labels[:base_take])
+        extras = max(0, n - base_take)
+        if extras > 0:
+            intent_labels = ["intent_index_norm", "intent_active", "intent_visible"]
+            intent_take = min(len(intent_labels), extras)
+            labels.extend(intent_labels[:intent_take])
+            for idx in range(intent_take, extras):
+                labels.append(f"global_{base_take + idx}")
+        obs_tokens_dict["globals_labels"] = labels
+
     # Convert numpy types to standard Python types for JSON serialization
     positions_py = [(int(q), int(r)) for q, r in game_state.env.positions]
     ball_holder_py = (
@@ -151,6 +174,7 @@ def get_full_game_state(
                     if hasattr(globals_tokens, "tolist")
                     else globals_tokens
                 )
+                _set_global_labels(obs_tokens, globals_tokens)
     if obs_tokens is None and game_state.env and game_state.obs:
         try:
             wrapper = SetObservationWrapper(game_state.env)
@@ -171,6 +195,7 @@ def get_full_game_state(
                         if hasattr(globals_tokens, "tolist")
                         else globals_tokens
                     )
+                    _set_global_labels(obs_tokens, globals_tokens)
         except Exception:
             obs_tokens = obs_tokens
 
@@ -397,6 +422,44 @@ def get_full_game_state(
         ),
         "offensive_three_seconds_enabled": bool(
             getattr(game_state.env, "offensive_three_seconds_enabled", False)
+        ),
+        "enable_intent_learning": bool(
+            getattr(game_state.env, "enable_intent_learning", False)
+        ),
+        "num_intents": int(getattr(game_state.env, "num_intents", 0)),
+        "intent_commitment_steps": int(
+            getattr(game_state.env, "intent_commitment_steps", 0)
+        ),
+        "intent_null_prob": float(
+            getattr(game_state.env, "intent_null_prob", 0.0)
+        ),
+        "intent_visible_to_defense_prob": float(
+            getattr(game_state.env, "intent_visible_to_defense_prob", 0.0)
+        ),
+        "intent_diversity_enabled": (
+            bool(
+                getattr(game_state, "mlflow_training_params", {}).get(
+                    "intent_diversity_enabled", False
+                )
+            )
+            if getattr(game_state, "mlflow_training_params", None) is not None
+            else None
+        ),
+        "intent_obs_mode": str(
+            getattr(game_state.env, "intent_obs_mode", "private_offense")
+        ),
+        "intent_active_current": bool(
+            getattr(game_state.env, "intent_active", False)
+        ),
+        "intent_index_current": int(
+            getattr(game_state.env, "intent_index", 0)
+        ),
+        "intent_age": int(getattr(game_state.env, "intent_age", 0)),
+        "intent_commitment_remaining": int(
+            getattr(game_state.env, "intent_commitment_remaining", 0)
+        ),
+        "intent_visible_to_defense_current": bool(
+            getattr(game_state.env, "_intent_visible_to_defense", False)
         ),
         "include_hoop_vector": bool(
             getattr(game_state.env, "include_hoop_vector", False)

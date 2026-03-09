@@ -697,6 +697,8 @@ class IntentDiversityCallback(BaseCallback):
         self._warned_recompute = False
         self._last_disc_loss = 0.0
         self._last_disc_acc = 0.0
+        self._last_disc_auc: Optional[float] = None
+        self._defense_unknown_baseline_ppp: Optional[float] = None
 
     def _on_training_start(self) -> None:
         try:
@@ -851,6 +853,81 @@ class IntentDiversityCallback(BaseCallback):
             bonus = chosen + float(np.log(float(self.num_intents)))
         return bonus.detach().cpu().numpy().astype(np.float32, copy=False)
 
+    @staticmethod
+    def _binary_auc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
+        """Compute binary ROC-AUC from labels and scores via rank statistic."""
+        y_true_arr = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_score_arr = np.asarray(y_score, dtype=np.float64).reshape(-1)
+        if y_true_arr.size == 0 or y_true_arr.size != y_score_arr.size:
+            return None
+
+        pos = (y_true_arr > 0).astype(np.int64)
+        n_pos = int(np.sum(pos))
+        n_neg = int(pos.size - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return None
+
+        order = np.argsort(y_score_arr, kind="mergesort")
+        sorted_scores = y_score_arr[order]
+        ranks = np.empty_like(sorted_scores, dtype=np.float64)
+        i = 0
+        n = sorted_scores.size
+        while i < n:
+            j = i + 1
+            while j < n and sorted_scores[j] == sorted_scores[i]:
+                j += 1
+            avg_rank = 0.5 * ((i + 1) + j)  # 1-indexed average rank
+            ranks[i:j] = avg_rank
+            i = j
+
+        rank_by_original_index = np.empty_like(ranks)
+        rank_by_original_index[order] = ranks
+        sum_pos_ranks = float(np.sum(rank_by_original_index[pos == 1]))
+        auc = (sum_pos_ranks - (n_pos * (n_pos + 1) / 2.0)) / float(n_pos * n_neg)
+        return float(np.clip(auc, 0.0, 1.0))
+
+    @classmethod
+    def _multiclass_auc_ovr_macro(
+        cls, logits_np: np.ndarray, y_np: np.ndarray, num_classes: int
+    ) -> Optional[float]:
+        """Compute macro OVR ROC-AUC for multiclass logits."""
+        logits = np.asarray(logits_np, dtype=np.float64)
+        y_true = np.asarray(y_np, dtype=np.int64).reshape(-1)
+        if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[0] != y_true.size:
+            return None
+        if num_classes <= 1:
+            return None
+
+        logits = logits - np.max(logits, axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        denom = np.clip(np.sum(exp_logits, axis=1, keepdims=True), 1e-12, None)
+        probs = exp_logits / denom
+
+        aucs: list[float] = []
+        k = min(int(num_classes), int(probs.shape[1]))
+        for class_idx in range(k):
+            y_bin = (y_true == class_idx).astype(np.int64)
+            auc = cls._binary_auc_from_scores(y_bin, probs[:, class_idx])
+            if auc is not None:
+                aucs.append(float(auc))
+        if not aucs:
+            return None
+        return float(np.mean(aucs))
+
+    def _compute_disc_auc(self, x_np: np.ndarray, y_np: np.ndarray) -> Optional[float]:
+        if x_np.shape[0] == 0 or self._disc is None:
+            return None
+        x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x)
+        logits_np = logits.detach().cpu().numpy()
+        return self._multiclass_auc_ovr_macro(
+            logits_np,
+            y_np,
+            num_classes=self.num_intents,
+        )
+
     def _recompute_returns_and_advantage(self) -> None:
         try:
             rollout_buffer = self.model.rollout_buffer
@@ -880,9 +957,112 @@ class IntentDiversityCallback(BaseCallback):
         min_prob = float(np.min(probs))
         return entropy, min_prob
 
+    @staticmethod
+    def _episode_ppp(ep: dict) -> float:
+        m2 = float(ep.get("made_2pt", 0.0))
+        m3 = float(ep.get("made_3pt", 0.0))
+        md = float(ep.get("made_dunk", 0.0))
+        lane_violation_pts = float(ep.get("defensive_lane_violation", 0.0))
+        att = float(ep.get("attempts", 0.0))
+        tov = float(ep.get("turnover", 0.0))
+        points = (2.0 * m2) + (3.0 * m3) + (2.0 * md) + lane_violation_pts
+        possessions = max(1.0, att + tov + lane_violation_pts)
+        return float(points / possessions)
+
+    @staticmethod
+    def _episode_shot_three_share(ep: dict) -> float:
+        s2 = float(ep.get("shot_2pt", 0.0))
+        s3 = float(ep.get("shot_3pt", 0.0))
+        sd = float(ep.get("shot_dunk", 0.0))
+        total = s2 + s3 + sd
+        if total <= 0.0:
+            return 0.0
+        return float(s3 / total)
+
+    def _log_intent_behavior_metrics(self, global_step: int) -> None:
+        episodes = list(getattr(self.model, "ep_info_buffer", []) or [])
+        if not episodes:
+            return
+
+        grouped: dict[int, dict[str, list[float]]] = {}
+        for ep in episodes:
+            try:
+                team = str(ep.get("training_team", "")).strip().lower()
+                if team != "offense":
+                    continue
+                if float(ep.get("intent_active", 0.0)) <= 0.5:
+                    continue
+                z = int(float(ep.get("intent_index", 0.0)))
+            except Exception:
+                continue
+            z = max(0, min(self.num_intents - 1, z))
+            slot = grouped.setdefault(z, {"ppp": [], "passes": [], "shot_three_share": []})
+            slot["ppp"].append(self._episode_ppp(ep))
+            slot["passes"].append(float(ep.get("passes", 0.0)))
+            slot["shot_three_share"].append(self._episode_shot_three_share(ep))
+
+        if not grouped:
+            return
+
+        for z, vals in grouped.items():
+            if vals["ppp"]:
+                mlflow.log_metric(
+                    f"intent/ppp_by_intent/{z}",
+                    float(np.mean(vals["ppp"])),
+                    step=global_step,
+                )
+            if vals["passes"]:
+                mlflow.log_metric(
+                    f"intent/pass_rate_by_intent/{z}",
+                    float(np.mean(vals["passes"])),
+                    step=global_step,
+                )
+            if vals["shot_three_share"]:
+                mlflow.log_metric(
+                    f"intent/shot_dist_by_intent/{z}",
+                    float(np.mean(vals["shot_three_share"])),
+                    step=global_step,
+                )
+
+    def _log_defense_unknown_intent_proxy(self, global_step: int) -> None:
+        episodes = list(getattr(self.model, "ep_info_buffer", []) or [])
+        if not episodes:
+            return
+        values: list[float] = []
+        for ep in episodes:
+            try:
+                team = str(ep.get("training_team", "")).strip().lower()
+                if team != "defense":
+                    continue
+                visible = float(ep.get("intent_visible_training_obs", 0.0))
+                if visible > 0.5:
+                    continue
+                values.append(self._episode_ppp(ep))
+            except Exception:
+                continue
+        if not values:
+            return
+        current = float(np.mean(values))
+        if self._defense_unknown_baseline_ppp is None:
+            self._defense_unknown_baseline_ppp = current
+        delta = float(current - float(self._defense_unknown_baseline_ppp))
+        mlflow.log_metric("intent/defense_unknown_intent_ppp", current, step=global_step)
+        mlflow.log_metric(
+            "intent/defense_unknown_intent_delta_vs_baseline",
+            delta,
+            step=global_step,
+        )
+
     def _on_rollout_end(self) -> None:
         if not self.enabled:
             return
+
+        global_step = int(getattr(self.model, "num_timesteps", 0))
+        try:
+            self._log_intent_behavior_metrics(global_step)
+            self._log_defense_unknown_intent_proxy(global_step)
+        except Exception:
+            pass
 
         episodes = self._episodes.pop_completed(
             filter_fn=lambda ep: ep.role_is_offense and ep.intent_active and ep.length > 0
@@ -902,6 +1082,7 @@ class IntentDiversityCallback(BaseCallback):
             return
 
         self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
+        self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
         raw_bonus = self._compute_episode_bonus(x_np, y_np)
         if raw_bonus.size == 0:
             return
@@ -925,9 +1106,14 @@ class IntentDiversityCallback(BaseCallback):
         self._recompute_returns_and_advantage()
 
         try:
-            global_step = int(getattr(self.model, "num_timesteps", 0))
             mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
             mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            if self._last_disc_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
             mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
             mlflow.log_metric(
                 "intent/bonus_norm_mean", float(np.mean(norm_bonus)), step=global_step
@@ -1273,6 +1459,82 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # Throttled: avoid per-step update/logging
+        return True
+
+
+class IntentRobustnessScheduleCallback(BaseCallback):
+    """Schedule intent null/visibility probabilities for robustness curriculum.
+
+    - null_prob(t): linear from null_start -> null_end
+    - visible_prob(t): linear from visible_start -> visible_end
+    Applies via VecEnv.env_method on wrapped environments.
+    """
+
+    def __init__(
+        self,
+        null_start: float,
+        null_end: float,
+        visible_start: float,
+        visible_end: float,
+        total_planned_timesteps: int,
+        log_freq_rollouts: int = 1,
+        timestep_offset: int = 0,
+    ):
+        super().__init__()
+        self.null_start = float(max(0.0, min(1.0, null_start)))
+        self.null_end = float(max(0.0, min(1.0, null_end)))
+        self.visible_start = float(max(0.0, min(1.0, visible_start)))
+        self.visible_end = float(max(0.0, min(1.0, visible_end)))
+        self.total = int(max(1, total_planned_timesteps))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self.timestep_offset = int(timestep_offset)
+        self._rollouts = 0
+
+    def _linear(self, start: float, end: float, t: int) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        return float(start + (end - start) * progress)
+
+    def _apply_current(self, log_to_mlflow: bool = True) -> None:
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
+            null_prob = self._linear(self.null_start, self.null_end, t)
+            visible_prob = self._linear(self.visible_start, self.visible_end, t)
+            vecenv = self.model.get_env()
+            try:
+                if vecenv is not None and hasattr(vecenv, "env_method"):
+                    vecenv.env_method("set_intent_null_prob", float(null_prob))
+                    vecenv.env_method(
+                        "set_intent_visible_to_defense_prob", float(visible_prob)
+                    )
+            except Exception:
+                pass
+            if log_to_mlflow:
+                step = int(t + self.timestep_offset)
+                try:
+                    mlflow.log_metric("intent/null_prob_config", float(null_prob), step=step)
+                    mlflow.log_metric(
+                        "intent/visible_to_defense_prob_config",
+                        float(visible_prob),
+                        step=step,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current(log_to_mlflow=True)
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current(log_to_mlflow=False)
+
+    def _on_rollout_end(self) -> None:
+        self._rollouts += 1
+        self._apply_current(
+            log_to_mlflow=(self._rollouts % self.log_freq_rollouts == 0)
+        )
+
+    def _on_step(self) -> bool:
         return True
 
 

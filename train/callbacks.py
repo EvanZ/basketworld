@@ -18,6 +18,7 @@ from basketworld.utils.callbacks import (
     PotentialBetaExpScheduleCallback,
     PassLogitBiasExpScheduleCallback,
     PassCurriculumExpScheduleCallback,
+    IntentRobustnessScheduleCallback,
     EpisodeSampleLogger,
     IntentDiversityCallback,
 )
@@ -150,6 +151,29 @@ def build_intent_diversity_callback(args):
     )
 
 
+def build_intent_robustness_callback(args, total_planned_ts, timestep_offset):
+    """Build intent robustness curriculum scheduler if requested."""
+    if not getattr(args, "enable_intent_learning", False):
+        return None
+    null_end = getattr(args, "intent_null_prob_end", None)
+    visible_end = getattr(args, "intent_visible_to_defense_prob_end", None)
+    if null_end is None and visible_end is None:
+        return None
+    null_start = float(getattr(args, "intent_null_prob", 0.2))
+    visible_start = float(getattr(args, "intent_visible_to_defense_prob", 0.0))
+    null_end = float(null_start if null_end is None else null_end)
+    visible_end = float(visible_start if visible_end is None else visible_end)
+    return IntentRobustnessScheduleCallback(
+        null_start=null_start,
+        null_end=null_end,
+        visible_start=visible_start,
+        visible_end=visible_end,
+        total_planned_timesteps=total_planned_ts,
+        log_freq_rollouts=getattr(args, "mlflow_schedule_log_every_rollouts", 1),
+        timestep_offset=timestep_offset,
+    )
+
+
 def build_mixed_callbacks(
     args,
     global_alt: int,
@@ -158,6 +182,7 @@ def build_mixed_callbacks(
     beta_cb: Optional[BaseCallback],
     pass_bias_cb: Optional[BaseCallback],
     pass_curriculum_cb: Optional[BaseCallback],
+    intent_robustness_cb: Optional[BaseCallback],
     intent_diversity_cb: Optional[BaseCallback],
 ) -> List[BaseCallback]:
     """Assemble callbacks for mixed training."""
@@ -176,6 +201,8 @@ def build_mixed_callbacks(
         callbacks.append(pass_bias_cb)
     if pass_curriculum_cb is not None:
         callbacks.append(pass_curriculum_cb)
+    if intent_robustness_cb is not None:
+        callbacks.append(intent_robustness_cb)
     if intent_diversity_cb is not None:
         callbacks.append(intent_diversity_cb)
     if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
