@@ -149,6 +149,11 @@ class PlayableStartRequest(BaseModel):
     period_length_minutes: int = 5
 
 
+class PlayableDemoTakeoverRequest(BaseModel):
+    period_mode: Literal["period", "halves", "quarters"] = "period"
+    period_length_minutes: int = 5
+
+
 class PlayableStepRequest(BaseModel):
     actions: dict[str, object]
     auto_user_actions: bool = False

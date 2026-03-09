@@ -13,6 +13,7 @@ import {
   newPlayableGame,
   startPlayableGame,
   startPlayableDemoGame,
+  takeOverPlayableDemoGame,
   stepPlayableGame,
 } from './services/api';
 
@@ -1089,14 +1090,20 @@ const hasGame = computed(() => !!gameState.value);
 const isDemoSession = computed(() => Boolean(sessionConfig.value?.demo_mode));
 const isGameOver = computed(() => Boolean(gameResult.value?.game_over));
 const showGameOverOverlay = computed(() => Boolean(isGameOver.value || forceGameOverPreview.value));
+const canTakeOverDemoGame = computed(() => Boolean(isDemoSession.value && hasGame.value));
 
 const canStartGame = computed(() => {
   return (
     !optionsLoading.value
     && !actionLoading.value
     && !transitionRunning.value
-    && Boolean(currentDifficultyConfig.value?.available)
-    && (!hasGame.value || isGameOver.value || isDemoSession.value)
+    && (
+      (
+        Boolean(currentDifficultyConfig.value?.available)
+        && (!hasGame.value || isGameOver.value || isDemoSession.value)
+      )
+      || canTakeOverDemoGame.value
+    )
   );
 });
 const controlsDisabled = computed(() => actionLoading.value || transitionRunning.value || isGameOver.value || isDemoSession.value);
@@ -1452,9 +1459,13 @@ const selectedModeLabel = computed(() => {
       + ` · ${modeLabel} x ${minutes} min`
     );
   }
+  const difficultyValue = String(sessionConfig.value.difficulty || '').toLowerCase();
+  const difficultySegment = ['easy', 'medium', 'hard'].includes(difficultyValue)
+    ? ` · ${difficultyValue}`
+    : '';
   return (
     `${sessionConfig.value.players_per_side}v${sessionConfig.value.players_per_side}`
-    + ` · ${sessionConfig.value.difficulty}`
+    + difficultySegment
     + ` · ${modeLabel} x ${minutes} min`
   );
 });
@@ -1949,11 +1960,18 @@ async function onStartGame() {
   resetPlayablePresentationState();
 
   try {
-    const payload = await startPlayableGame(
-      selectedPlayersPerSide.value,
-      selectedDifficulty.value,
-      selectedPeriodMode.value,
-      selectedPeriodLengthMinutes.value,
+    const payload = (
+      isDemoSession.value && !currentDifficultyConfig.value?.available
+        ? await takeOverPlayableDemoGame(
+          selectedPeriodMode.value,
+          selectedPeriodLengthMinutes.value,
+        )
+        : await startPlayableGame(
+          selectedPlayersPerSide.value,
+          selectedDifficulty.value,
+          selectedPeriodMode.value,
+          selectedPeriodLengthMinutes.value,
+        )
     );
     applyFreshPlayableSessionPayload(payload);
   } catch (err) {
@@ -2289,7 +2307,7 @@ onBeforeUnmount(() => {
 
       <div class="setup-actions" data-tutorial-id="setup-actions">
         <button data-tutorial-id="setup-start-game-btn" :disabled="!canStartGame" @click="onStartGame">
-          {{ actionLoading ? 'Loading...' : (isDemoSession ? 'Start Playing' : 'Start Game') }}
+          {{ actionLoading ? 'Loading...' : 'Start Game' }}
         </button>
         <button :disabled="!hasGame || actionLoading || transitionRunning || isDemoSession" @click="onNewGame">New Game</button>
         <button :disabled="!hasGame || actionLoading || transitionRunning || isDemoSession" @click="onResetSetup">Reset</button>

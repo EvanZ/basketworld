@@ -4,7 +4,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.backend.routes import playable_routes
-from app.backend.schemas import PlayableStepRequest
+from app.backend.schemas import PlayableDemoTakeoverRequest, PlayableStepRequest
 from app.backend.state import GameState
 
 
@@ -137,3 +137,30 @@ def test_playable_options_include_demo_config(monkeypatch):
     assert body["demo"]["period_mode"] == "period"
     assert body["demo"]["period_length_minutes"] == 5
     assert body["demo"]["session_kind"] == "demo"
+
+
+def test_playable_demo_takeover_turns_demo_into_live_game(monkeypatch):
+    target_state = _build_dummy_playable_state(demo_mode=True)
+
+    def fake_resolve_session_state(_request, *, require_active):
+        assert require_active is True
+        return "session-id", target_state
+
+    monkeypatch.setattr(playable_routes, "_resolve_session_state", fake_resolve_session_state)
+    monkeypatch.setattr(playable_routes, "_build_playable_side_skills", lambda: {"user": {}, "ai": {}})
+    monkeypatch.setattr(playable_routes, "_reset_playable_possession", lambda session: {"done": False})
+    monkeypatch.setattr(playable_routes, "_map_state_for_playable", lambda state, session: state)
+
+    response = Response()
+    payload = playable_routes.playable_demo_takeover(
+        PlayableDemoTakeoverRequest(period_mode="quarters", period_length_minutes=7),
+        _make_request(),
+        response,
+    )
+
+    assert payload["status"] == "success"
+    assert payload["config"]["demo_mode"] is False
+    assert payload["config"]["session_kind"] == "human"
+    assert payload["config"]["period_mode"] == "quarters"
+    assert payload["config"]["period_length_minutes"] == 7
+    assert target_state.playable_session["demo_mode"] is False

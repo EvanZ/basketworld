@@ -545,6 +545,25 @@ export async function startPlayableDemoGame() {
   return parsePlayableJsonResponse(response);
 }
 
+export async function takeOverPlayableDemoGame(periodMode = 'period', periodLengthMinutes = 5) {
+  const response = await fetch(`${API_BASE_URL}/api/playable/demo/takeover`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getPlayableSessionHeaders(),
+    },
+    body: JSON.stringify({
+      period_mode: String(periodMode || 'period').toLowerCase(),
+      period_length_minutes: Number(periodLengthMinutes),
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start playable game from demo');
+  }
+  return parsePlayableJsonResponse(response);
+}
+
 export async function newPlayableGame() {
   const response = await fetch(`${API_BASE_URL}/api/playable/new_game`, {
     method: 'POST',

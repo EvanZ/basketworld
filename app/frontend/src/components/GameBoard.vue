@@ -193,6 +193,26 @@ function getPlayerJerseyNumber(playerId) {
   return jersey;
 }
 
+function getOutcomePlayerLabel(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return 'Unknown';
+  const displayName = getPlayerDisplayName(id);
+  if (displayName) return displayName;
+  return `Player ${id}`;
+}
+
+function hasOutcomePlayer(playerId) {
+  return Number.isFinite(Number(playerId));
+}
+
+function getTurnoverOutcomeText(outcome) {
+  const stolenBy = Number(outcome?.stolenBy);
+  if (Number.isFinite(stolenBy)) {
+    return `Stolen by ${getOutcomePlayerLabel(stolenBy)}!`;
+  }
+  return 'Turnover!';
+}
+
 function expectedValueLabelDy() {
   return props.minimalChrome ? '1.9em' : '-1.0em';
 }
@@ -1912,9 +1932,20 @@ const episodeOutcome = computed(() => {
         }
     }
 
-    if (allTurnovers.length > 0 && allTurnovers[0].turnover_pos) {
-        const { x, y } = axialToCartesian(allTurnovers[0].turnover_pos[0], allTurnovers[0].turnover_pos[1]);
-        return { type: 'TURNOVER', x, y };
+    if (allTurnovers.length > 0) {
+        const turnover = allTurnovers[0] && typeof allTurnovers[0] === 'object' ? allTurnovers[0] : {};
+        const outcome = {
+            type: 'TURNOVER',
+            playerId: turnover.player_id,
+            stolenBy: turnover.stolen_by,
+            reason: turnover.reason,
+        };
+        if (Array.isArray(turnover.turnover_pos) && turnover.turnover_pos.length >= 2) {
+            const { x, y } = axialToCartesian(turnover.turnover_pos[0], turnover.turnover_pos[1]);
+            outcome.x = x;
+            outcome.y = y;
+        }
+        return outcome;
     }
 
     // Check for shot clock violation
@@ -3589,7 +3620,7 @@ onBeforeUnmount(() => {
             class="pass-flash-text"
             :opacity="passFlashOpacity"
           >
-            PASS {{ passFlash.passerId }} -> {{ passFlash.receiverId }}
+            {{ getOutcomePlayerLabel(passFlash.passerId) }} -> {{ getOutcomePlayerLabel(passFlash.receiverId) }}
           </text>
         </g>
 
@@ -3677,7 +3708,12 @@ onBeforeUnmount(() => {
             <circle v-if="episodeOutcome.type === 'MISSED_SHOT'" :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS" class="basket-fill-missed" />
 
             <!-- Turnover 'X' -->
-            <text v-if="episodeOutcome.type === 'TURNOVER'" :x="episodeOutcome.x" :y="episodeOutcome.y" class="turnover-x">X</text>
+            <text
+              v-if="episodeOutcome.type === 'TURNOVER' && episodeOutcome.x !== undefined && episodeOutcome.y !== undefined"
+              :x="episodeOutcome.x"
+              :y="episodeOutcome.y"
+              class="turnover-x"
+            >X</text>
             
             <!-- Defensive Violation indicator -->
             <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION' && episodeOutcome.x" :x="episodeOutcome.x" :y="episodeOutcome.y" class="violation-marker defensive">!</text>
@@ -3723,21 +3759,26 @@ onBeforeUnmount(() => {
       <!-- Outcome Text (drawn outside the transformed group to keep it upright) -->
       <g v-if="episodeOutcome" class="outcome-text-group">
           <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
-              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Made Dunk!' : (episodeOutcome.isThree ? 'Made 3!' : 'Made 2!') }}</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">
-              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Missed Dunk!' : (episodeOutcome.isThree ? 'Missed 3!' : 'Missed 2!') }}</tspan>
           </text>
-          <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover">TURNOVER!</text>
+          <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">
+              <tspan v-if="hasOutcomePlayer(episodeOutcome.playerId)" class="player-outcome-text" x="50%" dy="-1.2em">
+                {{ getOutcomePlayerLabel(episodeOutcome.playerId) }}
+              </tspan>
+              <tspan x="50%" :dy="hasOutcomePlayer(episodeOutcome.playerId) ? '1.2em' : '0'">{{ getTurnoverOutcomeText(episodeOutcome) }}</tspan>
+          </text>
           <text v-if="episodeOutcome.type === 'SHOT_CLOCK_VIOLATION'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">SHOT CLOCK!</text>
           <text v-if="episodeOutcome.type === 'DEFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation long-outcome-text">
-              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">Violation - Defense!</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'OFFENSIVE_VIOLATION'" x="50%" y="15%" class="outcome-text violation-offense long-outcome-text">
-              <tspan class="player-outcome-text" x="50%" dy="-1.2em">Player {{ episodeOutcome.playerId }}</tspan>
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">Violation - Offense!</tspan>
           </text>
       </g>

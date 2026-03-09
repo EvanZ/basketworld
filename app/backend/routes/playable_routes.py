@@ -21,6 +21,7 @@ from app.backend.routes.lifecycle_routes import step as lifecycle_step
 from app.backend.schemas import (
     ActionRequest,
     InitGameRequest,
+    PlayableDemoTakeoverRequest,
     PlayableStartRequest,
     PlayableStepRequest,
 )
@@ -1072,6 +1073,73 @@ async def start_playable_demo(
             event_type="game_started",
             payload={
                 "source": "demo_start",
+                "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
+                "user_on_offense": bool(session.get("user_on_offense")),
+                "score": score,
+                "possession": possession,
+                "game_clock": game_clock,
+                "game_result": game_result,
+                "sampled_skills": copy.deepcopy(session.get("side_skills") or {}),
+            },
+        )
+    return _attach_session_id(payload, session_id, http_response)
+
+
+@router.post("/api/playable/demo/takeover")
+def playable_demo_takeover(
+    request: PlayableDemoTakeoverRequest,
+    http_request: Request,
+    http_response: Response,
+):
+    session_id, target_state = _resolve_session_state(http_request, require_active=True)
+    with bind_game_state(target_state):
+        session = _get_playable_session(required=True)
+        if not bool(session.get("demo_mode", False)):
+            raise HTTPException(status_code=400, detail="Playable session is not in demo mode.")
+
+        period_mode = _normalize_period_mode(request.period_mode)
+        period_length_minutes = _normalize_period_length_minutes(request.period_length_minutes)
+        total_periods = int(PLAYABLE_PERIOD_MODE_TO_COUNT[period_mode])
+
+        session["difficulty"] = "demo"
+        session["score"] = {"user": 0, "ai": 0}
+        session["possession_number"] = 1
+        session["user_on_offense"] = bool(random.getrandbits(1))
+        session["side_skills"] = _build_playable_side_skills()
+        session["period_mode"] = period_mode
+        session["total_periods"] = total_periods
+        session["current_period"] = 1
+        session["period_length_minutes"] = period_length_minutes
+        session["period_seconds_remaining"] = period_length_minutes * 60
+        session["game_over"] = False
+        session["turn_index"] = 1
+        session["demo_mode"] = False
+        session["analytics"] = {
+            "game_id": uuid.uuid4().hex,
+            "next_seq": 1,
+        }
+
+        state = _reset_playable_possession(session)
+        game_clock = _build_game_clock_info(session)
+        score = _build_score_info(session)
+        possession = _build_possession_info(session)
+        game_result = _build_game_result(session)
+
+        payload = {
+            "status": "success",
+            "state": _map_state_for_playable(state, session),
+            "score": score,
+            "possession": possession,
+            "game_clock": game_clock,
+            "game_result": game_result,
+            "config": _build_playable_config_info(session),
+        }
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="game_started",
+            payload={
+                "source": "demo_takeover",
                 "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
                 "user_on_offense": bool(session.get("user_on_offense")),
                 "score": score,
