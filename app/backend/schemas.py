@@ -151,3 +151,4 @@ class PlayableStartRequest(BaseModel):
 
 class PlayableStepRequest(BaseModel):
     actions: dict[str, object]
+    auto_user_actions: bool = False

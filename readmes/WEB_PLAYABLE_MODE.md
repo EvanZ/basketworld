@@ -37,6 +37,12 @@ BACKEND_CORS_ALLOW_ORIGINS=https://basketworld.toplines.app
 BW_PLAYABLE_MAX_ACTIVE_SESSIONS=8
 BW_PLAYABLE_SESSION_TTL_MINUTES=120
 
+# Optional landing-page demo mode (AI vs AI autoplay)
+BW_PLAYABLE_DEMO_RUN_ID=<run-id>
+BW_PLAYABLE_DEMO_ALTERNATION_NUMBER=220
+BW_PLAYABLE_DEMO_PERIOD_MODE=period
+BW_PLAYABLE_DEMO_PERIOD_LENGTH_MINUTES=5
+
 # Optional playable analytics export (S3 JSONL batches)
 BW_ANALYTICS_S3_ENABLED=true
 BW_ANALYTICS_S3_BUCKET=basketworld
@@ -155,3 +161,10 @@ Rules:
 - no terminal winner in v1; user can start a new game
 - episode replay/save routes are disabled in backend public mode
 - single-board PNG/GIF capture remains available in UI
+
+## Landing Demo Mode
+
+- when `BW_PLAYABLE_DEMO_RUN_ID` and `BW_PLAYABLE_DEMO_ALTERNATION_NUMBER` are configured, the playable frontend can auto-start an AI-vs-AI demo session on landing
+- the backend loads `unified_iter_<alternation>.zip` from that run
+- demo sessions expose `config.demo_mode=true`
+- playable step requests can set `auto_user_actions=true` so the policy drives both sides instead of forcing missing user actions to `NOOP`

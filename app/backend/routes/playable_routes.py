@@ -40,6 +40,12 @@ PLAYABLE_PERIOD_MODE_TO_COUNT = {
 PLAYABLE_MIN_PERIOD_MINUTES = 1
 PLAYABLE_MAX_PERIOD_MINUTES = 60
 PLAYABLE_CLOCK_TICK_SECONDS = 1
+PLAYABLE_DEMO_ENABLED_ENV = "BW_PLAYABLE_DEMO_ENABLED"
+PLAYABLE_DEMO_RUN_ID_ENV = "BW_PLAYABLE_DEMO_RUN_ID"
+PLAYABLE_DEMO_ALTERNATION_ENV = "BW_PLAYABLE_DEMO_ALTERNATION_NUMBER"
+PLAYABLE_DEMO_CHECKPOINT_ENV = "BW_PLAYABLE_DEMO_CHECKPOINT"
+PLAYABLE_DEMO_PERIOD_MODE_ENV = "BW_PLAYABLE_DEMO_PERIOD_MODE"
+PLAYABLE_DEMO_PERIOD_LENGTH_ENV = "BW_PLAYABLE_DEMO_PERIOD_LENGTH_MINUTES"
 
 
 def _utc_now_iso() -> str:
@@ -131,6 +137,7 @@ def _emit_playable_event(
             "period_length_minutes": int(session.get("period_length_minutes", 5) or 5),
             "policy_run_id": str(session.get("run_id", "")),
             "policy_checkpoint_index": int(session.get("checkpoint_index", 0) or 0),
+            "session_kind": "demo" if bool(session.get("demo_mode", False)) else "human",
             "pass_mode": pass_mode,
         }
         event = {
@@ -176,6 +183,122 @@ def _normalize_period_length_minutes(raw: Any) -> int:
             ),
         )
     return minutes
+
+
+def _build_playable_config_info(session: dict[str, Any]) -> dict[str, Any]:
+    mode = _normalize_period_mode(session.get("period_mode", "period"))
+    total_periods = int(
+        session.get("total_periods", PLAYABLE_PERIOD_MODE_TO_COUNT[mode])
+        or PLAYABLE_PERIOD_MODE_TO_COUNT[mode]
+    )
+    return {
+        "players_per_side": int(session["players_per_side"]),
+        "difficulty": str(session.get("difficulty", "")).lower(),
+        "period_mode": mode,
+        "total_periods": total_periods,
+        "period_length_minutes": _normalize_period_length_minutes(session.get("period_length_minutes", 5)),
+        "demo_mode": bool(session.get("demo_mode", False)),
+        "session_kind": "demo" if bool(session.get("demo_mode", False)) else "human",
+    }
+
+
+def _build_playable_demo_config() -> dict[str, Any]:
+    run_id = str(os.getenv(PLAYABLE_DEMO_RUN_ID_ENV) or "").strip()
+    checkpoint = _to_int(os.getenv(PLAYABLE_DEMO_ALTERNATION_ENV))
+    if checkpoint is None:
+        checkpoint = _to_int(os.getenv(PLAYABLE_DEMO_CHECKPOINT_ENV))
+
+    raw_enabled = str(os.getenv(PLAYABLE_DEMO_ENABLED_ENV) or "").strip()
+    if not raw_enabled:
+        enabled = bool(run_id) and checkpoint is not None
+    else:
+        enabled = _is_truthy(raw_enabled)
+
+    raw_period_mode = str(os.getenv(PLAYABLE_DEMO_PERIOD_MODE_ENV) or "period").strip().lower()
+    period_mode = raw_period_mode if raw_period_mode in PLAYABLE_PERIOD_MODE_TO_COUNT else "period"
+
+    raw_period_length = _to_int(os.getenv(PLAYABLE_DEMO_PERIOD_LENGTH_ENV))
+    if raw_period_length is None:
+        period_length_minutes = 5
+    else:
+        period_length_minutes = max(
+            PLAYABLE_MIN_PERIOD_MINUTES,
+            min(PLAYABLE_MAX_PERIOD_MINUTES, int(raw_period_length)),
+        )
+
+    reason = ""
+    if enabled and not run_id:
+        reason = f"Missing {PLAYABLE_DEMO_RUN_ID_ENV}"
+    elif enabled and checkpoint is None:
+        reason = (
+            f"Missing {PLAYABLE_DEMO_ALTERNATION_ENV}"
+            f" (or {PLAYABLE_DEMO_CHECKPOINT_ENV})"
+        )
+
+    return {
+        "enabled": bool(enabled),
+        "available": bool(enabled and run_id and checkpoint is not None),
+        "run_id": run_id,
+        "checkpoint_index": int(checkpoint) if checkpoint is not None else None,
+        "policy_name": f"unified_iter_{int(checkpoint)}.zip" if checkpoint is not None else "",
+        "period_mode": period_mode,
+        "total_periods": int(PLAYABLE_PERIOD_MODE_TO_COUNT[period_mode]),
+        "period_length_minutes": int(period_length_minutes),
+        "reason": reason,
+    }
+
+
+def _sanitize_demo_config_for_response(config: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "enabled": bool(config.get("enabled", False)),
+        "available": bool(config.get("available", False)),
+        "period_mode": str(config.get("period_mode", "period")),
+        "total_periods": int(config.get("total_periods", 1) or 1),
+        "period_length_minutes": int(config.get("period_length_minutes", 5) or 5),
+        "session_kind": "demo",
+    }
+    reason = str(config.get("reason") or "").strip()
+    if reason:
+        payload["reason"] = reason
+    return payload
+
+
+def _build_new_playable_session(
+    *,
+    players_per_side: int,
+    difficulty: str,
+    run_id: str,
+    checkpoint_index: int,
+    policy_name: str,
+    period_mode: str,
+    total_periods: int,
+    period_length_minutes: int,
+    demo_mode: bool,
+) -> dict[str, Any]:
+    return {
+        "active": True,
+        "players_per_side": int(players_per_side),
+        "difficulty": str(difficulty).lower(),
+        "run_id": str(run_id),
+        "checkpoint_index": int(checkpoint_index),
+        "policy_name": str(policy_name),
+        "score": {"user": 0, "ai": 0},
+        "possession_number": 1,
+        "user_on_offense": bool(random.getrandbits(1)),
+        "side_skills": _build_playable_side_skills(),
+        "period_mode": period_mode,
+        "total_periods": int(total_periods),
+        "current_period": 1,
+        "period_length_minutes": int(period_length_minutes),
+        "period_seconds_remaining": int(period_length_minutes) * 60,
+        "game_over": False,
+        "turn_index": 1,
+        "demo_mode": bool(demo_mode),
+        "analytics": {
+            "game_id": uuid.uuid4().hex,
+            "next_seq": 1,
+        },
+    }
 
 
 def _segment_label_for_mode(mode: str, period_index: int) -> str:
@@ -747,6 +870,7 @@ def _sanitize_options_for_response(matrix: dict[int, dict[str, dict[str, Any]]])
 def get_playable_options():
     matrix = _load_playable_matrix()
     runtime_metrics = playable_session_store.metrics()
+    demo_config = _build_playable_demo_config()
     return {
         "status": "success",
         "players_per_side": list(PLAYABLE_PLAYERS),
@@ -758,6 +882,7 @@ def get_playable_options():
             "default": 5,
         },
         "options": _sanitize_options_for_response(matrix),
+        "demo": _sanitize_demo_config_for_response(demo_config),
         "runtime_limits": {
             "max_active_sessions": int(runtime_metrics["max_active_sessions"]),
             "session_ttl_minutes": int(runtime_metrics["session_ttl_minutes"]),
@@ -820,31 +945,17 @@ async def start_playable_game(
                 ),
             )
 
-        user_starts = bool(random.getrandbits(1))
-        side_skills = _build_playable_side_skills()
-        game_state.playable_session = {
-            "active": True,
-            "players_per_side": players_per_side,
-            "difficulty": difficulty,
-            "run_id": str(cfg["run_id"]),
-            "checkpoint_index": int(cfg["checkpoint_index"]),
-            "policy_name": str(cfg["policy_name"]),
-            "score": {"user": 0, "ai": 0},
-            "possession_number": 1,
-            "user_on_offense": user_starts,
-            "side_skills": side_skills,
-            "period_mode": period_mode,
-            "total_periods": total_periods,
-            "current_period": 1,
-            "period_length_minutes": period_length_minutes,
-            "period_seconds_remaining": period_length_minutes * 60,
-            "game_over": False,
-            "turn_index": 1,
-            "analytics": {
-                "game_id": uuid.uuid4().hex,
-                "next_seq": 1,
-            },
-        }
+        game_state.playable_session = _build_new_playable_session(
+            players_per_side=players_per_side,
+            difficulty=difficulty,
+            run_id=str(cfg["run_id"]),
+            checkpoint_index=int(cfg["checkpoint_index"]),
+            policy_name=str(cfg["policy_name"]),
+            period_mode=period_mode,
+            total_periods=total_periods,
+            period_length_minutes=period_length_minutes,
+            demo_mode=False,
+        )
 
         session = game_state.playable_session
         state = _reset_playable_possession(session)
@@ -860,13 +971,7 @@ async def start_playable_game(
             "possession": possession,
             "game_clock": game_clock,
             "game_result": game_result,
-            "config": {
-                "players_per_side": players_per_side,
-                "difficulty": difficulty,
-                "period_mode": period_mode,
-                "total_periods": total_periods,
-                "period_length_minutes": period_length_minutes,
-            },
+            "config": _build_playable_config_info(session),
         }
         _emit_playable_event(
             session_id=session_id,
@@ -874,6 +979,99 @@ async def start_playable_game(
             event_type="game_started",
             payload={
                 "source": "start",
+                "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
+                "user_on_offense": bool(session.get("user_on_offense")),
+                "score": score,
+                "possession": possession,
+                "game_clock": game_clock,
+                "game_result": game_result,
+                "sampled_skills": copy.deepcopy(session.get("side_skills") or {}),
+            },
+        )
+    return _attach_session_id(payload, session_id, http_response)
+
+
+@router.post("/api/playable/demo/start")
+async def start_playable_demo(
+    http_request: Request,
+    http_response: Response,
+):
+    demo_config = _build_playable_demo_config()
+    if not bool(demo_config.get("enabled", False)):
+        raise HTTPException(status_code=404, detail="Playable demo mode is disabled.")
+    if not bool(demo_config.get("available", False)):
+        raise HTTPException(
+            status_code=400,
+            detail=str(demo_config.get("reason") or "Playable demo mode is not configured."),
+        )
+
+    try:
+        session_id, target_state, _ = playable_session_store.get_or_create_for_start(
+            http_request.headers.get(PLAYABLE_SESSION_HEADER)
+        )
+    except PlayableCapacityError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Playable server is full ({exc.max_active} active games). "
+                "Please try again shortly."
+            ),
+        ) from exc
+
+    with bind_game_state(target_state):
+        init_request = InitGameRequest(
+            run_id=str(demo_config["run_id"]),
+            user_team_name="OFFENSE",
+            unified_policy_name=str(demo_config["policy_name"]),
+            opponent_unified_policy_name=None,
+        )
+
+        await init_game_route(init_request)
+
+        players_per_side = int(getattr(game_state.env, "players_per_side", 0) or 0)
+        if players_per_side not in PLAYABLE_PLAYERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Playable demo run must load a supported players_per_side value "
+                    f"(got {players_per_side})."
+                ),
+            )
+
+        game_state.playable_session = _build_new_playable_session(
+            players_per_side=players_per_side,
+            difficulty="demo",
+            run_id=str(demo_config["run_id"]),
+            checkpoint_index=int(demo_config["checkpoint_index"]),
+            policy_name=str(demo_config["policy_name"]),
+            period_mode=str(demo_config["period_mode"]),
+            total_periods=int(demo_config["total_periods"]),
+            period_length_minutes=int(demo_config["period_length_minutes"]),
+            demo_mode=True,
+        )
+
+        session = game_state.playable_session
+        state = _reset_playable_possession(session)
+        game_clock = _build_game_clock_info(session)
+        score = _build_score_info(session)
+        possession = _build_possession_info(session)
+        game_result = _build_game_result(session)
+
+        payload = {
+            "status": "success",
+            "state": _map_state_for_playable(state, session),
+            "score": score,
+            "possession": possession,
+            "game_clock": game_clock,
+            "game_result": game_result,
+            "config": _build_playable_config_info(session),
+        }
+        _emit_playable_event(
+            session_id=session_id,
+            session=session,
+            event_type="game_started",
+            payload={
+                "source": "demo_start",
                 "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
                 "user_on_offense": bool(session.get("user_on_offense")),
                 "score": score,
@@ -923,20 +1121,14 @@ def playable_new_game(http_request: Request, http_response: Response):
             "possession": possession,
             "game_clock": game_clock,
             "game_result": game_result,
-            "config": {
-                "players_per_side": int(session["players_per_side"]),
-                "difficulty": str(session["difficulty"]),
-                "period_mode": period_mode,
-                "total_periods": total_periods,
-                "period_length_minutes": period_length_minutes,
-            },
+            "config": _build_playable_config_info(session),
         }
         _emit_playable_event(
             session_id=session_id,
             session=session,
             event_type="game_started",
             payload={
-                "source": "new_game",
+                "source": "demo_new_game" if bool(session.get("demo_mode", False)) else "new_game",
                 "coin_toss_winner": "user" if bool(session.get("user_on_offense")) else "ai",
                 "user_on_offense": bool(session.get("user_on_offense")),
                 "score": score,
@@ -963,6 +1155,7 @@ def playable_step(
             raise HTTPException(status_code=400, detail="Game is over. Start a new game.")
 
         players_per_side = int(session["players_per_side"])
+        auto_user_actions = bool(request.auto_user_actions or session.get("demo_mode", False))
 
         env_to_canonical, canonical_to_env = _build_id_maps(
             players_per_side,
@@ -980,6 +1173,8 @@ def playable_step(
         for canonical_pid in range(players_per_side):
             raw_action = provided.get(str(canonical_pid), provided.get(canonical_pid))
             if raw_action is None:
+                if auto_user_actions:
+                    continue
                 raw_action = "NOOP"
             env_pid = canonical_to_env[canonical_pid]
             user_actions[str(env_pid)] = raw_action
@@ -994,6 +1189,7 @@ def playable_step(
                 "score_before": score_before,
                 "game_clock_before": game_clock_before,
                 "shot_clock_before": int(shot_clock_before),
+                "auto_user_actions": bool(auto_user_actions),
                 "submitted_actions": copy.deepcopy(submitted_actions),
             },
         )
@@ -1001,7 +1197,7 @@ def playable_step(
         step_payload = lifecycle_step(
             ActionRequest(
                 actions=user_actions,
-                player_deterministic=True,
+                player_deterministic=not auto_user_actions,
                 opponent_deterministic=False,
                 use_mcts=False,
             )
@@ -1085,6 +1281,7 @@ def playable_step(
                 "game_clock_after": game_clock_after,
                 "shot_clock_before": int(shot_clock_before),
                 "shot_clock_after": int(shot_clock_after),
+                "auto_user_actions": bool(auto_user_actions),
                 "submitted_actions": copy.deepcopy(submitted_actions),
                 "actions_taken": copy.deepcopy(actions_taken),
                 "actions_taken_meta": copy.deepcopy(actions_taken_meta),
@@ -1182,13 +1379,7 @@ def get_playable_state(http_request: Request, http_response: Response):
             "possession": _build_possession_info(session),
             "game_clock": _build_game_clock_info(session),
             "game_result": _build_game_result(session),
-            "config": {
-                "players_per_side": int(session["players_per_side"]),
-                "difficulty": str(session["difficulty"]),
-                "period_mode": _normalize_period_mode(session.get("period_mode", "period")),
-                "total_periods": int(session.get("total_periods", 1) or 1),
-                "period_length_minutes": _normalize_period_length_minutes(session.get("period_length_minutes", 5)),
-            },
+            "config": _build_playable_config_info(session),
         }
     return _attach_session_id(payload, session_id, http_response)
 
@@ -1200,6 +1391,7 @@ def get_playable_runtime_config():
         "status": "success",
         "public_mode": _is_truthy(os.getenv("BW_PUBLIC_MODE")),
         "matrix_source_json": bool(os.getenv("BW_PLAYABLE_POLICY_MATRIX_JSON")),
+        "demo": _sanitize_demo_config_for_response(_build_playable_demo_config()),
         "session_header": PLAYABLE_SESSION_HEADER,
         "active_sessions": int(runtime_metrics["active_sessions"]),
         "max_active_sessions": int(runtime_metrics["max_active_sessions"]),

@@ -530,6 +530,21 @@ export async function startPlayableGame(playersPerSide, difficulty, periodMode =
   return parsePlayableJsonResponse(response);
 }
 
+export async function startPlayableDemoGame() {
+  const response = await fetch(`${API_BASE_URL}/api/playable/demo/start`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...getPlayableSessionHeaders(),
+    },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start playable demo');
+  }
+  return parsePlayableJsonResponse(response);
+}
+
 export async function newPlayableGame() {
   const response = await fetch(`${API_BASE_URL}/api/playable/new_game`, {
     method: 'POST',
@@ -545,14 +560,17 @@ export async function newPlayableGame() {
   return parsePlayableJsonResponse(response);
 }
 
-export async function stepPlayableGame(actions = {}) {
+export async function stepPlayableGame(actions = {}, options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/playable/step`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...getPlayableSessionHeaders(),
     },
-    body: JSON.stringify({ actions }),
+    body: JSON.stringify({
+      actions,
+      auto_user_actions: Boolean(options?.autoUserActions),
+    }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));

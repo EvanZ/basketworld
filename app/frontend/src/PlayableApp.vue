@@ -8,16 +8,25 @@ import TutorialOverlay from './components/TutorialOverlay.vue';
 import basketworldLogo from './assets/basketworld-logo.jpg';
 import { playableTutorialSteps } from './tutorials/playableTutorial';
 import {
+  getPlayableState,
   getPlayableOptions,
   newPlayableGame,
   startPlayableGame,
+  startPlayableDemoGame,
   stepPlayableGame,
 } from './services/api';
 
 const optionsLoading = ref(false);
 const actionLoading = ref(false);
+const demoActionLoading = ref(false);
 const error = ref('');
 const isDevBuild = Boolean(import.meta.env?.DEV);
+const demoLoopToken = ref(0);
+const demoAutoplayRunning = ref(false);
+const demoDismissed = ref(false);
+const demoBootstrapAttempted = ref(false);
+const DEMO_STEP_DELAY_MS = 1050;
+const DEMO_RESTART_DELAY_MS = 1500;
 
 const optionsPayload = ref(null);
 const selectedPlayersPerSide = ref(1);
@@ -61,6 +70,7 @@ const gameClock = ref(createDefaultGameClock());
 const gameResult = ref(createDefaultGameResult());
 const lastPossessionResult = ref(null);
 const transitionRunning = ref(false);
+const demoTransitionRunning = ref(false);
 const forceGameOverPreview = ref(false);
 const violationOverlayPreview = ref(null);
 const passChordPPressed = ref(false);
@@ -1069,7 +1079,14 @@ const currentDifficultyConfig = computed(() => {
   return difficultyEntries.value.find((entry) => entry.value === selectedDifficulty.value) || null;
 });
 
+const demoConfig = computed(() => {
+  const raw = optionsPayload.value?.demo;
+  return raw && typeof raw === 'object' ? raw : null;
+});
+
+const demoAvailable = computed(() => Boolean(demoConfig.value?.enabled && demoConfig.value?.available));
 const hasGame = computed(() => !!gameState.value);
+const isDemoSession = computed(() => Boolean(sessionConfig.value?.demo_mode));
 const isGameOver = computed(() => Boolean(gameResult.value?.game_over));
 const showGameOverOverlay = computed(() => Boolean(isGameOver.value || forceGameOverPreview.value));
 
@@ -1079,11 +1096,16 @@ const canStartGame = computed(() => {
     && !actionLoading.value
     && !transitionRunning.value
     && Boolean(currentDifficultyConfig.value?.available)
-    && (!hasGame.value || isGameOver.value)
+    && (!hasGame.value || isGameOver.value || isDemoSession.value)
   );
 });
-const controlsDisabled = computed(() => actionLoading.value || transitionRunning.value || isGameOver.value);
-const setupLocked = computed(() => optionsLoading.value || actionLoading.value || transitionRunning.value || (hasGame.value && !isGameOver.value));
+const controlsDisabled = computed(() => actionLoading.value || transitionRunning.value || isGameOver.value || isDemoSession.value);
+const setupLocked = computed(() => (
+  optionsLoading.value
+  || actionLoading.value
+  || transitionRunning.value
+  || (hasGame.value && !isGameOver.value && !isDemoSession.value)
+));
 
 const userPlayerIds = computed(() => {
   const ids = gameState.value?.playable_user_ids;
@@ -1424,6 +1446,12 @@ const selectedModeLabel = computed(() => {
   if (!sessionConfig.value) return '';
   const modeLabel = periodModeLabelMap[String(sessionConfig.value.period_mode || 'period')] || '1 period';
   const minutes = Number(sessionConfig.value.period_length_minutes || 5);
+  if (Boolean(sessionConfig.value.demo_mode)) {
+    return (
+      `Demo AI vs AI · ${sessionConfig.value.players_per_side}v${sessionConfig.value.players_per_side}`
+      + ` · ${modeLabel} x ${minutes} min`
+    );
+  }
   return (
     `${sessionConfig.value.players_per_side}v${sessionConfig.value.players_per_side}`
     + ` · ${sessionConfig.value.difficulty}`
@@ -1558,12 +1586,15 @@ function applyStatePayload(payload) {
   if (payload?.config) {
     const cfgMode = String(payload.config.period_mode || selectedPeriodMode.value || 'period').toLowerCase();
     const cfgMinutes = Number(payload.config.period_length_minutes ?? selectedPeriodLengthMinutes.value ?? 5);
+    const demoMode = Boolean(payload.config.demo_mode);
     sessionConfig.value = {
       players_per_side: Number(payload.config.players_per_side),
       difficulty: String(payload.config.difficulty || '').toLowerCase(),
       period_mode: ['period', 'halves', 'quarters'].includes(cfgMode) ? cfgMode : 'period',
       total_periods: Number(payload.config.total_periods || (cfgMode === 'halves' ? 2 : (cfgMode === 'quarters' ? 4 : 1))),
       period_length_minutes: Math.max(1, cfgMinutes),
+      demo_mode: demoMode,
+      session_kind: String(payload.config.session_kind || (demoMode ? 'demo' : 'human')).toLowerCase(),
     };
     selectedPeriodMode.value = sessionConfig.value.period_mode;
     selectedPeriodLengthMinutes.value = sessionConfig.value.period_length_minutes;
@@ -1644,11 +1675,265 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function stopDemoLoop(markDismissed = false) {
+  demoLoopToken.value += 1;
+  demoAutoplayRunning.value = false;
+  if (markDismissed) {
+    demoDismissed.value = true;
+  }
+}
+
+async function waitForDemoIdle() {
+  while (demoActionLoading.value || demoTransitionRunning.value) {
+    await sleep(50);
+  }
+}
+
+function resetPlayablePresentationState() {
+  error.value = '';
+  tutorialTurnSubmissionCount.value = 0;
+  lastPossessionResult.value = null;
+  forceGameOverPreview.value = false;
+  violationOverlayPreview.value = null;
+}
+
+function applyFreshPlayableSessionPayload(payload) {
+  resetPlayableStats();
+  resetPlayablePlayByPlay();
+  applyStatePayload(payload);
+  assignRandomPlayablePlayerNames(payload?.state);
+  assignRandomPlayableJerseyNumbers(payload?.state);
+  recordPlayableStartPlayByPlay(payload);
+  boardSelections.value = {};
+}
+
+async function handlePlayableStepPayload(payload, context = {}) {
+  const userIds = context.userIds instanceof Set ? context.userIds : new Set();
+  const aiIds = context.aiIds instanceof Set ? context.aiIds : new Set();
+  const userOnOffense = Boolean(context.userOnOffense);
+  const allowPassFocus = context.allowPassFocus !== false;
+  const shouldCountTutorialTurn = context.countTutorialTurn !== false;
+  const transitionDelayMs = Math.max(0, Number(context.transitionDelayMs ?? 1125));
+  const useDemoTransitionState = Boolean(context.useDemoTransitionState);
+  const shouldAbort = typeof context.shouldAbort === 'function' ? context.shouldAbort : () => false;
+  const successfulUserPassReceiverId = allowPassFocus
+    ? getSuccessfulUserPassReceiverId(payload, userIds)
+    : null;
+
+  if (shouldAbort()) return;
+
+  if (shouldCountTutorialTurn) {
+    tutorialTurnSubmissionCount.value = Number(tutorialTurnSubmissionCount.value || 0) + 1;
+  }
+
+  recordPlayableStepStats(payload, { userIds, aiIds, userOnOffense });
+  recordPlayableStepPlayByPlay(payload, { userIds, aiIds, userOnOffense });
+
+  const possessionEnded = Boolean(payload?.possession_ended);
+  const periodEnded = Boolean(payload?.period_ended);
+  const gameEnded = Boolean(payload?.game_result?.game_over);
+  const possessionMessage = String(payload?.possession_result?.message || '').trim();
+  const periodMessage = String(payload?.period_result?.message || '').trim();
+
+  if (gameEnded) {
+    lastPossessionResult.value = null;
+  } else if (possessionEnded && possessionMessage) {
+    lastPossessionResult.value = {
+      message: periodEnded && periodMessage
+        ? `${possessionMessage} ${periodMessage}`
+        : possessionMessage,
+    };
+  } else if (periodEnded && periodMessage) {
+    lastPossessionResult.value = { message: periodMessage };
+  } else {
+    lastPossessionResult.value = null;
+  }
+
+  if (possessionEnded && payload?.ended_state && !gameEnded) {
+    if (useDemoTransitionState) {
+      demoTransitionRunning.value = true;
+    } else {
+      transitionRunning.value = true;
+    }
+    gameState.value = payload.ended_state;
+    gameHistory.value = [payload.ended_state];
+    boardSelections.value = buildBoardSelectionActions(payload?.actions_taken, payload?.actions_taken_meta);
+    await sleep(transitionDelayMs);
+    if (shouldAbort()) {
+      boardSelections.value = {};
+      if (useDemoTransitionState) {
+        demoTransitionRunning.value = false;
+      } else {
+        transitionRunning.value = false;
+      }
+      return;
+    }
+    applyStatePayload(payload);
+    if (Number.isFinite(successfulUserPassReceiverId)) {
+      const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
+        ? gameState.value.playable_user_ids
+          .map((v) => Number(v))
+          .filter((v) => Number.isFinite(v))
+        : [];
+      if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
+        activePlayerId.value = Number(successfulUserPassReceiverId);
+      }
+    }
+    boardSelections.value = {};
+    if (useDemoTransitionState) {
+      demoTransitionRunning.value = false;
+    } else {
+      transitionRunning.value = false;
+    }
+    return;
+  }
+
+  if (shouldAbort()) return;
+  applyStatePayload(payload);
+  if (Number.isFinite(successfulUserPassReceiverId)) {
+    const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
+      ? gameState.value.playable_user_ids
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v))
+      : [];
+    if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
+      activePlayerId.value = Number(successfulUserPassReceiverId);
+    }
+  }
+  boardSelections.value = {};
+}
+
+async function runDemoLoop(token) {
+  while (
+    token === demoLoopToken.value
+    && !demoDismissed.value
+    && isDemoSession.value
+  ) {
+    if (!hasGame.value) break;
+
+    if (demoActionLoading.value || demoTransitionRunning.value || actionLoading.value || transitionRunning.value) {
+      await sleep(120);
+      continue;
+    }
+
+    if (Boolean(gameResult.value?.game_over)) {
+      await sleep(DEMO_RESTART_DELAY_MS);
+      if (token !== demoLoopToken.value || demoDismissed.value || !isDemoSession.value) break;
+      demoActionLoading.value = true;
+      error.value = '';
+      try {
+        const payload = await newPlayableGame();
+        if (token !== demoLoopToken.value || demoDismissed.value || !isDemoSession.value) break;
+        applyFreshPlayableSessionPayload(payload);
+      } catch (err) {
+        if (token === demoLoopToken.value) {
+          error.value = err?.message || 'Failed to restart playable demo.';
+        }
+        break;
+      } finally {
+        demoActionLoading.value = false;
+        demoTransitionRunning.value = false;
+      }
+      continue;
+    }
+
+    await sleep(DEMO_STEP_DELAY_MS);
+    if (token !== demoLoopToken.value || demoDismissed.value || !isDemoSession.value) break;
+
+    demoActionLoading.value = true;
+    error.value = '';
+    try {
+      violationOverlayPreview.value = null;
+      const userIds = toIdSet(userPlayerIds.value);
+      const aiIds = toIdSet(gameState.value?.playable_ai_ids);
+      const userOnOffense = Boolean(possession.value?.user_on_offense);
+      const payload = await stepPlayableGame({}, { autoUserActions: true });
+      if (token !== demoLoopToken.value || demoDismissed.value || !isDemoSession.value) break;
+      await handlePlayableStepPayload(payload, {
+        userIds,
+        aiIds,
+        userOnOffense,
+        allowPassFocus: false,
+        countTutorialTurn: false,
+        useDemoTransitionState: true,
+        shouldAbort: () => (
+          token !== demoLoopToken.value
+          || demoDismissed.value
+          || !isDemoSession.value
+        ),
+      });
+    } catch (err) {
+      if (token === demoLoopToken.value) {
+        error.value = err?.message || 'Failed to advance playable demo.';
+      }
+      break;
+    } finally {
+      demoActionLoading.value = false;
+      demoTransitionRunning.value = false;
+    }
+  }
+
+  if (token === demoLoopToken.value) {
+    demoAutoplayRunning.value = false;
+  }
+}
+
+async function startDemoSession() {
+  if (!demoAvailable.value || demoDismissed.value) return;
+
+  const token = demoLoopToken.value + 1;
+  demoLoopToken.value = token;
+  demoAutoplayRunning.value = true;
+  demoActionLoading.value = true;
+  resetPlayablePresentationState();
+
+  try {
+    const payload = await startPlayableDemoGame();
+    if (token !== demoLoopToken.value || demoDismissed.value) return;
+    applyFreshPlayableSessionPayload(payload);
+  } catch (err) {
+    if (token === demoLoopToken.value) {
+      error.value = err?.message || 'Failed to start playable demo.';
+    }
+    demoAutoplayRunning.value = false;
+    return;
+  } finally {
+    demoActionLoading.value = false;
+  }
+
+  await runDemoLoop(token);
+}
+
+async function bootstrapPlayableLandingExperience() {
+  if (demoBootstrapAttempted.value) return;
+  demoBootstrapAttempted.value = true;
+
+  try {
+    const payload = await getPlayableState();
+    applyStatePayload(payload);
+    boardSelections.value = {};
+    if (Boolean(payload?.config?.demo_mode)) {
+      demoAutoplayRunning.value = true;
+      const token = demoLoopToken.value + 1;
+      demoLoopToken.value = token;
+      void runDemoLoop(token);
+    }
+    return;
+  } catch (_) {
+    // No active playable session is expected on first page load.
+  }
+
+  if (demoAvailable.value && !demoDismissed.value) {
+    await startDemoSession();
+  }
+}
+
 async function loadOptions() {
   optionsLoading.value = true;
   error.value = '';
   try {
     optionsPayload.value = await getPlayableOptions();
+    await bootstrapPlayableLandingExperience();
   } catch (err) {
     error.value = err?.message || 'Failed to load playable options.';
   } finally {
@@ -1658,12 +1943,10 @@ async function loadOptions() {
 
 async function onStartGame() {
   if (!canStartGame.value) return;
+  stopDemoLoop(true);
+  await waitForDemoIdle();
   actionLoading.value = true;
-  error.value = '';
-  tutorialTurnSubmissionCount.value = 0;
-  lastPossessionResult.value = null;
-  forceGameOverPreview.value = false;
-  violationOverlayPreview.value = null;
+  resetPlayablePresentationState();
 
   try {
     const payload = await startPlayableGame(
@@ -1672,13 +1955,7 @@ async function onStartGame() {
       selectedPeriodMode.value,
       selectedPeriodLengthMinutes.value,
     );
-    resetPlayableStats();
-    resetPlayablePlayByPlay();
-    applyStatePayload(payload);
-    assignRandomPlayablePlayerNames(payload?.state);
-    assignRandomPlayableJerseyNumbers(payload?.state);
-    recordPlayableStartPlayByPlay(payload);
-    boardSelections.value = {};
+    applyFreshPlayableSessionPayload(payload);
   } catch (err) {
     error.value = err?.message || 'Failed to start playable game.';
   } finally {
@@ -1688,22 +1965,13 @@ async function onStartGame() {
 
 async function onNewGame() {
   if (!hasGame.value || actionLoading.value) return;
+  stopDemoLoop(isDemoSession.value);
   actionLoading.value = true;
-  error.value = '';
-  tutorialTurnSubmissionCount.value = 0;
-  lastPossessionResult.value = null;
-  forceGameOverPreview.value = false;
-  violationOverlayPreview.value = null;
+  resetPlayablePresentationState();
 
   try {
     const payload = await newPlayableGame();
-    resetPlayableStats();
-    resetPlayablePlayByPlay();
-    applyStatePayload(payload);
-    assignRandomPlayablePlayerNames(payload?.state);
-    assignRandomPlayableJerseyNumbers(payload?.state);
-    recordPlayableStartPlayByPlay(payload);
-    boardSelections.value = {};
+    applyFreshPlayableSessionPayload(payload);
   } catch (err) {
     error.value = err?.message || 'Failed to reset playable game.';
   } finally {
@@ -1711,14 +1979,11 @@ async function onNewGame() {
   }
 }
 
-function onResetSetup() {
+async function onResetSetup() {
   if (actionLoading.value || transitionRunning.value) return;
 
-  error.value = '';
-  tutorialTurnSubmissionCount.value = 0;
-  lastPossessionResult.value = null;
-  forceGameOverPreview.value = false;
-  violationOverlayPreview.value = null;
+  stopDemoLoop(false);
+  resetPlayablePresentationState();
 
   gameState.value = null;
   gameHistory.value = [];
@@ -1745,6 +2010,11 @@ function onResetSetup() {
 
   resetPlayableStats();
   resetPlayablePlayByPlay();
+
+  if (demoAvailable.value) {
+    demoDismissed.value = false;
+    await startDemoSession();
+  }
 }
 
 async function onActionsSubmitted(actions) {
@@ -1759,64 +2029,7 @@ async function onActionsSubmitted(actions) {
     const userOnOffense = Boolean(possession.value?.user_on_offense);
 
     const payload = await stepPlayableGame(actions || {});
-    const successfulUserPassReceiverId = getSuccessfulUserPassReceiverId(payload, userIds);
-    tutorialTurnSubmissionCount.value = Number(tutorialTurnSubmissionCount.value || 0) + 1;
-    recordPlayableStepStats(payload, { userIds, aiIds, userOnOffense });
-    recordPlayableStepPlayByPlay(payload, { userIds, aiIds, userOnOffense });
-    const possessionEnded = Boolean(payload?.possession_ended);
-    const periodEnded = Boolean(payload?.period_ended);
-    const gameEnded = Boolean(payload?.game_result?.game_over);
-    const possessionMessage = String(payload?.possession_result?.message || '').trim();
-    const periodMessage = String(payload?.period_result?.message || '').trim();
-
-    if (gameEnded) {
-      lastPossessionResult.value = null;
-    } else if (possessionEnded && possessionMessage) {
-      lastPossessionResult.value = {
-        message: periodEnded && periodMessage
-          ? `${possessionMessage} ${periodMessage}`
-          : possessionMessage,
-      };
-    } else if (periodEnded && periodMessage) {
-      lastPossessionResult.value = { message: periodMessage };
-    } else {
-      lastPossessionResult.value = null;
-    }
-
-    if (possessionEnded && payload?.ended_state && !Boolean(payload?.game_result?.game_over)) {
-      transitionRunning.value = true;
-      gameState.value = payload.ended_state;
-      gameHistory.value = [payload.ended_state];
-      boardSelections.value = buildBoardSelectionActions(payload?.actions_taken, payload?.actions_taken_meta);
-      await sleep(1125);
-      applyStatePayload(payload);
-      if (Number.isFinite(successfulUserPassReceiverId)) {
-        const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
-          ? gameState.value.playable_user_ids
-            .map((v) => Number(v))
-            .filter((v) => Number.isFinite(v))
-          : [];
-        if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
-          activePlayerId.value = Number(successfulUserPassReceiverId);
-        }
-      }
-      boardSelections.value = {};
-      transitionRunning.value = false;
-      return;
-    }
-
-    applyStatePayload(payload);
-    if (Number.isFinite(successfulUserPassReceiverId)) {
-      const currentUserIds = Array.isArray(gameState.value?.playable_user_ids)
-        ? gameState.value.playable_user_ids
-          .map((v) => Number(v))
-          .filter((v) => Number.isFinite(v))
-        : [];
-      if (currentUserIds.includes(Number(successfulUserPassReceiverId))) {
-        activePlayerId.value = Number(successfulUserPassReceiverId);
-      }
-    }
-    boardSelections.value = {};
+    await handlePlayableStepPayload(payload, { userIds, aiIds, userOnOffense });
   } catch (err) {
     error.value = err?.message || 'Failed to process turn.';
   } finally {
@@ -1876,6 +2089,13 @@ function onGlobalKeydown(event) {
   if (rulesModalOpen.value) {
     if (key === 'escape') {
       closeRulesModal();
+      event.preventDefault();
+    }
+    return;
+  }
+  if (isDemoSession.value) {
+    if (key === 'n' && canStartGame.value) {
+      onStartGame();
       event.preventDefault();
     }
     return;
@@ -1974,6 +2194,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopDemoLoop(false);
   window.removeEventListener('keydown', onGlobalKeydown);
   window.removeEventListener('keyup', onGlobalKeyup);
   window.removeEventListener('blur', onWindowBlur);
@@ -2068,11 +2289,11 @@ onBeforeUnmount(() => {
 
       <div class="setup-actions" data-tutorial-id="setup-actions">
         <button data-tutorial-id="setup-start-game-btn" :disabled="!canStartGame" @click="onStartGame">
-          {{ actionLoading ? 'Loading...' : 'Start Game' }}
+          {{ actionLoading ? 'Loading...' : (isDemoSession ? 'Start Playing' : 'Start Game') }}
         </button>
-        <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onNewGame">New Game</button>
-        <button :disabled="!hasGame || actionLoading || transitionRunning" @click="onResetSetup">Reset</button>
-        <button :disabled="actionLoading || transitionRunning" @click="toggleTutorial">
+        <button :disabled="!hasGame || actionLoading || transitionRunning || isDemoSession" @click="onNewGame">New Game</button>
+        <button :disabled="!hasGame || actionLoading || transitionRunning || isDemoSession" @click="onResetSetup">Reset</button>
+        <button :disabled="actionLoading || transitionRunning || isDemoSession" @click="toggleTutorial">
           {{ tutorialActive ? 'Exit Tutorial' : (tutorialCompleted ? 'Replay Tutorial' : 'Tutorial') }}
         </button>
         <button
@@ -2108,17 +2329,18 @@ onBeforeUnmount(() => {
       <div class="status-row">
         <span v-if="selectedModeLabel">Mode: {{ selectedModeLabel }}</span>
         <span v-if="possessionSummary">{{ possessionSummary }}</span>
+        <span v-if="isDemoSession">Demo mode: AI vs AI autoplay. Adjust settings above and press Start Game to play.</span>
         <span v-if="violationOverlayPreview === 'defensive'">Demo: Defensive violation overlay</span>
         <span v-if="violationOverlayPreview === 'offensive'">Demo: Offensive violation overlay</span>
       </div>
 
-      <p v-if="lastPossessionResult" class="possession-result">
+      <p v-if="lastPossessionResult && !isDemoSession" class="possession-result">
         {{ lastPossessionResult.message }}
       </p>
       <p v-if="error" class="error">{{ error }}</p>
     </section>
 
-    <section v-if="hasGame" class="playable-layout">
+    <section v-if="hasGame" class="playable-layout" :class="{ 'playable-layout-demo': isDemoSession }">
       <div class="playable-scoreboard" data-tutorial-id="playable-scoreboard" aria-label="Scoreboard">
         <div class="score-side score-side-you">
           <div class="score-lane-meter score-lane-meter-left" :title="userLaneMeter.title">
@@ -2215,6 +2437,13 @@ onBeforeUnmount(() => {
             :player-display-names="playerDisplayNames"
             :player-jersey-numbers="playerJerseyNumbers"
           />
+        </div>
+      </div>
+
+      <div v-if="isDemoSession" class="playable-demo-scrim" role="status" aria-live="polite">
+        <div class="playable-demo-banner">
+          <p class="playable-demo-main">DEMO MODE</p>
+          <p class="playable-demo-sub">AI vs AI autoplay. Configure above and press Start Game to take over.</p>
         </div>
       </div>
 
@@ -2558,6 +2787,7 @@ onBeforeUnmount(() => {
 }
 
 .playable-layout {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1024px) minmax(375px, 450px);
   justify-content: center;
@@ -2567,6 +2797,54 @@ onBeforeUnmount(() => {
   border-radius: 20px;
   border: 1px solid var(--app-panel-border);
   background: var(--app-panel);
+  overflow: hidden;
+}
+
+.playable-layout.playable-layout-demo > .playable-scoreboard,
+.playable-layout.playable-layout-demo > .left-shell,
+.playable-layout.playable-layout-demo > .sidebar-shell {
+  filter: blur(1.4px) saturate(0.82) brightness(0.74);
+  transform: scale(0.996);
+  transform-origin: center top;
+}
+
+.playable-demo-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5.6rem 1.1rem 1.1rem;
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.08), rgba(2, 6, 23, 0.24));
+}
+
+.playable-demo-banner {
+  pointer-events: none;
+  width: min(88%, 640px);
+  padding: 0.72rem 0.92rem;
+  border-radius: 14px;
+  border: 1px solid rgba(125, 211, 252, 0.26);
+  background: rgba(8, 15, 28, 0.42);
+  box-shadow: 0 14px 30px rgba(2, 6, 23, 0.24);
+  text-align: center;
+  backdrop-filter: blur(6px);
+}
+
+.playable-demo-main {
+  margin: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: #7dd3fc;
+}
+
+.playable-demo-sub {
+  margin: 0.38rem 0 0;
+  font-size: 0.84rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.92);
 }
 
 .board-shell,
@@ -2818,6 +3096,14 @@ onBeforeUnmount(() => {
 
   .playable-layout {
     grid-template-columns: 1fr;
+  }
+
+  .playable-layout.playable-layout-demo .board-shell,
+  .playable-layout.playable-layout-demo .environment-shell,
+  .playable-layout.playable-layout-demo > .sidebar-shell {
+    filter: blur(1.4px) saturate(0.82) brightness(0.74);
+    transform: scale(0.996);
+    transform-origin: center top;
   }
 
   .left-shell {
