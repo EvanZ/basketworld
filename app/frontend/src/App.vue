@@ -6,7 +6,7 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -271,6 +271,15 @@ const pressureExposure = computed(() => {
 // Evaluation mode state
 const isEvaluating = ref(false);
 const evalNumEpisodes = ref(100);
+const evalProgress = ref({
+  running: false,
+  completed: 0,
+  total: 0,
+  fraction: 0,
+  status: 'idle',
+  error: null,
+});
+let evalProgressPollHandle = null;
 const defaultEvalConfig = () => ({
   mode: 'default',
   placementEditing: false,
@@ -1334,6 +1343,7 @@ async function handleEvaluation() {
   
   // Set UI state immediately to show we're evaluating
   isEvaluating.value = true;
+  startEvaluationProgressPolling(numEpisodes);
   error.value = null;
   
   // Give UI a chance to update before blocking on API call
@@ -1439,9 +1449,28 @@ async function handleEvaluation() {
       throw new Error('Invalid evaluation response');
     }
   } catch (err) {
+    evalProgress.value = {
+      ...evalProgress.value,
+      running: false,
+      status: 'failed',
+      error: err.message,
+    };
     error.value = `Evaluation failed: ${err.message}`;
     console.error('[App] Evaluation error:', err);
   } finally {
+    stopEvaluationProgressPolling();
+    if (!evalProgress.value.error) {
+      const total = Number(evalProgress.value.total || numEpisodes || 0);
+      const completed = Math.max(Number(evalProgress.value.completed || 0), total);
+      evalProgress.value = {
+        ...evalProgress.value,
+        running: false,
+        completed,
+        total,
+        fraction: total > 0 ? 1 : 0,
+        status: 'completed',
+      };
+    }
     console.log('[App] Setting isEvaluating to false');
     isEvaluating.value = false;
   }
@@ -1733,6 +1762,68 @@ function handlePlayAgain() {
   }
 }
 
+function clearEvaluationArtifacts() {
+  shotAccumulator.value = {};
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  perPlayerEvalStats.value = {};
+  evalProgress.value = {
+    running: false,
+    completed: 0,
+    total: 0,
+    fraction: 0,
+    status: 'idle',
+    error: null,
+  };
+}
+
+function handleStatsReset() {
+  clearEvaluationArtifacts();
+}
+
+function stopEvaluationProgressPolling() {
+  if (evalProgressPollHandle !== null) {
+    clearInterval(evalProgressPollHandle);
+    evalProgressPollHandle = null;
+  }
+}
+
+async function refreshEvaluationProgress() {
+  try {
+    const payload = await getEvaluationProgress();
+    evalProgress.value = {
+      running: Boolean(payload?.running),
+      completed: Number(payload?.completed || 0),
+      total: Number(payload?.total || 0),
+      fraction: Number(payload?.fraction || 0),
+      status: String(payload?.status || 'idle'),
+      error: payload?.error || null,
+    };
+  } catch (_) {
+    // Ignore transient failures while the main evaluation request is in flight.
+  }
+}
+
+function startEvaluationProgressPolling(expectedTotal) {
+  stopEvaluationProgressPolling();
+  evalProgress.value = {
+    running: true,
+    completed: 0,
+    total: Number(expectedTotal || 0),
+    fraction: 0,
+    status: 'running',
+    error: null,
+  };
+  evalProgressPollHandle = window.setInterval(() => {
+    refreshEvaluationProgress();
+  }, 1000);
+  window.setTimeout(() => {
+    refreshEvaluationProgress();
+  }, 250);
+}
+
 // --- Global keyboard shortcuts ---
 function onKeydown(e) {
   const tag = (e.target?.tagName || '').toLowerCase();
@@ -1790,6 +1881,7 @@ onMounted(() => {
   window.addEventListener('keydown', onKeydown);
 });
 onBeforeUnmount(() => {
+  stopEvaluationProgressPolling();
   window.removeEventListener('keydown', onKeydown);
 });
 </script>
@@ -1915,6 +2007,7 @@ onBeforeUnmount(() => {
           :external-selections="isSelfPlaying ? currentSelections : null"
           :eval-config="evalConfig"
           :eval-num-episodes="evalNumEpisodes"
+          :eval-progress="evalProgress"
           :per-player-eval-stats="perPlayerEvalStats"
           :tabs-mount-el="tabsMountEl"
           :tabs-mount-selector="'#dev-bottom-tabs'"
@@ -1931,6 +2024,7 @@ onBeforeUnmount(() => {
           @eval-config-changed="handleEvalConfigChanged"
           @eval-run="handleEvalRunRequested"
           @active-tab-changed="handleActiveTabChanged"
+          @stats-reset="handleStatsReset"
           ref="controlsRef"
         />
 

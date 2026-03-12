@@ -263,6 +263,18 @@ def get_mlflow_params(
         float,
         0.0,
     )
+    optional["enable_defense_intent_learning"] = _get_param(
+        params,
+        ["enable_defense_intent_learning", "enable-defense-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["defense_intent_null_prob"] = _get_param(
+        params,
+        ["defense_intent_null_prob", "defense-intent-null-prob"],
+        float,
+        1.0,
+    )
     optional["intent_obs_mode"] = _get_param(
         params,
         ["intent_obs_mode", "intent-obs-mode"],

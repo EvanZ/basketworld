@@ -117,6 +117,10 @@ const props = defineProps({
     type: Number,
     default: 100,
   },
+  evalProgress: {
+    type: Object,
+    default: null,
+  },
   perPlayerEvalStats: {
     type: Object,
     default: null,
@@ -131,7 +135,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -576,6 +580,28 @@ watch(() => props.evalNumEpisodes, (val) => {
   const safe = Number.isFinite(val) ? Number(val) : 100;
   evalEpisodesInput.value = safe;
 });
+
+const evalProgressSafe = computed(() => {
+  const incoming = props.evalProgress && typeof props.evalProgress === 'object'
+    ? props.evalProgress
+    : {};
+  const total = Math.max(0, Number(incoming.total || evalEpisodesInput.value || 0));
+  const rawCompleted = Math.max(0, Number(incoming.completed || 0));
+  const completed = total > 0 ? Math.min(total, rawCompleted) : rawCompleted;
+  const fraction = total > 0
+    ? Math.max(0, Math.min(1, Number.isFinite(Number(incoming.fraction)) ? Number(incoming.fraction) : (completed / total)))
+    : 0;
+  return {
+    running: Boolean(incoming.running),
+    completed,
+    total,
+    fraction,
+    status: String(incoming.status || 'idle'),
+    error: incoming.error || null,
+  };
+});
+
+const evalProgressPercent = computed(() => `${(evalProgressSafe.value.fraction * 100).toFixed(1)}%`);
 
 function updateEvalEpisodes(val) {
   const safe = Math.max(1, Number(val) || 1);
@@ -1645,6 +1671,7 @@ function applyEvaluationStats(
 
 function resetStats() {
   statsState.value = resetStatsStorage();
+  emit('stats-reset');
 }
 
 async function copyStatsMarkdown() {
@@ -3708,8 +3735,8 @@ const stealRisks = computed(() => {
           </div>
         </div>
         <div style="display:flex; gap: 0.5rem;">
-          <button class="new-game-button" @click="resetStats">Reset Stats</button>
-          <button class="submit-button" @click="copyStatsMarkdown">Copy</button>
+          <button type="button" class="new-game-button" @click="resetStats">Reset Stats</button>
+          <button type="button" class="submit-button" @click="copyStatsMarkdown">Copy</button>
         </div>
       </div>
     </div>
@@ -3852,9 +3879,20 @@ const stealRisks = computed(() => {
         >
           {{ props.isEvaluating ? 'Evaluating…' : 'Run Eval' }}
         </button>
-        <span v-if="props.isEvaluating" class="eval-status">
-          Running {{ evalEpisodesInput }} episodes…
-        </span>
+        <div v-if="props.isEvaluating" class="eval-progress-wrap">
+          <div class="eval-progress-bar" :aria-valuenow="evalProgressSafe.completed" :aria-valuemin="0" :aria-valuemax="Math.max(1, evalProgressSafe.total)" role="progressbar">
+            <div
+              class="eval-progress-fill"
+              :class="{ indeterminate: evalProgressSafe.total <= 0 }"
+              :style="evalProgressSafe.total > 0 ? { width: evalProgressPercent } : null"
+            ></div>
+          </div>
+          <span class="eval-status">
+            {{ evalProgressSafe.completed }}/{{ evalProgressSafe.total || evalEpisodesInput }}
+            episodes
+            <span v-if="evalProgressSafe.total > 0">({{ evalProgressPercent }})</span>
+          </span>
+        </div>
       </div>
 
       <div class="eval-row">
@@ -6269,8 +6307,43 @@ const stealRisks = computed(() => {
   opacity: 0.6;
   cursor: not-allowed;
 }
+.eval-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.eval-progress-bar {
+  width: 180px;
+  height: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.eval-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #38bdf8);
+}
+.eval-progress-fill.indeterminate {
+  animation: indeterminate-progress 1.5s linear infinite;
+}
 .eval-status {
   color: #38bdf8;
+}
+@keyframes indeterminate-progress {
+  0% {
+    transform: translateX(-100%);
+    width: 35%;
+  }
+  50% {
+    transform: translateX(150%);
+  }
+  100% {
+    transform: translateX(-100%);
+    width: 35%;
+  }
 }
 .eval-custom {
   display: flex;

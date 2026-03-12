@@ -110,6 +110,7 @@ try:
         build_pass_curriculum_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
+        build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -149,6 +150,7 @@ except ImportError:
         build_pass_curriculum_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
+        build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -689,6 +691,10 @@ def main(args):
         )
         # Optional DIAYN-style intent diversity objective
         intent_diversity_callback = build_intent_diversity_callback(args)
+        # Optional diagnostic for whether the policy actually responds to latent intent.
+        intent_policy_sensitivity_callback = build_intent_policy_sensitivity_callback(
+            args
+        )
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -854,6 +860,7 @@ def main(args):
                 pass_curriculum_callback,
                 intent_robustness_callback,
                 intent_diversity_callback,
+                intent_policy_sensitivity_callback,
             )
             
             # Single learn() call trains both offense and defense together

@@ -973,6 +973,7 @@ def _run_sequential_evaluation(
     shot_accumulator: dict[str, list[int]] | None = None,
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
+    progress_callback=None,
 ) -> dict:
     results = []
     per_player_stats = _init_player_stats(env.n_players)
@@ -1115,6 +1116,11 @@ def _run_sequential_evaluation(
                 "shot_counts": episode_shots,
             }
         )
+        if progress_callback is not None:
+            try:
+                progress_callback(ep_idx + 1, num_episodes)
+            except Exception:
+                pass
         if (ep_idx + 1) % progress_every == 0 or (ep_idx + 1) == num_episodes:
             _print_eval_progress("Evaluation", ep_idx + 1, num_episodes, progress_start)
 
@@ -1141,6 +1147,7 @@ def _run_parallel_evaluation(
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
     num_workers: int | None = None,
+    progress_callback=None,
 ) -> dict:
     if num_workers is None:
         num_workers = min(mp.cpu_count(), 16)
@@ -1193,6 +1200,11 @@ def _run_parallel_evaluation(
                 if done_reported:
                     return
                 done_reported = True
+            if progress_callback is not None:
+                try:
+                    progress_callback(completed, num_episodes)
+                except Exception:
+                    pass
             _print_eval_progress("Parallel Eval", completed, num_episodes, progress_start)
 
         report_progress()
@@ -1356,6 +1368,7 @@ def run_evaluation(
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
     num_workers: int | None = None,
+    progress_callback=None,
 ):
     if num_workers is None or num_workers <= 1:
         env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
@@ -1396,6 +1409,7 @@ def run_evaluation(
             shot_accumulator=shot_accumulator,
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_permutation,
+            progress_callback=progress_callback,
         )
 
     return _run_parallel_evaluation(
@@ -1413,6 +1427,7 @@ def run_evaluation(
         custom_setup=custom_setup,
         randomize_offense_permutation=randomize_offense_permutation,
         num_workers=num_workers,
+        progress_callback=progress_callback,
     )
 
 

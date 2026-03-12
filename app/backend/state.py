@@ -1,5 +1,7 @@
 import numpy as np
 import torch
+import time
+from threading import Lock
 from fastapi.encoders import jsonable_encoder
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 from basketworld.utils.wrappers import SetObservationWrapper
@@ -63,9 +65,72 @@ class GameState:
         self.opponent_policy_path: str | None = None
         # Public/playable mode session metadata.
         self.playable_session: dict | None = None
+        # Evaluation progress for frontend polling.
+        self._evaluation_progress_lock = Lock()
+        self.evaluation_progress: dict = {
+            "running": False,
+            "completed": 0,
+            "total": 0,
+            "started_at": None,
+            "finished_at": None,
+            "status": "idle",
+            "error": None,
+        }
 
 
 game_state = GameState()
+
+
+def reset_evaluation_progress(total: int = 0) -> None:
+    with game_state._evaluation_progress_lock:
+        game_state.evaluation_progress = {
+            "running": bool(total > 0),
+            "completed": 0,
+            "total": int(max(0, total)),
+            "started_at": time.time() if total > 0 else None,
+            "finished_at": None,
+            "status": "running" if total > 0 else "idle",
+            "error": None,
+        }
+
+
+def update_evaluation_progress(completed: int, total: int | None = None) -> None:
+    with game_state._evaluation_progress_lock:
+        current_total = int(game_state.evaluation_progress.get("total") or 0)
+        next_total = current_total if total is None else int(max(0, total))
+        next_completed = int(max(0, completed))
+        running = next_completed < next_total if next_total > 0 else False
+        game_state.evaluation_progress.update(
+            {
+                "completed": next_completed,
+                "total": next_total,
+                "running": running,
+                "status": "running" if running else ("completed" if next_total > 0 else "idle"),
+            }
+        )
+        if not running and next_total > 0:
+            game_state.evaluation_progress["finished_at"] = time.time()
+
+
+def fail_evaluation_progress(error: str) -> None:
+    with game_state._evaluation_progress_lock:
+        game_state.evaluation_progress.update(
+            {
+                "running": False,
+                "status": "failed",
+                "error": str(error),
+                "finished_at": time.time(),
+            }
+        )
+
+
+def get_evaluation_progress() -> dict:
+    with game_state._evaluation_progress_lock:
+        payload = dict(game_state.evaluation_progress)
+    total = int(payload.get("total") or 0)
+    completed = int(payload.get("completed") or 0)
+    payload["fraction"] = float(completed / total) if total > 0 else 0.0
+    return payload
 
 
 def _role_flag_value_for_team(team: Team) -> float:
@@ -436,6 +501,12 @@ def get_full_game_state(
         "intent_visible_to_defense_prob": float(
             getattr(game_state.env, "intent_visible_to_defense_prob", 0.0)
         ),
+        "enable_defense_intent_learning": bool(
+            getattr(game_state.env, "enable_defense_intent_learning", False)
+        ),
+        "defense_intent_null_prob": float(
+            getattr(game_state.env, "defense_intent_null_prob", 1.0)
+        ),
         "intent_diversity_enabled": (
             bool(
                 getattr(game_state, "mlflow_training_params", {}).get(
@@ -460,6 +531,16 @@ def get_full_game_state(
         ),
         "intent_visible_to_defense_current": bool(
             getattr(game_state.env, "_intent_visible_to_defense", False)
+        ),
+        "defense_intent_active_current": bool(
+            getattr(game_state.env, "defense_intent_active", False)
+        ),
+        "defense_intent_index_current": int(
+            getattr(game_state.env, "defense_intent_index", 0)
+        ),
+        "defense_intent_age": int(getattr(game_state.env, "defense_intent_age", 0)),
+        "defense_intent_commitment_remaining": int(
+            getattr(game_state.env, "defense_intent_commitment_remaining", 0)
         ),
         "include_hoop_vector": bool(
             getattr(game_state.env, "include_hoop_vector", False)

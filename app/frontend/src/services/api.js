@@ -329,6 +329,15 @@ export async function runEvaluation(numEpisodes = 100, playerDeterministic = fal
   return response.json();
 }
 
+export async function getEvaluationProgress() {
+  const response = await fetch(`${API_BASE_URL}/api/evaluation_progress`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to get evaluation progress');
+  }
+  return response.json();
+}
+
 export async function previewPassSteal(positions, ballHolder) {
   const response = await fetch(`${API_BASE_URL}/api/pass_steal_preview`, {
     method: 'POST',

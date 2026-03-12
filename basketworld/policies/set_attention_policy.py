@@ -41,8 +41,9 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
       3) Shared token MLP:
          token_mlp: (B, P, T+G) -> (B, P, D)
          D = embed_dim
-      3b) Optional intent embedding modulation:
-         intent embedding -> projected to global dim and added to globals
+      3b) Optional role-selected intent conditioning:
+         offense/defense intent embedding -> projected to token dim and added to
+         every player token for the acting role only
       4) Optional learned CLS tokens:
          cls_tokens: (C, D) where C = num_cls_tokens
          append -> (B, P+C, D)
@@ -83,7 +84,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self.intent_embedding_enabled = bool(intent_embedding_enabled)
         self.intent_embedding_dim = max(1, int(intent_embedding_dim))
         self.num_intents = max(1, int(num_intents))
-        # Intent globals are currently appended as trailing [index_norm, active, visible].
+        # Intent globals are appended as trailing [index_norm, active, visible].
         self._intent_globals_dim = 3
         self._intent_start_idx = max(0, self.global_dim - self._intent_globals_dim)
         self._has_intent_globals = self.global_dim >= (4 + self._intent_globals_dim)
@@ -98,18 +99,29 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
         if self.intent_embedding_enabled and self._has_intent_globals:
-            self.intent_embedding = nn.Embedding(
+            self.offense_intent_embedding = nn.Embedding(
                 num_embeddings=self.num_intents,
                 embedding_dim=self.intent_embedding_dim,
             )
-            self.intent_to_global = nn.Linear(
-                self.intent_embedding_dim, self.global_dim, bias=False
+            self.defense_intent_embedding = nn.Embedding(
+                num_embeddings=self.num_intents,
+                embedding_dim=self.intent_embedding_dim,
             )
-            nn.init.normal_(self.intent_embedding.weight, mean=0.0, std=0.02)
-            nn.init.zeros_(self.intent_to_global.weight)
+            self.offense_intent_to_token = nn.Linear(
+                self.intent_embedding_dim, self.embed_dim, bias=False
+            )
+            self.defense_intent_to_token = nn.Linear(
+                self.intent_embedding_dim, self.embed_dim, bias=False
+            )
+            nn.init.normal_(self.offense_intent_embedding.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.defense_intent_embedding.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.offense_intent_to_token.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.defense_intent_to_token.weight, mean=0.0, std=0.02)
         else:
-            self.intent_embedding = None
-            self.intent_to_global = None
+            self.offense_intent_embedding = None
+            self.defense_intent_embedding = None
+            self.offense_intent_to_token = None
+            self.defense_intent_to_token = None
         self.attn = nn.MultiheadAttention(self.embed_dim, n_heads, batch_first=True)
         self.attn_norm = nn.LayerNorm(self.embed_dim)
         if self.num_cls_tokens > 0:
@@ -129,7 +141,15 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         """
         players = obs["players"]
         globals_vec = obs["globals"]
-        if self.intent_embedding is not None and self.intent_to_global is not None:
+        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
+        tokens = th.cat([players, g], dim=-1)
+        emb = self.token_mlp(tokens)
+        if (
+            self.offense_intent_embedding is not None
+            and self.defense_intent_embedding is not None
+            and self.offense_intent_to_token is not None
+            and self.defense_intent_to_token is not None
+        ):
             try:
                 start = int(self._intent_start_idx)
                 idx_norm = globals_vec[:, start]
@@ -142,16 +162,23 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
                 else:
                     intent_idx = th.zeros_like(idx_norm, dtype=th.long)
                 intent_idx = intent_idx.clamp(min=0, max=self.num_intents - 1)
-                intent_emb = self.intent_embedding(intent_idx)
-                # Do not leak hidden intent through embedding modulation.
+                role_flag = obs.get("role_flag")
+                if role_flag is None:
+                    is_offense = th.ones_like(idx_norm, dtype=th.bool)
+                else:
+                    if role_flag.ndim == 1:
+                        role_flag = role_flag.unsqueeze(-1)
+                    is_offense = role_flag.squeeze(-1) > 0.0
+                off_emb = self.offense_intent_embedding(intent_idx)
+                def_emb = self.defense_intent_embedding(intent_idx)
+                off_delta = self.offense_intent_to_token(off_emb)
+                def_delta = self.defense_intent_to_token(def_emb)
+                intent_delta = th.where(is_offense.unsqueeze(-1), off_delta, def_delta)
+                # Hidden intent remains zeroed because visible=0 masks the shift.
                 intent_gate = (active * visible).unsqueeze(-1)
-                intent_delta = self.intent_to_global(intent_emb * intent_gate)
-                globals_vec = globals_vec + intent_delta
+                emb = emb + (intent_delta.unsqueeze(1) * intent_gate.unsqueeze(1))
             except Exception:
                 pass
-        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
-        tokens = th.cat([players, g], dim=-1)
-        emb = self.token_mlp(tokens)
         if self.cls_tokens is not None:
             batch = emb.size(0)
             cls = self.cls_tokens.unsqueeze(0).expand(batch, -1, -1)
@@ -929,6 +956,10 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             "pointer_",
             "features_extractor.intent_embedding",
             "features_extractor.intent_to_global",
+            "features_extractor.offense_intent_embedding",
+            "features_extractor.defense_intent_embedding",
+            "features_extractor.offense_intent_to_token",
+            "features_extractor.defense_intent_to_token",
         )
         missing = [
             key

@@ -113,7 +113,7 @@ def test_wrapper_reconditions_intent_fields_for_opponent_role():
     wrapped = SelfPlayEnvWrapper(env, opponent_policy=opponent)
 
     obs, _ = wrapped.reset(seed=5)
-    assert float(obs["intent_active"][0]) == 1.0
+    assert float(obs["intent_active"][0]) == 0.0
     assert float(obs["intent_visible"][0]) == 0.0
 
     wrapped.step(np.zeros(env.players_per_side, dtype=int))

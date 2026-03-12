@@ -85,6 +85,10 @@ def setup_environment(args, training_team, env_idx=None):
         intent_visible_to_defense_prob=getattr(
             args, "intent_visible_to_defense_prob", 0.0
         ),
+        enable_defense_intent_learning=getattr(
+            args, "enable_defense_intent_learning", False
+        ),
+        defense_intent_null_prob=getattr(args, "defense_intent_null_prob", 1.0),
         intent_obs_mode=getattr(args, "intent_obs_mode", "private_offense"),
         mask_occupied_moves=args.mask_occupied_moves,
         enable_pass_gating=getattr(args, "enable_pass_gating", True),
@@ -147,6 +151,10 @@ def setup_environment(args, training_team, env_idx=None):
             "intent_visible_training_obs",
             "intent_age",
             "intent_commitment_remaining",
+            "offense_intent_index",
+            "offense_intent_active",
+            "defense_intent_index",
+            "defense_intent_active",
             "gt_is_three",
             "gt_is_dunk",
             "gt_points",

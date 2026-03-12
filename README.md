@@ -43,7 +43,7 @@ pip install -r requirements.txt       # installs basketworld in editable mode
 
 Run MLflow locally (default for training/backend):
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+./start_mlflow.sh --disable-s3
 ```
 
 S3 artifacts (project-scoped credentials, auto-loaded):

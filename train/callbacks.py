@@ -21,6 +21,7 @@ from basketworld.utils.callbacks import (
     IntentRobustnessScheduleCallback,
     EpisodeSampleLogger,
     IntentDiversityCallback,
+    IntentPolicySensitivityCallback,
 )
 from basketworld.utils.mlflow_logger import MLflowWriter
 
@@ -174,6 +175,22 @@ def build_intent_robustness_callback(args, total_planned_ts, timestep_offset):
     )
 
 
+def build_intent_policy_sensitivity_callback(args):
+    """Build intent policy sensitivity diagnostics when intent learning is enabled."""
+    if not getattr(args, "enable_intent_learning", False):
+        return None
+    if not getattr(args, "intent_policy_sensitivity_enabled", True):
+        return None
+    return IntentPolicySensitivityCallback(
+        enabled=True,
+        num_intents=getattr(args, "num_intents", 8),
+        sample_states=getattr(args, "intent_policy_sensitivity_sample_states", 32),
+        log_freq_rollouts=getattr(
+            args, "intent_policy_sensitivity_log_every_rollouts", 4
+        ),
+    )
+
+
 def build_mixed_callbacks(
     args,
     global_alt: int,
@@ -184,6 +201,7 @@ def build_mixed_callbacks(
     pass_curriculum_cb: Optional[BaseCallback],
     intent_robustness_cb: Optional[BaseCallback],
     intent_diversity_cb: Optional[BaseCallback],
+    intent_policy_sensitivity_cb: Optional[BaseCallback],
 ) -> List[BaseCallback]:
     """Assemble callbacks for mixed training."""
     callbacks: List[BaseCallback] = [
@@ -205,6 +223,8 @@ def build_mixed_callbacks(
         callbacks.append(intent_robustness_cb)
     if intent_diversity_cb is not None:
         callbacks.append(intent_diversity_cb)
+    if intent_policy_sensitivity_cb is not None:
+        callbacks.append(intent_policy_sensitivity_cb)
     if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
         callbacks.append(
             EpisodeSampleLogger(

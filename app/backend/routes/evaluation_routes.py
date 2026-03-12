@@ -12,7 +12,14 @@ from app.backend.evaluation import (
     validate_custom_eval_setup as eval_validate_custom_eval_setup,
 )
 from app.backend.schemas import EvaluationRequest, PassStealPreviewRequest
-from app.backend.state import game_state, get_ui_game_state
+from app.backend.state import (
+    game_state,
+    get_ui_game_state,
+    reset_evaluation_progress,
+    update_evaluation_progress,
+    fail_evaluation_progress,
+    get_evaluation_progress,
+)
 
 
 router = APIRouter()
@@ -110,6 +117,7 @@ def run_evaluation(request: EvaluationRequest):
         num_workers = max(2, min(mp.cpu_count(), 16, num_episodes))
 
     try:
+        reset_evaluation_progress(num_episodes)
         raw_results = eval_run_evaluation(
             num_episodes=num_episodes,
             player_deterministic=player_deterministic,
@@ -125,11 +133,13 @@ def run_evaluation(request: EvaluationRequest):
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_perm,
             num_workers=num_workers,
+            progress_callback=update_evaluation_progress,
         )
     except Exception as e:
         import traceback
 
         traceback.print_exc()
+        fail_evaluation_progress(str(e))
         raise HTTPException(status_code=500, detail=f"Failed to run evaluation: {e}")
 
     if isinstance(raw_results, dict):
@@ -193,6 +203,8 @@ def run_evaluation(request: EvaluationRequest):
     except Exception:
         pass
 
+    update_evaluation_progress(len(episode_results), len(episode_results))
+
     return _to_jsonable({
         "status": "success",
         "num_episodes": len(episode_results),
@@ -202,3 +214,8 @@ def run_evaluation(request: EvaluationRequest):
         "per_player_stats": per_player_stats,
         "eval_diagnostics": eval_diagnostics,
     })
+
+
+@router.get("/api/evaluation_progress")
+def evaluation_progress():
+    return _to_jsonable(get_evaluation_progress())

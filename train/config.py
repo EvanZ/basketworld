@@ -578,6 +578,20 @@ def get_parser() -> argparse.ArgumentParser:
         help="Probability that defense-visible intent is exposed in an episode.",
     )
     parser.add_argument(
+        "--enable-defense-intent-learning",
+        dest="enable_defense_intent_learning",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable a separate latent intent state for the defense policy.",
+    )
+    parser.add_argument(
+        "--defense-intent-null-prob",
+        dest="defense_intent_null_prob",
+        type=float,
+        default=1.0,
+        help="Probability of sampling no active defense intent for an episode.",
+    )
+    parser.add_argument(
         "--intent-null-prob-end",
         dest="intent_null_prob_end",
         type=float,
@@ -688,6 +702,27 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Max flattened action features used by discriminator input.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-enabled",
+        dest="intent_policy_sensitivity_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Log diagnostic metrics for policy sensitivity to latent intent.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-sample-states",
+        dest="intent_policy_sensitivity_sample_states",
+        type=int,
+        default=32,
+        help="Reservoir sample size of offense states per rollout for intent sensitivity diagnostics.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-log-every-rollouts",
+        dest="intent_policy_sensitivity_log_every_rollouts",
+        type=int,
+        default=4,
+        help="How often to log intent policy-sensitivity metrics.",
     )
     parser.add_argument(
         "--mask-occupied-moves",

@@ -31,6 +31,7 @@ class SetObservationWrapper(gym.ObservationWrapper):
         n_players = int(self.env.unwrapped.n_players)
         self._include_intent_globals = bool(
             getattr(self.env.unwrapped, "enable_intent_learning", False)
+            or getattr(self.env.unwrapped, "enable_defense_intent_learning", False)
         )
         self._global_dim = self._GLOBAL_DIM + (
             self._INTENT_GLOBAL_DIM if self._include_intent_globals else 0

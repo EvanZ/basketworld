@@ -170,6 +170,8 @@ class HexagonBasketballEnv(gym.Env):
         intent_commitment_steps: int = 4,
         intent_null_prob: float = 0.2,
         intent_visible_to_defense_prob: float = 0.0,
+        enable_defense_intent_learning: bool = False,
+        defense_intent_null_prob: float = 1.0,
         intent_obs_mode: str = "private_offense",  # "private_offense" | "public" | "hidden"
         # Deterministic overrides (optional)
         initial_positions: Optional[List[Tuple[int, int]]] = None,
@@ -237,15 +239,27 @@ class HexagonBasketballEnv(gym.Env):
         self.intent_visible_to_defense_prob = float(
             max(0.0, min(1.0, intent_visible_to_defense_prob))
         )
+        self.enable_defense_intent_learning = bool(enable_defense_intent_learning)
+        self.defense_intent_null_prob = float(
+            max(0.0, min(1.0, defense_intent_null_prob))
+        )
         mode = str(intent_obs_mode or "private_offense").lower()
         if mode not in ("private_offense", "public", "hidden"):
             mode = "private_offense"
         self.intent_obs_mode = mode
+        # Offense intent state is kept on the legacy attribute names for backward
+        # compatibility with existing code and checkpoints.
         self.intent_index: int = 0
         self.intent_active: bool = False
         self.intent_age: int = 0
         self.intent_commitment_remaining: int = 0
         self._intent_visible_to_defense: bool = False
+        # Defense intent state is separate and never exposed to offense unless a
+        # future observation mode explicitly opts in.
+        self.defense_intent_index: int = 0
+        self.defense_intent_active: bool = False
+        self.defense_intent_age: int = 0
+        self.defense_intent_commitment_remaining: int = 0
         normalized_pass_mode = str(pass_mode).lower()
         if normalized_pass_mode not in ("directional", "pointer_targeted"):
             normalized_pass_mode = "directional"
@@ -405,7 +419,7 @@ class HexagonBasketballEnv(gym.Env):
             "role_flag": role_flag_space,
             "skills": skills_space,
         }
-        if self.enable_intent_learning:
+        if self.enable_intent_learning or self.enable_defense_intent_learning:
             obs_spaces["intent_index"] = spaces.Box(
                 low=0.0,
                 high=float(max(0, self.num_intents - 1)),
@@ -718,34 +732,104 @@ class HexagonBasketballEnv(gym.Env):
     def _training_observer_is_offense(self) -> bool:
         return self.training_team == Team.OFFENSE
 
-    def _sample_intent_for_episode(self) -> None:
-        """Sample/initialize latent intent state for the episode."""
-        if not self.enable_intent_learning:
-            self.intent_index = 0
-            self.intent_active = False
-            self.intent_age = 0
-            self.intent_commitment_remaining = 0
-            self._intent_visible_to_defense = False
+    def _intent_enabled_for_role(self, observer_is_offense: bool) -> bool:
+        if observer_is_offense:
+            return bool(self.enable_intent_learning)
+        return bool(self.enable_defense_intent_learning)
+
+    def _get_role_intent_state(
+        self, observer_is_offense: bool
+    ) -> Tuple[int, bool, int, int]:
+        if observer_is_offense:
+            return (
+                int(self.intent_index),
+                bool(self.intent_active),
+                int(self.intent_age),
+                int(self.intent_commitment_remaining),
+            )
+        return (
+            int(self.defense_intent_index),
+            bool(self.defense_intent_active),
+            int(self.defense_intent_age),
+            int(self.defense_intent_commitment_remaining),
+        )
+
+    def _set_role_intent_state(
+        self,
+        observer_is_offense: bool,
+        *,
+        intent_index: int,
+        intent_active: bool,
+        intent_age: int,
+        intent_commitment_remaining: int,
+    ) -> None:
+        if observer_is_offense:
+            self.intent_index = int(intent_index)
+            self.intent_active = bool(intent_active)
+            self.intent_age = int(intent_age)
+            self.intent_commitment_remaining = int(intent_commitment_remaining)
+            return
+        self.defense_intent_index = int(intent_index)
+        self.defense_intent_active = bool(intent_active)
+        self.defense_intent_age = int(intent_age)
+        self.defense_intent_commitment_remaining = int(intent_commitment_remaining)
+
+    def _sample_role_intent_for_episode(self, observer_is_offense: bool) -> None:
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        null_prob = (
+            float(self.intent_null_prob)
+            if observer_is_offense
+            else float(self.defense_intent_null_prob)
+        )
+        if not enabled:
+            self._set_role_intent_state(
+                observer_is_offense,
+                intent_index=0,
+                intent_active=False,
+                intent_age=0,
+                intent_commitment_remaining=0,
+            )
             return
 
-        self.intent_active = bool(self._rng.random() >= self.intent_null_prob)
-        self.intent_index = (
-            int(self._rng.integers(0, self.num_intents)) if self.intent_active else 0
+        intent_active = bool(self._rng.random() >= null_prob)
+        intent_index = (
+            int(self._rng.integers(0, self.num_intents)) if intent_active else 0
         )
-        self.intent_age = 0
-        self.intent_commitment_remaining = int(self.intent_commitment_steps)
+        self._set_role_intent_state(
+            observer_is_offense,
+            intent_index=intent_index,
+            intent_active=intent_active,
+            intent_age=0,
+            intent_commitment_remaining=int(self.intent_commitment_steps),
+        )
+
+    def _sample_intent_for_episode(self) -> None:
+        """Sample/initialize offense and defense latent intent state for the episode."""
+        self._sample_role_intent_for_episode(observer_is_offense=True)
+        self._sample_role_intent_for_episode(observer_is_offense=False)
         self._intent_visible_to_defense = bool(
             self._rng.random() < self.intent_visible_to_defense_prob
         )
 
     def _advance_intent_clock(self) -> None:
-        if not self.enable_intent_learning:
-            return
-        self.intent_age += 1
-        if self.intent_commitment_remaining > 0:
-            self.intent_commitment_remaining -= 1
+        for observer_is_offense in (True, False):
+            if not self._intent_enabled_for_role(observer_is_offense):
+                continue
+            intent_index, intent_active, intent_age, intent_commitment_remaining = (
+                self._get_role_intent_state(observer_is_offense)
+            )
+            del intent_index  # index itself is unchanged across the commitment window
+            if not intent_active:
+                continue
+            self._set_role_intent_state(
+                observer_is_offense,
+                intent_index=self.intent_index if observer_is_offense else self.defense_intent_index,
+                intent_active=intent_active,
+                intent_age=int(intent_age) + 1,
+                intent_commitment_remaining=max(0, int(intent_commitment_remaining) - 1),
+            )
 
-    def _intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
+    def _offense_intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
         if not self.enable_intent_learning or not self.intent_active:
             return False
         if self.intent_obs_mode == "public":
@@ -756,22 +840,43 @@ class HexagonBasketballEnv(gym.Env):
             return True
         return bool(self._intent_visible_to_defense)
 
+    def _intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
+        """Return whether the observer can see its own latent intent fields."""
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        _, active, _, _ = self._get_role_intent_state(observer_is_offense)
+        if not enabled or not active:
+            return False
+        if observer_is_offense:
+            return self._offense_intent_visible_for_observer(True)
+        return True
+
     def get_intent_observation_fields(
         self, observer_is_offense: bool
     ) -> Dict[str, np.ndarray]:
-        """Return role-conditioned intent features as observation fields."""
-        if not self.enable_intent_learning:
+        """Return role-conditioned own-intent features as observation fields."""
+        if not (self.enable_intent_learning or self.enable_defense_intent_learning):
             return {}
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        if not enabled:
+            return {
+                "intent_index": np.array([0.0], dtype=np.float32),
+                "intent_active": np.array([0.0], dtype=np.float32),
+                "intent_visible": np.array([0.0], dtype=np.float32),
+                "intent_age_norm": np.array([0.0], dtype=np.float32),
+                "intent_commitment_remaining_norm": np.array([0.0], dtype=np.float32),
+            }
         visible = self._intent_visible_for_observer(bool(observer_is_offense))
-        active = bool(self.intent_active)
-        masked_index = int(self.intent_index) if (active and visible) else 0
+        intent_index, active, intent_age, intent_commitment_remaining = (
+            self._get_role_intent_state(observer_is_offense)
+        )
+        masked_index = int(intent_index) if (active and visible) else 0
         age_norm = (
-            float(self.intent_age) / float(max(1, self.intent_commitment_steps))
+            float(intent_age) / float(max(1, self.intent_commitment_steps))
             if active
             else 0.0
         )
         remaining_norm = (
-            float(self.intent_commitment_remaining)
+            float(intent_commitment_remaining)
             / float(max(1, self.intent_commitment_steps))
             if active
             else 0.0
@@ -790,7 +895,7 @@ class HexagonBasketballEnv(gym.Env):
 
     def get_intent_global_features(self, observer_is_offense: bool) -> np.ndarray:
         """Return compact intent globals for set-observation pipelines."""
-        if not self.enable_intent_learning:
+        if not (self.enable_intent_learning or self.enable_defense_intent_learning):
             return np.zeros(0, dtype=np.float32)
         fields = self.get_intent_observation_fields(bool(observer_is_offense))
         intent_index = float(fields["intent_index"][0])
@@ -1702,6 +1807,13 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
+    @profile_section("set_defense_intent_null_prob")
+    def set_defense_intent_null_prob(self, value: float) -> None:
+        try:
+            self.defense_intent_null_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
     @profile_section("_get_player_distances")
     def _get_player_distances(self, base_id: int, target_ids: List[int]) -> np.ndarray:
         """Return hex distances from `base_id` to each ID in `target_ids`."""
@@ -1819,23 +1931,31 @@ class HexagonBasketballEnv(gym.Env):
     def _attach_intent_stats(self, info: Optional[Dict]) -> Dict:
         if info is None:
             info = {}
-        training_visible = self._intent_visible_for_observer(
-            self._training_observer_is_offense()
+        training_observer_is_offense = self._training_observer_is_offense()
+        training_intent_index, training_intent_active, training_intent_age, training_remaining = (
+            self._get_role_intent_state(training_observer_is_offense)
+        )
+        training_visible = self._offense_intent_visible_for_observer(
+            training_observer_is_offense
         )
         info.setdefault(
             "intent_index",
-            float(self.intent_index if self.intent_active else 0),
+            float(training_intent_index if training_intent_active else 0),
         )
-        info.setdefault("intent_active", 1.0 if self.intent_active else 0.0)
+        info.setdefault("intent_active", 1.0 if training_intent_active else 0.0)
         info.setdefault(
             "intent_visible_training_obs",
             1.0 if training_visible else 0.0,
         )
-        info.setdefault("intent_age", float(self.intent_age))
+        info.setdefault("intent_age", float(training_intent_age))
         info.setdefault(
             "intent_commitment_remaining",
-            float(self.intent_commitment_remaining),
+            float(training_remaining),
         )
+        info.setdefault("offense_intent_index", float(self.intent_index if self.intent_active else 0))
+        info.setdefault("offense_intent_active", 1.0 if self.intent_active else 0.0)
+        info.setdefault("defense_intent_index", float(self.defense_intent_index if self.defense_intent_active else 0))
+        info.setdefault("defense_intent_active", 1.0 if self.defense_intent_active else 0.0)
         return info
 
     @profile_section("render")

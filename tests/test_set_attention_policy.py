@@ -311,6 +311,10 @@ def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_ke
             k.startswith("pointer_")
             or k.startswith("features_extractor.intent_embedding")
             or k.startswith("features_extractor.intent_to_global")
+            or k.startswith("features_extractor.offense_intent_embedding")
+            or k.startswith("features_extractor.defense_intent_embedding")
+            or k.startswith("features_extractor.offense_intent_to_token")
+            or k.startswith("features_extractor.defense_intent_to_token")
         )
     }
     result = policy.load_state_dict(legacy_state, strict=True)
@@ -318,8 +322,65 @@ def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_ke
         "pointer_",
         "features_extractor.intent_embedding",
         "features_extractor.intent_to_global",
+        "features_extractor.offense_intent_embedding",
+        "features_extractor.defense_intent_embedding",
+        "features_extractor.offense_intent_to_token",
+        "features_extractor.defense_intent_to_token",
     )
     assert all(str(k).startswith(allowed_prefixes) for k in result.missing_keys)
+
+
+def test_set_attention_policy_uses_role_selected_intent_embeddings():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=4,
+        num_intents=8,
+    )
+    extractor = policy.features_extractor
+    assert extractor.offense_intent_embedding is not None
+    assert extractor.defense_intent_embedding is not None
+    assert extractor.offense_intent_to_token is not None
+    assert extractor.defense_intent_to_token is not None
+
+    with th.no_grad():
+        extractor.offense_intent_embedding.weight.zero_()
+        extractor.defense_intent_embedding.weight.zero_()
+        extractor.offense_intent_embedding.weight[3].fill_(1.0)
+        extractor.defense_intent_embedding.weight[3].fill_(1.0)
+        extractor.offense_intent_to_token.weight.fill_(0.5)
+        extractor.defense_intent_to_token.weight.fill_(-0.5)
+
+    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 3.0 / 7.0, 1.0, 1.0], dtype=np.float32)
+    obs_off = _make_obs(
+        n_players,
+        globals_dim=7,
+        n_actions=n_actions,
+        role=1.0,
+        globals_vec=globals_vec,
+    )
+    obs_def = _make_obs(
+        n_players,
+        globals_dim=7,
+        n_actions=n_actions,
+        role=-1.0,
+        globals_vec=globals_vec,
+    )
+
+    tensor_off, _ = policy.obs_to_tensor(obs_off)
+    tensor_def, _ = policy.obs_to_tensor(obs_def)
+    latent_off = extractor(tensor_off)
+    latent_def = extractor(tensor_def)
+
+    assert not th.allclose(latent_off, latent_def)
 
 
 def test_pointer_targeted_backward_pass_no_inplace_error():

@@ -20,6 +20,10 @@ from basketworld.utils.intent_discovery import (
     extract_action_features_for_env,
     flatten_observation_for_env,
 )
+from basketworld.utils.intent_policy_sensitivity import (
+    compute_policy_sensitivity_metrics,
+    extract_single_env_observation,
+)
 
 
 class TimingCallback(BaseCallback):
@@ -1125,6 +1129,133 @@ class IntentDiversityCallback(BaseCallback):
             usage_entropy, min_prob = self._usage_entropy(y_np, self.num_intents)
             mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
             mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
+        except Exception:
+            pass
+
+
+class IntentPolicySensitivityCallback(BaseCallback):
+    """Log how strongly offense action distributions depend on latent intent."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        sample_states: int = 32,
+        log_freq_rollouts: int = 4,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.sample_states = max(1, int(sample_states))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._sampled_states: list[dict] = []
+        self._sampled_seen = 0
+        self._rollout_counter = 0
+
+    @staticmethod
+    def _extract_role_flag(obs_payload, env_idx: int, n_envs: int) -> float:
+        try:
+            if not isinstance(obs_payload, dict) or "role_flag" not in obs_payload:
+                return 0.0
+            role = np.asarray(obs_payload["role_flag"], dtype=np.float32)
+            if role.ndim == 0:
+                return float(role)
+            if role.shape[0] == int(n_envs):
+                return float(np.asarray(role[int(env_idx)]).reshape(-1)[0])
+        except Exception:
+            pass
+        return 0.0
+
+    def _on_rollout_start(self) -> None:
+        self._sampled_states = []
+        self._sampled_seen = 0
+
+    def _maybe_add_state(self, obs_payload, env_idx: int, n_envs: int) -> None:
+        try:
+            state = extract_single_env_observation(
+                obs_payload,
+                env_idx=env_idx,
+                expected_batch_size=n_envs,
+            )
+        except Exception:
+            return
+        self._sampled_seen += 1
+        if len(self._sampled_states) < self.sample_states:
+            self._sampled_states.append(state)
+            return
+        replace_idx = random.randint(0, self._sampled_seen - 1)
+        if replace_idx < self.sample_states:
+            self._sampled_states[replace_idx] = state
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        obs_payload = self.locals.get("new_obs", None)
+        if obs_payload is None:
+            obs_payload = self.locals.get("obs", None)
+        if obs_payload is None or not isinstance(infos, (list, tuple)):
+            return True
+
+        n_envs = len(infos)
+        for env_idx in range(n_envs):
+            if self._extract_role_flag(obs_payload, env_idx, n_envs) <= 0.0:
+                continue
+            self._maybe_add_state(obs_payload, env_idx, n_envs)
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled:
+            return
+        self._rollout_counter += 1
+        if not self._sampled_states:
+            return
+        if (self._rollout_counter % self.log_freq_rollouts) != 0:
+            return
+
+        try:
+            metrics = compute_policy_sensitivity_metrics(
+                self.model,
+                self._sampled_states,
+                num_intents=self.num_intents,
+                active=1.0,
+                visible=1.0,
+                age_norm=0.0,
+                commitment_remaining_norm=1.0,
+            )
+            if metrics.get("num_pairs", 0.0) <= 0.0:
+                return
+            global_step = int(getattr(self.model, "num_timesteps", 0))
+            mlflow.log_metric(
+                "intent/policy_kl_mean",
+                float(metrics["policy_kl_mean"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_kl_max",
+                float(metrics["policy_kl_max"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_tv_mean",
+                float(metrics["policy_tv_mean"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/action_flip_rate",
+                float(metrics["action_flip_rate"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_sensitivity_samples",
+                float(metrics["num_states"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_sensitivity_pairs",
+                float(metrics["num_pairs"]),
+                step=global_step,
+            )
         except Exception:
             pass
 
