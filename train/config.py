@@ -683,6 +683,27 @@ def get_parser() -> argparse.ArgumentParser:
         help="Hidden dimension for MLP discriminator.",
     )
     parser.add_argument(
+        "--intent-disc-encoder-type",
+        dest="intent_disc_encoder_type",
+        choices=["mlp_mean", "gru"],
+        default="mlp_mean",
+        help="Encoder type for intent discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-step-dim",
+        dest="intent_disc_step_dim",
+        type=int,
+        default=64,
+        help="Per-step embedding dimension for GRU discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-console-log-every-rollouts",
+        dest="intent_disc_console_log_every_rollouts",
+        type=int,
+        default=0,
+        help="Print discriminator pass summary every N rollouts. 0 disables console tracing.",
+    )
+    parser.add_argument(
         "--intent-disc-dropout",
         dest="intent_disc_dropout",
         type=float,

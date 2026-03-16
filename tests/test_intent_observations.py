@@ -23,6 +23,7 @@ def test_intent_fields_present_and_visible_for_offense_training():
     assert "intent_index" in obs
     assert float(obs["intent_active"][0]) == 1.0
     assert float(obs["intent_visible"][0]) == 1.0
+    assert "intent_commitment_remaining_norm" not in obs
     intent_index = float(obs["intent_index"][0])
     assert 0.0 <= intent_index <= 7.0
 
@@ -40,6 +41,7 @@ def test_intent_index_masked_for_defense_when_private():
     assert float(obs["intent_visible"][0]) == 0.0
     assert float(obs["intent_index"][0]) == 0.0
     assert np.isfinite(obs["intent_age_norm"]).all()
+    assert "intent_commitment_remaining_norm" not in obs
 
 
 def test_defense_observer_sees_own_defense_intent_when_enabled():
@@ -54,4 +56,29 @@ def test_defense_observer_sees_own_defense_intent_when_enabled():
     obs, _ = env.reset(seed=23)
     assert float(obs["intent_active"][0]) == 1.0
     assert float(obs["intent_visible"][0]) == 1.0
+    assert "intent_commitment_remaining_norm" not in obs
     assert 0.0 <= float(obs["intent_index"][0]) <= 7.0
+
+
+def test_intent_deactivates_after_commitment_window_expires():
+    env = HexagonBasketballEnv(
+        players=3,
+        training_team=Team.OFFENSE,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+        intent_commitment_steps=2,
+    )
+    obs, _ = env.reset(seed=29)
+    assert float(obs["intent_active"][0]) == 1.0
+
+    env._advance_intent_clock()
+    obs = env.get_intent_observation_fields(True)
+    assert float(obs["intent_active"][0]) == 1.0
+
+    env._advance_intent_clock()
+    obs = env.get_intent_observation_fields(True)
+    assert float(obs["intent_active"][0]) == 1.0
+
+    env._advance_intent_clock()
+    obs = env.get_intent_observation_fields(True)
+    assert float(obs["intent_active"][0]) == 0.0

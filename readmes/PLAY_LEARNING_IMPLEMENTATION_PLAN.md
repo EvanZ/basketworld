@@ -259,6 +259,648 @@ Add:
 
 Then integrate via callbacks or custom PPO training step.
 
+### Current implementation status
+
+The codebase currently implements a simplified first-pass discriminator, not the richer
+`TrajectoryEncoder` design described above.
+
+Files:
+
+1. `basketworld/utils/intent_discovery.py`
+2. `basketworld/utils/callbacks.py`
+
+What is implemented today:
+
+1. `IntentEpisodeBuffer`
+   - Stores per-step transitions until an episode ends.
+
+2. `IntentTransition.feature`
+   - Per step, build one flat feature vector by concatenating:
+     - flattened observation for that env index
+     - flattened action for that env index
+
+3. `compute_episode_embeddings(...)`
+   - Stack all step features in the episode.
+   - Take the mean over time.
+   - Pad or truncate to a fixed length of `max_obs_dim + max_action_dim`.
+   - Current callback defaults:
+     - `max_obs_dim = 256`
+     - `max_action_dim = 16`
+     - total discriminator input dim = `272`
+
+4. `IntentDiscriminator`
+   - A small MLP:
+     - `Linear(input_dim, hidden_dim)`
+     - `ReLU`
+     - `Dropout`
+     - `Linear(hidden_dim, num_intents)`
+   - This is a classifier over the mean-pooled episode embedding.
+
+5. Diversity bonus
+   - Compute `log q(z | episode_embedding) + log(num_intents)`.
+   - Normalize with a running mean/std.
+   - Clip.
+   - Multiply by `beta`.
+   - Spread evenly across the episode steps in the rollout buffer.
+
+Important limitation of the current implementation:
+
+1. Temporal order is discarded.
+2. Pass-receive order, cut timing, and multi-step structure are not modeled explicitly.
+3. The discriminator is therefore weaker than the original plan's intended
+   trajectory-aware version.
+
+### Worked numerical example of the current discriminator
+
+This example uses small vectors for readability. The real code uses up to `256`
+observation dims plus `16` action dims before padding/truncation.
+
+Assume:
+
+1. `num_intents = 8`
+2. true sampled intent for this episode is `z = 2`
+3. episode length is `3` steps
+4. for illustration, we show only the first `4` observation dims and first `2` action dims
+
+Per-step features:
+
+1. Step 0
+   - flattened observation slice = `[0.80, -0.25, 0.33, 1.00]`
+   - flattened action slice = `[4.00, 0.00]`
+   - concatenated step feature = `[0.80, -0.25, 0.33, 1.00, 4.00, 0.00]`
+
+2. Step 1
+   - flattened observation slice = `[0.78, -0.10, 0.40, 1.00]`
+   - flattened action slice = `[7.00, 1.00]`
+   - concatenated step feature = `[0.78, -0.10, 0.40, 1.00, 7.00, 1.00]`
+
+3. Step 2
+   - flattened observation slice = `[0.75, 0.05, 0.52, 1.00]`
+   - flattened action slice = `[9.00, 0.00]`
+   - concatenated step feature = `[0.75, 0.05, 0.52, 1.00, 9.00, 0.00]`
+
+Episode embedding:
+
+1. Stack the 3 step vectors.
+2. Mean-pool over time:
+
+`x_episode = mean(step_0, step_1, step_2)`
+
+`x_episode = [0.7767, -0.1000, 0.4167, 1.0000, 6.6667, 0.3333]`
+
+3. In the real implementation, this vector is then padded/truncated to length `272`.
+
+Classifier pass:
+
+1. Feed `x_episode` into the MLP.
+2. Suppose the discriminator outputs logits:
+
+`[0.2, -0.4, 1.1, 0.3, -0.2, 0.0, -0.5, 0.1]`
+
+3. Softmax gives intent probabilities:
+
+`q(z | episode) = [0.116, 0.064, 0.286, 0.128, 0.078, 0.095, 0.058, 0.105]`
+
+4. Since the true intent is `z = 2`, the chosen probability is:
+
+`q(z=2 | episode) = 0.286`
+
+Raw diversity bonus:
+
+1. Current formula:
+
+`bonus_raw = log q(z | episode) + log(num_intents)`
+
+2. With `num_intents = 8`:
+
+`bonus_raw = log(0.286) + log(8)`
+
+`bonus_raw = -1.2528 + 2.0794 = 0.8266`
+
+Normalization and reward injection:
+
+1. Suppose the running bonus statistics at this point are:
+   - running mean = `0.5000`
+   - running std = `0.2500`
+
+2. Normalized bonus:
+
+`bonus_norm = (0.8266 - 0.5000) / 0.2500 = 1.3064`
+
+3. Suppose clip range is `[-2, 2]`, so clipped bonus stays `1.3064`.
+
+4. Suppose current `beta = 0.05` and episode length is `3`:
+
+`per_step_bonus = beta * clipped_bonus / episode_length`
+
+`per_step_bonus = 0.05 * 1.3064 / 3 = 0.0218`
+
+5. The callback adds `+0.0218` to each of the 3 offense steps in the rollout buffer for this
+   episode before recomputing returns and advantages.
+
+Interpretation:
+
+1. If the discriminator can confidently identify the sampled intent from the episode summary,
+   the episode receives positive shaping reward.
+2. If the discriminator is uncertain, the raw bonus is smaller or negative.
+3. Because the current embedding is only a mean over flat step features, the discriminator can
+   miss sequence structure even when the policy is using the latent.
+
+### Proposed trajectory encoder upgrade (GRU first)
+
+The simplest meaningful upgrade is to replace mean pooling with a small GRU over the
+step sequence.
+
+Current path:
+
+1. `step feature`
+2. mean over time
+3. MLP
+4. logits over intents
+
+Proposed path:
+
+1. `step feature`
+2. step encoder MLP
+3. GRU over time
+4. final hidden state
+5. discriminator head
+6. logits over intents
+
+This keeps the reward-shaping logic unchanged while preserving order information.
+
+#### Files and classes to change
+
+File: `basketworld/utils/intent_discovery.py`
+
+Add or replace:
+
+1. `build_padded_episode_batch(...)`
+   - Input: `List[CompletedIntentEpisode]`
+   - Output:
+     - `x_steps: [B, T_max, D]`
+     - `lengths: [B]`
+     - `y: [B]`
+
+2. `StepEncoder`
+   - Small MLP applied independently to each step.
+   - Example:
+     - `Linear(D, d_step)`
+     - `ReLU`
+     - optional dropout
+
+3. `TrajectoryEncoderGRU`
+   - `GRU(input_size=d_step, hidden_size=d_hidden, batch_first=True)`
+   - Returns one episode embedding per sequence.
+
+4. `IntentDiscriminator`
+   - Wrap:
+     - step encoder
+     - GRU
+     - final classifier head
+
+File: `basketworld/utils/callbacks.py`
+
+Modify:
+
+1. `_train_discriminator(...)`
+   - Train on padded sequences plus lengths, not a pre-averaged matrix.
+
+2. `_compute_episode_bonus(...)`
+   - Run the same GRU discriminator forward pass and compute:
+     - `log q(z | trajectory) + log(num_intents)`
+
+3. Keep rollout-buffer reward injection exactly the same.
+
+#### Tensor shapes
+
+Recommended first cut:
+
+1. raw step feature dim:
+   - `D = 272`
+   - from `256` obs dims + `16` action dims
+
+2. step encoder dim:
+   - `d_step = 64`
+
+3. GRU hidden dim:
+   - `d_hidden = 128`
+
+4. intents:
+   - `K = 8`
+
+For a minibatch of `B = 32` episodes with max episode length `T_max = 6`:
+
+1. raw padded batch:
+   - `x_steps.shape = [32, 6, 272]`
+
+2. after step MLP:
+   - `x_step_emb.shape = [32, 6, 64]`
+
+3. after GRU:
+   - `h_seq.shape = [32, 6, 128]`
+
+4. final episode embedding:
+   - `h_episode.shape = [32, 128]`
+
+5. logits:
+   - `logits.shape = [32, 8]`
+
+#### Variable-length handling
+
+Episodes are short but not identical in length, so the GRU should use sequence lengths.
+
+Implementation approach:
+
+1. Build padded tensor with zeros on the right.
+2. Build `lengths` array with true episode lengths.
+3. Use `torch.nn.utils.rnn.pack_padded_sequence(...)`.
+4. Use the GRU final hidden state `h_n[-1]` as the episode embedding.
+
+That avoids letting padding steps affect the episode representation.
+
+#### Numerical example
+
+Suppose one episode has 3 steps and each step feature is already reduced to 4 dims for
+illustration only:
+
+1. `x1 = [0.8, 0.1, 0.0, 1.0]`
+2. `x2 = [0.4, 0.9, 0.0, 0.0]`
+3. `x3 = [0.2, 0.3, 1.0, 0.0]`
+
+Let the GRU hidden size be 2. Conceptually:
+
+1. `h1 = GRU(x1, h0)`
+   - `h1 = [0.30, -0.10]`
+
+2. `h2 = GRU(x2, h1)`
+   - `h2 = [0.52, 0.08]`
+
+3. `h3 = GRU(x3, h2)`
+   - `h3 = [0.71, 0.41]`
+
+Episode embedding:
+
+1. `h_episode = h3 = [0.71, 0.41]`
+
+Classifier head:
+
+1. logits over 4 intents for illustration:
+   - `[0.1, -0.3, 1.2, 0.0]`
+
+2. softmax:
+   - `[0.171, 0.115, 0.518, 0.196]`
+
+3. if true intent is `z = 2`:
+   - `q(z=2 | trajectory) = 0.518`
+
+Compare with the same three steps in a different order:
+
+1. `x1 = [0.2, 0.3, 1.0, 0.0]`
+2. `x2 = [0.4, 0.9, 0.0, 0.0]`
+3. `x3 = [0.8, 0.1, 0.0, 1.0]`
+
+The mean of the three vectors is identical, so the current implementation cannot
+distinguish them after pooling.
+
+But the GRU hidden-state path will generally be different:
+
+1. `h1' = [0.12, 0.28]`
+2. `h2' = [0.33, 0.35]`
+3. `h3' = [0.44, 0.09]`
+
+So:
+
+1. current discriminator:
+   - same episode embedding for both orders
+   - same logits
+
+2. GRU discriminator:
+   - different final hidden state
+   - different logits
+
+This is exactly why a trajectory encoder is a better fit for learned plays.
+
+#### What stays the same
+
+1. `IntentEpisodeBuffer` can stay.
+2. Per-episode bonus formula can stay.
+3. Running mean/std normalization can stay.
+4. Reward injection into rollout buffer can stay.
+5. Logged metrics can stay:
+   - `intent/disc_loss`
+   - `intent/disc_top1_acc`
+   - `intent/disc_auc_ovr_macro`
+   - `intent/beta_current`
+
+#### Minimal config additions
+
+If we implement this cleanly, add discriminator-specific config like:
+
+1. `--intent-disc-encoder-type gru`
+2. `--intent-disc-step-dim 64`
+3. `--intent-disc-hidden-dim 128`
+4. `--intent-disc-dropout 0.1`
+
+Defaults should keep the current MLP/mean-pooling path available for ablations.
+
+#### Implementation checklist (ready to code)
+
+This is the concrete order of work to replace the current mean-pooled discriminator with
+the GRU version while minimizing risk.
+
+##### Step 1: Extend `intent_discovery.py`
+
+Add these classes and functions.
+
+1. New step encoder:
+
+```python
+class StepEncoder(nn.Module):
+    def __init__(self, input_dim: int, step_dim: int, dropout: float = 0.1) -> None: ...
+    def forward(self, x_steps: torch.Tensor) -> torch.Tensor: ...
+```
+
+Expected shapes:
+
+1. input: `x_steps.shape == [B, T, D]`
+2. output: `x_step_emb.shape == [B, T, d_step]`
+
+2. New GRU trajectory encoder:
+
+```python
+class TrajectoryEncoderGRU(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 1, dropout: float = 0.0) -> None: ...
+    def forward(self, x_steps: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor: ...
+```
+
+Expected behavior:
+
+1. use `pack_padded_sequence`
+2. return final hidden state with shape `[B, d_hidden]`
+
+3. Replace current `IntentDiscriminator` with an encoder-aware version:
+
+```python
+class IntentDiscriminator(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        num_intents: int,
+        encoder_type: str = "mlp_mean",
+        hidden_dim: int = 128,
+        step_dim: int = 64,
+        dropout: float = 0.1,
+    ) -> None: ...
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor: ...
+```
+
+Expected modes:
+
+1. `encoder_type == "mlp_mean"`
+   - preserve current behavior for ablation/backward comparison
+2. `encoder_type == "gru"`
+   - use `StepEncoder + TrajectoryEncoderGRU + classifier head`
+
+4. Add padded-batch builder:
+
+```python
+def build_padded_episode_batch(
+    episodes: List[CompletedIntentEpisode],
+    max_obs_dim: int = 256,
+    max_action_dim: int = 16,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ...
+```
+
+Return:
+
+1. `x_steps`: shape `[B, T_max, D]`
+2. `lengths`: shape `[B]`
+3. `labels`: shape `[B]`
+
+Implementation notes:
+
+1. reuse the current `IntentTransition.feature`
+2. pad on the right with zeros
+3. skip empty episodes
+4. keep `D = max_obs_dim + max_action_dim`
+
+##### Step 2: Update discriminator training in `callbacks.py`
+
+Modify the current callback methods.
+
+1. `_maybe_build_discriminator(...)`
+
+Current:
+
+```python
+def _maybe_build_discriminator(self, input_dim: int) -> None: ...
+```
+
+Recommended:
+
+```python
+def _maybe_build_discriminator(self, input_dim: int) -> None: ...
+```
+
+Same signature, but instantiate `IntentDiscriminator` with:
+
+1. `encoder_type`
+2. `step_dim`
+3. `hidden_dim`
+4. `dropout`
+
+2. `_train_discriminator(...)`
+
+Current:
+
+```python
+def _train_discriminator(self, x_np: np.ndarray, y_np: np.ndarray) -> tuple[float, float]: ...
+```
+
+Recommended replacement:
+
+```python
+def _train_discriminator(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> tuple[float, float]:
+    ...
+```
+
+Behavior:
+
+1. if `encoder_type == "mlp_mean"`:
+   - ignore `lengths_np`
+   - preserve current path
+2. if `encoder_type == "gru"`:
+   - sample minibatch indices over episodes
+   - pass both `xb` and `lengths_b` into discriminator
+
+3. `_compute_episode_bonus(...)`
+
+Current:
+
+```python
+def _compute_episode_bonus(self, x_np: np.ndarray, y_np: np.ndarray) -> np.ndarray: ...
+```
+
+Recommended replacement:
+
+```python
+def _compute_episode_bonus(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> np.ndarray:
+    ...
+```
+
+4. `_compute_disc_auc(...)`
+
+Current:
+
+```python
+def _compute_disc_auc(self, x_np: np.ndarray, y_np: np.ndarray) -> Optional[float]: ...
+```
+
+Recommended replacement:
+
+```python
+def _compute_disc_auc(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> Optional[float]:
+    ...
+```
+
+##### Step 3: Replace rollout-end feature preparation
+
+Current rollout-end path:
+
+```python
+x_np, y_np = compute_episode_embeddings(...)
+```
+
+Replace with:
+
+```python
+if self.disc_encoder_type == "gru":
+    x_np, lengths_np, y_np = build_padded_episode_batch(...)
+else:
+    x_np, y_np = compute_episode_embeddings(...)
+    lengths_np = None
+```
+
+Then pass `lengths_np` through:
+
+1. `_train_discriminator(...)`
+2. `_compute_disc_auc(...)`
+3. `_compute_episode_bonus(...)`
+
+##### Step 4: Add config plumbing
+
+File: `train/config.py`
+
+Add CLI args:
+
+```python
+parser.add_argument("--intent-disc-encoder-type", choices=["mlp_mean", "gru"], default="mlp_mean")
+parser.add_argument("--intent-disc-step-dim", type=int, default=64)
+parser.add_argument("--intent-disc-hidden-dim", type=int, default=128)
+parser.add_argument("--intent-disc-dropout", type=float, default=0.1)
+```
+
+File: `train/callbacks.py`
+
+Pass the new args into the diversity callback constructor.
+
+File: `basketworld/utils/mlflow_params.py`
+
+Parse and expose the new fields so dev mode can inspect them.
+
+##### Step 5: Keep metrics and reward shaping unchanged
+
+Do not change these initially:
+
+1. `intent/disc_loss`
+2. `intent/disc_top1_acc`
+3. `intent/disc_auc_ovr_macro`
+4. `intent/bonus_raw_mean`
+5. `intent/bonus_norm_mean`
+6. `intent/beta_current`
+
+Do not change:
+
+1. `RunningMeanStd`
+2. clipping logic
+3. reward injection into rollout buffer
+4. return/advantage recomputation
+
+This isolates the experiment to the discriminator representation.
+
+##### Step 6: Add tests before long runs
+
+Add:
+
+1. `tests/test_intent_discovery_gru.py`
+
+Recommended test cases:
+
+1. `build_padded_episode_batch` returns correct shapes for variable-length episodes
+2. padded timesteps do not change the final hidden-state embedding
+3. `IntentDiscriminator(..., encoder_type="gru")` returns logits of shape `[B, K]`
+4. reordered step sequences produce different GRU embeddings
+5. `encoder_type="mlp_mean"` path still matches current behavior
+
+2. Update:
+
+1. `tests/test_intent_diversity_callback.py`
+   - cover the new `lengths_np` path
+   - ensure bonus computation still returns finite values
+
+##### Step 7: Diagnostic run sequence
+
+Run these in order:
+
+1. `encoder_type = mlp_mean`
+   - confirm baseline reproduces current behavior
+
+2. `encoder_type = gru`, `beta = 0`
+   - confirm code path runs
+   - confirm no NaNs / shape errors
+
+3. `encoder_type = gru`, diversity enabled
+   - compare:
+     - `intent/disc_auc_ovr_macro`
+     - `intent/disc_top1_acc`
+     - `intent/policy_kl_mean`
+     - `intent/action_flip_rate`
+     - PPP
+
+##### Acceptance criteria for the GRU upgrade
+
+Treat the GRU upgrade as justified if:
+
+1. `policy_kl_mean` remains nonzero
+2. `disc_auc_ovr_macro` rises above the mean-pooling baseline
+3. `disc_top1_acc` rises above the mean-pooling baseline
+4. PPP does not collapse further versus the current intent-enabled baseline
+
+If AUC/top1 do not improve materially over mean pooling, then the next bottleneck is
+likely the step features themselves, not just sequence aggregation.
+
 ## H) Callbacks + metrics
 
 Files:

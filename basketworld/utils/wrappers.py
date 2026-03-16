@@ -7,7 +7,7 @@ from basketworld.envs.basketworld_env_v2 import ActionType, Team
 
 TOKEN_DIM = 15
 GLOBAL_DIM = 4
-INTENT_GLOBAL_DIM = 3
+INTENT_GLOBAL_DIM = 4
 TOKEN_Q_IDX = 0
 TOKEN_R_IDX = 1
 TOKEN_ROLE_IDX = 2

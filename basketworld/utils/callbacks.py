@@ -16,6 +16,7 @@ from basketworld.utils.intent_discovery import (
     IntentEpisodeBuffer,
     IntentTransition,
     RunningMeanStd,
+    build_padded_episode_batch,
     compute_episode_embeddings,
     extract_action_features_for_env,
     flatten_observation_for_env,
@@ -674,6 +675,9 @@ class IntentDiversityCallback(BaseCallback):
         disc_updates_per_rollout: int = 2,
         disc_hidden_dim: int = 128,
         disc_dropout: float = 0.1,
+        disc_encoder_type: str = "mlp_mean",
+        disc_step_dim: int = 64,
+        disc_console_log_every_rollouts: int = 0,
         max_obs_dim: int = 256,
         max_action_dim: int = 16,
     ) -> None:
@@ -689,10 +693,16 @@ class IntentDiversityCallback(BaseCallback):
         self.disc_updates_per_rollout = int(max(1, disc_updates_per_rollout))
         self.disc_hidden_dim = int(max(16, disc_hidden_dim))
         self.disc_dropout = float(max(0.0, disc_dropout))
+        self.disc_encoder_type = str(disc_encoder_type).strip().lower()
+        self.disc_step_dim = int(max(8, disc_step_dim))
+        self.disc_console_log_every_rollouts = int(
+            max(0, disc_console_log_every_rollouts)
+        )
         self.max_obs_dim = int(max(8, max_obs_dim))
         self.max_action_dim = int(max(1, max_action_dim))
 
         self._rollout_step_idx = 0
+        self._rollout_counter = 0
         self._episodes = IntentEpisodeBuffer()
         self._bonus_stats = RunningMeanStd()
         self._disc: Optional[IntentDiscriminator] = None
@@ -702,6 +712,7 @@ class IntentDiversityCallback(BaseCallback):
         self._last_disc_loss = 0.0
         self._last_disc_acc = 0.0
         self._last_disc_auc: Optional[float] = None
+        self._last_disc_pass_ms = 0.0
         self._defense_unknown_baseline_ppp: Optional[float] = None
 
     def _on_training_start(self) -> None:
@@ -714,6 +725,12 @@ class IntentDiversityCallback(BaseCallback):
 
     def _on_rollout_start(self) -> None:
         self._rollout_step_idx = 0
+        self._rollout_counter += 1
+
+    def _should_console_log_disc(self) -> bool:
+        return self.disc_console_log_every_rollouts > 0 and (
+            self._rollout_counter % self.disc_console_log_every_rollouts
+        ) == 0
 
     def _beta_current(self) -> float:
         t = int(getattr(self.model, "num_timesteps", 0))
@@ -806,18 +823,29 @@ class IntentDiversityCallback(BaseCallback):
             hidden_dim=self.disc_hidden_dim,
             num_intents=self.num_intents,
             dropout=self.disc_dropout,
+            encoder_type=self.disc_encoder_type,
+            step_dim=self.disc_step_dim,
         ).to(self._device)
         self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=self.disc_lr)
 
-    def _train_discriminator(self, x_np: np.ndarray, y_np: np.ndarray) -> tuple[float, float]:
+    def _train_discriminator(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> tuple[float, float]:
         if x_np.shape[0] == 0:
             return 0.0, 0.0
-        self._maybe_build_discriminator(x_np.shape[1])
+        input_dim = int(x_np.shape[-1]) if x_np.ndim >= 2 else int(x_np.shape[0])
+        self._maybe_build_discriminator(input_dim)
         assert self._disc is not None
         assert self._disc_opt is not None
 
         x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
         y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+        lengths = None
+        if lengths_np is not None:
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
 
         self._disc.train()
         last_loss = 0.0
@@ -830,7 +858,8 @@ class IntentDiversityCallback(BaseCallback):
                 idx = torch.randint(0, n, (self.disc_batch_size,), device=self._device)
             xb = x[idx]
             yb = y[idx]
-            logits = self._disc(xb)
+            lb = lengths[idx] if lengths is not None else None
+            logits = self._disc(xb, lb)
             loss = F.cross_entropy(logits, yb)
             self._disc_opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -843,15 +872,23 @@ class IntentDiversityCallback(BaseCallback):
                 last_acc = float(acc.detach().cpu().item())
         return last_loss, last_acc
 
-    def _compute_episode_bonus(self, x_np: np.ndarray, y_np: np.ndarray) -> np.ndarray:
+    def _compute_episode_bonus(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         if x_np.shape[0] == 0:
             return np.zeros((0,), dtype=np.float32)
         assert self._disc is not None
         x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
         y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+        lengths = None
+        if lengths_np is not None:
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
         self._disc.eval()
         with torch.no_grad():
-            logits = self._disc(x)
+            logits = self._disc(x, lengths)
             log_probs = F.log_softmax(logits, dim=-1)
             chosen = log_probs[torch.arange(log_probs.shape[0], device=self._device), y]
             bonus = chosen + float(np.log(float(self.num_intents)))
@@ -918,13 +955,21 @@ class IntentDiversityCallback(BaseCallback):
             return None
         return float(np.mean(aucs))
 
-    def _compute_disc_auc(self, x_np: np.ndarray, y_np: np.ndarray) -> Optional[float]:
+    def _compute_disc_auc(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
         if x_np.shape[0] == 0 or self._disc is None:
             return None
         x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        lengths = None
+        if lengths_np is not None:
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
         self._disc.eval()
         with torch.no_grad():
-            logits = self._disc(x)
+            logits = self._disc(x, lengths)
         logits_np = logits.detach().cpu().numpy()
         return self._multiclass_auc_ovr_macro(
             logits_np,
@@ -974,14 +1019,14 @@ class IntentDiversityCallback(BaseCallback):
         return float(points / possessions)
 
     @staticmethod
-    def _episode_shot_three_share(ep: dict) -> float:
+    def _episode_shot_type_shares(ep: dict) -> tuple[float, float, float]:
         s2 = float(ep.get("shot_2pt", 0.0))
         s3 = float(ep.get("shot_3pt", 0.0))
         sd = float(ep.get("shot_dunk", 0.0))
         total = s2 + s3 + sd
         if total <= 0.0:
-            return 0.0
-        return float(s3 / total)
+            return 0.0, 0.0, 0.0
+        return float(s2 / total), float(s3 / total), float(sd / total)
 
     def _log_intent_behavior_metrics(self, global_step: int) -> None:
         episodes = list(getattr(self.model, "ep_info_buffer", []) or [])
@@ -1000,10 +1045,24 @@ class IntentDiversityCallback(BaseCallback):
             except Exception:
                 continue
             z = max(0, min(self.num_intents - 1, z))
-            slot = grouped.setdefault(z, {"ppp": [], "passes": [], "shot_three_share": []})
+            slot = grouped.setdefault(
+                z,
+                {
+                    "ppp": [],
+                    "passes": [],
+                    "shot_2pt_share": [],
+                    "shot_3pt_share": [],
+                    "shot_dunk_share": [],
+                },
+            )
             slot["ppp"].append(self._episode_ppp(ep))
             slot["passes"].append(float(ep.get("passes", 0.0)))
-            slot["shot_three_share"].append(self._episode_shot_three_share(ep))
+            shot_2pt_share, shot_3pt_share, shot_dunk_share = self._episode_shot_type_shares(
+                ep
+            )
+            slot["shot_2pt_share"].append(shot_2pt_share)
+            slot["shot_3pt_share"].append(shot_3pt_share)
+            slot["shot_dunk_share"].append(shot_dunk_share)
 
         if not grouped:
             return
@@ -1021,10 +1080,28 @@ class IntentDiversityCallback(BaseCallback):
                     float(np.mean(vals["passes"])),
                     step=global_step,
                 )
-            if vals["shot_three_share"]:
+            if vals["shot_2pt_share"]:
+                mlflow.log_metric(
+                    f"intent/shot_2pt_share_by_intent/{z}",
+                    float(np.mean(vals["shot_2pt_share"])),
+                    step=global_step,
+                )
+            if vals["shot_3pt_share"]:
+                # Keep legacy metric name for existing reports; it is the 3PT share.
                 mlflow.log_metric(
                     f"intent/shot_dist_by_intent/{z}",
-                    float(np.mean(vals["shot_three_share"])),
+                    float(np.mean(vals["shot_3pt_share"])),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/shot_3pt_share_by_intent/{z}",
+                    float(np.mean(vals["shot_3pt_share"])),
+                    step=global_step,
+                )
+            if vals["shot_dunk_share"]:
+                mlflow.log_metric(
+                    f"intent/shot_dunk_share_by_intent/{z}",
+                    float(np.mean(vals["shot_dunk_share"])),
                     step=global_step,
                 )
 
@@ -1069,25 +1146,68 @@ class IntentDiversityCallback(BaseCallback):
             pass
 
         episodes = self._episodes.pop_completed(
-            filter_fn=lambda ep: ep.role_is_offense and ep.intent_active and ep.length > 0
+            filter_fn=lambda ep: ep.role_is_offense and ep.active_prefix_length > 0
         )
         if not episodes:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=no_completed_offense_intent_episodes",
+                    flush=True,
+                )
             return
         beta = self._beta_current()
         if beta <= 0.0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"skipped=warmup "
+                    f"beta={float(beta):.4f} "
+                    f"episodes={len(episodes)}",
+                    flush=True,
+                )
             return
 
-        x_np, y_np = compute_episode_embeddings(
-            episodes,
-            max_obs_dim=self.max_obs_dim,
-            max_action_dim=self.max_action_dim,
-        )
+        lengths_np = None
+        if self.disc_encoder_type == "gru":
+            x_np, lengths_np, y_np = build_padded_episode_batch(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
+        else:
+            x_np, y_np = compute_episode_embeddings(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
         if x_np.shape[0] == 0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=empty_discriminator_batch",
+                    flush=True,
+                )
             return
 
-        self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
-        self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
-        raw_bonus = self._compute_episode_bonus(x_np, y_np)
+        disc_pass_start = time.perf_counter()
+        if lengths_np is None:
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
+            self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
+            raw_bonus = self._compute_episode_bonus(x_np, y_np)
+        else:
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_np, y_np, lengths_np
+            )
+            self._last_disc_auc = self._compute_disc_auc(x_np, y_np, lengths_np)
+            raw_bonus = self._compute_episode_bonus(x_np, y_np, lengths_np)
+        self._last_disc_pass_ms = float((time.perf_counter() - disc_pass_start) * 1000.0)
         if raw_bonus.size == 0:
             return
 
@@ -1099,8 +1219,9 @@ class IntentDiversityCallback(BaseCallback):
         for ep_idx, episode in enumerate(episodes):
             if ep_idx >= clipped_bonus.shape[0]:
                 break
-            per_step = float(beta * clipped_bonus[ep_idx] / max(1, episode.length))
-            for t_idx, env_idx in episode.buffer_indices:
+            active_len = max(1, int(episode.active_prefix_length))
+            per_step = float(beta * clipped_bonus[ep_idx] / active_len)
+            for t_idx, env_idx in episode.active_buffer_indices:
                 if (
                     0 <= int(t_idx) < rb.rewards.shape[0]
                     and 0 <= int(env_idx) < rb.rewards.shape[1]
@@ -1108,6 +1229,36 @@ class IntentDiversityCallback(BaseCallback):
                     rb.rewards[int(t_idx), int(env_idx)] += per_step
 
         self._recompute_returns_and_advantage()
+
+        if self._should_console_log_disc():
+            try:
+                avg_len = float(
+                    np.mean([float(ep.active_prefix_length) for ep in episodes])
+                    if episodes
+                    else 0.0
+                )
+                auc_str = (
+                    f"{float(self._last_disc_auc):.4f}"
+                    if self._last_disc_auc is not None
+                    else "NA"
+                )
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"encoder={self.disc_encoder_type} "
+                    f"episodes={len(episodes)} "
+                    f"avg_len={avg_len:.2f} "
+                    f"updates={self.disc_updates_per_rollout} "
+                    f"disc_ms={float(self._last_disc_pass_ms):.1f} "
+                    f"loss={float(self._last_disc_loss):.4f} "
+                    f"top1={float(self._last_disc_acc):.4f} "
+                    f"auc={auc_str} "
+                    f"beta={float(beta):.4f}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         try:
             mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
@@ -1221,7 +1372,6 @@ class IntentPolicySensitivityCallback(BaseCallback):
                 active=1.0,
                 visible=1.0,
                 age_norm=0.0,
-                commitment_remaining_norm=1.0,
             )
             if metrics.get("num_pairs", 0.0) <= 0.0:
                 return

@@ -7,7 +7,7 @@ import torch
 
 
 _BASE_SET_GLOBAL_DIM = 4
-_INTENT_GLOBAL_DIM = 3
+_INTENT_GLOBAL_DIM = 4
 _EPS = 1e-12
 
 
@@ -88,7 +88,6 @@ def patch_intent_in_observation(
     active: float = 1.0,
     visible: float = 1.0,
     age_norm: Optional[float] = None,
-    commitment_remaining_norm: Optional[float] = None,
     batch_index: Optional[int] = None,
 ) -> dict:
     """Patch intent-conditioned observation fields in-place and return `obs`."""
@@ -97,8 +96,6 @@ def patch_intent_in_observation(
     visible_f = float(visible)
     if age_norm is None:
         age_norm = 0.0 if active_f > 0.5 else 0.0
-    if commitment_remaining_norm is None:
-        commitment_remaining_norm = 1.0 if active_f > 0.5 else 0.0
     if num_intents <= 1:
         index_norm = 0.0
     else:
@@ -112,24 +109,18 @@ def patch_intent_in_observation(
             if batch_index is None:
                 globals_np = np.array(globals_np, copy=True)
                 globals_np[-_INTENT_GLOBAL_DIM :] = np.asarray(
-                    [index_norm, active_f, visible_f], dtype=np.float32
+                    [index_norm, active_f, visible_f, float(age_norm)], dtype=np.float32
                 )
                 obs["globals"] = globals_np
             else:
                 obs["globals"][int(batch_index), -_INTENT_GLOBAL_DIM :] = np.asarray(
-                    [index_norm, active_f, visible_f], dtype=np.float32
+                    [index_norm, active_f, visible_f, float(age_norm)], dtype=np.float32
                 )
 
     _set_scalar_field(obs, "intent_index", float(z), batch_index)
     _set_scalar_field(obs, "intent_active", active_f, batch_index)
     _set_scalar_field(obs, "intent_visible", visible_f, batch_index)
     _set_scalar_field(obs, "intent_age_norm", float(age_norm), batch_index)
-    _set_scalar_field(
-        obs,
-        "intent_commitment_remaining_norm",
-        float(commitment_remaining_norm),
-        batch_index,
-    )
     return obs
 
 
@@ -141,7 +132,6 @@ def build_intent_variant_batch(
     active: float = 1.0,
     visible: float = 1.0,
     age_norm: float = 0.0,
-    commitment_remaining_norm: float = 1.0,
 ) -> tuple[dict, list[int]]:
     """Repeat one observation into a batch and patch each row with a different intent."""
     intents = (
@@ -161,7 +151,6 @@ def build_intent_variant_batch(
             active=active,
             visible=visible,
             age_norm=age_norm,
-            commitment_remaining_norm=commitment_remaining_norm,
             batch_index=batch_idx,
         )
     return batch, intents
@@ -271,7 +260,6 @@ def compute_policy_sensitivity_metrics(
     active: float = 1.0,
     visible: float = 1.0,
     age_norm: float = 0.0,
-    commitment_remaining_norm: float = 1.0,
 ) -> dict[str, float]:
     """Measure how much action distributions move when only intent changes."""
     intents = (
@@ -302,7 +290,6 @@ def compute_policy_sensitivity_metrics(
             active=active,
             visible=visible,
             age_norm=age_norm,
-            commitment_remaining_norm=commitment_remaining_norm,
         )
         probs = get_policy_action_probabilities_tensor(policy_or_model, batch_obs)
         if probs is None or probs.ndim != 3 or probs.shape[0] != len(used_intents):

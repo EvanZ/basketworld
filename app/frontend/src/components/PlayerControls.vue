@@ -2942,7 +2942,7 @@ const tokenFeatureLabels = [
   'dist_to_nearest_team',
 ];
 const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
-const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible'];
+const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible', 'intent_age_norm'];
 
 const tokenPlayers = computed(() => {
   const players = obsTokens.value?.players;

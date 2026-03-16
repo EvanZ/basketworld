@@ -202,7 +202,12 @@ def get_full_game_state(
         labels.extend(base_labels[:base_take])
         extras = max(0, n - base_take)
         if extras > 0:
-            intent_labels = ["intent_index_norm", "intent_active", "intent_visible"]
+            intent_labels = [
+                "intent_index_norm",
+                "intent_active",
+                "intent_visible",
+                "intent_age_norm",
+            ]
             intent_take = min(len(intent_labels), extras)
             labels.extend(intent_labels[:intent_take])
             for idx in range(intent_take, extras):

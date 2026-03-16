@@ -435,9 +435,6 @@ class HexagonBasketballEnv(gym.Env):
             obs_spaces["intent_age_norm"] = spaces.Box(
                 low=0.0, high=1.0, shape=(1,), dtype=np.float32
             )
-            obs_spaces["intent_commitment_remaining_norm"] = spaces.Box(
-                low=0.0, high=1.0, shape=(1,), dtype=np.float32
-            )
         self.observation_space = spaces.Dict(obs_spaces)
 
         # --- Hexagonal Grid Directions ---
@@ -818,13 +815,21 @@ class HexagonBasketballEnv(gym.Env):
             intent_index, intent_active, intent_age, intent_commitment_remaining = (
                 self._get_role_intent_state(observer_is_offense)
             )
-            del intent_index  # index itself is unchanged across the commitment window
             if not intent_active:
+                continue
+            if int(intent_commitment_remaining) <= 0:
+                self._set_role_intent_state(
+                    observer_is_offense,
+                    intent_index=int(intent_index),
+                    intent_active=False,
+                    intent_age=int(intent_age),
+                    intent_commitment_remaining=0,
+                )
                 continue
             self._set_role_intent_state(
                 observer_is_offense,
-                intent_index=self.intent_index if observer_is_offense else self.defense_intent_index,
-                intent_active=intent_active,
+                intent_index=int(intent_index),
+                intent_active=True,
                 intent_age=int(intent_age) + 1,
                 intent_commitment_remaining=max(0, int(intent_commitment_remaining) - 1),
             )
@@ -863,7 +868,6 @@ class HexagonBasketballEnv(gym.Env):
                 "intent_active": np.array([0.0], dtype=np.float32),
                 "intent_visible": np.array([0.0], dtype=np.float32),
                 "intent_age_norm": np.array([0.0], dtype=np.float32),
-                "intent_commitment_remaining_norm": np.array([0.0], dtype=np.float32),
             }
         visible = self._intent_visible_for_observer(bool(observer_is_offense))
         intent_index, active, intent_age, intent_commitment_remaining = (
@@ -875,22 +879,12 @@ class HexagonBasketballEnv(gym.Env):
             if active
             else 0.0
         )
-        remaining_norm = (
-            float(intent_commitment_remaining)
-            / float(max(1, self.intent_commitment_steps))
-            if active
-            else 0.0
-        )
         age_norm = float(max(0.0, min(1.0, age_norm)))
-        remaining_norm = float(max(0.0, min(1.0, remaining_norm)))
         return {
             "intent_index": np.array([float(masked_index)], dtype=np.float32),
             "intent_active": np.array([1.0 if active else 0.0], dtype=np.float32),
             "intent_visible": np.array([1.0 if visible else 0.0], dtype=np.float32),
             "intent_age_norm": np.array([age_norm], dtype=np.float32),
-            "intent_commitment_remaining_norm": np.array(
-                [remaining_norm], dtype=np.float32
-            ),
         }
 
     def get_intent_global_features(self, observer_is_offense: bool) -> np.ndarray:
@@ -909,6 +903,7 @@ class HexagonBasketballEnv(gym.Env):
                 float(intent_index_norm),
                 float(fields["intent_active"][0]),
                 float(fields["intent_visible"][0]),
+                float(fields["intent_age_norm"][0]),
             ],
             dtype=np.float32,
         )

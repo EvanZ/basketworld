@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 @dataclass
@@ -46,6 +47,23 @@ class CompletedIntentEpisode:
         if not self.transitions:
             return False
         return bool(self.transitions[0].intent_active)
+
+    @property
+    def active_prefix_transitions(self) -> List[IntentTransition]:
+        prefix: List[IntentTransition] = []
+        for tr in self.transitions:
+            if not bool(tr.intent_active):
+                break
+            prefix.append(tr)
+        return prefix
+
+    @property
+    def active_prefix_length(self) -> int:
+        return len(self.active_prefix_transitions)
+
+    @property
+    def active_buffer_indices(self) -> List[Tuple[int, int]]:
+        return [(tr.buffer_step_idx, tr.env_idx) for tr in self.active_prefix_transitions]
 
 
 class RunningMeanStd:
@@ -111,8 +129,65 @@ class IntentEpisodeBuffer:
         return [ep for ep in episodes if bool(filter_fn(ep))]
 
 
+class StepEncoder(nn.Module):
+    """Per-step feature projection before temporal aggregation."""
+
+    def __init__(self, input_dim: int, step_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(input_dim), int(step_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(max(0.0, dropout))),
+        )
+
+    def forward(self, x_steps: torch.Tensor) -> torch.Tensor:
+        if x_steps.ndim != 3:
+            raise ValueError(f"StepEncoder expects [B, T, D], got {tuple(x_steps.shape)}")
+        b, t, d = x_steps.shape
+        flat = x_steps.reshape(b * t, d)
+        step_emb = self.net(flat)
+        return step_emb.reshape(b, t, -1)
+
+
+class TrajectoryEncoderGRU(nn.Module):
+    """GRU over variable-length step sequences."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        gru_dropout = float(max(0.0, dropout)) if int(num_layers) > 1 else 0.0
+        self.gru = nn.GRU(
+            input_size=int(input_dim),
+            hidden_size=int(hidden_dim),
+            num_layers=int(max(1, num_layers)),
+            batch_first=True,
+            dropout=gru_dropout,
+        )
+
+    def forward(self, x_steps: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        if x_steps.ndim != 3:
+            raise ValueError(
+                f"TrajectoryEncoderGRU expects [B, T, D], got {tuple(x_steps.shape)}"
+            )
+        if lengths.ndim != 1:
+            raise ValueError(f"TrajectoryEncoderGRU expects [B] lengths, got {tuple(lengths.shape)}")
+        packed = pack_padded_sequence(
+            x_steps,
+            lengths.detach().to(device="cpu", dtype=torch.long),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, h_n = self.gru(packed)
+        return h_n[-1]
+
+
 class IntentDiscriminator(nn.Module):
-    """Simple MLP discriminator over episode embeddings."""
+    """Intent discriminator over either pooled or sequential episode features."""
 
     def __init__(
         self,
@@ -120,17 +195,72 @@ class IntentDiscriminator(nn.Module):
         hidden_dim: int,
         num_intents: int,
         dropout: float = 0.1,
+        encoder_type: str = "mlp_mean",
+        step_dim: int = 64,
     ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(int(input_dim), int(hidden_dim)),
-            nn.ReLU(),
-            nn.Dropout(float(max(0.0, dropout))),
-            nn.Linear(int(hidden_dim), int(num_intents)),
-        )
+        self.encoder_type = str(encoder_type).strip().lower()
+        if self.encoder_type not in {"mlp_mean", "gru"}:
+            raise ValueError(f"Unsupported intent discriminator encoder_type={encoder_type!r}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        if self.encoder_type == "mlp_mean":
+            self.net = nn.Sequential(
+                nn.Linear(int(input_dim), int(hidden_dim)),
+                nn.ReLU(),
+                nn.Dropout(float(max(0.0, dropout))),
+                nn.Linear(int(hidden_dim), int(num_intents)),
+            )
+            self.step_encoder = None
+            self.traj_encoder = None
+            self.head = None
+        else:
+            self.net = None
+            self.step_encoder = StepEncoder(
+                input_dim=int(input_dim),
+                step_dim=int(step_dim),
+                dropout=float(max(0.0, dropout)),
+            )
+            self.traj_encoder = TrajectoryEncoderGRU(
+                input_dim=int(step_dim),
+                hidden_dim=int(hidden_dim),
+                num_layers=1,
+                dropout=0.0,
+            )
+            self.head = nn.Sequential(
+                nn.Dropout(float(max(0.0, dropout))),
+                nn.Linear(int(hidden_dim), int(num_intents)),
+            )
+
+    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.encoder_type == "mlp_mean":
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+            elif x.ndim == 3:
+                x = torch.mean(x, dim=1)
+            if x.ndim != 2:
+                raise ValueError(f"MLP intent discriminator expects [B, D], got {tuple(x.shape)}")
+            assert self.net is not None
+            return self.net(x)
+
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        if x.ndim != 3:
+            raise ValueError(f"GRU intent discriminator expects [B, T, D], got {tuple(x.shape)}")
+        if lengths is None:
+            lengths = torch.full(
+                (x.shape[0],),
+                int(x.shape[1]),
+                dtype=torch.long,
+                device=x.device,
+            )
+        else:
+            lengths = lengths.to(device=x.device, dtype=torch.long).reshape(-1)
+        assert self.step_encoder is not None
+        assert self.traj_encoder is not None
+        assert self.head is not None
+        step_emb = self.step_encoder(x)
+        episode_emb = self.traj_encoder(step_emb, lengths)
+        return self.head(episode_emb)
 
 
 def flatten_observation_for_env(obs_payload, env_idx: int) -> np.ndarray:
@@ -184,6 +314,39 @@ def extract_action_features_for_env(actions_payload, env_idx: int) -> np.ndarray
     return np.zeros(1, dtype=np.float32)
 
 
+def _fixed_dim_step_feature(
+    feat: np.ndarray,
+    max_obs_dim: int,
+    max_action_dim: int,
+) -> np.ndarray:
+    total_dim = int(max_obs_dim + max_action_dim)
+    fixed = np.zeros((total_dim,), dtype=np.float32)
+    flat = np.asarray(feat, dtype=np.float32).reshape(-1)
+    take = min(total_dim, flat.shape[0])
+    if take > 0:
+        fixed[:take] = flat[:take]
+    return fixed
+
+
+def _episode_feature_matrix(
+    episode: CompletedIntentEpisode,
+    max_obs_dim: int = 256,
+    max_action_dim: int = 16,
+) -> Optional[np.ndarray]:
+    step_vecs: List[np.ndarray] = []
+    for tr in episode.active_prefix_transitions:
+        step_vecs.append(
+            _fixed_dim_step_feature(
+                tr.feature,
+                max_obs_dim=max_obs_dim,
+                max_action_dim=max_action_dim,
+            )
+        )
+    if not step_vecs:
+        return None
+    return np.vstack(step_vecs).astype(np.float32, copy=False)
+
+
 def compute_episode_embeddings(
     episodes: List[CompletedIntentEpisode],
     max_obs_dim: int = 256,
@@ -196,20 +359,14 @@ def compute_episode_embeddings(
     emb_rows: List[np.ndarray] = []
     labels: List[int] = []
     for ep in episodes:
-        step_vecs: List[np.ndarray] = []
-        for tr in ep.transitions:
-            feat = np.asarray(tr.feature, dtype=np.float32).reshape(-1)
-            step_vecs.append(feat)
-        if not step_vecs:
+        stacked = _episode_feature_matrix(
+            ep,
+            max_obs_dim=max_obs_dim,
+            max_action_dim=max_action_dim,
+        )
+        if stacked is None or stacked.shape[0] == 0:
             continue
-        stacked = np.vstack(step_vecs)
         mean_vec = np.mean(stacked, axis=0)
-        if mean_vec.shape[0] < (max_obs_dim + max_action_dim):
-            padded = np.zeros((max_obs_dim + max_action_dim,), dtype=np.float32)
-            padded[: mean_vec.shape[0]] = mean_vec
-            mean_vec = padded
-        else:
-            mean_vec = mean_vec[: (max_obs_dim + max_action_dim)]
         emb_rows.append(mean_vec.astype(np.float32, copy=False))
         labels.append(int(ep.intent_index))
 
@@ -218,3 +375,51 @@ def compute_episode_embeddings(
             (0,), dtype=np.int64
         )
     return np.vstack(emb_rows), np.asarray(labels, dtype=np.int64)
+
+
+def build_padded_episode_batch(
+    episodes: List[CompletedIntentEpisode],
+    max_obs_dim: int = 256,
+    max_action_dim: int = 16,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert completed episodes to padded [B, T, D] batch with lengths and labels."""
+    total_dim = int(max_obs_dim + max_action_dim)
+    if not episodes:
+        return (
+            np.zeros((0, 1, total_dim), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    sequences: List[np.ndarray] = []
+    lengths: List[int] = []
+    labels: List[int] = []
+    max_len = 0
+    for ep in episodes:
+        seq = _episode_feature_matrix(
+            ep,
+            max_obs_dim=max_obs_dim,
+            max_action_dim=max_action_dim,
+        )
+        if seq is None or seq.shape[0] == 0:
+            continue
+        sequences.append(seq)
+        lengths.append(int(seq.shape[0]))
+        labels.append(int(ep.intent_index))
+        max_len = max(max_len, int(seq.shape[0]))
+
+    if not sequences:
+        return (
+            np.zeros((0, 1, total_dim), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    padded = np.zeros((len(sequences), max_len, total_dim), dtype=np.float32)
+    for idx, seq in enumerate(sequences):
+        padded[idx, : seq.shape[0], :] = seq
+    return (
+        padded,
+        np.asarray(lengths, dtype=np.int64),
+        np.asarray(labels, dtype=np.int64),
+    )

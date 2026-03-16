@@ -84,8 +84,8 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self.intent_embedding_enabled = bool(intent_embedding_enabled)
         self.intent_embedding_dim = max(1, int(intent_embedding_dim))
         self.num_intents = max(1, int(num_intents))
-        # Intent globals are appended as trailing [index_norm, active, visible].
-        self._intent_globals_dim = 3
+        # Intent globals are appended as trailing [index_norm, active, visible, age_norm].
+        self._intent_globals_dim = 4
         self._intent_start_idx = max(0, self.global_dim - self._intent_globals_dim)
         self._has_intent_globals = self.global_dim >= (4 + self._intent_globals_dim)
 

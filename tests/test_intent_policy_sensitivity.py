@@ -32,7 +32,7 @@ class _DummySensitivityPolicy:
 
     def get_distribution(self, obs_tensor):
         globals_vec = obs_tensor["globals"]
-        idx_norm = globals_vec[:, -3]
+        idx_norm = globals_vec[:, -4]
         if self.num_intents > 1:
             intent_idx = torch.round(idx_norm * float(self.num_intents - 1)).long()
         else:
@@ -61,28 +61,28 @@ class _DummyModel:
 def _single_obs():
     return {
         "players": np.zeros((6, 15), dtype=np.float32),
-        "globals": np.array([24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0], dtype=np.float32),
+        "globals": np.array([24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         "action_mask": np.ones((2, 4), dtype=np.float32),
         "role_flag": np.array([1.0], dtype=np.float32),
         "intent_index": np.array([0.0], dtype=np.float32),
         "intent_active": np.array([0.0], dtype=np.float32),
         "intent_visible": np.array([0.0], dtype=np.float32),
         "intent_age_norm": np.array([0.0], dtype=np.float32),
-        "intent_commitment_remaining_norm": np.array([0.0], dtype=np.float32),
     }
 
 
 def test_build_intent_variant_batch_patches_scalar_and_set_fields():
     batch, intents = build_intent_variant_batch(_single_obs(), num_intents=4)
     assert intents == [0, 1, 2, 3]
-    assert batch["globals"].shape == (4, 7)
-    assert np.isclose(batch["globals"][2, -3], 2.0 / 3.0)
+    assert batch["globals"].shape == (4, 8)
+    assert np.isclose(batch["globals"][2, -4], 2.0 / 3.0)
+    assert np.isclose(batch["globals"][3, -3], 1.0)
     assert np.isclose(batch["globals"][3, -2], 1.0)
-    assert np.isclose(batch["globals"][3, -1], 1.0)
+    assert np.isclose(batch["globals"][3, -1], 0.0)
     assert np.isclose(batch["intent_index"][3, 0], 3.0)
     assert np.isclose(batch["intent_active"][1, 0], 1.0)
     assert np.isclose(batch["intent_visible"][1, 0], 1.0)
-    assert np.isclose(batch["intent_commitment_remaining_norm"][1, 0], 1.0)
+    assert np.isclose(batch["intent_age_norm"][1, 0], 0.0)
 
 
 def test_compute_policy_sensitivity_metrics_detects_intent_dependence():
@@ -123,8 +123,8 @@ def test_intent_policy_sensitivity_callback_logs_metrics(monkeypatch):
             "players": np.zeros((2, 6, 15), dtype=np.float32),
             "globals": np.array(
                 [
-                    [24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0],
-                    [24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0],
+                    [24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0],
+                    [24.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0],
                 ],
                 dtype=np.float32,
             ),
@@ -134,7 +134,6 @@ def test_intent_policy_sensitivity_callback_logs_metrics(monkeypatch):
             "intent_active": np.ones((2, 1), dtype=np.float32),
             "intent_visible": np.ones((2, 1), dtype=np.float32),
             "intent_age_norm": np.zeros((2, 1), dtype=np.float32),
-            "intent_commitment_remaining_norm": np.ones((2, 1), dtype=np.float32),
         },
     }
     assert callback._on_step() is True

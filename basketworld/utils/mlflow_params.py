@@ -610,5 +610,29 @@ def get_mlflow_training_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
+    training_params["intent_disc_encoder_type"] = _get_param(
+        params,
+        ["intent_disc_encoder_type", "intent-disc-encoder-type"],
+        str,
+        "mlp_mean",
+    )
+    training_params["intent_disc_step_dim"] = _get_param(
+        params,
+        ["intent_disc_step_dim", "intent-disc-step-dim"],
+        int,
+        64,
+    )
+    training_params["intent_disc_hidden_dim"] = _get_param(
+        params,
+        ["intent_disc_hidden_dim", "intent-disc-hidden-dim"],
+        int,
+        128,
+    )
+    training_params["intent_disc_dropout"] = _get_param(
+        params,
+        ["intent_disc_dropout", "intent-disc-dropout"],
+        float,
+        0.1,
+    )
 
     return training_params

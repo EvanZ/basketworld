@@ -265,7 +265,7 @@ def test_set_attention_policy_intent_embedding_smoke():
     n_players = 6
     players_per_side = 3
     n_actions = 14
-    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    obs_space = _make_obs_space(n_players, globals_dim=8, n_actions=n_actions)
     action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
 
     policy = SetAttentionDualCriticPolicy(
@@ -277,8 +277,8 @@ def test_set_attention_policy_intent_embedding_smoke():
         num_intents=8,
     )
 
-    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 0.42, 1.0, 1.0], dtype=np.float32)
-    obs = _make_obs(n_players, globals_dim=7, n_actions=n_actions, role=1.0, globals_vec=globals_vec)
+    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 0.42, 1.0, 1.0, 0.25], dtype=np.float32)
+    obs = _make_obs(n_players, globals_dim=8, n_actions=n_actions, role=1.0, globals_vec=globals_vec)
     tensor_obs, _ = policy.obs_to_tensor(obs)
     actions, values, log_prob = policy.forward(tensor_obs, deterministic=True)
 
@@ -291,7 +291,7 @@ def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_ke
     n_players = 6
     players_per_side = 3
     n_actions = 14
-    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    obs_space = _make_obs_space(n_players, globals_dim=8, n_actions=n_actions)
     action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
 
     policy = SetAttentionDualCriticPolicy(
@@ -334,7 +334,7 @@ def test_set_attention_policy_uses_role_selected_intent_embeddings():
     n_players = 6
     players_per_side = 3
     n_actions = 14
-    obs_space = _make_obs_space(n_players, globals_dim=7, n_actions=n_actions)
+    obs_space = _make_obs_space(n_players, globals_dim=8, n_actions=n_actions)
     action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
 
     policy = SetAttentionDualCriticPolicy(
@@ -359,17 +359,17 @@ def test_set_attention_policy_uses_role_selected_intent_embeddings():
         extractor.offense_intent_to_token.weight.fill_(0.5)
         extractor.defense_intent_to_token.weight.fill_(-0.5)
 
-    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 3.0 / 7.0, 1.0, 1.0], dtype=np.float32)
+    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 3.0 / 7.0, 1.0, 1.0, 0.25], dtype=np.float32)
     obs_off = _make_obs(
         n_players,
-        globals_dim=7,
+        globals_dim=8,
         n_actions=n_actions,
         role=1.0,
         globals_vec=globals_vec,
     )
     obs_def = _make_obs(
         n_players,
-        globals_dim=7,
+        globals_dim=8,
         n_actions=n_actions,
         role=-1.0,
         globals_vec=globals_vec,

@@ -146,6 +146,11 @@ def build_intent_diversity_callback(args):
         disc_batch_size=getattr(args, "intent_disc_batch_size", 256),
         disc_updates_per_rollout=getattr(args, "intent_disc_updates_per_rollout", 2),
         disc_hidden_dim=getattr(args, "intent_disc_hidden_dim", 128),
+        disc_encoder_type=getattr(args, "intent_disc_encoder_type", "mlp_mean"),
+        disc_step_dim=getattr(args, "intent_disc_step_dim", 64),
+        disc_console_log_every_rollouts=getattr(
+            args, "intent_disc_console_log_every_rollouts", 0
+        ),
         disc_dropout=getattr(args, "intent_disc_dropout", 0.1),
         max_obs_dim=getattr(args, "intent_disc_max_obs_dim", 256),
         max_action_dim=getattr(args, "intent_disc_max_action_dim", 16),

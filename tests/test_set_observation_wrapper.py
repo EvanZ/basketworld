@@ -31,5 +31,5 @@ def test_set_observation_wrapper_adds_intent_globals_when_enabled():
     )
     obs, _ = env.reset(seed=3)
     globals_vec = obs["globals"]
-    assert globals_vec.shape == (7,)
+    assert globals_vec.shape == (8,)
     assert np.all(np.isfinite(globals_vec))
