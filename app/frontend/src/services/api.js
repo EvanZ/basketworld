@@ -406,6 +406,19 @@ export async function setBallHolder(playerId) {
   return response.json();
 }
 
+export async function setIntentState(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_intent_state`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set intent state');
+  }
+  return response.json();
+}
+
 export async function resetTurnState() {
   const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
     method: 'POST',

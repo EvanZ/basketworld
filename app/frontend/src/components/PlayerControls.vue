@@ -10,6 +10,7 @@ import {
   setPassTargetStrategy,
   setPassLogitBias,
   setBallHolder,
+  setIntentState,
   setShotPressureParams,
   setPassInterceptionParams,
   setDefenderPressureParams,
@@ -367,6 +368,13 @@ const passLogitBiasInput = ref(0);
 const passLogitBiasDefault = 0.0;
 const passLogitBiasUpdating = ref(false);
 const passLogitBiasError = ref(null);
+const intentStateInput = ref({
+  active: false,
+  intent_index: 0,
+  intent_age: 0,
+});
+const intentStateUpdating = ref(false);
+const intentStateError = ref(null);
 const pressureParamsInput = ref({
   three_pt_extra_hex_decay: 0.05,
   shot_pressure_enabled: true,
@@ -415,6 +423,21 @@ const PASS_TARGET_STRATEGIES = [
   { value: 'nearest', label: 'Nearest (legacy)' },
   { value: 'best_ev', label: 'Best EV' },
 ];
+const intentIndexMax = computed(() =>
+  Math.max(0, Number(props.gameState?.num_intents || 1) - 1)
+);
+const intentAgeMax = computed(() =>
+  Math.max(0, Number(props.gameState?.intent_commitment_steps || 0))
+);
+const intentControlsDisabled = computed(() =>
+  intentStateUpdating.value ||
+  !props.gameState ||
+  !props.gameState.enable_intent_learning ||
+  props.gameState.done ||
+  props.isEvaluating ||
+  props.isReplaying ||
+  props.isManualStepping
+);
 
 const passTargetStrategyValue = computed(() => {
   const val = props.gameState?.pass_target_strategy || 'nearest';
@@ -461,6 +484,30 @@ watch(() => props.gameState?.pass_logit_bias, (val) => {
     passLogitBiasInput.value = Number.isFinite(num) ? num : 0;
   }
 }, { immediate: true });
+
+watch(
+  () => [
+    props.gameState?.intent_active_current,
+    props.gameState?.intent_index_current,
+    props.gameState?.intent_age,
+    props.gameState?.num_intents,
+    props.gameState?.intent_commitment_steps,
+  ],
+  () => {
+    intentStateInput.value = {
+      active: Boolean(props.gameState?.intent_active_current),
+      intent_index: Math.max(
+        0,
+        Math.min(intentIndexMax.value, Number(props.gameState?.intent_index_current ?? 0) || 0),
+      ),
+      intent_age: Math.max(
+        0,
+        Math.min(intentAgeMax.value, Number(props.gameState?.intent_age ?? 0) || 0),
+      ),
+    };
+  },
+  { immediate: true }
+);
 
 function syncPressureParamsInputs(state) {
   const src = state || {};
@@ -841,6 +888,51 @@ async function resetPassLogitBiasDefault() {
   if (!props.gameState) return;
   passLogitBiasInput.value = passLogitBiasDefault;
   await applyPassLogitBiasOverride();
+}
+
+async function applyIntentStateOverride() {
+  if (!props.gameState || intentControlsDisabled.value) return;
+  intentStateUpdating.value = true;
+  intentStateError.value = null;
+  try {
+    const payload = {
+      active: Boolean(intentStateInput.value.active),
+      intent_index: Math.max(
+        0,
+        Math.min(intentIndexMax.value, Number(intentStateInput.value.intent_index) || 0),
+      ),
+      intent_age: Math.max(
+        0,
+        Math.min(intentAgeMax.value, Number(intentStateInput.value.intent_age) || 0),
+      ),
+    };
+    const res = await setIntentState(payload);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update intent state');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update intent state', err);
+    intentStateError.value = err?.message || 'Failed to update intent state';
+  } finally {
+    intentStateUpdating.value = false;
+  }
+}
+
+function resetIntentStateInputs() {
+  intentStateInput.value = {
+    active: Boolean(props.gameState?.intent_active_current),
+    intent_index: Math.max(
+      0,
+      Math.min(intentIndexMax.value, Number(props.gameState?.intent_index_current ?? 0) || 0),
+    ),
+    intent_age: Math.max(
+      0,
+      Math.min(intentAgeMax.value, Number(props.gameState?.intent_age ?? 0) || 0),
+    ),
+  };
+  intentStateError.value = null;
 }
 
 function _normalizePressurePayload(input) {
@@ -1884,6 +1976,38 @@ const entropyTotals = computed(() => {
 });
 
 const hasEntropyData = computed(() => entropyRows.value.some((row) => row.entropy !== null && row.entropy !== undefined));
+const policyTeamLabel = computed(() => props.gameState?.user_team_name || 'OFFENSE');
+const policyRowsByPlayer = computed(() => {
+  if (!props.gameState || !policyProbabilities.value) return [];
+
+  return userControlledPlayerIds.value.map((pid) => {
+    const probs =
+      policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
+    const mask = props.gameState?.action_mask?.[pid];
+    const normalized = normalizeLegalProbs(probs, mask);
+    if (!Array.isArray(normalized)) {
+      return { playerId: pid, actions: [] };
+    }
+
+    const actions = [];
+    for (let i = 0; i < normalized.length && i < actionNames.length; i += 1) {
+      const allowed = !Array.isArray(mask) || Number(mask[i]) > 0;
+      if (!allowed) continue;
+      const prob = Number(normalized[i]);
+      if (!Number.isFinite(prob)) continue;
+      actions.push({
+        action: actionNames[i] || `ACTION_${i}`,
+        prob,
+      });
+    }
+
+    actions.sort((a, b) => b.prob - a.prob);
+    return { playerId: pid, actions };
+  });
+});
+const hasPolicyData = computed(() =>
+  policyRowsByPlayer.value.some((row) => Array.isArray(row.actions) && row.actions.length > 0)
+);
 
 // Shot probability display is handled on the board
 
@@ -3333,6 +3457,12 @@ const stealRisks = computed(() => {
         Entropy
       </button>
       <button 
+        :class="{ active: activeTab === 'policy' }"
+        @click="activeTab = 'policy'"
+      >
+        Policy
+      </button>
+      <button 
         :class="{ active: activeTab === 'advisor' }"
         @click="activeTab = 'advisor'"
       >
@@ -3785,6 +3915,48 @@ const stealRisks = computed(() => {
                 </tr>
               </tbody>
             </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Policy Tab -->
+    <div v-if="activeTab === 'policy'" class="tab-content">
+      <div class="entropy-section">
+        <h4>Policy Probabilities ({{ policyTeamLabel }})</h4>
+        <p class="entropy-note">Legal-action probabilities for the current state, filtered to the selected team.</p>
+
+        <div v-if="!policyProbabilities || !hasPolicyData" class="no-data">
+          No policy probabilities available yet.
+        </div>
+        <div v-else class="parameters-grid">
+          <div
+            v-for="row in policyRowsByPlayer"
+            :key="`policy-${row.playerId}`"
+            class="param-category"
+          >
+            <h5>Player {{ row.playerId }}</h5>
+            <div v-if="!row.actions.length" class="no-data">
+              No legal actions available.
+            </div>
+            <div v-else class="entropy-table-wrapper">
+              <table class="entropy-table">
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Action</th>
+                    <th>Prob</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(action, idx) in row.actions" :key="`${row.playerId}-${action.action}`">
+                    <td>{{ idx + 1 }}</td>
+                    <td>{{ action.action }}</td>
+                    <td>{{ (action.prob * 100).toFixed(2) }}%</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
@@ -4435,43 +4607,36 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Bias added to pass action logits in the policy network. Positive = encourage passing.">
               <span class="param-name">Pass logit bias:</span>
+              <input
+                class="env-param-input"
+                type="number"
+                step="0.05"
+                v-model.number="passLogitBiasInput"
+                :disabled="passLogitBiasUpdating"
+              />
             </div>
-            <div class="offense-skills-editor">
-              <div class="offense-skills-row header">`
-                `
-                <span>Setting</span>
-                <span>Bias</span>
-                <span></span>
-                <span></span>
-              </div>
-              <div class="offense-skills-row">
-                <span class="skills-player">Pass logit bias</span>
-                <div class="offense-skill-input">
-                  <input type="number" step="0.05" v-model.number="passLogitBiasInput" :disabled="passLogitBiasUpdating" />
-                  <span class="offense-skill-default">Default {{ passLogitBiasDefault.toFixed(2) }}</span>
-                </div>
-                <span></span>
-                <span></span>
-              </div>
-              <div class="offense-skill-actions">
-                <button
-                  class="refresh-policies-btn"
-                  @click="resetPassLogitBiasDefault"
-                  :disabled="passLogitBiasUpdating"
-                >
-                  Reset 
-                </button>
-                <button
-                  class="refresh-policies-btn"
-                  @click="applyPassLogitBiasOverride"
-                  :disabled="passLogitBiasUpdating"
-                >
-                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply ' }}
-                </button>
-              </div>
-              <div class="policy-status error" v-if="passLogitBiasError">
-                {{ passLogitBiasError }}
-              </div>
+            <div class="param-item" data-tooltip="Default pass logit bias from the loaded policy/config.">
+              <span class="param-name">Default bias:</span>
+              <span class="param-value">{{ passLogitBiasDefault.toFixed(2) }}</span>
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="resetPassLogitBiasDefault"
+                :disabled="passLogitBiasUpdating"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyPassLogitBiasOverride"
+                :disabled="passLogitBiasUpdating"
+              >
+                {{ passLogitBiasUpdating ? 'Saving...' : 'Apply' }}
+              </button>
+            </div>
+            <div class="policy-status error" v-if="passLogitBiasError">
+              {{ passLogitBiasError }}
             </div>
           </div>
 
@@ -4551,15 +4716,45 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Whether current possession has an active latent intent.">
               <span class="param-name">Current active:</span>
-              <span class="param-value">{{ props.gameState.intent_active_current ? '✓ Yes' : '✗ No' }}</span>
+              <template v-if="props.gameState.enable_intent_learning">
+                <label class="param-value">
+                  <input
+                    type="checkbox"
+                    v-model="intentStateInput.active"
+                    :disabled="intentControlsDisabled"
+                  />
+                  <span>{{ intentStateInput.active ? ' Enabled' : ' Disabled' }}</span>
+                </label>
+              </template>
+              <span v-else class="param-value">{{ props.gameState.intent_active_current ? '✓ Yes' : '✗ No' }}</span>
             </div>
             <div class="param-item" data-tooltip="Current latent intent index (masked elsewhere when hidden).">
               <span class="param-name">Current index:</span>
-              <span class="param-value">{{ props.gameState.intent_index_current ?? 'N/A' }}</span>
+              <input
+                v-if="props.gameState.enable_intent_learning"
+                class="env-param-input"
+                type="number"
+                min="0"
+                :max="intentIndexMax"
+                step="1"
+                v-model.number="intentStateInput.intent_index"
+                :disabled="intentControlsDisabled"
+              />
+              <span v-else class="param-value">{{ props.gameState.intent_index_current ?? 'N/A' }}</span>
             </div>
             <div class="param-item" data-tooltip="Current age of active intent (steps since sampled).">
               <span class="param-name">Current age:</span>
-              <span class="param-value">{{ props.gameState.intent_age ?? 'N/A' }}</span>
+              <input
+                v-if="props.gameState.enable_intent_learning"
+                class="env-param-input"
+                type="number"
+                min="0"
+                :max="intentAgeMax"
+                step="1"
+                v-model.number="intentStateInput.intent_age"
+                :disabled="intentControlsDisabled"
+              />
+              <span v-else class="param-value">{{ props.gameState.intent_age ?? 'N/A' }}</span>
             </div>
             <div class="param-item" data-tooltip="Remaining commitment steps before intent can be reconsidered.">
               <span class="param-name">Commitment remaining:</span>
@@ -4568,6 +4763,25 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="Whether this possession's intent is currently visible to the defense role.">
               <span class="param-name">Current defense-visible:</span>
               <span class="param-value">{{ props.gameState.intent_visible_to_defense_current ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="offense-skill-actions" v-if="props.gameState.enable_intent_learning">
+              <button
+                class="refresh-policies-btn"
+                @click="resetIntentStateInputs"
+                :disabled="intentStateUpdating"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyIntentStateOverride"
+                :disabled="intentControlsDisabled"
+              >
+                {{ intentStateUpdating ? 'Saving...' : 'Apply' }}
+              </button>
+              <div class="policy-status error" v-if="intentStateError">
+                {{ intentStateError }}
+              </div>
             </div>
           </div>
         </div>

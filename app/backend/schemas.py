@@ -100,6 +100,12 @@ class BatchUpdatePositionRequest(BaseModel):
     updates: List[UpdatePositionRequest]
 
 
+class SetIntentStateRequest(BaseModel):
+    active: bool
+    intent_index: int
+    intent_age: int
+
+
 class OffenseSkillsPayload(BaseModel):
     layup: List[float]
     three_pt: List[float]

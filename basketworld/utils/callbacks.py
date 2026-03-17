@@ -828,6 +828,54 @@ class IntentDiversityCallback(BaseCallback):
         ).to(self._device)
         self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=self.disc_lr)
 
+    def has_trained_discriminator(self) -> bool:
+        return self._disc is not None and self._disc_opt is not None
+
+    def export_discriminator_checkpoint(
+        self,
+        path: str,
+        *,
+        global_step: Optional[int] = None,
+        alternation_idx: Optional[int] = None,
+    ) -> bool:
+        if not self.has_trained_discriminator():
+            return False
+        assert self._disc is not None
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "state_dict": self._disc.state_dict(),
+            "config": {
+                "input_dim": int(self.max_obs_dim + self.max_action_dim),
+                "hidden_dim": int(self.disc_hidden_dim),
+                "num_intents": int(self.num_intents),
+                "dropout": float(self.disc_dropout),
+                "encoder_type": str(self.disc_encoder_type),
+                "step_dim": int(self.disc_step_dim),
+                "max_obs_dim": int(self.max_obs_dim),
+                "max_action_dim": int(self.max_action_dim),
+            },
+            "meta": {
+                "global_step": (
+                    int(global_step)
+                    if global_step is not None
+                    else int(getattr(self.model, "num_timesteps", 0))
+                ),
+                "alternation_idx": (
+                    int(alternation_idx) if alternation_idx is not None else None
+                ),
+                "rollout_counter": int(self._rollout_counter),
+                "last_disc_loss": float(self._last_disc_loss),
+                "last_disc_top1_acc": float(self._last_disc_acc),
+                "last_disc_auc_ovr_macro": (
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else None
+                ),
+            },
+        }
+        torch.save(payload, path)
+        return True
+
     def _train_discriminator(
         self,
         x_np: np.ndarray,
@@ -1214,13 +1262,16 @@ class IntentDiversityCallback(BaseCallback):
         self._bonus_stats.update(raw_bonus)
         norm_bonus = (raw_bonus - float(self._bonus_stats.mean)) / float(self._bonus_stats.std)
         clipped_bonus = np.clip(norm_bonus, -self.bonus_clip, self.bonus_clip)
+        episode_bonus = (float(beta) * clipped_bonus).astype(np.float32, copy=False)
 
         rb = self.model.rollout_buffer
+        per_step_bonus_values: list[float] = []
         for ep_idx, episode in enumerate(episodes):
             if ep_idx >= clipped_bonus.shape[0]:
                 break
             active_len = max(1, int(episode.active_prefix_length))
-            per_step = float(beta * clipped_bonus[ep_idx] / active_len)
+            per_step = float(episode_bonus[ep_idx] / active_len)
+            per_step_bonus_values.append(per_step)
             for t_idx, env_idx in episode.active_buffer_indices:
                 if (
                     0 <= int(t_idx) < rb.rewards.shape[0]
@@ -1270,11 +1321,38 @@ class IntentDiversityCallback(BaseCallback):
                     step=global_step,
                 )
             mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
+            mlflow.log_metric("intent/bonus_raw_std", float(np.std(raw_bonus)), step=global_step)
             mlflow.log_metric(
                 "intent/bonus_norm_mean", float(np.mean(norm_bonus)), step=global_step
             )
             mlflow.log_metric(
                 "intent/bonus_norm_std", float(np.std(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_mean", float(np.mean(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_std", float(np.std(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_mean",
+                float(np.mean(episode_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_std",
+                float(np.std(episode_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_mean",
+                float(np.mean(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_std",
+                float(np.std(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
             )
             mlflow.log_metric("intent/beta_current", float(beta), step=global_step)
             usage_entropy, min_prob = self._usage_entropy(y_np, self.num_intents)

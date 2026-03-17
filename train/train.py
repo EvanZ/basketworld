@@ -898,6 +898,24 @@ def main(args):
                 )
                 unified_policy.save(unified_model_path)
                 mlflow.log_artifact(unified_model_path, artifact_path="models")
+                if (
+                    intent_diversity_callback is not None
+                    and getattr(intent_diversity_callback, "enabled", False)
+                    and getattr(
+                        intent_diversity_callback, "has_trained_discriminator", None
+                    ) is not None
+                    and intent_diversity_callback.has_trained_discriminator()
+                ):
+                    disc_ckpt_path = os.path.join(
+                        tmpdir, f"intent_disc_iter_{global_alt}.pt"
+                    )
+                    saved = intent_diversity_callback.export_discriminator_checkpoint(
+                        disc_ckpt_path,
+                        global_step=int(unified_policy.num_timesteps),
+                        alternation_idx=int(global_alt),
+                    )
+                    if saved:
+                        mlflow.log_artifact(disc_ckpt_path, artifact_path="models")
             print(f"Logged unified model for alternation {global_alt} to MLflow")
 
             # --- 3. Run Evaluation Phase ---

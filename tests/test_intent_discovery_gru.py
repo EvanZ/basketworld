@@ -125,3 +125,26 @@ def test_gru_discriminator_outputs_logits_and_uses_order():
     assert logits_a.shape == (1, 3)
     assert logits_b.shape == (1, 3)
     assert not torch.allclose(logits_a, logits_b, atol=1e-6)
+
+
+def test_intent_discriminator_encode_returns_episode_embedding():
+    torch.manual_seed(0)
+    disc = IntentDiscriminator(
+        input_dim=4,
+        hidden_dim=8,
+        num_intents=3,
+        encoder_type="gru",
+        step_dim=6,
+        dropout=0.0,
+    )
+    seq = torch.tensor(
+        [[[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 3.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    lengths = torch.tensor([3], dtype=torch.long)
+
+    emb = disc.encode(seq, lengths)
+    logits = disc(seq, lengths)
+
+    assert emb.shape == (1, 8)
+    assert logits.shape == (1, 3)

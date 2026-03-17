@@ -14,6 +14,7 @@ from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtra
 from app.backend.schemas import (
     BatchUpdatePositionRequest,
     SetBallHolderRequest,
+    SetIntentStateRequest,
     SetOffenseSkillsRequest,
     SetPassLogitBiasRequest,
     SetPressureParamsRequest,
@@ -170,6 +171,53 @@ def set_ball_holder(req: SetBallHolderRequest):
         return {"status": "success", "state": updated_state}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set ball holder: {e}")
+
+
+@router.post("/api/set_intent_state")
+def set_intent_state(req: SetIntentStateRequest):
+    """Override the live offense intent state for the current possession."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if game_state.env.episode_ended:
+        raise HTTPException(status_code=400, detail="Cannot edit intent after episode has ended.")
+
+    env = game_state.env
+    if not bool(getattr(env, "enable_intent_learning", False)):
+        raise HTTPException(
+            status_code=400,
+            detail="Offense intent learning is not enabled for this environment.",
+        )
+
+    try:
+        num_intents = max(1, int(getattr(env, "num_intents", 1)))
+        max_age = max(0, int(getattr(env, "intent_commitment_steps", 0)))
+
+        active = bool(req.active)
+        intent_index = max(0, min(num_intents - 1, int(req.intent_index)))
+        intent_age = max(0, min(max_age, int(req.intent_age)))
+
+        if not active:
+            intent_index = 0
+            intent_age = 0
+            intent_commitment_remaining = 0
+        else:
+            intent_commitment_remaining = max(0, max_age - intent_age)
+
+        env.intent_active = active
+        env.intent_index = int(intent_index)
+        env.intent_age = int(intent_age)
+        env.intent_commitment_remaining = int(intent_commitment_remaining)
+
+        _rebuild_cached_obs()
+
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {"status": "success", "state": updated_state}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set intent state: {e}")
 
 
 @router.post("/api/offense_skills")

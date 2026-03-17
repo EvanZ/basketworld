@@ -232,6 +232,15 @@ class IntentDiscriminator(nn.Module):
             )
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        episode_emb = self.encode(x, lengths)
+        if self.encoder_type == "mlp_mean":
+            assert self.net is not None
+            return self.net[-1](episode_emb)
+        assert self.head is not None
+        return self.head(episode_emb)
+
+    def encode(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the episode embedding prior to the final classifier layer."""
         if self.encoder_type == "mlp_mean":
             if x.ndim == 1:
                 x = x.unsqueeze(0)
@@ -240,7 +249,10 @@ class IntentDiscriminator(nn.Module):
             if x.ndim != 2:
                 raise ValueError(f"MLP intent discriminator expects [B, D], got {tuple(x.shape)}")
             assert self.net is not None
-            return self.net(x)
+            hidden = x
+            for layer in list(self.net.children())[:-1]:
+                hidden = layer(hidden)
+            return hidden
 
         if x.ndim == 2:
             x = x.unsqueeze(1)
@@ -257,10 +269,8 @@ class IntentDiscriminator(nn.Module):
             lengths = lengths.to(device=x.device, dtype=torch.long).reshape(-1)
         assert self.step_encoder is not None
         assert self.traj_encoder is not None
-        assert self.head is not None
         step_emb = self.step_encoder(x)
-        episode_emb = self.traj_encoder(step_emb, lengths)
-        return self.head(episode_emb)
+        return self.traj_encoder(step_emb, lengths)
 
 
 def flatten_observation_for_env(obs_payload, env_idx: int) -> np.ndarray:

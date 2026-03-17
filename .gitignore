@@ -55,6 +55,7 @@ mlartifacts/
 
 # data
 data/
+analytics/*
 *.csv
 
 

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -125,6 +127,73 @@ def test_intent_diversity_callback_injects_offense_only_bonus():
     assert np.any(model.rollout_buffer.rewards[:, 0] != 0.0)
     assert np.all(model.rollout_buffer.rewards[:, 1] == 0.0)
     assert model.rollout_buffer.recomputed
+
+
+def test_intent_diversity_callback_logs_clipped_and_shaping_bonus_metrics():
+    cb = IntentDiversityCallback(
+        enabled=True,
+        num_intents=4,
+        beta_target=0.5,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=1.0,
+    )
+    model = _DummyModel()
+    model.num_timesteps = 100
+    cb.init_callback(model)
+    cb._on_training_start()
+
+    class _FixedStats:
+        mean = 0.0
+        std = 1.0
+
+        @staticmethod
+        def update(_):
+            return None
+
+    cb._bonus_stats = _FixedStats()
+    cb._train_discriminator = lambda x_np, y_np: (0.1, 0.9)
+    cb._compute_disc_auc = lambda x_np, y_np: 0.75
+    cb._compute_episode_bonus = lambda x_np, y_np: np.array([2.0], dtype=np.float32)
+
+    cb._on_rollout_start()
+    cb.locals = {
+        "infos": [{}, {}],
+        "dones": np.array([False, False], dtype=bool),
+        "actions": np.zeros((2, 2), dtype=np.int64),
+        "new_obs": _make_step_obs(1.0, -1.0),
+    }
+    cb._on_step()
+    cb.locals = {
+        "infos": [{}, {}],
+        "dones": np.array([True, True], dtype=bool),
+        "actions": np.zeros((2, 2), dtype=np.int64),
+        "new_obs": _make_step_obs(1.0, -1.0),
+    }
+    cb._on_step()
+
+    logged = {}
+    original_log_metric = callbacks_module.mlflow.log_metric
+
+    def _capture_metric(key, value, step=None):
+        logged[key] = (value, step)
+
+    callbacks_module.mlflow.log_metric = _capture_metric
+    try:
+        cb._on_rollout_end()
+    finally:
+        callbacks_module.mlflow.log_metric = original_log_metric
+
+    assert np.isclose(logged["intent/bonus_raw_mean"][0], 2.0)
+    assert np.isclose(logged["intent/bonus_raw_std"][0], 0.0)
+    assert np.isclose(logged["intent/bonus_norm_mean"][0], 2.0)
+    assert np.isclose(logged["intent/bonus_norm_std"][0], 0.0)
+    assert np.isclose(logged["intent/bonus_clipped_mean"][0], 1.0)
+    assert np.isclose(logged["intent/bonus_clipped_std"][0], 0.0)
+    assert np.isclose(logged["intent/bonus_shaping_per_episode_mean"][0], 0.5)
+    assert np.isclose(logged["intent/bonus_shaping_per_episode_std"][0], 0.0)
+    assert np.isclose(logged["intent/bonus_shaping_per_step_mean"][0], 0.25)
+    assert np.isclose(logged["intent/bonus_shaping_per_step_std"][0], 0.0)
 
 
 def test_intent_episode_metric_helpers():
@@ -343,3 +412,24 @@ def test_intent_diversity_bonus_applies_only_to_active_prefix():
     assert np.all(model.rollout_buffer.rewards[:2, 0] != 0.0)
     assert np.all(model.rollout_buffer.rewards[2:, 0] == 0.0)
     assert np.all(model.rollout_buffer.rewards[:, 1] == 0.0)
+
+
+def test_intent_diversity_callback_exports_discriminator_checkpoint(tmp_path: Path):
+    cb = IntentDiversityCallback(enabled=True, num_intents=4, disc_encoder_type="gru")
+    model = _DummyModel()
+    cb.init_callback(model)
+    cb._on_training_start()
+    cb._maybe_build_discriminator(input_dim=12)
+
+    out_path = tmp_path / "intent_disc_iter_1.pt"
+    saved = cb.export_discriminator_checkpoint(
+        str(out_path), global_step=1234, alternation_idx=7
+    )
+
+    payload = torch.load(out_path, map_location="cpu", weights_only=False)
+    assert saved is True
+    assert out_path.exists()
+    assert payload["config"]["encoder_type"] == "gru"
+    assert payload["config"]["input_dim"] == 272
+    assert payload["meta"]["global_step"] == 1234
+    assert payload["meta"]["alternation_idx"] == 7

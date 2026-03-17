@@ -340,9 +340,8 @@ def main(args):
 
         # Always write GIFs; also log to MLflow if enabled
         if not args.no_log_mlflow and all_gifs:
-            with mlflow.start_run(run_id=args.run_id):
-                for p in all_gifs:
-                    mlflow.log_artifact(p, artifact_path="trajectories")
+            for p in all_gifs:
+                client.log_artifact(args.run_id, p, artifact_path="trajectories")
             print("Logged trajectory animations to MLflow under 'trajectories/'.")
 
 
