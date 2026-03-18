@@ -419,6 +419,47 @@ export async function setIntentState(payload = {}) {
   return response.json();
 }
 
+export async function captureCounterfactualSnapshot() {
+  const response = await fetch(`${API_BASE_URL}/api/capture_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to capture snapshot');
+  }
+  return response.json();
+}
+
+export async function restoreCounterfactualSnapshot() {
+  const response = await fetch(`${API_BASE_URL}/api/restore_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to restore snapshot');
+  }
+  return response.json();
+}
+
+export async function replayCounterfactualSnapshot(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/replay_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player_deterministic: payload.player_deterministic ?? true,
+      opponent_deterministic: payload.opponent_deterministic ?? true,
+      max_steps: payload.max_steps ?? 256,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to replay counterfactual snapshot');
+  }
+  return response.json();
+}
+
 export async function resetTurnState() {
   const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
     method: 'POST',

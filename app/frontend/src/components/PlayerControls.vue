@@ -11,6 +11,9 @@ import {
   setPassLogitBias,
   setBallHolder,
   setIntentState,
+  captureCounterfactualSnapshot,
+  restoreCounterfactualSnapshot,
+  replayCounterfactualSnapshot,
   setShotPressureParams,
   setPassInterceptionParams,
   setDefenderPressureParams,
@@ -136,7 +139,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -375,6 +378,8 @@ const intentStateInput = ref({
 });
 const intentStateUpdating = ref(false);
 const intentStateError = ref(null);
+const counterfactualSnapshotUpdating = ref(false);
+const counterfactualSnapshotError = ref(null);
 const pressureParamsInput = ref({
   three_pt_extra_hex_decay: 0.05,
   shot_pressure_enabled: true,
@@ -437,6 +442,32 @@ const intentControlsDisabled = computed(() =>
   props.isEvaluating ||
   props.isReplaying ||
   props.isManualStepping
+);
+const counterfactualSnapshotAvailable = computed(() =>
+  Boolean(props.gameState?.counterfactual_snapshot_available)
+);
+const counterfactualSnapshotStep = computed(() =>
+  props.gameState?.counterfactual_snapshot_step ?? null
+);
+const counterfactualSnapshotShotClock = computed(() =>
+  props.gameState?.counterfactual_snapshot_shot_clock ?? null
+);
+const counterfactualSnapshotBallHolder = computed(() =>
+  props.gameState?.counterfactual_snapshot_ball_holder ?? null
+);
+const counterfactualSnapshotIntentSummary = computed(() => {
+  if (!counterfactualSnapshotAvailable.value) return 'None';
+  const active = Boolean(props.gameState?.counterfactual_snapshot_intent_active);
+  if (!active) return 'Inactive';
+  const idx = props.gameState?.counterfactual_snapshot_intent_index ?? 0;
+  const age = props.gameState?.counterfactual_snapshot_intent_age ?? 0;
+  return `z=${idx}, age=${age}`;
+});
+const counterfactualSnapshotControlsDisabled = computed(() =>
+  counterfactualSnapshotUpdating.value ||
+  !props.gameState ||
+  props.isEvaluating ||
+  props.isReplaying
 );
 
 const passTargetStrategyValue = computed(() => {
@@ -935,6 +966,73 @@ function resetIntentStateInputs() {
   intentStateError.value = null;
 }
 
+async function handleCaptureCounterfactualSnapshot() {
+  if (!props.gameState || counterfactualSnapshotControlsDisabled.value) return;
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await captureCounterfactualSnapshot();
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to capture snapshot');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to capture counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to capture snapshot';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+async function handleRestoreCounterfactualSnapshot() {
+  if (!props.gameState || counterfactualSnapshotControlsDisabled.value) return;
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await restoreCounterfactualSnapshot();
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to restore snapshot');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to restore counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to restore snapshot';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+async function handleReplayCounterfactualSnapshot() {
+  if (
+    !props.gameState ||
+    counterfactualSnapshotControlsDisabled.value ||
+    !counterfactualSnapshotAvailable.value ||
+    props.gameState.done
+  ) {
+    return;
+  }
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await replayCounterfactualSnapshot({
+      player_deterministic: true,
+      opponent_deterministic: true,
+    });
+    if (res?.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
+      emit('counterfactual-replay-loaded', res);
+    } else {
+      throw new Error(res?.detail || 'Failed to replay from current branch state');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to replay counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to replay current state';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
 function _normalizePressurePayload(input) {
   return {
     three_pt_extra_hex_decay: Number(input?.three_pt_extra_hex_decay ?? 0.05),
@@ -1146,7 +1244,60 @@ async function handleBallHolderChange(val) {
 }
 
 // Add rewards tracking
+const DEV_TABS_STORAGE_KEY = 'basketworld.dev.tab_order';
+const DEFAULT_DEV_TABS = Object.freeze([
+  { id: 'environment', label: 'Environment' },
+  { id: 'rewards', label: 'Rewards' },
+  { id: 'stats', label: 'Stats' },
+  { id: 'entropy', label: 'Entropy' },
+  { id: 'policy', label: 'Policy' },
+  { id: 'advisor', label: 'Advisor' },
+  { id: 'moves', label: 'Moves' },
+  { id: 'eval', label: 'Eval' },
+  { id: 'training', label: 'Training' },
+  { id: 'phi', label: 'Phi Shaping' },
+  { id: 'observation', label: 'Observation' },
+  { id: 'attention', label: 'Attention' },
+]);
+const DEFAULT_DEV_TAB_ORDER = DEFAULT_DEV_TABS.map((tab) => tab.id);
+const DEV_TAB_ID_SET = new Set(DEFAULT_DEV_TAB_ORDER);
+
+function normalizeDevTabOrder(rawOrder) {
+  const candidateOrder = Array.isArray(rawOrder) ? rawOrder : [];
+  const seen = new Set();
+  const normalized = [];
+  for (const tabId of candidateOrder) {
+    if (typeof tabId !== 'string' || seen.has(tabId) || !DEV_TAB_ID_SET.has(tabId)) continue;
+    seen.add(tabId);
+    normalized.push(tabId);
+  }
+  for (const tabId of DEFAULT_DEV_TAB_ORDER) {
+    if (!seen.has(tabId)) normalized.push(tabId);
+  }
+  return normalized;
+}
+
+function loadStoredDevTabOrder() {
+  if (typeof window === 'undefined') return [...DEFAULT_DEV_TAB_ORDER];
+  try {
+    const raw = window.localStorage.getItem(DEV_TABS_STORAGE_KEY);
+    if (!raw) return [...DEFAULT_DEV_TAB_ORDER];
+    return normalizeDevTabOrder(JSON.parse(raw));
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load tab order preference', err);
+    return [...DEFAULT_DEV_TAB_ORDER];
+  }
+}
+
 const activeTab = ref('environment');
+const devTabOrder = ref(loadStoredDevTabOrder());
+const draggedDevTabId = ref(null);
+const orderedDevTabs = computed(() => {
+  const tabsById = new Map(DEFAULT_DEV_TABS.map((tab) => [tab.id, tab]));
+  return devTabOrder.value
+    .map((tabId) => tabsById.get(tabId))
+    .filter((tab) => Boolean(tab));
+});
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
@@ -1222,6 +1373,45 @@ watch(activeTab, async (newTab) => {
     console.warn('Failed to scroll to current shot clock on tab change:', err);
   }
 }, { flush: 'post' });
+
+watch(devTabOrder, (newOrder) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(DEV_TABS_STORAGE_KEY, JSON.stringify(newOrder));
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist tab order preference', err);
+  }
+});
+
+function handleDevTabDragStart(tabId, event) {
+  draggedDevTabId.value = tabId;
+  if (event?.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', tabId);
+  }
+}
+
+function handleDevTabDragOver(event) {
+  if (!draggedDevTabId.value) return;
+  event.dataTransfer.dropEffect = 'move';
+}
+
+function handleDevTabDrop(targetTabId) {
+  const sourceTabId = draggedDevTabId.value;
+  draggedDevTabId.value = null;
+  if (!sourceTabId || sourceTabId === targetTabId) return;
+  const nextOrder = [...devTabOrder.value];
+  const sourceIndex = nextOrder.indexOf(sourceTabId);
+  const targetIndex = nextOrder.indexOf(targetTabId);
+  if (sourceIndex === -1 || targetIndex === -1) return;
+  nextOrder.splice(sourceIndex, 1);
+  nextOrder.splice(targetIndex, 0, sourceTabId);
+  devTabOrder.value = nextOrder;
+}
+
+function handleDevTabDragEnd() {
+  draggedDevTabId.value = null;
+}
 
 // Move tracking is now handled by parent component
 
@@ -3432,77 +3622,18 @@ const stealRisks = computed(() => {
       <div class="tabs-content-shell">
     <!-- Tab Navigation -->
     <div class="tab-navigation">
-      <button 
-        :class="{ active: activeTab === 'environment' }"
-        @click="activeTab = 'environment'"
+      <button
+        v-for="tab in orderedDevTabs"
+        :key="tab.id"
+        :class="{ active: activeTab === tab.id, dragging: draggedDevTabId === tab.id }"
+        draggable="true"
+        @click="activeTab = tab.id"
+        @dragstart="handleDevTabDragStart(tab.id, $event)"
+        @dragover.prevent="handleDevTabDragOver"
+        @drop="handleDevTabDrop(tab.id)"
+        @dragend="handleDevTabDragEnd"
       >
-        Environment
-      </button>
-      <button 
-        :class="{ active: activeTab === 'rewards' }"
-        @click="activeTab = 'rewards'"
-      >
-        Rewards
-      </button>
-      <button 
-        :class="{ active: activeTab === 'stats' }"
-        @click="activeTab = 'stats'"
-      >
-        Stats
-      </button>
-      <button 
-        :class="{ active: activeTab === 'entropy' }"
-        @click="activeTab = 'entropy'"
-      >
-        Entropy
-      </button>
-      <button 
-        :class="{ active: activeTab === 'policy' }"
-        @click="activeTab = 'policy'"
-      >
-        Policy
-      </button>
-      <button 
-        :class="{ active: activeTab === 'advisor' }"
-        @click="activeTab = 'advisor'"
-      >
-        Advisor
-      </button>
-      <button 
-        :class="{ active: activeTab === 'moves' }"
-        @click="activeTab = 'moves'"
-      >
-        Moves
-      </button>
-      <button 
-        :class="{ active: activeTab === 'eval' }"
-        @click="activeTab = 'eval'"
-      >
-        Eval
-      </button>
-      <button 
-        :class="{ active: activeTab === 'training' }"
-        @click="activeTab = 'training'"
-      >
-        Training
-      </button>
-      <button 
-        :class="{ active: activeTab === 'phi' }"
-        @click="activeTab = 'phi'"
-      >
-        Phi Shaping
-      </button>
-      <button 
-        :class="{ active: activeTab === 'observation' }"
-        @click="activeTab = 'observation'"
-      >
-        Observation
-      </button>
-      <button 
-        :class="{ active: activeTab === 'attention' }"
-        @click="activeTab = 'attention'"
-      >
-        Attention
+        {{ tab.label }}
       </button>
     </div>
 
@@ -4685,6 +4816,60 @@ const stealRisks = computed(() => {
           </div>
 
           <div class="param-category">
+            <h5>Counterfactual Snapshot</h5>
+            <div class="param-item" data-tooltip="Whether a branch point snapshot is currently stored for restoring the exact current state later.">
+              <span class="param-name">Snapshot stored:</span>
+              <span class="param-value">{{ counterfactualSnapshotAvailable ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Step index captured when the snapshot was stored.">
+              <span class="param-name">Captured step:</span>
+              <span class="param-value">{{ counterfactualSnapshotStep ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Shot clock value in the stored snapshot.">
+              <span class="param-name">Snapshot shot clock:</span>
+              <span class="param-value">{{ counterfactualSnapshotShotClock ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Ball holder stored in the snapshot.">
+              <span class="param-name">Snapshot ball holder:</span>
+              <span class="param-value">{{ counterfactualSnapshotBallHolder ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent state stored in the snapshot.">
+              <span class="param-name">Snapshot intent:</span>
+              <span class="param-value">{{ counterfactualSnapshotIntentSummary }}</span>
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="handleCaptureCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled"
+              >
+                <font-awesome-icon :icon="['fas', 'camera']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Saving...' : 'Capture' }}</span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="handleRestoreCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled || !counterfactualSnapshotAvailable"
+              >
+                <font-awesome-icon :icon="['fas', 'redo']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Restoring...' : 'Restore' }}</span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="handleReplayCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled || !counterfactualSnapshotAvailable || props.gameState?.done"
+                data-tooltip="Autoplay deterministically from the current live state. Restore the snapshot first if you want to branch from the saved point."
+              >
+                <font-awesome-icon :icon="['fas', 'play']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Playing...' : 'Play' }}</span>
+              </button>
+            </div>
+            <div class="policy-status error" v-if="counterfactualSnapshotError">
+              {{ counterfactualSnapshotError }}
+            </div>
+          </div>
+
+          <div class="param-category">
             <h5>Intent Learning</h5>
             <div class="param-item" data-tooltip="Whether latent intent/play learning is enabled in this environment.">
               <span class="param-name">Enabled:</span>
@@ -4889,6 +5074,108 @@ const stealRisks = computed(() => {
             <div class="param-item" v-if="paramCounts" data-tooltip="Value head parameters (offense/defense critics).">
               <span class="param-name">Params (value):</span>
               <span class="param-value">{{ formatParamCount(paramCounts.value_heads) }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Discriminator Architecture</h5>
+            <div class="param-item" data-tooltip="Whether the DIAYN-style intent discriminator bonus was enabled during training.">
+              <span class="param-name">Intent diversity:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_enabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Encoder used to summarize the intent-conditioned trajectory before classification.">
+              <span class="param-name">Encoder:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_encoder_type || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Hidden width of the discriminator MLP head.">
+              <span class="param-name">Hidden dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_hidden_dim ?? 'N/A' }}</span>
+            </div>
+            <div
+              class="param-item"
+              v-if="props.gameState.training_params.intent_disc_encoder_type === 'gru'"
+              data-tooltip="Per-step embedding width before the GRU consumes the trajectory."
+            >
+              <span class="param-name">Step dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_step_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Dropout applied inside the discriminator network.">
+              <span class="param-name">Dropout:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_dropout ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Maximum flattened observation features passed into the discriminator per step.">
+              <span class="param-name">Max obs dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_max_obs_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Maximum flattened action features passed into the discriminator per step.">
+              <span class="param-name">Max action dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_max_action_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Optimizer learning rate for the intent discriminator.">
+              <span class="param-name">Disc LR:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_lr?.toExponential?.(2) || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Batch size for discriminator updates at rollout end.">
+              <span class="param-name">Disc batch size:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_batch_size ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many discriminator optimization passes run after each rollout.">
+              <span class="param-name">Updates/rollout:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_updates_per_rollout ?? 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Intent Objective</h5>
+            <div class="param-item" data-tooltip="Number of discrete latent plays available to the policy.">
+              <span class="param-name">Num intents:</span>
+              <span class="param-value">{{ props.gameState.training_params.num_intents ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many steps an active intent stays in force before it deactivates.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_commitment_steps ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Who can observe the latent intent in the model observation.">
+              <span class="param-name">Obs mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_obs_mode || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability of sampling no offense intent. If scheduled, this is the start value.">
+              <span class="param-name">Null prob:</span>
+              <span class="param-value" v-if="props.gameState.training_params.intent_null_prob_end != null">
+                {{ props.gameState.training_params.intent_null_prob }} → {{ props.gameState.training_params.intent_null_prob_end }}
+              </span>
+              <span class="param-value" v-else>{{ props.gameState.training_params.intent_null_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability that the offense intent is visible to defense. If scheduled, this is the start value.">
+              <span class="param-name">Defense-visible prob:</span>
+              <span class="param-value" v-if="props.gameState.training_params.intent_visible_to_defense_prob_end != null">
+                {{ props.gameState.training_params.intent_visible_to_defense_prob }} → {{ props.gameState.training_params.intent_visible_to_defense_prob_end }}
+              </span>
+              <span class="param-value" v-else>{{ props.gameState.training_params.intent_visible_to_defense_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether a separate latent intent is also trained for the defense.">
+              <span class="param-name">Defense intent:</span>
+              <span class="param-value">{{ props.gameState.training_params.enable_defense_intent_learning ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.enable_defense_intent_learning" data-tooltip="Probability of sampling no defense intent.">
+              <span class="param-name">Defense null prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.defense_intent_null_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Target scale for the DIAYN-style intrinsic bonus once fully ramped.">
+              <span class="param-name">Beta target:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_beta_target ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of timesteps before the intent diversity reward starts contributing.">
+              <span class="param-name">Warmup steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_warmup_steps?.toLocaleString?.() || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of timesteps used to ramp the diversity beta from zero to target.">
+              <span class="param-name">Ramp steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_ramp_steps?.toLocaleString?.() || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Clip range applied to the normalized discriminator bonus before reward shaping.">
+              <span class="param-name">Bonus clip:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_clip ?? 'N/A' }}</span>
             </div>
           </div>
 
@@ -5294,7 +5581,7 @@ const stealRisks = computed(() => {
   padding: 0.5rem 1rem;
   border: 1px solid var(--app-panel-border);
   background-color: transparent;
-  cursor: pointer;
+  cursor: grab;
   border-bottom: 1px solid transparent;
   font-weight: 500;
   color: var(--app-text-muted);
@@ -5307,6 +5594,11 @@ const stealRisks = computed(() => {
 .tab-navigation button:hover {
   color: var(--app-text);
   background-color: rgba(255, 255, 255, 0.03);
+}
+
+.tab-navigation button.dragging {
+  opacity: 0.6;
+  cursor: grabbing;
 }
 
 .tab-navigation button.active {
@@ -6187,6 +6479,9 @@ const stealRisks = computed(() => {
 }
 
 .refresh-policies-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
   padding: 0.35rem 0.75rem;
   font-size: 0.8rem;
   border-radius: 6px;
@@ -6256,7 +6551,8 @@ const stealRisks = computed(() => {
 
 .offense-skill-actions {
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 0.5rem;
   margin-top: 0.25rem;
 }

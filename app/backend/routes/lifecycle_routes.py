@@ -214,6 +214,7 @@ async def init_game(request: InitGameRequest):
         game_state.run_name = run_name or request.run_id
         game_state.mlflow_phi_shaping_params = mlflow_phi_params
         game_state.mlflow_training_params = mlflow_training_params
+        game_state.counterfactual_snapshot = None
         game_state.frames = []
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}

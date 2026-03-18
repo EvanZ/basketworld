@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import torch
 import time
@@ -65,6 +66,8 @@ class GameState:
         self.opponent_policy_path: str | None = None
         # Public/playable mode session metadata.
         self.playable_session: dict | None = None
+        # User-defined snapshot for counterfactual restore/replay.
+        self.counterfactual_snapshot: dict | None = None
         # Evaluation progress for frontend polling.
         self._evaluation_progress_lock = Lock()
         self.evaluation_progress: dict = {
@@ -157,6 +160,122 @@ def _capture_turn_start_snapshot():
         int(env.ball_holder) if getattr(env, "ball_holder", None) is not None else None
     )
     game_state.turn_start_shot_clock = int(getattr(env, "shot_clock", 0))
+
+
+def _rebuild_cached_obs() -> None:
+    """Rebuild game_state.obs from env while preserving the current viewer role."""
+    if not game_state.env:
+        return
+    env = game_state.env
+    role_value = (
+        float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
+        if game_state.obs is not None and game_state.obs.get("role_flag") is not None
+        else (1.0 if env.training_team == Team.OFFENSE else -1.0)
+    )
+    observer_is_offense = bool(role_value > 0.0)
+    if hasattr(env, "_build_observation_dict"):
+        game_state.obs = env._build_observation_dict(observer_is_offense)
+        game_state.obs["role_flag"] = np.array([role_value], dtype=np.float32)
+    else:
+        game_state.obs = {
+            "obs": env._get_observation(),
+            "action_mask": env._get_action_masks(),
+            "role_flag": np.array([role_value], dtype=np.float32),
+            "skills": env._get_offense_skills_array(),
+        }
+
+
+def _build_counterfactual_snapshot_metadata() -> dict:
+    env = game_state.env
+    return {
+        "captured_step": int(len(getattr(game_state, "actions_log", []) or [])),
+        "shot_clock": int(getattr(env, "shot_clock", 0)),
+        "ball_holder": (
+            int(getattr(env, "ball_holder", 0))
+            if getattr(env, "ball_holder", None) is not None
+            else None
+        ),
+        "intent_active": bool(getattr(env, "intent_active", False)),
+        "intent_index": int(getattr(env, "intent_index", 0)),
+        "intent_age": int(getattr(env, "intent_age", 0)),
+        "captured_at": float(time.time()),
+    }
+
+
+def get_counterfactual_snapshot_summary() -> dict:
+    snapshot = getattr(game_state, "counterfactual_snapshot", None)
+    metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+    return {
+        "available": bool(snapshot),
+        "captured_step": metadata.get("captured_step"),
+        "shot_clock": metadata.get("shot_clock"),
+        "ball_holder": metadata.get("ball_holder"),
+        "intent_active": metadata.get("intent_active"),
+        "intent_index": metadata.get("intent_index"),
+        "intent_age": metadata.get("intent_age"),
+        "captured_at": metadata.get("captured_at"),
+    }
+
+
+def capture_counterfactual_snapshot() -> dict:
+    """Capture a restorable snapshot of the current env/session state."""
+    if not game_state.env or game_state.obs is None:
+        raise RuntimeError("Game not initialized.")
+
+    snapshot = {
+        "env": copy.deepcopy(game_state.env),
+        "user_team": copy.deepcopy(game_state.user_team),
+        "obs": copy.deepcopy(game_state.obs),
+        "prev_obs": copy.deepcopy(game_state.prev_obs),
+        "sampled_offense_skills": copy.deepcopy(game_state.sampled_offense_skills),
+        "replay_seed": copy.deepcopy(game_state.replay_seed),
+        "replay_initial_positions": copy.deepcopy(game_state.replay_initial_positions),
+        "replay_ball_holder": copy.deepcopy(game_state.replay_ball_holder),
+        "replay_shot_clock": copy.deepcopy(game_state.replay_shot_clock),
+        "replay_offense_skills": copy.deepcopy(game_state.replay_offense_skills),
+        "self_play_active": bool(getattr(game_state, "self_play_active", False)),
+        "reward_history": copy.deepcopy(game_state.reward_history),
+        "episode_rewards": copy.deepcopy(game_state.episode_rewards),
+        "shot_log": copy.deepcopy(game_state.shot_log),
+        "phi_log": copy.deepcopy(game_state.phi_log),
+        "actions_log": copy.deepcopy(game_state.actions_log),
+        "episode_states": copy.deepcopy(game_state.episode_states),
+        "playable_session": copy.deepcopy(game_state.playable_session),
+        "metadata": _build_counterfactual_snapshot_metadata(),
+    }
+    game_state.counterfactual_snapshot = snapshot
+    return get_counterfactual_snapshot_summary()
+
+
+def restore_counterfactual_snapshot() -> dict:
+    """Restore the most recently captured counterfactual snapshot."""
+    snapshot = getattr(game_state, "counterfactual_snapshot", None)
+    if not snapshot:
+        raise RuntimeError("No counterfactual snapshot available.")
+
+    game_state.env = copy.deepcopy(snapshot["env"])
+    game_state.user_team = copy.deepcopy(snapshot["user_team"])
+    game_state.obs = copy.deepcopy(snapshot["obs"])
+    game_state.prev_obs = copy.deepcopy(snapshot["prev_obs"])
+    game_state.sampled_offense_skills = copy.deepcopy(snapshot["sampled_offense_skills"])
+    game_state.replay_seed = copy.deepcopy(snapshot["replay_seed"])
+    game_state.replay_initial_positions = copy.deepcopy(snapshot["replay_initial_positions"])
+    game_state.replay_ball_holder = copy.deepcopy(snapshot["replay_ball_holder"])
+    game_state.replay_shot_clock = copy.deepcopy(snapshot["replay_shot_clock"])
+    game_state.replay_offense_skills = copy.deepcopy(snapshot["replay_offense_skills"])
+    game_state.self_play_active = bool(snapshot["self_play_active"])
+    game_state.reward_history = copy.deepcopy(snapshot["reward_history"])
+    game_state.episode_rewards = copy.deepcopy(snapshot["episode_rewards"])
+    game_state.shot_log = copy.deepcopy(snapshot["shot_log"])
+    game_state.phi_log = copy.deepcopy(snapshot["phi_log"])
+    game_state.actions_log = copy.deepcopy(snapshot["actions_log"])
+    game_state.episode_states = copy.deepcopy(snapshot["episode_states"])
+    game_state.playable_session = copy.deepcopy(snapshot["playable_session"])
+
+    # Make "reset turn" use the restored state as its new branch point.
+    _rebuild_cached_obs()
+    _capture_turn_start_snapshot()
+    return get_counterfactual_snapshot_summary()
 
 
 def get_full_game_state(
@@ -375,6 +494,8 @@ def get_full_game_state(
 
     sampled_offense_skills = getattr(game_state, "sampled_offense_skills", None) or {}
 
+    counterfactual_snapshot = get_counterfactual_snapshot_summary()
+
     state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
         "players": int(getattr(game_state.env, "players_per_side", 3)),
@@ -394,6 +515,14 @@ def get_full_game_state(
             if getattr(game_state.env, "training_team", None)
             else None
         ),
+        "counterfactual_snapshot_available": bool(counterfactual_snapshot["available"]),
+        "counterfactual_snapshot_step": counterfactual_snapshot["captured_step"],
+        "counterfactual_snapshot_shot_clock": counterfactual_snapshot["shot_clock"],
+        "counterfactual_snapshot_ball_holder": counterfactual_snapshot["ball_holder"],
+        "counterfactual_snapshot_intent_active": counterfactual_snapshot["intent_active"],
+        "counterfactual_snapshot_intent_index": counterfactual_snapshot["intent_index"],
+        "counterfactual_snapshot_intent_age": counterfactual_snapshot["intent_age"],
+        "counterfactual_snapshot_captured_at": counterfactual_snapshot["captured_at"],
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
         "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],

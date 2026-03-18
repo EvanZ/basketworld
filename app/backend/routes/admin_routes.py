@@ -6,13 +6,14 @@ from typing import List
 
 from fastapi import APIRouter, HTTPException
 import mlflow
-import numpy as np
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 from app.backend.schemas import (
+    ActionRequest,
     BatchUpdatePositionRequest,
+    ReplayCounterfactualRequest,
     SetBallHolderRequest,
     SetIntentStateRequest,
     SetOffenseSkillsRequest,
@@ -23,36 +24,18 @@ from app.backend.schemas import (
     UpdatePositionRequest,
     UpdateShotClockRequest,
 )
-from app.backend.state import get_ui_game_state, game_state
+from app.backend.state import (
+    _rebuild_cached_obs,
+    capture_counterfactual_snapshot,
+    get_ui_game_state,
+    game_state,
+    restore_counterfactual_snapshot,
+)
 from app.backend.policies import _compute_param_counts_from_policy, get_unified_policy_path
-from basketworld.envs.basketworld_env_v2 import Team
 
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _rebuild_cached_obs() -> None:
-    """Rebuild game_state.obs from env while preserving current viewer role."""
-    if not game_state.env:
-        return
-    env = game_state.env
-    role_value = (
-        float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
-        if game_state.obs is not None and game_state.obs.get("role_flag") is not None
-        else (1.0 if env.training_team == Team.OFFENSE else -1.0)
-    )
-    observer_is_offense = bool(role_value > 0.0)
-    if hasattr(env, "_build_observation_dict"):
-        game_state.obs = env._build_observation_dict(observer_is_offense)
-        game_state.obs["role_flag"] = np.array([role_value], dtype=np.float32)
-    else:
-        game_state.obs = {
-            "obs": env._get_observation(),
-            "action_mask": env._get_action_masks(),
-            "role_flag": np.array([role_value], dtype=np.float32),
-            "skills": env._get_offense_skills_array(),
-        }
 
 
 @router.post("/api/batch_update_player_positions")
@@ -218,6 +201,89 @@ def set_intent_state(req: SetIntentStateRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set intent state: {e}")
+
+
+@router.post("/api/capture_counterfactual_snapshot")
+def capture_counterfactual_snapshot_route():
+    """Capture the current env/session state as a branch point for counterfactual testing."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    try:
+        snapshot = capture_counterfactual_snapshot()
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {
+            "status": "success",
+            "state": updated_state,
+            "snapshot": snapshot,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to capture snapshot: {e}")
+
+
+@router.post("/api/restore_counterfactual_snapshot")
+def restore_counterfactual_snapshot_route():
+    """Restore the current env/session to the most recently captured counterfactual snapshot."""
+    if not game_state.counterfactual_snapshot:
+        raise HTTPException(status_code=400, detail="No counterfactual snapshot available.")
+    try:
+        snapshot = restore_counterfactual_snapshot()
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {
+            "status": "success",
+            "state": updated_state,
+            "snapshot": snapshot,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to restore snapshot: {e}")
+
+
+@router.post("/api/replay_counterfactual_snapshot")
+def replay_counterfactual_snapshot_route(req: ReplayCounterfactualRequest):
+    """Autoplay deterministically from the current branch state after snapshot-based edits."""
+    if not game_state.counterfactual_snapshot:
+        raise HTTPException(status_code=400, detail="No counterfactual snapshot available.")
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    from app.backend.routes.lifecycle_routes import step as step_route
+
+    try:
+        max_steps = max(1, int(req.max_steps))
+        states = [get_ui_game_state()]
+        done = bool(states[-1].get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+        steps_taken = 0
+
+        while not done and steps_taken < max_steps:
+            step_body = step_route(
+                ActionRequest(
+                    actions={},
+                    player_deterministic=bool(req.player_deterministic),
+                    opponent_deterministic=bool(req.opponent_deterministic),
+                )
+            )
+            next_state = step_body.get("state")
+            if not next_state:
+                raise RuntimeError("Counterfactual replay step did not return a state.")
+            states.append(next_state)
+            steps_taken += 1
+            done = bool(next_state.get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+
+        return {
+            "status": "success",
+            "states": states,
+            "state": states[-1],
+            "steps_taken": int(steps_taken),
+            "terminated": bool(done),
+            "max_steps": int(max_steps),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to replay counterfactual snapshot: {e}")
 
 
 @router.post("/api/offense_skills")

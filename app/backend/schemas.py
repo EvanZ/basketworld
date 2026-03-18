@@ -106,6 +106,12 @@ class SetIntentStateRequest(BaseModel):
     intent_age: int
 
 
+class ReplayCounterfactualRequest(BaseModel):
+    player_deterministic: bool = True
+    opponent_deterministic: bool = True
+    max_steps: int = 256
+
+
 class OffenseSkillsPayload(BaseModel):
     layup: List[float]
     three_pt: List[float]

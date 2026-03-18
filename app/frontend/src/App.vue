@@ -677,13 +677,13 @@ async function handlePlayerPositionUpdate({ playerId, q, r }) {
 
 function handlePatchedGameState(newState) {
   if (!newState) return;
+  isReplaying.value = false;
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
   gameState.value = newState;
   const clonedState = cloneState(newState);
-  if (gameHistory.value.length > 0) {
-    gameHistory.value[gameHistory.value.length - 1] = clonedState;
-  } else {
-    gameHistory.value = [clonedState];
-  }
+  gameHistory.value = [clonedState];
   syncPolicyProbsFromState(newState);
 }
 
@@ -1650,26 +1650,50 @@ async function handleReplay() {
   try {
     const res = await replayLastEpisode();
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
-      // Animate the replay so it is visible in the UI
-      isReplaying.value = true;
-      isManualStepping.value = false;
-      gameHistory.value = [];
-      const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
-      for (const s of res.states) {
-        gameState.value = s;
-        gameHistory.value.push(s);
-        // Small delay between frames aligned to slider
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise(resolve => setTimeout(resolve, stepDurationMs));
-      }
-      isReplaying.value = false;
-      // After animated replay, reload for manual stepping (keep showing final state)
-      await handleManualReplay(false, true);
+      await animateReplayStates(res.states);
     } else {
       throw new Error('Invalid replay response');
     }
   } catch (e) {
     alert(`Failed to replay episode: ${e.message}`);
+  }
+}
+
+async function animateReplayStates(states) {
+  if (!Array.isArray(states) || states.length === 0) {
+    throw new Error('Invalid replay state sequence');
+  }
+
+  isReplaying.value = true;
+  isManualStepping.value = false;
+  gameHistory.value = [];
+  const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+
+  try {
+    for (const state of states) {
+      gameState.value = state;
+      syncPolicyProbsFromState(state);
+      gameHistory.value.push(cloneState(state));
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise(resolve => setTimeout(resolve, stepDurationMs));
+    }
+  } finally {
+    isReplaying.value = false;
+  }
+
+  replayStates.value = states;
+  isManualStepping.value = true;
+  currentStepIndex.value = states.length - 1;
+  gameState.value = states[currentStepIndex.value];
+  syncPolicyProbsFromState(gameState.value);
+  gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1).map(cloneState);
+}
+
+async function handleCounterfactualReplayLoaded(payload) {
+  try {
+    await animateReplayStates(payload?.states || []);
+  } catch (e) {
+    alert(`Failed to replay counterfactual branch: ${e.message}`);
   }
 }
 
@@ -2021,6 +2045,7 @@ onBeforeUnmount(() => {
           @mcts-options-changed="handleMctsOptionsChanged"
           @mcts-toggle-changed="handleMctsToggleChanged"
           @state-updated="handlePatchedGameState"
+          @counterfactual-replay-loaded="handleCounterfactualReplayLoaded"
           @eval-config-changed="handleEvalConfigChanged"
           @eval-run="handleEvalRunRequested"
           @active-tab-changed="handleActiveTabChanged"

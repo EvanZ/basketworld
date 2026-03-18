@@ -1,6 +1,11 @@
 import numpy as np
+from pathlib import Path
 
-from analytics.intent_pca import _build_feature_matrix
+from analytics.intent_pca import (
+    _build_feature_matrix,
+    _intent_pca_mlflow_artifact_path,
+    resolve_policy_path,
+)
 from basketworld.utils.intent_discovery import CompletedIntentEpisode, IntentTransition
 from basketworld.utils.intent_pca import (
     SUMMARY_FEATURE_NAMES,
@@ -99,3 +104,42 @@ def test_set_attention_pool_feature_mode_means_active_prefix_embeddings():
     assert y.tolist() == [3]
     assert feature_names == ["attn_pool_0000", "attn_pool_0001"]
     assert np.allclose(x[0], [2.0, 3.0])
+
+
+def test_resolve_policy_path_uses_requested_checkpoint_in_local_directory(tmp_path: Path):
+    older = tmp_path / "unified_iter_12.zip"
+    newer = tmp_path / "unified_iter_45.zip"
+    alt = tmp_path / "unified_alternation_20.zip"
+    for path in (older, newer, alt):
+        path.write_bytes(b"")
+
+    selected, inferred_run_id = resolve_policy_path(str(tmp_path), checkpoint_idx=20)
+
+    assert selected == str(alt)
+    assert inferred_run_id is None
+
+
+def test_resolve_policy_path_errors_when_requested_checkpoint_missing(tmp_path: Path):
+    (tmp_path / "unified_iter_12.zip").write_bytes(b"")
+
+    try:
+        resolve_policy_path(str(tmp_path), checkpoint_idx=99)
+    except RuntimeError as exc:
+        assert "alternation/index=99" in str(exc)
+    else:
+        raise AssertionError("Expected resolve_policy_path to raise for missing checkpoint")
+
+
+def test_intent_pca_mlflow_artifact_path_uses_checkpoint_index():
+    assert (
+        _intent_pca_mlflow_artifact_path("/tmp/unified_iter_30.zip")
+        == "analysis/intent_pca/iter_30"
+    )
+    assert (
+        _intent_pca_mlflow_artifact_path("/tmp/unified_alternation_12.zip")
+        == "analysis/intent_pca/alternation_12"
+    )
+    assert (
+        _intent_pca_mlflow_artifact_path("/tmp/unified_latest.zip")
+        == "analysis/intent_pca/latest"
+    )

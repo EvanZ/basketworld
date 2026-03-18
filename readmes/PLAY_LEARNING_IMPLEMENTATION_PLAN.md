@@ -933,6 +933,325 @@ Recommended schedule:
    - increase unknown/no-intent fraction for defense robustness
    - periodic eval against intent-free offense
 
+4. Stage 3:
+   - keep low-level play execution `pi(a | s, z)` and learned latent play space
+   - introduce a learned high-level play selector `mu(z | s_context)`
+   - ramp selector influence from uniform intent sampling to selector-driven intent sampling
+   - preserve coverage regularization so previously learned plays do not collapse
+
+## Stage 3 extension: learned play selection `mu(z | s)`
+
+Once the latent play space is clearly formed, the next architectural step is to learn
+which play to call, not just how to execute a sampled play.
+
+Current system:
+
+1. offense intent `z` is sampled externally
+2. policy learns `pi(a_t | s_t, z)`
+3. diversity objective shapes the latent play space
+
+Stage 3 system:
+
+1. high-level selector learns `mu(z | s_context)`
+2. selector chooses or samples `z` at possession start
+3. low-level policy executes `pi(a_t | s_t, z)` for the commitment window
+
+This turns the current latent play discovery setup into a hierarchical play-calling
+architecture.
+
+### Why stage it instead of learning `mu` from the beginning
+
+Jointly learning:
+
+1. what each play means
+2. how to execute it
+3. when to select it
+
+is possible, but substantially less stable.
+
+Main failure modes:
+
+1. selector collapse
+   - `mu` quickly concentrates on a few lucky intents
+   - other intents receive too little data to become useful plays
+
+2. moving semantics
+   - while `pi(a | s, z)` is still changing what each `z` means, `mu` is trying to
+     optimize on top of a drifting codebook
+
+3. premature rejection
+   - an intent that starts weak can be abandoned before it has enough experience to improve
+
+The current random-sampling phase is therefore best understood as forced coverage for
+playbook formation.
+
+### High-level selector design
+
+The minimal selector should choose offense intent once per possession from a compact
+context representation:
+
+`z ~ mu(z | s_context)`
+
+Recommended `s_context` contents:
+
+1. offense player positions
+2. defense player positions
+3. ball holder
+4. shot clock / game clock context
+5. score differential / period context if available
+
+The selector does not need the full primitive action history. It only needs enough
+context to decide which latent play is appropriate for the current possession start.
+
+### Recommended implementation choice
+
+Recommended first implementation:
+
+1. reuse the existing offense state encoder / set-attention trunk
+2. add a separate selector head on top of that shared representation
+3. output categorical logits over `num_intents`
+4. call the selector once per possession, not every step
+5. keep the selected `z` fixed for the existing commitment window
+
+This is the best first version because:
+
+1. it matches the semantics of a play call
+2. it reuses the strongest existing court-state representation
+3. it avoids duplicating a second full state encoder
+4. it is easier to stabilize than a per-step selector
+
+So the intended architecture is:
+
+1. shared state encoder
+2. selector head `mu(z | s_context)`
+3. low-level action policy `pi(a | s, z)`
+
+and not:
+
+1. a fully separate selector network as the first implementation
+2. a per-step selector that changes `z` every timestep
+
+Per-step `mu(z_t | s_t)` is possible in principle, but without extra switching costs or
+dwell constraints it stops behaving like a play caller and starts behaving like a noisy
+latent mode switcher.
+
+### Runtime sampling schedule
+
+Do not hard-switch from:
+
+1. `z ~ Uniform`
+
+to:
+
+2. `z ~ mu(z | s_context)`
+
+Instead, use a mixture schedule:
+
+`z ~ (1 - alpha) * Uniform + alpha * mu(z | s_context)`
+
+where:
+
+1. `alpha = 0` during latent play discovery
+2. `alpha` is ramped upward only after the play space is stable
+
+Recommended selector ramp:
+
+1. `0M - 150M`:
+   - `alpha = 0`
+   - pure random coverage
+
+2. `150M - 250M`:
+   - ramp `alpha: 0 -> 1`
+   - keep selector entropy high
+   - optionally freeze or partially freeze low-level policy for part of this window
+
+3. `250M+`:
+   - allow selector-dominant play calling
+   - optionally fine-tune jointly
+
+### Training objective with selector
+
+Low-level policy remains conditioned on `z`:
+
+`pi(a_t | s_t, z)`
+
+High-level selector receives task reward through the chosen play and should also be
+regularized for coverage:
+
+`L_total = L_PPO_low_level + lambda_sel * L_selector + lambda_cov * L_usage_reg`
+
+Where:
+
+1. `L_PPO_low_level`
+   - normal PPO objective for the primitive policy
+
+2. `L_selector`
+   - selector objective for choosing better plays under task reward
+   - implementation can be PPO-style if the selector is treated as a once-per-possession action
+
+3. `L_usage_reg`
+   - entropy/KL/usage regularization to prevent immediate collapse onto a few intents
+
+### How `mu` actually learns which play to call
+
+The selector should be treated as a slower-timescale policy whose action is the choice
+of latent play at possession start.
+
+Mechanism:
+
+1. selector sees possession-start context `s_context`
+2. selector chooses `z`
+3. low-level policy executes the possession under `pi(a | s, z)`
+4. possession ends and produces return `R_possession`
+5. selector is updated so that choices of `z` that led to better returns in that context
+   become more likely
+
+So the learning signal is:
+
+1. not "which play looks good in the abstract"
+2. but "which play choice improved downstream possession reward in this context"
+
+This is why Stage 3 only makes sense after the latent play space is already somewhat
+stable. If `z` semantics are still drifting, then `mu` is trying to optimize over labels
+whose meaning is moving underneath it.
+
+Recommended credit assignment model:
+
+1. treat selector choice as a once-per-possession categorical action
+2. assign selector return from the resulting possession return
+3. optimize selector with PPO-style policy gradient or equivalent episodic objective
+4. keep low-level `pi(a | s, z)` training separate but concurrent
+
+In other words:
+
+1. `mu` learns play selection from possession outcomes
+2. `pi(a | s, z)` learns play execution from step-level PPO updates
+
+This separation of timescales is the core reason the architecture is learnable.
+
+### Recommended stabilization strategy
+
+When `mu` turns on:
+
+1. initialize selector with near-uniform logits
+2. keep high selector entropy early
+3. add KL-to-uniform or minimum-usage regularization
+4. use lower LR for low-level `pi(a | s, z)` during the first selector phase
+5. consider freezing low-level policy for a short warm-start window while `mu` begins learning
+
+This makes Stage 3 mostly about learning play selection, not rewriting the meaning of the
+latent plays again from scratch.
+
+### File/class modification plan for `mu`
+
+#### A) Environment intent sampling
+
+File: `basketworld/envs/basketworld_env_v2.py`
+
+Current reset path samples `intent_id` from RNG.
+
+For Stage 3, refactor reset-time offense intent sampling into a strategy hook:
+
+1. default:
+   - uniform random sampler (current behavior)
+
+2. selector-enabled:
+   - query high-level selector for possession-start offense intent
+
+Recommended helper:
+
+1. `sample_offense_intent_id(...)`
+2. `sample_defense_intent_id(...)` if defense selector is ever added later
+
+#### B) High-level selector module
+
+New file suggestion:
+
+`basketworld/utils/intent_selector.py`
+
+Add:
+
+1. `IntentSelector`
+   - selector head over the existing shared offense encoder representation
+   - outputs logits over `num_intents`
+   - intended to run once per possession
+
+2. `sample_intent_with_mixture(...)`
+   - combines uniform prior with selector distribution using current `alpha`
+
+3. `compute_selector_usage_metrics(...)`
+   - selector entropy
+   - selector top-1 frequency
+   - per-intent usage histogram
+
+#### C) Training integration
+
+Files:
+
+1. `train/train.py`
+2. `train/callbacks.py`
+3. optionally `basketworld/utils/callbacks.py`
+
+Add:
+
+1. selector creation and optimizer
+2. selector schedule params:
+   - `selector_enabled`
+   - `selector_alpha_start`
+   - `selector_alpha_end`
+   - `selector_alpha_warmup_steps`
+   - `selector_alpha_ramp_steps`
+   - `selector_entropy_coef`
+   - `selector_usage_reg_coef`
+
+3. MLflow logging:
+   - `intent/selector_entropy`
+   - `intent/selector_usage_by_intent/<z>`
+   - `intent/selector_top1_by_intent/<z>`
+   - `intent/selector_alpha_current`
+
+#### D) Policy/runtime boundary
+
+Keep the low-level policy interface unchanged:
+
+1. policy still receives `z` in observation/globals
+2. low-level policy still outputs primitive actions
+3. selector head only runs at possession start / play-selection time
+
+This keeps Stage 3 compatible with the current low-level architecture and isolates the
+new complexity to possession-start play selection.
+
+### Evaluation criteria for `mu`
+
+Treat the selector as successful if:
+
+1. latent play separability remains strong
+   - `disc_auc_ovr_macro`
+   - `disc_top1_acc`
+
+2. task performance improves
+   - PPP / win rate / turnover rate
+
+3. selector does not collapse immediately
+   - healthy selector entropy
+   - nontrivial usage across intents during ramp
+
+4. counterfactual play selection makes sense in fixed states
+   - same state, different selected `z`, different continuation
+   - similar states, selector chooses similar plays
+
+### Practical recommendation
+
+Do not implement Stage 3 until:
+
+1. latent play space is visibly present in metrics and analysis
+2. at least some intents are behaviorally interpretable
+3. low-level execution is stable enough that `z` semantics are not drifting wildly
+
+At the current stage of the project, Stage 3 should be treated as the next architecture
+branch after latent play discovery is sufficiently mature, not as a config toggle to
+turn on immediately.
+
 ## Real examples (emergent, not handcrafted)
 
 ## Example 1: What a learned intent looks like in practice
@@ -1004,6 +1323,8 @@ Fix:
 3. Add diversity objective (phase 2) and track intent separability.
 4. Harden defense with unknown/no-intent curriculum.
 5. Add post-hoc clustering notebook/report to interpret learned intents.
+6. After latent play space stabilizes, add Stage 3 selector `mu(z | s_context)` with
+   mixture ramp from uniform to selector-driven play calling.
 
 ## Success criteria
 
@@ -1041,7 +1362,19 @@ Implementation caution:
 1. Canonical DIAYN uses entropy-maximizing actor-critic (often SAC). Since current stack is PPO + discrete actions, this should be treated as a dedicated research branch, not an in-place toggle.
 2. Keep backward compatibility by version-tagging checkpoints and observation schema.
 
-### 2) Defensive latent plays track
+### 2) Learned play selector track
+
+If the latent play space becomes stable and interpretable, add the high-level
+selector described in Stage 3:
+
+1. selector chooses offense play `z`
+2. low-level policy executes `pi(a | s, z)`
+3. selector is ramped in gradually from uniform sampling
+
+This should be treated as a hierarchical-control branch, not folded into the original
+latent-play discovery code path without clear ablations.
+
+### 3) Defensive latent plays track
 
 Extend latent play learning to defense with its own latent variable, separate from offense.
 

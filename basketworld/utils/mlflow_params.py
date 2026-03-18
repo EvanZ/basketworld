@@ -610,6 +610,87 @@ def get_mlflow_training_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
+    training_params["num_intents"] = _get_param(
+        params,
+        ["num_intents", "num-intents"],
+        int,
+        0,
+    )
+    training_params["intent_commitment_steps"] = _get_param(
+        params,
+        ["intent_commitment_steps", "intent-commitment-steps"],
+        int,
+        4,
+    )
+    training_params["intent_obs_mode"] = _get_param(
+        params,
+        ["intent_obs_mode", "intent-obs-mode"],
+        str,
+        "private_offense",
+    )
+    training_params["intent_null_prob"] = _get_param(
+        params,
+        ["intent_null_prob", "intent-null-prob"],
+        float,
+        0.2,
+    )
+    training_params["intent_null_prob_end"] = _get_param(
+        params,
+        ["intent_null_prob_end", "intent-null-prob-end"],
+        float,
+        None,
+    )
+    training_params["intent_visible_to_defense_prob"] = _get_param(
+        params,
+        ["intent_visible_to_defense_prob", "intent-visible-to-defense-prob"],
+        float,
+        0.0,
+    )
+    training_params["intent_visible_to_defense_prob_end"] = _get_param(
+        params,
+        [
+            "intent_visible_to_defense_prob_end",
+            "intent-visible-to-defense-prob-end",
+        ],
+        float,
+        None,
+    )
+    training_params["enable_defense_intent_learning"] = _get_param(
+        params,
+        ["enable_defense_intent_learning", "enable-defense-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["defense_intent_null_prob"] = _get_param(
+        params,
+        ["defense_intent_null_prob", "defense-intent-null-prob"],
+        float,
+        1.0,
+    )
+    training_params["intent_diversity_beta_target"] = _get_param(
+        params,
+        ["intent_diversity_beta_target", "intent-diversity-beta-target"],
+        float,
+        0.05,
+    )
+    training_params["intent_diversity_warmup_steps"] = _get_param(
+        params,
+        ["intent_diversity_warmup_steps", "intent-diversity-warmup-steps"],
+        int,
+        1_000_000,
+    )
+    training_params["intent_diversity_ramp_steps"] = _get_param(
+        params,
+        ["intent_diversity_ramp_steps", "intent-diversity-ramp-steps"],
+        int,
+        1_000_000,
+    )
+    training_params["intent_diversity_clip"] = _get_param(
+        params,
+        ["intent_diversity_clip", "intent-diversity-clip"],
+        float,
+        2.0,
+    )
     training_params["intent_disc_encoder_type"] = _get_param(
         params,
         ["intent_disc_encoder_type", "intent-disc-encoder-type"],
@@ -633,6 +714,36 @@ def get_mlflow_training_params(
         ["intent_disc_dropout", "intent-disc-dropout"],
         float,
         0.1,
+    )
+    training_params["intent_disc_lr"] = _get_param(
+        params,
+        ["intent_disc_lr", "intent-disc-lr"],
+        float,
+        3e-4,
+    )
+    training_params["intent_disc_batch_size"] = _get_param(
+        params,
+        ["intent_disc_batch_size", "intent-disc-batch-size"],
+        int,
+        256,
+    )
+    training_params["intent_disc_updates_per_rollout"] = _get_param(
+        params,
+        ["intent_disc_updates_per_rollout", "intent-disc-updates-per-rollout"],
+        int,
+        2,
+    )
+    training_params["intent_disc_max_obs_dim"] = _get_param(
+        params,
+        ["intent_disc_max_obs_dim", "intent-disc-max-obs-dim"],
+        int,
+        256,
+    )
+    training_params["intent_disc_max_action_dim"] = _get_param(
+        params,
+        ["intent_disc_max_action_dim", "intent-disc-max-action-dim"],
+        int,
+        16,
     )
 
     return training_params
