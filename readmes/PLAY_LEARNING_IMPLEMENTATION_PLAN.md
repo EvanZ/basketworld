@@ -1221,6 +1221,261 @@ Keep the low-level policy interface unchanged:
 This keeps Stage 3 compatible with the current low-level architecture and isolates the
 new complexity to possession-start play selection.
 
+### Clean integrated implementation target
+
+The callback-based selector prototype is acceptable for smoke testing, but it is not the
+final architecture. The clean solution is to keep `mu` inside the same policy object and
+the same PPO optimization pass, while still treating it as a slower-timescale decision.
+
+Desired end state:
+
+1. one shared set-attention encoder
+2. one low-level action head for primitive actions
+3. one high-level selector head `mu(z | s_context)`
+4. one PPO training loop that optimizes both heads together
+
+That means:
+
+1. `mu` is not a separate standalone policy/network
+2. `mu` is also not trained as a callback-side afterthought
+3. selector log-prob, entropy, and advantage should be first-class rollout data
+
+#### Why this is the clean solution
+
+It removes the main ambiguity in the prototype:
+
+1. selector is produced by the same policy object that owns the low-level action head
+2. selector exploration/entropy is part of the same training step
+3. selector credit assignment is explicit in rollout storage, not inferred later by a callback
+4. selector and low-level policy can share a coherent optimizer/update schedule
+
+In other words, this is still "one policy" in the architectural sense:
+
+1. shared encoder
+2. multiple heads
+3. unified training graph
+
+#### Recommended algorithm structure
+
+Add a custom PPO variant for hierarchical play selection.
+
+New file suggestion:
+
+`basketworld/algorithms/hierarchical_intent_ppo.py`
+
+This should subclass SB3 PPO rather than trying to force the logic through callbacks.
+
+Recommended helper classes:
+
+1. `HierarchicalIntentRolloutBuffer`
+2. `SelectorDecisionRecord`
+
+The reason is simple: selector decisions are not emitted every timestep, so they do not
+fit cleanly into the existing per-step-only rollout schema without explicit bookkeeping.
+
+#### Rollout-time semantics
+
+Selector should run only at possession start or play-selection boundary.
+
+For each environment `env_idx`:
+
+1. detect whether this timestep is a selector boundary
+   - initially: episode start / possession start
+   - later: optionally commitment-window boundary
+
+2. build selector context from the current observation
+   - clone observation
+   - neutralize current intent fields so selector does not read the already-sampled `z`
+   - feed this context into selector head
+
+3. compute selector distribution
+   - `p_sel = mu(z | s_context)`
+   - optionally mix with uniform:
+     - `p_mix = (1 - alpha) * Uniform + alpha * p_sel`
+
+4. sample or argmax a play `z`
+   - during training: sample from `p_mix`
+   - during deterministic eval: argmax or deterministic mixture rule
+
+5. write selected `z` into env state and observation fields
+   - this becomes the play seen by the low-level policy for the commitment window
+
+6. store one selector-decision record
+   - selector log-prob
+   - selector entropy
+   - selected `z`
+   - boundary timestep
+   - env index
+   - optional selector value estimate if using a selector critic
+
+Then normal low-level PPO rollout collection continues step-by-step.
+
+#### Recommended rollout buffer additions
+
+Minimal buffer additions:
+
+1. `selector_episode_start_mask[t, env]`
+   - whether a selector decision happened here
+
+2. `selector_chosen_z[t, env]`
+   - chosen intent ID for this boundary
+
+3. `selector_log_prob[t, env]`
+   - log-prob of chosen `z` under the selector distribution used at rollout time
+
+4. `selector_entropy[t, env]`
+   - entropy of selector distribution at decision time
+
+5. `selector_alpha[t, env]`
+   - current mixture coefficient `alpha`
+
+6. `selector_return[t, env]`
+   - possession/window return assigned later
+
+7. `selector_advantage[t, env]`
+   - normalized advantage used for selector loss
+
+Recommended if doing full PPO-style selector learning:
+
+8. `selector_value[t, env]`
+   - selector baseline estimate
+
+9. `selector_value_target[t, env]`
+   - target for selector value loss
+
+10. `selector_valid_mask[t, env]`
+   - whether this timestep holds a real selector decision to optimize
+
+#### Recommended selector credit assignment
+
+The selector action should receive credit from the possession it initiated.
+
+For the initial clean implementation:
+
+1. selector decision happens at possession start
+2. possession ends with return `R_possession`
+3. assign `R_possession` back to the selector decision that chose `z`
+
+Two acceptable versions:
+
+1. REINFORCE-style integrated loss
+   - `A_selector = normalized(R_possession)`
+   - simplest first clean version
+
+2. PPO-style selector critic
+   - add selector value head
+   - `A_selector = R_possession - V_selector(s_context)`
+   - preferred long-term version
+
+Recommended implementation order:
+
+1. first clean version: integrated REINFORCE-style selector loss
+2. second refinement: add selector critic and clipped PPO-style selector objective
+
+#### Recommended policy changes
+
+File:
+
+`basketworld/policies/set_attention_policy.py`
+
+The policy already has the right high-level shape:
+
+1. shared set-attention encoder
+2. low-level action head
+3. selector head over shared features
+
+For the clean version, extend policy API with explicit selector methods:
+
+1. `get_selector_context(obs)`
+   - returns shared context tensor for selector
+
+2. `get_intent_selector_distribution(obs, alpha)`
+   - returns selector distribution and optionally mixture distribution
+
+3. `sample_intent_selector(obs, alpha, deterministic=False)`
+   - returns:
+     - selected `z`
+     - selector log-prob
+     - selector entropy
+     - optional selector value
+
+These should be used by the custom PPO algorithm during rollout collection, not by a callback.
+
+#### Recommended training losses
+
+Unified objective should look like:
+
+`L_total = L_PPO_low_level + lambda_sel * L_selector_policy + lambda_sel_v * L_selector_value - lambda_sel_ent * H_selector + lambda_usage * L_usage_reg`
+
+Where:
+
+1. `L_PPO_low_level`
+   - existing primitive-action PPO loss
+
+2. `L_selector_policy`
+   - selector policy gradient term
+   - REINFORCE-style first, PPO-style later if selector critic is added
+
+3. `L_selector_value`
+   - optional selector baseline loss
+
+4. `H_selector`
+   - selector entropy bonus
+
+5. `L_usage_reg`
+   - KL-to-uniform or equivalent coverage penalty over selector usage
+
+Important:
+
+1. low-level PPO entropy and selector entropy are distinct terms
+2. both live in the same total loss, but they regularize different heads
+
+#### Recommended file modification plan for the clean version
+
+1. `basketworld/policies/set_attention_policy.py`
+   - expose selector distribution/log-prob/value helpers
+
+2. `basketworld/algorithms/hierarchical_intent_ppo.py`
+   - custom PPO subclass
+   - rollout collection with selector-boundary handling
+   - unified selector + low-level loss computation
+
+3. `basketworld/algorithms/hierarchical_rollout_buffer.py`
+   - selector decision storage
+   - possession-return assignment
+   - selector advantage computation
+
+4. `basketworld/envs/basketworld_env_v2.py`
+   - selector boundary hook remains possession start initially
+   - later optional support for commitment-window reselection
+
+5. `train/train.py`
+   - instantiate hierarchical PPO when selector is enabled in clean mode
+
+6. `train/config.py`
+   - keep selector schedule/regularization flags
+   - add explicit switch between:
+     - callback prototype
+     - clean integrated PPO path
+
+#### Recommended implementation order
+
+1. keep current callback selector only as a temporary prototype
+2. implement custom rollout buffer for selector decisions
+3. implement custom PPO subclass that samples `z` at possession start
+4. move selector loss out of callback and into PPO train step
+5. add selector critic only after REINFORCE-style integrated version is stable
+
+#### Success criteria for the clean version
+
+The clean implementation should replace the prototype only if it achieves:
+
+1. same or better latent-play separability
+2. same or better PPP / possession efficiency
+3. selector metrics that are easier to interpret
+4. no callback-side mutation of rollout starts
+5. explicit first-class selector data in rollout storage
+
 ### Evaluation criteria for `mu`
 
 Treat the selector as successful if:
