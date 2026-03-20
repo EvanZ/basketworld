@@ -287,6 +287,39 @@ def test_set_attention_policy_intent_embedding_smoke():
     assert log_prob.shape == (1,)
 
 
+def test_set_attention_policy_intent_selector_logits_shape():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, globals_dim=8, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=12,
+        num_intents=8,
+        intent_selector_enabled=True,
+        intent_selector_hidden_dim=32,
+    )
+
+    globals_vec = np.array([24.0, 0.0, 0.0, 0.0, 0.42, 1.0, 1.0, 0.25], dtype=np.float32)
+    obs = _make_obs(
+        n_players,
+        globals_dim=8,
+        n_actions=n_actions,
+        role=1.0,
+        globals_vec=globals_vec,
+    )
+    tensor_obs, _ = policy.obs_to_tensor(obs)
+    logits = policy.get_intent_selector_logits(tensor_obs)
+
+    assert logits.shape == (1, 8)
+    assert th.isfinite(logits).all()
+
+
 def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_keys():
     n_players = 6
     players_per_side = 3
@@ -327,6 +360,34 @@ def test_set_attention_policy_load_state_dict_allows_missing_intent_embedding_ke
         "features_extractor.offense_intent_to_token",
         "features_extractor.defense_intent_to_token",
     )
+    assert all(str(k).startswith(allowed_prefixes) for k in result.missing_keys)
+
+
+def test_set_attention_policy_load_state_dict_allows_missing_selector_keys():
+    n_players = 6
+    players_per_side = 3
+    n_actions = 14
+    obs_space = _make_obs_space(n_players, globals_dim=8, n_actions=n_actions)
+    action_space = spaces.MultiDiscrete([n_actions] * players_per_side)
+
+    policy = SetAttentionDualCriticPolicy(
+        obs_space,
+        action_space,
+        lr_schedule=lambda _: 0.0003,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=8,
+        num_intents=8,
+        intent_selector_enabled=True,
+    )
+
+    full_state = policy.state_dict()
+    legacy_state = {
+        k: v
+        for k, v in full_state.items()
+        if not (k.startswith("pointer_") or k.startswith("intent_selector_head"))
+    }
+    result = policy.load_state_dict(legacy_state, strict=True)
+    allowed_prefixes = ("pointer_", "intent_selector_head")
     assert all(str(k).startswith(allowed_prefixes) for k in result.missing_keys)
 
 

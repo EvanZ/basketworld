@@ -1,18 +1,25 @@
 import copy
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import logging
 import math
+import multiprocessing as mp
 import os
+import queue
 from typing import List
 
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
 import mlflow
+import numpy as np
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
+import app.backend.evaluation as backend_evaluation
 from app.backend.schemas import (
     ActionRequest,
     BatchUpdatePositionRequest,
+    PlaybookAnalysisRequest,
     ReplayCounterfactualRequest,
     SetBallHolderRequest,
     SetIntentStateRequest,
@@ -25,17 +32,607 @@ from app.backend.schemas import (
     UpdateShotClockRequest,
 )
 from app.backend.state import (
+    _capture_restorable_backend_state,
     _rebuild_cached_obs,
+    _restore_restorable_backend_state,
     capture_counterfactual_snapshot,
+    fail_playbook_progress,
+    get_playbook_progress,
     get_ui_game_state,
     game_state,
+    reset_playbook_progress,
     restore_counterfactual_snapshot,
+    update_playbook_progress,
 )
 from app.backend.policies import _compute_param_counts_from_policy, get_unified_policy_path
 
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_NUMPY_SAFE_ENCODER = {
+    np.integer: int,
+    np.floating: float,
+    np.bool_: bool,
+    np.ndarray: lambda arr: arr.tolist(),
+}
+
+
+def _heatmap_increment(heatmap: dict[str, list[int]], pos) -> None:
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        return
+    try:
+        q = int(pos[0])
+        r = int(pos[1])
+    except Exception:
+        return
+    key = f"{q},{r}"
+    slot = heatmap.setdefault(key, [0, 0])
+    slot[0] += 1
+    slot[1] += 1
+
+
+def _increment_count(counts: dict[str, int], key: str, amount: int = 1) -> None:
+    counts[str(key)] = int(counts.get(str(key), 0)) + int(amount)
+
+
+def _classify_playbook_terminal_outcome(
+    state: dict,
+    done: bool,
+    shot_clock: int | None,
+) -> tuple[str, str | None]:
+    if not done:
+        return "horizon_cutoff", None
+
+    action_results = state.get("last_action_results") or {}
+    raw_shots = action_results.get("shots") or {}
+    if raw_shots:
+        any_make = False
+        for shot_result in raw_shots.values():
+            if isinstance(shot_result, dict) and bool(shot_result.get("success")):
+                any_make = True
+                break
+        return ("shot_make" if any_make else "shot_miss"), None
+
+    if action_results.get("defensive_lane_violations"):
+        return "defensive_violation", None
+
+    raw_turnovers = action_results.get("turnovers") or []
+    if raw_turnovers:
+        turnover_reason = "unknown"
+        first = raw_turnovers[0]
+        if isinstance(first, dict):
+            turnover_reason = str(first.get("reason") or "unknown").lower()
+        return "turnover", turnover_reason
+
+    try:
+        if shot_clock is not None and int(shot_clock) <= 0:
+            return "shot_clock_expiration", None
+    except Exception:
+        pass
+
+    return "other_terminal", None
+
+
+def _count_rollout_state(
+    state: dict,
+    offense_ids: list[int],
+    player_heatmaps: dict[str, dict[str, list[int]]],
+    ball_heatmap: dict[str, list[int]],
+    shot_heatmap: dict[str, list[int]],
+    player_shot_heatmaps: dict[str, dict[str, list[int]]],
+    player_shot_stats: dict[str, dict[str, int]],
+    pass_links: dict[str, int],
+    pass_path_segments: dict[str, int] | None = None,
+) -> tuple[int, int]:
+    positions = state.get("positions") or []
+    passes_this_state = 0
+    shots_this_state = 0
+
+    for pid in offense_ids:
+        if pid < 0 or pid >= len(positions):
+            continue
+        player_map = player_heatmaps.setdefault(str(pid), {})
+        _heatmap_increment(player_map, positions[pid])
+
+    ball_holder = state.get("ball_holder")
+    if ball_holder is not None:
+        try:
+            bh = int(ball_holder)
+        except Exception:
+            bh = None
+        if bh is not None and 0 <= bh < len(positions):
+            _heatmap_increment(ball_heatmap, positions[bh])
+
+    action_results = state.get("last_action_results") or {}
+    raw_passes = action_results.get("passes") or {}
+    for raw_passer, pass_result in raw_passes.items():
+        if not isinstance(pass_result, dict) or not pass_result.get("success"):
+            continue
+        try:
+            passer = int(raw_passer)
+        except Exception:
+            continue
+        raw_target = pass_result.get("target")
+        if raw_target is None:
+            raw_target = pass_result.get("intended_target")
+        try:
+            target = int(raw_target)
+        except Exception:
+            continue
+        pass_links[f"{passer}->{target}"] = int(pass_links.get(f"{passer}->{target}", 0)) + 1
+        if pass_path_segments is not None and 0 <= passer < len(positions) and 0 <= target < len(positions):
+            _pass_segment_increment(pass_path_segments, passer, target, positions[passer], positions[target])
+        passes_this_state += 1
+
+    raw_shots = action_results.get("shots") or {}
+    for raw_shooter, shot_result in raw_shots.items():
+        try:
+            shooter = int(raw_shooter)
+        except Exception:
+            continue
+        if 0 <= shooter < len(positions):
+            _heatmap_increment(shot_heatmap, positions[shooter])
+            _heatmap_increment(
+                player_shot_heatmaps.setdefault(str(shooter), {}),
+                positions[shooter],
+            )
+            shooter_stats = player_shot_stats.setdefault(
+                str(shooter),
+                {"attempts": 0, "makes": 0},
+            )
+            shooter_stats["attempts"] = int(shooter_stats.get("attempts", 0)) + 1
+            if isinstance(shot_result, dict) and bool(shot_result.get("success")):
+                shooter_stats["makes"] = int(shooter_stats.get("makes", 0)) + 1
+            shots_this_state += 1
+
+    return passes_this_state, shots_this_state
+
+
+def _init_playbook_panel_accumulator(offense_ids: list[int]) -> dict:
+    return {
+        "player_heatmaps": {str(pid): {} for pid in offense_ids},
+        "ball_heatmap": {},
+        "shot_heatmap": {},
+        "player_shot_heatmaps": {str(pid): {} for pid in offense_ids},
+        "player_shot_stats": {
+            str(pid): {"attempts": 0, "makes": 0} for pid in offense_ids
+        },
+        "terminal_outcomes": {},
+        "turnover_reasons": {},
+        "pass_links": {},
+        "player_path_segments": {str(pid): {} for pid in offense_ids},
+        "ball_path_segments": {},
+        "pass_path_segments": {},
+        "rollout_lengths_sum": 0,
+        "rollout_passes_sum": 0,
+        "rollout_shots_sum": 0,
+        "terminated_rollouts": 0,
+        "num_rollouts": 0,
+        "base_state": None,
+    }
+
+
+def _merge_heatmap_counts(dest: dict[str, list[int]], src: dict[str, list[int]]) -> None:
+    for key, vals in (src or {}).items():
+        try:
+            src_0 = int(vals[0]) if isinstance(vals, (list, tuple)) and len(vals) > 0 else 0
+            src_1 = int(vals[1]) if isinstance(vals, (list, tuple)) and len(vals) > 1 else 0
+        except Exception:
+            src_0, src_1 = 0, 0
+        slot = dest.setdefault(key, [0, 0])
+        slot[0] += src_0
+        slot[1] += src_1
+
+
+def _merge_player_heatmaps(
+    dest: dict[str, dict[str, list[int]]],
+    src: dict[str, dict[str, list[int]]],
+) -> None:
+    for pid, player_map in (src or {}).items():
+        _merge_heatmap_counts(dest.setdefault(str(pid), {}), player_map or {})
+
+
+def _segment_key(start_pos, end_pos) -> str | None:
+    if not isinstance(start_pos, (list, tuple)) or not isinstance(end_pos, (list, tuple)):
+        return None
+    if len(start_pos) < 2 or len(end_pos) < 2:
+        return None
+    try:
+        start_q = int(start_pos[0])
+        start_r = int(start_pos[1])
+        end_q = int(end_pos[0])
+        end_r = int(end_pos[1])
+    except Exception:
+        return None
+    if start_q == end_q and start_r == end_r:
+        return None
+    return f"{start_q},{start_r}|{end_q},{end_r}"
+
+
+def _segment_increment(segment_counts: dict[str, int], start_pos, end_pos) -> None:
+    key = _segment_key(start_pos, end_pos)
+    if not key:
+        return
+    segment_counts[key] = int(segment_counts.get(key, 0)) + 1
+
+
+def _pass_segment_increment(
+    segment_counts: dict[str, int],
+    passer_id: int,
+    receiver_id: int,
+    start_pos,
+    end_pos,
+) -> None:
+    key = _segment_key(start_pos, end_pos)
+    if not key:
+        return
+    scoped_key = f"{int(passer_id)}->{int(receiver_id)}::{key}"
+    segment_counts[scoped_key] = int(segment_counts.get(scoped_key, 0)) + 1
+
+
+def _count_rollout_transition(
+    prev_state: dict,
+    state: dict,
+    offense_ids: list[int],
+    player_path_segments: dict[str, dict[str, int]],
+    ball_path_segments: dict[str, int],
+) -> None:
+    prev_positions = prev_state.get("positions") or []
+    curr_positions = state.get("positions") or []
+
+    for pid in offense_ids:
+        if pid < 0 or pid >= len(prev_positions) or pid >= len(curr_positions):
+            continue
+        _segment_increment(
+            player_path_segments.setdefault(str(pid), {}),
+            prev_positions[pid],
+            curr_positions[pid],
+        )
+
+    try:
+        prev_holder = int(prev_state.get("ball_holder"))
+        curr_holder = int(state.get("ball_holder"))
+    except Exception:
+        return
+    if (
+        prev_holder < 0
+        or curr_holder < 0
+        or prev_holder >= len(prev_positions)
+        or curr_holder >= len(curr_positions)
+    ):
+        return
+    _segment_increment(
+        ball_path_segments,
+        prev_positions[prev_holder],
+        curr_positions[curr_holder],
+    )
+
+
+def _merge_segment_counts(dest: dict[str, int], src: dict[str, int]) -> None:
+    for key, count in (src or {}).items():
+        dest[key] = int(dest.get(key, 0)) + int(count or 0)
+
+
+def _merge_player_segment_counts(
+    dest: dict[str, dict[str, int]],
+    src: dict[str, dict[str, int]],
+) -> None:
+    for pid, player_segments in (src or {}).items():
+        _merge_segment_counts(dest.setdefault(str(pid), {}), player_segments or {})
+
+
+def _serialize_segment_counts(segment_counts: dict[str, int]) -> list[dict]:
+    serialized: list[dict] = []
+    for key, raw_count in sorted(
+        (segment_counts or {}).items(),
+        key=lambda item: (-int(item[1] or 0), str(item[0])),
+    ):
+        try:
+            start_key, end_key = str(key).split("|", 1)
+            start_q, start_r = (int(part) for part in start_key.split(",", 1))
+            end_q, end_r = (int(part) for part in end_key.split(",", 1))
+            count = int(raw_count)
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        serialized.append(
+            {
+                "from": [start_q, start_r],
+                "to": [end_q, end_r],
+                "count": count,
+            }
+        )
+    return serialized
+
+
+def _serialize_pass_segment_counts(segment_counts: dict[str, int]) -> list[dict]:
+    serialized: list[dict] = []
+    for key, raw_count in sorted(
+        (segment_counts or {}).items(),
+        key=lambda item: (-int(item[1] or 0), str(item[0])),
+    ):
+        try:
+            participants_key, segment_key = str(key).split("::", 1)
+            passer_key, receiver_key = participants_key.split("->", 1)
+            passer_id = int(passer_key)
+            receiver_id = int(receiver_key)
+            start_key, end_key = str(segment_key).split("|", 1)
+            start_q, start_r = (int(part) for part in start_key.split(",", 1))
+            end_q, end_r = (int(part) for part in end_key.split(",", 1))
+            count = int(raw_count)
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        serialized.append(
+            {
+                "passer_id": passer_id,
+                "receiver_id": receiver_id,
+                "from": [start_q, start_r],
+                "to": [end_q, end_r],
+                "count": count,
+            }
+        )
+    return serialized
+
+
+def _merge_playbook_panel_accumulator(dest: dict, src: dict) -> None:
+    _merge_player_heatmaps(dest["player_heatmaps"], src.get("player_heatmaps") or {})
+    _merge_heatmap_counts(dest["ball_heatmap"], src.get("ball_heatmap") or {})
+    _merge_heatmap_counts(dest["shot_heatmap"], src.get("shot_heatmap") or {})
+    _merge_player_heatmaps(
+        dest["player_shot_heatmaps"], src.get("player_shot_heatmaps") or {}
+    )
+    for pid, raw_stats in (src.get("player_shot_stats") or {}).items():
+        slot = dest["player_shot_stats"].setdefault(
+            str(pid),
+            {"attempts": 0, "makes": 0},
+        )
+        slot["attempts"] = int(slot.get("attempts", 0)) + int(
+            (raw_stats or {}).get("attempts", 0) or 0
+        )
+        slot["makes"] = int(slot.get("makes", 0)) + int(
+            (raw_stats or {}).get("makes", 0) or 0
+        )
+    for key, count in (src.get("terminal_outcomes") or {}).items():
+        _increment_count(dest["terminal_outcomes"], str(key), int(count or 0))
+    for key, count in (src.get("turnover_reasons") or {}).items():
+        _increment_count(dest["turnover_reasons"], str(key), int(count or 0))
+    _merge_player_segment_counts(dest["player_path_segments"], src.get("player_path_segments") or {})
+    _merge_segment_counts(dest["ball_path_segments"], src.get("ball_path_segments") or {})
+    _merge_segment_counts(dest["pass_path_segments"], src.get("pass_path_segments") or {})
+    for key, count in (src.get("pass_links") or {}).items():
+        dest["pass_links"][key] = int(dest["pass_links"].get(key, 0)) + int(count or 0)
+    for key in (
+        "rollout_lengths_sum",
+        "rollout_passes_sum",
+        "rollout_shots_sum",
+        "terminated_rollouts",
+        "num_rollouts",
+    ):
+        dest[key] = int(dest.get(key, 0)) + int(src.get(key, 0) or 0)
+    if dest.get("base_state") is None and src.get("base_state") is not None:
+        dest["base_state"] = copy.deepcopy(src.get("base_state"))
+
+
+def _build_playbook_rollout_state(env, action_results: dict | None = None) -> dict:
+    return {
+        "positions": copy.deepcopy(getattr(env, "positions", [])),
+        "ball_holder": getattr(env, "ball_holder", None),
+        "last_action_results": action_results or {},
+    }
+
+
+def _build_playbook_ui_state(template_state: dict, env, action_results: dict | None = None) -> dict:
+    state = copy.deepcopy(template_state or {})
+    state["positions"] = [
+        [int(pos[0]), int(pos[1])] for pos in getattr(env, "positions", [])
+    ]
+    ball_holder = getattr(env, "ball_holder", None)
+    state["ball_holder"] = int(ball_holder) if ball_holder is not None else None
+    state["shot_clock"] = int(getattr(env, "shot_clock", 0))
+    state["done"] = bool(getattr(env, "episode_ended", False))
+    state["last_action_results"] = copy.deepcopy(action_results or {})
+    state["intent_active_current"] = bool(getattr(env, "intent_active", False))
+    state["intent_index_current"] = int(getattr(env, "intent_index", 0))
+    state["intent_age_current"] = int(getattr(env, "intent_age", 0))
+    state["pass_steal_probabilities"] = {}
+    state["ball_handler_shot_probability"] = None
+    return state
+
+
+def _build_playbook_worker_obs(env, user_team) -> dict:
+    worker_state = backend_evaluation._worker_state
+    _np = worker_state["np"]
+    _Team = worker_state["Team"]
+    observer_is_offense = bool(user_team == _Team.OFFENSE)
+    if hasattr(env, "_build_observation_dict"):
+        obs = env._build_observation_dict(observer_is_offense)
+    else:
+        obs = {
+            "obs": env._get_observation(),
+            "action_mask": env._get_action_masks(),
+            "skills": env._get_offense_skills_array(),
+        }
+    role_value = (
+        worker_state.get("role_flag_offense", 1.0)
+        if observer_is_offense
+        else worker_state.get("role_flag_defense", -1.0)
+    )
+    obs["role_flag"] = _np.array([role_value], dtype=_np.float32)
+    return obs
+
+
+def _run_playbook_batch_worker(args: tuple) -> dict:
+    (
+        rollout_specs,
+        base_env,
+        base_ui_state,
+        user_team_name,
+        offense_ids,
+        commitment_steps,
+        max_steps,
+        run_to_end,
+        player_deterministic,
+        opponent_deterministic,
+    ) = args
+
+    worker_state = backend_evaluation._worker_state
+    _np = worker_state["np"]
+    _Team = worker_state["Team"]
+    unified_policy = worker_state["unified_policy"]
+    opponent_policy = worker_state["opponent_policy"]
+    progress_queue = worker_state.get("progress_queue")
+    user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
+    player_strategy = (
+        worker_state["IllegalActionStrategy"].BEST_PROB
+        if player_deterministic
+        else worker_state["IllegalActionStrategy"].SAMPLE_PROB
+    )
+    opponent_strategy = (
+        worker_state["IllegalActionStrategy"].BEST_PROB
+        if opponent_deterministic
+        else worker_state["IllegalActionStrategy"].SAMPLE_PROB
+    )
+
+    try:
+        import torch as _torch
+    except Exception:
+        _torch = None
+
+    payload: dict[int, dict] = {}
+
+    for _, intent_index, rollout_seed in rollout_specs:
+        if _torch is not None:
+            try:
+                _torch.manual_seed(int(rollout_seed))
+            except Exception:
+                pass
+        try:
+            _np.random.seed(int(rollout_seed))
+        except Exception:
+            pass
+
+        env = copy.deepcopy(base_env)
+        env.training_team = user_team
+        try:
+            env._rng = _np.random.default_rng(int(rollout_seed))
+        except Exception:
+            pass
+
+        env.intent_active = True
+        env.intent_index = int(intent_index)
+        env.intent_age = 0
+        env.intent_commitment_remaining = int(commitment_steps)
+
+        obs = _build_playbook_worker_obs(env, user_team)
+        panel = payload.setdefault(int(intent_index), _init_playbook_panel_accumulator(offense_ids))
+        initial_ui_state = _build_playbook_ui_state(base_ui_state, env)
+        if panel.get("base_state") is None:
+            panel["base_state"] = copy.deepcopy(initial_ui_state)
+
+        rollout_state = _build_playbook_rollout_state(env)
+        passes_count, shots_count = _count_rollout_state(
+            rollout_state,
+            offense_ids,
+            panel["player_heatmaps"],
+            panel["ball_heatmap"],
+            panel["shot_heatmap"],
+            panel["player_shot_heatmaps"],
+            panel["player_shot_stats"],
+            panel["pass_links"],
+            panel["pass_path_segments"],
+        )
+        rollout_steps = 0
+        done = bool(getattr(env, "episode_ended", False))
+
+        while not done and (run_to_end or rollout_steps < max_steps):
+            actions_player = backend_evaluation._worker_predict_policy_actions(
+                unified_policy,
+                obs,
+                env,
+                deterministic=player_deterministic,
+                strategy=player_strategy,
+            )
+            actions_opponent = backend_evaluation._worker_predict_policy_actions(
+                opponent_policy if opponent_policy is not None else unified_policy,
+                obs,
+                env,
+                deterministic=opponent_deterministic,
+                strategy=opponent_strategy,
+            )
+
+            full_action = _np.zeros(env.n_players, dtype=int)
+            if user_team == _Team.OFFENSE:
+                full_action[env.offense_ids] = actions_player[env.offense_ids]
+                full_action[env.defense_ids] = actions_opponent[env.defense_ids]
+            else:
+                full_action[env.defense_ids] = actions_player[env.defense_ids]
+                full_action[env.offense_ids] = actions_opponent[env.offense_ids]
+
+            obs, _, terminated, truncated, info = env.step(full_action)
+            action_results = info.get("action_results", {}) if info else {}
+            if not action_results:
+                action_results = info.get("last_action_results", {}) if info else {}
+            if not action_results:
+                action_results = getattr(env, "last_action_results", {}) or {}
+
+            next_rollout_state = _build_playbook_rollout_state(env, action_results)
+            _count_rollout_transition(
+                rollout_state,
+                next_rollout_state,
+                offense_ids,
+                panel["player_path_segments"],
+                panel["ball_path_segments"],
+            )
+            more_passes, more_shots = _count_rollout_state(
+                next_rollout_state,
+                offense_ids,
+                panel["player_heatmaps"],
+                panel["ball_heatmap"],
+                panel["shot_heatmap"],
+                panel["player_shot_heatmaps"],
+                panel["player_shot_stats"],
+                panel["pass_links"],
+                panel["pass_path_segments"],
+            )
+            passes_count += more_passes
+            shots_count += more_shots
+            rollout_steps += 1
+            done = bool(terminated or truncated)
+            rollout_state = next_rollout_state
+
+            role_value = (
+                worker_state.get("role_flag_offense", 1.0)
+                if user_team == _Team.OFFENSE
+                else worker_state.get("role_flag_defense", -1.0)
+            )
+            obs["role_flag"] = _np.array([role_value], dtype=_np.float32)
+
+        panel["rollout_lengths_sum"] += int(rollout_steps)
+        panel["rollout_passes_sum"] += int(passes_count)
+        panel["rollout_shots_sum"] += int(shots_count)
+        panel["terminated_rollouts"] += int(bool(done))
+        panel["num_rollouts"] += 1
+        terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
+            rollout_state,
+            done=bool(done),
+            shot_clock=getattr(env, "shot_clock", None),
+        )
+        _increment_count(panel["terminal_outcomes"], terminal_key, 1)
+        if turnover_reason:
+            _increment_count(panel["turnover_reasons"], turnover_reason, 1)
+
+        if progress_queue is not None:
+            try:
+                progress_queue.put_nowait(1)
+            except queue.Full:
+                pass
+            except Exception:
+                pass
+
+    return payload
 
 
 @router.post("/api/batch_update_player_positions")
@@ -284,6 +881,337 @@ def replay_counterfactual_snapshot_route(req: ReplayCounterfactualRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to replay counterfactual snapshot: {e}")
+
+
+@router.post("/api/playbook_analysis")
+def playbook_analysis_route(req: PlaybookAnalysisRequest):
+    """Run repeated snapshot/current-state rollouts and aggregate intent-conditioned spatial patterns."""
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    if req.use_snapshot and not game_state.counterfactual_snapshot:
+        raise HTTPException(status_code=400, detail="No counterfactual snapshot available.")
+
+    from app.backend.routes.lifecycle_routes import step as step_route
+
+    env = game_state.env
+    num_intents = max(1, int(getattr(env, "num_intents", 1)))
+    if not bool(getattr(env, "enable_intent_learning", False)):
+        raise HTTPException(status_code=400, detail="Intent learning is not enabled for this environment.")
+
+    raw_indices = list(req.intent_indices or [])
+    if not raw_indices:
+        raise HTTPException(status_code=400, detail="Provide at least one intent index.")
+
+    intent_indices: list[int] = []
+    for raw_idx in raw_indices:
+        idx = int(raw_idx)
+        if idx < 0 or idx >= num_intents:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Intent index {idx} is out of range for {num_intents} intents.",
+            )
+        if idx not in intent_indices:
+            intent_indices.append(idx)
+
+    num_rollouts = max(1, min(512, int(req.num_rollouts)))
+    max_steps = max(1, min(256, int(req.max_steps)))
+    run_to_end = bool(req.run_to_end)
+    total_rollouts = int(num_rollouts * len(intent_indices))
+    commitment_steps = max(0, int(getattr(env, "intent_commitment_steps", 0)))
+    offense_ids = [int(pid) for pid in getattr(env, "offense_ids", [])]
+    source_label = "snapshot" if bool(req.use_snapshot) else "current"
+    can_parallelize = bool(
+        game_state.env_required_params is not None
+        and game_state.unified_policy_path is not None
+        and game_state.user_team is not None
+        and total_rollouts > 1
+    )
+    num_workers = None
+    if can_parallelize and total_rollouts >= 8:
+        num_workers = max(2, min(mp.cpu_count(), 16, total_rollouts))
+
+    live_restore_state = _capture_restorable_backend_state()
+    original_counterfactual_snapshot = copy.deepcopy(game_state.counterfactual_snapshot)
+
+    try:
+        reset_playbook_progress(total_rollouts)
+        if req.use_snapshot:
+            base_state = copy.deepcopy(game_state.counterfactual_snapshot)
+        else:
+            base_state = _capture_restorable_backend_state()
+
+        if req.use_snapshot:
+            _restore_restorable_backend_state(base_state)
+            base_ui_state = get_ui_game_state()
+            _restore_restorable_backend_state(live_restore_state)
+            game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
+        else:
+            base_ui_state = get_ui_game_state()
+
+        panel_accumulators = {
+            int(intent_index): _init_playbook_panel_accumulator(offense_ids)
+            for intent_index in intent_indices
+        }
+
+        if num_workers is not None:
+            parallel_base_env = copy.deepcopy(base_state["env"])
+            rollout_specs = [
+                (int(order), int(intent_index), int(np.random.randint(0, 2**31 - 1)))
+                for order, intent_index in enumerate(
+                    [
+                        int(intent_index)
+                        for intent_index in intent_indices
+                        for _ in range(num_rollouts)
+                    ]
+                )
+            ]
+            target_batches = max(1, num_workers * 4)
+            batch_size = max(1, (len(rollout_specs) + target_batches - 1) // target_batches)
+            batches = []
+            for idx in range(0, len(rollout_specs), batch_size):
+                batch_specs = rollout_specs[idx : idx + batch_size]
+                if not batch_specs:
+                    continue
+                batches.append(
+                    (
+                        batch_specs,
+                        parallel_base_env,
+                        base_ui_state,
+                        str(game_state.user_team.name),
+                        offense_ids,
+                        int(commitment_steps),
+                        int(max_steps),
+                        bool(run_to_end),
+                        bool(req.player_deterministic),
+                        bool(req.opponent_deterministic),
+                    )
+                )
+
+            ctx = mp.get_context("spawn")
+            progress_queue = ctx.Queue()
+            completed = 0
+            payloads: list[dict] = []
+
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=ctx,
+                initializer=backend_evaluation._init_evaluation_worker,
+                initargs=(
+                    game_state.env_required_params,
+                    game_state.env_optional_params,
+                    game_state.unified_policy_path,
+                    game_state.opponent_policy_path,
+                    game_state.user_team.name,
+                    game_state.role_flag_offense,
+                    game_state.role_flag_defense,
+                    progress_queue,
+                ),
+            ) as executor:
+                pending = {
+                    executor.submit(_run_playbook_batch_worker, batch)
+                    for batch in batches
+                }
+                while pending:
+                    done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                    while True:
+                        try:
+                            completed += int(progress_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                        except Exception:
+                            break
+                    update_playbook_progress(min(completed, total_rollouts), total_rollouts)
+                    if not done:
+                        continue
+                    for future in done:
+                        payloads.append(future.result())
+
+                while True:
+                    try:
+                        completed += int(progress_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+
+            update_playbook_progress(total_rollouts, total_rollouts)
+            for payload in payloads:
+                for intent_index, partial in (payload or {}).items():
+                    _merge_playbook_panel_accumulator(
+                        panel_accumulators[int(intent_index)],
+                        partial or {},
+                    )
+        else:
+            completed = 0
+            for intent_index in intent_indices:
+                panel = panel_accumulators[int(intent_index)]
+                for _ in range(num_rollouts):
+                    _restore_restorable_backend_state(base_state)
+                    game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
+
+                    game_state.env.intent_active = True
+                    game_state.env.intent_index = int(intent_index)
+                    game_state.env.intent_age = 0
+                    game_state.env.intent_commitment_remaining = int(commitment_steps)
+                    _rebuild_cached_obs()
+                    initial_state = copy.deepcopy(get_ui_game_state())
+                    if panel.get("base_state") is None:
+                        panel["base_state"] = copy.deepcopy(initial_state)
+
+                    rollout_state = _build_playbook_rollout_state(game_state.env)
+                    passes_count, shots_count = _count_rollout_state(
+                        rollout_state,
+                        offense_ids,
+                        panel["player_heatmaps"],
+                        panel["ball_heatmap"],
+                        panel["shot_heatmap"],
+                        panel["player_shot_heatmaps"],
+                        panel["player_shot_stats"],
+                        panel["pass_links"],
+                        panel["pass_path_segments"],
+                    )
+                    rollout_steps = 0
+                    done = bool(getattr(game_state.env, "episode_ended", False))
+
+                    while not done and (run_to_end or rollout_steps < max_steps):
+                        step_body = step_route(
+                            ActionRequest(
+                                actions={},
+                                player_deterministic=bool(req.player_deterministic),
+                                opponent_deterministic=bool(req.opponent_deterministic),
+                            )
+                        )
+                        next_state = step_body.get("state")
+                        if not next_state:
+                            raise RuntimeError("Playbook analysis step did not return a state.")
+                        next_rollout_state = _build_playbook_rollout_state(
+                            game_state.env,
+                            next_state.get("last_action_results") or {},
+                        )
+                        _count_rollout_transition(
+                            rollout_state,
+                            next_rollout_state,
+                            offense_ids,
+                            panel["player_path_segments"],
+                            panel["ball_path_segments"],
+                        )
+                        more_passes, more_shots = _count_rollout_state(
+                            next_rollout_state,
+                            offense_ids,
+                            panel["player_heatmaps"],
+                            panel["ball_heatmap"],
+                            panel["shot_heatmap"],
+                            panel["player_shot_heatmaps"],
+                            panel["player_shot_stats"],
+                            panel["pass_links"],
+                            panel["pass_path_segments"],
+                        )
+                        passes_count += more_passes
+                        shots_count += more_shots
+                        rollout_steps += 1
+                        done = bool(next_state.get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+                        rollout_state = next_rollout_state
+
+                    panel["rollout_lengths_sum"] += int(rollout_steps)
+                    panel["rollout_passes_sum"] += int(passes_count)
+                    panel["rollout_shots_sum"] += int(shots_count)
+                    panel["terminated_rollouts"] += int(bool(done))
+                    panel["num_rollouts"] += 1
+                    terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
+                        rollout_state,
+                        done=bool(done),
+                        shot_clock=getattr(game_state.env, "shot_clock", None),
+                    )
+                    _increment_count(panel["terminal_outcomes"], terminal_key, 1)
+                    if turnover_reason:
+                        _increment_count(panel["turnover_reasons"], turnover_reason, 1)
+                    completed += 1
+                    update_playbook_progress(completed, total_rollouts)
+
+        panels = []
+        for intent_index in intent_indices:
+            panel = panel_accumulators[int(intent_index)]
+            rollouts_done = max(1, int(panel["num_rollouts"]))
+            shot_stats_by_player = {
+                str(pid): {
+                    "attempts": int((stats or {}).get("attempts", 0) or 0),
+                    "makes": int((stats or {}).get("makes", 0) or 0),
+                }
+                for pid, stats in (panel["player_shot_stats"] or {}).items()
+            }
+            total_shot_attempts = int(
+                sum(stats["attempts"] for stats in shot_stats_by_player.values())
+            )
+            total_shot_makes = int(
+                sum(stats["makes"] for stats in shot_stats_by_player.values())
+            )
+            terminal_outcomes = {
+                str(key): int(value or 0)
+                for key, value in (panel["terminal_outcomes"] or {}).items()
+            }
+            turnover_reasons = {
+                str(key): int(value or 0)
+                for key, value in (panel["turnover_reasons"] or {}).items()
+            }
+            panels.append(
+                {
+                    "intent_index": int(intent_index),
+                    "num_rollouts": int(panel["num_rollouts"]),
+                    "avg_steps": float(panel["rollout_lengths_sum"] / rollouts_done),
+                    "avg_passes": float(panel["rollout_passes_sum"] / rollouts_done),
+                    "avg_shots": float(panel["rollout_shots_sum"] / rollouts_done),
+                    "terminated_rate": float(panel["terminated_rollouts"] / rollouts_done),
+                    "player_heatmaps": panel["player_heatmaps"],
+                    "ball_heatmap": panel["ball_heatmap"],
+                    "shot_heatmap": panel["shot_heatmap"],
+                    "player_shot_heatmaps": panel["player_shot_heatmaps"],
+                    "shot_stats": {
+                        "by_player": shot_stats_by_player,
+                        "total": {
+                            "attempts": total_shot_attempts,
+                            "makes": total_shot_makes,
+                        },
+                    },
+                    "terminal_outcomes": terminal_outcomes,
+                    "turnover_reasons": turnover_reasons,
+                    "pass_links": dict(sorted(panel["pass_links"].items())),
+                    "base_state": panel["base_state"],
+                    "player_path_segments": {
+                        str(pid): _serialize_segment_counts(segments)
+                        for pid, segments in (panel["player_path_segments"] or {}).items()
+                    },
+                    "ball_path_segments": _serialize_segment_counts(panel["ball_path_segments"]),
+                    "pass_path_segments": _serialize_pass_segment_counts(panel["pass_path_segments"]),
+                }
+            )
+
+        return jsonable_encoder({
+            "status": "success",
+            "source": source_label,
+            "num_rollouts": int(num_rollouts),
+            "total_rollouts": int(total_rollouts),
+            "max_steps": int(max_steps),
+            "run_to_end": bool(run_to_end),
+            "offense_ids": offense_ids,
+            "used_parallel": bool(num_workers is not None),
+            "num_workers": int(num_workers or 1),
+            "panels": panels,
+        }, custom_encoder=_NUMPY_SAFE_ENCODER)
+    except HTTPException:
+        raise
+    except Exception as e:
+        fail_playbook_progress(str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to run playbook analysis: {e}")
+    finally:
+        if get_playbook_progress().get("status") == "running":
+            update_playbook_progress(total_rollouts, total_rollouts)
+        _restore_restorable_backend_state(live_restore_state)
+        game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
+
+
+@router.get("/api/playbook_progress")
+def playbook_progress():
+    return get_playbook_progress()
 
 
 @router.post("/api/offense_skills")

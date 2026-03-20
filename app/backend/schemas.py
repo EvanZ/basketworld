@@ -112,6 +112,16 @@ class ReplayCounterfactualRequest(BaseModel):
     max_steps: int = 256
 
 
+class PlaybookAnalysisRequest(BaseModel):
+    intent_indices: List[int]
+    num_rollouts: int = 16
+    max_steps: int = 8
+    run_to_end: bool = False
+    use_snapshot: bool = True
+    player_deterministic: bool = False
+    opponent_deterministic: bool = True
+
+
 class OffenseSkillsPayload(BaseModel):
     layup: List[float]
     three_pt: List[float]

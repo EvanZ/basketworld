@@ -745,5 +745,59 @@ def get_mlflow_training_params(
         int,
         16,
     )
+    training_params["intent_selector_enabled"] = _get_param(
+        params,
+        ["intent_selector_enabled", "intent-selector-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_selector_hidden_dim"] = _get_param(
+        params,
+        ["intent_selector_hidden_dim", "intent-selector-hidden-dim"],
+        int,
+        64,
+    )
+    training_params["intent_selector_alpha_start"] = _get_param(
+        params,
+        ["intent_selector_alpha_start", "intent-selector-alpha-start"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_alpha_end"] = _get_param(
+        params,
+        ["intent_selector_alpha_end", "intent-selector-alpha-end"],
+        float,
+        1.0,
+    )
+    training_params["intent_selector_alpha_warmup_steps"] = _get_param(
+        params,
+        [
+            "intent_selector_alpha_warmup_steps",
+            "intent-selector-alpha-warmup-steps",
+        ],
+        int,
+        0,
+    )
+    training_params["intent_selector_alpha_ramp_steps"] = _get_param(
+        params,
+        ["intent_selector_alpha_ramp_steps", "intent-selector-alpha-ramp-steps"],
+        int,
+        1,
+    )
+    training_params["intent_selector_entropy_coef"] = _get_param(
+        params,
+        ["intent_selector_entropy_coef", "intent-selector-entropy-coef"],
+        float,
+        0.01,
+    )
+    training_params["intent_selector_usage_reg_coef"] = _get_param(
+        params,
+        [
+            "intent_selector_usage_reg_coef",
+            "intent-selector-usage-reg-coef",
+        ],
+        float,
+        0.01,
+    )
 
     return training_params

@@ -11,7 +11,7 @@ import app.backend.state as backend_state
 import basketworld.utils.mlflow_config as mlflow_config
 from app.backend.routes import admin_routes
 from app.backend.routes import lifecycle_routes
-from app.backend.schemas import InitGameRequest, ReplayCounterfactualRequest
+from app.backend.schemas import InitGameRequest, PlaybookAnalysisRequest, ReplayCounterfactualRequest
 from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv, Team
 
 
@@ -208,6 +208,100 @@ def test_replay_counterfactual_snapshot_route_replays_deterministically(isolated
     )
 
     assert _encode(second["states"]) == _encode(first["states"])
+
+
+def test_playbook_analysis_route_aggregates_and_restores_live_state(isolated_game_state):
+    _init_live_game(isolated_game_state)
+    backend_state.capture_counterfactual_snapshot()
+
+    baseline_positions = [tuple(pos) for pos in isolated_game_state.env.positions]
+    baseline_ball_holder = int(isolated_game_state.env.ball_holder)
+    baseline_intent_index = int(isolated_game_state.env.intent_index)
+    baseline_reward_history = copy.deepcopy(isolated_game_state.reward_history)
+    baseline_snapshot = copy.deepcopy(isolated_game_state.counterfactual_snapshot)
+
+    body = admin_routes.playbook_analysis_route(
+        PlaybookAnalysisRequest(
+            intent_indices=[0, 2],
+            num_rollouts=2,
+            max_steps=3,
+            use_snapshot=True,
+            player_deterministic=False,
+            opponent_deterministic=True,
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["source"] == "snapshot"
+    assert body["offense_ids"] == list(isolated_game_state.env.offense_ids)
+    assert len(body["panels"]) == 2
+    assert {panel["intent_index"] for panel in body["panels"]} == {0, 2}
+    for panel in body["panels"]:
+        assert panel["ball_heatmap"]
+        assert isinstance(panel["player_heatmaps"], dict)
+        assert isinstance(panel["player_shot_heatmaps"], dict)
+        assert isinstance(panel["shot_stats"], dict)
+        assert isinstance(panel["shot_stats"]["by_player"], dict)
+        assert isinstance(panel["shot_stats"]["total"], dict)
+        assert isinstance(panel["terminal_outcomes"], dict)
+        assert isinstance(panel["turnover_reasons"], dict)
+        assert panel["num_rollouts"] == 2
+        assert panel["base_state"]
+        assert isinstance(panel["player_path_segments"], dict)
+        assert isinstance(panel["ball_path_segments"], list)
+        assert isinstance(panel["pass_path_segments"], list)
+        assert all(isinstance(segments, list) for segments in panel["player_path_segments"].values())
+        for segment in panel["pass_path_segments"]:
+            assert "passer_id" in segment
+            assert "receiver_id" in segment
+
+    assert [tuple(pos) for pos in isolated_game_state.env.positions] == baseline_positions
+    assert int(isolated_game_state.env.ball_holder) == baseline_ball_holder
+    assert int(isolated_game_state.env.intent_index) == baseline_intent_index
+    assert isolated_game_state.reward_history == baseline_reward_history
+
+
+def test_playbook_analysis_run_to_end_ignores_max_steps(isolated_game_state, monkeypatch):
+    _init_live_game(isolated_game_state)
+    backend_state.capture_counterfactual_snapshot()
+
+    steps = {"count": 0}
+
+    def fake_step(_req):
+        steps["count"] += 1
+        isolated_game_state.env.shot_clock -= 1
+        done = steps["count"] >= 3
+        isolated_game_state.env.episode_ended = done
+        return {
+            "state": {
+                "done": done,
+                "last_action_results": {},
+            }
+        }
+
+    monkeypatch.setattr(lifecycle_routes, "step", fake_step)
+
+    body = admin_routes.playbook_analysis_route(
+        PlaybookAnalysisRequest(
+            intent_indices=[0],
+            num_rollouts=1,
+            max_steps=1,
+            run_to_end=True,
+            use_snapshot=True,
+            player_deterministic=False,
+            opponent_deterministic=True,
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["run_to_end"] is True
+    assert steps["count"] == 3
+    assert body["panels"][0]["avg_steps"] == pytest.approx(3.0)
+    assert isolated_game_state.counterfactual_snapshot is not None
+    progress = admin_routes.playbook_progress()
+    assert progress["status"] == "completed"
+    assert progress["completed"] == 1
+    assert progress["total"] == 1
 
 
 def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_state):

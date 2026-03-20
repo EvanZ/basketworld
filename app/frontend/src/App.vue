@@ -105,6 +105,13 @@ const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
+const playbookAnalysis = ref(null);
+const selectedPlaybookIntent = ref(null);
+const playbookShowPlayerPaths = ref(true);
+const playbookShowBallPaths = ref(true);
+const playbookShowPassPaths = ref(false);
+const playbookShowShotHeatmap = ref(false);
+const playbookPlayerFilter = ref('all');
 const shotChartTarget = ref('team');
 const assistLinksByPair = ref({});
 const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
@@ -319,6 +326,89 @@ const boardShotChartLabel = computed(() =>
     ? (shotChartOptions.value.find((o) => o.value === shotChartTarget.value)?.label || '')
     : '',
 );
+const playbookIntentOptions = computed(() => {
+  const panels = Array.isArray(playbookAnalysis.value?.panels) ? playbookAnalysis.value.panels : [];
+  return panels
+    .map((panel) => ({
+      value: Number(panel.intent_index),
+      label: `z=${Number(panel.intent_index)}`,
+    }))
+    .filter((opt) => Number.isFinite(opt.value));
+});
+const playbookPlayerOptions = computed(() => {
+  const offenseIds = Array.isArray(selectedPlaybookPanel.value?.base_state?.offense_ids)
+    ? selectedPlaybookPanel.value.base_state.offense_ids
+    : (Array.isArray(gameState.value?.offense_ids) ? gameState.value.offense_ids : []);
+  return [
+    { value: 'all', label: 'All offense' },
+    ...offenseIds
+      .map((rawId) => Number(rawId))
+      .filter((pid) => Number.isFinite(pid))
+      .map((pid) => ({ value: String(pid), label: `Player ${pid}` })),
+  ];
+});
+const selectedPlaybookPanel = computed(() => {
+  const panels = Array.isArray(playbookAnalysis.value?.panels) ? playbookAnalysis.value.panels : [];
+  if (panels.length === 0) return null;
+  const selected = Number(selectedPlaybookIntent.value);
+  return panels.find((panel) => Number(panel.intent_index) === selected) || panels[0];
+});
+const isPlaybookBoardPreviewActive = computed(() =>
+  activeControlsTab.value === 'playbook'
+  && !!selectedPlaybookPanel.value?.base_state
+);
+const playbookSummaryLabel = computed(() => {
+  const panel = selectedPlaybookPanel.value;
+  if (!panel) return '';
+  const rollouts = Number(panel.num_rollouts || 0);
+  const avgSteps = Number(panel.avg_steps || 0).toFixed(2);
+  const avgPasses = Number(panel.avg_passes || 0).toFixed(2);
+  const terminated = Math.round(Number(panel.terminated_rate || 0) * 100);
+  return `${rollouts} rollouts • ${avgSteps} avg steps • ${avgPasses} avg passes • ${terminated}% terminated`;
+});
+const boardGameHistory = computed(() =>
+  isPlaybookBoardPreviewActive.value
+    ? [selectedPlaybookPanel.value?.base_state].filter(Boolean)
+    : gameHistory.value
+);
+const boardPlaybookOverlay = computed(() =>
+  isPlaybookBoardPreviewActive.value
+    ? {
+        ...(selectedPlaybookPanel.value || {}),
+        display: {
+          showPlayerPaths: Boolean(playbookShowPlayerPaths.value),
+          showBallPaths: Boolean(playbookShowBallPaths.value),
+          showPassPaths: Boolean(playbookShowPassPaths.value),
+          showShotHeatmap: Boolean(playbookShowShotHeatmap.value),
+          playerFilter: String(playbookPlayerFilter.value || 'all'),
+        },
+      }
+    : null
+);
+const boardRenderKey = computed(() => {
+  if (!isPlaybookBoardPreviewActive.value) return `live-${activeControlsTab.value}`;
+  return [
+    'playbook',
+    String(selectedPlaybookIntent.value ?? 'none'),
+    playbookShowPlayerPaths.value ? 'players1' : 'players0',
+    playbookShowBallPaths.value ? 'ball1' : 'ball0',
+    playbookShowPassPaths.value ? 'pass1' : 'pass0',
+    playbookShowShotHeatmap.value ? 'shots1' : 'shots0',
+    String(playbookPlayerFilter.value || 'all'),
+  ].join('-');
+});
+const boardPolicyProbabilities = computed(() =>
+  isPlaybookBoardPreviewActive.value ? null : policyProbs.value
+);
+const boardSelectedActionsDisplay = computed(() =>
+  isPlaybookBoardPreviewActive.value ? {} : visibleBoardSelectedActions.value
+);
+const boardShotAccumulatorDisplay = computed(() =>
+  isPlaybookBoardPreviewActive.value ? {} : shotAccumulatorForBoard.value
+);
+const boardShotChartLabelDisplay = computed(() =>
+  isPlaybookBoardPreviewActive.value ? '' : boardShotChartLabel.value
+);
 
 const selectedSankeyLinkMap = computed(() => {
   const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
@@ -441,6 +531,8 @@ async function handleGameStarted(setupData) {
   // Clear move history for new game
   moveHistory.value = [];
   shotAccumulator.value = {};
+  playbookAnalysis.value = null;
+  selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
   potentialAssistLinksByPair.value = {};
@@ -852,6 +944,22 @@ function handleMctsToggleChanged(val) {
 
 function handleActiveTabChanged(tab) {
   activeControlsTab.value = tab || 'controls';
+}
+
+function handlePlaybookAnalysisLoaded(result) {
+  playbookAnalysis.value = result || null;
+  const panels = Array.isArray(result?.panels) ? result.panels : [];
+  if (panels.length === 0) {
+    selectedPlaybookIntent.value = null;
+    playbookPlayerFilter.value = 'all';
+    return;
+  }
+  const current = Number(selectedPlaybookIntent.value);
+  const hasCurrent = panels.some((panel) => Number(panel.intent_index) === current);
+  if (!hasCurrent) {
+    selectedPlaybookIntent.value = Number(panels[0].intent_index);
+  }
+  playbookPlayerFilter.value = 'all';
 }
 
 // Computed: which selections to show on board (user or self-play)
@@ -1952,8 +2060,8 @@ onBeforeUnmount(() => {
       <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
       <div class="top-row">
       <div class="board-area">
-        <div v-if="showShotChartSelector || showSankeySelector" class="shot-chart-selector">
-          <template v-if="showShotChartSelector">
+        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
+          <template v-if="activeControlsTab !== 'playbook' && showShotChartSelector">
             <label>Shot chart:</label>
             <select v-model="shotChartTarget">
               <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
@@ -1961,7 +2069,7 @@ onBeforeUnmount(() => {
               </option>
             </select>
           </template>
-          <template v-if="showSankeySelector">
+          <template v-if="activeControlsTab !== 'playbook' && showSankeySelector">
             <label>Sankey:</label>
             <select v-model="sankeyFlowMode">
               <option value="assisted">Assisted makes</option>
@@ -1975,16 +2083,49 @@ onBeforeUnmount(() => {
               <option value="three">3PT</option>
             </select>
           </template>
+          <template v-if="activeControlsTab === 'playbook' && playbookIntentOptions.length > 0">
+            <label>Playbook:</label>
+            <select v-model.number="selectedPlaybookIntent">
+              <option v-for="opt in playbookIntentOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <label>Player:</label>
+            <select v-model="playbookPlayerFilter">
+              <option v-for="opt in playbookPlayerOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <label class="inline-check">
+              <input type="checkbox" v-model="playbookShowPlayerPaths" />
+              <span>Players</span>
+            </label>
+            <label class="inline-check">
+              <input type="checkbox" v-model="playbookShowBallPaths" />
+              <span>Ball</span>
+            </label>
+            <label class="inline-check">
+              <input type="checkbox" v-model="playbookShowPassPaths" />
+              <span>Passes</span>
+            </label>
+            <label class="inline-check">
+              <input type="checkbox" v-model="playbookShowShotHeatmap" />
+              <span>Shots</span>
+            </label>
+            <span class="status-note">{{ playbookSummaryLabel }}</span>
+          </template>
         </div>
         <GameBoard 
+          :key="boardRenderKey"
           ref="gameBoardRef"
-          :game-history="gameHistory" 
+          :game-history="boardGameHistory" 
+          :playbook-overlay="boardPlaybookOverlay"
           v-model:activePlayerId="activePlayerId"
-          :policy-probabilities="policyProbs"
+          :policy-probabilities="boardPolicyProbabilities"
           :is-manual-stepping="isManualStepping"
-          :selected-actions="visibleBoardSelectedActions"
-          :shot-accumulator="shotAccumulatorForBoard"
-          :shot-chart-label="boardShotChartLabel"
+          :selected-actions="boardSelectedActionsDisplay"
+          :shot-accumulator="boardShotAccumulatorDisplay"
+          :shot-chart-label="boardShotChartLabelDisplay"
           :placement-mode="isEvalPlacementMode"
           :placement-editable="evalConfig.placementEditing"
           :placement-positions="evalConfig.positions"
@@ -1996,9 +2137,12 @@ onBeforeUnmount(() => {
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
+          :disable-backend-value-fetches="isPlaybookBoardPreviewActive"
+          :allow-position-drag="!isPlaybookBoardPreviewActive"
+          :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"
         />
         <AssistSankey
-          v-if="!isEvalPlacementMode && hasAssistSankeyData"
+          v-if="!isEvalPlacementMode && hasAssistSankeyData && !isPlaybookBoardPreviewActive"
           :links="assistSankeyLinks"
           :player-ids="assistSankeyPlayerIds"
           :title="assistSankeyTitle"
@@ -2046,6 +2190,7 @@ onBeforeUnmount(() => {
           @mcts-toggle-changed="handleMctsToggleChanged"
           @state-updated="handlePatchedGameState"
           @counterfactual-replay-loaded="handleCounterfactualReplayLoaded"
+          @playbook-analysis-loaded="handlePlaybookAnalysisLoaded"
           @eval-config-changed="handleEvalConfigChanged"
           @eval-run="handleEvalRunRequested"
           @active-tab-changed="handleActiveTabChanged"
@@ -2351,6 +2496,20 @@ header {
   color: var(--app-text);
   border-radius: 10px;
   padding: 0.25rem 0.5rem;
+}
+.shot-chart-selector .inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--app-text-muted);
+  font-size: 0.9rem;
+}
+.shot-chart-selector .inline-check input {
+  accent-color: #38bdf8;
+}
+.shot-chart-selector .status-note {
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
 }
 
 .controls-area {

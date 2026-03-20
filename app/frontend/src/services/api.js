@@ -460,6 +460,36 @@ export async function replayCounterfactualSnapshot(payload = {}) {
   return response.json();
 }
 
+export async function runPlaybookAnalysis(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/playbook_analysis`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      intent_indices: Array.isArray(payload.intent_indices) ? payload.intent_indices : [],
+      num_rollouts: payload.num_rollouts ?? 16,
+      max_steps: payload.max_steps ?? 8,
+      run_to_end: payload.run_to_end ?? false,
+      use_snapshot: payload.use_snapshot ?? true,
+      player_deterministic: payload.player_deterministic ?? false,
+      opponent_deterministic: payload.opponent_deterministic ?? true,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to run playbook analysis');
+  }
+  return response.json();
+}
+
+export async function getPlaybookProgress() {
+  const response = await fetch(`${API_BASE_URL}/api/playbook_progress`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch playbook progress');
+  }
+  return response.json();
+}
+
 export async function resetTurnState() {
   const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
     method: 'POST',

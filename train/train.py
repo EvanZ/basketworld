@@ -110,6 +110,7 @@ try:
         build_pass_curriculum_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
+        build_intent_selector_callback,
         build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
@@ -150,6 +151,7 @@ except ImportError:
         build_pass_curriculum_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
+        build_intent_selector_callback,
         build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
@@ -261,6 +263,38 @@ def main(args):
             mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
             mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
             mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
+            mlflow.log_param(
+                "intent_selector_enabled",
+                getattr(args, "intent_selector_enabled", False),
+            )
+            mlflow.log_param(
+                "intent_selector_hidden_dim",
+                getattr(args, "intent_selector_hidden_dim", 64),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_start",
+                getattr(args, "intent_selector_alpha_start", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_end",
+                getattr(args, "intent_selector_alpha_end", 1.0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_warmup_steps",
+                getattr(args, "intent_selector_alpha_warmup_steps", 0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_ramp_steps",
+                getattr(args, "intent_selector_alpha_ramp_steps", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_entropy_coef",
+                getattr(args, "intent_selector_entropy_coef", 0.01),
+            )
+            mlflow.log_param(
+                "intent_selector_usage_reg_coef",
+                getattr(args, "intent_selector_usage_reg_coef", 0.01),
+            )
         mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
         mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
         mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
@@ -314,6 +348,16 @@ def main(args):
                 print("[Info] Using --net-arch for set-attention head MLP.")
             else:
                 print("[Info] Using --net-arch-pi/vf for set-attention head MLP.")
+            if getattr(args, "intent_selector_enabled", False):
+                if not getattr(args, "enable_intent_learning", False):
+                    raise ValueError(
+                        "--intent-selector-enabled requires --enable-intent-learning."
+                    )
+                if str(getattr(args, "intent_obs_mode", "private_offense")).lower() == "hidden":
+                    raise ValueError(
+                        "--intent-selector-enabled is incompatible with --intent-obs-mode hidden "
+                        "because the low-level policy would not see the selected play."
+                    )
             policy_kwargs["embed_dim"] = int(getattr(args, "set_embed_dim", 64))
             policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
             policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))
@@ -328,6 +372,13 @@ def main(args):
                 getattr(args, "set_intent_embedding_dim", 16)
             )
             policy_kwargs["num_intents"] = int(getattr(args, "num_intents", 8))
+            policy_kwargs["intent_selector_enabled"] = bool(
+                getattr(args, "intent_selector_enabled", False)
+                and getattr(args, "enable_intent_learning", False)
+            )
+            policy_kwargs["intent_selector_hidden_dim"] = int(
+                getattr(args, "intent_selector_hidden_dim", 64)
+            )
             print(
                 "Set-attention config:",
                 f"embed_dim={policy_kwargs['embed_dim']}",
@@ -338,9 +389,15 @@ def main(args):
                 f"head_activation={policy_kwargs['head_activation']}",
                 f"intent_embedding_enabled={policy_kwargs['intent_embedding_enabled']}",
                 f"intent_embedding_dim={policy_kwargs['intent_embedding_dim']}",
+                f"intent_selector_enabled={policy_kwargs['intent_selector_enabled']}",
+                f"intent_selector_hidden_dim={policy_kwargs['intent_selector_hidden_dim']}",
                 f"mirror_episode_prob={getattr(args, 'mirror_episode_prob', 0.0)}",
             )
         else:
+            if getattr(args, "intent_selector_enabled", False):
+                raise ValueError(
+                    "--intent-selector-enabled currently requires --use-set-obs."
+                )
             # Prevent the policy from learning directly from action_mask
             policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
         
@@ -379,6 +436,8 @@ def main(args):
                         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
                         "SetAttentionExtractor": SetAttentionExtractor,
                     }
+                    if getattr(args, "intent_selector_enabled", False):
+                        custom_objects["policy_kwargs"] = policy_kwargs
                     unified_policy = PPO.load(
                         uni_local, env=temp_env, device=device, custom_objects=custom_objects
                     )
@@ -691,6 +750,8 @@ def main(args):
         )
         # Optional DIAYN-style intent diversity objective
         intent_diversity_callback = build_intent_diversity_callback(args)
+        # Optional high-level selector mu(z|s) for offense play calling.
+        intent_selector_callback = build_intent_selector_callback(args)
         # Optional diagnostic for whether the policy actually responds to latent intent.
         intent_policy_sensitivity_callback = build_intent_policy_sensitivity_callback(
             args
@@ -861,6 +922,7 @@ def main(args):
                 intent_robustness_callback,
                 intent_diversity_callback,
                 intent_policy_sensitivity_callback,
+                intent_selector_callback,
             )
             
             # Single learn() call trains both offense and defense together

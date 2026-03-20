@@ -1,11 +1,13 @@
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import {
   getActionValues,
+  getPlaybookProgress,
   getRewards,
   mctsAdvise,
+  runPlaybookAnalysis,
   setOffenseSkills,
   setPassTargetStrategy,
   setPassLogitBias,
@@ -139,7 +141,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -270,6 +272,32 @@ function buildDisplaySelections(selections) {
 }
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
+const selectorTrainingParams = computed(() => props.gameState?.training_params || {});
+const selectorEnabled = computed(() =>
+  Boolean(selectorTrainingParams.value?.intent_selector_enabled)
+);
+const selectorAlphaSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const start = selectorTrainingParams.value?.intent_selector_alpha_start;
+  const end = selectorTrainingParams.value?.intent_selector_alpha_end;
+  if (start === null || start === undefined) return 'N/A';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const selectorScheduleSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.intent_selector_alpha_warmup_steps;
+  const ramp = selectorTrainingParams.value?.intent_selector_alpha_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
+const selectorHeadContextLabel = computed(() => {
+  const policyClass = String(selectorTrainingParams.value?.policy_class || '');
+  return policyClass.includes('SetAttention') ? 'Shared set-attention encoder' : 'Shared policy encoder';
+});
 const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
 const pressureExposureDisplay = computed(() => {
   const val = Number(props.pressureExposure);
@@ -380,6 +408,26 @@ const intentStateUpdating = ref(false);
 const intentStateError = ref(null);
 const counterfactualSnapshotUpdating = ref(false);
 const counterfactualSnapshotError = ref(null);
+const playbookIntentInput = ref('');
+const playbookNumRollouts = ref(24);
+const playbookMaxSteps = ref(8);
+const playbookRunToEnd = ref(false);
+const playbookUseSnapshot = ref(true);
+const playbookPlayerDeterministic = ref(false);
+const playbookOpponentDeterministic = ref(true);
+const playbookRunning = ref(false);
+const playbookError = ref(null);
+const playbookResult = ref(null);
+const playbookProgress = ref({
+  running: false,
+  completed: 0,
+  total: 0,
+  fraction: 0,
+  status: 'idle',
+  error: null,
+});
+let playbookProgressPollHandle = null;
+let playbookProgressPollBusy = false;
 const pressureParamsInput = ref({
   three_pt_extra_hex_decay: 0.05,
   shot_pressure_enabled: true,
@@ -468,6 +516,11 @@ const counterfactualSnapshotControlsDisabled = computed(() =>
   !props.gameState ||
   props.isEvaluating ||
   props.isReplaying
+);
+const playbookControlsDisabled = computed(() =>
+  playbookRunning.value ||
+  !props.gameState ||
+  props.isEvaluating
 );
 
 const passTargetStrategyValue = computed(() => {
@@ -680,6 +733,28 @@ const evalProgressSafe = computed(() => {
 });
 
 const evalProgressPercent = computed(() => `${(evalProgressSafe.value.fraction * 100).toFixed(1)}%`);
+
+const playbookProgressSafe = computed(() => {
+  const incoming = playbookProgress.value && typeof playbookProgress.value === 'object'
+    ? playbookProgress.value
+    : {};
+  const total = Math.max(0, Number(incoming.total || 0));
+  const rawCompleted = Math.max(0, Number(incoming.completed || 0));
+  const completed = total > 0 ? Math.min(total, rawCompleted) : rawCompleted;
+  const fraction = total > 0
+    ? Math.max(0, Math.min(1, Number.isFinite(Number(incoming.fraction)) ? Number(incoming.fraction) : (completed / total)))
+    : 0;
+  return {
+    running: Boolean(incoming.running),
+    completed,
+    total,
+    fraction,
+    status: String(incoming.status || 'idle'),
+    error: incoming.error || null,
+  };
+});
+
+const playbookProgressPercent = computed(() => `${(playbookProgressSafe.value.fraction * 100).toFixed(1)}%`);
 
 function updateEvalEpisodes(val) {
   const safe = Math.max(1, Number(val) || 1);
@@ -1033,6 +1108,171 @@ async function handleReplayCounterfactualSnapshot() {
   }
 }
 
+function resetPlaybookProgressState(total = 0) {
+  playbookProgress.value = {
+    running: total > 0,
+    completed: 0,
+    total: Math.max(0, Number(total || 0)),
+    fraction: 0,
+    status: total > 0 ? 'running' : 'idle',
+    error: null,
+  };
+}
+
+function stopPlaybookProgressPolling() {
+  if (playbookProgressPollHandle !== null) {
+    clearInterval(playbookProgressPollHandle);
+    playbookProgressPollHandle = null;
+  }
+}
+
+async function pollPlaybookProgressOnce() {
+  if (playbookProgressPollBusy) return;
+  playbookProgressPollBusy = true;
+  try {
+    const payload = await getPlaybookProgress();
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      ...(payload || {}),
+    };
+  } catch (err) {
+    console.error('[PlayerControls] Failed to fetch playbook progress', err);
+  } finally {
+    playbookProgressPollBusy = false;
+  }
+}
+
+function startPlaybookProgressPolling(total = 0) {
+  stopPlaybookProgressPolling();
+  resetPlaybookProgressState(total);
+  void pollPlaybookProgressOnce();
+  playbookProgressPollHandle = window.setInterval(() => {
+    void pollPlaybookProgressOnce();
+  }, 750);
+}
+
+function getPlaybookShotStatsForPanel(panel) {
+  const rawByPlayer = panel?.shot_stats?.by_player || {};
+  const offenseIds = Array.isArray(props.gameState?.offense_ids)
+    ? props.gameState.offense_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id))
+    : [];
+  const seen = new Set();
+  const orderedIds = [];
+  for (const pid of offenseIds) {
+    const key = String(pid);
+    seen.add(key);
+    orderedIds.push(key);
+  }
+  for (const key of Object.keys(rawByPlayer)) {
+    if (!seen.has(String(key))) {
+      orderedIds.push(String(key));
+    }
+  }
+  return orderedIds.map((key) => {
+    const stats = rawByPlayer?.[key] || {};
+    return {
+      playerId: Number(key),
+      attempts: Number(stats?.attempts || 0),
+      makes: Number(stats?.makes || 0),
+    };
+  });
+}
+
+function formatPlaybookOutcomeKey(rawKey) {
+  const key = String(rawKey || '').trim();
+  switch (key) {
+    case 'shot_make':
+      return 'Made shots';
+    case 'shot_miss':
+      return 'Missed shots';
+    case 'turnover':
+      return 'Turnovers';
+    case 'defensive_violation':
+      return 'Defensive violations';
+    case 'shot_clock_expiration':
+      return 'Shot clock expirations';
+    case 'horizon_cutoff':
+      return 'Horizon cutoffs';
+    case 'other_terminal':
+      return 'Other terminal';
+    default:
+      return key.replaceAll('_', ' ');
+  }
+}
+
+function formatPlaybookTurnoverReason(rawKey) {
+  const key = String(rawKey || '').trim();
+  switch (key) {
+    case 'steal':
+      return 'Steal';
+    case 'out_of_bounds':
+      return 'Out of bounds';
+    case 'pressure':
+      return 'Pressure';
+    case 'offensive_three_seconds':
+      return 'Offensive 3 seconds';
+    case 'unknown':
+      return 'Unknown';
+    default:
+      return key.replaceAll('_', ' ');
+  }
+}
+
+async function handleRunPlaybookAnalysis() {
+  if (!props.gameState || playbookControlsDisabled.value) return;
+  if (!playbookSelectedIntentIndices.value.length) {
+    playbookError.value = 'Provide at least one valid intent index.';
+    return;
+  }
+  if (playbookUseSnapshot.value && !counterfactualSnapshotAvailable.value) {
+    playbookError.value = 'Capture a snapshot first, or switch the source to current state.';
+    return;
+  }
+
+  playbookRunning.value = true;
+  playbookError.value = null;
+  const totalRollouts = playbookSelectedIntentIndices.value.length * Number(playbookNumRollouts.value || 16);
+  startPlaybookProgressPolling(totalRollouts);
+  try {
+    const res = await runPlaybookAnalysis({
+      intent_indices: playbookSelectedIntentIndices.value,
+      num_rollouts: Number(playbookNumRollouts.value || 16),
+      max_steps: Number(playbookMaxSteps.value || 8),
+      run_to_end: Boolean(playbookRunToEnd.value),
+      use_snapshot: Boolean(playbookUseSnapshot.value),
+      player_deterministic: Boolean(playbookPlayerDeterministic.value),
+      opponent_deterministic: Boolean(playbookOpponentDeterministic.value),
+    });
+    if (res?.status === 'success') {
+      playbookResult.value = res;
+      emit('playbook-analysis-loaded', res);
+      playbookProgress.value = {
+        ...playbookProgress.value,
+        running: false,
+        completed: Number(res?.total_rollouts || totalRollouts || 0),
+        total: Number(res?.total_rollouts || totalRollouts || 0),
+        fraction: 1,
+        status: 'completed',
+        error: null,
+      };
+    } else {
+      throw new Error(res?.detail || 'Failed to generate playbook analysis');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to run playbook analysis', err);
+    playbookError.value = err?.message || 'Failed to run playbook analysis';
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      running: false,
+      status: 'failed',
+      error: err?.message || 'Failed to run playbook analysis',
+    };
+  } finally {
+    stopPlaybookProgressPolling();
+    playbookRunning.value = false;
+  }
+}
+
 function _normalizePressurePayload(input) {
   return {
     three_pt_extra_hex_decay: Number(input?.three_pt_extra_hex_decay ?? 0.05),
@@ -1251,6 +1491,7 @@ const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'stats', label: 'Stats' },
   { id: 'entropy', label: 'Entropy' },
   { id: 'policy', label: 'Policy' },
+  { id: 'playbook', label: 'Playbook' },
   { id: 'advisor', label: 'Advisor' },
   { id: 'moves', label: 'Moves' },
   { id: 'eval', label: 'Eval' },
@@ -1434,6 +1675,10 @@ const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, M
 
 function ensureStatsDiagnosticFields(target) {
   if (!target || typeof target !== 'object') return;
+  if (!target.intentSelectionCounts || typeof target.intentSelectionCounts !== 'object') {
+    target.intentSelectionCounts = {};
+  }
+  target.intentInactiveCount = Number(target.intentInactiveCount || 0);
   if (!target.turnoverReasons || typeof target.turnoverReasons !== 'object') {
     target.turnoverReasons = {};
   }
@@ -1543,6 +1788,23 @@ const actionMixRows = computed(() => {
       asRow('pass', 'PASS'),
       asRow('other', 'OTHER'),
     ],
+  };
+});
+
+const intentSelectionRows = computed(() => {
+  const raw = statsState.value?.intentSelectionCounts || {};
+  const rows = Object.entries(raw)
+    .map(([intent, count]) => ({
+      intent: Number(intent),
+      label: `z=${Number(intent)}`,
+      count: Number(count || 0),
+    }))
+    .filter((row) => Number.isFinite(row.intent))
+    .sort((a, b) => a.intent - b.intent);
+  return {
+    rows,
+    inactiveCount: Number(statsState.value?.intentInactiveCount || 0),
+    total: rows.reduce((acc, row) => acc + row.count, 0) + Number(statsState.value?.intentInactiveCount || 0),
   };
 });
 
@@ -1915,6 +2177,15 @@ function applyEvaluationStats(
   }
 
   if (evalDiagnostics && typeof evalDiagnostics === 'object') {
+    const intentRaw = evalDiagnostics.intent_selection_counts || {};
+    next.intentSelectionCounts = {};
+    for (const [intent, count] of Object.entries(intentRaw)) {
+      const idx = Number(intent);
+      if (!Number.isFinite(idx)) continue;
+      next.intentSelectionCounts[String(idx)] = Number(count || 0);
+    }
+    next.intentInactiveCount = Number(evalDiagnostics.intent_inactive_count || 0);
+
     const reasonsRaw = evalDiagnostics.turnover_reasons || {};
     next.turnoverReasons = {};
     for (const [reason, count] of Object.entries(reasonsRaw)) {
@@ -1988,6 +2259,12 @@ async function copyStatsMarkdown() {
       String(count),
       `${(actionTotal > 0 ? (Number(count) / actionTotal) * 100 : 0).toFixed(1)}%`,
     ]);
+    const intentRows = Object.entries(s.intentSelectionCounts || {})
+      .map(([intent, count]) => [`z=${Number(intent)}`, String(Number(count || 0))])
+      .sort((a, b) => Number(a[0].slice(2)) - Number(b[0].slice(2)));
+    if (Number(s.intentInactiveCount || 0) > 0) {
+      intentRows.push(['No intent', String(Number(s.intentInactiveCount || 0))]);
+    }
     const rb = s.rewardBreakdown || {};
     const rewardRows = [
       ['Total reward', Number(rb.totalReward || 0).toFixed(2)],
@@ -2026,6 +2303,11 @@ async function copyStatsMarkdown() {
       '| Action | Count | Rate |',
       '| --- | --- | --- |',
       table(actionRows),
+      '',
+      '## Offense Intent Starts',
+      '| Intent | Count |',
+      '| --- | --- |',
+      table(intentRows.length ? intentRows : [['(none)', '0']]),
       '',
       '## Reward Decomposition',
       '| Component | Value |',
@@ -2198,6 +2480,19 @@ const policyRowsByPlayer = computed(() => {
 const hasPolicyData = computed(() =>
   policyRowsByPlayer.value.some((row) => Array.isArray(row.actions) && row.actions.length > 0)
 );
+const playbookSelectedIntentIndices = computed(() => {
+  const maxIntent = Math.max(0, Number(props.gameState?.num_intents || 1) - 1);
+  const raw = String(playbookIntentInput.value || '')
+    .split(',')
+    .map((part) => Number(part.trim()))
+    .filter((val) => Number.isFinite(val));
+  const out = [];
+  for (const val of raw) {
+    const idx = Math.max(0, Math.min(maxIntent, Math.round(val)));
+    if (!out.includes(idx)) out.push(idx);
+  }
+  return out;
+});
 
 // Shot probability display is handled on the board
 
@@ -2303,6 +2598,20 @@ watch(() => props.gameState, async (newGameState) => {
     valueRange.value = { min: 0, max: 0 };
   }
 }, { immediate: true });
+
+watch(
+  () => [props.gameState?.num_intents, props.gameState?.intent_commitment_steps],
+  ([numIntents, commitment]) => {
+    if (!playbookIntentInput.value) {
+      const count = Math.max(1, Math.min(4, Number(numIntents || 1)));
+      playbookIntentInput.value = Array.from({ length: count }, (_, idx) => idx).join(', ');
+    }
+    if (!playbookMaxSteps.value || playbookMaxSteps.value <= 0) {
+      playbookMaxSteps.value = Math.max(1, Number(commitment || 8));
+    }
+  },
+  { immediate: true },
+);
 
 
 // Watch for the list of players to be populated, then set the first one as active.
@@ -2980,6 +3289,10 @@ onMounted(() => {
     setTimeout(() => refreshTabsTeleportTarget(), 0);
   });
   emit('active-tab-changed', activeTab.value);
+});
+
+onBeforeUnmount(() => {
+  stopPlaybookProgressPolling();
 });
 
 watch(resolvedTabsMount, () => {
@@ -3928,6 +4241,42 @@ const stealRisks = computed(() => {
           </div>
           <div class="param-category">
             <h5>
+              Offense Intent Starts
+              <span
+                class="category-help"
+                title="Count of offense intent index at episode start during evaluation. This reflects the active offense intent sampled/applied when each eval episode began."
+                aria-label="Offense intent starts help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total number of evaluated episode starts counted for offense intent.">
+              <span class="param-name">Total starts:</span>
+              <span class="param-value">{{ intentSelectionRows.total }}</span>
+            </div>
+            <div
+              v-for="row in intentSelectionRows.rows"
+              :key="`intent-start-${row.intent}`"
+              class="param-item"
+              data-tooltip="Number of evaluation episodes that started with this offense intent index active."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.count }}</span>
+            </div>
+            <div
+              v-if="intentSelectionRows.inactiveCount > 0"
+              class="param-item"
+              data-tooltip="Episodes where offense intent learning was enabled but no active intent was present at episode start."
+            >
+              <span class="param-name">No intent:</span>
+              <span class="param-value">{{ intentSelectionRows.inactiveCount }}</span>
+            </div>
+            <div v-if="intentSelectionRows.total === 0" class="param-item" data-tooltip="No offense intent start counts were recorded in this evaluation window.">
+              <span class="param-name">(none)</span>
+              <span class="param-value">0</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
               Reward Decomposition
               <span
                 class="category-help"
@@ -4088,6 +4437,191 @@ const stealRisks = computed(() => {
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Playbook Tab -->
+    <div v-if="activeTab === 'playbook'" class="tab-content">
+      <div class="entropy-section">
+        <h4>Playbook</h4>
+        <p class="entropy-note">
+          Aggregate intent-conditioned rollout patterns from the current state or a captured snapshot. The main board renders trajectory overlays after generation.
+        </p>
+
+        <div class="playbook-controls">
+          <div class="eval-row">
+            <label>Intent indices</label>
+            <input
+              type="text"
+              v-model="playbookIntentInput"
+              placeholder="0, 1, 2, 3"
+              :disabled="playbookControlsDisabled"
+            />
+            <span class="status-note">Parsed: {{ playbookSelectedIntentIndices.join(', ') || 'none' }}</span>
+          </div>
+
+          <div class="eval-row">
+            <label>Rollouts</label>
+            <input
+              type="number"
+              min="1"
+              max="512"
+              v-model.number="playbookNumRollouts"
+              :disabled="playbookControlsDisabled"
+            />
+            <label>Horizon</label>
+            <input
+              type="number"
+              min="1"
+              max="256"
+              v-model.number="playbookMaxSteps"
+              :disabled="playbookControlsDisabled || playbookRunToEnd"
+            />
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookRunToEnd"
+                :disabled="playbookControlsDisabled"
+              />
+              Run to end
+            </label>
+            <button
+              class="eval-run-btn"
+              @click="handleRunPlaybookAnalysis"
+              :disabled="playbookControlsDisabled"
+            >
+              {{ playbookRunning ? 'Generating…' : 'Generate' }}
+            </button>
+          </div>
+
+          <div v-if="playbookRunning" class="eval-progress-wrap">
+            <div
+              class="eval-progress-bar"
+              :aria-valuenow="playbookProgressSafe.completed"
+              :aria-valuemin="0"
+              :aria-valuemax="Math.max(1, playbookProgressSafe.total)"
+              role="progressbar"
+            >
+              <div
+                class="eval-progress-fill"
+                :class="{ indeterminate: playbookProgressSafe.total <= 0 }"
+                :style="playbookProgressSafe.total > 0 ? { width: playbookProgressPercent } : null"
+              />
+            </div>
+            <span class="eval-status">
+              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || (playbookSelectedIntentIndices.length * Number(playbookNumRollouts || 0)) }}
+            </span>
+            <span class="eval-status" v-if="playbookProgressSafe.total > 0">({{ playbookProgressPercent }})</span>
+          </div>
+
+          <div class="eval-row">
+            <label class="inline-label">
+              <input
+                type="radio"
+                :checked="playbookUseSnapshot"
+                @change="playbookUseSnapshot = true"
+                :disabled="playbookControlsDisabled"
+              />
+              Snapshot source
+            </label>
+            <label class="inline-label">
+              <input
+                type="radio"
+                :checked="!playbookUseSnapshot"
+                @change="playbookUseSnapshot = false"
+                :disabled="playbookControlsDisabled"
+              />
+              Current state source
+            </label>
+            <span class="status-note" v-if="playbookUseSnapshot">
+              {{ counterfactualSnapshotAvailable ? 'Using captured snapshot as pinned start state.' : 'No snapshot available yet.' }}
+            </span>
+          </div>
+
+          <div class="eval-row">
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookPlayerDeterministic"
+                :disabled="playbookControlsDisabled"
+              />
+              Player deterministic
+            </label>
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookOpponentDeterministic"
+                :disabled="playbookControlsDisabled"
+              />
+              Opponent deterministic
+            </label>
+            <span class="status-note">
+              {{ playbookRunToEnd
+                ? 'Rollouts continue until the possession ends; Horizon is ignored.'
+                : 'Fully deterministic rollouts from the same source state collapse to a single trajectory.' }}
+            </span>
+          </div>
+        </div>
+
+        <div class="policy-status error" v-if="playbookError">
+          {{ playbookError }}
+        </div>
+
+        <div v-if="!playbookResult?.panels?.length" class="no-data">
+          No playbook preview generated yet.
+        </div>
+        <div v-else class="status-note">
+          Generated {{ playbookResult.panels.length }} intent trajectories using
+          {{ playbookResult.run_to_end ? 'full-possession rollouts' : `a ${playbookResult.max_steps}-step horizon` }}.
+          Use the Playbook dropdown above the main board to inspect them.
+        </div>
+        <div v-if="playbookResult?.panels?.length" class="playbook-debug-grid">
+          <div
+            v-for="panel in playbookResult.panels"
+            :key="`playbook-debug-${panel.intent_index}`"
+            class="playbook-debug-card"
+          >
+            <div class="playbook-debug-title">z={{ panel.intent_index }}</div>
+            <div class="playbook-debug-line">
+              Total shots:
+              <strong>{{ panel?.shot_stats?.total?.attempts ?? 0 }}</strong>
+              attempts /
+              <strong>{{ panel?.shot_stats?.total?.makes ?? 0 }}</strong>
+              makes
+            </div>
+            <div
+              v-for="entry in getPlaybookShotStatsForPanel(panel)"
+              :key="`playbook-debug-${panel.intent_index}-p${entry.playerId}`"
+              class="playbook-debug-line"
+            >
+              P{{ entry.playerId }}:
+              <strong>{{ entry.attempts }}</strong>
+              attempts /
+              <strong>{{ entry.makes }}</strong>
+              makes
+            </div>
+            <div class="playbook-debug-subtitle">Terminal outcomes</div>
+            <div
+              v-for="(count, outcomeKey) in (panel?.terminal_outcomes || {})"
+              :key="`playbook-debug-${panel.intent_index}-outcome-${outcomeKey}`"
+              class="playbook-debug-line"
+            >
+              {{ formatPlaybookOutcomeKey(outcomeKey) }}:
+              <strong>{{ count }}</strong>
+            </div>
+            <template v-if="panel?.turnover_reasons && Object.keys(panel.turnover_reasons).length">
+              <div class="playbook-debug-subtitle">Turnover reasons</div>
+              <div
+                v-for="(count, reasonKey) in panel.turnover_reasons"
+                :key="`playbook-debug-${panel.intent_index}-turnover-${reasonKey}`"
+                class="playbook-debug-line"
+              >
+                {{ formatPlaybookTurnoverReason(reasonKey) }}:
+                <strong>{{ count }}</strong>
+              </div>
+            </template>
           </div>
         </div>
       </div>
@@ -4969,6 +5503,34 @@ const stealRisks = computed(() => {
               </div>
             </div>
           </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector</h5>
+            <div class="param-item" data-tooltip="Whether the learned play selector mu(z|s) was enabled in the loaded training run.">
+              <span class="param-name">Enabled:</span>
+              <span class="param-value">{{ selectorEnabled ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation mixes uniform intent sampling with selector-driven play calling using alpha.">
+              <span class="param-name">Alpha schedule:</span>
+              <span class="param-value">{{ selectorAlphaSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Warmup and ramp window controlling when selector-driven play calling begins to replace uniform sampling.">
+              <span class="param-name">Warmup / ramp:</span>
+              <span class="param-value">{{ selectorScheduleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Entropy regularization applied to the selector's categorical distribution over intents.">
+              <span class="param-name">Entropy coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_entropy_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Coverage regularizer that penalizes selector collapse by pushing average usage back toward uniform.">
+              <span class="param-name">Usage reg coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="The selector head uses the shared set-attention state encoder and emits logits over intents at offense possession start.">
+              <span class="param-name">Architecture:</span>
+              <span class="param-value">{{ selectorEnabled ? `${selectorHeadContextLabel}, separate selector head` : 'N/A' }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -5176,6 +5738,54 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="Clip range applied to the normalized discriminator bonus before reward shaping.">
               <span class="param-name">Bonus clip:</span>
               <span class="param-value">{{ props.gameState.training_params.intent_diversity_clip ?? 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector Architecture</h5>
+            <div class="param-item" data-tooltip="Whether the learned high-level play selector head mu(z|s) was enabled for this run.">
+              <span class="param-name">Selector enabled:</span>
+              <span class="param-value">{{ selectorEnabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation uses the same shared set-attention encoder and adds a separate categorical selector head over intents.">
+              <span class="param-name">Selector context:</span>
+              <span class="param-value">{{ selectorHeadContextLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Hidden width of the selector head MLP before intent logits.">
+              <span class="param-name">Head hidden dim:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_hidden_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation samples mu only at offense possession start, not every timestep.">
+              <span class="param-name">Decision boundary:</span>
+              <span class="param-value">Offense possession start</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation is the callback prototype, not the future integrated hierarchical PPO path.">
+              <span class="param-name">Integration:</span>
+              <span class="param-value">Callback prototype</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector Mechanics</h5>
+            <div class="param-item" data-tooltip="mu does not fully replace uniform intent sampling immediately. It mixes between uniform play sampling and selector-driven play choice using alpha.">
+              <span class="param-name">Alpha schedule:</span>
+              <span class="param-value">{{ selectorAlphaSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent before selector usage begins, followed by the selector ramp window.">
+              <span class="param-name">Schedule:</span>
+              <span class="param-value">{{ selectorScheduleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Entropy regularization on the selector distribution over intents. This is distinct from low-level PPO action entropy.">
+              <span class="param-name">Selector entropy coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_entropy_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="KL-to-uniform regularization on average selector usage to prevent early play collapse.">
+              <span class="param-name">Usage reg coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="The action policy still produces low-level pi(a|s,z); the selector only chooses z at possession start.">
+              <span class="param-name">Low-level policy:</span>
+              <span class="param-value">Conditioned on selected z</span>
             </div>
           </div>
 
@@ -6804,6 +7414,59 @@ const stealRisks = computed(() => {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
+}
+.playbook-controls .eval-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.playbook-controls .inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.playbook-results-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.playbook-debug-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.9rem;
+}
+.playbook-debug-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.75rem 0.9rem;
+  background: rgba(15, 23, 42, 0.52);
+}
+.playbook-debug-title {
+  color: #38bdf8;
+  font-weight: 700;
+  margin-bottom: 0.45rem;
+}
+.playbook-debug-subtitle {
+  color: #94a3b8;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-top: 0.6rem;
+  margin-bottom: 0.15rem;
+}
+.playbook-debug-line {
+  color: #cbd5e1;
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+.playbook-debug-line strong {
+  color: #f8fafc;
+  font-weight: 700;
 }
 .eval-run-btn {
   padding: 0.5rem 1rem;

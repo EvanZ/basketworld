@@ -120,3 +120,23 @@ def test_wrapper_reconditions_intent_fields_for_opponent_role():
     assert opponent.last_obs is not None
     assert float(opponent.last_obs["role_flag"][0]) == 1.0
     assert float(opponent.last_obs["intent_visible"][0]) == 1.0
+
+
+def test_wrapper_set_offense_intent_state_reconditions_cached_training_obs():
+    env = HexagonBasketballEnv(
+        players=3,
+        render_mode=None,
+        training_team=Team.OFFENSE,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+    )
+    opponent = _DummySB3Policy(output_actions=[0, 0, 0])
+    wrapped = SelfPlayEnvWrapper(env, opponent_policy=opponent)
+
+    wrapped.reset(seed=17)
+    wrapped.set_offense_intent_state(2, intent_active=True, intent_age=0)
+
+    assert wrapped._last_obs is not None
+    assert float(wrapped._last_obs["intent_index"][0]) == 2.0
+    assert float(wrapped._last_obs["intent_active"][0]) == 1.0
+    assert float(wrapped._last_obs["intent_visible"][0]) == 1.0

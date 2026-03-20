@@ -79,6 +79,16 @@ class GameState:
             "status": "idle",
             "error": None,
         }
+        self._playbook_progress_lock = Lock()
+        self.playbook_progress: dict = {
+            "running": False,
+            "completed": 0,
+            "total": 0,
+            "started_at": None,
+            "finished_at": None,
+            "status": "idle",
+            "error": None,
+        }
 
 
 game_state = GameState()
@@ -130,6 +140,58 @@ def fail_evaluation_progress(error: str) -> None:
 def get_evaluation_progress() -> dict:
     with game_state._evaluation_progress_lock:
         payload = dict(game_state.evaluation_progress)
+    total = int(payload.get("total") or 0)
+    completed = int(payload.get("completed") or 0)
+    payload["fraction"] = float(completed / total) if total > 0 else 0.0
+    return payload
+
+
+def reset_playbook_progress(total: int = 0) -> None:
+    with game_state._playbook_progress_lock:
+        game_state.playbook_progress = {
+            "running": bool(total > 0),
+            "completed": 0,
+            "total": int(max(0, total)),
+            "started_at": time.time() if total > 0 else None,
+            "finished_at": None,
+            "status": "running" if total > 0 else "idle",
+            "error": None,
+        }
+
+
+def update_playbook_progress(completed: int, total: int | None = None) -> None:
+    with game_state._playbook_progress_lock:
+        current_total = int(game_state.playbook_progress.get("total") or 0)
+        next_total = current_total if total is None else int(max(0, total))
+        next_completed = int(max(0, completed))
+        running = next_completed < next_total if next_total > 0 else False
+        game_state.playbook_progress.update(
+            {
+                "completed": next_completed,
+                "total": next_total,
+                "running": running,
+                "status": "running" if running else ("completed" if next_total > 0 else "idle"),
+            }
+        )
+        if not running and next_total > 0:
+            game_state.playbook_progress["finished_at"] = time.time()
+
+
+def fail_playbook_progress(error: str) -> None:
+    with game_state._playbook_progress_lock:
+        game_state.playbook_progress.update(
+            {
+                "running": False,
+                "status": "failed",
+                "error": str(error),
+                "finished_at": time.time(),
+            }
+        )
+
+
+def get_playbook_progress() -> dict:
+    with game_state._playbook_progress_lock:
+        payload = dict(game_state.playbook_progress)
     total = int(payload.get("total") or 0)
     completed = int(payload.get("completed") or 0)
     payload["fraction"] = float(completed / total) if total > 0 else 0.0
@@ -202,27 +264,12 @@ def _build_counterfactual_snapshot_metadata() -> dict:
     }
 
 
-def get_counterfactual_snapshot_summary() -> dict:
-    snapshot = getattr(game_state, "counterfactual_snapshot", None)
-    metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
-    return {
-        "available": bool(snapshot),
-        "captured_step": metadata.get("captured_step"),
-        "shot_clock": metadata.get("shot_clock"),
-        "ball_holder": metadata.get("ball_holder"),
-        "intent_active": metadata.get("intent_active"),
-        "intent_index": metadata.get("intent_index"),
-        "intent_age": metadata.get("intent_age"),
-        "captured_at": metadata.get("captured_at"),
-    }
-
-
-def capture_counterfactual_snapshot() -> dict:
-    """Capture a restorable snapshot of the current env/session state."""
+def _capture_restorable_backend_state() -> dict:
+    """Capture enough backend session state to restore the current live branch exactly."""
     if not game_state.env or game_state.obs is None:
         raise RuntimeError("Game not initialized.")
 
-    snapshot = {
+    return {
         "env": copy.deepcopy(game_state.env),
         "user_team": copy.deepcopy(game_state.user_team),
         "obs": copy.deepcopy(game_state.obs),
@@ -241,17 +288,13 @@ def capture_counterfactual_snapshot() -> dict:
         "actions_log": copy.deepcopy(game_state.actions_log),
         "episode_states": copy.deepcopy(game_state.episode_states),
         "playable_session": copy.deepcopy(game_state.playable_session),
-        "metadata": _build_counterfactual_snapshot_metadata(),
     }
-    game_state.counterfactual_snapshot = snapshot
-    return get_counterfactual_snapshot_summary()
 
 
-def restore_counterfactual_snapshot() -> dict:
-    """Restore the most recently captured counterfactual snapshot."""
-    snapshot = getattr(game_state, "counterfactual_snapshot", None)
+def _restore_restorable_backend_state(snapshot: dict) -> None:
+    """Restore backend session state from `_capture_restorable_backend_state` output."""
     if not snapshot:
-        raise RuntimeError("No counterfactual snapshot available.")
+        raise RuntimeError("Missing backend restore snapshot.")
 
     game_state.env = copy.deepcopy(snapshot["env"])
     game_state.user_team = copy.deepcopy(snapshot["user_team"])
@@ -272,9 +315,40 @@ def restore_counterfactual_snapshot() -> dict:
     game_state.episode_states = copy.deepcopy(snapshot["episode_states"])
     game_state.playable_session = copy.deepcopy(snapshot["playable_session"])
 
-    # Make "reset turn" use the restored state as its new branch point.
     _rebuild_cached_obs()
     _capture_turn_start_snapshot()
+
+
+def get_counterfactual_snapshot_summary() -> dict:
+    snapshot = getattr(game_state, "counterfactual_snapshot", None)
+    metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+    return {
+        "available": bool(snapshot),
+        "captured_step": metadata.get("captured_step"),
+        "shot_clock": metadata.get("shot_clock"),
+        "ball_holder": metadata.get("ball_holder"),
+        "intent_active": metadata.get("intent_active"),
+        "intent_index": metadata.get("intent_index"),
+        "intent_age": metadata.get("intent_age"),
+        "captured_at": metadata.get("captured_at"),
+    }
+
+
+def capture_counterfactual_snapshot() -> dict:
+    """Capture a restorable snapshot of the current env/session state."""
+    snapshot = _capture_restorable_backend_state()
+    snapshot["metadata"] = _build_counterfactual_snapshot_metadata()
+    game_state.counterfactual_snapshot = snapshot
+    return get_counterfactual_snapshot_summary()
+
+
+def restore_counterfactual_snapshot() -> dict:
+    """Restore the most recently captured counterfactual snapshot."""
+    snapshot = getattr(game_state, "counterfactual_snapshot", None)
+    if not snapshot:
+        raise RuntimeError("No counterfactual snapshot available.")
+
+    _restore_restorable_backend_state(snapshot)
     return get_counterfactual_snapshot_summary()
 
 

@@ -725,6 +725,62 @@ def get_parser() -> argparse.ArgumentParser:
         help="Max flattened action features used by discriminator input.",
     )
     parser.add_argument(
+        "--intent-selector-enabled",
+        dest="intent_selector_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable a learned high-level selector mu(z|s) for offense intent at possession start.",
+    )
+    parser.add_argument(
+        "--intent-selector-hidden-dim",
+        dest="intent_selector_hidden_dim",
+        type=int,
+        default=64,
+        help="Hidden width for the intent selector head.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-start",
+        dest="intent_selector_alpha_start",
+        type=float,
+        default=0.0,
+        help="Initial probability of using the learned selector instead of uniform intent sampling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-end",
+        dest="intent_selector_alpha_end",
+        type=float,
+        default=1.0,
+        help="Final probability of using the learned selector instead of uniform intent sampling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-warmup-steps",
+        dest="intent_selector_alpha_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to wait before ramping selector-driven play calling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-ramp-steps",
+        dest="intent_selector_alpha_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps over which selector influence ramps from alpha-start to alpha-end.",
+    )
+    parser.add_argument(
+        "--intent-selector-entropy-coef",
+        dest="intent_selector_entropy_coef",
+        type=float,
+        default=0.01,
+        help="Entropy regularization coefficient for the high-level intent selector.",
+    )
+    parser.add_argument(
+        "--intent-selector-usage-reg-coef",
+        dest="intent_selector_usage_reg_coef",
+        type=float,
+        default=0.01,
+        help="KL-to-uniform regularization coefficient to keep selector intent usage broad during ramp-in.",
+    )
+    parser.add_argument(
         "--intent-policy-sensitivity-enabled",
         dest="intent_policy_sensitivity_enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],

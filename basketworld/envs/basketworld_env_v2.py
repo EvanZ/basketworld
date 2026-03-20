@@ -1809,6 +1809,39 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
+    @profile_section("set_offense_intent_state")
+    def set_offense_intent_state(
+        self,
+        intent_index: int,
+        *,
+        intent_active: bool = True,
+        intent_age: int = 0,
+        intent_commitment_remaining: Optional[int] = None,
+    ) -> None:
+        try:
+            z = int(max(0, min(max(1, int(self.num_intents)) - 1, int(intent_index))))
+            active = bool(intent_active) and bool(self.enable_intent_learning)
+            age = int(max(0, int(intent_age)))
+            if intent_commitment_remaining is None:
+                remaining = (
+                    max(0, int(self.intent_commitment_steps) - age) if active else 0
+                )
+            else:
+                remaining = int(max(0, int(intent_commitment_remaining)))
+            if not active:
+                z = 0
+                age = 0
+                remaining = 0
+            self._set_role_intent_state(
+                True,
+                intent_index=z,
+                intent_active=active,
+                intent_age=age,
+                intent_commitment_remaining=remaining,
+            )
+        except Exception:
+            pass
+
     @profile_section("_get_player_distances")
     def _get_player_distances(self, base_id: int, target_ids: List[int]) -> np.ndarray:
         """Return hex distances from `base_id` to each ID in `target_ids`."""

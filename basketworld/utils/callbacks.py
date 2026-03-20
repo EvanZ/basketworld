@@ -22,8 +22,10 @@ from basketworld.utils.intent_discovery import (
     flatten_observation_for_env,
 )
 from basketworld.utils.intent_policy_sensitivity import (
+    clone_observation_dict,
     compute_policy_sensitivity_metrics,
     extract_single_env_observation,
+    patch_intent_in_observation,
 )
 
 
@@ -1358,6 +1360,388 @@ class IntentDiversityCallback(BaseCallback):
             usage_entropy, min_prob = self._usage_entropy(y_np, self.num_intents)
             mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
             mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
+        except Exception:
+            pass
+
+
+class IntentSelectorCallback(BaseCallback):
+    """Learn a high-level selector mu(z|s) and optionally override offense intent starts."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        alpha_start: float = 0.0,
+        alpha_end: float = 1.0,
+        warmup_steps: int = 0,
+        ramp_steps: int = 1,
+        entropy_coef: float = 0.01,
+        usage_reg_coef: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.alpha_start = float(alpha_start)
+        self.alpha_end = float(alpha_end)
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.ramp_steps = max(0, int(ramp_steps))
+        self.entropy_coef = float(max(0.0, entropy_coef))
+        self.usage_reg_coef = float(max(0.0, usage_reg_coef))
+
+        self._device = torch.device("cpu")
+        self._return_stats = RunningMeanStd()
+        self._episode_start_records_by_env: dict[int, dict] = {}
+        self._completed_selector_samples: list[dict] = []
+
+    @staticmethod
+    def _extract_scalar_from_obs(
+        obs_payload, key: str, env_idx: int, default: float = 0.0
+    ) -> float:
+        try:
+            if not isinstance(obs_payload, dict) or key not in obs_payload:
+                return float(default)
+            arr = np.asarray(obs_payload[key], dtype=np.float32)
+            if arr.ndim == 0:
+                return float(arr)
+            if arr.shape[0] <= int(env_idx):
+                return float(default)
+            return float(np.asarray(arr[int(env_idx)]).reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _obs_batch_size(obs_payload) -> int:
+        try:
+            if not isinstance(obs_payload, dict):
+                return 0
+            for value in obs_payload.values():
+                arr = np.asarray(value)
+                if arr.ndim >= 1:
+                    return int(arr.shape[0])
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _stack_single_observations(single_obs_list: list[dict]) -> dict:
+        if not single_obs_list:
+            raise ValueError("single_obs_list cannot be empty")
+        keys = list(single_obs_list[0].keys())
+        batched: dict[str, np.ndarray] = {}
+        for key in keys:
+            batched[key] = np.stack(
+                [np.asarray(obs[key]) for obs in single_obs_list], axis=0
+            )
+        return batched
+
+    def _alpha_current(self) -> float:
+        t = int(getattr(self.model, "num_timesteps", 0))
+        if t < self.warmup_steps:
+            return float(self.alpha_start)
+        if self.ramp_steps <= 0:
+            return float(self.alpha_end)
+        progress = min(
+            1.0, max(0.0, (t - self.warmup_steps) / float(self.ramp_steps))
+        )
+        return float(self.alpha_start + progress * (self.alpha_end - self.alpha_start))
+
+    def _neutralize_selector_observation(self, single_obs: dict) -> dict:
+        selector_obs = clone_observation_dict(single_obs)
+        patch_intent_in_observation(
+            selector_obs,
+            0,
+            self.num_intents,
+            active=0.0,
+            visible=0.0,
+            age_norm=0.0,
+        )
+        return selector_obs
+
+    def _apply_selected_intent(self, obs_payload, env_idx: int, intent_index: int) -> None:
+        visible = self._extract_scalar_from_obs(
+            obs_payload, "intent_visible", env_idx, default=1.0
+        )
+        try:
+            self.training_env.env_method(
+                "set_offense_intent_state",
+                int(intent_index),
+                indices=[int(env_idx)],
+                intent_active=True,
+                intent_age=0,
+            )
+        except Exception:
+            pass
+        patch_intent_in_observation(
+            obs_payload,
+            int(intent_index),
+            self.num_intents,
+            active=1.0,
+            visible=visible,
+            age_norm=0.0,
+            batch_index=env_idx,
+        )
+
+    def _maybe_select_for_episode_start(self, obs_payload, env_idx: int) -> None:
+        if not self.enabled or not isinstance(obs_payload, dict):
+            return
+        if self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0) <= 0.0:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        if self._extract_scalar_from_obs(obs_payload, "intent_active", env_idx, default=0.0) <= 0.5:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+
+        alpha = self._alpha_current()
+        if alpha <= 0.0 or np.random.random() >= alpha:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+
+        n_envs = self._obs_batch_size(obs_payload)
+        if n_envs <= 0:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        try:
+            start_obs = extract_single_env_observation(
+                obs_payload,
+                env_idx=env_idx,
+                expected_batch_size=n_envs,
+            )
+        except Exception:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        selector_obs = self._neutralize_selector_observation(start_obs)
+        policy = getattr(self.model, "policy", None)
+        if policy is None:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        try:
+            was_training = bool(getattr(policy, "training", False))
+            if hasattr(policy, "eval"):
+                policy.eval()
+            with torch.no_grad():
+                logits = policy.get_intent_selector_logits(selector_obs)
+                dist = torch.distributions.Categorical(logits=logits)
+                chosen_z = int(dist.sample().reshape(-1)[0].item())
+        except Exception:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        finally:
+            try:
+                if was_training and hasattr(policy, "train"):
+                    policy.train()
+            except Exception:
+                pass
+
+        self._apply_selected_intent(obs_payload, env_idx, chosen_z)
+        self._episode_start_records_by_env[int(env_idx)] = {
+            "selector_obs": selector_obs,
+            "chosen_z": int(chosen_z),
+            "alpha": float(alpha),
+        }
+
+    def _on_training_start(self) -> None:
+        if not self.enabled:
+            return
+        policy = getattr(self.model, "policy", None)
+        if policy is None or not hasattr(policy, "has_intent_selector") or not policy.has_intent_selector():
+            raise RuntimeError(
+                "Intent selector callback requires a policy with intent_selector_enabled=True."
+            )
+        try:
+            self._device = torch.device(policy.device)
+        except Exception:
+            self._device = torch.device("cpu")
+        self._episode_start_records_by_env = {}
+        self._completed_selector_samples = []
+
+    def _on_rollout_start(self) -> None:
+        if not self.enabled:
+            return
+        obs_payload = getattr(self.model, "_last_obs", None)
+        if not isinstance(obs_payload, dict):
+            return
+        n_envs = self._obs_batch_size(obs_payload)
+        if n_envs <= 0:
+            return
+        episode_starts = getattr(self.model, "_last_episode_starts", None)
+        if episode_starts is None or len(np.asarray(episode_starts).reshape(-1)) != n_envs:
+            episode_starts = np.ones(n_envs, dtype=bool)
+        else:
+            episode_starts = np.asarray(episode_starts, dtype=bool).reshape(-1)
+        for env_idx in range(n_envs):
+            if bool(episode_starts[env_idx]):
+                self._maybe_select_for_episode_start(obs_payload, env_idx)
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
+        obs_payload = self.locals.get("new_obs", None)
+        if not isinstance(obs_payload, dict) or not isinstance(infos, (list, tuple)):
+            return True
+        n_envs = min(len(infos), len(dones), self._obs_batch_size(obs_payload))
+        for env_idx in range(n_envs):
+            if not bool(dones[env_idx]):
+                continue
+            start_record = self._episode_start_records_by_env.pop(int(env_idx), None)
+            episode_info = infos[env_idx].get("episode") if isinstance(infos[env_idx], dict) else None
+            if (
+                start_record is not None
+                and isinstance(episode_info, dict)
+                and "r" in episode_info
+            ):
+                self._completed_selector_samples.append(
+                    {
+                        **start_record,
+                        "episode_return": float(episode_info.get("r", 0.0)),
+                    }
+                )
+            self._maybe_select_for_episode_start(obs_payload, env_idx)
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled or not self._completed_selector_samples:
+            return
+
+        policy = getattr(self.model, "policy", None)
+        if policy is None:
+            self._completed_selector_samples = []
+            return
+
+        samples = list(self._completed_selector_samples)
+        self._completed_selector_samples = []
+        selector_obs_batch = self._stack_single_observations(
+            [sample["selector_obs"] for sample in samples]
+        )
+        returns_np = np.asarray(
+            [sample["episode_return"] for sample in samples], dtype=np.float32
+        )
+        chosen_z_np = np.asarray([sample["chosen_z"] for sample in samples], dtype=np.int64)
+        returns_norm = (returns_np - float(self._return_stats.mean)) / float(
+            self._return_stats.std
+        )
+        self._return_stats.update(returns_np)
+
+        obs_tensor, _ = policy.obs_to_tensor(selector_obs_batch)
+        logits = policy.get_intent_selector_logits(obs_tensor)
+        dist = torch.distributions.Categorical(logits=logits)
+        chosen_z = torch.as_tensor(chosen_z_np, dtype=torch.long, device=logits.device)
+        advantage = torch.as_tensor(
+            returns_norm, dtype=torch.float32, device=logits.device
+        )
+        log_prob = dist.log_prob(chosen_z)
+        entropy = dist.entropy().mean()
+        prob_tensor = torch.softmax(logits, dim=-1)
+        mean_probs = prob_tensor.mean(dim=0)
+        usage_kl = torch.sum(
+            mean_probs * torch.log(mean_probs.clamp_min(1e-8) * float(self.num_intents))
+        )
+        policy_loss = -(advantage * log_prob).mean()
+        total_loss = (
+            policy_loss
+            - float(self.entropy_coef) * entropy
+            + float(self.usage_reg_coef) * usage_kl
+        )
+
+        optimizer = getattr(policy, "optimizer", None)
+        if optimizer is None:
+            return
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        global_step = int(getattr(self.model, "num_timesteps", 0))
+        usage_counts = np.bincount(chosen_z_np, minlength=self.num_intents).astype(np.float64)
+        usage_probs = usage_counts / max(1.0, float(np.sum(usage_counts)))
+        nonzero = usage_probs > 0.0
+        usage_entropy = float(-np.sum(usage_probs[nonzero] * np.log(usage_probs[nonzero])))
+        mean_probs_np = mean_probs.detach().cpu().numpy().astype(np.float64, copy=False)
+        top1_np = torch.argmax(logits, dim=-1).detach().cpu().numpy().astype(np.int64, copy=False)
+        top1_counts = np.bincount(top1_np, minlength=self.num_intents).astype(np.float64)
+        top1_probs = top1_counts / max(1.0, float(np.sum(top1_counts)))
+        max_prob_np = torch.max(prob_tensor, dim=-1).values.detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
+        top2_vals = torch.topk(prob_tensor, k=min(2, self.num_intents), dim=-1).values
+        if top2_vals.shape[-1] >= 2:
+            margin_np = (
+                top2_vals[:, 0] - top2_vals[:, 1]
+            ).detach().cpu().numpy().astype(np.float64, copy=False)
+        else:
+            margin_np = max_prob_np.copy()
+        try:
+            mlflow.log_metric(
+                "intent/selector_alpha_current",
+                float(self._alpha_current()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_loss", float(total_loss.detach().cpu().item()), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/selector_policy_loss",
+                float(policy_loss.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_entropy",
+                float(entropy.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_usage_entropy",
+                float(usage_entropy),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_usage_kl_uniform",
+                float(usage_kl.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_return_mean",
+                float(np.mean(returns_np)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_samples",
+                float(len(samples)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_confidence_mean",
+                float(np.mean(max_prob_np)) if max_prob_np.size > 0 else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_margin_mean",
+                float(np.mean(margin_np)) if margin_np.size > 0 else 0.0,
+                step=global_step,
+            )
+            for z in range(self.num_intents):
+                mlflow.log_metric(
+                    f"intent/selector_usage_by_intent/{z}",
+                    float(usage_probs[z]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/selector_prob_mean_by_intent/{z}",
+                    float(mean_probs_np[z]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/selector_top1_by_intent/{z}",
+                    float(top1_probs[z]),
+                    step=global_step,
+                )
+                selected_mask = chosen_z_np == z
+                if np.any(selected_mask):
+                    mlflow.log_metric(
+                        f"intent/selector_return_by_intent/{z}",
+                        float(np.mean(returns_np[selected_mask])),
+                        step=global_step,
+                    )
         except Exception:
             pass
 

@@ -1221,10 +1221,10 @@ Keep the low-level policy interface unchanged:
 This keeps Stage 3 compatible with the current low-level architecture and isolates the
 new complexity to possession-start play selection.
 
-### Clean integrated implementation target
+### Integrated `mu` selector implementation target
 
 The callback-based selector prototype is acceptable for smoke testing, but it is not the
-final architecture. The clean solution is to keep `mu` inside the same policy object and
+final architecture. The integrated `mu` selector solution is to keep `mu` inside the same policy object and
 the same PPO optimization pass, while still treating it as a slower-timescale decision.
 
 Desired end state:
@@ -1240,7 +1240,7 @@ That means:
 2. `mu` is also not trained as a callback-side afterthought
 3. selector log-prob, entropy, and advantage should be first-class rollout data
 
-#### Why this is the clean solution
+#### Why this is the integrated solution
 
 It removes the main ambiguity in the prototype:
 
@@ -1277,11 +1277,25 @@ fit cleanly into the existing per-step-only rollout schema without explicit book
 
 Selector should run only at possession start or play-selection boundary.
 
+Intent source precedence should remain explicit:
+
+1. explicit user/admin override of `z`
+2. otherwise selector choice `mu(z | s_context)`
+3. otherwise fallback env/default intent sampling
+
+This is required so that:
+
+1. Playbook analysis can still force a chosen intent
+2. counterfactual replay can still hold state fixed and swap only `z`
+3. UI debugging can still compare same-state behavior under different forced plays
+4. eval can still support forced-intent ablations in addition to selector-driven play calling
+
 For each environment `env_idx`:
 
 1. detect whether this timestep is a selector boundary
    - initially: episode start / possession start
-   - later: optionally commitment-window boundary
+   - later: commitment-window boundary when offense still has a live possession
+   - allow the selector to re-emit the same `z`; reselection does not imply forced play change
 
 2. build selector context from the current observation
    - clone observation
@@ -1299,6 +1313,7 @@ For each environment `env_idx`:
 
 5. write selected `z` into env state and observation fields
    - this becomes the play seen by the low-level policy for the commitment window
+   - if an explicit override is present, skip selector sampling and write the forced `z` instead
 
 6. store one selector-decision record
    - selector log-prob
@@ -1306,6 +1321,8 @@ For each environment `env_idx`:
    - selected `z`
    - boundary timestep
    - env index
+   - selector segment start step
+   - selector segment end step once known
    - optional selector value estimate if using a selector critic
 
 Then normal low-level PPO rollout collection continues step-by-step.
@@ -1346,11 +1363,20 @@ Recommended if doing full PPO-style selector learning:
 10. `selector_valid_mask[t, env]`
    - whether this timestep holds a real selector decision to optimize
 
+11. `selector_segment_id[t, env]`
+   - identifies which selector-controlled commitment segment a step belongs to
+
+12. `selector_boundary_type[t, env]`
+   - possession start vs commitment-expiry reselection
+
+13. `selector_next_boundary_mask[t, env]`
+   - whether this segment ended because another selector choice happened before episode end
+
 #### Recommended selector credit assignment
 
 The selector action should receive credit from the possession it initiated.
 
-For the initial clean implementation:
+For the initial integrated `mu` selector implementation:
 
 1. selector decision happens at possession start
 2. possession ends with return `R_possession`
@@ -1360,7 +1386,7 @@ Two acceptable versions:
 
 1. REINFORCE-style integrated loss
    - `A_selector = normalized(R_possession)`
-   - simplest first clean version
+   - simplest first integrated version
 
 2. PPO-style selector critic
    - add selector value head
@@ -1369,8 +1395,29 @@ Two acceptable versions:
 
 Recommended implementation order:
 
-1. first clean version: integrated REINFORCE-style selector loss
+1. first integrated version: integrated REINFORCE-style selector loss
 2. second refinement: add selector critic and clipped PPO-style selector objective
+
+Extension once commitment-expiry reselection is enabled:
+
+1. selector may act multiple times within one possession
+2. each selector choice should receive credit primarily from the segment it controlled
+3. preferred target:
+   - commitment-window rewards accumulated until next selector boundary or episode end
+   - plus bootstrap from selector value at the next selector boundary
+
+Recommended long-term target for reselection:
+
+`R_sel(t_k) = sum_{t=t_k}^{t_{k+1}-1} gamma^(t-t_k) r_t + gamma^Delta * V_sel(s_{t_{k+1}})`
+
+Where:
+
+1. `t_k` is a selector decision time
+2. `t_{k+1}` is the next selector boundary or episode end
+3. `V_sel` is a selector-specific baseline/value head
+
+This is important because one-shot terminal shot reward is too sparse to cleanly train the
+initial play choice once multiple play selections can happen in the same possession.
 
 #### Recommended policy changes
 
@@ -1384,7 +1431,7 @@ The policy already has the right high-level shape:
 2. low-level action head
 3. selector head over shared features
 
-For the clean version, extend policy API with explicit selector methods:
+For the integrated `mu` selector version, extend policy API with explicit selector methods:
 
 1. `get_selector_context(obs)`
    - returns shared context tensor for selector
@@ -1430,7 +1477,7 @@ Important:
 1. low-level PPO entropy and selector entropy are distinct terms
 2. both live in the same total loss, but they regularize different heads
 
-#### Recommended file modification plan for the clean version
+#### Recommended file modification plan for the integrated `mu` selector version
 
 1. `basketworld/policies/set_attention_policy.py`
    - expose selector distribution/log-prob/value helpers
@@ -1447,7 +1494,9 @@ Important:
 
 4. `basketworld/envs/basketworld_env_v2.py`
    - selector boundary hook remains possession start initially
-   - later optional support for commitment-window reselection
+   - later add commitment-window reselection hook when offense possession is still alive
+   - selector should be called automatically at commitment expiry, not every primitive step
+   - preserve explicit intent override hook with precedence above selector choice
 
 5. `train/train.py`
    - instantiate hierarchical PPO when selector is enabled in clean mode
@@ -1456,7 +1505,7 @@ Important:
    - keep selector schedule/regularization flags
    - add explicit switch between:
      - callback prototype
-     - clean integrated PPO path
+     - integrated `mu` selector PPO path
 
 #### Recommended implementation order
 
@@ -1465,10 +1514,18 @@ Important:
 3. implement custom PPO subclass that samples `z` at possession start
 4. move selector loss out of callback and into PPO train step
 5. add selector critic only after REINFORCE-style integrated version is stable
+6. after clean possession-start selector is stable, add commitment-expiry reselection
+7. when reselection is added, switch selector credit from full-possession return to
+   segment return + bootstrap target
+8. preserve forced-intent override behavior across:
+   - dev app gameplay
+   - Playbook analysis
+   - counterfactual replay
+   - eval-time ablations
 
-#### Success criteria for the clean version
+#### Success criteria for the integrated `mu` selector version
 
-The clean implementation should replace the prototype only if it achieves:
+The integrated `mu` selector implementation should replace the prototype only if it achieves:
 
 1. same or better latent-play separability
 2. same or better PPP / possession efficiency
@@ -1494,6 +1551,107 @@ Treat the selector as successful if:
 4. counterfactual play selection makes sense in fixed states
    - same state, different selected `z`, different continuation
    - similar states, selector chooses similar plays
+
+### Open research questions from Playbook analysis
+
+The Playbook tooling surfaced several questions that should be treated as active
+research items before the selector design is considered settled.
+
+#### 1) Is the current commitment window long enough?
+
+Current evidence suggests `intent_commitment_steps = 8` may be too short for many
+intent-conditioned possessions to reach a meaningful shot state from a fixed start.
+
+Questions:
+
+1. how often does a possession produce a shot while `z` is still active?
+2. how often does the decisive shot/turnover happen only after commitment expires?
+3. does increasing commitment length improve:
+   - selector learnability
+   - per-intent interpretability
+   - counterfactual trajectory separation
+
+Recommended experiments:
+
+1. compare Playbook rollouts at commitment lengths `8`, `12`, `16`, and full-possession
+2. log fraction of episodes where first shot occurs before commitment expires
+3. log fraction of episodes where first turnover occurs before commitment expires
+4. compare discriminator metrics and policy sensitivity under these settings
+
+#### 2) What return should train `mu`?
+
+The current selector prototype uses the full possession return, even though the chosen
+`z` only controls behavior during the commitment window.
+
+This means selector reward is available, but potentially noisy:
+
+1. `mu` chooses `z` at possession start
+2. `z` shapes the first `K` steps
+3. later uncontrolled steps may dominate the final possession outcome
+
+Questions:
+
+1. is full-possession return the right signal for selector learning?
+2. would selector learning improve if credit were restricted to:
+   - commitment-window return only
+   - discounted return with heavier early weighting
+   - return through the first shot state
+   - return through the first major branch event (shot, turnover, foul)
+3. does longer commitment reduce this credit-assignment noise enough to keep full-possession return?
+
+Recommended experiments:
+
+1. compare selector learning under:
+   - full-possession return
+   - commitment-window return
+   - first-shot / first-terminal-event return
+   - segment return + bootstrap at next selector boundary
+2. measure selector entropy, collapse, and per-intent usage under each variant
+3. compare downstream PPP and stability of learned play selection
+
+Additional note:
+
+If `mu` is later allowed to resample a new play at commitment expiry, full-possession return
+is almost certainly too blunt for the initial selector decision. At that point the default
+clean design should become selector-segment return plus selector-value bootstrap, not
+one terminal possession reward shared across all selector choices.
+
+#### 3) Should `mu` resample a new play when commitment expires?
+
+Current staged selector design assumes one play call at possession start. A likely
+extension is to allow a fresh high-level play decision whenever the current play's
+commitment window ends and the possession is still alive.
+
+Questions:
+
+1. should reselection happen automatically at every commitment expiry?
+2. should the selector be allowed to repeat the same `z`?
+3. does reselection improve shot creation enough to justify the added credit-assignment complexity?
+4. does reselection make the current commitment window more usable, or does it simply hide that `K` is too short?
+
+Recommended default if this is implemented:
+
+1. reselection trigger = commitment expiry while offense possession is still live
+2. selector may choose the same `z` again
+3. do not call `mu` every step
+4. treat each selector choice as controlling one segment, with segment-level credit
+
+#### 4) Should play selection include the initial ball handler?
+
+Current `mu` chooses only `z`, while ball handler is part of the state/context.
+This allows `mu` to learn "given current ball handler, pick play `z`", but not
+"choose who should initiate the play."
+
+Questions:
+
+1. is play quality bottlenecked by who starts with the ball?
+2. does the low-level policy already learn effective "entry pass to initiator" behavior?
+3. would high-level play calling improve if selector chose:
+   - play only: `mu(z | s_context)`
+   - ball handler then play: `mu(h, z | s_context)`
+   - factorized head: `mu_h(h | s), mu_z(z | s, h)`
+
+This should remain a later-stage research branch, not part of the first selector rollout.
 
 ### Practical recommendation
 

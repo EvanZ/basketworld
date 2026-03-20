@@ -359,6 +359,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
 
         # Update role_flag using worker-local values
         obs["role_flag"] = _np.array([role_flag_offense if user_team == _Team.OFFENSE else role_flag_defense], dtype=_np.float32)
+        _accumulate_intent_selection(eval_diagnostics, env)
 
         done = False
         step_count = 0
@@ -580,6 +581,8 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
 
 def _init_eval_diagnostics() -> dict:
     return {
+        "intent_selection_counts": {},
+        "intent_inactive_count": 0,
         "turnover_reasons": {},
         "assist_links": {},
         "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
@@ -611,6 +614,16 @@ def _merge_eval_diagnostics(dest: dict | None, src: dict | None) -> dict:
         dest = _init_eval_diagnostics()
     if not src:
         return dest
+
+    for raw_z, count in (src.get("intent_selection_counts") or {}).items():
+        key = str(raw_z)
+        dest["intent_selection_counts"][key] = int(
+            dest["intent_selection_counts"].get(key, 0)
+        ) + int(count or 0)
+
+    dest["intent_inactive_count"] = int(dest.get("intent_inactive_count", 0)) + int(
+        src.get("intent_inactive_count", 0) or 0
+    )
 
     for reason, count in (src.get("turnover_reasons") or {}).items():
         key = str(reason) if reason is not None else "unknown"
@@ -699,6 +712,25 @@ def _accumulate_action_mix(eval_diagnostics: dict, full_action, user_team_ids: l
         bucket = _action_bucket(action_id)
         action_mix[bucket] = int(action_mix.get(bucket, 0)) + 1
         action_mix["total"] = int(action_mix.get("total", 0)) + 1
+
+
+def _accumulate_intent_selection(eval_diagnostics: dict, env) -> None:
+    if eval_diagnostics is None or env is None:
+        return
+    if not bool(getattr(env, "enable_intent_learning", False)):
+        return
+    if not bool(getattr(env, "intent_active", False)):
+        eval_diagnostics["intent_inactive_count"] = int(
+            eval_diagnostics.get("intent_inactive_count", 0)
+        ) + 1
+        return
+    try:
+        z = int(getattr(env, "intent_index", 0))
+    except Exception:
+        z = 0
+    counts = eval_diagnostics.setdefault("intent_selection_counts", {})
+    key = str(z)
+    counts[key] = int(counts.get(key, 0)) + 1
 
 
 def _accumulate_turnover_reasons(
@@ -993,6 +1025,7 @@ def _run_sequential_evaluation(
         obs, _ = env.reset(options=reset_opts)
         env.training_team = user_team
         obs["role_flag"] = np.array([role_flag_offense if user_team == Team.OFFENSE else role_flag_defense], dtype=np.float32)
+        _accumulate_intent_selection(eval_diagnostics, env)
 
         done = False
         step_count = 0

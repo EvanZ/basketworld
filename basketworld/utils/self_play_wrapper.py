@@ -295,6 +295,29 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         except Exception:
             pass
 
+    def set_offense_intent_state(
+        self,
+        intent_index: int,
+        *,
+        intent_active: bool = True,
+        intent_age: int = 0,
+        intent_commitment_remaining: Optional[int] = None,
+    ) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_offense_intent_state(
+                int(intent_index),
+                intent_active=bool(intent_active),
+                intent_age=int(intent_age),
+                intent_commitment_remaining=intent_commitment_remaining,
+            )
+            if (
+                getattr(self.env.unwrapped, "training_team", None) == Team.OFFENSE
+                and isinstance(getattr(self, "_last_obs", None), dict)
+            ):
+                self._recondition_intent_fields_for_role(self._last_obs, True)
+        except Exception:
+            pass
+
     def get_profile_stats(self):  # pragma: no cover - thin shim
         try:
             return self.env.unwrapped.get_profile_stats()
