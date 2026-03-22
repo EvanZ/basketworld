@@ -384,10 +384,14 @@ def test_set_attention_policy_load_state_dict_allows_missing_selector_keys():
     legacy_state = {
         k: v
         for k, v in full_state.items()
-        if not (k.startswith("pointer_") or k.startswith("intent_selector_head"))
+        if not (
+            k.startswith("pointer_")
+            or k.startswith("intent_selector_head")
+            or k.startswith("intent_selector_value_head")
+        )
     }
     result = policy.load_state_dict(legacy_state, strict=True)
-    allowed_prefixes = ("pointer_", "intent_selector_head")
+    allowed_prefixes = ("pointer_", "intent_selector_head", "intent_selector_value_head")
     assert all(str(k).startswith(allowed_prefixes) for k in result.missing_keys)
 
 

@@ -173,17 +173,18 @@ def get_shot_probability(player_id: int):
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
     try:
-        player_pos = game_state.env.positions[player_id]
-        basket_pos = game_state.env.basket_position
-        distance = game_state.env._hex_distance(player_pos, basket_pos)
-        base_prob = game_state.env._calculate_base_shot_probability(player_id, distance)
-        final_prob = game_state.env._calculate_shot_probability(player_id, distance)
+        env = getattr(game_state.env, "unwrapped", game_state.env)
+        player_pos = env.positions[player_id]
+        basket_pos = env.basket_position
+        distance = env._hex_distance(player_pos, basket_pos)
+        base_prob = env._calculate_base_shot_probability(player_id, distance)
+        final_prob = env._calculate_shot_probability(player_id, distance)
         return {
             "player_id": player_id,
             "shot_probability": float(base_prob),
             "shot_probability_final": float(final_prob),
             "distance": int(distance),
-            "is_three": bool(game_state.env._is_three_point_hex(tuple(player_pos))),
+            "is_three": bool(env._is_three_point_hex(tuple(player_pos))),
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}

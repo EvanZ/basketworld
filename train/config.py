@@ -725,11 +725,25 @@ def get_parser() -> argparse.ArgumentParser:
         help="Max flattened action features used by discriminator input.",
     )
     parser.add_argument(
+        "--disc-eval-batch-output",
+        dest="disc_eval_batch_output",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Export discriminator eval batches alongside alternation checkpoints.",
+    )
+    parser.add_argument(
         "--intent-selector-enabled",
         dest="intent_selector_enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
         help="Enable a learned high-level selector mu(z|s) for offense intent at possession start.",
+    )
+    parser.add_argument(
+        "--intent-selector-mode",
+        dest="intent_selector_mode",
+        choices=["callback", "integrated"],
+        default="callback",
+        help="Selector implementation path: legacy callback prototype or integrated PPO path.",
     )
     parser.add_argument(
         "--intent-selector-hidden-dim",
@@ -779,6 +793,13 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.01,
         help="KL-to-uniform regularization coefficient to keep selector intent usage broad during ramp-in.",
+    )
+    parser.add_argument(
+        "--intent-selector-value-coef",
+        dest="intent_selector_value_coef",
+        type=float,
+        default=0.5,
+        help="Value loss coefficient for the integrated selector critic.",
     )
     parser.add_argument(
         "--intent-policy-sensitivity-enabled",

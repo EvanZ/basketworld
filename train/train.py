@@ -43,6 +43,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
+from basketworld.algorithms import IntegratedIntentSelectorPPO
 from basketworld.utils.mlflow_logger import MLflowWriter
 from basketworld.utils.callbacks import MLflowCallback
 from basketworld.utils.schedule_state import (
@@ -96,6 +97,7 @@ try:
         get_random_policy_from_artifacts,
         get_opponent_policy_pool_for_envs,
         get_latest_policy_path,
+        get_latest_discriminator_checkpoint_path,
         get_latest_unified_policy_path,
         get_max_alternation_index,
         transfer_critic_weights,
@@ -130,6 +132,7 @@ except ImportError:
         get_random_policy_from_artifacts,
         get_opponent_policy_pool_for_envs,
         get_latest_policy_path,
+        get_latest_discriminator_checkpoint_path,
         get_latest_unified_policy_path,
         get_max_alternation_index,
         transfer_critic_weights,
@@ -272,6 +275,10 @@ def main(args):
                 getattr(args, "intent_selector_hidden_dim", 64),
             )
             mlflow.log_param(
+                "intent_selector_mode",
+                getattr(args, "intent_selector_mode", "callback"),
+            )
+            mlflow.log_param(
                 "intent_selector_alpha_start",
                 getattr(args, "intent_selector_alpha_start", 0.0),
             )
@@ -295,9 +302,17 @@ def main(args):
                 "intent_selector_usage_reg_coef",
                 getattr(args, "intent_selector_usage_reg_coef", 0.01),
             )
+            mlflow.log_param(
+                "intent_selector_value_coef",
+                getattr(args, "intent_selector_value_coef", 0.5),
+            )
         mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
         mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
         mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
+        mlflow.log_param(
+            "disc_eval_batch_output",
+            getattr(args, "disc_eval_batch_output", False),
+        )
         mlflow.log_param(
             "offense_spawn_boundary_margin",
             getattr(args, "offense_spawn_boundary_margin", 0),
@@ -420,6 +435,43 @@ def main(args):
 
         print("Initializing unified policy...")
         unified_policy = None
+        selector_mode = str(
+            getattr(args, "intent_selector_mode", "callback")
+        ).lower()
+        use_integrated_intent_selector = bool(
+            getattr(args, "intent_selector_enabled", False)
+            and selector_mode == "integrated"
+        )
+        algorithm_class = (
+            IntegratedIntentSelectorPPO if use_integrated_intent_selector else PPO
+        )
+        algo_kwargs = {}
+        if use_integrated_intent_selector:
+            algo_kwargs.update(
+                intent_selector_enabled=True,
+                num_intents=int(getattr(args, "num_intents", 8)),
+                intent_selector_alpha_start=float(
+                    getattr(args, "intent_selector_alpha_start", 0.0)
+                ),
+                intent_selector_alpha_end=float(
+                    getattr(args, "intent_selector_alpha_end", 1.0)
+                ),
+                intent_selector_alpha_warmup_steps=int(
+                    getattr(args, "intent_selector_alpha_warmup_steps", 0)
+                ),
+                intent_selector_alpha_ramp_steps=int(
+                    getattr(args, "intent_selector_alpha_ramp_steps", 1)
+                ),
+                intent_selector_entropy_coef=float(
+                    getattr(args, "intent_selector_entropy_coef", 0.01)
+                ),
+                intent_selector_usage_reg_coef=float(
+                    getattr(args, "intent_selector_usage_reg_coef", 0.01)
+                ),
+                intent_selector_value_coef=float(
+                    getattr(args, "intent_selector_value_coef", 0.5)
+                ),
+            )
 
         if args.continue_run_id:
             print(f"Continuing from run {args.continue_run_id}...")
@@ -438,8 +490,12 @@ def main(args):
                     }
                     if getattr(args, "intent_selector_enabled", False):
                         custom_objects["policy_kwargs"] = policy_kwargs
-                    unified_policy = PPO.load(
-                        uni_local, env=temp_env, device=device, custom_objects=custom_objects
+                    unified_policy = algorithm_class.load(
+                        uni_local,
+                        env=temp_env,
+                        device=device,
+                        custom_objects=custom_objects,
+                        **algo_kwargs,
                     )
                     print(
                         f"  - Loaded latest unified policy: {os.path.basename(uni_art)}"
@@ -462,7 +518,7 @@ def main(args):
             else:
                 policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
             
-            unified_policy = PPO(
+            unified_policy = algorithm_class(
                 policy_class,
                 temp_env,
                 verbose=1,
@@ -476,6 +532,7 @@ def main(args):
                 policy_kwargs=policy_kwargs,
                 target_kl=args.target_kl,
                 device=device,
+                **algo_kwargs,
             )
             
             # --- Transfer critic weights if requested ---
@@ -750,6 +807,42 @@ def main(args):
         )
         # Optional DIAYN-style intent diversity objective
         intent_diversity_callback = build_intent_diversity_callback(args)
+        if (
+            args.continue_run_id
+            and intent_diversity_callback is not None
+            and getattr(intent_diversity_callback, "enabled", False)
+        ):
+            try:
+                client = mlflow.tracking.MlflowClient()
+                disc_art = get_latest_discriminator_checkpoint_path(
+                    client, args.continue_run_id
+                )
+                if disc_art:
+                    with tempfile.TemporaryDirectory() as _tmp_disc_dir:
+                        disc_local = client.download_artifacts(
+                            args.continue_run_id, disc_art, _tmp_disc_dir
+                        )
+                        disc_payload = torch.load(
+                            disc_local, map_location="cpu", weights_only=False
+                        )
+                    queued = (
+                        intent_diversity_callback.queue_discriminator_checkpoint_restore(
+                            disc_payload,
+                            source=f"{args.continue_run_id}:{os.path.basename(disc_art)}",
+                        )
+                    )
+                    if queued:
+                        print(
+                            f"Queued intent discriminator restore from "
+                            f"{os.path.basename(disc_art)}"
+                        )
+                else:
+                    print(
+                        "No prior intent discriminator checkpoint found; "
+                        "intent diversity metrics will resume from a fresh probe."
+                    )
+            except Exception as e:
+                print("Warning: failed to queue prior intent discriminator:", e)
         # Optional high-level selector mu(z|s) for offense play calling.
         intent_selector_callback = build_intent_selector_callback(args)
         # Optional diagnostic for whether the policy actually responds to latent intent.
@@ -978,6 +1071,19 @@ def main(args):
                     )
                     if saved:
                         mlflow.log_artifact(disc_ckpt_path, artifact_path="models")
+                    if bool(getattr(args, "disc_eval_batch_output", False)):
+                        disc_eval_batch_path = os.path.join(
+                            tmpdir, f"intent_disc_eval_batch_iter_{global_alt}.npz"
+                        )
+                        batch_saved = (
+                            intent_diversity_callback.export_latest_discriminator_eval_batch(
+                                disc_eval_batch_path,
+                                global_step=int(unified_policy.num_timesteps),
+                                alternation_idx=int(global_alt),
+                            )
+                        )
+                        if batch_saved:
+                            mlflow.log_artifact(disc_eval_batch_path, artifact_path="models")
             print(f"Logged unified model for alternation {global_alt} to MLflow")
 
             # --- 3. Run Evaluation Phase ---

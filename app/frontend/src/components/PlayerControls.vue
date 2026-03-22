@@ -298,6 +298,39 @@ const selectorHeadContextLabel = computed(() => {
   const policyClass = String(selectorTrainingParams.value?.policy_class || '');
   return policyClass.includes('SetAttention') ? 'Shared set-attention encoder' : 'Shared policy encoder';
 });
+const selectorMode = computed(() =>
+  String(selectorTrainingParams.value?.intent_selector_mode || 'callback').toLowerCase()
+);
+const selectorUsesIntegratedPath = computed(() => selectorMode.value === 'integrated');
+const selectorImplementationLabel = computed(() => {
+  return selectorUsesIntegratedPath.value ? 'Integrated PPO path' : 'Callback prototype';
+});
+const selectorValueCoef = computed(() => selectorTrainingParams.value?.intent_selector_value_coef);
+const selectorCriticEnabled = computed(() =>
+  Boolean(
+    selectorEnabled.value
+    && selectorUsesIntegratedPath.value
+    && selectorValueCoef.value !== null
+    && selectorValueCoef.value !== undefined
+  )
+);
+const selectorHeadSummary = computed(() => {
+  if (!selectorEnabled.value) return 'N/A';
+  if (selectorCriticEnabled.value) return 'Intent logits + selector value head';
+  return 'Intent logits head';
+});
+const selectorObjectiveLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (selectorCriticEnabled.value) return 'Clipped PPO selector loss + full-possession value baseline';
+  if (selectorUsesIntegratedPath.value) return 'Integrated selector policy loss';
+  return 'Callback-side selector prototype';
+});
+const selectorCreditAssignmentLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  return selectorCriticEnabled.value
+    ? 'Full-possession return against selector value baseline'
+    : 'Full-possession return';
+});
 const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
 const pressureExposureDisplay = computed(() => {
   const val = Number(props.pressureExposure);
@@ -5510,6 +5543,10 @@ const stealRisks = computed(() => {
               <span class="param-name">Enabled:</span>
               <span class="param-value">{{ selectorEnabled ? '✓ Yes' : '✗ No' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Which selector implementation path trained this checkpoint.">
+              <span class="param-name">Path:</span>
+              <span class="param-value">{{ selectorImplementationLabel }}</span>
+            </div>
             <div class="param-item" data-tooltip="Current implementation mixes uniform intent sampling with selector-driven play calling using alpha.">
               <span class="param-name">Alpha schedule:</span>
               <span class="param-value">{{ selectorAlphaSummary }}</span>
@@ -5526,9 +5563,17 @@ const stealRisks = computed(() => {
               <span class="param-name">Usage reg coef:</span>
               <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
             </div>
-            <div class="param-item" data-tooltip="The selector head uses the shared set-attention state encoder and emits logits over intents at offense possession start.">
+            <div class="param-item" data-tooltip="Integrated selector runs add a selector critic/value head on top of the shared selector context.">
+              <span class="param-name">Selector critic:</span>
+              <span class="param-value">{{ selectorCriticEnabled ? '✓ Enabled' : '✗ No / not logged' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Weight on the selector value loss when the integrated selector critic is enabled.">
+              <span class="param-name">Value coef:</span>
+              <span class="param-value">{{ selectorValueCoef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="The selector uses the shared set-attention state encoder and emits intent logits, plus a selector value estimate in the integrated critic path.">
               <span class="param-name">Architecture:</span>
-              <span class="param-value">{{ selectorEnabled ? `${selectorHeadContextLabel}, separate selector head` : 'N/A' }}</span>
+              <span class="param-value">{{ selectorEnabled ? `${selectorHeadContextLabel}, ${selectorHeadSummary}` : 'N/A' }}</span>
             </div>
           </div>
         </div>
@@ -5685,6 +5730,10 @@ const stealRisks = computed(() => {
               <span class="param-name">Updates/rollout:</span>
               <span class="param-value">{{ props.gameState.training_params.intent_disc_updates_per_rollout ?? 'N/A' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Whether training exported the discriminator eval batch artifact after each alternation checkpoint.">
+              <span class="param-name">Eval batch output:</span>
+              <span class="param-value">{{ props.gameState.training_params.disc_eval_batch_output ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
           </div>
 
           <div class="param-category">
@@ -5747,7 +5796,7 @@ const stealRisks = computed(() => {
               <span class="param-name">Selector enabled:</span>
               <span class="param-value">{{ selectorEnabled ? '✓ Enabled' : '✗ Disabled' }}</span>
             </div>
-            <div class="param-item" data-tooltip="Current implementation uses the same shared set-attention encoder and adds a separate categorical selector head over intents.">
+            <div class="param-item" data-tooltip="Current implementation uses the same shared set-attention encoder for low-level control and selector context.">
               <span class="param-name">Selector context:</span>
               <span class="param-value">{{ selectorHeadContextLabel }}</span>
             </div>
@@ -5755,13 +5804,17 @@ const stealRisks = computed(() => {
               <span class="param-name">Head hidden dim:</span>
               <span class="param-value">{{ selectorTrainingParams.intent_selector_hidden_dim ?? 'N/A' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Whether the selector path includes a learned value baseline/critic in addition to intent logits.">
+              <span class="param-name">Selector heads:</span>
+              <span class="param-value">{{ selectorHeadSummary }}</span>
+            </div>
             <div class="param-item" data-tooltip="Current implementation samples mu only at offense possession start, not every timestep.">
               <span class="param-name">Decision boundary:</span>
               <span class="param-value">Offense possession start</span>
             </div>
-            <div class="param-item" data-tooltip="Current implementation is the callback prototype, not the future integrated hierarchical PPO path.">
+            <div class="param-item" data-tooltip="Which selector implementation path trained this checkpoint.">
               <span class="param-name">Integration:</span>
-              <span class="param-value">Callback prototype</span>
+              <span class="param-value">{{ selectorImplementationLabel }}</span>
             </div>
           </div>
 
@@ -5782,6 +5835,18 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="KL-to-uniform regularization on average selector usage to prevent early play collapse.">
               <span class="param-name">Usage reg coef:</span>
               <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Weight on the selector value-loss term in the integrated selector critic path.">
+              <span class="param-name">Value coef:</span>
+              <span class="param-value">{{ selectorValueCoef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How selector updates are optimized in this checkpoint.">
+              <span class="param-name">Objective:</span>
+              <span class="param-value">{{ selectorObjectiveLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current integrated selector critic still trains on full-possession return; segment-return reselection is a later planned extension.">
+              <span class="param-name">Credit target:</span>
+              <span class="param-value">{{ selectorCreditAssignmentLabel }}</span>
             </div>
             <div class="param-item" data-tooltip="The action policy still produces low-level pi(a|s,z); the selector only chooses z at possession start.">
               <span class="param-name">Low-level policy:</span>

@@ -1,4 +1,5 @@
 import copy
+import inspect
 import os
 import tempfile
 from pathlib import Path
@@ -8,7 +9,6 @@ import mlflow
 import numpy as np
 import torch
 from fastapi import APIRouter, HTTPException
-from stable_baselines3 import PPO
 
 from basketworld.utils.mlflow_params import (
     get_mlflow_params,
@@ -16,10 +16,10 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_training_params,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
-from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
-from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
+from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
@@ -48,6 +48,17 @@ from fastapi.encoders import jsonable_encoder
 
 
 router = APIRouter()
+
+
+def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
+    """Separate real env kwargs from wrapper/training-only metadata."""
+    env_signature = inspect.signature(basketworld.HexagonBasketballEnv.__init__)
+    valid_env_keys = {
+        name for name in env_signature.parameters.keys() if name not in {"self", "render_mode"}
+    }
+    env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
+    wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
+    return env_kwargs, wrapper_kwargs
 
 
 @router.post("/api/list_policies")
@@ -138,25 +149,25 @@ async def init_game(request: InitGameRequest):
                     raise HTTPException(status_code=404, detail=f"Opponent policy not found for run {run_id}")
                 raise HTTPException(status_code=500, detail=f"Failed to download opponent policy: {e}")
 
-        custom_objects = {
-            "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
-            "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
-            "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
-            "SetAttentionExtractor": SetAttentionExtractor,
-        }
-        game_state.unified_policy = PPO.load(unified_path, custom_objects=custom_objects)
+        game_state.unified_policy = load_ppo_for_inference(unified_path, device="cpu")
         game_state.offense_policy = None
         game_state.defense_policy = (
-            PPO.load(opponent_unified_path, custom_objects=custom_objects) if opponent_unified_path else None
+            load_ppo_for_inference(opponent_unified_path, device="cpu")
+            if opponent_unified_path
+            else None
         )
         game_state.unified_policy_key = os.path.basename(unified_path)
         game_state.opponent_unified_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
 
+        env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(optional_params)
+        use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
         game_state.env = basketworld.HexagonBasketballEnv(
             **required_params,
-            **optional_params,
+            **env_optional_params,
             render_mode="rgb_array",
         )
+        if use_set_obs:
+            game_state.env = SetObservationWrapper(game_state.env)
 
         def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
             policy = getattr(policy_obj, "policy", None)
@@ -194,8 +205,8 @@ async def init_game(request: InitGameRequest):
         game_state.prev_obs = None
 
         game_state.env_required_params = copy.deepcopy(required_params)
-        game_state.env_optional_params = copy.deepcopy(optional_params)
-        game_state.mlflow_env_optional_defaults = copy.deepcopy(optional_params)
+        game_state.env_optional_params = copy.deepcopy(env_optional_params)
+        game_state.mlflow_env_optional_defaults = copy.deepcopy(env_optional_params)
         game_state.unified_policy_path = unified_path
         game_state.opponent_policy_path = opponent_unified_path
 
@@ -235,7 +246,7 @@ async def init_game(request: InitGameRequest):
 
         # Record initial phi entry (step 0) for Rewards tab calculations
         try:
-            env = game_state.env
+            env = getattr(game_state.env, "unwrapped", game_state.env)
             offense_ids = list(getattr(env, "offense_ids", []))
             ball_holder_id = int(env.ball_holder) if getattr(env, "ball_holder", None) is not None else (offense_ids[0] if offense_ids else -1)
 
@@ -650,7 +661,7 @@ def step(request: ActionRequest):
 
     if not ep_by_player and game_state.env:
         try:
-            env = game_state.env
+            env = getattr(game_state.env, "unwrapped", game_state.env)
             for pid in range(getattr(env, "n_players", 0)):
                 pos = getattr(env, "positions", [])[pid] if pid < len(getattr(env, "positions", [])) else (0, 0)
                 dist = env._hex_distance(pos, getattr(env, "basket_position", (0, 0))) if hasattr(env, "_hex_distance") else 0

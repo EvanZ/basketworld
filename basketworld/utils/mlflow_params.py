@@ -348,11 +348,60 @@ def get_mlflow_params(
     optional["pass_mode"] = _get_param(
         params, ["pass_mode", "pass-mode"], str, "directional"
     )
+    optional["use_set_obs"] = _get_param(
+        params,
+        ["use_set_obs", "use-set-obs"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["mirror_episode_prob"] = _get_param(
+        params,
+        ["mirror_episode_prob", "mirror-episode-prob"],
+        float,
+        0.0,
+    )
     optional["enable_pass_gating"] = _get_param(
         params,
         ["enable_pass_gating", "enable-pass-gating"],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         True,
+    )
+    # Opponent sampling / self-play parameters. These are needed by offline
+    # analysis tools to reproduce training-time rollout distributions.
+    optional["deterministic_opponent"] = _get_param(
+        params,
+        ["deterministic_opponent", "deterministic-opponent"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["per_env_opponent_sampling"] = _get_param(
+        params,
+        ["per_env_opponent_sampling", "per-env-opponent-sampling"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["opponent_pool_size"] = _get_param(
+        params,
+        [
+            "opponent_pool_size",
+            "opponent-pool-size",
+            "opponent_sample_k",
+            "opponent-sample-k",
+        ],
+        int,
+        10,
+    )
+    optional["opponent_pool_beta"] = _get_param(
+        params,
+        ["opponent_pool_beta", "opponent-pool-beta"],
+        float,
+        0.7,
+    )
+    optional["opponent_pool_exploration"] = _get_param(
+        params,
+        ["opponent_pool_exploration", "opponent-pool-exploration"],
+        float,
+        0.15,
     )
     # Illegal action policy
     optional["illegal_action_policy"] = _get_param(
@@ -745,6 +794,12 @@ def get_mlflow_training_params(
         int,
         16,
     )
+    training_params["disc_eval_batch_output"] = _get_param(
+        params,
+        ["disc_eval_batch_output", "disc-eval-batch-output"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
     training_params["intent_selector_enabled"] = _get_param(
         params,
         ["intent_selector_enabled", "intent-selector-enabled"],
@@ -756,6 +811,12 @@ def get_mlflow_training_params(
         ["intent_selector_hidden_dim", "intent-selector-hidden-dim"],
         int,
         64,
+    )
+    training_params["intent_selector_mode"] = _get_param(
+        params,
+        ["intent_selector_mode", "intent-selector-mode"],
+        str,
+        "callback",
     )
     training_params["intent_selector_alpha_start"] = _get_param(
         params,
@@ -798,6 +859,12 @@ def get_mlflow_training_params(
         ],
         float,
         0.01,
+    )
+    training_params["intent_selector_value_coef"] = _get_param(
+        params,
+        ["intent_selector_value_coef", "intent-selector-value-coef"],
+        float,
+        0.5,
     )
 
     return training_params

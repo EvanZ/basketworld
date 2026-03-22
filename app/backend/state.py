@@ -229,22 +229,26 @@ def _rebuild_cached_obs() -> None:
     if not game_state.env:
         return
     env = game_state.env
+    base_env = getattr(env, "unwrapped", env)
     role_value = (
         float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
         if game_state.obs is not None and game_state.obs.get("role_flag") is not None
-        else (1.0 if env.training_team == Team.OFFENSE else -1.0)
+        else (1.0 if base_env.training_team == Team.OFFENSE else -1.0)
     )
     observer_is_offense = bool(role_value > 0.0)
-    if hasattr(env, "_build_observation_dict"):
-        game_state.obs = env._build_observation_dict(observer_is_offense)
-        game_state.obs["role_flag"] = np.array([role_value], dtype=np.float32)
+    if hasattr(base_env, "_build_observation_dict"):
+        rebuilt_obs = base_env._build_observation_dict(observer_is_offense)
     else:
-        game_state.obs = {
-            "obs": env._get_observation(),
-            "action_mask": env._get_action_masks(),
+        rebuilt_obs = {
+            "obs": base_env._get_observation(),
+            "action_mask": base_env._get_action_masks(),
             "role_flag": np.array([role_value], dtype=np.float32),
-            "skills": env._get_offense_skills_array(),
+            "skills": base_env._get_offense_skills_array(),
         }
+    if env is not base_env and hasattr(env, "observation"):
+        rebuilt_obs = env.observation(rebuilt_obs)
+    rebuilt_obs["role_flag"] = np.array([role_value], dtype=np.float32)
+    game_state.obs = rebuilt_obs
 
 
 def _build_counterfactual_snapshot_metadata() -> dict:
@@ -529,11 +533,12 @@ def get_full_game_state(
     ball_handler_shot_prob = None
     if ball_holder_py is not None:
         try:
-            player_pos = game_state.env.positions[ball_holder_py]
-            basket_pos = game_state.env.basket_position
-            distance = game_state.env._hex_distance(player_pos, basket_pos)
+            base_env = getattr(game_state.env, "unwrapped", game_state.env)
+            player_pos = base_env.positions[ball_holder_py]
+            basket_pos = base_env.basket_position
+            distance = base_env._hex_distance(player_pos, basket_pos)
             ball_handler_shot_prob = float(
-                game_state.env._calculate_shot_probability(ball_holder_py, distance)
+                base_env._calculate_shot_probability(ball_holder_py, distance)
             )
         except Exception:
             ball_handler_shot_prob = None
@@ -542,7 +547,8 @@ def get_full_game_state(
     pass_steal_probs = {}
     if ball_holder_py is not None:
         try:
-            steal_probs = game_state.env.calculate_pass_steal_probabilities(ball_holder_py)
+            base_env = getattr(game_state.env, "unwrapped", game_state.env)
+            steal_probs = base_env.calculate_pass_steal_probabilities(ball_holder_py)
             pass_steal_probs = {int(k): float(v) for k, v in steal_probs.items()}
         except Exception as e:
             print(f"[get_full_game_state] Failed to calculate pass steal probabilities: {e}")
@@ -551,7 +557,7 @@ def get_full_game_state(
     # Calculate EP (expected points) for all players
     ep_by_player = []
     try:
-        env = game_state.env
+        env = getattr(game_state.env, "unwrapped", game_state.env)
         for pid in range(env.n_players):
             pos = env.positions[pid]
             dist = env._hex_distance(pos, env.basket_position)
@@ -569,6 +575,7 @@ def get_full_game_state(
     sampled_offense_skills = getattr(game_state, "sampled_offense_skills", None) or {}
 
     counterfactual_snapshot = get_counterfactual_snapshot_summary()
+    base_env = getattr(game_state.env, "unwrapped", game_state.env)
 
     state = {
         "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
@@ -618,15 +625,15 @@ def get_full_game_state(
         ),
         "three_point_hexes": [
             (int(q), int(r))
-            for q, r in getattr(game_state.env, "_three_point_hexes", set())
+            for q, r in getattr(base_env, "_three_point_hexes", set())
         ],
         "three_point_line_hexes": [
             (int(q), int(r))
-            for q, r in getattr(game_state.env, "_three_point_line_hexes", set())
+            for q, r in getattr(base_env, "_three_point_line_hexes", set())
         ],
         "three_point_outline": [
             (float(x), float(y))
-            for x, y in getattr(game_state.env, "_three_point_outline_points", [])
+            for x, y in getattr(base_env, "_three_point_outline_points", [])
         ],
         "shot_probs": getattr(game_state.env, "shot_probs", None),
         "shot_params": {

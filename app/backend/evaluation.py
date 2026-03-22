@@ -18,6 +18,7 @@ from basketworld.utils.action_resolution import (
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from stable_baselines3 import PPO
+from basketworld.utils.policy_loading import load_ppo_for_inference
 
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
@@ -98,9 +99,17 @@ def _init_evaluation_worker(
         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
         "SetAttentionExtractor": SetAttentionExtractor,
     }
-    unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
+    unified_policy = load_ppo_for_inference(
+        unified_policy_path,
+        device="cpu",
+        custom_objects=custom_objects,
+    )
     opponent_policy = (
-        PPO.load(opponent_policy_path, custom_objects=custom_objects)
+        load_ppo_for_inference(
+            opponent_policy_path,
+            device="cpu",
+            custom_objects=custom_objects,
+        )
         if opponent_policy_path
         else None
     )
@@ -1411,9 +1420,17 @@ def run_evaluation(
             "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
             "SetAttentionExtractor": SetAttentionExtractor,
         }
-        unified_policy = PPO.load(unified_policy_path, custom_objects=custom_objects)
+        unified_policy = load_ppo_for_inference(
+            unified_policy_path,
+            device="cpu",
+            custom_objects=custom_objects,
+        )
         opponent_policy = (
-            PPO.load(opponent_policy_path, custom_objects=custom_objects)
+            load_ppo_for_inference(
+                opponent_policy_path,
+                device="cpu",
+                custom_objects=custom_objects,
+            )
             if opponent_policy_path
             else None
         )

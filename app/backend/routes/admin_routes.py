@@ -57,6 +57,11 @@ _NUMPY_SAFE_ENCODER = {
 }
 
 
+def _base_env():
+    env = game_state.env
+    return getattr(env, "unwrapped", env)
+
+
 def _heatmap_increment(heatmap: dict[str, list[int]], pos) -> None:
     if not isinstance(pos, (list, tuple)) or len(pos) < 2:
         return
@@ -514,7 +519,8 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
         except Exception:
             pass
 
-        env = copy.deepcopy(base_env)
+        env_copy = copy.deepcopy(base_env)
+        env = getattr(env_copy, "unwrapped", env_copy)
         env.training_team = user_team
         try:
             env._rng = _np.random.default_rng(int(rollout_seed))
@@ -640,7 +646,8 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
     """Updates positions for multiple players at once."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    if game_state.env.episode_ended:
+    env = _base_env()
+    if env.episode_ended:
         raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
 
     updates = req.updates or []
@@ -650,14 +657,14 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
     for upd in updates:
         pid = upd.player_id
         new_pos = (upd.q, upd.r)
-        if pid < 0 or pid >= game_state.env.n_players:
+        if pid < 0 or pid >= env.n_players:
             raise HTTPException(status_code=400, detail=f"Invalid player ID: {pid}")
-        if not game_state.env._is_valid_position(*new_pos):
+        if not env._is_valid_position(*new_pos):
             raise HTTPException(status_code=400, detail=f"Position {new_pos} is out of bounds.")
-        for i, pos in enumerate(game_state.env.positions):
+        for i, pos in enumerate(env.positions):
             if i != pid and pos == new_pos:
                 raise HTTPException(status_code=400, detail=f"Position {new_pos} is occupied by Player {i}.")
-        game_state.env.positions[pid] = new_pos
+        env.positions[pid] = new_pos
 
     _rebuild_cached_obs()
 
@@ -675,21 +682,22 @@ def update_player_position(req: UpdatePositionRequest):
     """Updates a single player's position during an ongoing episode."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    if game_state.env.episode_ended:
+    env = _base_env()
+    if env.episode_ended:
         raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
 
     pid = req.player_id
     new_pos = (req.q, req.r)
 
-    if pid < 0 or pid >= game_state.env.n_players:
+    if pid < 0 or pid >= env.n_players:
         raise HTTPException(status_code=400, detail=f"Invalid player ID: {pid}")
-    if not game_state.env._is_valid_position(*new_pos):
+    if not env._is_valid_position(*new_pos):
         raise HTTPException(status_code=400, detail=f"Position {new_pos} is out of bounds.")
-    for i, pos in enumerate(game_state.env.positions):
+    for i, pos in enumerate(env.positions):
         if i != pid and pos == new_pos:
             raise HTTPException(status_code=400, detail=f"Position {new_pos} is occupied by Player {i}.")
 
-    game_state.env.positions[pid] = new_pos
+    env.positions[pid] = new_pos
 
     _rebuild_cached_obs()
 
@@ -707,19 +715,21 @@ def update_shot_clock(req: UpdateShotClockRequest):
     """Adjust the shot clock by a delta (see UpdateShotClockRequest)."""
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
+    env = _base_env()
     try:
         delta = int(req.delta)
-        current = int(getattr(game_state.env, "shot_clock", 0))
-        max_val = int(getattr(game_state.env, "shot_clock_steps", current))
+        current = int(getattr(env, "shot_clock", 0))
+        max_val = int(getattr(env, "shot_clock_steps", current))
         new_val = current + delta
         if max_val > 0:
             new_val = max(0, min(max_val, new_val))
         else:
             new_val = max(0, new_val)
-        game_state.env.shot_clock = int(new_val)
+        env.shot_clock = int(new_val)
+        _rebuild_cached_obs()
         return {
             "status": "success",
-            "shot_clock": int(game_state.env.shot_clock),
+            "shot_clock": int(env.shot_clock),
             "state": get_ui_game_state(),
         }
     except Exception as e:
@@ -738,7 +748,7 @@ def set_ball_holder(req: SetBallHolderRequest):
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
-    env = game_state.env
+    env = _base_env()
     if req.player_id not in env.offense_ids:
         raise HTTPException(status_code=400, detail="Ball holder must be an offensive player.")
 
@@ -758,10 +768,10 @@ def set_intent_state(req: SetIntentStateRequest):
     """Override the live offense intent state for the current possession."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    if game_state.env.episode_ended:
+    env = _base_env()
+    if env.episode_ended:
         raise HTTPException(status_code=400, detail="Cannot edit intent after episode has ended.")
 
-    env = game_state.env
     if not bool(getattr(env, "enable_intent_learning", False)):
         raise HTTPException(
             status_code=400,
@@ -893,7 +903,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
 
     from app.backend.routes.lifecycle_routes import step as step_route
 
-    env = game_state.env
+    env = _base_env()
     num_intents = max(1, int(getattr(env, "num_intents", 1)))
     if not bool(getattr(env, "enable_intent_learning", False)):
         raise HTTPException(status_code=400, detail="Intent learning is not enabled for this environment.")
@@ -954,7 +964,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
         }
 
         if num_workers is not None:
-            parallel_base_env = copy.deepcopy(base_state["env"])
+            parallel_base_env = copy.deepcopy(getattr(base_state["env"], "unwrapped", base_state["env"]))
             rollout_specs = [
                 (int(order), int(intent_index), int(np.random.randint(0, 2**31 - 1)))
                 for order, intent_index in enumerate(
@@ -1049,10 +1059,11 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     _restore_restorable_backend_state(base_state)
                     game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
 
-                    game_state.env.intent_active = True
-                    game_state.env.intent_index = int(intent_index)
-                    game_state.env.intent_age = 0
-                    game_state.env.intent_commitment_remaining = int(commitment_steps)
+                    base_env = _base_env()
+                    base_env.intent_active = True
+                    base_env.intent_index = int(intent_index)
+                    base_env.intent_age = 0
+                    base_env.intent_commitment_remaining = int(commitment_steps)
                     _rebuild_cached_obs()
                     initial_state = copy.deepcopy(get_ui_game_state())
                     if panel.get("base_state") is None:
@@ -1220,7 +1231,7 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
-    env = game_state.env
+    env = _base_env()
     count = env.players_per_side
 
     def _normalize(values: List[float] | None, name: str) -> List[float]:
@@ -1273,7 +1284,8 @@ def set_pass_target_strategy(req: SetPassTargetStrategyRequest):
         raise HTTPException(status_code=400, detail="Game not initialized.")
     try:
         strategy = req.strategy
-        game_state.env.pass_target_strategy = strategy
+        env = _base_env()
+        env.pass_target_strategy = strategy
         return {"status": "success", "pass_target_strategy": strategy}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update pass target strategy: {e}")
@@ -1317,7 +1329,7 @@ def _set_pressure_params_impl(
     """Internal implementation for pressure/interception parameter updates."""
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    env = game_state.env
+    env = _base_env()
 
     mlflow_defaults = (
         game_state.mlflow_env_optional_defaults

@@ -312,11 +312,24 @@ def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_sta
             self.policy = type("DummyPolicy", (), {"pass_logit_bias": 0.0})()
 
     monkeypatch.setattr(mlflow_config, "setup_mlflow", lambda *args, **kwargs: None)
-    monkeypatch.setattr(lifecycle_routes, "get_mlflow_params", lambda client, run_id: ({"players": 3}, {}))
+    monkeypatch.setattr(
+        lifecycle_routes,
+        "get_mlflow_params",
+        lambda client, run_id: (
+            {"players": 3},
+            {
+                "use_set_obs": True,
+                "mirror_episode_prob": 0.5,
+                "deterministic_opponent": True,
+                "per_env_opponent_sampling": True,
+                "opponent_pool_size": 16,
+            },
+        ),
+    )
     monkeypatch.setattr(lifecycle_routes, "get_mlflow_phi_shaping_params", lambda client, run_id: {})
     monkeypatch.setattr(lifecycle_routes, "get_mlflow_training_params", lambda client, run_id: {})
     monkeypatch.setattr(lifecycle_routes, "get_unified_policy_path", lambda client, run_id, unified_name=None: "/tmp/fake.zip")
-    monkeypatch.setattr(lifecycle_routes.PPO, "load", lambda *args, **kwargs: DummyPPO())
+    monkeypatch.setattr(lifecycle_routes, "load_ppo_for_inference", lambda *args, **kwargs: DummyPPO())
     monkeypatch.setattr(lifecycle_routes, "validate_policy_observation_schema", lambda policy, env, obs, **kwargs: obs)
     monkeypatch.setattr(lifecycle_routes, "_compute_param_counts_from_policy", lambda policy: None)
     monkeypatch.setattr(lifecycle_routes.mlflow.tracking, "MlflowClient", lambda: object())

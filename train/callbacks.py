@@ -201,6 +201,8 @@ def build_intent_selector_callback(args):
     """Build high-level intent selector callback when enabled."""
     if not getattr(args, "intent_selector_enabled", False):
         return None
+    if str(getattr(args, "intent_selector_mode", "callback")).lower() != "callback":
+        return None
     return IntentSelectorCallback(
         enabled=True,
         num_intents=getattr(args, "num_intents", 8),

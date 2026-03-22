@@ -1787,7 +1787,123 @@ selector described in Stage 3:
 This should be treated as a hierarchical-control branch, not folded into the original
 latent-play discovery code path without clear ablations.
 
-### 3) Defensive latent plays track
+### 3) Inductive priors for play-learning track
+
+If pure intent-ID prediction is not producing human-legible play structure, add weak
+supervised inductive priors to the discriminator/trajectory encoder so the learned
+representation is nudged toward "play completion" rather than arbitrary separability.
+
+Core idea:
+
+1. Keep the main intent-classification objective:
+   - `CE(z_logits, true_intent)`
+2. Add auxiliary heads on the same trajectory representation, for example:
+   - `shot_end` head: did the play/segment end in a shot attempt?
+   - `shot_quality` head: what was the final shot EP / make probability / expected value?
+3. Train with a multi-task loss such as:
+   - `CE(z_logits, true_intent) + lambda_shot * BCE(shot_logit, shot_end_label) + lambda_q * MSE(quality_pred, final_shot_quality)`
+
+Why this is interesting:
+
+1. It provides structure similar in spirit to the "priors / supervision help diversity"
+   observation from DIAYN-style work, but adapted to basketball-play discovery.
+2. It may bias the learned latent space toward possessions/segments that terminate in
+   a recognizable offensive outcome instead of only maximizing trajectory-level
+   distinguishability.
+3. It could make intents more behaviorally interpretable even if plain discriminator
+   AUC/top-1 already looks acceptable.
+
+Important cautions:
+
+1. Do not make this a hard requirement that every play must end in a shot.
+2. If `lambda_shot` is too large, all intents may collapse toward generic
+   shot-seeking behavior.
+3. This idea likely fits segment-based/multi-selection play learning better than the
+   current one-intent-per-possession setup, because "play completion" is more natural
+   at a selector segment boundary than at an entire possession boundary.
+4. If explored, treat `lambda_shot` and `lambda_q` as small research knobs with
+   explicit ablations, not default production settings.
+
+Suggested experiments:
+
+1. Compare plain discriminator loss vs:
+   - `+ lambda_shot * BCE(...)`
+   - `+ lambda_q * MSE(...)`
+   - both together
+2. Measure not only discriminator metrics, but also:
+   - deterministic Playbook distinctness from fixed starts
+   - first-shot timing / shot-end frequency while `z` is active
+   - shot-quality spread by intent
+   - selector sensitivity and collapse
+3. Revisit this more seriously once selector reselection / segment returns exist, since
+   that is the cleaner place to define "end of play."
+
+### 4) Multi-selection play learning with pass boundaries
+
+If one-intent-per-possession continues to produce weak or overly overlapping plays,
+explore a segmented selector design where multiple play choices can occur within the
+same possession.
+
+Current environment constraint:
+
+1. possessions already terminate on shot attempt
+2. possessions already terminate on turnover / violation / dead-ball terminal
+3. therefore the only practical intra-possession boundary candidate is a completed pass
+
+Practical first design:
+
+1. let `mu` choose `z_0` at possession start
+2. keep `z_k` active for a short play segment
+3. if a completed pass occurs after a minimum number of steps, allow a reselection
+4. if no pass occurs, force reselection at a maximum play length
+
+Recommended first heuristics:
+
+1. `min_play_steps = 3`
+2. `max_play_steps = 6`
+3. eligible reselection event = successful completed pass with possession still alive
+4. selector may either:
+   - keep the same `z`
+   - or sample a new `z`
+
+Why this branch is attractive:
+
+1. it defines "play" at a more natural medium-horizon timescale (`4-6` steps) rather
+   than forcing one play label to explain an entire possession
+2. it aligns better with inductive priors like:
+   - does this play segment end in a shot?
+   - does this segment improve shot quality?
+3. it may make learned plays more behaviorally legible in Playbook analysis
+
+Credit-assignment implication:
+
+1. full-possession return is no longer the right default
+2. each selector decision should get:
+   - segment return up to the next pass-boundary / terminal
+   - plus selector-value bootstrap at the next selector boundary
+
+Research questions:
+
+1. does allowing reselection only on completed passes improve play distinctness?
+2. should every eligible pass trigger reselection, or should the model learn a
+   "continue current play vs end current play" decision?
+3. does a fixed `3-6` step play horizon produce more interpretable plays than
+   possession-level intents?
+4. do pass-boundary segments improve deterministic Playbook differences from fixed starts?
+
+Suggested experiments:
+
+1. compare:
+   - possession-level selector
+   - forced reselection on every eligible pass
+   - learned reselection decision at eligible passes
+2. evaluate:
+   - discriminator metrics
+   - selector stability / collapse
+   - fixed-start deterministic Playbook divergence
+   - shot-quality improvement by segment
+
+### 5) Defensive latent plays track
 
 Extend latent play learning to defense with its own latent variable, separate from offense.
 

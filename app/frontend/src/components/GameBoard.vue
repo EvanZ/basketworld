@@ -109,6 +109,7 @@ const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'ad
 
 const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
 const SQRT3 = Math.sqrt(3);
+const HEX_HALF_WIDTH = HEX_RADIUS * SQRT3 * 0.5;
 const PASS_COS_EPS = 1e-9;
 // Axial direction vectors (q, r) aligned with ActionType ordering (E, NE, NW, W, SW, SE)
 const HEX_DIRECTIONS = [
@@ -621,6 +622,13 @@ const courtLayout = computed(() => {
     }
     return hexes;
 });
+
+const courtHexPolygons = computed(() =>
+  courtLayout.value.map((hex) => ({
+    ...hex,
+    points: hexPointsFor(hex.x, hex.y, HEX_RADIUS),
+  }))
+);
 
 const shotCountsMap = computed(() => props.shotAccumulator || {});
 const shotChartLabel = computed(() => props.shotChartLabel || '');
@@ -1534,6 +1542,18 @@ const courtBounds = computed(() => {
     maxX: Math.max(...xs),
     minY: Math.min(...ys),
     maxY: Math.max(...ys),
+  };
+});
+
+const courtBackdropRect = computed(() => {
+  if (courtLayout.value.length === 0) return null;
+  const { minX, maxX, minY, maxY } = courtBounds.value;
+  const epsilon = 0.75;
+  return {
+    x: minX - HEX_HALF_WIDTH - epsilon,
+    y: minY - HEX_RADIUS - epsilon,
+    width: (maxX - minX) + (2 * HEX_HALF_WIDTH) + (2 * epsilon),
+    height: (maxY - minY) + (2 * HEX_RADIUS) + (2 * epsilon),
   };
 });
 
@@ -3452,19 +3472,45 @@ onBeforeUnmount(() => {
           <stop offset="0%" stop-color="rgba(15,23,42,0.85)" />
           <stop offset="100%" stop-color="rgba(251,146,60,0.95)" />
         </linearGradient>
+        <mask
+          v-if="courtBackdropRect"
+          id="court-gap-mask"
+          maskUnits="userSpaceOnUse"
+          maskContentUnits="userSpaceOnUse"
+        >
+          <rect
+            :x="courtBackdropRect.x"
+            :y="courtBackdropRect.y"
+            :width="courtBackdropRect.width"
+            :height="courtBackdropRect.height"
+            fill="white"
+          />
+          <polygon
+            v-for="hex in courtHexPolygons"
+            :key="`court-gap-mask-${hex.key}`"
+            :points="hex.points"
+            fill="black"
+            stroke="black"
+            stroke-width="2"
+          />
+        </mask>
       </defs>
       <g :transform="boardTransform">
+        <rect
+          v-if="courtBackdropRect"
+          :x="courtBackdropRect.x"
+          :y="courtBackdropRect.y"
+          :width="courtBackdropRect.width"
+          :height="courtBackdropRect.height"
+          class="court-gap-fill"
+          mask="url(#court-gap-mask)"
+        />
+
         <!-- Draw qualified (blue) and unqualified (dark) court hexes -->
         <polygon
-          v-for="hex in courtLayout"
+          v-for="hex in courtHexPolygons"
           :key="hex.key"
-          :points="[...Array(6)].map((_, i) => {
-            const angle_deg = 60 * i + 30;
-            const angle_rad = Math.PI / 180 * angle_deg;
-            const xPoint = hex.x + HEX_RADIUS * Math.cos(angle_rad);
-            const yPoint = hex.y + HEX_RADIUS * Math.sin(angle_rad);
-            return `${xPoint},${yPoint}`;
-          }).join(' ')"
+          :points="hex.points"
           :class="['court-hex', threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified']"
         />
 
@@ -3480,6 +3526,15 @@ onBeforeUnmount(() => {
             return `${xPoint},${yPoint}`;
           }).join(' ')"
           class="offensive-lane"
+        />
+
+        <rect
+          v-if="courtBackdropRect"
+          :x="courtBackdropRect.x"
+          :y="courtBackdropRect.y"
+          :width="courtBackdropRect.width"
+          :height="courtBackdropRect.height"
+          class="court-gap-boundary"
         />
 
         <!-- 3PT line outline -->
@@ -4592,6 +4647,18 @@ onBeforeUnmount(() => {
   display: block;
   width: 100%;
   height: auto;
+}
+.court-gap-fill {
+  fill: rgba(58, 70, 108, 0.92);
+  pointer-events: none;
+}
+.court-gap-boundary {
+  fill: none;
+  stroke: rgba(251, 146, 60, 0.78);
+  stroke-width: 0.18rem;
+  stroke-linejoin: round;
+  pointer-events: none;
+  filter: drop-shadow(0px 0px 3px rgba(0, 0, 0, 0.35));
 }
 .court-hex {
   stroke: rgba(15, 23, 42, 0.6);

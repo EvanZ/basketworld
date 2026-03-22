@@ -5,14 +5,13 @@ from typing import Optional, Any
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from stable_baselines3 import PPO
-
 from .action_resolution import (
     IllegalActionStrategy,
     get_policy_action_probabilities,
     resolve_illegal_actions,
 )
 from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.utils.policy_loading import load_ppo_for_inference
 
 
 class SelfPlayEnvWrapper(gym.Wrapper):
@@ -63,20 +62,9 @@ class SelfPlayEnvWrapper(gym.Wrapper):
     def _ensure_opponent_loaded(self):
         # Allow passing a policy path string to avoid pickling full PPO
         if isinstance(self.opponent_policy, str):
-            from basketworld.utils.policies import (
-                PassBiasDualCriticPolicy,
-                PassBiasMultiInputPolicy,
-            )
-            from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
-
-            custom_objects = {
-                "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
-                "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
-                "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
-                "SetAttentionExtractor": SetAttentionExtractor,
-            }
-            self.opponent_policy = PPO.load(
-                self.opponent_policy, device="cpu", custom_objects=custom_objects
+            self.opponent_policy = load_ppo_for_inference(
+                self.opponent_policy,
+                device="cpu",
             )
         self._apply_pass_mode_to_policy(self.opponent_policy)
 
@@ -317,6 +305,15 @@ class SelfPlayEnvWrapper(gym.Wrapper):
                 self._recondition_intent_fields_for_role(self._last_obs, True)
         except Exception:
             pass
+
+    def get_offense_intent_override(self):  # pragma: no cover - thin shim
+        try:
+            getter = getattr(self.env.unwrapped, "get_offense_intent_override", None)
+            if callable(getter):
+                return getter()
+        except Exception:
+            pass
+        return None
 
     def get_profile_stats(self):  # pragma: no cover - thin shim
         try:

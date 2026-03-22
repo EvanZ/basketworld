@@ -147,6 +147,25 @@ def get_latest_unified_policy_path(client, run_id: str) -> Optional[str]:
     return get_latest_policy_path(client, run_id, "unified")
 
 
+def get_latest_discriminator_checkpoint_path(client, run_id: str) -> Optional[str]:
+    """Return latest intent discriminator checkpoint artifact path."""
+    artifacts = client.list_artifacts(run_id, "models")
+    pattern = re.compile(r"intent_disc_(?:alternation|iter)_(\d+)\.pt$")
+
+    def sort_key(p):
+        m = pattern.search(p.path)
+        if m:
+            return int(m.group(1))
+        return -1
+
+    filtered = [p for p in artifacts if pattern.search(p.path)]
+    if not filtered:
+        return None
+    filtered = sorted(filtered, key=sort_key)
+    latest = filtered[-1]
+    return latest.path
+
+
 def get_max_alternation_index(client, run_id: str) -> int:
     """Return max alternation index from saved models in an MLflow run."""
     artifacts = client.list_artifacts(run_id, "models")

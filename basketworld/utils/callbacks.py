@@ -3,7 +3,7 @@ import os
 import csv
 import tempfile
 import random
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import mlflow
@@ -713,9 +713,13 @@ class IntentDiversityCallback(BaseCallback):
         self._warned_recompute = False
         self._last_disc_loss = 0.0
         self._last_disc_acc = 0.0
+        self._last_disc_eval_acc = 0.0
         self._last_disc_auc: Optional[float] = None
         self._last_disc_pass_ms = 0.0
         self._defense_unknown_baseline_ppp: Optional[float] = None
+        self._pending_disc_restore_payload: Optional[dict[str, Any]] = None
+        self._pending_disc_restore_source: Optional[str] = None
+        self._latest_disc_eval_batch: Optional[dict[str, Any]] = None
 
     def _on_training_start(self) -> None:
         try:
@@ -724,6 +728,19 @@ class IntentDiversityCallback(BaseCallback):
                 self._device = torch.device(policy.device)
         except Exception:
             self._device = torch.device("cpu")
+        if self._pending_disc_restore_payload is not None:
+            payload = self._pending_disc_restore_payload
+            source = self._pending_disc_restore_source or "queued payload"
+            self._pending_disc_restore_payload = None
+            self._pending_disc_restore_source = None
+            restored = self.restore_discriminator_checkpoint_payload(
+                payload, source=source
+            )
+            if not restored:
+                print(
+                    f"Warning: failed to restore discriminator checkpoint from {source}; "
+                    "starting intent discriminator from scratch."
+                )
 
     def _on_rollout_start(self) -> None:
         self._rollout_step_idx = 0
@@ -833,6 +850,103 @@ class IntentDiversityCallback(BaseCallback):
     def has_trained_discriminator(self) -> bool:
         return self._disc is not None and self._disc_opt is not None
 
+    def _discriminator_expected_config(self) -> dict[str, Any]:
+        return {
+            "input_dim": int(self.max_obs_dim + self.max_action_dim),
+            "hidden_dim": int(self.disc_hidden_dim),
+            "num_intents": int(self.num_intents),
+            "dropout": float(self.disc_dropout),
+            "encoder_type": str(self.disc_encoder_type),
+            "step_dim": int(self.disc_step_dim),
+            "max_obs_dim": int(self.max_obs_dim),
+            "max_action_dim": int(self.max_action_dim),
+        }
+
+    @staticmethod
+    def _normalize_discriminator_config(
+        config: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        cfg = dict(config or {})
+        return {
+            "input_dim": int(cfg.get("input_dim", 0)),
+            "hidden_dim": int(cfg.get("hidden_dim", 0)),
+            "num_intents": int(cfg.get("num_intents", 0)),
+            "dropout": float(cfg.get("dropout", 0.0)),
+            "encoder_type": str(cfg.get("encoder_type", "")),
+            "step_dim": int(cfg.get("step_dim", 0)),
+            "max_obs_dim": int(cfg.get("max_obs_dim", 0)),
+            "max_action_dim": int(cfg.get("max_action_dim", 0)),
+        }
+
+    def validate_discriminator_checkpoint_payload(
+        self, payload: Optional[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        if not isinstance(payload, dict):
+            return False, "checkpoint payload is not a dict"
+        if "state_dict" not in payload:
+            return False, "checkpoint payload missing state_dict"
+        payload_cfg = self._normalize_discriminator_config(payload.get("config"))
+        expected_cfg = self._normalize_discriminator_config(
+            self._discriminator_expected_config()
+        )
+        if payload_cfg != expected_cfg:
+            return (
+                False,
+                f"config mismatch: expected {expected_cfg}, got {payload_cfg}",
+            )
+        return True, ""
+
+    def queue_discriminator_checkpoint_restore(
+        self, payload: dict[str, Any], *, source: str = "checkpoint payload"
+    ) -> bool:
+        ok, reason = self.validate_discriminator_checkpoint_payload(payload)
+        if not ok:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                f"skipping restore ({reason})."
+            )
+            return False
+        self._pending_disc_restore_payload = payload
+        self._pending_disc_restore_source = source
+        return True
+
+    def restore_discriminator_checkpoint_payload(
+        self, payload: dict[str, Any], *, source: str = "checkpoint payload"
+    ) -> bool:
+        ok, reason = self.validate_discriminator_checkpoint_payload(payload)
+        if not ok:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                f"skipping restore ({reason})."
+            )
+            return False
+        config = self._normalize_discriminator_config(payload.get("config"))
+        self._maybe_build_discriminator(int(config["input_dim"]))
+        assert self._disc is not None
+        assert self._disc_opt is not None
+        self._disc.load_state_dict(payload["state_dict"], strict=True)
+        optimizer_state = payload.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            try:
+                self._disc_opt.load_state_dict(optimizer_state)
+            except Exception as exc:
+                print(
+                    f"Warning: failed to restore discriminator optimizer state from "
+                    f"{source}: {exc}"
+                )
+        meta = payload.get("meta") or {}
+        self._rollout_counter = int(meta.get("rollout_counter", self._rollout_counter))
+        self._last_disc_loss = float(meta.get("last_disc_loss", self._last_disc_loss))
+        self._last_disc_acc = float(
+            meta.get("last_disc_top1_acc", self._last_disc_acc)
+        )
+        self._last_disc_eval_acc = float(
+            meta.get("last_disc_top1_acc_eval", self._last_disc_eval_acc)
+        )
+        auc_value = meta.get("last_disc_auc_ovr_macro", self._last_disc_auc)
+        self._last_disc_auc = None if auc_value is None else float(auc_value)
+        return True
+
     def export_discriminator_checkpoint(
         self,
         path: str,
@@ -846,6 +960,9 @@ class IntentDiversityCallback(BaseCallback):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
             "state_dict": self._disc.state_dict(),
+            "optimizer_state_dict": (
+                self._disc_opt.state_dict() if self._disc_opt is not None else None
+            ),
             "config": {
                 "input_dim": int(self.max_obs_dim + self.max_action_dim),
                 "hidden_dim": int(self.disc_hidden_dim),
@@ -868,6 +985,7 @@ class IntentDiversityCallback(BaseCallback):
                 "rollout_counter": int(self._rollout_counter),
                 "last_disc_loss": float(self._last_disc_loss),
                 "last_disc_top1_acc": float(self._last_disc_acc),
+                "last_disc_top1_acc_eval": float(self._last_disc_eval_acc),
                 "last_disc_auc_ovr_macro": (
                     float(self._last_disc_auc)
                     if self._last_disc_auc is not None
@@ -876,6 +994,60 @@ class IntentDiversityCallback(BaseCallback):
             },
         }
         torch.save(payload, path)
+        return True
+
+    def export_latest_discriminator_eval_batch(
+        self,
+        path: str,
+        *,
+        global_step: Optional[int] = None,
+        alternation_idx: Optional[int] = None,
+    ) -> bool:
+        payload = self._latest_disc_eval_batch
+        if not isinstance(payload, dict):
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        x_np = np.asarray(payload.get("x"), dtype=np.float32)
+        y_np = np.asarray(payload.get("y"), dtype=np.int64)
+        lengths_raw = payload.get("lengths")
+        lengths_np = (
+            np.asarray(lengths_raw, dtype=np.int64).reshape(-1)
+            if lengths_raw is not None
+            else np.zeros((0,), dtype=np.int64)
+        )
+        np.savez_compressed(
+            path,
+            x=x_np,
+            y=y_np,
+            lengths=lengths_np,
+            has_lengths=np.array([1 if lengths_raw is not None else 0], dtype=np.int8),
+            global_step=np.array(
+                [
+                    int(global_step)
+                    if global_step is not None
+                    else int(getattr(self.model, "num_timesteps", 0))
+                ],
+                dtype=np.int64,
+            ),
+            alternation_idx=np.array(
+                [int(alternation_idx) if alternation_idx is not None else -1],
+                dtype=np.int64,
+            ),
+            rollout_counter=np.array([int(self._rollout_counter)], dtype=np.int64),
+            num_intents=np.array([int(self.num_intents)], dtype=np.int64),
+            max_obs_dim=np.array([int(self.max_obs_dim)], dtype=np.int64),
+            max_action_dim=np.array([int(self.max_action_dim)], dtype=np.int64),
+            encoder_type=np.array([str(self.disc_encoder_type)], dtype=object),
+            disc_top1_acc_eval=np.array([float(self._last_disc_eval_acc)], dtype=np.float32),
+            disc_auc_ovr_macro=np.array(
+                [
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+        )
         return True
 
     def _train_discriminator(
@@ -1027,6 +1199,26 @@ class IntentDiversityCallback(BaseCallback):
             num_classes=self.num_intents,
         )
 
+    def _compute_disc_eval_top1_acc(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> float:
+        if x_np.shape[0] == 0 or self._disc is None:
+            return 0.0
+        x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        lengths = None
+        if lengths_np is not None:
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x, lengths)
+            pred = torch.argmax(logits, dim=-1)
+            y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+            acc = (pred == y).float().mean()
+        return float(acc.detach().cpu().item())
+
     def _recompute_returns_and_advantage(self) -> None:
         try:
             rollout_buffer = self.model.rollout_buffer
@@ -1057,7 +1249,7 @@ class IntentDiversityCallback(BaseCallback):
         return entropy, min_prob
 
     @staticmethod
-    def _episode_ppp(ep: dict) -> float:
+    def _episode_points_and_possessions(ep: dict) -> tuple[float, float]:
         m2 = float(ep.get("made_2pt", 0.0))
         m3 = float(ep.get("made_3pt", 0.0))
         md = float(ep.get("made_dunk", 0.0))
@@ -1066,6 +1258,11 @@ class IntentDiversityCallback(BaseCallback):
         tov = float(ep.get("turnover", 0.0))
         points = (2.0 * m2) + (3.0 * m3) + (2.0 * md) + lane_violation_pts
         possessions = max(1.0, att + tov + lane_violation_pts)
+        return float(points), float(possessions)
+
+    @classmethod
+    def _episode_ppp(cls, ep: dict) -> float:
+        points, possessions = cls._episode_points_and_possessions(ep)
         return float(points / possessions)
 
     @staticmethod
@@ -1098,14 +1295,19 @@ class IntentDiversityCallback(BaseCallback):
             slot = grouped.setdefault(
                 z,
                 {
-                    "ppp": [],
+                    "points": 0.0,
+                    "possessions": 0.0,
+                    "episodes": 0.0,
                     "passes": [],
                     "shot_2pt_share": [],
                     "shot_3pt_share": [],
                     "shot_dunk_share": [],
                 },
             )
-            slot["ppp"].append(self._episode_ppp(ep))
+            points, possessions = self._episode_points_and_possessions(ep)
+            slot["points"] += points
+            slot["possessions"] += possessions
+            slot["episodes"] += 1.0
             slot["passes"].append(float(ep.get("passes", 0.0)))
             shot_2pt_share, shot_3pt_share, shot_dunk_share = self._episode_shot_type_shares(
                 ep
@@ -1118,10 +1320,26 @@ class IntentDiversityCallback(BaseCallback):
             return
 
         for z, vals in grouped.items():
-            if vals["ppp"]:
+            if vals["episodes"] > 0.0:
+                mlflow.log_metric(
+                    f"intent/episodes_by_intent/{z}",
+                    float(vals["episodes"]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/points_by_intent/{z}",
+                    float(vals["points"]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/possessions_by_intent/{z}",
+                    float(vals["possessions"]),
+                    step=global_step,
+                )
+            if vals["possessions"] > 0.0:
                 mlflow.log_metric(
                     f"intent/ppp_by_intent/{z}",
-                    float(np.mean(vals["ppp"])),
+                    float(vals["points"] / vals["possessions"]),
                     step=global_step,
                 )
             if vals["passes"]:
@@ -1246,13 +1464,23 @@ class IntentDiversityCallback(BaseCallback):
                 )
             return
 
+        self._latest_disc_eval_batch = {
+            "x": np.array(x_np, copy=True),
+            "y": np.array(y_np, copy=True),
+            "lengths": None if lengths_np is None else np.array(lengths_np, copy=True),
+        }
+
         disc_pass_start = time.perf_counter()
         if lengths_np is None:
             self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
+            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(x_np, y_np)
             self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
             raw_bonus = self._compute_episode_bonus(x_np, y_np)
         else:
             self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_np, y_np, lengths_np
+            )
+            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
                 x_np, y_np, lengths_np
             )
             self._last_disc_auc = self._compute_disc_auc(x_np, y_np, lengths_np)
@@ -1306,6 +1534,7 @@ class IntentDiversityCallback(BaseCallback):
                     f"disc_ms={float(self._last_disc_pass_ms):.1f} "
                     f"loss={float(self._last_disc_loss):.4f} "
                     f"top1={float(self._last_disc_acc):.4f} "
+                    f"top1_eval={float(self._last_disc_eval_acc):.4f} "
                     f"auc={auc_str} "
                     f"beta={float(beta):.4f}",
                     flush=True,
@@ -1316,6 +1545,11 @@ class IntentDiversityCallback(BaseCallback):
         try:
             mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
             mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            mlflow.log_metric(
+                "intent/disc_top1_acc_eval",
+                float(self._last_disc_eval_acc),
+                step=global_step,
+            )
             if self._last_disc_auc is not None:
                 mlflow.log_metric(
                     "intent/disc_auc_ovr_macro",

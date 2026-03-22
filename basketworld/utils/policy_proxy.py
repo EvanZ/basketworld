@@ -4,6 +4,8 @@ from typing import Optional
 
 from stable_baselines3 import PPO
 
+from basketworld.utils.policy_loading import load_ppo_for_inference
+
 
 class FrozenPolicyProxy:
     """Picklable proxy that loads a PPO policy from a local .zip path on first use.
@@ -19,20 +21,9 @@ class FrozenPolicyProxy:
 
     def _ensure_loaded(self):
         if self._policy is None:
-            from basketworld.utils.policies import (
-                PassBiasDualCriticPolicy,
-                PassBiasMultiInputPolicy,
-            )
-            from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
-
-            custom_objects = {
-                "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
-                "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
-                "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
-                "SetAttentionExtractor": SetAttentionExtractor,
-            }
-            self._policy = PPO.load(
-                self.policy_path, device=self.device, custom_objects=custom_objects
+            self._policy = load_ppo_for_inference(
+                self.policy_path,
+                device=self.device,
             )
 
     def predict(self, obs, deterministic: bool = False):

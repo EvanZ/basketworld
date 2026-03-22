@@ -1,10 +1,12 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 import basketworld.utils.callbacks as callbacks_module
 from basketworld.utils.callbacks import IntentDiversityCallback
+from train.policy_utils import get_latest_discriminator_checkpoint_path
 
 
 class _DummyRolloutBuffer:
@@ -153,6 +155,7 @@ def test_intent_diversity_callback_logs_clipped_and_shaping_bonus_metrics():
 
     cb._bonus_stats = _FixedStats()
     cb._train_discriminator = lambda x_np, y_np: (0.1, 0.9)
+    cb._compute_disc_eval_top1_acc = lambda x_np, y_np: 0.42
     cb._compute_disc_auc = lambda x_np, y_np: 0.75
     cb._compute_episode_bonus = lambda x_np, y_np: np.array([2.0], dtype=np.float32)
 
@@ -194,6 +197,7 @@ def test_intent_diversity_callback_logs_clipped_and_shaping_bonus_metrics():
     assert np.isclose(logged["intent/bonus_shaping_per_episode_std"][0], 0.0)
     assert np.isclose(logged["intent/bonus_shaping_per_step_mean"][0], 0.25)
     assert np.isclose(logged["intent/bonus_shaping_per_step_std"][0], 0.0)
+    assert np.isclose(logged["intent/disc_top1_acc_eval"][0], 0.42)
 
 
 def test_intent_episode_metric_helpers():
@@ -253,11 +257,18 @@ def test_log_intent_behavior_metrics_logs_shot_type_shares():
         callbacks_module.mlflow.log_metric = original_log_metric
 
     assert "intent/ppp_by_intent/2" in logged
+    assert "intent/episodes_by_intent/2" in logged
+    assert "intent/points_by_intent/2" in logged
+    assert "intent/possessions_by_intent/2" in logged
     assert "intent/pass_rate_by_intent/2" in logged
     assert "intent/shot_2pt_share_by_intent/2" in logged
     assert "intent/shot_3pt_share_by_intent/2" in logged
     assert "intent/shot_dunk_share_by_intent/2" in logged
     assert "intent/shot_dist_by_intent/2" in logged
+    assert np.isclose(logged["intent/episodes_by_intent/2"][0], 1.0)
+    assert np.isclose(logged["intent/points_by_intent/2"][0], 2.0)
+    assert np.isclose(logged["intent/possessions_by_intent/2"][0], 1.0)
+    assert np.isclose(logged["intent/ppp_by_intent/2"][0], 2.0)
     assert np.isclose(logged["intent/shot_2pt_share_by_intent/2"][0], 0.0)
     assert np.isclose(logged["intent/shot_3pt_share_by_intent/2"][0], 0.0)
     assert np.isclose(logged["intent/shot_dunk_share_by_intent/2"][0], 1.0)
@@ -429,7 +440,124 @@ def test_intent_diversity_callback_exports_discriminator_checkpoint(tmp_path: Pa
     payload = torch.load(out_path, map_location="cpu", weights_only=False)
     assert saved is True
     assert out_path.exists()
+    assert "optimizer_state_dict" in payload
     assert payload["config"]["encoder_type"] == "gru"
     assert payload["config"]["input_dim"] == 272
     assert payload["meta"]["global_step"] == 1234
     assert payload["meta"]["alternation_idx"] == 7
+
+
+def test_intent_diversity_callback_exports_latest_eval_batch(tmp_path: Path):
+    cb = IntentDiversityCallback(enabled=True, num_intents=4, disc_encoder_type="gru")
+    model = _DummyModel()
+    model.num_timesteps = 4321
+    cb.init_callback(model)
+    cb._on_training_start()
+    cb._last_disc_eval_acc = 0.36
+    cb._last_disc_auc = 0.82
+    cb._latest_disc_eval_batch = {
+        "x": np.arange(24, dtype=np.float32).reshape(2, 3, 4),
+        "y": np.array([1, 3], dtype=np.int64),
+        "lengths": np.array([3, 2], dtype=np.int64),
+    }
+
+    out_path = tmp_path / "intent_disc_eval_batch_iter_5.npz"
+    saved = cb.export_latest_discriminator_eval_batch(
+        str(out_path), global_step=4321, alternation_idx=5
+    )
+
+    assert saved is True
+    assert out_path.exists()
+    payload = np.load(out_path, allow_pickle=True)
+    assert payload["x"].shape == (2, 3, 4)
+    assert payload["y"].tolist() == [1, 3]
+    assert payload["lengths"].tolist() == [3, 2]
+    assert int(payload["global_step"][0]) == 4321
+    assert int(payload["alternation_idx"][0]) == 5
+    assert np.isclose(float(payload["disc_top1_acc_eval"][0]), 0.36, atol=1e-6)
+    assert np.isclose(float(payload["disc_auc_ovr_macro"][0]), 0.82, atol=1e-6)
+
+
+def test_restore_discriminator_checkpoint_payload_restores_state_and_meta(tmp_path: Path):
+    cb = IntentDiversityCallback(enabled=True, num_intents=4, disc_encoder_type="gru")
+    model = _DummyModel()
+    cb.init_callback(model)
+    cb._on_training_start()
+    cb._maybe_build_discriminator(input_dim=272)
+    assert cb._disc is not None
+
+    with torch.no_grad():
+        for param in cb._disc.parameters():
+            param.fill_(0.25)
+
+    out_path = tmp_path / "intent_disc_iter_3.pt"
+    cb._last_disc_loss = 0.12
+    cb._last_disc_acc = 0.34
+    cb._last_disc_eval_acc = 0.23
+    cb._last_disc_auc = 0.56
+    saved = cb.export_discriminator_checkpoint(
+        str(out_path), global_step=4321, alternation_idx=9
+    )
+    assert saved is True
+
+    restored_cb = IntentDiversityCallback(
+        enabled=True, num_intents=4, disc_encoder_type="gru"
+    )
+    restored_model = _DummyModel()
+    restored_cb.init_callback(restored_model)
+    restored_cb._on_training_start()
+
+    payload = torch.load(out_path, map_location="cpu", weights_only=False)
+    restored = restored_cb.restore_discriminator_checkpoint_payload(
+        payload, source="unit-test"
+    )
+
+    assert restored is True
+    assert restored_cb._disc is not None
+    for expected_param, restored_param in zip(
+        cb._disc.parameters(), restored_cb._disc.parameters()
+    ):
+        assert torch.allclose(expected_param, restored_param)
+    assert np.isclose(restored_cb._last_disc_loss, 0.12)
+    assert np.isclose(restored_cb._last_disc_acc, 0.34)
+    assert np.isclose(restored_cb._last_disc_eval_acc, 0.23)
+    assert np.isclose(restored_cb._last_disc_auc, 0.56)
+    assert restored_cb._rollout_counter == 0
+
+
+def test_queue_discriminator_checkpoint_restore_rejects_incompatible_payload():
+    cb = IntentDiversityCallback(enabled=True, num_intents=4, disc_encoder_type="gru")
+    payload = {
+        "state_dict": {},
+        "config": {
+            "input_dim": 999,
+            "hidden_dim": 128,
+            "num_intents": 4,
+            "dropout": 0.1,
+            "encoder_type": "gru",
+            "step_dim": 64,
+            "max_obs_dim": 256,
+            "max_action_dim": 16,
+        },
+    }
+
+    queued = cb.queue_discriminator_checkpoint_restore(payload, source="bad-payload")
+
+    assert queued is False
+    assert cb._pending_disc_restore_payload is None
+
+
+def test_get_latest_discriminator_checkpoint_path_selects_highest_index():
+    class _Client:
+        @staticmethod
+        def list_artifacts(_run_id, _artifact_path):
+            return [
+                SimpleNamespace(path="models/unified_iter_1.zip"),
+                SimpleNamespace(path="models/intent_disc_iter_2.pt"),
+                SimpleNamespace(path="models/intent_disc_iter_17.pt"),
+                SimpleNamespace(path="models/intent_disc_iter_5.pt"),
+            ]
+
+    latest = get_latest_discriminator_checkpoint_path(_Client(), "dummy-run")
+
+    assert latest == "models/intent_disc_iter_17.pt"

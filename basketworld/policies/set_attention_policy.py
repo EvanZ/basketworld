@@ -540,11 +540,17 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
                     )
 
         self.intent_selector_head = None
+        self.intent_selector_value_head = None
         if self.intent_selector_enabled:
             self.intent_selector_head = nn.Sequential(
                 nn.Linear(self.embed_dim, self.intent_selector_hidden_dim),
                 self._head_activation(),
                 nn.Linear(self.intent_selector_hidden_dim, int(num_intents)),
+            )
+            self.intent_selector_value_head = nn.Sequential(
+                nn.Linear(self.embed_dim, self.intent_selector_hidden_dim),
+                self._head_activation(),
+                nn.Linear(self.intent_selector_hidden_dim, 1),
             )
 
         if self.use_dual_policy:
@@ -597,6 +603,13 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
                 # Start near-uniform so selector ramp-in does not begin collapsed.
                 nn.init.constant_(selector_last.weight, 0)
                 nn.init.constant_(selector_last.bias, 0)
+            if self.intent_selector_value_head is not None:
+                selector_value_first = self.intent_selector_value_head[0]
+                selector_value_last = self.intent_selector_value_head[-1]
+                nn.init.orthogonal_(selector_value_first.weight, gain=1.0)
+                nn.init.constant_(selector_value_first.bias, 0)
+                nn.init.constant_(selector_value_last.weight, 0)
+                nn.init.constant_(selector_value_last.bias, 0)
             if self.use_dual_policy:
                 for net in [
                     self.action_head_offense,
@@ -878,15 +891,22 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
     def has_intent_selector(self) -> bool:
         return bool(self.intent_selector_head is not None and self.intent_selector_enabled)
 
+    def has_intent_selector_value_head(self) -> bool:
+        return bool(
+            self.intent_selector_value_head is not None and self.intent_selector_enabled
+        )
+
     def _selector_context_from_features(self, features: th.Tensor) -> th.Tensor:
         tokens = self._split_tokens(features)
         if self.num_cls_tokens >= 1:
             return tokens[:, self.token_players, :]
         return tokens[:, : self.token_players, :].mean(dim=1)
 
-    def get_intent_selector_logits(self, obs: Any) -> th.Tensor:
+    def get_intent_selector_outputs(self, obs: Any) -> tuple[th.Tensor, th.Tensor]:
         if not self.has_intent_selector():
             raise RuntimeError("Intent selector head is not enabled for this policy.")
+        if not self.has_intent_selector_value_head():
+            raise RuntimeError("Intent selector value head is not enabled for this policy.")
 
         obs_tensor = obs
         if not (
@@ -900,7 +920,18 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             features = features[0]
         selector_ctx = self._selector_context_from_features(features)
         assert self.intent_selector_head is not None
-        return self.intent_selector_head(selector_ctx)
+        assert self.intent_selector_value_head is not None
+        logits = self.intent_selector_head(selector_ctx)
+        values = self.intent_selector_value_head(selector_ctx).reshape(-1)
+        return logits, values
+
+    def get_intent_selector_logits(self, obs: Any) -> th.Tensor:
+        logits, _ = self.get_intent_selector_outputs(obs)
+        return logits
+
+    def predict_intent_selector_values(self, obs: Any) -> th.Tensor:
+        _, values = self.get_intent_selector_outputs(obs)
+        return values
 
     def _get_action_logits(self, latent_pi: th.Tensor) -> th.Tensor:
         """Compute per-player action logits from token embeddings.
@@ -1002,6 +1033,7 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         allowed_prefixes = (
             "pointer_",
             "intent_selector_head",
+            "intent_selector_value_head",
             "features_extractor.intent_embedding",
             "features_extractor.intent_to_global",
             "features_extractor.offense_intent_embedding",
