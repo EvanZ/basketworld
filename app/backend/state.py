@@ -68,6 +68,9 @@ class GameState:
         self.playable_session: dict | None = None
         # User-defined snapshot for counterfactual restore/replay.
         self.counterfactual_snapshot: dict | None = None
+        # App-side selector runtime state for integrated multi-segment inference.
+        self.selector_segment_index: int = 0
+        self.selector_last_boundary_reason: str | None = None
         # Evaluation progress for frontend polling.
         self._evaluation_progress_lock = Lock()
         self.evaluation_progress: dict = {
@@ -292,6 +295,10 @@ def _capture_restorable_backend_state() -> dict:
         "actions_log": copy.deepcopy(game_state.actions_log),
         "episode_states": copy.deepcopy(game_state.episode_states),
         "playable_session": copy.deepcopy(game_state.playable_session),
+        "selector_segment_index": int(getattr(game_state, "selector_segment_index", 0)),
+        "selector_last_boundary_reason": copy.deepcopy(
+            getattr(game_state, "selector_last_boundary_reason", None)
+        ),
     }
 
 
@@ -318,6 +325,10 @@ def _restore_restorable_backend_state(snapshot: dict) -> None:
     game_state.actions_log = copy.deepcopy(snapshot["actions_log"])
     game_state.episode_states = copy.deepcopy(snapshot["episode_states"])
     game_state.playable_session = copy.deepcopy(snapshot["playable_session"])
+    game_state.selector_segment_index = int(snapshot.get("selector_segment_index", 0))
+    game_state.selector_last_boundary_reason = copy.deepcopy(
+        snapshot.get("selector_last_boundary_reason", None)
+    )
 
     _rebuild_cached_obs()
     _capture_turn_start_snapshot()
@@ -743,6 +754,12 @@ def get_full_game_state(
         "intent_age": int(getattr(game_state.env, "intent_age", 0)),
         "intent_commitment_remaining": int(
             getattr(game_state.env, "intent_commitment_remaining", 0)
+        ),
+        "selector_segment_index_current": int(
+            getattr(game_state, "selector_segment_index", 0)
+        ),
+        "selector_last_boundary_reason": getattr(
+            game_state, "selector_last_boundary_reason", None
         ),
         "intent_visible_to_defense_current": bool(
             getattr(game_state.env, "_intent_visible_to_defense", False)

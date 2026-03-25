@@ -802,6 +802,34 @@ def get_parser() -> argparse.ArgumentParser:
         help="Value loss coefficient for the integrated selector critic.",
     )
     parser.add_argument(
+        "--intent-selector-multiselect-enabled",
+        dest="intent_selector_multiselect_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Allow integrated selector reselection on completed pass boundaries within a possession.",
+    )
+    parser.add_argument(
+        "--intent-selector-min-play-steps",
+        dest="intent_selector_min_play_steps",
+        type=int,
+        default=3,
+        help="Minimum segment length before a completed pass can trigger selector reselection.",
+    )
+    parser.add_argument(
+        "--intent-disc-lambda-shot",
+        dest="intent_disc_lambda_shot",
+        type=float,
+        default=0.0,
+        help="Auxiliary BCE weight for discriminator shot-end prior.",
+    )
+    parser.add_argument(
+        "--intent-disc-lambda-q",
+        dest="intent_disc_lambda_q",
+        type=float,
+        default=0.0,
+        help="Auxiliary MSE weight for discriminator shot-quality prior.",
+    )
+    parser.add_argument(
         "--intent-policy-sensitivity-enabled",
         dest="intent_policy_sensitivity_enabled",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],

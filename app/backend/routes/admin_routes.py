@@ -930,11 +930,19 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     commitment_steps = max(0, int(getattr(env, "intent_commitment_steps", 0)))
     offense_ids = [int(pid) for pid in getattr(env, "offense_ids", [])]
     source_label = "snapshot" if bool(req.use_snapshot) else "current"
+    training_params = getattr(game_state, "mlflow_training_params", None) or {}
+    integrated_multiselect_active = bool(
+        training_params.get("intent_selector_enabled", False)
+        and str(training_params.get("intent_selector_mode", "callback")).lower()
+        == "integrated"
+        and training_params.get("intent_selector_multiselect_enabled", False)
+    )
     can_parallelize = bool(
         game_state.env_required_params is not None
         and game_state.unified_policy_path is not None
         and game_state.user_team is not None
         and total_rollouts > 1
+        and not integrated_multiselect_active
     )
     num_workers = None
     if can_parallelize and total_rollouts >= 8:

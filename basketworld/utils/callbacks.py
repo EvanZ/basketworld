@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
 
 from basketworld.utils.intent_discovery import (
+    CompletedIntentEpisode,
     IntentDiscriminator,
     IntentEpisodeBuffer,
     IntentTransition,
@@ -682,6 +683,8 @@ class IntentDiversityCallback(BaseCallback):
         disc_console_log_every_rollouts: int = 0,
         max_obs_dim: int = 256,
         max_action_dim: int = 16,
+        disc_lambda_shot: float = 0.0,
+        disc_lambda_q: float = 0.0,
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
@@ -702,6 +705,8 @@ class IntentDiversityCallback(BaseCallback):
         )
         self.max_obs_dim = int(max(8, max_obs_dim))
         self.max_action_dim = int(max(1, max_action_dim))
+        self.disc_lambda_shot = float(max(0.0, disc_lambda_shot))
+        self.disc_lambda_q = float(max(0.0, disc_lambda_q))
 
         self._rollout_step_idx = 0
         self._rollout_counter = 0
@@ -716,6 +721,8 @@ class IntentDiversityCallback(BaseCallback):
         self._last_disc_eval_acc = 0.0
         self._last_disc_auc: Optional[float] = None
         self._last_disc_pass_ms = 0.0
+        self._last_disc_shot_end_loss = 0.0
+        self._last_disc_shot_quality_loss = 0.0
         self._defense_unknown_baseline_ppp: Optional[float] = None
         self._pending_disc_restore_payload: Optional[dict[str, Any]] = None
         self._pending_disc_restore_source: Optional[str] = None
@@ -827,9 +834,18 @@ class IntentDiversityCallback(BaseCallback):
         for env_idx in range(n_envs):
             info = infos[env_idx] or {}
             tr = self._build_transition(obs_payload, actions, info, env_idx)
+            current_intent = self._episodes.current_intent_index(env_idx)
+            if (
+                current_intent is not None
+                and current_intent != int(tr.intent_index)
+                and not (env_idx < len(dones) and bool(dones[env_idx]))
+            ):
+                self._episodes.close_episode(env_idx)
             self._episodes.append(env_idx, tr)
             if env_idx < len(dones) and bool(dones[env_idx]):
-                self._episodes.close_episode(env_idx)
+                self._episodes.close_episode(env_idx, terminal_info=info)
+            elif float(info.get("intent_segment_boundary", 0.0)) > 0.5:
+                self._episodes.close_episode(env_idx, terminal_info=info)
 
         self._rollout_step_idx += 1
         return True
@@ -844,6 +860,8 @@ class IntentDiversityCallback(BaseCallback):
             dropout=self.disc_dropout,
             encoder_type=self.disc_encoder_type,
             step_dim=self.disc_step_dim,
+            enable_shot_end_head=self.disc_lambda_shot > 0.0,
+            enable_shot_quality_head=self.disc_lambda_q > 0.0,
         ).to(self._device)
         self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=self.disc_lr)
 
@@ -861,6 +879,18 @@ class IntentDiversityCallback(BaseCallback):
             "max_obs_dim": int(self.max_obs_dim),
             "max_action_dim": int(self.max_action_dim),
         }
+
+    @staticmethod
+    def _discriminator_aux_state_mismatch(exc: RuntimeError) -> bool:
+        message = str(exc)
+        return (
+            "shot_end_head" in message or "shot_quality_head" in message
+        ) and (
+            "Missing key(s) in state_dict" in message
+            or "Missing key(s):" in message
+            or "Unexpected key(s) in state_dict" in message
+            or "Unexpected key(s):" in message
+        )
 
     @staticmethod
     def _normalize_discriminator_config(
@@ -924,7 +954,17 @@ class IntentDiversityCallback(BaseCallback):
         self._maybe_build_discriminator(int(config["input_dim"]))
         assert self._disc is not None
         assert self._disc_opt is not None
-        self._disc.load_state_dict(payload["state_dict"], strict=True)
+        try:
+            self._disc.load_state_dict(payload["state_dict"], strict=True)
+        except RuntimeError as exc:
+            if self._discriminator_aux_state_mismatch(exc):
+                self._disc.load_state_dict(payload["state_dict"], strict=False)
+                print(
+                    f"Warning: restored discriminator weights from {source} with freshly initialized "
+                    "auxiliary prior heads."
+                )
+            else:
+                raise
         optimizer_state = payload.get("optimizer_state_dict")
         if optimizer_state is not None:
             try:
@@ -945,6 +985,14 @@ class IntentDiversityCallback(BaseCallback):
         )
         auc_value = meta.get("last_disc_auc_ovr_macro", self._last_disc_auc)
         self._last_disc_auc = None if auc_value is None else float(auc_value)
+        self._last_disc_shot_end_loss = float(
+            meta.get("last_disc_shot_end_loss", self._last_disc_shot_end_loss)
+        )
+        self._last_disc_shot_quality_loss = float(
+            meta.get(
+                "last_disc_shot_quality_loss", self._last_disc_shot_quality_loss
+            )
+        )
         return True
 
     def export_discriminator_checkpoint(
@@ -972,6 +1020,10 @@ class IntentDiversityCallback(BaseCallback):
                 "step_dim": int(self.disc_step_dim),
                 "max_obs_dim": int(self.max_obs_dim),
                 "max_action_dim": int(self.max_action_dim),
+                "disc_lambda_shot": float(self.disc_lambda_shot),
+                "disc_lambda_q": float(self.disc_lambda_q),
+                "enable_shot_end_head": bool(self.disc_lambda_shot > 0.0),
+                "enable_shot_quality_head": bool(self.disc_lambda_q > 0.0),
             },
             "meta": {
                 "global_step": (
@@ -991,6 +1043,8 @@ class IntentDiversityCallback(BaseCallback):
                     if self._last_disc_auc is not None
                     else None
                 ),
+                "last_disc_shot_end_loss": float(self._last_disc_shot_end_loss),
+                "last_disc_shot_quality_loss": float(self._last_disc_shot_quality_loss),
             },
         }
         torch.save(payload, path)
@@ -1015,11 +1069,28 @@ class IntentDiversityCallback(BaseCallback):
             if lengths_raw is not None
             else np.zeros((0,), dtype=np.int64)
         )
+        shot_end_np = np.asarray(
+            payload.get("shot_end", np.zeros((x_np.shape[0],), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        shot_quality_np = np.asarray(
+            payload.get("shot_quality", np.zeros((x_np.shape[0],), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        shot_quality_mask_np = np.asarray(
+            payload.get(
+                "shot_quality_mask", np.zeros((x_np.shape[0],), dtype=np.float32)
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
         np.savez_compressed(
             path,
             x=x_np,
             y=y_np,
             lengths=lengths_np,
+            shot_end=shot_end_np,
+            shot_quality=shot_quality_np,
+            shot_quality_mask=shot_quality_mask_np,
             has_lengths=np.array([1 if lengths_raw is not None else 0], dtype=np.int8),
             global_step=np.array(
                 [
@@ -1055,6 +1126,9 @@ class IntentDiversityCallback(BaseCallback):
         x_np: np.ndarray,
         y_np: np.ndarray,
         lengths_np: Optional[np.ndarray] = None,
+        shot_end_np: Optional[np.ndarray] = None,
+        shot_quality_np: Optional[np.ndarray] = None,
+        shot_quality_mask_np: Optional[np.ndarray] = None,
     ) -> tuple[float, float]:
         if x_np.shape[0] == 0:
             return 0.0, 0.0
@@ -1068,10 +1142,27 @@ class IntentDiversityCallback(BaseCallback):
         lengths = None
         if lengths_np is not None:
             lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        shot_end = None
+        if shot_end_np is not None:
+            shot_end = torch.as_tensor(
+                shot_end_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
+        shot_quality = None
+        if shot_quality_np is not None:
+            shot_quality = torch.as_tensor(
+                shot_quality_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
+        shot_quality_mask = None
+        if shot_quality_mask_np is not None:
+            shot_quality_mask = torch.as_tensor(
+                shot_quality_mask_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
 
         self._disc.train()
         last_loss = 0.0
         last_acc = 0.0
+        last_shot_end_loss = 0.0
+        last_shot_quality_loss = 0.0
         n = int(x.shape[0])
         for _ in range(self.disc_updates_per_rollout):
             if n <= self.disc_batch_size:
@@ -1081,8 +1172,43 @@ class IntentDiversityCallback(BaseCallback):
             xb = x[idx]
             yb = y[idx]
             lb = lengths[idx] if lengths is not None else None
-            logits = self._disc(xb, lb)
+            shot_end_b = shot_end[idx] if shot_end is not None else None
+            shot_quality_b = shot_quality[idx] if shot_quality is not None else None
+            shot_quality_mask_b = (
+                shot_quality_mask[idx] if shot_quality_mask is not None else None
+            )
+            logits, shot_end_pred, shot_quality_pred = self._disc.forward_with_aux(
+                xb, lb
+            )
             loss = F.cross_entropy(logits, yb)
+            shot_end_loss = torch.zeros((), dtype=torch.float32, device=self._device)
+            if (
+                float(self.disc_lambda_shot) > 0.0
+                and shot_end_pred is not None
+                and shot_end_b is not None
+            ):
+                shot_end_loss = F.binary_cross_entropy_with_logits(
+                    shot_end_pred, shot_end_b
+                )
+                loss = loss + float(self.disc_lambda_shot) * shot_end_loss
+            shot_quality_loss = torch.zeros(
+                (), dtype=torch.float32, device=self._device
+            )
+            if (
+                float(self.disc_lambda_q) > 0.0
+                and shot_quality_pred is not None
+                and shot_quality_b is not None
+            ):
+                if shot_quality_mask_b is None:
+                    shot_quality_loss = F.mse_loss(shot_quality_pred, shot_quality_b)
+                    loss = loss + float(self.disc_lambda_q) * shot_quality_loss
+                else:
+                    active = shot_quality_mask_b > 0.5
+                    if bool(torch.any(active)):
+                        shot_quality_loss = F.mse_loss(
+                            shot_quality_pred[active], shot_quality_b[active]
+                        )
+                        loss = loss + float(self.disc_lambda_q) * shot_quality_loss
             self._disc_opt.zero_grad(set_to_none=True)
             loss.backward()
             self._disc_opt.step()
@@ -1092,6 +1218,12 @@ class IntentDiversityCallback(BaseCallback):
                 acc = (pred == yb).float().mean()
                 last_loss = float(loss.detach().cpu().item())
                 last_acc = float(acc.detach().cpu().item())
+                last_shot_end_loss = float(shot_end_loss.detach().cpu().item())
+                last_shot_quality_loss = float(
+                    shot_quality_loss.detach().cpu().item()
+                )
+        self._last_disc_shot_end_loss = float(last_shot_end_loss)
+        self._last_disc_shot_quality_loss = float(last_shot_quality_loss)
         return last_loss, last_acc
 
     def _compute_episode_bonus(
@@ -1236,6 +1368,19 @@ class IntentDiversityCallback(BaseCallback):
                     f"[IntentDiversityCallback] Warning: could not recompute returns/advantages: {e}"
                 )
                 self._warned_recompute = True
+
+    @staticmethod
+    def _build_disc_aux_targets(
+        episodes: list[CompletedIntentEpisode],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shot_end = np.asarray(
+            [float(ep.shot_end_label) for ep in episodes], dtype=np.float32
+        )
+        shot_quality = np.asarray(
+            [float(ep.shot_quality_target) for ep in episodes], dtype=np.float32
+        )
+        shot_quality_mask = (shot_end > 0.5).astype(np.float32, copy=False)
+        return shot_end, shot_quality, shot_quality_mask
 
     @staticmethod
     def _usage_entropy(y_np: np.ndarray, num_intents: int) -> tuple[float, float]:
@@ -1469,16 +1614,37 @@ class IntentDiversityCallback(BaseCallback):
             "y": np.array(y_np, copy=True),
             "lengths": None if lengths_np is None else np.array(lengths_np, copy=True),
         }
+        shot_end_np, shot_quality_np, shot_quality_mask_np = self._build_disc_aux_targets(
+            episodes
+        )
+        self._latest_disc_eval_batch["shot_end"] = np.array(shot_end_np, copy=True)
+        self._latest_disc_eval_batch["shot_quality"] = np.array(
+            shot_quality_np, copy=True
+        )
+        self._latest_disc_eval_batch["shot_quality_mask"] = np.array(
+            shot_quality_mask_np, copy=True
+        )
 
         disc_pass_start = time.perf_counter()
         if lengths_np is None:
-            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(x_np, y_np)
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_np,
+                y_np,
+                shot_end_np=shot_end_np,
+                shot_quality_np=shot_quality_np,
+                shot_quality_mask_np=shot_quality_mask_np,
+            )
             self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(x_np, y_np)
             self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
             raw_bonus = self._compute_episode_bonus(x_np, y_np)
         else:
             self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
-                x_np, y_np, lengths_np
+                x_np,
+                y_np,
+                lengths_np,
+                shot_end_np=shot_end_np,
+                shot_quality_np=shot_quality_np,
+                shot_quality_mask_np=shot_quality_mask_np,
             )
             self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
                 x_np, y_np, lengths_np
@@ -1545,6 +1711,18 @@ class IntentDiversityCallback(BaseCallback):
         try:
             mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
             mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            if float(self.disc_lambda_shot) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_end_loss",
+                    float(self._last_disc_shot_end_loss),
+                    step=global_step,
+                )
+            if float(self.disc_lambda_q) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_quality_loss",
+                    float(self._last_disc_shot_quality_loss),
+                    step=global_step,
+                )
             mlflow.log_metric(
                 "intent/disc_top1_acc_eval",
                 float(self._last_disc_eval_acc),

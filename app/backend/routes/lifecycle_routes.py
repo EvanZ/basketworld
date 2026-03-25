@@ -23,9 +23,19 @@ from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
+    _apply_intent_fields_for_role,
+    _clone_obs_with_role_flag,
     _compute_q_values_for_player,
+    _ensure_set_obs,
     _predict_policy_actions,
     validate_policy_observation_schema,
+)
+from app.backend.selector_runtime import (
+    apply_selected_offense_intent,
+    selector_neutralize_observation,
+    selector_runtime_enabled,
+    selector_sample_intent,
+    selector_segment_boundary_reason,
 )
 from app.backend.policies import (
     _compute_param_counts_from_policy,
@@ -41,6 +51,8 @@ from app.backend.schemas import (
 )
 from app.backend.state import (
     _capture_turn_start_snapshot,
+    _rebuild_cached_obs,
+    _role_flag_value_for_team,
     game_state,
     get_ui_game_state,
 )
@@ -59,6 +71,104 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
     wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
     return env_kwargs, wrapper_kwargs
+
+
+def _current_offense_controller_policy():
+    user_team = game_state.user_team or Team.OFFENSE
+    if user_team == Team.OFFENSE:
+        return game_state.unified_policy
+    if game_state.defense_policy is not None:
+        return game_state.defense_policy
+    return game_state.unified_policy
+
+
+def _build_offense_selector_observation(policy_model, base_obs: dict | None) -> dict | None:
+    if policy_model is None or game_state.env is None or base_obs is None:
+        return None
+    prepared_obs = _ensure_set_obs(policy_model, game_state.env, base_obs)
+    if prepared_obs is None:
+        return None
+    role_flag_value = _role_flag_value_for_team(Team.OFFENSE)
+    conditioned_obs = _clone_obs_with_role_flag(prepared_obs, role_flag_value)
+    conditioned_obs = _apply_intent_fields_for_role(
+        conditioned_obs,
+        game_state.env,
+        role_flag_value,
+    )
+    num_intents = max(
+        1,
+        int(getattr(getattr(game_state.env, "unwrapped", game_state.env), "num_intents", 1)),
+    )
+    return selector_neutralize_observation(conditioned_obs, num_intents)
+
+
+def _selector_runtime_active_for_app() -> bool:
+    return selector_runtime_enabled(
+        getattr(game_state, "mlflow_training_params", None),
+        _current_offense_controller_policy(),
+    )
+
+
+def _apply_app_segment_start(*, allow_uniform_fallback: bool) -> bool:
+    if not _selector_runtime_active_for_app():
+        return False
+    base_env = getattr(game_state.env, "unwrapped", game_state.env)
+    if not bool(getattr(base_env, "enable_intent_learning", False)):
+        return False
+    if not bool(getattr(base_env, "intent_active", False)):
+        return False
+    offense_policy = _current_offense_controller_policy()
+    selector_obs = _build_offense_selector_observation(offense_policy, game_state.obs)
+    if selector_obs is None:
+        return False
+    result = selector_sample_intent(
+        getattr(game_state, "mlflow_training_params", None),
+        offense_policy,
+        selector_obs,
+        num_intents=max(1, int(getattr(base_env, "num_intents", 1))),
+        allow_uniform_fallback=allow_uniform_fallback,
+        rng=getattr(base_env, "_rng", None),
+    )
+    intent_index = result.get("intent_index")
+    if intent_index is None:
+        return False
+    apply_selected_offense_intent(
+        game_state.env,
+        int(intent_index),
+        intent_commitment_steps=int(getattr(base_env, "intent_commitment_steps", 0)),
+    )
+    _rebuild_cached_obs()
+    return bool(result.get("used_selector", False))
+
+
+def _initialize_app_selector_runtime_for_episode() -> None:
+    game_state.selector_segment_index = 0
+    game_state.selector_last_boundary_reason = None
+    _apply_app_segment_start(allow_uniform_fallback=False)
+
+
+def _maybe_apply_app_multisegment_boundary(info: dict | None, done: bool) -> str | None:
+    game_state.selector_last_boundary_reason = None
+    if bool(done) or not _selector_runtime_active_for_app():
+        return None
+    base_env = getattr(game_state.env, "unwrapped", game_state.env)
+    reason = selector_segment_boundary_reason(
+        getattr(game_state, "mlflow_training_params", None),
+        segment_length=int(getattr(base_env, "intent_age", 0)),
+        info=info,
+        intent_commitment_steps=int(getattr(base_env, "intent_commitment_steps", 0)),
+    )
+    if reason is None:
+        return None
+    _apply_app_segment_start(allow_uniform_fallback=True)
+    game_state.selector_segment_index = int(
+        getattr(game_state, "selector_segment_index", 0)
+    ) + 1
+    game_state.selector_last_boundary_reason = str(reason)
+    if isinstance(info, dict):
+        info["intent_segment_boundary"] = 1.0
+        info["intent_segment_boundary_reason"] = str(reason)
+    return str(reason)
 
 
 @router.post("/api/list_policies")
@@ -233,6 +343,7 @@ async def init_game(request: InitGameRequest):
         game_state.episode_states = []
         game_state.phi_log = []
         game_state.playable_session = None
+        _initialize_app_selector_runtime_for_episode()
 
         try:
             frame = game_state.env.render()
@@ -525,6 +636,10 @@ def step(request: ActionRequest):
 
     game_state.prev_obs = game_state.obs
     game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
+    _maybe_apply_app_multisegment_boundary(
+        info if isinstance(info, dict) else None,
+        bool(done),
+    )
 
     try:
         game_state.actions_log.append([int(a) for a in full_action.tolist()])
@@ -901,6 +1016,7 @@ def start_self_play():
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
     game_state.prev_obs = None
+    _initialize_app_selector_runtime_for_episode()
     _capture_turn_start_snapshot()
 
     try:

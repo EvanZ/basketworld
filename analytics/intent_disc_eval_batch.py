@@ -19,7 +19,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from basketworld.utils.callbacks import IntentDiversityCallback
-from basketworld.utils.intent_discovery import IntentDiscriminator
+from basketworld.utils.intent_discovery import (
+    IntentDiscriminator,
+    load_intent_discriminator_from_checkpoint,
+)
 from basketworld.utils.mlflow_config import setup_mlflow
 
 
@@ -66,6 +69,51 @@ def _download_matching_artifact(
     return client.download_artifacts(run_id, artifact_path, tmpdir)
 
 
+def _download_exact_artifact(
+    run_id: str,
+    *,
+    artifact_path: str,
+    tmp_prefix: str,
+) -> str:
+    client = mlflow.tracking.MlflowClient()
+    tmpdir = tempfile.mkdtemp(prefix=tmp_prefix)
+    return client.download_artifacts(run_id, artifact_path, tmpdir)
+
+
+def _try_download_pca_batch_artifact(
+    run_id: str,
+    *,
+    checkpoint_idx: Optional[int],
+) -> str | None:
+    if checkpoint_idx is None:
+        return None
+    idx = int(checkpoint_idx)
+    candidate_paths = [
+        f"analysis/intent_pca/iter_{idx}/intent_disc_eval_batch_from_pca.npz",
+        f"analysis/intent_pca/alternation_{idx}/intent_disc_eval_batch_from_pca.npz",
+    ]
+    for artifact_path in candidate_paths:
+        try:
+            return _download_exact_artifact(
+                run_id,
+                artifact_path=artifact_path,
+                tmp_prefix="intent_disc_eval_batch_pca_",
+            )
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_artifact_uri(uri: str) -> tuple[str, str]:
+    match = re.match(
+        r"^mlflow-artifacts:/\d+/([0-9a-f]+)/artifacts/(.+)$",
+        str(uri).strip(),
+    )
+    if not match:
+        raise RuntimeError(f"Unsupported MLflow artifact URI: {uri}")
+    return match.group(1), match.group(2)
+
+
 def _resolve_local_discriminator_path(batch_path: str) -> str | None:
     batch_dir = os.path.dirname(os.path.abspath(batch_path))
     checkpoint_idx = _extract_checkpoint_index(batch_path)
@@ -80,21 +128,26 @@ def _resolve_local_discriminator_path(batch_path: str) -> str | None:
     return str(candidates[-1]) if candidates else None
 
 
+def _resolve_disc_path_input(disc_path: Optional[str]) -> Optional[str]:
+    if not disc_path:
+        return None
+    if os.path.isfile(disc_path):
+        return disc_path
+    if str(disc_path).startswith("mlflow-artifacts:/"):
+        run_id, artifact_path = _resolve_artifact_uri(str(disc_path))
+        return _download_exact_artifact(
+            run_id,
+            artifact_path=artifact_path,
+            tmp_prefix="intent_disc_ckpt_uri_",
+        )
+    return disc_path
+
+
 def _load_discriminator_checkpoint(path: str, device: str) -> tuple[IntentDiscriminator, dict[str, Any]]:
     payload = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(payload, dict) or "state_dict" not in payload or "config" not in payload:
         raise RuntimeError(f"Unsupported discriminator checkpoint format: {path}")
-    config = dict(payload.get("config", {}) or {})
-    disc = IntentDiscriminator(
-        input_dim=int(config["input_dim"]),
-        hidden_dim=int(config["hidden_dim"]),
-        num_intents=int(config["num_intents"]),
-        dropout=float(config.get("dropout", 0.1)),
-        encoder_type=str(config.get("encoder_type", "mlp_mean")),
-        step_dim=int(config.get("step_dim", 64)),
-    ).to(device)
-    disc.load_state_dict(payload["state_dict"])
-    disc.eval()
+    disc = load_intent_discriminator_from_checkpoint(payload, device=device)
     return disc, payload
 
 
@@ -171,12 +224,18 @@ def score_eval_batch(
         logits_np, y_np, num_classes=int(disc_config.get("num_intents", logits_np.shape[1]))
     )
     confusion = np.zeros((0, 0), dtype=np.int64)
+    confusion_row_normalized = np.zeros((0, 0), dtype=np.float64)
     if y_np.size and logits_np.ndim == 2:
         num_classes = int(disc_config.get("num_intents", logits_np.shape[1]))
         confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
         for truth, pred_idx in zip(y_np.tolist(), pred.tolist()):
             if 0 <= int(truth) < num_classes and 0 <= int(pred_idx) < num_classes:
                 confusion[int(truth), int(pred_idx)] += 1
+        row_totals = confusion.sum(axis=1, keepdims=True).astype(np.float64, copy=False)
+        confusion_row_normalized = np.divide(
+            confusion.astype(np.float64, copy=False),
+            np.maximum(row_totals, 1.0),
+        )
 
     return {
         "batch_path": os.path.abspath(batch_path),
@@ -193,6 +252,36 @@ def score_eval_batch(
         if pred.size
         else [],
         "confusion_matrix_counts": confusion.tolist(),
+        "confusion_matrix_row_normalized": [
+            [float(v) for v in row] for row in confusion_row_normalized.tolist()
+        ],
+    }
+
+
+def validate_eval_result(
+    result: dict[str, Any],
+    *,
+    min_top1: float | None = None,
+    min_auc: float | None = None,
+) -> dict[str, Any]:
+    failed_checks: list[str] = []
+    if min_top1 is not None:
+        actual_top1 = float(result.get("recomputed_top1_acc", 0.0))
+        if actual_top1 < float(min_top1):
+            failed_checks.append(
+                f"top1 {actual_top1:.6f} < required {float(min_top1):.6f}"
+            )
+    if min_auc is not None:
+        actual_auc = result.get("recomputed_auc_ovr_macro", None)
+        if actual_auc is None:
+            failed_checks.append("auc unavailable")
+        elif float(actual_auc) < float(min_auc):
+            failed_checks.append(
+                f"auc {float(actual_auc):.6f} < required {float(min_auc):.6f}"
+            )
+    return {
+        "passed": len(failed_checks) == 0,
+        "failed_checks": failed_checks,
     }
 
 
@@ -202,25 +291,49 @@ def _resolve_inputs(
     disc_path: Optional[str],
     checkpoint_idx: Optional[int],
 ) -> tuple[str, str]:
+    resolved_disc_path_arg = _resolve_disc_path_input(disc_path)
     if os.path.isfile(batch_or_run_id):
         batch_path = batch_or_run_id
-        resolved_disc_path = disc_path or _resolve_local_discriminator_path(batch_path)
+        resolved_disc_path = resolved_disc_path_arg or _resolve_local_discriminator_path(batch_path)
         if not resolved_disc_path or not os.path.isfile(resolved_disc_path):
             raise RuntimeError(
                 "Could not resolve a local discriminator checkpoint. Pass --disc-path explicitly."
             )
         return batch_path, resolved_disc_path
 
+    if str(batch_or_run_id).startswith("mlflow-artifacts:/"):
+        run_id_from_uri, artifact_path = _resolve_artifact_uri(batch_or_run_id)
+        batch_path = _download_exact_artifact(
+            run_id_from_uri,
+            artifact_path=artifact_path,
+            tmp_prefix="intent_disc_eval_batch_uri_",
+        )
+        resolved_disc_path = resolved_disc_path_arg or _download_matching_artifact(
+            run_id_from_uri,
+            pattern=re.compile(r"intent_disc_(?:alternation|iter)_(\d+)\.pt$"),
+            checkpoint_idx=checkpoint_idx,
+            tmp_prefix="intent_disc_ckpt_",
+        )
+        return batch_path, resolved_disc_path
+
     run_id = batch_or_run_id
     batch_artifact_pattern = re.compile(r"intent_disc_eval_batch_(?:alternation|iter)_(\d+)\.npz$")
     disc_artifact_pattern = re.compile(r"intent_disc_(?:alternation|iter)_(\d+)\.pt$")
-    batch_path = _download_matching_artifact(
-        run_id,
-        pattern=batch_artifact_pattern,
-        checkpoint_idx=checkpoint_idx,
-        tmp_prefix="intent_disc_eval_batch_",
-    )
-    resolved_disc_path = disc_path or _download_matching_artifact(
+    try:
+        batch_path = _download_matching_artifact(
+            run_id,
+            pattern=batch_artifact_pattern,
+            checkpoint_idx=checkpoint_idx,
+            tmp_prefix="intent_disc_eval_batch_",
+        )
+    except RuntimeError:
+        batch_path = _try_download_pca_batch_artifact(
+            run_id,
+            checkpoint_idx=checkpoint_idx,
+        )
+        if batch_path is None:
+            raise
+    resolved_disc_path = resolved_disc_path_arg or _download_matching_artifact(
         run_id,
         pattern=disc_artifact_pattern,
         checkpoint_idx=checkpoint_idx,
@@ -261,6 +374,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional path to write the result JSON.",
     )
+    parser.add_argument(
+        "--min-top1",
+        type=float,
+        default=None,
+        help="Optional minimum required recomputed top1 accuracy. Exits nonzero if unmet.",
+    )
+    parser.add_argument(
+        "--min-auc",
+        type=float,
+        default=None,
+        help="Optional minimum required recomputed one-vs-rest macro AUC. Exits nonzero if unmet.",
+    )
     return parser.parse_args(argv)
 
 
@@ -274,6 +399,11 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_idx=args.alternation_index,
     )
     result = score_eval_batch(batch_path, disc_path, device=args.device)
+    result["validation"] = validate_eval_result(
+        result,
+        min_top1=args.min_top1,
+        min_auc=args.min_auc,
+    )
     rendered = json.dumps(result, indent=2, sort_keys=True)
     print(rendered)
     if args.json_out:
@@ -282,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(rendered)
             fh.write("\n")
-    return 0
+    return 0 if bool(result["validation"]["passed"]) else 1
 
 
 if __name__ == "__main__":

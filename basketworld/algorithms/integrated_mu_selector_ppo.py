@@ -38,6 +38,9 @@ class IntegratedIntentSelectorPPO(PPO):
         intent_selector_entropy_coef: float = 0.01,
         intent_selector_usage_reg_coef: float = 0.01,
         intent_selector_value_coef: float = 0.5,
+        intent_selector_multiselect_enabled: bool = False,
+        intent_selector_min_play_steps: int = 3,
+        intent_commitment_steps: int = 4,
         **kwargs,
     ) -> None:
         self.intent_selector_enabled = bool(intent_selector_enabled)
@@ -55,12 +58,23 @@ class IntegratedIntentSelectorPPO(PPO):
             max(0.0, intent_selector_usage_reg_coef)
         )
         self.intent_selector_value_coef = float(max(0.0, intent_selector_value_coef))
+        self.intent_selector_multiselect_enabled = bool(
+            intent_selector_multiselect_enabled
+        )
+        self.intent_selector_min_play_steps = max(1, int(intent_selector_min_play_steps))
+        self.intent_commitment_steps = max(1, int(intent_commitment_steps))
 
         self._selector_return_stats = RunningMeanStd()
         self._selector_episode_start_records_by_env: dict[int, dict[str, Any]] = {}
         self._selector_completed_samples: list[dict[str, Any]] = []
-        self._selector_episode_returns: Optional[np.ndarray] = None
+        self._selector_segment_returns: Optional[np.ndarray] = None
+        self._selector_segment_discounts: Optional[np.ndarray] = None
+        self._selector_segment_lengths: Optional[np.ndarray] = None
+        self._selector_episode_segment_counts: Optional[np.ndarray] = None
+        self._selector_episode_trackable_mask: Optional[np.ndarray] = None
         self._selector_current_obs_selected_mask: Optional[np.ndarray] = None
+        self._selector_rollout_completed_episode_segment_counts: list[int] = []
+        self._selector_rollout_boundary_reason_counts: dict[str, int] = {}
         self._selector_last_metrics: dict[str, float] = {}
         super().__init__(*args, **kwargs)
 
@@ -70,8 +84,14 @@ class IntegratedIntentSelectorPPO(PPO):
             [
                 "_selector_episode_start_records_by_env",
                 "_selector_completed_samples",
-                "_selector_episode_returns",
+                "_selector_segment_returns",
+                "_selector_segment_discounts",
+                "_selector_segment_lengths",
+                "_selector_episode_segment_counts",
+                "_selector_episode_trackable_mask",
                 "_selector_current_obs_selected_mask",
+                "_selector_rollout_completed_episode_segment_counts",
+                "_selector_rollout_boundary_reason_counts",
                 "_selector_last_metrics",
             ]
         )
@@ -183,18 +203,36 @@ class IntegratedIntentSelectorPPO(PPO):
         env_count = int(self.n_envs if n_envs is None else n_envs)
         self._selector_episode_start_records_by_env = {}
         self._selector_completed_samples = []
-        self._selector_episode_returns = np.zeros(env_count, dtype=np.float64)
+        self._selector_segment_returns = np.zeros(env_count, dtype=np.float64)
+        self._selector_segment_discounts = np.ones(env_count, dtype=np.float64)
+        self._selector_segment_lengths = np.zeros(env_count, dtype=np.int64)
+        self._selector_episode_segment_counts = np.zeros(env_count, dtype=np.int64)
+        self._selector_episode_trackable_mask = np.zeros(env_count, dtype=bool)
         self._selector_current_obs_selected_mask = np.zeros(env_count, dtype=bool)
+        self._selector_rollout_completed_episode_segment_counts = []
+        self._selector_rollout_boundary_reason_counts = {}
         self._selector_last_metrics = {}
 
     def _selector_ensure_runtime_state(self, n_envs: int) -> None:
         if (
-            self._selector_episode_returns is None
+            self._selector_segment_returns is None
+            or self._selector_segment_discounts is None
+            or self._selector_segment_lengths is None
+            or self._selector_episode_segment_counts is None
+            or self._selector_episode_trackable_mask is None
             or self._selector_current_obs_selected_mask is None
-            or len(self._selector_episode_returns) != int(n_envs)
+            or len(self._selector_segment_returns) != int(n_envs)
+            or len(self._selector_segment_discounts) != int(n_envs)
+            or len(self._selector_segment_lengths) != int(n_envs)
+            or len(self._selector_episode_segment_counts) != int(n_envs)
+            or len(self._selector_episode_trackable_mask) != int(n_envs)
             or len(self._selector_current_obs_selected_mask) != int(n_envs)
         ):
             self._selector_reset_runtime_state(n_envs)
+
+    def _selector_reset_rollout_observability(self) -> None:
+        self._selector_rollout_completed_episode_segment_counts = []
+        self._selector_rollout_boundary_reason_counts = {}
 
     @staticmethod
     def _selector_extract_scalar_from_obs(
@@ -311,75 +349,275 @@ class IntegratedIntentSelectorPPO(PPO):
             batch_index=env_idx,
         )
 
-    def _selector_maybe_select_for_episode_start(
-        self, obs_payload: Any, env_idx: int
-    ) -> bool:
+    def _selector_reset_segment_tracking_for_env(self, env_idx: int) -> None:
+        assert self._selector_segment_returns is not None
+        assert self._selector_segment_discounts is not None
+        assert self._selector_segment_lengths is not None
+        self._selector_segment_returns[int(env_idx)] = 0.0
+        self._selector_segment_discounts[int(env_idx)] = 1.0
+        self._selector_segment_lengths[int(env_idx)] = 0
+
+    @staticmethod
+    def _selector_segment_bucket_label(segment_index_within_episode: int) -> str:
+        idx = max(0, int(segment_index_within_episode))
+        if idx >= 3:
+            return "3_plus"
+        return str(idx)
+
+    def _selector_episode_is_trackable(self, obs_payload: Any, env_idx: int) -> bool:
+        if not isinstance(obs_payload, dict):
+            return False
+        return (
+            self._selector_extract_scalar_from_obs(
+                obs_payload, "role_flag", env_idx, default=0.0
+            )
+            > 0.0
+            and self._selector_extract_scalar_from_obs(
+                obs_payload, "intent_active", env_idx, default=0.0
+            )
+            > 0.5
+        )
+
+    def _selector_mark_episode_start(self, obs_payload: Any, env_idx: int) -> None:
+        assert self._selector_episode_segment_counts is not None
+        assert self._selector_episode_trackable_mask is not None
+        trackable = self._selector_episode_is_trackable(obs_payload, env_idx)
+        self._selector_episode_trackable_mask[int(env_idx)] = bool(trackable)
+        self._selector_episode_segment_counts[int(env_idx)] = 1 if trackable else 0
+
+    def _selector_record_segment_boundary(self, env_idx: int, reason: str) -> None:
+        assert self._selector_episode_segment_counts is not None
+        assert self._selector_episode_trackable_mask is not None
+        if not bool(self._selector_episode_trackable_mask[int(env_idx)]):
+            return
+        self._selector_episode_segment_counts[int(env_idx)] += 1
+        self._selector_rollout_boundary_reason_counts[reason] = (
+            self._selector_rollout_boundary_reason_counts.get(reason, 0) + 1
+        )
+
+    def _selector_finalize_episode_tracking(self, env_idx: int) -> None:
+        assert self._selector_episode_segment_counts is not None
+        assert self._selector_episode_trackable_mask is not None
+        if bool(self._selector_episode_trackable_mask[int(env_idx)]):
+            self._selector_rollout_completed_episode_segment_counts.append(
+                int(self._selector_episode_segment_counts[int(env_idx)])
+            )
+        self._selector_episode_segment_counts[int(env_idx)] = 0
+        self._selector_episode_trackable_mask[int(env_idx)] = False
+
+    def _selector_accumulate_step_reward(
+        self, rewards: np.ndarray, dones: np.ndarray
+    ) -> None:
+        assert self._selector_segment_returns is not None
+        assert self._selector_segment_discounts is not None
+        assert self._selector_segment_lengths is not None
+        reward_arr = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        for env_idx in range(min(len(reward_arr), len(self._selector_segment_returns))):
+            self._selector_segment_returns[env_idx] += float(reward_arr[env_idx])
+            self._selector_segment_lengths[env_idx] += 1
+
+    @staticmethod
+    def _selector_completed_pass_boundary(info: Any) -> bool:
+        if not isinstance(info, dict):
+            return False
+        action_results = info.get("action_results", {})
+        if not isinstance(action_results, dict):
+            return False
+        passes = action_results.get("passes", {})
+        if not isinstance(passes, dict):
+            return False
+        for pass_result in passes.values():
+            if isinstance(pass_result, dict) and bool(pass_result.get("success")):
+                return True
+        return False
+
+    def _selector_segment_boundary_reason(self, info: Any, env_idx: int) -> Optional[str]:
+        assert self._selector_segment_lengths is not None
+        if self._selector_segment_lengths[int(env_idx)] >= int(self.intent_commitment_steps):
+            return "commitment_timeout"
+        if (
+            self._selector_segment_lengths[int(env_idx)] >= self.intent_selector_min_play_steps
+            and self._selector_completed_pass_boundary(info)
+        ):
+            return "completed_pass"
+        return None
+
+    def _selector_prepare_segment_start(
+        self,
+        obs_payload: Any,
+        env_idx: int,
+        *,
+        allow_uniform_fallback: bool,
+    ) -> dict[str, Any]:
+        prepared: dict[str, Any] = {
+            "apply_intent": None,
+            "used_selector": False,
+            "record": None,
+        }
         if (
             not self.intent_selector_enabled
             or not self._policy_has_intent_selector()
             or not isinstance(obs_payload, dict)
         ):
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
         if self._selector_has_forced_override(env_idx):
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
         if (
             self._selector_extract_scalar_from_obs(
                 obs_payload, "role_flag", env_idx, default=0.0
             )
             <= 0.0
         ):
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
         if (
             self._selector_extract_scalar_from_obs(
                 obs_payload, "intent_active", env_idx, default=0.0
             )
             <= 0.5
         ):
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
-
-        alpha = self._selector_alpha_current()
-        if alpha <= 0.0 or np.random.random() >= alpha:
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
 
         n_envs = self._selector_obs_batch_size(obs_payload)
         if n_envs <= 0:
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
         try:
             start_obs = extract_single_env_observation(
                 obs_payload, env_idx=env_idx, expected_batch_size=n_envs
             )
         except Exception:
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+            return prepared
 
+        alpha = self._selector_alpha_current()
         selector_obs = self._selector_neutralize_observation(start_obs)
-        try:
-            with torch.no_grad():
-                logits, values = self.policy.get_intent_selector_outputs(selector_obs)
-                dist = torch.distributions.Categorical(logits=logits)
-                chosen = dist.sample().reshape(-1)
-                chosen_z = int(chosen[0].item())
-                old_log_prob = float(dist.log_prob(chosen).reshape(-1)[0].item())
-                old_value = float(values.reshape(-1)[0].item())
-        except Exception:
-            self._selector_episode_start_records_by_env.pop(int(env_idx), None)
-            return False
+        if alpha > 0.0 and np.random.random() < alpha:
+            try:
+                with torch.no_grad():
+                    logits, values = self.policy.get_intent_selector_outputs(selector_obs)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    chosen = dist.sample().reshape(-1)
+                    chosen_z = int(chosen[0].item())
+                    old_log_prob = float(dist.log_prob(chosen).reshape(-1)[0].item())
+                    old_value = float(values.reshape(-1)[0].item())
+            except Exception:
+                return prepared
+            prepared["apply_intent"] = int(chosen_z)
+            prepared["used_selector"] = True
+            prepared["record"] = {
+                "selector_obs": selector_obs,
+                "chosen_z": int(chosen_z),
+                "segment_index_within_episode": int(
+                    self._selector_episode_segment_counts[int(env_idx)] - 1
+                )
+                if self._selector_episode_segment_counts is not None
+                else 0,
+                "alpha": float(alpha),
+                "old_log_prob": float(old_log_prob),
+                "old_value": float(old_value),
+            }
+            return prepared
 
-        self._selector_apply_selected_intent(obs_payload, env_idx, chosen_z)
-        self._selector_episode_start_records_by_env[int(env_idx)] = {
-            "selector_obs": selector_obs,
-            "chosen_z": int(chosen_z),
-            "alpha": float(alpha),
-            "old_log_prob": float(old_log_prob),
-            "old_value": float(old_value),
+        if allow_uniform_fallback:
+            prepared["apply_intent"] = int(
+                np.random.randint(0, self.intent_selector_num_intents)
+            )
+        return prepared
+
+    def _selector_commit_prepared_segment_start(
+        self, obs_payload: Any, env_idx: int, prepared: dict[str, Any]
+    ) -> bool:
+        self._selector_episode_start_records_by_env.pop(int(env_idx), None)
+        self._selector_reset_segment_tracking_for_env(env_idx)
+        chosen_z = prepared.get("apply_intent")
+        if chosen_z is None:
+            return False
+        if isinstance(obs_payload, dict):
+            self._selector_apply_selected_intent(obs_payload, env_idx, int(chosen_z))
+        record = prepared.get("record")
+        if isinstance(record, dict) and bool(prepared.get("used_selector", False)):
+            self._selector_episode_start_records_by_env[int(env_idx)] = record
+            return True
+        return False
+
+    def _selector_finalize_current_segment(
+        self, env_idx: int, *, bootstrap_value: Optional[float] = None
+    ) -> None:
+        assert self._selector_segment_returns is not None
+        assert self._selector_segment_discounts is not None
+        assert self._selector_segment_lengths is not None
+        record = self._selector_episode_start_records_by_env.pop(int(env_idx), None)
+        segment_return = float(self._selector_segment_returns[int(env_idx)])
+        segment_discount = float(self._selector_segment_discounts[int(env_idx)])
+        segment_length = int(self._selector_segment_lengths[int(env_idx)])
+        if record is not None:
+            target_return = segment_return
+            if bootstrap_value is not None:
+                target_return += segment_discount * float(bootstrap_value)
+            self._selector_completed_samples.append(
+                {
+                    **record,
+                    "segment_return": float(segment_return),
+                    "target_return": float(target_return),
+                    "segment_length": float(segment_length),
+                    "bootstrap_value": (
+                        float(bootstrap_value) if bootstrap_value is not None else 0.0
+                    ),
+                    "used_bootstrap": bool(bootstrap_value is not None),
+                }
+            )
+        self._selector_reset_segment_tracking_for_env(env_idx)
+
+    def _selector_log_rollout_segment_metrics(self) -> None:
+        completed_counts = np.asarray(
+            self._selector_rollout_completed_episode_segment_counts, dtype=np.float64
+        )
+        episode_count = int(completed_counts.size)
+        boundary_total = int(sum(self._selector_rollout_boundary_reason_counts.values()))
+        metrics: dict[str, float] = {
+            "intent/segment_episode_count": float(episode_count),
+            "intent/multisegment_episode_rate": float(
+                np.mean(completed_counts >= 2.0) if episode_count > 0 else 0.0
+            ),
+            "intent/segments_per_episode_mean": float(
+                np.mean(completed_counts) if episode_count > 0 else 0.0
+            ),
+            "intent/segment_boundary_count": float(boundary_total),
+            "intent/segment_boundary_reason_completed_pass_rate": float(
+                self._selector_rollout_boundary_reason_counts.get("completed_pass", 0)
+                / boundary_total
+            )
+            if boundary_total > 0
+            else 0.0,
+            "intent/segment_boundary_reason_commitment_timeout_rate": float(
+                self._selector_rollout_boundary_reason_counts.get(
+                    "commitment_timeout", 0
+                )
+                / boundary_total
+            )
+            if boundary_total > 0
+            else 0.0,
         }
-        return True
+        self._selector_last_metrics = {
+            **self._selector_last_metrics,
+            **metrics,
+        }
+        global_step = int(getattr(self, "num_timesteps", 0))
+        for key, value in metrics.items():
+            try:
+                mlflow.log_metric(key, float(value), step=global_step)
+            except Exception:
+                pass
+
+    def _selector_maybe_select_for_episode_start(
+        self, obs_payload: Any, env_idx: int
+    ) -> bool:
+        prepared = self._selector_prepare_segment_start(
+            obs_payload,
+            env_idx,
+            allow_uniform_fallback=False,
+        )
+        return bool(
+            self._selector_commit_prepared_segment_start(obs_payload, env_idx, prepared)
+        )
 
     def collect_rollouts(
         self,
@@ -395,7 +633,10 @@ class IntegratedIntentSelectorPPO(PPO):
         n_steps = 0
         rollout_buffer.reset()
         self._selector_ensure_runtime_state(env.num_envs)
-        assert self._selector_episode_returns is not None
+        self._selector_reset_rollout_observability()
+        assert self._selector_segment_returns is not None
+        assert self._selector_segment_discounts is not None
+        assert self._selector_segment_lengths is not None
         assert self._selector_current_obs_selected_mask is not None
 
         if self.use_sde:
@@ -407,7 +648,7 @@ class IntegratedIntentSelectorPPO(PPO):
         for env_idx, is_start in enumerate(episode_starts):
             if not bool(is_start):
                 continue
-            self._selector_episode_returns[env_idx] = 0.0
+            self._selector_mark_episode_start(self._last_obs, env_idx)
             if not bool(self._selector_current_obs_selected_mask[env_idx]):
                 selected = self._selector_maybe_select_for_episode_start(
                     self._last_obs, env_idx
@@ -434,26 +675,52 @@ class IntegratedIntentSelectorPPO(PPO):
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
             self.num_timesteps += env.num_envs
-            self._selector_episode_returns += np.asarray(rewards, dtype=np.float64)
+            self._selector_accumulate_step_reward(rewards, dones)
 
             next_selected_mask = np.zeros(env.num_envs, dtype=bool)
+            pending_segment_starts: dict[int, dict[str, Any]] = {}
             if isinstance(new_obs, dict):
-                for env_idx, done in enumerate(np.asarray(dones, dtype=bool).reshape(-1)):
+                done_mask = np.asarray(dones, dtype=bool).reshape(-1)
+                for env_idx, done in enumerate(done_mask):
                     if not bool(done):
+                        boundary_reason = None
+                        if (
+                            self.intent_selector_enabled
+                            and self.intent_selector_multiselect_enabled
+                        ):
+                            boundary_reason = self._selector_segment_boundary_reason(
+                                infos[env_idx] if env_idx < len(infos) else None,
+                                env_idx,
+                            )
+                        if boundary_reason is not None:
+                            self._selector_record_segment_boundary(
+                                env_idx, boundary_reason
+                            )
+                            prepared = self._selector_prepare_segment_start(
+                                new_obs,
+                                env_idx,
+                                allow_uniform_fallback=True,
+                            )
+                            bootstrap_value = None
+                            if bool(prepared.get("used_selector", False)):
+                                record = prepared.get("record")
+                                if isinstance(record, dict):
+                                    bootstrap_value = float(
+                                        record.get("old_value", 0.0)
+                                    )
+                            self._selector_finalize_current_segment(
+                                env_idx, bootstrap_value=bootstrap_value
+                            )
+                            if env_idx < len(infos) and isinstance(infos[env_idx], dict):
+                                infos[env_idx]["intent_segment_boundary"] = 1.0
+                                infos[env_idx]["intent_segment_boundary_reason"] = boundary_reason
+                            pending_segment_starts[int(env_idx)] = prepared
                         continue
-                    start_record = self._selector_episode_start_records_by_env.pop(
-                        int(env_idx), None
+                    self._selector_finalize_current_segment(
+                        env_idx, bootstrap_value=None
                     )
-                    if start_record is not None:
-                        self._selector_completed_samples.append(
-                            {
-                                **start_record,
-                                "episode_return": float(
-                                    self._selector_episode_returns[env_idx]
-                                ),
-                            }
-                        )
-                    self._selector_episode_returns[env_idx] = 0.0
+                    self._selector_finalize_episode_tracking(env_idx)
+                    self._selector_mark_episode_start(new_obs, env_idx)
                     selected = self._selector_maybe_select_for_episode_start(
                         new_obs, env_idx
                     )
@@ -462,6 +729,13 @@ class IntegratedIntentSelectorPPO(PPO):
             callback.update_locals(locals())
             if not callback.on_step():
                 return False
+
+            if isinstance(new_obs, dict) and pending_segment_starts:
+                for env_idx, prepared in pending_segment_starts.items():
+                    used_selector = self._selector_commit_prepared_segment_start(
+                        new_obs, env_idx, prepared
+                    )
+                    next_selected_mask[int(env_idx)] = bool(used_selector)
 
             self._update_info_buffer(infos)
             n_steps += 1
@@ -504,6 +778,7 @@ class IntegratedIntentSelectorPPO(PPO):
 
     def train(self) -> None:
         super().train()
+        self._selector_log_rollout_segment_metrics()
         self._train_intent_selector()
 
     def _train_intent_selector(self) -> None:
@@ -521,7 +796,21 @@ class IntegratedIntentSelectorPPO(PPO):
             [sample["selector_obs"] for sample in samples]
         )
         returns_np = np.asarray(
-            [sample["episode_return"] for sample in samples], dtype=np.float32
+            [sample["target_return"] for sample in samples], dtype=np.float32
+        )
+        segment_return_np = np.asarray(
+            [sample.get("segment_return", sample["target_return"]) for sample in samples],
+            dtype=np.float32,
+        )
+        segment_length_np = np.asarray(
+            [sample.get("segment_length", 0.0) for sample in samples], dtype=np.float32
+        )
+        bootstrap_value_np = np.asarray(
+            [sample.get("bootstrap_value", 0.0) for sample in samples], dtype=np.float32
+        )
+        segment_index_np = np.asarray(
+            [sample.get("segment_index_within_episode", 0) for sample in samples],
+            dtype=np.int64,
         )
         chosen_z_np = np.asarray(
             [sample["chosen_z"] for sample in samples], dtype=np.int64
@@ -637,6 +926,7 @@ class IntegratedIntentSelectorPPO(PPO):
             margin_np = max_prob_np.copy()
 
         metrics: dict[str, float] = {
+            **self._selector_last_metrics,
             "intent/selector_alpha_current": float(self._selector_alpha_current()),
             "intent/selector_loss": float(total_loss.detach().cpu().item()),
             "intent/selector_policy_loss": float(policy_loss.detach().cpu().item()),
@@ -647,6 +937,11 @@ class IntegratedIntentSelectorPPO(PPO):
                 usage_kl.detach().cpu().item()
             ),
             "intent/selector_return_mean": float(np.mean(returns_np)),
+            "intent/selector_segment_return_mean": float(np.mean(segment_return_np)),
+            "intent/selector_segment_steps_mean": float(np.mean(segment_length_np)),
+            "intent/selector_bootstrap_value_mean": float(
+                np.mean(bootstrap_value_np)
+            ),
             "intent/selector_samples": float(len(samples)),
             "intent/selector_advantage_raw_mean": float(np.mean(raw_advantages_np)),
             "intent/selector_value_mean": float(
@@ -679,6 +974,34 @@ class IntegratedIntentSelectorPPO(PPO):
             if np.any(selected_mask):
                 metrics[f"intent/selector_return_by_intent/{z}"] = float(
                     np.mean(returns_np[selected_mask])
+                )
+
+        segment_bucket_order = ["0", "1", "2", "3_plus"]
+        for bucket in segment_bucket_order:
+            if bucket == "3_plus":
+                bucket_mask = segment_index_np >= 3
+            else:
+                bucket_mask = segment_index_np == int(bucket)
+            bucket_count = int(np.sum(bucket_mask))
+            metrics[f"intent/selector_segment_index_count/{bucket}"] = float(
+                bucket_count
+            )
+            if bucket_count <= 0:
+                metrics[f"intent/selector_usage_entropy_by_segment/{bucket}"] = 0.0
+                for z in range(self.intent_selector_num_intents):
+                    metrics[f"intent/selector_usage_by_segment/{bucket}/{z}"] = 0.0
+                continue
+            bucket_counts = np.bincount(
+                chosen_z_np[bucket_mask], minlength=self.intent_selector_num_intents
+            ).astype(np.float64)
+            bucket_probs = bucket_counts / max(1.0, float(np.sum(bucket_counts)))
+            nonzero_bucket = bucket_probs > 0.0
+            metrics[f"intent/selector_usage_entropy_by_segment/{bucket}"] = float(
+                -np.sum(bucket_probs[nonzero_bucket] * np.log(bucket_probs[nonzero_bucket]))
+            )
+            for z in range(self.intent_selector_num_intents):
+                metrics[f"intent/selector_usage_by_segment/{bucket}/{z}"] = float(
+                    bucket_probs[z]
                 )
 
         self._selector_last_metrics = metrics

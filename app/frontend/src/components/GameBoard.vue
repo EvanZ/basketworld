@@ -4654,35 +4654,35 @@ onBeforeUnmount(() => {
 }
 .court-gap-boundary {
   fill: none;
-  stroke: rgba(251, 146, 60, 0.78);
-  stroke-width: 0.18rem;
+  stroke: white;
+  stroke-width: 0.08rem;
   stroke-linejoin: round;
   pointer-events: none;
-  filter: drop-shadow(0px 0px 3px rgba(0, 0, 0, 0.35));
+  filter: drop-shadow(0px 0px 5px rgba(203, 240, 69, 0.35));
 }
 .court-hex {
   stroke: rgba(15, 23, 42, 0.6);
   stroke-width: 0.1rem;
 }
 .court-hex.qualified {
-  fill: rgba(59, 130, 246, 0.35);
+  fill: rgba(44, 91, 246, 0.35);
   stroke: #fef3c781;
   stroke-width: 0.05rem;
 }
 .court-hex.unqualified {
-  fill: rgba(38, 47, 77, 0.89);
+  fill: rgba(41, 49, 88, 0.89);
   stroke: rgba(15, 23, 42, 0.95);
 }
 .three-point-arc {
   fill: none;
-  stroke: #fb923c;
-  stroke-width: 0.3rem;
-  stroke-linecap: square;
+  stroke: #f5f5e5;
+  stroke-width: 0.22rem;
+  stroke-linecap: round;
   /* stroke-dasharray: 4 8; */
-  filter: drop-shadow(0px 0px 4px rgba(0, 0, 0, 0.6));
+  filter: drop-shadow(0px 0px 3px rgba(225, 244, 223, 0.6));
 }
 .offensive-lane {
-  fill: rgba(243, 4, 104, 0.397);
+  fill: rgba(218, 3, 68, 0.631);
   stroke: rgba(255, 140, 140, 0.5);
   stroke-width: 1;
 }
@@ -4690,6 +4690,7 @@ onBeforeUnmount(() => {
   stroke: white;
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease, fill 0.2s ease;
+  filter: drop-shadow(0px 0px 1px rgba(204, 218, 246, 0.892));
 }
 .player-user {
   fill: #007bff;
@@ -4706,6 +4707,7 @@ onBeforeUnmount(() => {
   stroke: white;
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+  filter: drop-shadow(0px 0px 1px rgba(242, 165, 242, 0.88));
 }
 .player-ai {
   fill: #dc3545;

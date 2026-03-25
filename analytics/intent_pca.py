@@ -22,6 +22,7 @@ import mlflow
 import numpy as np
 import torch
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from stable_baselines3 import PPO
@@ -46,6 +47,7 @@ from basketworld.utils.intent_discovery import (
     compute_episode_embeddings,
     extract_action_features_for_env,
     flatten_observation_for_env,
+    load_intent_discriminator_from_checkpoint,
 )
 from basketworld.utils.intent_policy_sensitivity import (
     clone_observation_dict,
@@ -294,8 +296,11 @@ def resolve_policy_path(input_arg: str, checkpoint_idx: int | None = None) -> tu
                 )
             return selected, input_arg
         if checkpoint_idx is not None:
-            raise RuntimeError(
-                f"No cached unified checkpoint with alternation/index={int(checkpoint_idx)} found for run_id={input_arg}"
+            print(
+                "[IntentPCA] Requested checkpoint "
+                f"alternation/index={int(checkpoint_idx)} not found in cache for run_id={input_arg}; "
+                "trying MLflow artifacts.",
+                flush=True,
             )
     if os.path.isfile(f"{input_arg}.zip"):
         if checkpoint_idx is not None:
@@ -743,17 +748,7 @@ def _load_discriminator_checkpoint(path: str, device: str) -> tuple[IntentDiscri
     payload = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(payload, dict) or "state_dict" not in payload or "config" not in payload:
         raise RuntimeError(f"Unsupported discriminator checkpoint format: {path}")
-    config = dict(payload.get("config", {}) or {})
-    disc = IntentDiscriminator(
-        input_dim=int(config["input_dim"]),
-        hidden_dim=int(config["hidden_dim"]),
-        num_intents=int(config["num_intents"]),
-        dropout=float(config.get("dropout", 0.1)),
-        encoder_type=str(config.get("encoder_type", "mlp_mean")),
-        step_dim=int(config.get("step_dim", 64)),
-    ).to(device)
-    disc.load_state_dict(payload["state_dict"])
-    disc.eval()
+    disc = load_intent_discriminator_from_checkpoint(payload, device=device)
     return disc, payload
 
 
@@ -1526,7 +1521,15 @@ def _build_feature_matrix(
     raise ValueError(f"Unsupported feature_mode={feature_mode!r}")
 
 
-def _plot_pca(coords: np.ndarray, labels: np.ndarray, output_path: str, title: str, explained: np.ndarray) -> None:
+def _plot_embedding_scatter(
+    coords: np.ndarray,
+    labels: np.ndarray,
+    output_path: str,
+    title: str,
+    *,
+    xlabel: str,
+    ylabel: str,
+) -> None:
     unique_labels = sorted({int(x) for x in labels.tolist()})
     cmap = plt.get_cmap("tab10" if len(unique_labels) <= 10 else "tab20")
     fig, ax = plt.subplots(figsize=(11, 9))
@@ -1553,13 +1556,109 @@ def _plot_pca(coords: np.ndarray, labels: np.ndarray, output_path: str, title: s
         )
         ax.text(centroid[0], centroid[1], f" {z}", fontsize=10, va="center")
     ax.set_title(title)
-    ax.set_xlabel(f"PC1 ({100.0 * float(explained[0]):.2f}% var)")
-    ax.set_ylabel(f"PC2 ({100.0 * float(explained[1]):.2f}% var)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.legend(loc="best", frameon=True, fontsize=9)
     ax.grid(alpha=0.2)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
+
+
+def _plot_pca(coords: np.ndarray, labels: np.ndarray, output_path: str, title: str, explained: np.ndarray) -> None:
+    _plot_embedding_scatter(
+        coords,
+        labels,
+        output_path,
+        title,
+        xlabel=f"PC1 ({100.0 * float(explained[0]):.2f}% var)",
+        ylabel=f"PC2 ({100.0 * float(explained[1]):.2f}% var)",
+    )
+
+
+def _write_embedding_points_csv(
+    output_path: Path,
+    metadata: list[dict],
+    coords: np.ndarray,
+    *,
+    x_key: str,
+    y_key: str,
+) -> None:
+    with output_path.open("w", newline="") as f:
+        fieldnames = [
+            "episode_idx",
+            "intent_index",
+            "intent_active_start",
+            "outcome",
+            "shot_type",
+            "episode_length",
+            "active_prefix_length",
+            "pass_attempts",
+            "pass_completions",
+            "pass_intercepts",
+            "pass_oob",
+            "assist_potential",
+            "assist_full",
+            "points",
+            "team_reward_offense",
+            x_key,
+            y_key,
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for meta, coord in zip(metadata, coords):
+            row = {key: meta.get(key) for key in fieldnames if key not in {x_key, y_key}}
+            row[x_key] = float(coord[0])
+            row[y_key] = float(coord[1])
+            writer.writerow(row)
+
+
+def _fit_tsne_coords(
+    x_scaled: np.ndarray,
+    *,
+    seed: int,
+    perplexity: float,
+) -> tuple[np.ndarray, float]:
+    n_samples = int(x_scaled.shape[0])
+    if n_samples < 3:
+        raise RuntimeError("Need at least three episodes to run t-SNE.")
+    effective_perplexity = float(
+        min(float(perplexity), max(1.0, float(n_samples - 1) / 3.0))
+    )
+    tsne = TSNE(
+        n_components=2,
+        perplexity=effective_perplexity,
+        learning_rate="auto",
+        init="pca",
+        random_state=int(seed),
+    )
+    return tsne.fit_transform(x_scaled), effective_perplexity
+
+
+def _fit_umap_coords(
+    x_scaled: np.ndarray,
+    *,
+    seed: int,
+    n_neighbors: int,
+    min_dist: float,
+) -> tuple[np.ndarray, int]:
+    try:
+        import umap  # type: ignore
+    except Exception as exc:
+        raise ModuleNotFoundError(
+            "UMAP requires the optional 'umap-learn' package."
+        ) from exc
+    n_samples = int(x_scaled.shape[0])
+    if n_samples < 3:
+        raise RuntimeError("Need at least three episodes to run UMAP.")
+    effective_neighbors = int(min(max(2, int(n_neighbors)), max(2, n_samples - 1)))
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=effective_neighbors,
+        min_dist=float(min_dist),
+        random_state=int(seed),
+    )
+    return reducer.fit_transform(x_scaled), effective_neighbors
 
 
 def _compute_confusion_matrix_tables(
@@ -1817,6 +1916,31 @@ def main() -> int:
         help="Optional output directory. Defaults to analytics/intent_pca/<label>_<timestamp>/",
     )
     parser.add_argument(
+        "--embedding-methods",
+        nargs="+",
+        choices=["pca", "tsne", "umap"],
+        default=["pca"],
+        help="Low-dimensional projections to render. PCA remains the primary summary projection.",
+    )
+    parser.add_argument(
+        "--tsne-perplexity",
+        type=float,
+        default=30.0,
+        help="Requested t-SNE perplexity. The effective value is clipped based on sample count.",
+    )
+    parser.add_argument(
+        "--umap-n-neighbors",
+        type=int,
+        default=30,
+        help="Requested UMAP n_neighbors. The effective value is clipped based on sample count.",
+    )
+    parser.add_argument(
+        "--umap-min-dist",
+        type=float,
+        default=0.1,
+        help="UMAP min_dist parameter.",
+    )
+    parser.add_argument(
         "--log-to-mlflow",
         action="store_true",
         help="Log plot/csv/json artifacts back to the run when a run ID is available.",
@@ -1988,34 +2112,15 @@ def main() -> int:
     coords = pca.fit_transform(x_scaled)
     explained = pca.explained_variance_ratio_
 
+    requested_embedding_methods = list(dict.fromkeys(str(x).strip().lower() for x in args.embedding_methods))
     csv_path = output_dir / "intent_pca_points.csv"
-    with csv_path.open("w", newline="") as f:
-        fieldnames = [
-            "episode_idx",
-            "intent_index",
-            "intent_active_start",
-            "outcome",
-            "shot_type",
-            "episode_length",
-            "active_prefix_length",
-            "pass_attempts",
-            "pass_completions",
-            "pass_intercepts",
-            "pass_oob",
-            "assist_potential",
-            "assist_full",
-            "points",
-            "team_reward_offense",
-            "pca_x",
-            "pca_y",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for meta, coord in zip(metadata, coords):
-            row = {key: meta.get(key) for key in fieldnames if key not in {"pca_x", "pca_y"}}
-            row["pca_x"] = float(coord[0])
-            row["pca_y"] = float(coord[1])
-            writer.writerow(row)
+    _write_embedding_points_csv(
+        csv_path,
+        metadata,
+        coords,
+        x_key="pca_x",
+        y_key="pca_y",
+    )
 
     plot_path = output_dir / "intent_pca_scatter.png"
     title = (
@@ -2023,6 +2128,78 @@ def main() -> int:
         f"episodes={len(episodes)}  policy={Path(policy_path).name}"
     )
     _plot_pca(coords, labels, str(plot_path), title, explained)
+    tsne_csv_path = output_dir / "intent_tsne_points.csv"
+    tsne_plot_path = output_dir / "intent_tsne_scatter.png"
+    umap_csv_path = output_dir / "intent_umap_points.csv"
+    umap_plot_path = output_dir / "intent_umap_scatter.png"
+    extra_embedding_outputs: dict[str, dict[str, object]] = {}
+    if "tsne" in requested_embedding_methods:
+        tsne_coords, effective_perplexity = _fit_tsne_coords(
+            x_scaled,
+            seed=int(args.seed),
+            perplexity=float(args.tsne_perplexity),
+        )
+        _write_embedding_points_csv(
+            tsne_csv_path,
+            metadata,
+            tsne_coords,
+            x_key="tsne_x",
+            y_key="tsne_y",
+        )
+        _plot_embedding_scatter(
+            tsne_coords,
+            labels,
+            str(tsne_plot_path),
+            (
+                f"Intent t-SNE ({args.feature_mode})\n"
+                f"episodes={len(episodes)}  policy={Path(policy_path).name}"
+            ),
+            xlabel="t-SNE 1",
+            ylabel="t-SNE 2",
+        )
+        extra_embedding_outputs["tsne"] = {
+            "csv_path": str(tsne_csv_path),
+            "plot_path": str(tsne_plot_path),
+            "effective_perplexity": float(effective_perplexity),
+        }
+    if "umap" in requested_embedding_methods:
+        try:
+            umap_coords, effective_neighbors = _fit_umap_coords(
+                x_scaled,
+                seed=int(args.seed),
+                n_neighbors=int(args.umap_n_neighbors),
+                min_dist=float(args.umap_min_dist),
+            )
+            _write_embedding_points_csv(
+                umap_csv_path,
+                metadata,
+                umap_coords,
+                x_key="umap_x",
+                y_key="umap_y",
+            )
+            _plot_embedding_scatter(
+                umap_coords,
+                labels,
+                str(umap_plot_path),
+                (
+                    f"Intent UMAP ({args.feature_mode})\n"
+                    f"episodes={len(episodes)}  policy={Path(policy_path).name}"
+                ),
+                xlabel="UMAP 1",
+                ylabel="UMAP 2",
+            )
+            extra_embedding_outputs["umap"] = {
+                "csv_path": str(umap_csv_path),
+                "plot_path": str(umap_plot_path),
+                "effective_n_neighbors": int(effective_neighbors),
+                "min_dist": float(args.umap_min_dist),
+            }
+        except ModuleNotFoundError as exc:
+            print(f"[IntentPCA] Skipping UMAP: {exc}", flush=True)
+            extra_embedding_outputs["umap"] = {
+                "status": "skipped_missing_dependency",
+                "reason": str(exc),
+            }
 
     confusion_counts_path = output_dir / "intent_confusion_matrix_counts.csv"
     confusion_row_norm_path = output_dir / "intent_confusion_matrix_row_normalized.csv"
@@ -2035,6 +2212,7 @@ def main() -> int:
         "mlflow_artifact_path": _intent_pca_mlflow_artifact_path(policy_path) if run_id else None,
         "episodes": int(len(episodes)),
         "feature_mode": str(args.feature_mode),
+        "embedding_methods": requested_embedding_methods,
         "opponent_mode": opponent_meta.get("opponent_mode", str(args.opponent_mode)),
         "intent_source_requested": str(args.intent_source),
         "intent_source_resolved": resolved_intent_source,
@@ -2048,6 +2226,7 @@ def main() -> int:
         },
         "feature_dim": int(x.shape[1]),
         "summary_feature_names": feature_names if args.feature_mode == "summary" else None,
+        "embedding_outputs": extra_embedding_outputs,
         "discriminator_checkpoint_meta": (
             (disc_bundle[1] or {}).get("meta", None) if disc_bundle is not None else None
         ),
@@ -2198,6 +2377,14 @@ def main() -> int:
             )
             client.log_artifact(run_id, str(csv_path), artifact_path=artifact_path)
             client.log_artifact(run_id, str(plot_path), artifact_path=artifact_path)
+            if tsne_csv_path.exists():
+                client.log_artifact(run_id, str(tsne_csv_path), artifact_path=artifact_path)
+            if tsne_plot_path.exists():
+                client.log_artifact(run_id, str(tsne_plot_path), artifact_path=artifact_path)
+            if umap_csv_path.exists():
+                client.log_artifact(run_id, str(umap_csv_path), artifact_path=artifact_path)
+            if umap_plot_path.exists():
+                client.log_artifact(run_id, str(umap_plot_path), artifact_path=artifact_path)
             if confusion_counts_path.exists():
                 client.log_artifact(
                     run_id, str(confusion_counts_path), artifact_path=artifact_path
@@ -2223,6 +2410,7 @@ def main() -> int:
     print(f"Env params source: {run_id or 'local-only'}")
     print(f"Episodes: {len(episodes)}")
     print(f"Feature mode: {args.feature_mode}")
+    print(f"Embedding methods: {', '.join(requested_embedding_methods)}")
     print(f"Collection workers: {requested_num_envs} (eval_workers)")
     print(f"Feature dim: {x.shape[1]}")
     print(
@@ -2242,6 +2430,12 @@ def main() -> int:
         print(f"PCA disc eval batch: {pca_disc_eval_batch_path}")
     print(f"CSV: {csv_path}")
     print(f"Plot: {plot_path}")
+    if tsne_plot_path.exists():
+        print(f"t-SNE CSV: {tsne_csv_path}")
+        print(f"t-SNE Plot: {tsne_plot_path}")
+    if umap_plot_path.exists():
+        print(f"UMAP CSV: {umap_csv_path}")
+        print(f"UMAP Plot: {umap_plot_path}")
     print(f"Summary: {summary_path}")
     return 0
 

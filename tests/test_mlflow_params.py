@@ -70,3 +70,21 @@ def test_get_mlflow_training_params_includes_disc_eval_batch_output():
     assert training["disc_eval_batch_output"] is True
     assert training["intent_selector_mode"] == "integrated"
     assert training["intent_selector_value_coef"] == 0.75
+
+
+def test_get_mlflow_training_params_includes_multiselect_and_disc_priors():
+    client = _FakeClient(
+        {
+            "intent_selector_multiselect_enabled": "true",
+            "intent_selector_min_play_steps": "4",
+            "intent_disc_lambda_shot": "0.2",
+            "intent_disc_lambda_q": "0.05",
+        }
+    )
+
+    training = get_mlflow_training_params(client, "dummy")
+
+    assert training["intent_selector_multiselect_enabled"] is True
+    assert training["intent_selector_min_play_steps"] == 4
+    assert training["intent_disc_lambda_shot"] == 0.2
+    assert training["intent_disc_lambda_q"] == 0.05

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,6 +27,7 @@ class CompletedIntentEpisode:
 
     intent_index: int
     transitions: List[IntentTransition]
+    terminal_info: Optional[Dict[str, Any]] = None
 
     @property
     def length(self) -> int:
@@ -64,6 +65,43 @@ class CompletedIntentEpisode:
     @property
     def active_buffer_indices(self) -> List[Tuple[int, int]]:
         return [(tr.buffer_step_idx, tr.env_idx) for tr in self.active_prefix_transitions]
+
+    @property
+    def terminal_action_results(self) -> Dict[str, Any]:
+        info = self.terminal_info or {}
+        action_results = info.get("action_results", {})
+        if isinstance(action_results, dict):
+            return action_results
+        return {}
+
+    @property
+    def shot_end_label(self) -> float:
+        action_results = self.terminal_action_results
+        shots = action_results.get("shots", {})
+        if isinstance(shots, dict) and len(shots) > 0:
+            return 1.0
+        info = self.terminal_info or {}
+        if (
+            float(info.get("shot_dunk", 0.0)) > 0.0
+            or float(info.get("shot_2pt", 0.0)) > 0.0
+            or float(info.get("shot_3pt", 0.0)) > 0.0
+        ):
+            return 1.0
+        return 0.0
+
+    @property
+    def shot_quality_target(self) -> float:
+        action_results = self.terminal_action_results
+        shots = action_results.get("shots", {})
+        if isinstance(shots, dict):
+            for shot_result in shots.values():
+                if isinstance(shot_result, dict) and "expected_points" in shot_result:
+                    try:
+                        return float(shot_result.get("expected_points", 0.0))
+                    except Exception:
+                        break
+        info = self.terminal_info or {}
+        return float(info.get("expected_points", 0.0) or 0.0)
 
 
 class RunningMeanStd:
@@ -109,15 +147,30 @@ class IntentEpisodeBuffer:
     def append(self, env_idx: int, transition: IntentTransition) -> None:
         self._ongoing.setdefault(int(env_idx), []).append(transition)
 
-    def close_episode(self, env_idx: int) -> None:
+    def close_episode(
+        self,
+        env_idx: int,
+        *,
+        terminal_info: Optional[Dict[str, Any]] = None,
+    ) -> None:
         key = int(env_idx)
         transitions = self._ongoing.pop(key, [])
         if not transitions:
             return
         intent_index = int(transitions[0].intent_index)
         self._completed.append(
-            CompletedIntentEpisode(intent_index=intent_index, transitions=transitions)
+            CompletedIntentEpisode(
+                intent_index=intent_index,
+                transitions=transitions,
+                terminal_info=dict(terminal_info or {}),
+            )
         )
+
+    def current_intent_index(self, env_idx: int) -> Optional[int]:
+        transitions = self._ongoing.get(int(env_idx), [])
+        if not transitions:
+            return None
+        return int(transitions[0].intent_index)
 
     def pop_completed(
         self, filter_fn: Optional[Callable[[CompletedIntentEpisode], bool]] = None
@@ -197,11 +250,15 @@ class IntentDiscriminator(nn.Module):
         dropout: float = 0.1,
         encoder_type: str = "mlp_mean",
         step_dim: int = 64,
+        enable_shot_end_head: bool = False,
+        enable_shot_quality_head: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_type = str(encoder_type).strip().lower()
         if self.encoder_type not in {"mlp_mean", "gru"}:
             raise ValueError(f"Unsupported intent discriminator encoder_type={encoder_type!r}")
+        self.enable_shot_end_head = bool(enable_shot_end_head)
+        self.enable_shot_quality_head = bool(enable_shot_quality_head)
 
         if self.encoder_type == "mlp_mean":
             self.net = nn.Sequential(
@@ -230,6 +287,12 @@ class IntentDiscriminator(nn.Module):
                 nn.Dropout(float(max(0.0, dropout))),
                 nn.Linear(int(hidden_dim), int(num_intents)),
             )
+        self.shot_end_head = (
+            nn.Linear(int(hidden_dim), 1) if self.enable_shot_end_head else None
+        )
+        self.shot_quality_head = (
+            nn.Linear(int(hidden_dim), 1) if self.enable_shot_quality_head else None
+        )
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         episode_emb = self.encode(x, lengths)
@@ -238,6 +301,30 @@ class IntentDiscriminator(nn.Module):
             return self.net[-1](episode_emb)
         assert self.head is not None
         return self.head(episode_emb)
+
+    def forward_with_aux(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        episode_emb = self.encode(x, lengths)
+        if self.encoder_type == "mlp_mean":
+            assert self.net is not None
+            logits = self.net[-1](episode_emb)
+        else:
+            assert self.head is not None
+            logits = self.head(episode_emb)
+        shot_end = (
+            self.shot_end_head(episode_emb).reshape(-1)
+            if self.shot_end_head is not None
+            else None
+        )
+        shot_quality = (
+            self.shot_quality_head(episode_emb).reshape(-1)
+            if self.shot_quality_head is not None
+            else None
+        )
+        return logits, shot_end, shot_quality
 
     def encode(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the episode embedding prior to the final classifier layer."""
@@ -271,6 +358,59 @@ class IntentDiscriminator(nn.Module):
         assert self.traj_encoder is not None
         step_emb = self.step_encoder(x)
         return self.traj_encoder(step_emb, lengths)
+
+
+def _checkpoint_head_enabled(
+    config: Dict[str, Any],
+    state_dict: Dict[str, Any],
+    *,
+    enabled_key: str,
+    lambda_key: str,
+    head_prefix: str,
+) -> bool:
+    if enabled_key in config:
+        return bool(config.get(enabled_key))
+    if float(config.get(lambda_key, 0.0) or 0.0) > 0.0:
+        return True
+    prefix = f"{head_prefix}."
+    return any(str(key).startswith(prefix) for key in state_dict.keys())
+
+
+def load_intent_discriminator_from_checkpoint(
+    payload: Dict[str, Any],
+    *,
+    device: str | torch.device,
+) -> IntentDiscriminator:
+    """Instantiate a discriminator from checkpoint payload with schema compatibility."""
+    if not isinstance(payload, dict) or "state_dict" not in payload or "config" not in payload:
+        raise RuntimeError("Unsupported discriminator checkpoint payload")
+    config = dict(payload.get("config", {}) or {})
+    state_dict = dict(payload.get("state_dict", {}) or {})
+    disc = IntentDiscriminator(
+        input_dim=int(config["input_dim"]),
+        hidden_dim=int(config["hidden_dim"]),
+        num_intents=int(config["num_intents"]),
+        dropout=float(config.get("dropout", 0.1)),
+        encoder_type=str(config.get("encoder_type", "mlp_mean")),
+        step_dim=int(config.get("step_dim", 64)),
+        enable_shot_end_head=_checkpoint_head_enabled(
+            config,
+            state_dict,
+            enabled_key="enable_shot_end_head",
+            lambda_key="disc_lambda_shot",
+            head_prefix="shot_end_head",
+        ),
+        enable_shot_quality_head=_checkpoint_head_enabled(
+            config,
+            state_dict,
+            enabled_key="enable_shot_quality_head",
+            lambda_key="disc_lambda_q",
+            head_prefix="shot_quality_head",
+        ),
+    ).to(device)
+    disc.load_state_dict(state_dict)
+    disc.eval()
+    return disc
 
 
 def flatten_observation_for_env(obs_payload, env_idx: int) -> np.ndarray:

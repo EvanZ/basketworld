@@ -8,7 +8,10 @@ from analytics.intent_pca import (
     _compute_confusion_matrix_tables,
     _episode_label_intent_index,
     _fit_logged_opponent_assignments,
+    _fit_tsne_coords,
+    _fit_umap_coords,
     _intent_pca_mlflow_artifact_path,
+    _load_discriminator_checkpoint,
     _maybe_apply_selector_intent_start,
     _offense_subset_logged_assignments,
     _parse_logged_opponent_assignment_text,
@@ -20,7 +23,11 @@ from analytics.intent_pca import (
     _select_discriminator_eval_episodes,
     resolve_policy_path,
 )
-from basketworld.utils.intent_discovery import CompletedIntentEpisode, IntentTransition
+from basketworld.utils.intent_discovery import (
+    CompletedIntentEpisode,
+    IntentDiscriminator,
+    IntentTransition,
+)
 from basketworld.utils.intent_pca import (
     SUMMARY_FEATURE_NAMES,
     build_summary_feature,
@@ -144,6 +151,27 @@ def test_resolve_policy_path_errors_when_requested_checkpoint_missing(tmp_path: 
         raise AssertionError("Expected resolve_policy_path to raise for missing checkpoint")
 
 
+def test_resolve_policy_path_downloads_when_requested_checkpoint_missing_from_cache(monkeypatch):
+    monkeypatch.setattr("analytics.intent_pca.os.path.isfile", lambda path: False)
+    monkeypatch.setattr(
+        "analytics.intent_pca.os.path.isdir",
+        lambda path: path == ".opponent_cache/dummy_run",
+    )
+    monkeypatch.setattr(
+        "analytics.intent_pca._find_unified_checkpoint_in_dir",
+        lambda directory, checkpoint_idx: None,
+    )
+    monkeypatch.setattr(
+        "analytics.intent_pca._download_unified_checkpoint",
+        lambda run_id, checkpoint_idx: f"/tmp/unified_iter_{int(checkpoint_idx)}.zip",
+    )
+
+    selected, inferred_run_id = resolve_policy_path("dummy_run", checkpoint_idx=45)
+
+    assert selected == "/tmp/unified_iter_45.zip"
+    assert inferred_run_id == "dummy_run"
+
+
 def test_intent_pca_mlflow_artifact_path_uses_checkpoint_index():
     assert (
         _intent_pca_mlflow_artifact_path("/tmp/unified_iter_30.zip")
@@ -177,6 +205,36 @@ def test_compute_confusion_matrix_tables_row_normalizes_counts():
     assert np.allclose(row_norm[2], [0.0, 0.0, 0.0])
 
 
+def test_fit_tsne_coords_clips_perplexity_to_sample_count():
+    x = np.arange(24, dtype=np.float32).reshape(6, 4)
+
+    coords, effective_perplexity = _fit_tsne_coords(
+        x,
+        seed=0,
+        perplexity=30.0,
+    )
+
+    assert coords.shape == (6, 2)
+    assert effective_perplexity < 30.0
+    assert effective_perplexity <= (6 - 1) / 3.0 + 1e-6
+
+
+def test_fit_umap_coords_requires_optional_dependency():
+    x = np.arange(24, dtype=np.float32).reshape(6, 4)
+
+    try:
+        _fit_umap_coords(
+            x,
+            seed=0,
+            n_neighbors=10,
+            min_dist=0.1,
+        )
+    except ModuleNotFoundError as exc:
+        assert "umap-learn" in str(exc)
+    else:
+        raise AssertionError("Expected UMAP helper to require the optional dependency")
+
+
 def test_resolve_discriminator_feature_dims_prefers_checkpoint_config():
     disc_bundle = (
         object(),
@@ -196,6 +254,40 @@ def test_resolve_discriminator_feature_dims_prefers_checkpoint_config():
 
     assert obs_dim == 192
     assert action_dim == 12
+
+
+def test_load_discriminator_checkpoint_supports_aux_heads(tmp_path: Path):
+    disc = IntentDiscriminator(
+        input_dim=272,
+        hidden_dim=128,
+        num_intents=8,
+        encoder_type="gru",
+        step_dim=64,
+        enable_shot_end_head=True,
+        enable_shot_quality_head=True,
+    )
+    path = tmp_path / "intent_disc_iter_4.pt"
+    torch.save(
+        {
+            "state_dict": disc.state_dict(),
+            "config": {
+                "input_dim": 272,
+                "hidden_dim": 128,
+                "num_intents": 8,
+                "dropout": 0.1,
+                "encoder_type": "gru",
+                "step_dim": 64,
+            },
+        },
+        path,
+    )
+
+    loaded, payload = _load_discriminator_checkpoint(str(path), device="cpu")
+
+    assert isinstance(loaded, IntentDiscriminator)
+    assert loaded.shot_end_head is not None
+    assert loaded.shot_quality_head is not None
+    assert int(payload["config"]["num_intents"]) == 8
 
 
 def test_select_discriminator_eval_episodes_prefers_raw_step_collection():

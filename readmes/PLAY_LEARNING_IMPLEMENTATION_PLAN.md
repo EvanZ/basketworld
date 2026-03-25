@@ -1509,19 +1509,33 @@ Important:
 
 #### Recommended implementation order
 
-1. keep current callback selector only as a temporary prototype
-2. implement custom rollout buffer for selector decisions
-3. implement custom PPO subclass that samples `z` at possession start
-4. move selector loss out of callback and into PPO train step
-5. add selector critic only after REINFORCE-style integrated version is stable
-6. after clean possession-start selector is stable, add commitment-expiry reselection
-7. when reselection is added, switch selector credit from full-possession return to
-   segment return + bootstrap target
-8. preserve forced-intent override behavior across:
+Implemented status:
+
+1. current callback selector exists only as a prototype / legacy comparison path
+2. custom integrated PPO selector path is implemented
+3. selector loss has been moved into PPO train step
+4. selector critic is implemented
+5. first multi-selection slice is implemented:
+   - segment boundary on completed pass after `intent_selector_min_play_steps`
+   - fallback boundary on `intent_commitment_steps`
+   - segment return + selector-value bootstrap target
+6. discriminator auxiliary priors are implemented:
+   - `lambda_shot`
+   - `lambda_q`
+
+Remaining implementation order:
+
+1. preserve forced-intent override behavior across:
    - dev app gameplay
    - Playbook analysis
    - counterfactual replay
    - eval-time ablations
+2. add learned `continue current play vs reselect` decision at eligible pass boundaries
+3. decide whether alpha miss at a segment boundary should:
+   - keep current `z`
+   - or resample uniformly
+4. add a cleaner explicit max-segment-length control if `intent_commitment_steps` and
+   selector segment horizon should diverge
 
 #### Success criteria for the integrated `mu` selector version
 
@@ -1580,24 +1594,31 @@ Recommended experiments:
 
 #### 2) What return should train `mu`?
 
-The current selector prototype uses the full possession return, even though the chosen
-`z` only controls behavior during the commitment window.
+Current status:
 
-This means selector reward is available, but potentially noisy:
+1. possession-start selector path now has a selector critic
+2. multi-selection path now uses segment return plus optional selector-value bootstrap
+   at the next selector boundary
 
-1. `mu` chooses `z` at possession start
-2. `z` shapes the first `K` steps
-3. later uncontrolled steps may dominate the final possession outcome
+Open issue:
 
-Questions:
+The current first-slice segment target is a practical implementation, not yet a settled
+final design.
 
-1. is full-possession return the right signal for selector learning?
-2. would selector learning improve if credit were restricted to:
+Remaining questions:
+
+1. is full-possession return still the right signal for the possession-start-only regime?
+2. would segment learning improve if credit were restricted to:
    - commitment-window return only
    - discounted return with heavier early weighting
    - return through the first shot state
    - return through the first major branch event (shot, turnover, foul)
-3. does longer commitment reduce this credit-assignment noise enough to keep full-possession return?
+3. should selector bootstrap be:
+   - undiscounted
+   - gamma-discounted
+   - or learned with a separate boundary-specific formulation?
+4. does longer commitment reduce this credit-assignment noise enough to keep
+   full-possession return in the non-multiselect regime?
 
 Recommended experiments:
 
@@ -1611,30 +1632,37 @@ Recommended experiments:
 
 Additional note:
 
-If `mu` is later allowed to resample a new play at commitment expiry, full-possession return
-is almost certainly too blunt for the initial selector decision. At that point the default
-clean design should become selector-segment return plus selector-value bootstrap, not
-one terminal possession reward shared across all selector choices.
+This branch has now crossed the threshold where segment return + selector-value bootstrap
+is no longer purely hypothetical. The open question is no longer whether segmentation is
+needed, but whether the current first implementation is the right segment credit target.
 
 #### 3) Should `mu` resample a new play when commitment expires?
 
-Current staged selector design assumes one play call at possession start. A likely
-extension is to allow a fresh high-level play decision whenever the current play's
-commitment window ends and the possession is still alive.
+Current status:
+
+1. the first multiselect implementation is in place
+2. reselection can now happen within a possession
+3. practical boundaries are:
+   - completed pass after `intent_selector_min_play_steps`
+   - commitment timeout at `intent_commitment_steps`
 
 Questions:
 
-1. should reselection happen automatically at every commitment expiry?
-2. should the selector be allowed to repeat the same `z`?
-3. does reselection improve shot creation enough to justify the added credit-assignment complexity?
-4. does reselection make the current commitment window more usable, or does it simply hide that `K` is too short?
+1. should reselection happen automatically at every eligible boundary, or should the
+   model learn a `continue vs reselect` decision?
+2. on a segment boundary where selector alpha does not fire, should the system:
+   - keep current `z`
+   - or resample uniformly as the current first-slice implementation does?
+3. should the selector be allowed to repeat the same `z` after a learned reselect?
+4. does reselection improve shot creation enough to justify the added credit-assignment complexity?
+5. does reselection make the current commitment window more usable, or does it simply hide that `K` is too short?
 
 Recommended default if this is implemented:
 
-1. reselection trigger = commitment expiry while offense possession is still live
-2. selector may choose the same `z` again
-3. do not call `mu` every step
-4. treat each selector choice as controlling one segment, with segment-level credit
+1. keep reselection constrained to meaningful candidate boundaries, not every primitive step
+2. allow selector to choose the same `z` again
+3. treat each selector choice as controlling one segment, with segment-level credit
+4. next refinement should be a learned pass-boundary `continue vs reselect` head
 
 #### 4) Should play selection include the initial ball handler?
 
@@ -1789,6 +1817,18 @@ latent-play discovery code path without clear ablations.
 
 ### 3) Inductive priors for play-learning track
 
+Current status:
+
+1. weak discriminator priors are now implemented as optional auxiliary heads
+2. current implemented priors are:
+   - `shot_end`
+   - `shot_quality`
+3. current knobs are:
+   - `intent_disc_lambda_shot`
+   - `intent_disc_lambda_q`
+
+Why this was added:
+
 If pure intent-ID prediction is not producing human-legible play structure, add weak
 supervised inductive priors to the discriminator/trajectory encoder so the learned
 representation is nudged toward "play completion" rather than arbitrary separability.
@@ -1835,14 +1875,17 @@ Suggested experiments:
    - first-shot timing / shot-end frequency while `z` is active
    - shot-quality spread by intent
    - selector sensitivity and collapse
-3. Revisit this more seriously once selector reselection / segment returns exist, since
-   that is the cleaner place to define "end of play."
+3. Compare plain intent-ID vs priors on the now-implemented segment-based path
+4. Revisit whether additional priors are useful, for example:
+   - assisted shot
+   - shot zone
+   - turnover-end
 
 ### 4) Multi-selection play learning with pass boundaries
 
-If one-intent-per-possession continues to produce weak or overly overlapping plays,
-explore a segmented selector design where multiple play choices can occur within the
-same possession.
+Current status:
+
+The first multi-selection implementation is now in the codebase.
 
 Current environment constraint:
 
@@ -1855,7 +1898,20 @@ Practical first design:
 1. let `mu` choose `z_0` at possession start
 2. keep `z_k` active for a short play segment
 3. if a completed pass occurs after a minimum number of steps, allow a reselection
-4. if no pass occurs, force reselection at a maximum play length
+4. if no pass occurs, force reselection at the commitment horizon
+
+Implemented first slice:
+
+1. `min_play_steps` gate before a completed pass can create a new segment
+2. timeout boundary at `intent_commitment_steps`
+3. selector target uses segment return plus optional selector-value bootstrap
+4. discriminator segments close on selector boundaries and episode terminal
+
+Not yet implemented:
+
+1. learned `continue vs reselect` boundary head
+2. explicit separate `max_play_steps` distinct from commitment horizon
+3. keep-current-`z` fallback on alpha miss at a boundary
 
 Recommended first heuristics:
 
@@ -1895,7 +1951,7 @@ Suggested experiments:
 
 1. compare:
    - possession-level selector
-   - forced reselection on every eligible pass
+   - current implemented pass-boundary / commitment-timeout selector
    - learned reselection decision at eligible passes
 2. evaluate:
    - discriminator metrics

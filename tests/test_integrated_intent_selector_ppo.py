@@ -83,6 +83,7 @@ class _DummySelectorEnv(gym.Env):
         role: float = 1.0,
         episode_reward: float = 1.0,
         steps_per_episode: int = 1,
+        pass_boundary_steps: tuple[int, ...] = (),
     ):
         super().__init__()
         self.n_players = 6
@@ -98,6 +99,7 @@ class _DummySelectorEnv(gym.Env):
         self.intent_active = True
         self.intent_visible = True
         self.set_intent_calls: list[tuple[int, bool, int]] = []
+        self.pass_boundary_steps = tuple(int(step) for step in pass_boundary_steps)
 
     def _obs(self):
         return _make_obs(
@@ -121,7 +123,14 @@ class _DummySelectorEnv(gym.Env):
         self._steps += 1
         terminated = self._steps >= self.steps_per_episode
         reward = self.episode_reward if terminated else 0.0
-        return self._obs(), reward, terminated, False, {}
+        info = {}
+        if (not terminated) and self._steps in self.pass_boundary_steps:
+            info["action_results"] = {
+                "passes": {
+                    0: {"success": True, "target": 1},
+                }
+            }
+        return self._obs(), reward, terminated, False, info
 
     def set_offense_intent_state(
         self,
@@ -258,6 +267,103 @@ def test_integrated_selector_model_save_load_roundtrip(tmp_path):
     assert loaded.intent_selector_num_intents == 4
     assert loaded._policy_has_intent_selector() is True
     assert loaded._policy_has_intent_selector_value_head() is True
+
+
+def test_integrated_selector_multiselect_reselects_on_completed_pass(monkeypatch):
+    env_ref: list[_DummySelectorEnv] = []
+
+    def _make():
+        env = _DummySelectorEnv(
+            role=1.0,
+            episode_reward=1.0,
+            steps_per_episode=3,
+            pass_boundary_steps=(1,),
+        )
+        env_ref.append(env)
+        return env
+
+    env = DummyVecEnv([_make])
+    logged = {}
+    monkeypatch.setattr(
+        "basketworld.algorithms.integrated_mu_selector_ppo.mlflow.log_metric",
+        lambda name, value, step=None: logged.setdefault(name, float(value)),
+    )
+
+    model = _make_model(
+        env,
+        n_steps=3,
+        intent_selector_multiselect_enabled=True,
+        intent_selector_min_play_steps=1,
+    )
+    model.learn(total_timesteps=3)
+
+    test_env = env_ref[0]
+    assert len(test_env.set_intent_calls) >= 2
+    assert np.isclose(model._selector_last_metrics["intent/selector_samples"], 2.0)
+    assert (
+        model._selector_last_metrics["intent/selector_segment_steps_mean"] >= 1.0
+    )
+    assert np.isclose(logged["intent/multisegment_episode_rate"], 1.0)
+    assert np.isclose(logged["intent/segments_per_episode_mean"], 2.0)
+    assert np.isclose(
+        logged["intent/segment_boundary_reason_completed_pass_rate"], 1.0
+    )
+    assert np.isclose(
+        logged["intent/segment_boundary_reason_commitment_timeout_rate"], 0.0
+    )
+    assert np.isclose(logged["intent/selector_segment_index_count/0"], 1.0)
+    assert np.isclose(logged["intent/selector_segment_index_count/1"], 1.0)
+    assert np.isclose(logged["intent/selector_usage_by_segment/0/2"], 1.0)
+    assert np.isclose(logged["intent/selector_usage_by_segment/1/2"], 1.0)
+
+
+def test_integrated_selector_multiselect_reselects_on_commitment_timeout(monkeypatch):
+    env_ref: list[_DummySelectorEnv] = []
+
+    def _make():
+        env = _DummySelectorEnv(
+            role=1.0,
+            episode_reward=1.0,
+            steps_per_episode=3,
+            pass_boundary_steps=(),
+        )
+        env_ref.append(env)
+        return env
+
+    env = DummyVecEnv([_make])
+    logged = {}
+    monkeypatch.setattr(
+        "basketworld.algorithms.integrated_mu_selector_ppo.mlflow.log_metric",
+        lambda name, value, step=None: logged.setdefault(name, float(value)),
+    )
+
+    model = _make_model(
+        env,
+        n_steps=3,
+        intent_selector_multiselect_enabled=True,
+        intent_selector_min_play_steps=3,
+        intent_commitment_steps=2,
+    )
+    model.learn(total_timesteps=3)
+
+    test_env = env_ref[0]
+    assert len(test_env.set_intent_calls) >= 2
+    assert np.isclose(model._selector_last_metrics["intent/selector_samples"], 2.0)
+    assert (
+        model._selector_last_metrics["intent/selector_segment_steps_mean"] >= 1.0
+    )
+    assert np.isclose(logged["intent/multisegment_episode_rate"], 1.0)
+    assert np.isclose(logged["intent/segments_per_episode_mean"], 2.0)
+    assert np.isclose(
+        logged["intent/segment_boundary_reason_completed_pass_rate"], 0.0
+    )
+    assert np.isclose(
+        logged["intent/segment_boundary_reason_commitment_timeout_rate"], 1.0
+    )
+    assert np.isclose(logged["intent/selector_segment_index_count/0"], 1.0)
+    assert np.isclose(logged["intent/selector_segment_index_count/1"], 1.0)
+    assert np.isclose(logged["intent/selector_usage_by_segment/0/2"], 1.0)
+    assert np.isclose(logged["intent/selector_usage_by_segment/1/2"], 1.0)
 
 
 def test_integrated_selector_loads_legacy_checkpoint_without_value_head():

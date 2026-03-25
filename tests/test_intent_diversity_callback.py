@@ -6,6 +6,7 @@ import torch
 
 import basketworld.utils.callbacks as callbacks_module
 from basketworld.utils.callbacks import IntentDiversityCallback
+from basketworld.utils.intent_discovery import CompletedIntentEpisode, IntentTransition
 from train.policy_utils import get_latest_discriminator_checkpoint_path
 
 
@@ -104,8 +105,10 @@ def test_intent_diversity_callback_injects_offense_only_bonus():
             return None
 
     cb._bonus_stats = _FixedStats()
-    cb._train_discriminator = lambda x_np, y_np: (0.1, 0.9)
-    cb._compute_episode_bonus = lambda x_np, y_np: np.array([1.0], dtype=np.float32)
+    cb._train_discriminator = lambda x_np, y_np, **kwargs: (0.1, 0.9)
+    cb._compute_episode_bonus = (
+        lambda x_np, y_np, **kwargs: np.array([1.0], dtype=np.float32)
+    )
 
     cb._on_rollout_start()
     cb.locals = {
@@ -154,10 +157,12 @@ def test_intent_diversity_callback_logs_clipped_and_shaping_bonus_metrics():
             return None
 
     cb._bonus_stats = _FixedStats()
-    cb._train_discriminator = lambda x_np, y_np: (0.1, 0.9)
-    cb._compute_disc_eval_top1_acc = lambda x_np, y_np: 0.42
-    cb._compute_disc_auc = lambda x_np, y_np: 0.75
-    cb._compute_episode_bonus = lambda x_np, y_np: np.array([2.0], dtype=np.float32)
+    cb._train_discriminator = lambda x_np, y_np, **kwargs: (0.1, 0.9)
+    cb._compute_disc_eval_top1_acc = lambda x_np, y_np, **kwargs: 0.42
+    cb._compute_disc_auc = lambda x_np, y_np, **kwargs: 0.75
+    cb._compute_episode_bonus = (
+        lambda x_np, y_np, **kwargs: np.array([2.0], dtype=np.float32)
+    )
 
     cb._on_rollout_start()
     cb.locals = {
@@ -302,6 +307,59 @@ def test_multiclass_auc_ovr_macro_helper():
     assert auc > 0.99
 
 
+def test_build_disc_aux_targets_uses_segment_terminal_info():
+    episode_with_shot = CompletedIntentEpisode(
+        intent_index=1,
+        transitions=[
+            IntentTransition(
+                feature=np.zeros((4,), dtype=np.float32),
+                buffer_step_idx=0,
+                env_idx=0,
+                role_flag=1.0,
+                intent_active=True,
+                intent_index=1,
+            )
+        ],
+        terminal_info={
+            "action_results": {
+                "shots": {
+                    0: {"expected_points": 1.7, "success": False},
+                }
+            }
+        },
+    )
+    episode_with_pass = CompletedIntentEpisode(
+        intent_index=2,
+        transitions=[
+            IntentTransition(
+                feature=np.zeros((4,), dtype=np.float32),
+                buffer_step_idx=1,
+                env_idx=0,
+                role_flag=1.0,
+                intent_active=True,
+                intent_index=2,
+            )
+        ],
+        terminal_info={
+            "action_results": {
+                "passes": {
+                    0: {"success": True, "target": 1},
+                }
+            }
+        },
+    )
+
+    shot_end, shot_quality, shot_quality_mask = (
+        IntentDiversityCallback._build_disc_aux_targets(
+            [episode_with_shot, episode_with_pass]
+        )
+    )
+
+    assert np.allclose(shot_end, np.array([1.0, 0.0], dtype=np.float32))
+    assert np.allclose(shot_quality, np.array([1.7, 0.0], dtype=np.float32))
+    assert np.allclose(shot_quality_mask, np.array([1.0, 0.0], dtype=np.float32))
+
+
 def test_intent_diversity_callback_gru_path_uses_sequence_lengths():
     cb = IntentDiversityCallback(
         enabled=True,
@@ -328,15 +386,15 @@ def test_intent_diversity_callback_gru_path_uses_sequence_lengths():
     cb._bonus_stats = _FixedStats()
     seen = {"train_lengths": None, "auc_lengths": None, "bonus_lengths": None}
 
-    def _train(x_np, y_np, lengths_np=None):
+    def _train(x_np, y_np, lengths_np=None, **kwargs):
         seen["train_lengths"] = None if lengths_np is None else lengths_np.copy()
         return 0.1, 0.9
 
-    def _auc(x_np, y_np, lengths_np=None):
+    def _auc(x_np, y_np, lengths_np=None, **kwargs):
         seen["auc_lengths"] = None if lengths_np is None else lengths_np.copy()
         return 0.75
 
-    def _bonus(x_np, y_np, lengths_np=None):
+    def _bonus(x_np, y_np, lengths_np=None, **kwargs):
         seen["bonus_lengths"] = None if lengths_np is None else lengths_np.copy()
         return np.array([1.0], dtype=np.float32)
 
@@ -392,8 +450,10 @@ def test_intent_diversity_bonus_applies_only_to_active_prefix():
             return None
 
     cb._bonus_stats = _FixedStats()
-    cb._train_discriminator = lambda x_np, y_np: (0.1, 0.9)
-    cb._compute_episode_bonus = lambda x_np, y_np: np.array([1.0], dtype=np.float32)
+    cb._train_discriminator = lambda x_np, y_np, **kwargs: (0.1, 0.9)
+    cb._compute_episode_bonus = (
+        lambda x_np, y_np, **kwargs: np.array([1.0], dtype=np.float32)
+    )
 
     cb._on_rollout_start()
     cb.locals = {

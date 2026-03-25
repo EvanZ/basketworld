@@ -866,5 +866,32 @@ def get_mlflow_training_params(
         float,
         0.5,
     )
+    training_params["intent_selector_multiselect_enabled"] = _get_param(
+        params,
+        [
+            "intent_selector_multiselect_enabled",
+            "intent-selector-multiselect-enabled",
+        ],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_selector_min_play_steps"] = _get_param(
+        params,
+        ["intent_selector_min_play_steps", "intent-selector-min-play-steps"],
+        int,
+        3,
+    )
+    training_params["intent_disc_lambda_shot"] = _get_param(
+        params,
+        ["intent_disc_lambda_shot", "intent-disc-lambda-shot"],
+        float,
+        0.0,
+    )
+    training_params["intent_disc_lambda_q"] = _get_param(
+        params,
+        ["intent_disc_lambda_q", "intent-disc-lambda-q"],
+        float,
+        0.0,
+    )
 
     return training_params

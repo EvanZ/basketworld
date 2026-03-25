@@ -306,6 +306,22 @@ def main(args):
                 "intent_selector_value_coef",
                 getattr(args, "intent_selector_value_coef", 0.5),
             )
+            mlflow.log_param(
+                "intent_selector_multiselect_enabled",
+                getattr(args, "intent_selector_multiselect_enabled", False),
+            )
+            mlflow.log_param(
+                "intent_selector_min_play_steps",
+                getattr(args, "intent_selector_min_play_steps", 3),
+            )
+            mlflow.log_param(
+                "intent_disc_lambda_shot",
+                getattr(args, "intent_disc_lambda_shot", 0.0),
+            )
+            mlflow.log_param(
+                "intent_disc_lambda_q",
+                getattr(args, "intent_disc_lambda_q", 0.0),
+            )
         mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
         mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
         mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
@@ -470,6 +486,15 @@ def main(args):
                 ),
                 intent_selector_value_coef=float(
                     getattr(args, "intent_selector_value_coef", 0.5)
+                ),
+                intent_selector_multiselect_enabled=bool(
+                    getattr(args, "intent_selector_multiselect_enabled", False)
+                ),
+                intent_selector_min_play_steps=int(
+                    getattr(args, "intent_selector_min_play_steps", 3)
+                ),
+                intent_commitment_steps=int(
+                    getattr(args, "intent_commitment_steps", 4)
                 ),
             )
 
