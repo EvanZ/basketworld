@@ -16,6 +16,13 @@ from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiIn
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 
 import app.backend.evaluation as backend_evaluation
+from app.backend.observations import rebuild_observation_from_env
+from app.backend.rollout_runtime import (
+    apply_post_step_rollout_updates,
+    combine_team_actions,
+    predict_joint_policy_actions,
+)
+from app.backend.env_access import env_view
 from app.backend.schemas import (
     ActionRequest,
     BatchUpdatePositionRequest,
@@ -430,6 +437,7 @@ def _build_playbook_rollout_state(env, action_results: dict | None = None) -> di
 
 
 def _build_playbook_ui_state(template_state: dict, env, action_results: dict | None = None) -> dict:
+    env_read = env_view(env)
     state = copy.deepcopy(template_state or {})
     state["positions"] = [
         [int(pos[0]), int(pos[1])] for pos in getattr(env, "positions", [])
@@ -437,7 +445,7 @@ def _build_playbook_ui_state(template_state: dict, env, action_results: dict | N
     ball_holder = getattr(env, "ball_holder", None)
     state["ball_holder"] = int(ball_holder) if ball_holder is not None else None
     state["shot_clock"] = int(getattr(env, "shot_clock", 0))
-    state["done"] = bool(getattr(env, "episode_ended", False))
+    state["done"] = bool(env_read.episode_ended)
     state["last_action_results"] = copy.deepcopy(action_results or {})
     state["intent_active_current"] = bool(getattr(env, "intent_active", False))
     state["intent_index_current"] = int(getattr(env, "intent_index", 0))
@@ -449,24 +457,13 @@ def _build_playbook_ui_state(template_state: dict, env, action_results: dict | N
 
 def _build_playbook_worker_obs(env, user_team) -> dict:
     worker_state = backend_evaluation._worker_state
-    _np = worker_state["np"]
     _Team = worker_state["Team"]
-    observer_is_offense = bool(user_team == _Team.OFFENSE)
-    if hasattr(env, "_build_observation_dict"):
-        obs = env._build_observation_dict(observer_is_offense)
-    else:
-        obs = {
-            "obs": env._get_observation(),
-            "action_mask": env._get_action_masks(),
-            "skills": env._get_offense_skills_array(),
-        }
     role_value = (
         worker_state.get("role_flag_offense", 1.0)
-        if observer_is_offense
+        if user_team == _Team.OFFENSE
         else worker_state.get("role_flag_defense", -1.0)
     )
-    obs["role_flag"] = _np.array([role_value], dtype=_np.float32)
-    return obs
+    return rebuild_observation_from_env(env, role_flag_value=float(role_value))
 
 
 def _run_playbook_batch_worker(args: tuple) -> dict:
@@ -486,20 +483,11 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
     worker_state = backend_evaluation._worker_state
     _np = worker_state["np"]
     _Team = worker_state["Team"]
+    training_params = worker_state.get("training_params", {}) or {}
     unified_policy = worker_state["unified_policy"]
     opponent_policy = worker_state["opponent_policy"]
     progress_queue = worker_state.get("progress_queue")
     user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
-    player_strategy = (
-        worker_state["IllegalActionStrategy"].BEST_PROB
-        if player_deterministic
-        else worker_state["IllegalActionStrategy"].SAMPLE_PROB
-    )
-    opponent_strategy = (
-        worker_state["IllegalActionStrategy"].BEST_PROB
-        if opponent_deterministic
-        else worker_state["IllegalActionStrategy"].SAMPLE_PROB
-    )
 
     try:
         import torch as _torch
@@ -533,6 +521,7 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
         env.intent_commitment_remaining = int(commitment_steps)
 
         obs = _build_playbook_worker_obs(env, user_team)
+        selector_segment_index = 0
         panel = payload.setdefault(int(intent_index), _init_playbook_panel_accumulator(offense_ids))
         initial_ui_state = _build_playbook_ui_state(base_ui_state, env)
         if panel.get("base_state") is None:
@@ -551,31 +540,25 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
             panel["pass_path_segments"],
         )
         rollout_steps = 0
-        done = bool(getattr(env, "episode_ended", False))
+        done = bool(env_view(env).episode_ended)
 
         while not done and (run_to_end or rollout_steps < max_steps):
-            actions_player = backend_evaluation._worker_predict_policy_actions(
-                unified_policy,
-                obs,
-                env,
-                deterministic=player_deterministic,
-                strategy=player_strategy,
+            rollout_actions = predict_joint_policy_actions(
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy if opponent_policy is not None else unified_policy,
+                obs=obs,
+                env=env,
+                player_deterministic=player_deterministic,
+                opponent_deterministic=opponent_deterministic,
+                role_flag_offense=float(worker_state.get("role_flag_offense", 1.0)),
+                role_flag_defense=float(worker_state.get("role_flag_defense", -1.0)),
             )
-            actions_opponent = backend_evaluation._worker_predict_policy_actions(
-                opponent_policy if opponent_policy is not None else unified_policy,
-                obs,
-                env,
-                deterministic=opponent_deterministic,
-                strategy=opponent_strategy,
+            full_action = combine_team_actions(
+                env=env,
+                user_team=user_team,
+                resolved_unified=rollout_actions["resolved_unified"],
+                resolved_opponent=rollout_actions["resolved_opponent"],
             )
-
-            full_action = _np.zeros(env.n_players, dtype=int)
-            if user_team == _Team.OFFENSE:
-                full_action[env.offense_ids] = actions_player[env.offense_ids]
-                full_action[env.defense_ids] = actions_opponent[env.defense_ids]
-            else:
-                full_action[env.defense_ids] = actions_player[env.defense_ids]
-                full_action[env.offense_ids] = actions_opponent[env.offense_ids]
 
             obs, _, terminated, truncated, info = env.step(full_action)
             action_results = info.get("action_results", {}) if info else {}
@@ -583,6 +566,22 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
                 action_results = info.get("last_action_results", {}) if info else {}
             if not action_results:
                 action_results = getattr(env, "last_action_results", {}) or {}
+            done = bool(terminated or truncated)
+            post_step = apply_post_step_rollout_updates(
+                env=env,
+                next_obs=obs,
+                info=info if isinstance(info, dict) else None,
+                done=done,
+                training_params=training_params,
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy,
+                user_team=user_team,
+                role_flag_offense=float(worker_state.get("role_flag_offense", 1.0)),
+                role_flag_defense=float(worker_state.get("role_flag_defense", -1.0)),
+                selector_segment_index=selector_segment_index,
+            )
+            obs = post_step["obs"]
+            selector_segment_index = int(post_step["selector_segment_index"])
 
             next_rollout_state = _build_playbook_rollout_state(env, action_results)
             _count_rollout_transition(
@@ -606,15 +605,7 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
             passes_count += more_passes
             shots_count += more_shots
             rollout_steps += 1
-            done = bool(terminated or truncated)
             rollout_state = next_rollout_state
-
-            role_value = (
-                worker_state.get("role_flag_offense", 1.0)
-                if user_team == _Team.OFFENSE
-                else worker_state.get("role_flag_defense", -1.0)
-            )
-            obs["role_flag"] = _np.array([role_value], dtype=_np.float32)
 
         panel["rollout_lengths_sum"] += int(rollout_steps)
         panel["rollout_passes_sum"] += int(passes_count)
@@ -647,7 +638,7 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     env = _base_env()
-    if env.episode_ended:
+    if env_view(env).episode_ended:
         raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
 
     updates = req.updates or []
@@ -683,7 +674,7 @@ def update_player_position(req: UpdatePositionRequest):
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     env = _base_env()
-    if env.episode_ended:
+    if env_view(env).episode_ended:
         raise HTTPException(status_code=400, detail="Cannot move players after episode has ended.")
 
     pid = req.player_id
@@ -769,7 +760,7 @@ def set_intent_state(req: SetIntentStateRequest):
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     env = _base_env()
-    if env.episode_ended:
+    if env_view(env).episode_ended:
         raise HTTPException(status_code=400, detail="Cannot edit intent after episode has ended.")
 
     if not bool(getattr(env, "enable_intent_learning", False)):
@@ -861,7 +852,7 @@ def replay_counterfactual_snapshot_route(req: ReplayCounterfactualRequest):
     try:
         max_steps = max(1, int(req.max_steps))
         states = [get_ui_game_state()]
-        done = bool(states[-1].get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+        done = bool(states[-1].get("done")) or bool(env_view(game_state.env).episode_ended)
         steps_taken = 0
 
         while not done and steps_taken < max_steps:
@@ -877,7 +868,7 @@ def replay_counterfactual_snapshot_route(req: ReplayCounterfactualRequest):
                 raise RuntimeError("Counterfactual replay step did not return a state.")
             states.append(next_state)
             steps_taken += 1
-            done = bool(next_state.get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+            done = bool(next_state.get("done")) or bool(env_view(game_state.env).episode_ended)
 
         return {
             "status": "success",
@@ -931,18 +922,11 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     offense_ids = [int(pid) for pid in getattr(env, "offense_ids", [])]
     source_label = "snapshot" if bool(req.use_snapshot) else "current"
     training_params = getattr(game_state, "mlflow_training_params", None) or {}
-    integrated_multiselect_active = bool(
-        training_params.get("intent_selector_enabled", False)
-        and str(training_params.get("intent_selector_mode", "callback")).lower()
-        == "integrated"
-        and training_params.get("intent_selector_multiselect_enabled", False)
-    )
     can_parallelize = bool(
         game_state.env_required_params is not None
         and game_state.unified_policy_path is not None
         and game_state.user_team is not None
         and total_rollouts > 1
-        and not integrated_multiselect_active
     )
     num_workers = None
     if can_parallelize and total_rollouts >= 8:
@@ -1017,11 +1001,13 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                 initargs=(
                     game_state.env_required_params,
                     game_state.env_optional_params,
+                    game_state.mlflow_training_params,
                     game_state.unified_policy_path,
                     game_state.opponent_policy_path,
                     game_state.user_team.name,
                     game_state.role_flag_offense,
                     game_state.role_flag_defense,
+                    "learned_sample",
                     progress_queue,
                 ),
             ) as executor:
@@ -1090,7 +1076,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         panel["pass_path_segments"],
                     )
                     rollout_steps = 0
-                    done = bool(getattr(game_state.env, "episode_ended", False))
+                    done = bool(env_view(game_state.env).episode_ended)
 
                     while not done and (run_to_end or rollout_steps < max_steps):
                         step_body = step_route(
@@ -1128,7 +1114,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         passes_count += more_passes
                         shots_count += more_shots
                         rollout_steps += 1
-                        done = bool(next_state.get("done")) or bool(getattr(game_state.env, "episode_ended", False))
+                        done = bool(next_state.get("done")) or bool(env_view(game_state.env).episode_ended)
                         rollout_state = next_rollout_state
 
                     panel["rollout_lengths_sum"] += int(rollout_steps)

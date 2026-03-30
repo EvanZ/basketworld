@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
+from app.backend.env_access import get_env_attr
 from app.backend.state import game_state, get_ui_game_state
 from app.backend.observations import calculate_phi_from_ep_data
 
@@ -133,11 +134,15 @@ def get_pass_steal_probabilities():
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
 
-    if game_state.env.ball_holder is None:
+    ball_holder = get_env_attr(game_state.env, "ball_holder")
+    if ball_holder is None:
         return {}
 
     try:
-        steal_probs = game_state.env.calculate_pass_steal_probabilities(game_state.env.ball_holder)
+        calc = get_env_attr(game_state.env, "calculate_pass_steal_probabilities")
+        if calc is None:
+            return {}
+        steal_probs = calc(int(ball_holder))
         return {int(k): float(v) for k, v in steal_probs.items()}
     except Exception as e:
         print(f"[ERROR] Failed to calculate pass steal probabilities: {e}")
@@ -312,14 +317,14 @@ def get_rewards():
     reward_params = {}
     try:
         reward_params = {
-            "pass_reward": float(getattr(env, "pass_reward", 0.0)),
+            "pass_reward": float(get_env_attr(env, "pass_reward", 0.0)),
             "turnover_reward": 0.0,
             "shot_reward_type": "expected_points",
             "shot_reward_description": "Reward = shot_value × pressure-adjusted make probability (applies to makes and misses)",
-            "violation_reward": float(getattr(env, "violation_reward", 0.0)),
-            "potential_assist_pct": float(getattr(env, "potential_assist_pct", 0.0)),
-            "full_assist_bonus_pct": float(getattr(env, "full_assist_bonus_pct", 0.0)),
-            "assist_window": int(getattr(env, "assist_window", 2)),
+            "violation_reward": float(get_env_attr(env, "violation_reward", 0.0)),
+            "potential_assist_pct": float(get_env_attr(env, "potential_assist_pct", 0.0)),
+            "full_assist_bonus_pct": float(get_env_attr(env, "full_assist_bonus_pct", 0.0)),
+            "assist_window": int(get_env_attr(env, "assist_window", 2)),
         }
     except Exception:
         reward_params = {}

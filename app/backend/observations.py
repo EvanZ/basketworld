@@ -14,18 +14,45 @@ from basketworld.utils.action_resolution import (
 )
 from basketworld.utils.wrappers import SetObservationWrapper
 
+from .env_access import env_view
 from .state import GameState, _role_flag_value_for_team, game_state
 
 _predict_failure_count = 0
+
+
+def _resolve_base_env(env):
+    return getattr(env, "unwrapped", env)
+
+
+def _apply_observation_wrappers(env, obs):
+    """Apply observation wrappers explicitly without deprecated wrapper forwarding."""
+    if env is None:
+        return obs
+    base_env = _resolve_base_env(env)
+    wrappers = []
+    current = env
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if current is base_env:
+            break
+        if isinstance(current, gym.ObservationWrapper):
+            wrappers.append(current)
+        current = getattr(current, "env", None)
+    rebuilt = obs
+    for wrapper in reversed(wrappers):
+        rebuilt = wrapper.observation(rebuilt)
+    return rebuilt
 
 
 def _apply_intent_fields_for_role(cloned: Dict, env, role_flag_value: float) -> Dict:
     """Recondition role-dependent intent fields for cloned observations."""
     if env is None:
         return cloned
+    base_env = _resolve_base_env(env)
     observer_is_offense = bool(float(role_flag_value) > 0.0)
     try:
-        fields = env.get_intent_observation_fields(observer_is_offense)
+        fields = base_env.get_intent_observation_fields(observer_is_offense)
     except Exception:
         fields = {}
     if fields:
@@ -33,7 +60,7 @@ def _apply_intent_fields_for_role(cloned: Dict, env, role_flag_value: float) -> 
             cloned[key] = np.array(value, dtype=np.float32, copy=True)
     if "globals" in cloned:
         try:
-            cloned["globals"] = env.patch_globals_with_intent_features(
+            cloned["globals"] = base_env.patch_globals_with_intent_features(
                 cloned["globals"], observer_is_offense
             )
         except Exception:
@@ -151,9 +178,56 @@ def validate_policy_observation_schema(
 
 
 def _team_player_ids(env, team: Team) -> List[int]:
+    env_read = env_view(env)
     if team == Team.OFFENSE:
-        return list(getattr(env, "offense_ids", []))
-    return list(getattr(env, "defense_ids", []))
+        return list(env_read.offense_ids or [])
+    return list(env_read.defense_ids or [])
+
+
+def _resolve_role_flag_value_for_team(
+    team: Team,
+    *,
+    role_flag_offense: float | None = None,
+    role_flag_defense: float | None = None,
+) -> float:
+    if team == Team.OFFENSE and role_flag_offense is not None:
+        return float(role_flag_offense)
+    if team == Team.DEFENSE and role_flag_defense is not None:
+        return float(role_flag_defense)
+    return _role_flag_value_for_team(team)
+
+
+def rebuild_observation_from_env(
+    env,
+    *,
+    current_obs: dict | None = None,
+    role_flag_value: float | None = None,
+) -> dict:
+    """Rebuild an observation dict from the current env state for the current viewer."""
+    base_env = _resolve_base_env(env)
+    if role_flag_value is None:
+        if (
+            current_obs is not None
+            and isinstance(current_obs, dict)
+            and current_obs.get("role_flag") is not None
+        ):
+            role_flag_value = float(
+                np.asarray(current_obs.get("role_flag"), dtype=np.float32).reshape(-1)[0]
+            )
+        else:
+            role_flag_value = 1.0 if base_env.training_team == Team.OFFENSE else -1.0
+    observer_is_offense = bool(float(role_flag_value) > 0.0)
+    if hasattr(base_env, "_build_observation_dict"):
+        rebuilt_obs = base_env._build_observation_dict(observer_is_offense)
+    else:
+        rebuilt_obs = {
+            "obs": base_env._get_observation(),
+            "action_mask": base_env._get_action_masks(),
+            "skills": base_env._get_offense_skills_array(),
+        }
+    rebuilt_obs = _apply_observation_wrappers(env, rebuilt_obs)
+    rebuilt_obs["role_flag"] = np.array([float(role_flag_value)], dtype=np.float32)
+    return rebuilt_obs
 
 
 def _predict_actions_for_team(
@@ -163,6 +237,9 @@ def _predict_actions_for_team(
     team: Team,
     deterministic: bool,
     strategy: IllegalActionStrategy,
+    *,
+    role_flag_offense: float | None = None,
+    role_flag_defense: float | None = None,
 ) -> Tuple[Dict[int, int], Dict[int, np.ndarray]]:
     actions_by_player: Dict[int, int] = {}
     probs_by_player: Dict[int, np.ndarray] = {}
@@ -174,8 +251,14 @@ def _predict_actions_for_team(
     team_ids = _team_player_ids(env, team)
     if not team_ids:
         return actions_by_player, probs_by_player
+    env_read = env_view(env)
+    num_players = int(env_read.n_players or 0)
 
-    role_flag_value = _role_flag_value_for_team(team)
+    role_flag_value = _resolve_role_flag_value_for_team(
+        team,
+        role_flag_offense=role_flag_offense,
+        role_flag_defense=role_flag_defense,
+    )
     conditioned_obs = _clone_obs_with_role_flag(base_obs, role_flag_value)
     conditioned_obs = _apply_intent_fields_for_role(conditioned_obs, env, role_flag_value)
 
@@ -202,7 +285,7 @@ def _predict_actions_for_team(
     # Legacy policies output actions for every player; new policies output players_per_side only.
     if action_len == len(team_ids):
         team_pred_actions = raw_actions
-    elif action_len == getattr(env, "n_players", action_len):
+    elif action_len == num_players:
         team_pred_actions = raw_actions[team_ids]
     else:
         # Fallback: truncate/pad to team size
@@ -211,7 +294,7 @@ def _predict_actions_for_team(
     probs = get_policy_action_probabilities(policy, conditioned_obs)
     if probs is not None:
         probs = [np.asarray(p, dtype=np.float32) for p in probs]
-        if len(probs) == getattr(env, "n_players", len(probs)):
+        if len(probs) == num_players:
             team_probs = [probs[int(pid)] for pid in team_ids]
         else:
             team_probs = probs[: len(team_ids)]
@@ -264,11 +347,15 @@ def _predict_policy_actions(
     env,
     deterministic: bool,
     strategy: IllegalActionStrategy,
+    *,
+    role_flag_offense: float | None = None,
+    role_flag_defense: float | None = None,
 ) -> Tuple[np.ndarray | None, List[np.ndarray] | None]:
     if policy is None or base_obs is None or env is None:
         return None, None
 
-    num_players = env.n_players
+    env_read = env_view(env)
+    num_players = int(env_read.n_players or 0)
     num_actions = len(ActionType)
     full_actions = np.zeros(num_players, dtype=int)
     probs_per_player: List[np.ndarray] = [
@@ -283,6 +370,8 @@ def _predict_policy_actions(
             team,
             deterministic,
             strategy,
+            role_flag_offense=role_flag_offense,
+            role_flag_defense=role_flag_defense,
         )
         for pid, action in team_actions.items():
             full_actions[int(pid)] = int(action)
@@ -407,11 +496,17 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
     value_policy = state.unified_policy
     gamma = value_policy.gamma
     possible_actions = [action.name for action in ActionType]
+    state_env_read = env_view(state.env)
+    state_offense_ids = set(state_env_read.offense_ids or [])
+    state_defense_ids = set(state_env_read.defense_ids or [])
+    state_num_players = int(state_env_read.n_players or 0)
 
     for action_name in possible_actions:
         action_id = ActionType[action_name].value
         temp_env = copy.deepcopy(state.env)
-        sim_action = np.zeros(temp_env.n_players, dtype=int)
+        temp_env_read = env_view(temp_env)
+        temp_num_players = int(temp_env_read.n_players or state_num_players)
+        sim_action = np.zeros(temp_num_players, dtype=int)
 
         full_actions_main, _ = _predict_policy_actions(
             state.unified_policy,
@@ -421,7 +516,7 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             strategy=IllegalActionStrategy.BEST_PROB,
         )
         if full_actions_main is None:
-            full_actions_main = np.zeros(temp_env.n_players, dtype=int)
+            full_actions_main = np.zeros(temp_num_players, dtype=int)
 
         full_actions_opponent, _ = _predict_policy_actions(
             state.defense_policy,
@@ -432,17 +527,17 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
         )
 
         is_player_on_user_team = (
-            (player_id in state.env.offense_ids and state.user_team == Team.OFFENSE)
-            or (player_id in state.env.defense_ids and state.user_team == Team.DEFENSE)
+            (player_id in state_offense_ids and state.user_team == Team.OFFENSE)
+            or (player_id in state_defense_ids and state.user_team == Team.DEFENSE)
         )
 
-        for i in range(temp_env.n_players):
+        for i in range(temp_num_players):
             if i == player_id:
                 sim_action[i] = action_id
             else:
                 is_i_on_user_team = (
-                    (i in state.env.offense_ids and state.user_team == Team.OFFENSE)
-                    or (i in state.env.defense_ids and state.user_team == Team.DEFENSE)
+                    (i in state_offense_ids and state.user_team == Team.OFFENSE)
+                    or (i in state_defense_ids and state.user_team == Team.DEFENSE)
                 )
                 if is_i_on_user_team:
                     sim_action[i] = full_actions_main[i]
@@ -457,7 +552,9 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             # Episode ended; return empty to avoid crashing endpoints when in terminal states
             return {}
         next_obs = _ensure_set_obs(value_policy, temp_env, next_obs)
-        role_flag_value = state.role_flag_offense if player_id in state.env.offense_ids else state.role_flag_defense
+        role_flag_value = (
+            state.role_flag_offense if player_id in state_offense_ids else state.role_flag_defense
+        )
         conditioned_next_obs = {
             "obs": np.copy(next_obs["obs"]),
             "action_mask": next_obs["action_mask"],
@@ -526,11 +623,14 @@ def _compute_policy_probabilities_for_obs(base_obs: dict, env) -> dict | None:
 
         action_mask = base_obs["action_mask"]
         probs_list = []
+        env_read = env_view(env)
+        offense_ids = set(env_read.offense_ids or [])
+        defense_ids = set(env_read.defense_ids or [])
 
-        for pid in range(env.n_players):
+        for pid in range(int(env_read.n_players or 0)):
             is_user_team = (
-                (pid in env.offense_ids and game_state.user_team == Team.OFFENSE)
-                or (pid in env.defense_ids and game_state.user_team == Team.DEFENSE)
+                (pid in offense_ids and game_state.user_team == Team.OFFENSE)
+                or (pid in defense_ids and game_state.user_team == Team.DEFENSE)
             )
             if is_user_team or raw_probs_opponent is None:
                 probs = raw_probs_main[pid]
@@ -591,11 +691,14 @@ def compute_policy_probabilities():
 
         action_mask = game_state.obs["action_mask"]  # shape (n_players, n_actions)
         probs_list = []
+        env_read = env_view(game_state.env)
+        offense_ids = set(env_read.offense_ids or [])
+        defense_ids = set(env_read.defense_ids or [])
 
-        for pid in range(game_state.env.n_players):
+        for pid in range(int(env_read.n_players or 0)):
             is_user_team = (
-                (pid in game_state.env.offense_ids and game_state.user_team == Team.OFFENSE)
-                or (pid in game_state.env.defense_ids and game_state.user_team == Team.DEFENSE)
+                (pid in offense_ids and game_state.user_team == Team.OFFENSE)
+                or (pid in defense_ids and game_state.user_team == Team.DEFENSE)
             )
 
             if is_user_team or raw_probs_opponent is None:

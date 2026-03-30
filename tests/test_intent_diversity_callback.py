@@ -61,6 +61,16 @@ def _make_step_obs(
     }
 
 
+class _PopCompletedBuffer:
+    def __init__(self, episodes):
+        self._episodes = list(episodes)
+
+    def pop_completed(self, filter_fn=None):
+        if filter_fn is None:
+            return list(self._episodes)
+        return [ep for ep in self._episodes if filter_fn(ep)]
+
+
 def test_intent_diversity_callback_disabled_noop():
     cb = IntentDiversityCallback(enabled=False)
     model = _DummyModel()
@@ -203,6 +213,207 @@ def test_intent_diversity_callback_logs_clipped_and_shaping_bonus_metrics():
     assert np.isclose(logged["intent/bonus_shaping_per_step_mean"][0], 0.25)
     assert np.isclose(logged["intent/bonus_shaping_per_step_std"][0], 0.0)
     assert np.isclose(logged["intent/disc_top1_acc_eval"][0], 0.42)
+
+
+def test_intent_diversity_callback_logs_holdout_metrics_from_holdout_subset():
+    cb = IntentDiversityCallback(
+        enabled=True,
+        num_intents=4,
+        beta_target=0.5,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=1.0,
+        disc_eval_holdout_fraction=0.5,
+    )
+    model = _DummyModel(n_steps=1, n_envs=4)
+    model.num_timesteps = 200
+    cb.init_callback(model)
+    cb._on_training_start()
+
+    class _FixedStats:
+        mean = 0.0
+        std = 1.0
+
+        @staticmethod
+        def update(_):
+            return None
+
+    episodes = [
+        CompletedIntentEpisode(
+            intent_index=0,
+            transitions=[
+                IntentTransition(
+                    feature=np.zeros((12,), dtype=np.float32),
+                    buffer_step_idx=0,
+                    env_idx=0,
+                    role_flag=1.0,
+                    intent_active=True,
+                    intent_index=0,
+                )
+            ],
+        ),
+        CompletedIntentEpisode(
+            intent_index=0,
+            transitions=[
+                IntentTransition(
+                    feature=np.ones((12,), dtype=np.float32),
+                    buffer_step_idx=0,
+                    env_idx=1,
+                    role_flag=1.0,
+                    intent_active=True,
+                    intent_index=0,
+                )
+            ],
+        ),
+        CompletedIntentEpisode(
+            intent_index=1,
+            transitions=[
+                IntentTransition(
+                    feature=np.full((12,), 2.0, dtype=np.float32),
+                    buffer_step_idx=0,
+                    env_idx=2,
+                    role_flag=1.0,
+                    intent_active=True,
+                    intent_index=1,
+                )
+            ],
+        ),
+        CompletedIntentEpisode(
+            intent_index=1,
+            transitions=[
+                IntentTransition(
+                    feature=np.full((12,), 3.0, dtype=np.float32),
+                    buffer_step_idx=0,
+                    env_idx=3,
+                    role_flag=1.0,
+                    intent_active=True,
+                    intent_index=1,
+                )
+            ],
+        ),
+    ]
+    cb._episodes = _PopCompletedBuffer(episodes)
+    cb._bonus_stats = _FixedStats()
+    cb._train_discriminator = lambda x_np, y_np, **kwargs: (0.1, 0.9)
+    cb._split_disc_train_holdout_episodes = lambda eps: (eps[:2], eps[2:])
+    cb._compute_disc_eval_top1_acc = (
+        lambda x_np, y_np, **kwargs: 0.11 if int(y_np[0]) == 0 else 0.22
+    )
+    cb._compute_disc_auc = (
+        lambda x_np, y_np, **kwargs: 0.66 if int(y_np[0]) == 0 else 0.77
+    )
+    cb._compute_episode_bonus = (
+        lambda x_np, y_np, **kwargs: np.ones((x_np.shape[0],), dtype=np.float32)
+    )
+
+    logged = {}
+    original_log_metric = callbacks_module.mlflow.log_metric
+
+    def _capture_metric(key, value, step=None):
+        logged[key] = (value, step)
+
+    callbacks_module.mlflow.log_metric = _capture_metric
+    try:
+        cb._on_rollout_end()
+    finally:
+        callbacks_module.mlflow.log_metric = original_log_metric
+
+    assert cb._latest_disc_eval_batch is not None
+    assert cb._latest_disc_eval_batch_kind == "holdout"
+    assert cb._latest_disc_eval_batch["y"].tolist() == [1, 1]
+    assert cb._latest_disc_eval_batch["env_idx"].tolist() == [2, 3]
+    assert cb._latest_disc_eval_batch["episode_length"].tolist() == [1, 1]
+    assert cb._latest_disc_eval_batch["active_prefix_length"].tolist() == [1, 1]
+    assert cb._latest_disc_eval_batch["training_team"].tolist() == ["", ""]
+    assert cb._latest_disc_eval_batch["boundary_reason"].tolist() == [
+        "episode_end",
+        "episode_end",
+    ]
+    assert cb._latest_disc_eval_batch["first_buffer_step_idx"].tolist() == [0, 0]
+    assert cb._latest_disc_eval_batch["last_buffer_step_idx"].tolist() == [0, 0]
+    assert np.isclose(logged["intent/disc_top1_acc_trainbatch"][0], 0.11)
+    assert np.isclose(logged["intent/disc_auc_ovr_macro_trainbatch"][0], 0.66)
+    assert np.isclose(logged["intent/disc_top1_acc_holdout"][0], 0.22)
+    assert np.isclose(logged["intent/disc_auc_ovr_macro_holdout"][0], 0.77)
+    assert np.isclose(logged["intent/disc_top1_acc_eval"][0], 0.22)
+    assert np.isclose(logged["intent/disc_auc_ovr_macro"][0], 0.77)
+
+
+def test_intent_diversity_callback_filters_out_frozen_offense_episodes_by_default():
+    cb = IntentDiversityCallback(
+        enabled=True,
+        num_intents=4,
+        beta_target=1.0,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=10.0,
+        disc_current_policy_only=True,
+    )
+    model = _DummyModel(n_steps=1, n_envs=2)
+    model.num_timesteps = 100
+    cb.init_callback(model)
+    cb._on_training_start()
+
+    class _FixedStats:
+        mean = 0.0
+        std = 1.0
+
+        @staticmethod
+        def update(_):
+            return None
+
+    cb._bonus_stats = _FixedStats()
+
+    captured = {}
+
+    def _capture_train(x_np, y_np, **kwargs):
+        captured["train_shape"] = tuple(x_np.shape)
+        captured["train_labels"] = np.asarray(y_np).tolist()
+        return 0.1, 0.9
+
+    cb._train_discriminator = _capture_train
+    cb._compute_disc_eval_top1_acc = lambda x_np, y_np, **kwargs: 0.5
+    cb._compute_disc_auc = lambda x_np, y_np, **kwargs: 0.75
+    cb._compute_episode_bonus = (
+        lambda x_np, y_np, **kwargs: np.ones((x_np.shape[0],), dtype=np.float32)
+    )
+
+    offense_episode = CompletedIntentEpisode(
+        intent_index=0,
+        transitions=[
+            IntentTransition(
+                feature=np.zeros((12,), dtype=np.float32),
+                buffer_step_idx=0,
+                env_idx=0,
+                role_flag=1.0,
+                intent_active=True,
+                intent_index=0,
+            )
+        ],
+        terminal_info={"training_team": "OFFENSE"},
+    )
+    frozen_offense_episode = CompletedIntentEpisode(
+        intent_index=1,
+        transitions=[
+            IntentTransition(
+                feature=np.ones((12,), dtype=np.float32),
+                buffer_step_idx=0,
+                env_idx=1,
+                role_flag=1.0,
+                intent_active=True,
+                intent_index=1,
+            )
+        ],
+        terminal_info={"training_team": "DEFENSE"},
+    )
+    cb._episodes = _PopCompletedBuffer([offense_episode, frozen_offense_episode])
+
+    cb._on_rollout_end()
+
+    assert captured["train_shape"][0] == 1
+    assert captured["train_labels"] == [0]
+    assert np.any(model.rollout_buffer.rewards[:, 0] != 0.0)
+    assert np.all(model.rollout_buffer.rewards[:, 1] == 0.0)
 
 
 def test_intent_episode_metric_helpers():
@@ -519,6 +730,13 @@ def test_intent_diversity_callback_exports_latest_eval_batch(tmp_path: Path):
         "x": np.arange(24, dtype=np.float32).reshape(2, 3, 4),
         "y": np.array([1, 3], dtype=np.int64),
         "lengths": np.array([3, 2], dtype=np.int64),
+        "env_idx": np.array([7, 9], dtype=np.int64),
+        "episode_length": np.array([3, 2], dtype=np.int64),
+        "active_prefix_length": np.array([2, 1], dtype=np.int64),
+        "training_team": np.array(["offense", "defense"], dtype=object),
+        "boundary_reason": np.array(["completed_pass", "episode_end"], dtype=object),
+        "first_buffer_step_idx": np.array([11, 21], dtype=np.int64),
+        "last_buffer_step_idx": np.array([13, 22], dtype=np.int64),
     }
 
     out_path = tmp_path / "intent_disc_eval_batch_iter_5.npz"
@@ -532,6 +750,13 @@ def test_intent_diversity_callback_exports_latest_eval_batch(tmp_path: Path):
     assert payload["x"].shape == (2, 3, 4)
     assert payload["y"].tolist() == [1, 3]
     assert payload["lengths"].tolist() == [3, 2]
+    assert payload["env_idx"].tolist() == [7, 9]
+    assert payload["episode_length"].tolist() == [3, 2]
+    assert payload["active_prefix_length"].tolist() == [2, 1]
+    assert payload["training_team"].tolist() == ["offense", "defense"]
+    assert payload["boundary_reason"].tolist() == ["completed_pass", "episode_end"]
+    assert payload["first_buffer_step_idx"].tolist() == [11, 21]
+    assert payload["last_buffer_step_idx"].tolist() == [13, 22]
     assert int(payload["global_step"][0]) == 4321
     assert int(payload["alternation_idx"][0]) == 5
     assert np.isclose(float(payload["disc_top1_acc_eval"][0]), 0.36, atol=1e-6)

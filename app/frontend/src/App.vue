@@ -188,6 +188,7 @@ const userSelections = ref({});
 const isSelfPlaying = ref(false);
 const canReplay = ref(false);
 const isReplaying = ref(false);
+const isReplayPaused = ref(false);
 // For manual stepping through replay
 const replayStates = ref([]);
 const currentStepIndex = ref(0);
@@ -214,6 +215,7 @@ const isPolicySwapping = ref(false);
 const policyOptions = ref([]);
 const policiesLoading = ref(false);
 const policyLoadError = ref(null);
+let replayAnimationRunId = 0;
 const mctsOptionsForStep = ref(null);
 const lastMctsResults = ref(null);
 const persistUseMcts = ref(false);
@@ -295,6 +297,7 @@ const defaultEvalConfig = () => ({
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
+  intentSelectionMode: 'learned_sample',
 });
 const evalConfig = ref(defaultEvalConfig());
 const perPlayerEvalStats = ref({});
@@ -518,6 +521,7 @@ watch(gameState, async (newState, oldState) => {
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
+  cancelReplayAnimation();
   
   // Preserve phi shaping parameters (always try to save them, not just when gameState exists)
   let savedPhiParams = null;
@@ -551,6 +555,7 @@ async function handleGameStarted(setupData) {
   isManualStepping.value = false;
   replayStates.value = [];
   currentStepIndex.value = 0;
+  isReplayPaused.value = false;
   
   // Start loading BEFORE clearing state to avoid interim UI flicker
   isLoading.value = true;
@@ -1475,7 +1480,8 @@ async function handleEvaluation() {
       playerDeterministic.value,
       opponentDeterministic.value,
       customSetup,
-      !!evalConfig.value.randomizeOffensePermutation
+      !!evalConfig.value.randomizeOffensePermutation,
+      evalConfig.value.intentSelectionMode || 'learned_sample',
     );
     
   if (response.status === 'success' && Array.isArray(response.results)) {
@@ -1767,34 +1773,78 @@ async function handleReplay() {
   }
 }
 
+function applyReplayStateAtIndex(index) {
+  if (!Array.isArray(replayStates.value) || replayStates.value.length === 0) return;
+  const clampedIndex = Math.max(0, Math.min(replayStates.value.length - 1, Number(index) || 0));
+  currentStepIndex.value = clampedIndex;
+  const currentState = replayStates.value[clampedIndex];
+  gameState.value = currentState;
+  syncPolicyProbsFromState(currentState);
+  gameHistory.value = replayStates.value.slice(0, clampedIndex + 1).map(cloneState);
+}
+
+function cancelReplayAnimation() {
+  replayAnimationRunId += 1;
+  isReplaying.value = false;
+  isReplayPaused.value = false;
+}
+
+async function waitForReplayStep(durationMs, runId) {
+  const pollMs = 50;
+  let remainingMs = Math.max(0, Number(durationMs) || 0);
+  while (remainingMs > 0) {
+    if (runId !== replayAnimationRunId) return false;
+    if (isReplayPaused.value) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      continue;
+    }
+    const chunkMs = Math.min(pollMs, remainingMs);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, chunkMs));
+    remainingMs -= chunkMs;
+  }
+  return runId === replayAnimationRunId;
+}
+
 async function animateReplayStates(states) {
   if (!Array.isArray(states) || states.length === 0) {
     throw new Error('Invalid replay state sequence');
   }
 
+  const runId = ++replayAnimationRunId;
+  replayStates.value = states.map(cloneState);
   isReplaying.value = true;
+  isReplayPaused.value = false;
   isManualStepping.value = false;
   gameHistory.value = [];
   const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+  let completed = true;
 
   try {
-    for (const state of states) {
-      gameState.value = state;
-      syncPolicyProbsFromState(state);
-      gameHistory.value.push(cloneState(state));
+    for (let idx = 0; idx < replayStates.value.length; idx += 1) {
+      if (runId !== replayAnimationRunId) {
+        completed = false;
+        return;
+      }
+      applyReplayStateAtIndex(idx);
       // eslint-disable-next-line no-await-in-loop
-      await new Promise(resolve => setTimeout(resolve, stepDurationMs));
+      const shouldContinue = await waitForReplayStep(stepDurationMs, runId);
+      if (!shouldContinue) {
+        completed = false;
+        return;
+      }
     }
   } finally {
-    isReplaying.value = false;
+    if (runId === replayAnimationRunId) {
+      isReplaying.value = false;
+      isReplayPaused.value = false;
+    }
   }
 
-  replayStates.value = states;
+  if (!completed || runId !== replayAnimationRunId) return;
   isManualStepping.value = true;
-  currentStepIndex.value = states.length - 1;
-  gameState.value = states[currentStepIndex.value];
-  syncPolicyProbsFromState(gameState.value);
-  gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1).map(cloneState);
+  applyReplayStateAtIndex(replayStates.value.length - 1);
 }
 
 async function handleCounterfactualReplayLoaded(payload) {
@@ -1810,8 +1860,9 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
     const res = await replayLastEpisode();
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
       // Store states for manual stepping
-      replayStates.value = res.states;
+      replayStates.value = res.states.map(cloneState);
       isManualStepping.value = true;
+      isReplayPaused.value = false;
       
       // Debug: check if policy probs are stored
       console.log('[handleManualReplay] First state has policy_probabilities:', !!res.states[0].policy_probabilities);
@@ -1819,14 +1870,10 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
       
       if (keepCurrentView) {
         // Keep showing current state (usually the final state), start from end
-        currentStepIndex.value = res.states.length - 1;
-        gameState.value = res.states[currentStepIndex.value];
-        gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+        applyReplayStateAtIndex(replayStates.value.length - 1);
       } else {
         // Reset to beginning
-        currentStepIndex.value = 0;
-        gameState.value = res.states[0];
-        gameHistory.value = [res.states[0]];
+        applyReplayStateAtIndex(0);
       }
     } else {
       throw new Error('Invalid replay response');
@@ -1843,28 +1890,33 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
 function stepForward() {
   if (!isManualStepping.value || replayStates.value.length === 0) return;
   if (currentStepIndex.value < replayStates.value.length - 1) {
-    currentStepIndex.value += 1;
-    const currentState = replayStates.value[currentStepIndex.value];
-
-    // Update gameState and history from the same replay snapshot.
-    gameState.value = currentState;
-    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    applyReplayStateAtIndex(currentStepIndex.value + 1);
   }
 }
 
 function stepBackward() {
   if (!isManualStepping.value || replayStates.value.length === 0) return;
   if (currentStepIndex.value > 0) {
-    currentStepIndex.value -= 1;
-    const currentState = replayStates.value[currentStepIndex.value];
-
-    // Update gameState and history from the same replay snapshot.
-    gameState.value = currentState;
-    gameHistory.value = replayStates.value.slice(0, currentStepIndex.value + 1);
+    applyReplayStateAtIndex(currentStepIndex.value - 1);
   }
 }
 
+function rewindReplay() {
+  if (replayStates.value.length === 0) return;
+  if (isReplaying.value) {
+    cancelReplayAnimation();
+  }
+  isManualStepping.value = true;
+  applyReplayStateAtIndex(0);
+}
+
+function toggleReplayPause() {
+  if (!isReplaying.value) return;
+  isReplayPaused.value = !isReplayPaused.value;
+}
+
 function handlePlayAgain() {
+  cancelReplayAnimation();
   gameState.value = null;
   gameHistory.value = [];
   policyProbs.value = null;
@@ -1886,6 +1938,7 @@ function handlePlayAgain() {
   isManualStepping.value = false;
   replayStates.value = [];
   currentStepIndex.value = 0;
+  isReplayPaused.value = false;
   isEvaluating.value = false;
   perPlayerEvalStats.value = {};
   evalNumEpisodes.value = 100;
@@ -2251,19 +2304,30 @@ onBeforeUnmount(() => {
           </button>
         </div>
         
-        <div v-if="isManualStepping && canReplay" class="replay-controls">
-          <button @click="handleReplay" class="replay-button" title="Replay (animated)">
+        <div v-if="(isManualStepping || isReplaying) && canReplay" class="replay-controls">
+          <button @click="handleReplay" class="replay-button" :disabled="isReplaying" title="Replay (animated)">
             <font-awesome-icon :icon="['fas', 'redo']" />
+          </button>
+          <button @click="rewindReplay" class="replay-button" :disabled="replayStates.length === 0" title="Rewind to first step">
+            <font-awesome-icon :icon="['fas', 'backward-step']" />
+          </button>
+          <button
+            v-if="isReplaying"
+            @click="toggleReplayPause"
+            class="replay-button"
+            :title="isReplayPaused ? 'Resume replay' : 'Pause replay'"
+          >
+            <font-awesome-icon :icon="['fas', isReplayPaused ? 'play' : 'pause']" />
           </button>
           
           <div class="step-controls-inline">
-            <button @click="stepBackward" class="step-button" :disabled="currentStepIndex === 0" title="Step back (← arrow)">
+            <button @click="stepBackward" class="step-button" :disabled="isReplaying || currentStepIndex === 0" title="Step back (← arrow)">
               <font-awesome-icon :icon="['fas', 'chevron-left']" />
             </button>
             <span class="step-indicator">
               {{ currentStepIndex + 1 }} / {{ replayStates.length }}
             </span>
-            <button @click="stepForward" class="step-button" :disabled="currentStepIndex === replayStates.length - 1" title="Step forward (→ arrow)">
+            <button @click="stepForward" class="step-button" :disabled="isReplaying || currentStepIndex === replayStates.length - 1" title="Step forward (→ arrow)">
               <font-awesome-icon :icon="['fas', 'chevron-right']" />
             </button>
           </div>
@@ -2585,6 +2649,7 @@ header {
 }
 
 .action-button:disabled,
+.replay-button:disabled,
 .step-button:disabled {
   opacity: 0.3;
   cursor: not-allowed;

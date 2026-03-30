@@ -31,6 +31,24 @@ class _DummySB3Policy:
         return np.array(self._output_actions, dtype=int), None
 
 
+class _DummySelectorInnerPolicy(_DummyInnerPolicy):
+    def has_intent_selector(self) -> bool:
+        return True
+
+
+class _DummyIntegratedSB3Policy(_DummySB3Policy):
+    def __init__(self, output_actions):
+        super().__init__(output_actions)
+        self.policy = _DummySelectorInnerPolicy()
+        self.intent_selector_enabled = True
+        self.intent_selector_alpha_start = 1.0
+        self.intent_selector_alpha_end = 1.0
+        self.intent_selector_alpha_warmup_steps = 0
+        self.intent_selector_alpha_ramp_steps = 1
+        self.intent_selector_multiselect_enabled = True
+        self.intent_selector_min_play_steps = 1
+
+
 class _MiniSetAttentionEnv(gym.Env):
     metadata = {}
 
@@ -208,6 +226,148 @@ def test_wrapper_get_offense_intent_override_defaults_to_none():
     wrapped.reset(seed=19)
 
     assert wrapped.get_offense_intent_override() is None
+
+
+def test_wrapper_reset_applies_frozen_offense_selector_segment_start_when_training_defense(
+    monkeypatch,
+):
+    env = HexagonBasketballEnv(
+        players=3,
+        render_mode=None,
+        training_team=Team.DEFENSE,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+    )
+    opponent = _DummyIntegratedSB3Policy(output_actions=[0, 0, 0])
+
+    captured = {}
+
+    def _fake_apply_rollout_segment_start(
+        env_obj,
+        base_obs,
+        *,
+        training_params,
+        unified_policy,
+        opponent_policy,
+        user_team,
+        role_flag_offense,
+        allow_uniform_fallback,
+        selection_mode,
+    ):
+        del env_obj, unified_policy, selection_mode
+        captured["training_params"] = dict(training_params)
+        captured["opponent_policy"] = opponent_policy
+        captured["user_team"] = user_team
+        captured["role_flag_offense"] = role_flag_offense
+        captured["allow_uniform_fallback"] = allow_uniform_fallback
+        obs = dict(base_obs)
+        obs["selector_stub"] = np.asarray([1.0], dtype=np.float32)
+        return {"applied": True, "obs": obs, "used_selector": True, "intent_index": 2}
+
+    monkeypatch.setattr(
+        "basketworld.utils.self_play_wrapper.apply_rollout_segment_start",
+        _fake_apply_rollout_segment_start,
+    )
+
+    wrapped = SelfPlayEnvWrapper(env, opponent_policy=opponent)
+    obs, _ = wrapped.reset(seed=31)
+
+    assert captured["training_params"]["intent_selector_enabled"] is True
+    assert captured["user_team"] == Team.DEFENSE
+    assert captured["role_flag_offense"] == 1.0
+    assert captured["allow_uniform_fallback"] is False
+    assert captured["opponent_policy"] is opponent
+    assert float(obs["selector_stub"][0]) == 1.0
+    assert float(wrapped._last_obs["selector_stub"][0]) == 1.0
+
+
+def test_wrapper_step_applies_frozen_offense_multisegment_boundary_when_training_defense(
+    monkeypatch,
+):
+    env = HexagonBasketballEnv(
+        players=3,
+        render_mode=None,
+        training_team=Team.DEFENSE,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+    )
+    opponent = _DummyIntegratedSB3Policy(output_actions=[0, 0, 0])
+
+    monkeypatch.setattr(
+        "basketworld.utils.self_play_wrapper.apply_rollout_segment_start",
+        lambda env_obj, base_obs, **kwargs: {
+            "applied": True,
+            "obs": base_obs,
+            "used_selector": True,
+            "intent_index": 1,
+        },
+    )
+
+    captured = {}
+
+    def _fake_env_step(full_action):
+        captured["full_action"] = np.array(full_action, dtype=int)
+        obs = {
+            key: np.copy(value) if isinstance(value, np.ndarray) else value
+            for key, value in wrapped._last_obs.items()
+        }
+        reward = np.zeros(wrapped.env.unwrapped.n_players, dtype=np.float32)
+        done = False
+        truncated = False
+        info = {"action_results": {"passes": {0: {"success": True}}}}
+        return obs, reward, done, truncated, info
+
+    def _fake_boundary(
+        env_obj,
+        base_obs,
+        *,
+        info,
+        done,
+        training_params,
+        unified_policy,
+        opponent_policy,
+        user_team,
+        role_flag_offense,
+        selector_segment_index,
+        selection_mode,
+    ):
+        del env_obj, done, training_params, unified_policy, selection_mode
+        captured["boundary_user_team"] = user_team
+        captured["boundary_opponent_policy"] = opponent_policy
+        captured["boundary_role_flag_offense"] = role_flag_offense
+        captured["selector_segment_index"] = selector_segment_index
+        info["intent_segment_boundary"] = 1.0
+        info["intent_segment_boundary_reason"] = "completed_pass"
+        obs = dict(base_obs)
+        obs["boundary_stub"] = np.asarray([1.0], dtype=np.float32)
+        return {
+            "reason": "completed_pass",
+            "selector_segment_index": int(selector_segment_index) + 1,
+            "obs": obs,
+            "used_selector": True,
+            "start_source": "selector",
+        }
+
+    wrapped = SelfPlayEnvWrapper(env, opponent_policy=opponent)
+    wrapped.reset(seed=37)
+
+    monkeypatch.setattr(wrapped.env, "step", _fake_env_step)
+    monkeypatch.setattr(
+        "basketworld.utils.self_play_wrapper.maybe_apply_rollout_multisegment_boundary",
+        _fake_boundary,
+    )
+
+    obs, _, _, _, info = wrapped.step(np.zeros(env.players_per_side, dtype=int))
+
+    assert captured["boundary_user_team"] == Team.DEFENSE
+    assert captured["boundary_opponent_policy"] is opponent
+    assert captured["boundary_role_flag_offense"] == 1.0
+    assert captured["selector_segment_index"] == 0
+    assert float(obs["boundary_stub"][0]) == 1.0
+    assert float(wrapped._last_obs["boundary_stub"][0]) == 1.0
+    assert float(info["intent_segment_boundary"]) == 1.0
+    assert info["intent_segment_boundary_reason"] == "completed_pass"
+    assert wrapped._opponent_selector_segment_index == 1
 
 
 def test_inference_loader_skips_legacy_optimizer_state(tmp_path):

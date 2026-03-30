@@ -6,6 +6,7 @@ from threading import Lock
 from fastapi.encoders import jsonable_encoder
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 from basketworld.utils.wrappers import SetObservationWrapper
+from app.backend.env_access import env_view, get_env_attr
 
 
 class GameState:
@@ -214,59 +215,44 @@ def _capture_turn_start_snapshot():
     """Store current positions/ball holder/shot clock as the baseline for the turn."""
     if not game_state.env:
         return
-    env = game_state.env
+    env = env_view(game_state.env)
     try:
         game_state.turn_start_positions = [
-            (int(pos[0]), int(pos[1])) for pos in getattr(env, "positions", [])
+            (int(pos[0]), int(pos[1])) for pos in (env.positions or [])
         ]
     except Exception:
         game_state.turn_start_positions = None
     game_state.turn_start_ball_holder = (
-        int(env.ball_holder) if getattr(env, "ball_holder", None) is not None else None
+        int(env.ball_holder) if env.ball_holder is not None else None
     )
-    game_state.turn_start_shot_clock = int(getattr(env, "shot_clock", 0))
+    game_state.turn_start_shot_clock = int(env.shot_clock or 0)
 
 
 def _rebuild_cached_obs() -> None:
     """Rebuild game_state.obs from env while preserving the current viewer role."""
     if not game_state.env:
         return
-    env = game_state.env
-    base_env = getattr(env, "unwrapped", env)
-    role_value = (
-        float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
-        if game_state.obs is not None and game_state.obs.get("role_flag") is not None
-        else (1.0 if base_env.training_team == Team.OFFENSE else -1.0)
+    from app.backend.observations import rebuild_observation_from_env
+
+    game_state.obs = rebuild_observation_from_env(
+        game_state.env,
+        current_obs=game_state.obs,
     )
-    observer_is_offense = bool(role_value > 0.0)
-    if hasattr(base_env, "_build_observation_dict"):
-        rebuilt_obs = base_env._build_observation_dict(observer_is_offense)
-    else:
-        rebuilt_obs = {
-            "obs": base_env._get_observation(),
-            "action_mask": base_env._get_action_masks(),
-            "role_flag": np.array([role_value], dtype=np.float32),
-            "skills": base_env._get_offense_skills_array(),
-        }
-    if env is not base_env and hasattr(env, "observation"):
-        rebuilt_obs = env.observation(rebuilt_obs)
-    rebuilt_obs["role_flag"] = np.array([role_value], dtype=np.float32)
-    game_state.obs = rebuilt_obs
 
 
 def _build_counterfactual_snapshot_metadata() -> dict:
-    env = game_state.env
+    env = env_view(game_state.env)
     return {
         "captured_step": int(len(getattr(game_state, "actions_log", []) or [])),
-        "shot_clock": int(getattr(env, "shot_clock", 0)),
+        "shot_clock": int(env.shot_clock or 0),
         "ball_holder": (
-            int(getattr(env, "ball_holder", 0))
-            if getattr(env, "ball_holder", None) is not None
+            int(env.ball_holder or 0)
+            if env.ball_holder is not None
             else None
         ),
-        "intent_active": bool(getattr(env, "intent_active", False)),
-        "intent_index": int(getattr(env, "intent_index", 0)),
-        "intent_age": int(getattr(env, "intent_age", 0)),
+        "intent_active": bool(env.intent_active),
+        "intent_index": int(env.intent_index or 0),
+        "intent_age": int(env.intent_age or 0),
         "captured_at": float(time.time()),
     }
 
@@ -382,6 +368,7 @@ def get_full_game_state(
         _compute_q_values_for_player,
         _compute_state_values_from_obs,
     )
+    from app.backend.selector_runtime import selector_ranked_intent_preferences
 
     # Use FastAPI's jsonable_encoder for numpy-safe encoding
     custom_encoder = {
@@ -390,8 +377,9 @@ def get_full_game_state(
         np.bool_: bool,
     }
 
+    env = env_view(game_state.env)
     last_action_results_py = jsonable_encoder(
-        game_state.env.last_action_results, custom_encoder=custom_encoder
+        env.last_action_results, custom_encoder=custom_encoder
     )
 
     def _set_global_labels(obs_tokens_dict: dict, globals_like) -> None:
@@ -423,15 +411,15 @@ def get_full_game_state(
         obs_tokens_dict["globals_labels"] = labels
 
     # Convert numpy types to standard Python types for JSON serialization
-    positions_py = [(int(q), int(r)) for q, r in game_state.env.positions]
+    positions_py = [(int(q), int(r)) for q, r in env.positions]
     ball_holder_py = (
-        int(game_state.env.ball_holder)
-        if game_state.env.ball_holder is not None
+        int(env.ball_holder)
+        if env.ball_holder is not None
         else None
     )
     basket_pos_py = (
-        int(game_state.env.basket_position[0]),
-        int(game_state.env.basket_position[1]),
+        int(env.basket_position[0]),
+        int(env.basket_position[1]),
     )
     action_mask_py = game_state.obs["action_mask"].tolist()
     obs_tokens = None
@@ -512,9 +500,9 @@ def get_full_game_state(
                     per_head_weights = per_head.tolist()
                 labels = []
                 for pid in range(players_np.shape[0]):
-                    if pid in getattr(game_state.env, "offense_ids", []):
+                    if pid in (env.offense_ids or []):
                         labels.append(f"O{pid}")
-                    elif pid in getattr(game_state.env, "defense_ids", []):
+                    elif pid in (env.defense_ids or []):
                         labels.append(f"D{pid}")
                     else:
                         labels.append(f"P{pid}")
@@ -568,16 +556,16 @@ def get_full_game_state(
     # Calculate EP (expected points) for all players
     ep_by_player = []
     try:
-        env = getattr(game_state.env, "unwrapped", game_state.env)
-        for pid in range(env.n_players):
-            pos = env.positions[pid]
-            dist = env._hex_distance(pos, env.basket_position)
-            is_three = env.is_three_point_location(pos)
-            if getattr(env, "allow_dunks", True) and dist == 0:
+        ep_env = getattr(game_state.env, "unwrapped", game_state.env)
+        for pid in range(ep_env.n_players):
+            pos = ep_env.positions[pid]
+            dist = ep_env._hex_distance(pos, ep_env.basket_position)
+            is_three = ep_env.is_three_point_location(pos)
+            if getattr(ep_env, "allow_dunks", True) and dist == 0:
                 shot_value = 2.0
             else:
                 shot_value = 3.0 if is_three else 2.0
-            p = float(env._calculate_shot_probability(pid, dist))
+            p = float(ep_env._calculate_shot_probability(pid, dist))
             ep = float(shot_value * p)
             ep_by_player.append(ep)
     except Exception:
@@ -589,22 +577,22 @@ def get_full_game_state(
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
 
     state = {
-        "players_per_side": int(getattr(game_state.env, "players_per_side", 3)),
-        "players": int(getattr(game_state.env, "players_per_side", 3)),
+        "players_per_side": int(env.players_per_side or 3),
+        "players": int(env.players_per_side or 3),
         "positions": positions_py,
         "ball_holder": ball_holder_py,
         "ball_handler_shot_probability": ball_handler_shot_prob,
         "pass_steal_probabilities": pass_steal_probs,
-        "shot_clock": int(game_state.env.shot_clock),
-        "min_shot_clock": int(getattr(game_state.env, "min_shot_clock", 10)),
+        "shot_clock": int(env.shot_clock or 0),
+        "min_shot_clock": int(env.min_shot_clock or 10),
         "shot_clock_steps": int(
-            getattr(game_state.env, "shot_clock_steps", getattr(game_state.env, "shot_clock", 24))
+            env.shot_clock_steps if env.shot_clock_steps is not None else (env.shot_clock or 24)
         ),
         "user_team_name": game_state.user_team.name,
-        "done": game_state.env.episode_ended,
+        "done": bool(env.episode_ended or False),
         "training_team": (
-            getattr(game_state.env, "training_team", None).name
-            if getattr(game_state.env, "training_team", None)
+            env.training_team.name
+            if env.training_team
             else None
         ),
         "counterfactual_snapshot_available": bool(counterfactual_snapshot["available"]),
@@ -623,15 +611,15 @@ def get_full_game_state(
         ),
         "obs_tokens_version": 1 if obs_tokens is not None else 0,
         "last_action_results": last_action_results_py,
-        "offense_ids": game_state.env.offense_ids,
-        "defense_ids": game_state.env.defense_ids,
+        "offense_ids": env.offense_ids,
+        "defense_ids": env.defense_ids,
         "basket_position": basket_pos_py,
-        "court_width": game_state.env.court_width,
-        "court_height": game_state.env.court_height,
-        "three_point_distance": float(getattr(game_state.env, "three_point_distance", 4.0)),
+        "court_width": env.court_width,
+        "court_height": env.court_height,
+        "three_point_distance": float(env.three_point_distance or 4.0),
         "three_point_short_distance": (
-            float(getattr(game_state.env, "three_point_short_distance"))
-            if getattr(game_state.env, "three_point_short_distance", None) is not None
+            float(env.three_point_short_distance)
+            if env.three_point_short_distance is not None
             else None
         ),
         "three_point_hexes": [
@@ -646,93 +634,51 @@ def get_full_game_state(
             (float(x), float(y))
             for x, y in getattr(base_env, "_three_point_outline_points", [])
         ],
-        "shot_probs": getattr(game_state.env, "shot_probs", None),
+        "shot_probs": env.shot_probs,
         "shot_params": {
-            "layup_pct": float(getattr(game_state.env, "layup_pct", 0.0)),
-            "three_pt_pct": float(getattr(game_state.env, "three_pt_pct", 0.0)),
-            "three_pt_extra_hex_decay": float(
-                getattr(game_state.env, "three_pt_extra_hex_decay", 0.05)
-            ),
-            "dunk_pct": float(getattr(game_state.env, "dunk_pct", 0.0)),
-            "layup_std": float(getattr(game_state.env, "layup_std", 0.0)),
-            "three_pt_std": float(getattr(game_state.env, "three_pt_std", 0.0)),
-            "dunk_std": float(getattr(game_state.env, "dunk_std", 0.0)),
-            "allow_dunks": bool(getattr(game_state.env, "allow_dunks", False)),
+            "layup_pct": float(env.layup_pct or 0.0),
+            "three_pt_pct": float(env.three_pt_pct or 0.0),
+            "three_pt_extra_hex_decay": float(env.three_pt_extra_hex_decay or 0.05),
+            "dunk_pct": float(env.dunk_pct or 0.0),
+            "layup_std": float(env.layup_std or 0.0),
+            "three_pt_std": float(env.three_pt_std or 0.0),
+            "dunk_std": float(env.dunk_std or 0.0),
+            "allow_dunks": bool(env.allow_dunks),
         },
-        "defender_pressure_distance": int(
-            getattr(game_state.env, "defender_pressure_distance", 1)
-        ),
-        "defender_pressure_turnover_chance": float(
-            getattr(game_state.env, "defender_pressure_turnover_chance", 0.05)
-        ),
-        "defender_pressure_decay_lambda": float(
-            getattr(game_state.env, "defender_pressure_decay_lambda", 1.0)
-        ),
-        "base_steal_rate": float(getattr(game_state.env, "base_steal_rate", 0.35)),
-        "steal_perp_decay": float(getattr(game_state.env, "steal_perp_decay", 1.5)),
-        "steal_distance_factor": float(getattr(game_state.env, "steal_distance_factor", 0.08)),
-        "steal_position_weight_min": float(getattr(game_state.env, "steal_position_weight_min", 0.3)),
-        "spawn_distance": int(getattr(game_state.env, "spawn_distance", 3)),
+        "defender_pressure_distance": int(env.defender_pressure_distance or 1),
+        "defender_pressure_turnover_chance": float(env.defender_pressure_turnover_chance or 0.05),
+        "defender_pressure_decay_lambda": float(env.defender_pressure_decay_lambda or 1.0),
+        "base_steal_rate": float(env.base_steal_rate or 0.35),
+        "steal_perp_decay": float(env.steal_perp_decay or 1.5),
+        "steal_distance_factor": float(env.steal_distance_factor or 0.08),
+        "steal_position_weight_min": float(env.steal_position_weight_min or 0.3),
+        "spawn_distance": int(env.spawn_distance or 3),
         "max_spawn_distance": (
-            int(getattr(game_state.env, "max_spawn_distance", None))
-            if getattr(game_state.env, "max_spawn_distance", None) is not None
+            int(env.max_spawn_distance)
+            if env.max_spawn_distance is not None
             else None
         ),
-        "defender_spawn_distance": int(getattr(game_state.env, "defender_spawn_distance", 0)),
-        "defender_guard_distance": int(getattr(game_state.env, "defender_guard_distance", 1)),
-        "offense_spawn_boundary_margin": int(
-            getattr(game_state.env, "offense_spawn_boundary_margin", 0)
-        ),
-        "shot_pressure_enabled": bool(
-            getattr(game_state.env, "shot_pressure_enabled", True)
-        ),
-        "shot_pressure_max": float(getattr(game_state.env, "shot_pressure_max", 0.5)),
-        "shot_pressure_lambda": float(
-            getattr(game_state.env, "shot_pressure_lambda", 1.0)
-        ),
-        "shot_pressure_arc_degrees": float(
-            getattr(game_state.env, "shot_pressure_arc_degrees", 60.0)
-        ),
-        "three_pt_extra_hex_decay": float(
-            getattr(game_state.env, "three_pt_extra_hex_decay", 0.05)
-        ),
-        "mask_occupied_moves": bool(
-            getattr(game_state.env, "mask_occupied_moves", False)
-        ),
-        "three_second_lane_width": int(
-            getattr(game_state.env, "three_second_lane_width", 1)
-        ),
-        "three_second_lane_height": int(
-            getattr(game_state.env, "three_second_lane_height", 3)
-        ),
-        "three_second_max_steps": int(
-            getattr(game_state.env, "three_second_max_steps", 3)
-        ),
-        "illegal_defense_enabled": bool(
-            getattr(game_state.env, "illegal_defense_enabled", False)
-        ),
-        "offensive_three_seconds_enabled": bool(
-            getattr(game_state.env, "offensive_three_seconds_enabled", False)
-        ),
-        "enable_intent_learning": bool(
-            getattr(game_state.env, "enable_intent_learning", False)
-        ),
-        "num_intents": int(getattr(game_state.env, "num_intents", 0)),
-        "intent_commitment_steps": int(
-            getattr(game_state.env, "intent_commitment_steps", 0)
-        ),
-        "intent_null_prob": float(
-            getattr(game_state.env, "intent_null_prob", 0.0)
-        ),
-        "intent_visible_to_defense_prob": float(
-            getattr(game_state.env, "intent_visible_to_defense_prob", 0.0)
-        ),
-        "enable_defense_intent_learning": bool(
-            getattr(game_state.env, "enable_defense_intent_learning", False)
-        ),
-        "defense_intent_null_prob": float(
-            getattr(game_state.env, "defense_intent_null_prob", 1.0)
-        ),
+        "defender_spawn_distance": int(env.defender_spawn_distance or 0),
+        "defender_guard_distance": int(env.defender_guard_distance or 1),
+        "offense_spawn_boundary_margin": int(env.offense_spawn_boundary_margin or 0),
+        "shot_pressure_enabled": bool(env.shot_pressure_enabled),
+        "shot_pressure_max": float(env.shot_pressure_max or 0.5),
+        "shot_pressure_lambda": float(env.shot_pressure_lambda or 1.0),
+        "shot_pressure_arc_degrees": float(env.shot_pressure_arc_degrees or 60.0),
+        "three_pt_extra_hex_decay": float(env.three_pt_extra_hex_decay or 0.05),
+        "mask_occupied_moves": bool(env.mask_occupied_moves),
+        "three_second_lane_width": int(env.three_second_lane_width or 1),
+        "three_second_lane_height": int(env.three_second_lane_height or 3),
+        "three_second_max_steps": int(env.three_second_max_steps or 3),
+        "illegal_defense_enabled": bool(env.illegal_defense_enabled),
+        "offensive_three_seconds_enabled": bool(env.offensive_three_seconds_enabled),
+        "enable_intent_learning": bool(env.enable_intent_learning),
+        "num_intents": int(env.num_intents or 0),
+        "intent_commitment_steps": int(env.intent_commitment_steps or 0),
+        "intent_null_prob": float(env.intent_null_prob or 0.0),
+        "intent_visible_to_defense_prob": float(env.intent_visible_to_defense_prob or 0.0),
+        "enable_defense_intent_learning": bool(env.enable_defense_intent_learning),
+        "defense_intent_null_prob": float(env.defense_intent_null_prob or 1.0),
         "intent_diversity_enabled": (
             bool(
                 getattr(game_state, "mlflow_training_params", {}).get(
@@ -743,18 +689,12 @@ def get_full_game_state(
             else None
         ),
         "intent_obs_mode": str(
-            getattr(game_state.env, "intent_obs_mode", "private_offense")
+            env.intent_obs_mode or "private_offense"
         ),
-        "intent_active_current": bool(
-            getattr(game_state.env, "intent_active", False)
-        ),
-        "intent_index_current": int(
-            getattr(game_state.env, "intent_index", 0)
-        ),
-        "intent_age": int(getattr(game_state.env, "intent_age", 0)),
-        "intent_commitment_remaining": int(
-            getattr(game_state.env, "intent_commitment_remaining", 0)
-        ),
+        "intent_active_current": bool(env.intent_active),
+        "intent_index_current": int(env.intent_index or 0),
+        "intent_age": int(env.intent_age or 0),
+        "intent_commitment_remaining": int(env.intent_commitment_remaining or 0),
         "selector_segment_index_current": int(
             getattr(game_state, "selector_segment_index", 0)
         ),
@@ -762,46 +702,34 @@ def get_full_game_state(
             game_state, "selector_last_boundary_reason", None
         ),
         "intent_visible_to_defense_current": bool(
-            getattr(game_state.env, "_intent_visible_to_defense", False)
+            get_env_attr(game_state.env, "_intent_visible_to_defense", False)
         ),
-        "defense_intent_active_current": bool(
-            getattr(game_state.env, "defense_intent_active", False)
-        ),
-        "defense_intent_index_current": int(
-            getattr(game_state.env, "defense_intent_index", 0)
-        ),
-        "defense_intent_age": int(getattr(game_state.env, "defense_intent_age", 0)),
-        "defense_intent_commitment_remaining": int(
-            getattr(game_state.env, "defense_intent_commitment_remaining", 0)
-        ),
-        "include_hoop_vector": bool(
-            getattr(game_state.env, "include_hoop_vector", False)
-        ),
+        "defense_intent_active_current": bool(env.defense_intent_active),
+        "defense_intent_index_current": int(env.defense_intent_index or 0),
+        "defense_intent_age": int(env.defense_intent_age or 0),
+        "defense_intent_commitment_remaining": int(env.defense_intent_commitment_remaining or 0),
+        "include_hoop_vector": bool(env.include_hoop_vector),
         "offensive_lane_hexes": [
-            (int(q), int(r))
-            for q, r in getattr(game_state.env, "offensive_lane_hexes", set())
+            (int(q), int(r)) for q, r in (env.offensive_lane_hexes or set())
         ],
         "defensive_lane_hexes": [
-            (int(q), int(r))
-            for q, r in getattr(game_state.env, "defensive_lane_hexes", set())
+            (int(q), int(r)) for q, r in (env.defensive_lane_hexes or set())
         ],
         "offensive_lane_steps": {
             int(pid): int(steps)
-            for pid, steps in getattr(game_state.env, "_offensive_lane_steps", {}).items()
+            for pid, steps in get_env_attr(game_state.env, "_offensive_lane_steps", {}).items()
         },
         "defensive_lane_steps": {
             int(pid): int(steps)
-            for pid, steps in getattr(game_state.env, "_defender_in_key_steps", {}).items()
+            for pid, steps in get_env_attr(game_state.env, "_defender_in_key_steps", {}).items()
         },
-        "pass_arc_degrees": float(getattr(game_state.env, "pass_arc_degrees", 60.0)),
-        "pass_oob_turnover_prob": float(
-            getattr(game_state.env, "pass_oob_turnover_prob", 1.0)
-        ),
-        "pass_target_strategy": getattr(game_state.env, "pass_target_strategy", "nearest"),
-        "pass_mode": getattr(game_state.env, "pass_mode", "directional"),
+        "pass_arc_degrees": float(env.pass_arc_degrees or 60.0),
+        "pass_oob_turnover_prob": float(env.pass_oob_turnover_prob or 1.0),
+        "pass_target_strategy": env.pass_target_strategy or "nearest",
+        "pass_mode": env.pass_mode or "directional",
         "illegal_action_policy": (
-            getattr(game_state.env, "illegal_action_policy", None).value
-            if getattr(game_state.env, "illegal_action_policy", None)
+            env.illegal_action_policy.value
+            if env.illegal_action_policy
             else "noop"
         ),
         "pass_logit_bias": float(
@@ -823,15 +751,15 @@ def get_full_game_state(
         "offense_shooting_pct_by_player": {
             "layup": [
                 float(x)
-                for x in getattr(game_state.env, "offense_layup_pct_by_player", [])
+                for x in (env.offense_layup_pct_by_player or [])
             ],
             "three_pt": [
                 float(x)
-                for x in getattr(game_state.env, "offense_three_pt_pct_by_player", [])
+                for x in (env.offense_three_pt_pct_by_player or [])
             ],
             "dunk": [
                 float(x)
-                for x in getattr(game_state.env, "offense_dunk_pct_by_player", [])
+                for x in (env.offense_dunk_pct_by_player or [])
             ],
         },
         "offense_shooting_pct_sampled": {
@@ -855,11 +783,22 @@ def get_full_game_state(
         policy_probs = compute_policy_probabilities()
         if policy_probs is not None:
             state["policy_probabilities"] = policy_probs
+        selector_prefs = selector_ranked_intent_preferences(
+            training_params=getattr(game_state, "mlflow_training_params", None),
+            env=game_state.env,
+            base_obs=game_state.obs,
+            unified_policy=game_state.unified_policy,
+            opponent_policy=getattr(game_state, "defense_policy", None),
+            user_team=game_state.user_team,
+            role_flag_offense=1.0,
+        )
+        if selector_prefs is not None:
+            state["selector_intent_preferences"] = selector_prefs
 
     if include_action_values:
         try:
             action_values_by_player = {}
-            for pid in range(game_state.env.n_players):
+            for pid in range(env.n_players):
                 action_values_by_player[str(pid)] = _compute_q_values_for_player(pid, game_state)
             state["action_values"] = action_values_by_player
         except Exception as e:

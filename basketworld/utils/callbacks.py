@@ -323,7 +323,11 @@ class MLflowCallback(BaseCallback):
                     rejected_move_occupied,
                     step=global_step,
                 )
-                mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
+                mlflow.log_metric(
+                    _offense_possession_metric_name(self.team_name, "PPP"),
+                    ppp_avg,
+                    step=global_step,
+                )
                 # Log current pass logit bias if custom policy exposes it
                 try:
                     pass_bias = float(
@@ -429,6 +433,13 @@ class GradNormCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         return True
+
+
+def _offense_possession_metric_name(team_label: str, metric_name: str) -> str:
+    """Name offense-possession metrics clearly when grouped under defense episodes."""
+    if str(team_label).strip().lower() == "defense":
+        return f"{team_label} {metric_name} Allowed"
+    return f"{team_label} {metric_name}"
 
 
 class AccumulativeMetricsCallback(BaseCallback):
@@ -610,12 +621,18 @@ class AccumulativeMetricsCallback(BaseCallback):
         expected_ppp_mean = (
             float(np.mean(expected_ppp_values)) if expected_ppp_values else 0.0
         )
-        mlflow.log_metric(f"{team_label} PPP", ppp_mean, step=global_step)
         mlflow.log_metric(
-            f"{team_label} Expected PPP", expected_ppp_mean, step=global_step
+            _offense_possession_metric_name(team_label, "PPP"),
+            ppp_mean,
+            step=global_step,
         )
         mlflow.log_metric(
-            f"{team_label} Expected Points / Episode",
+            _offense_possession_metric_name(team_label, "Expected PPP"),
+            expected_ppp_mean,
+            step=global_step,
+        )
+        mlflow.log_metric(
+            _offense_possession_metric_name(team_label, "Expected Points / Episode"),
             mean_key("expected_points"),
             step=global_step,
         )
@@ -685,6 +702,8 @@ class IntentDiversityCallback(BaseCallback):
         max_action_dim: int = 16,
         disc_lambda_shot: float = 0.0,
         disc_lambda_q: float = 0.0,
+        disc_eval_holdout_fraction: float = 0.25,
+        disc_current_policy_only: bool = True,
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
@@ -707,6 +726,10 @@ class IntentDiversityCallback(BaseCallback):
         self.max_action_dim = int(max(1, max_action_dim))
         self.disc_lambda_shot = float(max(0.0, disc_lambda_shot))
         self.disc_lambda_q = float(max(0.0, disc_lambda_q))
+        self.disc_eval_holdout_fraction = float(
+            min(0.9, max(0.0, disc_eval_holdout_fraction))
+        )
+        self.disc_current_policy_only = bool(disc_current_policy_only)
 
         self._rollout_step_idx = 0
         self._rollout_counter = 0
@@ -718,7 +741,9 @@ class IntentDiversityCallback(BaseCallback):
         self._warned_recompute = False
         self._last_disc_loss = 0.0
         self._last_disc_acc = 0.0
-        self._last_disc_eval_acc = 0.0
+        self._last_disc_trainbatch_acc: Optional[float] = None
+        self._last_disc_trainbatch_auc: Optional[float] = None
+        self._last_disc_eval_acc: Optional[float] = None
         self._last_disc_auc: Optional[float] = None
         self._last_disc_pass_ms = 0.0
         self._last_disc_shot_end_loss = 0.0
@@ -727,6 +752,7 @@ class IntentDiversityCallback(BaseCallback):
         self._pending_disc_restore_payload: Optional[dict[str, Any]] = None
         self._pending_disc_restore_source: Optional[str] = None
         self._latest_disc_eval_batch: Optional[dict[str, Any]] = None
+        self._latest_disc_eval_batch_kind: Optional[str] = None
 
     def _on_training_start(self) -> None:
         try:
@@ -980,10 +1006,29 @@ class IntentDiversityCallback(BaseCallback):
         self._last_disc_acc = float(
             meta.get("last_disc_top1_acc", self._last_disc_acc)
         )
-        self._last_disc_eval_acc = float(
-            meta.get("last_disc_top1_acc_eval", self._last_disc_eval_acc)
+        trainbatch_acc_value = meta.get(
+            "last_disc_top1_acc_trainbatch", self._last_disc_trainbatch_acc
         )
-        auc_value = meta.get("last_disc_auc_ovr_macro", self._last_disc_auc)
+        self._last_disc_trainbatch_acc = (
+            None if trainbatch_acc_value is None else float(trainbatch_acc_value)
+        )
+        trainbatch_auc_value = meta.get(
+            "last_disc_auc_ovr_macro_trainbatch", self._last_disc_trainbatch_auc
+        )
+        self._last_disc_trainbatch_auc = (
+            None if trainbatch_auc_value is None else float(trainbatch_auc_value)
+        )
+        eval_acc_value = meta.get(
+            "last_disc_top1_acc_holdout",
+            meta.get("last_disc_top1_acc_eval", self._last_disc_eval_acc),
+        )
+        self._last_disc_eval_acc = (
+            None if eval_acc_value is None else float(eval_acc_value)
+        )
+        auc_value = meta.get(
+            "last_disc_auc_ovr_macro_holdout",
+            meta.get("last_disc_auc_ovr_macro", self._last_disc_auc),
+        )
         self._last_disc_auc = None if auc_value is None else float(auc_value)
         self._last_disc_shot_end_loss = float(
             meta.get("last_disc_shot_end_loss", self._last_disc_shot_end_loss)
@@ -1037,7 +1082,31 @@ class IntentDiversityCallback(BaseCallback):
                 "rollout_counter": int(self._rollout_counter),
                 "last_disc_loss": float(self._last_disc_loss),
                 "last_disc_top1_acc": float(self._last_disc_acc),
-                "last_disc_top1_acc_eval": float(self._last_disc_eval_acc),
+                "last_disc_top1_acc_trainbatch": (
+                    float(self._last_disc_trainbatch_acc)
+                    if self._last_disc_trainbatch_acc is not None
+                    else None
+                ),
+                "last_disc_auc_ovr_macro_trainbatch": (
+                    float(self._last_disc_trainbatch_auc)
+                    if self._last_disc_trainbatch_auc is not None
+                    else None
+                ),
+                "last_disc_top1_acc_holdout": (
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else None
+                ),
+                "last_disc_auc_ovr_macro_holdout": (
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else None
+                ),
+                "last_disc_top1_acc_eval": (
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else None
+                ),
                 "last_disc_auc_ovr_macro": (
                     float(self._last_disc_auc)
                     if self._last_disc_auc is not None
@@ -1083,6 +1152,52 @@ class IntentDiversityCallback(BaseCallback):
             ),
             dtype=np.float32,
         ).reshape(-1)
+        env_idx_np = np.asarray(
+            payload.get("env_idx", np.full((x_np.shape[0],), -1, dtype=np.int64)),
+            dtype=np.int64,
+        ).reshape(-1)
+        episode_length_np = np.asarray(
+            payload.get(
+                "episode_length",
+                np.zeros((x_np.shape[0],), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        active_prefix_length_np = np.asarray(
+            payload.get(
+                "active_prefix_length",
+                np.zeros((x_np.shape[0],), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        training_team_np = np.asarray(
+            payload.get(
+                "training_team",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        boundary_reason_np = np.asarray(
+            payload.get(
+                "boundary_reason",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        first_buffer_step_idx_np = np.asarray(
+            payload.get(
+                "first_buffer_step_idx",
+                np.full((x_np.shape[0],), -1, dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        last_buffer_step_idx_np = np.asarray(
+            payload.get(
+                "last_buffer_step_idx",
+                np.full((x_np.shape[0],), -1, dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
         np.savez_compressed(
             path,
             x=x_np,
@@ -1091,6 +1206,13 @@ class IntentDiversityCallback(BaseCallback):
             shot_end=shot_end_np,
             shot_quality=shot_quality_np,
             shot_quality_mask=shot_quality_mask_np,
+            env_idx=env_idx_np,
+            episode_length=episode_length_np,
+            active_prefix_length=active_prefix_length_np,
+            training_team=training_team_np,
+            boundary_reason=boundary_reason_np,
+            first_buffer_step_idx=first_buffer_step_idx_np,
+            last_buffer_step_idx=last_buffer_step_idx_np,
             has_lengths=np.array([1 if lengths_raw is not None else 0], dtype=np.int8),
             global_step=np.array(
                 [
@@ -1109,7 +1231,49 @@ class IntentDiversityCallback(BaseCallback):
             max_obs_dim=np.array([int(self.max_obs_dim)], dtype=np.int64),
             max_action_dim=np.array([int(self.max_action_dim)], dtype=np.int64),
             encoder_type=np.array([str(self.disc_encoder_type)], dtype=object),
-            disc_top1_acc_eval=np.array([float(self._last_disc_eval_acc)], dtype=np.float32),
+            eval_split_kind=np.array(
+                [str(self._latest_disc_eval_batch_kind or "unknown")], dtype=object
+            ),
+            disc_top1_acc_trainbatch=np.array(
+                [
+                    float(self._last_disc_trainbatch_acc)
+                    if self._last_disc_trainbatch_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_auc_ovr_macro_trainbatch=np.array(
+                [
+                    float(self._last_disc_trainbatch_auc)
+                    if self._last_disc_trainbatch_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_top1_acc_holdout=np.array(
+                [
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_auc_ovr_macro_holdout=np.array(
+                [
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_top1_acc_eval=np.array(
+                [
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
             disc_auc_ovr_macro=np.array(
                 [
                     float(self._last_disc_auc)
@@ -1382,6 +1546,138 @@ class IntentDiversityCallback(BaseCallback):
         shot_quality_mask = (shot_end > 0.5).astype(np.float32, copy=False)
         return shot_end, shot_quality, shot_quality_mask
 
+    def _split_disc_train_holdout_episodes(
+        self, episodes: list[CompletedIntentEpisode]
+    ) -> tuple[list[CompletedIntentEpisode], list[CompletedIntentEpisode]]:
+        if (
+            self.disc_eval_holdout_fraction <= 0.0
+            or len(episodes) < 2
+        ):
+            return list(episodes), []
+
+        rng = np.random.default_rng(
+            int(getattr(self.model, "num_timesteps", 0))
+            + (1009 * int(self._rollout_counter))
+        )
+        by_intent: dict[int, list[int]] = {}
+        for idx, episode in enumerate(episodes):
+            by_intent.setdefault(int(episode.intent_index), []).append(idx)
+
+        train_idx: set[int] = set()
+        holdout_idx: set[int] = set()
+        for indices in by_intent.values():
+            if len(indices) <= 1:
+                train_idx.update(indices)
+                continue
+            shuffled = np.asarray(indices, dtype=np.int64)
+            rng.shuffle(shuffled)
+            holdout_count = int(
+                np.round(float(len(shuffled)) * float(self.disc_eval_holdout_fraction))
+            )
+            holdout_count = min(len(shuffled) - 1, max(1, holdout_count))
+            holdout_idx.update(int(v) for v in shuffled[:holdout_count].tolist())
+            train_idx.update(int(v) for v in shuffled[holdout_count:].tolist())
+
+        if not train_idx:
+            first_holdout_idx = min(holdout_idx)
+            train_idx.add(first_holdout_idx)
+            holdout_idx.remove(first_holdout_idx)
+        if not holdout_idx:
+            return list(episodes), []
+
+        train_eps = [ep for idx, ep in enumerate(episodes) if idx in train_idx]
+        holdout_eps = [ep for idx, ep in enumerate(episodes) if idx in holdout_idx]
+        return train_eps, holdout_eps
+
+    def _build_disc_batches_from_episodes(
+        self,
+        episodes: list[CompletedIntentEpisode],
+    ) -> tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        lengths_np = None
+        if self.disc_encoder_type == "gru":
+            x_np, lengths_np, y_np = build_padded_episode_batch(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
+        else:
+            x_np, y_np = compute_episode_embeddings(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
+        shot_end_np, shot_quality_np, shot_quality_mask_np = self._build_disc_aux_targets(
+            episodes
+        )
+        return (
+            x_np,
+            lengths_np,
+            y_np,
+            shot_end_np,
+            shot_quality_np,
+            shot_quality_mask_np,
+        )
+
+    @staticmethod
+    def _build_disc_batch_provenance(
+        episodes: list[CompletedIntentEpisode],
+    ) -> dict[str, np.ndarray]:
+        env_idx: list[int] = []
+        episode_length: list[int] = []
+        active_prefix_length: list[int] = []
+        training_team: list[str] = []
+        boundary_reason: list[str] = []
+        first_buffer_step_idx: list[int] = []
+        last_buffer_step_idx: list[int] = []
+        for episode in episodes:
+            first_transition = episode.transitions[0] if episode.transitions else None
+            last_transition = episode.transitions[-1] if episode.transitions else None
+            env_idx.append(
+                int(first_transition.env_idx) if first_transition is not None else -1
+            )
+            first_buffer_step_idx.append(
+                int(first_transition.buffer_step_idx)
+                if first_transition is not None
+                else -1
+            )
+            last_buffer_step_idx.append(
+                int(last_transition.buffer_step_idx)
+                if last_transition is not None
+                else -1
+            )
+            episode_length.append(int(episode.length))
+            active_prefix_length.append(int(episode.active_prefix_length))
+            info = dict(episode.terminal_info or {})
+            training_team.append(str(info.get("training_team", "")))
+            boundary_reason.append(str(info.get("intent_segment_boundary_reason", "episode_end")))
+        return {
+            "env_idx": np.asarray(env_idx, dtype=np.int64),
+            "episode_length": np.asarray(episode_length, dtype=np.int64),
+            "active_prefix_length": np.asarray(active_prefix_length, dtype=np.int64),
+            "training_team": np.asarray(training_team, dtype=object),
+            "boundary_reason": np.asarray(boundary_reason, dtype=object),
+            "first_buffer_step_idx": np.asarray(first_buffer_step_idx, dtype=np.int64),
+            "last_buffer_step_idx": np.asarray(last_buffer_step_idx, dtype=np.int64),
+        }
+
+    def _episode_matches_disc_source_filter(
+        self, episode: CompletedIntentEpisode
+    ) -> bool:
+        if not self.disc_current_policy_only:
+            return True
+        info = dict(episode.terminal_info or {})
+        team = str(info.get("training_team", "")).strip().lower()
+        if not team:
+            return True
+        return team == "offense"
+
     @staticmethod
     def _usage_entropy(y_np: np.ndarray, num_intents: int) -> tuple[float, float]:
         if y_np.size == 0:
@@ -1559,7 +1855,11 @@ class IntentDiversityCallback(BaseCallback):
             pass
 
         episodes = self._episodes.pop_completed(
-            filter_fn=lambda ep: ep.role_is_offense and ep.active_prefix_length > 0
+            filter_fn=lambda ep: (
+                ep.role_is_offense
+                and ep.active_prefix_length > 0
+                and self._episode_matches_disc_source_filter(ep)
+            )
         )
         if not episodes:
             if self._should_console_log_disc():
@@ -1585,20 +1885,15 @@ class IntentDiversityCallback(BaseCallback):
                 )
             return
 
-        lengths_np = None
-        if self.disc_encoder_type == "gru":
-            x_np, lengths_np, y_np = build_padded_episode_batch(
-                episodes,
-                max_obs_dim=self.max_obs_dim,
-                max_action_dim=self.max_action_dim,
-            )
-        else:
-            x_np, y_np = compute_episode_embeddings(
-                episodes,
-                max_obs_dim=self.max_obs_dim,
-                max_action_dim=self.max_action_dim,
-            )
-        if x_np.shape[0] == 0:
+        (
+            x_bonus_np,
+            lengths_bonus_np,
+            y_bonus_np,
+            shot_end_bonus_np,
+            shot_quality_bonus_np,
+            shot_quality_mask_bonus_np,
+        ) = self._build_disc_batches_from_episodes(episodes)
+        if x_bonus_np.shape[0] == 0:
             if self._should_console_log_disc():
                 print(
                     "[IntentDisc] "
@@ -1609,48 +1904,100 @@ class IntentDiversityCallback(BaseCallback):
                 )
             return
 
-        self._latest_disc_eval_batch = {
-            "x": np.array(x_np, copy=True),
-            "y": np.array(y_np, copy=True),
-            "lengths": None if lengths_np is None else np.array(lengths_np, copy=True),
-        }
-        shot_end_np, shot_quality_np, shot_quality_mask_np = self._build_disc_aux_targets(
+        train_episodes, holdout_episodes = self._split_disc_train_holdout_episodes(
             episodes
         )
-        self._latest_disc_eval_batch["shot_end"] = np.array(shot_end_np, copy=True)
-        self._latest_disc_eval_batch["shot_quality"] = np.array(
-            shot_quality_np, copy=True
+        (
+            x_train_np,
+            lengths_train_np,
+            y_train_np,
+            shot_end_train_np,
+            shot_quality_train_np,
+            shot_quality_mask_train_np,
+        ) = self._build_disc_batches_from_episodes(train_episodes)
+        if holdout_episodes:
+            (
+                x_eval_np,
+                lengths_eval_np,
+                y_eval_np,
+                shot_end_eval_np,
+                shot_quality_eval_np,
+                shot_quality_mask_eval_np,
+            ) = self._build_disc_batches_from_episodes(holdout_episodes)
+            eval_batch_kind = "holdout"
+        else:
+            x_eval_np = np.array(x_bonus_np, copy=True)
+            lengths_eval_np = (
+                None
+                if lengths_bonus_np is None
+                else np.array(lengths_bonus_np, copy=True)
+            )
+            y_eval_np = np.array(y_bonus_np, copy=True)
+            shot_end_eval_np = np.array(shot_end_bonus_np, copy=True)
+            shot_quality_eval_np = np.array(shot_quality_bonus_np, copy=True)
+            shot_quality_mask_eval_np = np.array(
+                shot_quality_mask_bonus_np, copy=True
+            )
+            eval_batch_kind = "trainbatch_fallback"
+
+        eval_batch_provenance = self._build_disc_batch_provenance(
+            holdout_episodes if holdout_episodes else episodes
         )
-        self._latest_disc_eval_batch["shot_quality_mask"] = np.array(
-            shot_quality_mask_np, copy=True
-        )
+        self._latest_disc_eval_batch = {
+            "x": np.array(x_eval_np, copy=True),
+            "y": np.array(y_eval_np, copy=True),
+            "lengths": (
+                None if lengths_eval_np is None else np.array(lengths_eval_np, copy=True)
+            ),
+            "shot_end": np.array(shot_end_eval_np, copy=True),
+            "shot_quality": np.array(shot_quality_eval_np, copy=True),
+            "shot_quality_mask": np.array(shot_quality_mask_eval_np, copy=True),
+            **eval_batch_provenance,
+        }
+        self._latest_disc_eval_batch_kind = str(eval_batch_kind)
 
         disc_pass_start = time.perf_counter()
-        if lengths_np is None:
+        if lengths_train_np is None:
             self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
-                x_np,
-                y_np,
-                shot_end_np=shot_end_np,
-                shot_quality_np=shot_quality_np,
-                shot_quality_mask_np=shot_quality_mask_np,
+                x_train_np,
+                y_train_np,
+                shot_end_np=shot_end_train_np,
+                shot_quality_np=shot_quality_train_np,
+                shot_quality_mask_np=shot_quality_mask_train_np,
             )
-            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(x_np, y_np)
-            self._last_disc_auc = self._compute_disc_auc(x_np, y_np)
-            raw_bonus = self._compute_episode_bonus(x_np, y_np)
-        else:
-            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
-                x_np,
-                y_np,
-                lengths_np,
-                shot_end_np=shot_end_np,
-                shot_quality_np=shot_quality_np,
-                shot_quality_mask_np=shot_quality_mask_np,
+            self._last_disc_trainbatch_acc = self._compute_disc_eval_top1_acc(
+                x_train_np, y_train_np
+            )
+            self._last_disc_trainbatch_auc = self._compute_disc_auc(
+                x_train_np, y_train_np
             )
             self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
-                x_np, y_np, lengths_np
+                x_eval_np, y_eval_np
             )
-            self._last_disc_auc = self._compute_disc_auc(x_np, y_np, lengths_np)
-            raw_bonus = self._compute_episode_bonus(x_np, y_np, lengths_np)
+            self._last_disc_auc = self._compute_disc_auc(x_eval_np, y_eval_np)
+            raw_bonus = self._compute_episode_bonus(x_bonus_np, y_bonus_np)
+        else:
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_train_np,
+                y_train_np,
+                lengths_train_np,
+                shot_end_np=shot_end_train_np,
+                shot_quality_np=shot_quality_train_np,
+                shot_quality_mask_np=shot_quality_mask_train_np,
+            )
+            self._last_disc_trainbatch_acc = self._compute_disc_eval_top1_acc(
+                x_train_np, y_train_np, lengths_train_np
+            )
+            self._last_disc_trainbatch_auc = self._compute_disc_auc(
+                x_train_np, y_train_np, lengths_train_np
+            )
+            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
+                x_eval_np, y_eval_np, lengths_eval_np
+            )
+            self._last_disc_auc = self._compute_disc_auc(
+                x_eval_np, y_eval_np, lengths_eval_np
+            )
+            raw_bonus = self._compute_episode_bonus(x_bonus_np, y_bonus_np, lengths_bonus_np)
         self._last_disc_pass_ms = float((time.perf_counter() - disc_pass_start) * 1000.0)
         if raw_bonus.size == 0:
             return
@@ -1684,7 +2031,17 @@ class IntentDiversityCallback(BaseCallback):
                     if episodes
                     else 0.0
                 )
-                auc_str = (
+                train_auc_str = (
+                    f"{float(self._last_disc_trainbatch_auc):.4f}"
+                    if self._last_disc_trainbatch_auc is not None
+                    else "NA"
+                )
+                holdout_acc_str = (
+                    f"{float(self._last_disc_eval_acc):.4f}"
+                    if self._last_disc_eval_acc is not None
+                    else "NA"
+                )
+                holdout_auc_str = (
                     f"{float(self._last_disc_auc):.4f}"
                     if self._last_disc_auc is not None
                     else "NA"
@@ -1695,13 +2052,18 @@ class IntentDiversityCallback(BaseCallback):
                     f"step={global_step} "
                     f"encoder={self.disc_encoder_type} "
                     f"episodes={len(episodes)} "
+                    f"train_eps={len(train_episodes)} "
+                    f"eval_eps={len(holdout_episodes) if holdout_episodes else len(episodes)} "
+                    f"eval_kind={eval_batch_kind} "
                     f"avg_len={avg_len:.2f} "
                     f"updates={self.disc_updates_per_rollout} "
                     f"disc_ms={float(self._last_disc_pass_ms):.1f} "
                     f"loss={float(self._last_disc_loss):.4f} "
                     f"top1={float(self._last_disc_acc):.4f} "
-                    f"top1_eval={float(self._last_disc_eval_acc):.4f} "
-                    f"auc={auc_str} "
+                    f"top1_train={float(self._last_disc_trainbatch_acc or 0.0):.4f} "
+                    f"auc_train={train_auc_str} "
+                    f"top1_holdout={holdout_acc_str} "
+                    f"auc_holdout={holdout_auc_str} "
                     f"beta={float(beta):.4f}",
                     flush=True,
                 )
@@ -1711,6 +2073,18 @@ class IntentDiversityCallback(BaseCallback):
         try:
             mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
             mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            if self._last_disc_trainbatch_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_trainbatch",
+                    float(self._last_disc_trainbatch_acc),
+                    step=global_step,
+                )
+            if self._last_disc_trainbatch_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_trainbatch",
+                    float(self._last_disc_trainbatch_auc),
+                    step=global_step,
+                )
             if float(self.disc_lambda_shot) > 0.0:
                 mlflow.log_metric(
                     "intent/disc_shot_end_loss",
@@ -1723,17 +2097,43 @@ class IntentDiversityCallback(BaseCallback):
                     float(self._last_disc_shot_quality_loss),
                     step=global_step,
                 )
-            mlflow.log_metric(
-                "intent/disc_top1_acc_eval",
-                float(self._last_disc_eval_acc),
-                step=global_step,
-            )
+            if self._last_disc_eval_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_holdout",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_eval",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
             if self._last_disc_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_holdout",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
                 mlflow.log_metric(
                     "intent/disc_auc_ovr_macro",
                     float(self._last_disc_auc),
                     step=global_step,
                 )
+            mlflow.log_metric(
+                "intent/disc_trainbatch_size",
+                float(x_train_np.shape[0]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/disc_holdout_size",
+                float(x_eval_np.shape[0]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/disc_holdout_fraction_realized",
+                float(x_eval_np.shape[0]) / float(max(1, x_bonus_np.shape[0])),
+                step=global_step,
+            )
             mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
             mlflow.log_metric("intent/bonus_raw_std", float(np.std(raw_bonus)), step=global_step)
             mlflow.log_metric(
@@ -1769,7 +2169,7 @@ class IntentDiversityCallback(BaseCallback):
                 step=global_step,
             )
             mlflow.log_metric("intent/beta_current", float(beta), step=global_step)
-            usage_entropy, min_prob = self._usage_entropy(y_np, self.num_intents)
+            usage_entropy, min_prob = self._usage_entropy(y_bonus_np, self.num_intents)
             mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
             mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
         except Exception:

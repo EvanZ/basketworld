@@ -17,6 +17,7 @@ from app.backend.observations import (
     _ensure_set_obs,
     _predict_policy_actions,
 )
+from app.backend.env_access import env_view
 from app.backend.state import game_state
 
 
@@ -66,15 +67,16 @@ class MCTSAdvisor:
 
     # --- Hashing helpers (partial state) ---
     def _hash_state(self, env, obs: dict) -> str:
-        positions_raw = getattr(env, "positions", None) or []
+        env_read = env_view(env)
+        positions_raw = env_read.positions or []
         positions = tuple((int(p[0]), int(p[1])) for p in positions_raw)
-        bh_val = getattr(env, "ball_holder", -1)
+        bh_val = env_read.ball_holder
         ball_holder = -1 if bh_val is None else int(bh_val)
-        sc_val = getattr(env, "shot_clock", 0)
+        sc_val = env_read.shot_clock
         shot_clock = 0 if sc_val is None else int(sc_val)
-        offense_lane_dict = getattr(env, "_offensive_lane_steps", None) or {}
+        offense_lane_dict = getattr(env_read, "_offensive_lane_steps", None) or {}
         offense_lane = tuple(sorted((int(k), int(v)) for k, v in offense_lane_dict.items()))
-        defense_lane_dict = getattr(env, "_defender_in_key_steps", None) or {}
+        defense_lane_dict = getattr(env_read, "_defender_in_key_steps", None) or {}
         defense_lane = tuple(sorted((int(k), int(v)) for k, v in defense_lane_dict.items()))
         skills = None
         try:
@@ -96,7 +98,8 @@ class MCTSAdvisor:
 
     # --- Policy helpers ---
     def _team_for_player(self, env, player_id: int) -> Team:
-        if player_id in getattr(env, "offense_ids", []):
+        env_read = env_view(env)
+        if player_id in (env_read.offense_ids or []):
             return Team.OFFENSE
         return Team.DEFENSE
 
@@ -131,9 +134,10 @@ class MCTSAdvisor:
             return 0.0
         try:
             obs = _ensure_set_obs(policy, env, obs)
+            env_read = env_view(env)
             role_flag = (
                 self.role_flag_offense
-                if self.target_player_id in getattr(env, "offense_ids", [])
+                if self.target_player_id in (env_read.offense_ids or [])
                 else self.role_flag_defense
             )
             conditioned = _build_role_conditioned_obs(obs, role_flag)
@@ -158,6 +162,10 @@ class MCTSAdvisor:
         return float(reward_list[0]) if reward_list else 0.0
 
     def _build_action_array(self, obs: dict, env, target_action: int) -> np.ndarray:
+        env_read = env_view(env)
+        num_players = int(env_read.n_players or 0)
+        offense_ids = list(env_read.offense_ids or [])
+        defense_ids = list(env_read.defense_ids or [])
         resolved_unified, _ = _predict_policy_actions(
             self.unified_policy,
             obs,
@@ -166,7 +174,7 @@ class MCTSAdvisor:
             strategy=IllegalActionStrategy.BEST_PROB,
         )
         if resolved_unified is None:
-            resolved_unified = np.zeros(env.n_players, dtype=int)
+            resolved_unified = np.zeros(num_players, dtype=int)
 
         resolved_opponent = None
         if self.opponent_policy is not None:
@@ -178,19 +186,19 @@ class MCTSAdvisor:
                 strategy=IllegalActionStrategy.BEST_PROB,
             )
 
-        final_action = np.zeros(env.n_players, dtype=np.int32)
+        final_action = np.zeros(num_players, dtype=np.int32)
         if self.user_team == Team.OFFENSE:
-            for idx in env.offense_ids:
+            for idx in offense_ids:
                 final_action[idx] = resolved_unified[idx]
-            for idx in env.defense_ids:
+            for idx in defense_ids:
                 final_action[idx] = resolved_opponent[idx] if resolved_opponent is not None else resolved_unified[idx]
         else:
-            for idx in env.defense_ids:
+            for idx in defense_ids:
                 final_action[idx] = resolved_unified[idx]
-            for idx in env.offense_ids:
+            for idx in offense_ids:
                 final_action[idx] = resolved_opponent[idx] if resolved_opponent is not None else resolved_unified[idx]
 
-        if 0 <= self.target_player_id < env.n_players:
+        if 0 <= self.target_player_id < num_players:
             final_action[self.target_player_id] = int(target_action)
 
         return final_action
@@ -332,7 +340,8 @@ def _run_mcts_advisor(
     if env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
 
-    target_player = player_id if player_id is not None else getattr(env, "ball_holder", 0)
+    env_read = env_view(env)
+    target_player = player_id if player_id is not None else (env_read.ball_holder or 0)
     if target_player is None:
         target_player = 0
 

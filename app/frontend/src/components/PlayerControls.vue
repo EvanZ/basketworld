@@ -719,6 +719,7 @@ const defaultEvalConfig = () => ({
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
+  intentSelectionMode: 'learned_sample',
 });
 
 const evalConfigSafe = computed(() => {
@@ -869,6 +870,13 @@ function setEvalShootingMode(mode) {
 
 function setEvalRandomizePermutation(val) {
   emitEvalConfigUpdate({ randomizeOffensePermutation: !!val });
+}
+
+function setEvalIntentSelectionMode(mode) {
+  const normalized = ['learned_sample', 'best_intent', 'uniform_random'].includes(String(mode))
+    ? String(mode)
+    : 'learned_sample';
+  emitEvalConfigUpdate({ intentSelectionMode: normalized });
 }
 
 function updateEvalSkill(idx, key, value) {
@@ -2482,6 +2490,57 @@ const entropyTotals = computed(() => {
 
 const hasEntropyData = computed(() => entropyRows.value.some((row) => row.entropy !== null && row.entropy !== undefined));
 const policyTeamLabel = computed(() => props.gameState?.user_team_name || 'OFFENSE');
+const selectorIntentPreferences = computed(() => {
+  const payload = props.gameState?.selector_intent_preferences;
+  const items = Array.isArray(payload?.intent_probs)
+    ? [...payload.intent_probs].sort(
+      (a, b) => Number(a?.intent_index ?? 0) - Number(b?.intent_index ?? 0),
+    )
+    : [];
+  return {
+    alphaCurrent: payload?.alpha_current ?? null,
+    valueEstimate: payload?.value_estimate ?? null,
+    currentIntentIndex: payload?.current_intent_index ?? null,
+    items,
+  };
+});
+const selectorIntentEntropy = computed(() => {
+  const items = selectorIntentPreferences.value.items || [];
+  if (!Array.isArray(items) || items.length === 0) {
+    return {
+      entropy: null,
+      normalizedEntropy: null,
+      klToUniform: null,
+      normalizedKlToUniform: null,
+    };
+  }
+  const probs = items
+    .map((item) => Number(item?.prob))
+    .filter((prob) => Number.isFinite(prob) && prob > 0);
+  if (!probs.length) {
+    return {
+      entropy: null,
+      normalizedEntropy: null,
+      klToUniform: null,
+      normalizedKlToUniform: null,
+    };
+  }
+  const entropy = -probs.reduce((sum, prob) => sum + (prob * Math.log(prob)), 0);
+  const maxEntropy = Math.log(items.length);
+  const normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : null;
+  const klToUniform = maxEntropy > 0 ? (maxEntropy - entropy) : 0;
+  const normalizedKlToUniform = maxEntropy > 0 ? (klToUniform / maxEntropy) : null;
+  return {
+    entropy,
+    normalizedEntropy,
+    klToUniform,
+    normalizedKlToUniform,
+  };
+});
+const hasSelectorIntentPreferences = computed(() =>
+  Array.isArray(selectorIntentPreferences.value.items)
+  && selectorIntentPreferences.value.items.length > 0
+);
 const policyRowsByPlayer = computed(() => {
   if (!props.gameState || !policyProbabilities.value) return [];
 
@@ -2506,13 +2565,22 @@ const policyRowsByPlayer = computed(() => {
       });
     }
 
-    actions.sort((a, b) => b.prob - a.prob);
+    actions.sort((a, b) => String(a.action).localeCompare(String(b.action)));
     return { playerId: pid, actions };
   });
 });
 const hasPolicyData = computed(() =>
   policyRowsByPlayer.value.some((row) => Array.isArray(row.actions) && row.actions.length > 0)
 );
+
+function isSelectedPolicyAction(playerId, actionName) {
+  const selected =
+    selectedActions.value?.[playerId]
+    ?? selectedActions.value?.[String(playerId)]
+    ?? null;
+  return selected === actionName;
+}
+
 const playbookSelectedIntentIndices = computed(() => {
   const maxIntent = Math.max(0, Number(props.gameState?.num_intents || 1) - 1);
   const raw = String(playbookIntentInput.value || '')
@@ -4439,6 +4507,57 @@ const stealRisks = computed(() => {
         <h4>Policy Probabilities ({{ policyTeamLabel }})</h4>
         <p class="entropy-note">Legal-action probabilities for the current state, filtered to the selected team.</p>
 
+        <div v-if="hasSelectorIntentPreferences" class="param-category selector-intent-card">
+          <h5>Intent Preferences</h5>
+          <p class="entropy-note">
+            Selector preferences for the current offense state in fixed intent order.
+            <span v-if="selectorIntentPreferences.alphaCurrent !== null">
+              Alpha {{ Number(selectorIntentPreferences.alphaCurrent).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentPreferences.valueEstimate !== null">
+              · Value {{ Number(selectorIntentPreferences.valueEstimate).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.entropy !== null">
+              · Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.normalizedEntropy !== null">
+              (norm {{ Number(selectorIntentEntropy.normalizedEntropy).toFixed(3) }})
+            </span>
+            <span v-if="selectorIntentEntropy.klToUniform !== null">
+              · KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.normalizedKlToUniform !== null">
+              (norm {{ Number(selectorIntentEntropy.normalizedKlToUniform).toFixed(3) }})
+            </span>
+          </p>
+          <div class="entropy-table-wrapper">
+            <table class="entropy-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Intent</th>
+                  <th>Prob</th>
+                  <th>Logit</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(item, idx) in selectorIntentPreferences.items"
+                  :key="`selector-intent-${item.intent_index}`"
+                  class="selector-intent-row"
+                  :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
+                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(item.prob) * 100)).toFixed(2)}%` }"
+                >
+                  <td>{{ idx + 1 }}</td>
+                  <td>z={{ item.intent_index }}</td>
+                  <td>{{ (Number(item.prob) * 100).toFixed(2) }}%</td>
+                  <td>{{ Number(item.logit).toFixed(3) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div v-if="!policyProbabilities || !hasPolicyData" class="no-data">
           No policy probabilities available yet.
         </div>
@@ -4456,13 +4575,21 @@ const stealRisks = computed(() => {
               <table class="entropy-table">
                 <thead>
                   <tr>
-                    <th>Rank</th>
+                    <th>#</th>
                     <th>Action</th>
                     <th>Prob</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(action, idx) in row.actions" :key="`${row.playerId}-${action.action}`">
+                  <tr
+                    v-for="(action, idx) in row.actions"
+                    :key="`${row.playerId}-${action.action}`"
+                    :class="[
+                      'probability-bar-row',
+                      { 'current-intent-row': isSelectedPolicyAction(row.playerId, action.action) }
+                    ]"
+                    :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(action.prob) * 100)).toFixed(2)}%` }"
+                  >
                     <td>{{ idx + 1 }}</td>
                     <td>{{ action.action }}</td>
                     <td>{{ (action.prob * 100).toFixed(2) }}%</td>
@@ -4774,6 +4901,22 @@ const stealRisks = computed(() => {
           />
           Randomize offense player slots each episode (shuffle positions)
         </label>
+      </div>
+
+      <div class="eval-row">
+        <label>Intent selection</label>
+        <select
+          :value="evalConfigSafe.intentSelectionMode"
+          :disabled="props.isEvaluating || !selectorEnabled"
+          @change="setEvalIntentSelectionMode($event.target.value)"
+        >
+          <option value="learned_sample">Learned sample</option>
+          <option value="best_intent">Best intent (argmax)</option>
+          <option value="uniform_random">Uniform random</option>
+        </select>
+        <span v-if="!selectorEnabled" class="status-note">
+          Selector is not enabled for this checkpoint.
+        </span>
       </div>
 
       <div v-if="evalModeIsCustom" class="eval-custom">
@@ -6643,6 +6786,44 @@ const stealRisks = computed(() => {
 .entropy-table td:last-child {
   font-family: 'Courier New', monospace;
   color: var(--app-accent);
+}
+
+.selector-intent-card {
+  margin-bottom: 1rem;
+}
+
+.probability-bar-row,
+.selector-intent-row {
+  --selector-prob-width: 0%;
+  background-image: linear-gradient(90deg, rgba(56, 189, 248, 0.24), rgba(56, 189, 248, 0.24));
+  background-repeat: no-repeat;
+  background-size: var(--selector-prob-width) 100%;
+  transition: background-size 160ms ease-out;
+}
+
+.probability-bar-row td,
+.selector-intent-row td {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  text-shadow: 0 1px 0 rgba(2, 6, 23, 0.8);
+}
+
+.probability-bar-row:hover td,
+.selector-intent-row:hover td {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.current-intent-row {
+  background-color: rgba(244, 114, 182, 0.06);
+  background-image: linear-gradient(90deg, rgba(244, 114, 182, 0.24), rgba(244, 114, 182, 0.24));
+  background-repeat: no-repeat;
+  background-size: var(--selector-prob-width) 100%;
+}
+
+.current-intent-row td {
+  font-weight: 600;
+  font-size: larger;
 }
 
 .no-rewards {

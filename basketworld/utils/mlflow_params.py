@@ -800,6 +800,24 @@ def get_mlflow_training_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
+    training_params["intent_disc_eval_holdout_fraction"] = _get_param(
+        params,
+        [
+            "intent_disc_eval_holdout_fraction",
+            "intent-disc-eval-holdout-fraction",
+        ],
+        float,
+        0.25,
+    )
+    training_params["intent_disc_current_policy_only"] = _get_param(
+        params,
+        [
+            "intent_disc_current_policy_only",
+            "intent-disc-current-policy-only",
+        ],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        True,
+    )
     training_params["intent_selector_enabled"] = _get_param(
         params,
         ["intent_selector_enabled", "intent-selector-enabled"],

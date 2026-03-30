@@ -176,6 +176,25 @@ except RuntimeError:
 torch.__config__.show()
 
 
+def _log_cli_args_artifact() -> None:
+    """Log the raw CLI invocation as an MLflow text artifact."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = os.path.join(tmpdir, "cli_args.txt")
+            with open(artifact_path, "w", encoding="utf-8") as f:
+                f.write("cwd:\n")
+                f.write(f"{os.getcwd()}\n\n")
+                f.write("argv_raw:\n")
+                for arg in sys.argv:
+                    f.write(f"{arg}\n")
+                f.write("\nargv_shell_quoted:\n")
+                f.write(" ".join(shlex.quote(arg) for arg in sys.argv))
+                f.write("\n")
+            mlflow.log_artifact(artifact_path, artifact_path="run_context")
+    except Exception as exc:
+        print(f"Warning: failed to log CLI args artifact: {exc}")
+
+
 def main(args):
     """Main training function."""
     
@@ -242,6 +261,7 @@ def main(args):
 
     with mlflow.start_run(run_name=args.mlflow_run_name) as run:
         print("MLflow tracking URI:", mlflow.get_tracking_uri())
+        _log_cli_args_artifact()
         # Log hyperparameters
         mlflow.log_params(vars(args))
         
@@ -328,6 +348,10 @@ def main(args):
         mlflow.log_param(
             "disc_eval_batch_output",
             getattr(args, "disc_eval_batch_output", False),
+        )
+        mlflow.log_param(
+            "intent_disc_current_policy_only",
+            getattr(args, "intent_disc_current_policy_only", True),
         )
         mlflow.log_param(
             "offense_spawn_boundary_margin",

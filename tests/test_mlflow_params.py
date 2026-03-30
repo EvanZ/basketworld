@@ -60,6 +60,7 @@ def test_get_mlflow_training_params_includes_disc_eval_batch_output():
     client = _FakeClient(
         {
             "disc_eval_batch_output": "true",
+            "intent_disc_eval_holdout_fraction": "0.3",
             "intent_selector_mode": "integrated",
             "intent_selector_value_coef": "0.75",
         }
@@ -68,6 +69,7 @@ def test_get_mlflow_training_params_includes_disc_eval_batch_output():
     training = get_mlflow_training_params(client, "dummy")
 
     assert training["disc_eval_batch_output"] is True
+    assert training["intent_disc_eval_holdout_fraction"] == 0.3
     assert training["intent_selector_mode"] == "integrated"
     assert training["intent_selector_value_coef"] == 0.75
 

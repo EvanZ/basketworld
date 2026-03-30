@@ -1,5 +1,7 @@
 import copy
 import asyncio
+import queue
+from concurrent.futures import Future
 
 import numpy as np
 import pytest
@@ -302,6 +304,107 @@ def test_playbook_analysis_run_to_end_ignores_max_steps(isolated_game_state, mon
     assert progress["status"] == "completed"
     assert progress["completed"] == 1
     assert progress["total"] == 1
+
+
+def test_playbook_analysis_parallel_path_passes_training_params_and_merges_payload(
+    isolated_game_state,
+    monkeypatch,
+):
+    _init_live_game(isolated_game_state)
+    backend_state.capture_counterfactual_snapshot()
+    isolated_game_state.env_required_params = {
+        "players": 3,
+        "allow_dunks": True,
+        "enable_intent_learning": True,
+    }
+    isolated_game_state.env_optional_params = {
+        "intent_null_prob": 0.0,
+        "enable_defense_intent_learning": True,
+        "defense_intent_null_prob": 0.0,
+        "intent_commitment_steps": 4,
+    }
+    isolated_game_state.mlflow_training_params = {
+        "intent_selector_multiselect_enabled": True,
+        "intent_selector_min_play_steps": 2,
+    }
+    isolated_game_state.unified_policy_path = "/tmp/unified_iter_1.zip"
+    isolated_game_state.opponent_policy_path = "/tmp/opponent_iter_1.zip"
+    isolated_game_state.role_flag_offense = 1.0
+    isolated_game_state.role_flag_defense = -1.0
+
+    captured: dict[str, object] = {}
+
+    class _FakeContext:
+        @staticmethod
+        def Queue():
+            return queue.Queue()
+
+    class _FakeExecutor:
+        def __init__(self, *, max_workers, mp_context, initializer, initargs):
+            captured["max_workers"] = int(max_workers)
+            captured["initargs"] = initargs
+            initializer(*initargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, batch):
+            future = Future()
+            future.set_result(fn(batch))
+            return future
+
+    def fake_run_playbook_batch_worker(batch):
+        (
+            batch_specs,
+            _parallel_base_env,
+            _base_ui_state,
+            _user_team_name,
+            offense_ids,
+            _commitment_steps,
+            _max_steps,
+            _run_to_end,
+            _player_deterministic,
+            _opponent_deterministic,
+        ) = batch
+        payload = {}
+        for _, intent_index, _ in batch_specs:
+            panel = payload.setdefault(int(intent_index), admin_routes._init_playbook_panel_accumulator(offense_ids))
+            panel["num_rollouts"] += 1
+            panel["base_state"] = panel["base_state"] or {"seeded": True}
+        return payload
+
+    monkeypatch.setattr(admin_routes.mp, "get_context", lambda _mode: _FakeContext())
+    monkeypatch.setattr(admin_routes, "ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr(admin_routes, "_run_playbook_batch_worker", fake_run_playbook_batch_worker)
+    monkeypatch.setattr(
+        admin_routes.backend_evaluation,
+        "_init_evaluation_worker",
+        lambda *args, **kwargs: captured.setdefault("initializer_called", True),
+    )
+
+    body = admin_routes.playbook_analysis_route(
+        PlaybookAnalysisRequest(
+            intent_indices=[0, 2],
+            num_rollouts=4,
+            max_steps=3,
+            use_snapshot=True,
+            player_deterministic=False,
+            opponent_deterministic=True,
+        )
+    )
+
+    assert body["status"] == "success"
+    assert captured["initargs"][2] == isolated_game_state.mlflow_training_params
+    assert captured["initargs"][3] == isolated_game_state.unified_policy_path
+    assert captured["initargs"][4] == isolated_game_state.opponent_policy_path
+    panels = {panel["intent_index"]: panel for panel in body["panels"]}
+    assert panels[0]["num_rollouts"] == 4
+    assert panels[2]["num_rollouts"] == 4
+    assert panels[0]["base_state"] == {"seeded": True}
+    assert panels[2]["base_state"] == {"seeded": True}
 
 
 def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_state):

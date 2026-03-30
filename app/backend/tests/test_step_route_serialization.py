@@ -1,9 +1,8 @@
 import numpy as np
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from app.backend.routes import lifecycle_routes
+from app.backend.schemas import ActionRequest
 from app.backend.state import game_state
 
 
@@ -53,21 +52,15 @@ def setup_dummy_env():
 
 
 def test_step_route_handles_legacy_action_payloads_and_serializes_response():
-    app = FastAPI()
-    app.include_router(lifecycle_routes.router)
-    client = TestClient(app)
-
-    payload = {
-        "actions": {
-            "0": {"action": 0},
-            "1": 1,
-        },
-        "team": "OFFENSE",
-    }
-
-    resp = client.post("/api/step", json=payload)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
+    body = lifecycle_routes.step(
+        ActionRequest(
+            actions={
+                "0": {"action": 0},
+                "1": 1,
+            },
+            team="OFFENSE",
+        )
+    )
 
     assert body["status"] == "success"
     assert "state" in body and isinstance(body["state"], dict)
@@ -80,21 +73,15 @@ def test_step_route_handles_legacy_action_payloads_and_serializes_response():
 def test_step_route_accepts_structured_pointer_pass_payload():
     game_state.env.pass_mode = "pointer_targeted"
 
-    app = FastAPI()
-    app.include_router(lifecycle_routes.router)
-    client = TestClient(app)
-
-    payload = {
-        "actions": {
-            "0": {"type": "PASS", "target": 1},
-            "1": 0,
-        },
-        "team": "OFFENSE",
-    }
-
-    resp = client.post("/api/step", json=payload)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
+    body = lifecycle_routes.step(
+        ActionRequest(
+            actions={
+                "0": {"type": "PASS", "target": 1},
+                "1": 0,
+            },
+            team="OFFENSE",
+        )
+    )
 
     assert body["status"] == "success"
     assert body["actions_taken"]["0"].startswith("PASS")

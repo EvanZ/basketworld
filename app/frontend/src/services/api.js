@@ -310,7 +310,14 @@ export async function getPhiLog() {
   return response.json();
 }
 
-export async function runEvaluation(numEpisodes = 100, playerDeterministic = false, opponentDeterministic = true, customSetup = null, randomizeOffensePermutation = false) {
+export async function runEvaluation(
+  numEpisodes = 100,
+  playerDeterministic = false,
+  opponentDeterministic = true,
+  customSetup = null,
+  randomizeOffensePermutation = false,
+  intentSelectionMode = 'learned_sample',
+) {
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -320,6 +327,7 @@ export async function runEvaluation(numEpisodes = 100, playerDeterministic = fal
       opponent_deterministic: opponentDeterministic,
       custom_setup: customSetup || null,
       randomize_offense_permutation: Boolean(randomizeOffensePermutation),
+      intent_selection_mode: String(intentSelectionMode || 'learned_sample'),
     }),
   });
   if (!response.ok) {

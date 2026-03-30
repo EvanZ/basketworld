@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -907,6 +908,61 @@ def _compute_policy_state_embedding(model: PPO, obs: dict) -> np.ndarray:
     )
 
 
+@contextmanager
+def _temporarily_disable_set_intent_embedding(policy_obj):
+    extractor = getattr(policy_obj, "features_extractor", None)
+    if extractor is None:
+        yield
+        return
+
+    attr_names = (
+        "offense_intent_embedding",
+        "defense_intent_embedding",
+        "offense_intent_to_token",
+        "defense_intent_to_token",
+    )
+    saved: dict[str, object] = {}
+    try:
+        for name in attr_names:
+            if hasattr(extractor, name):
+                saved[name] = getattr(extractor, name)
+                setattr(extractor, name, None)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(extractor, name, value)
+
+
+def _compute_policy_state_embedding_intent_embedding_ablated(
+    model: PPO, obs: dict
+) -> np.ndarray:
+    policy_obj = getattr(model, "policy", None)
+    if policy_obj is None:
+        raise RuntimeError("Loaded PPO model has no policy object.")
+    with _temporarily_disable_set_intent_embedding(policy_obj):
+        return _compute_policy_state_embedding(model, obs)
+
+
+def _compute_policy_state_embedding_no_intent_signal(
+    model: PPO, obs: dict
+) -> np.ndarray:
+    policy_obj = getattr(model, "policy", None)
+    if policy_obj is None:
+        raise RuntimeError("Loaded PPO model has no policy object.")
+    obs_clone = clone_observation_dict(obs)
+    num_intents = int(max(1, infer_num_intents(model, default=8)))
+    patch_intent_in_observation(
+        obs_clone,
+        0,
+        num_intents,
+        active=0.0,
+        visible=0.0,
+        age_norm=0.0,
+    )
+    with _temporarily_disable_set_intent_embedding(policy_obj):
+        return _compute_policy_state_embedding(model, obs_clone)
+
+
 def _normalize_training_action_for_wrapper(
     action_payload,
     wrapper_env: SelfPlayEnvWrapper,
@@ -1213,7 +1269,24 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                         )
                     )
 
-                if feature_mode == "set_attention_pool":
+                if feature_mode in {
+                    "set_attention_pool",
+                    "set_attention_pool_no_intent_embedding",
+                    "set_attention_pool_no_intent_signal",
+                }:
+                    feature_override = (
+                        _compute_policy_state_embedding_no_intent_signal(
+                            unified_policy, next_obs
+                        )
+                        if feature_mode == "set_attention_pool_no_intent_signal"
+                        else (
+                        _compute_policy_state_embedding_intent_embedding_ablated(
+                            unified_policy, next_obs
+                        )
+                        if feature_mode == "set_attention_pool_no_intent_embedding"
+                        else _compute_policy_state_embedding(unified_policy, next_obs)
+                        )
+                    )
                     transitions.append(
                         _build_transition_single_obs(
                             next_obs,
@@ -1221,9 +1294,7 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                             max_obs_dim=int(max_obs_dim),
                             max_action_dim=int(max_action_dim),
                             rollout_step_idx=rollout_step_idx,
-                            feature_override=_compute_policy_state_embedding(
-                                unified_policy, next_obs
-                            ),
+                            feature_override=feature_override,
                         )
                     )
                 else:
@@ -1442,7 +1513,11 @@ def _build_feature_matrix(
     disc_bundle: tuple[IntentDiscriminator, dict] | None = None,
     device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    if feature_mode == "set_attention_pool":
+    if feature_mode in {
+        "set_attention_pool",
+        "set_attention_pool_no_intent_embedding",
+        "set_attention_pool_no_intent_signal",
+    }:
         rows: list[np.ndarray] = []
         labels: list[int] = []
         for ep in episodes:
@@ -1835,6 +1910,8 @@ def main() -> int:
             "summary",
             "disc_embedding",
             "set_attention_pool",
+            "set_attention_pool_no_intent_embedding",
+            "set_attention_pool_no_intent_signal",
         ],
         default="active_prefix_flat",
         help="Episode representation to feed into PCA.",

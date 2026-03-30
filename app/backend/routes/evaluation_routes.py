@@ -75,12 +75,14 @@ def run_evaluation(request: EvaluationRequest):
     opponent_deterministic = request.opponent_deterministic
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
     randomize_offense_perm = bool(getattr(request, "randomize_offense_permutation", False))
+    intent_selection_mode = str(getattr(request, "intent_selection_mode", "learned_sample") or "learned_sample")
 
     # Log shot clock configuration before evaluation
     print(f"[Evaluation] Starting {num_episodes} episodes (parallel)")
     print("[Evaluation] Configuration:")
     print(f"  - Player deterministic: {player_deterministic}")
     print(f"  - Opponent deterministic: {opponent_deterministic}")
+    print(f"  - Intent selection mode: {intent_selection_mode}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
     print(f"  - User team: {game_state.user_team.name}")
     print(f"  - Unified policy (user): {game_state.unified_policy_key}")
@@ -124,6 +126,7 @@ def run_evaluation(request: EvaluationRequest):
             opponent_deterministic=opponent_deterministic,
             required_params=game_state.env_required_params,
             optional_params=game_state.env_optional_params,
+            training_params=game_state.mlflow_training_params,
             unified_policy_path=game_state.unified_policy_path,
             opponent_policy_path=game_state.opponent_policy_path,
             user_team_name=game_state.user_team.name,
@@ -132,6 +135,7 @@ def run_evaluation(request: EvaluationRequest):
             shot_accumulator=shot_accumulator,
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_perm,
+            intent_selection_mode=intent_selection_mode,
             num_workers=num_workers,
             progress_callback=update_evaluation_progress,
         )

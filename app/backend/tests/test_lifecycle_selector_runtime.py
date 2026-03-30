@@ -99,14 +99,21 @@ def _init_selector_state(
     }
     backend_state._rebuild_cached_obs()
 
-    def _fake_predict(policy, ai_obs, env_obj, deterministic, strategy):
+    def _fake_predict_joint_actions(**kwargs):
+        env_obj = kwargs["env"]
         probs = [
             np.full(len(ActionType), 1.0 / float(len(ActionType)), dtype=np.float32)
             for _ in range(env_obj.n_players)
         ]
-        return np.zeros(env_obj.n_players, dtype=int), probs
+        zeros = np.zeros(env_obj.n_players, dtype=int)
+        return {
+            "resolved_unified": zeros.copy(),
+            "unified_probs": probs,
+            "resolved_opponent": None,
+            "opponent_probs": None,
+        }
 
-    monkeypatch.setattr(lifecycle_routes, "_predict_policy_actions", _fake_predict)
+    monkeypatch.setattr(lifecycle_routes, "predict_joint_policy_actions", _fake_predict_joint_actions)
     return env
 
 

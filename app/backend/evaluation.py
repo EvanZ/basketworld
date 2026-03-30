@@ -21,10 +21,17 @@ from stable_baselines3 import PPO
 from basketworld.utils.policy_loading import load_ppo_for_inference
 
 from app.backend.mcts import _run_mcts_advisor
+from app.backend.env_access import env_view, get_env_attr
 from app.backend.observations import (
     _ensure_set_obs,
     _predict_policy_actions,
     validate_policy_observation_schema,
+)
+from app.backend.rollout_runtime import (
+    apply_post_step_rollout_updates,
+    combine_team_actions,
+    initialize_rollout_selector_episode,
+    predict_joint_policy_actions,
 )
 from app.backend.state import game_state
 
@@ -60,11 +67,13 @@ def _print_eval_progress(prefix: str, current: int, total: int, start_time: floa
 def _init_evaluation_worker(
     required_params: dict,
     optional_params: dict,
+    training_params: dict | None,
     unified_policy_path: str,
     opponent_policy_path: str | None,
     user_team_name: str,
     role_flag_offense: float,
     role_flag_defense: float,
+    intent_selection_mode: str = "learned_sample",
     progress_queue=None,
 ):
     """Initialize a worker process with its own environment and policies."""
@@ -129,11 +138,13 @@ def _init_evaluation_worker(
 
     _worker_state = {
         "env": env,
+        "training_params": dict(training_params or {}),
         "unified_policy": unified_policy,
         "opponent_policy": opponent_policy,
         "user_team": user_team,
         "role_flag_offense": role_flag_offense,
         "role_flag_defense": role_flag_defense,
+        "intent_selection_mode": str(intent_selection_mode or "learned_sample"),
         "np": _np,
         "Team": _Team,
         "IllegalActionStrategy": _IllegalActionStrategy,
@@ -186,9 +197,10 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
             if isinstance(value, _np.ndarray):
                 cloned[key] = _np.copy(value)
     observer_is_offense = bool(float(role_flag_value) > 0.0)
+    env = _worker_state.get("env")
+    base_env = getattr(env, "unwrapped", env)
     try:
-        env = _worker_state.get("env")
-        fields = env.get_intent_observation_fields(observer_is_offense)
+        fields = base_env.get_intent_observation_fields(observer_is_offense)
     except Exception:
         fields = {}
     if fields:
@@ -196,7 +208,7 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
             cloned[key] = _np.array(value, dtype=_np.float32, copy=True)
     if "globals" in cloned:
         try:
-            cloned["globals"] = _worker_state["env"].patch_globals_with_intent_features(
+            cloned["globals"] = base_env.patch_globals_with_intent_features(
                 cloned["globals"], observer_is_offense
             )
         except Exception:
@@ -224,7 +236,8 @@ def _worker_predict_actions_for_team(
         return actions_by_player
 
     base_obs = _ensure_set_obs(policy, env, base_obs)
-    team_ids = list(env.offense_ids if team == _Team.OFFENSE else env.defense_ids)
+    env_read = env_view(env)
+    team_ids = list(env_read.offense_ids if team == _Team.OFFENSE else env_read.defense_ids)
     if not team_ids:
         return actions_by_player
 
@@ -250,7 +263,7 @@ def _worker_predict_actions_for_team(
 
     if action_len == len(team_ids):
         team_pred_actions = raw_actions
-    elif action_len == getattr(env, "n_players", action_len):
+    elif action_len == int(get_env_attr(env, "n_players", action_len) or action_len):
         team_pred_actions = raw_actions[team_ids]
     else:
         team_pred_actions = raw_actions[: len(team_ids)]
@@ -258,7 +271,7 @@ def _worker_predict_actions_for_team(
     probs = _get_policy_action_probabilities(policy, conditioned_obs)
     if probs is not None:
         probs = [_np.asarray(p, dtype=_np.float32) for p in probs]
-        if len(probs) == getattr(env, "n_players", len(probs)):
+        if len(probs) == int(get_env_attr(env, "n_players", len(probs)) or len(probs)):
             team_probs = [probs[int(pid)] for pid in team_ids]
         else:
             team_probs = probs[: len(team_ids)]
@@ -310,27 +323,15 @@ def _worker_predict_policy_actions(
     deterministic: bool,
     strategy,
 ):
-    if policy is None or base_obs is None or env is None:
-        return None
-
-    _np = _worker_state["np"]
-    _Team = _worker_state["Team"]
-
-    num_players = env.n_players
-    full_actions = _np.zeros(num_players, dtype=int)
-
-    for team in (_Team.OFFENSE, _Team.DEFENSE):
-        team_actions = _worker_predict_actions_for_team(
-            policy,
-            base_obs,
-            env,
-            team,
-            deterministic,
-            strategy,
-        )
-        for pid, action in team_actions.items():
-            full_actions[int(pid)] = int(action)
-
+    full_actions, _ = _predict_policy_actions(
+        policy,
+        base_obs,
+        env,
+        deterministic=deterministic,
+        strategy=strategy,
+        role_flag_offense=float(_worker_state.get("role_flag_offense", 1.0)),
+        role_flag_defense=float(_worker_state.get("role_flag_defense", -1.0)),
+    )
     return full_actions
 
 
@@ -338,11 +339,13 @@ def _run_episode_batch_worker(args: tuple) -> dict:
     """Worker entrypoint to run a batch of episodes."""
     batch_specs, player_deterministic, opponent_deterministic, custom_setup, randomize_offense_permutation = args
     env = _worker_state["env"]
+    training_params = _worker_state.get("training_params", {}) or {}
     unified_policy = _worker_state["unified_policy"]
     opponent_policy = _worker_state["opponent_policy"]
     user_team = _worker_state["user_team"]
     role_flag_offense = _worker_state["role_flag_offense"]
     role_flag_defense = _worker_state["role_flag_defense"]
+    intent_selection_mode = str(_worker_state.get("intent_selection_mode") or "learned_sample")
     _np = _worker_state["np"]
     _Team = _worker_state["Team"]
     _IllegalActionStrategy = _worker_state["IllegalActionStrategy"]
@@ -350,9 +353,12 @@ def _run_episode_batch_worker(args: tuple) -> dict:
 
     results = []
     shot_accumulator: dict[str, list[int]] = {}
-    per_player_stats = _init_player_stats(env.n_players)
+    env_read = env_view(env)
+    offense_ids = list(env_read.offense_ids or [])
+    defense_ids = list(env_read.defense_ids or [])
+    per_player_stats = _init_player_stats(int(env_read.n_players or 0))
     eval_diagnostics = _init_eval_diagnostics()
-    user_team_ids = list(env.offense_ids if user_team == _Team.OFFENSE else env.defense_ids)
+    user_team_ids = list(offense_ids if user_team == _Team.OFFENSE else defense_ids)
     user_team_ids_set = {int(pid) for pid in user_team_ids}
 
     for ep_idx, seed in batch_specs:
@@ -360,7 +366,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         reset_opts = _build_reset_options_for_custom_setup(custom_setup, enforce_fixed_skills=True)
         if randomize_offense_permutation:
             perm = _sample_offense_permutation(env, _np.random)
-            perm_dict = {env.offense_ids[i]: perm[i] for i in range(len(env.offense_ids))}
+            perm_dict = {offense_ids[i]: perm[i] for i in range(len(offense_ids))}
             reset_opts["offense_player_permutation"] = perm_dict
 
         obs, _ = env.reset(seed=seed, options=reset_opts)
@@ -368,6 +374,18 @@ def _run_episode_batch_worker(args: tuple) -> dict:
 
         # Update role_flag using worker-local values
         obs["role_flag"] = _np.array([role_flag_offense if user_team == _Team.OFFENSE else role_flag_defense], dtype=_np.float32)
+        selector_state = initialize_rollout_selector_episode(
+            env=env,
+            obs=obs,
+            training_params=training_params,
+            unified_policy=unified_policy,
+            opponent_policy=opponent_policy,
+            user_team=user_team,
+            role_flag_offense=role_flag_offense,
+            selector_intent_selection_mode=intent_selection_mode,
+        )
+        obs = selector_state["obs"]
+        selector_segment_index = int(selector_state["selector_segment_index"])
         _accumulate_intent_selection(eval_diagnostics, env)
 
         done = False
@@ -377,34 +395,22 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         episode_shots: dict[str, list[int]] = {}
 
         while not done:
-            player_strategy = (
-                _IllegalActionStrategy.BEST_PROB if player_deterministic else _IllegalActionStrategy.SAMPLE_PROB
+            rollout_actions = predict_joint_policy_actions(
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy if opponent_policy is not None else unified_policy,
+                obs=obs,
+                env=env,
+                player_deterministic=player_deterministic,
+                opponent_deterministic=opponent_deterministic,
+                role_flag_offense=role_flag_offense,
+                role_flag_defense=role_flag_defense,
             )
-            opponent_strategy = (
-                _IllegalActionStrategy.BEST_PROB if opponent_deterministic else _IllegalActionStrategy.SAMPLE_PROB
+            full_action = combine_team_actions(
+                env=env,
+                user_team=user_team,
+                resolved_unified=rollout_actions["resolved_unified"],
+                resolved_opponent=rollout_actions["resolved_opponent"],
             )
-            actions_player = _worker_predict_policy_actions(
-                unified_policy,
-                obs,
-                env,
-                deterministic=player_deterministic,
-                strategy=player_strategy,
-            )
-            actions_opponent = _worker_predict_policy_actions(
-                opponent_policy if opponent_policy is not None else unified_policy,
-                obs,
-                env,
-                deterministic=opponent_deterministic,
-                strategy=opponent_strategy,
-            )
-
-            full_action = _np.zeros(env.n_players, dtype=int)
-            if user_team == _Team.OFFENSE:
-                full_action[env.offense_ids] = actions_player[env.offense_ids]
-                full_action[env.defense_ids] = actions_opponent[env.defense_ids]
-            else:
-                full_action[env.defense_ids] = actions_player[env.defense_ids]
-                full_action[env.offense_ids] = actions_opponent[env.offense_ids]
 
             _accumulate_action_mix(eval_diagnostics, full_action, user_team_ids)
             obs, reward, terminated, truncated, info = env.step(full_action)
@@ -414,6 +420,23 @@ def _run_episode_batch_worker(args: tuple) -> dict:
             if not action_results:
                 action_results = getattr(env, "last_action_results", {}) or {}
             last_action_results = action_results
+            done = bool(terminated or truncated)
+            post_step = apply_post_step_rollout_updates(
+                env=env,
+                next_obs=obs,
+                info=info if isinstance(info, dict) else None,
+                done=done,
+                training_params=training_params,
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy,
+                user_team=user_team,
+                role_flag_offense=role_flag_offense,
+                role_flag_defense=role_flag_defense,
+                selector_segment_index=selector_segment_index,
+                selector_intent_selection_mode=intent_selection_mode,
+            )
+            obs = post_step["obs"]
+            selector_segment_index = int(post_step["selector_segment_index"])
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
             _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
@@ -464,15 +487,12 @@ def _run_episode_batch_worker(args: tuple) -> dict:
             )
 
             # Update role_flag for next step
-            obs["role_flag"] = _np.array([role_flag_offense if user_team == _Team.OFFENSE else role_flag_defense], dtype=_np.float32)
-
-            episode_rewards["offense"] += float(reward[env.offense_ids].sum())
-            episode_rewards["defense"] += float(reward[env.defense_ids].sum())
+            episode_rewards["offense"] += float(reward[offense_ids].sum())
+            episode_rewards["defense"] += float(reward[defense_ids].sum())
             step_count += 1
-            done = bool(terminated or truncated)
 
         # Collect stats
-        shot_clock = getattr(env, "shot_clock", None)
+        shot_clock = get_env_attr(env, "shot_clock", None)
         three_point_distance = float(getattr(env, "three_point_distance", 4.0))
         # Mark participation for per-player stats
         for pid in per_player_stats:
@@ -847,7 +867,11 @@ def _accumulate_reward_breakdown(
     reward_breakdown = eval_diagnostics.setdefault("reward_breakdown", {})
     is_offense_user = _is_offense_team(user_team)
     offense_sign = 1.0 if is_offense_user else -1.0
-    user_team_ids = env.offense_ids if is_offense_user else env.defense_ids
+    user_team_ids = get_env_attr(
+        env,
+        "offense_ids" if is_offense_user else "defense_ids",
+        [],
+    )
 
     team_reward = float(np.sum(reward[user_team_ids]))
     reward_breakdown["total_reward"] = float(reward_breakdown.get("total_reward", 0.0)) + team_reward
@@ -858,7 +882,7 @@ def _accumulate_reward_breakdown(
     for pass_result in (action_results.get("passes", {}) or {}).values():
         if isinstance(pass_result, dict) and pass_result.get("success"):
             pass_successes += 1
-    pass_amt = offense_sign * float(getattr(env, "pass_reward", 0.0)) * float(pass_successes)
+    pass_amt = offense_sign * float(get_env_attr(env, "pass_reward", 0.0)) * float(pass_successes)
     reward_breakdown["pass_reward"] = float(reward_breakdown.get("pass_reward", 0.0)) + pass_amt
     step_known += pass_amt
 
@@ -872,11 +896,11 @@ def _accumulate_reward_breakdown(
         step_known += expected_amt
 
         if bool(shot_result.get("assist_potential", False)):
-            pot_pct = getattr(env, "potential_assist_pct", None)
+            pot_pct = get_env_attr(env, "potential_assist_pct", None)
             if pot_pct is not None:
                 potential_amt = max(0.0, float(pot_pct) * expected_points)
             else:
-                potential_amt = float(getattr(env, "potential_assist_reward", 0.0))
+                potential_amt = float(get_env_attr(env, "potential_assist_reward", 0.0))
             potential_term = offense_sign * potential_amt
             reward_breakdown["assist_potential"] = float(
                 reward_breakdown.get("assist_potential", 0.0)
@@ -884,11 +908,11 @@ def _accumulate_reward_breakdown(
             step_known += potential_term
 
         if bool(shot_result.get("assist_full", False)):
-            full_pct = getattr(env, "full_assist_bonus_pct", None)
+            full_pct = get_env_attr(env, "full_assist_bonus_pct", None)
             if full_pct is not None:
                 full_amt = max(0.0, float(full_pct) * expected_points)
             else:
-                full_amt = float(getattr(env, "full_assist_bonus", 0.0))
+                full_amt = float(get_env_attr(env, "full_assist_bonus", 0.0))
             full_term = offense_sign * full_amt
             reward_breakdown["assist_full_bonus"] = float(
                 reward_breakdown.get("assist_full_bonus", 0.0)
@@ -897,7 +921,7 @@ def _accumulate_reward_breakdown(
 
     if (action_results.get("defensive_lane_violations") or []) and not shots:
         violation_count = len(action_results.get("defensive_lane_violations") or [])
-        violation_amt = offense_sign * float(getattr(env, "violation_reward", 0.0)) * float(
+        violation_amt = offense_sign * float(get_env_attr(env, "violation_reward", 0.0)) * float(
             violation_count
         )
         reward_breakdown["violation_reward"] = float(
@@ -996,7 +1020,7 @@ def _build_reset_options_for_custom_setup(custom_setup: dict | None, enforce_fix
 
 def _sample_offense_permutation(env, rng=None) -> list[int]:
     rng = rng or np.random
-    offense_ids = list(env.offense_ids)
+    offense_ids = list(get_env_attr(env, "offense_ids", []))
     rng.shuffle(offense_ids)
     return offense_ids
 
@@ -1006,6 +1030,7 @@ def _run_sequential_evaluation(
     player_deterministic: bool,
     opponent_deterministic: bool,
     env,
+    training_params: dict | None,
     unified_policy: PPO,
     opponent_policy: PPO | None,
     user_team: Team,
@@ -1014,12 +1039,16 @@ def _run_sequential_evaluation(
     shot_accumulator: dict[str, list[int]] | None = None,
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
+    intent_selection_mode: str = "learned_sample",
     progress_callback=None,
 ) -> dict:
     results = []
-    per_player_stats = _init_player_stats(env.n_players)
+    env_read = env_view(env)
+    offense_ids = list(env_read.offense_ids or [])
+    defense_ids = list(env_read.defense_ids or [])
+    per_player_stats = _init_player_stats(int(env_read.n_players or 0))
     eval_diagnostics = _init_eval_diagnostics()
-    user_team_ids = list(env.offense_ids if user_team == Team.OFFENSE else env.defense_ids)
+    user_team_ids = list(offense_ids if user_team == Team.OFFENSE else defense_ids)
     user_team_ids_set = {int(pid) for pid in user_team_ids}
     progress_start = time.time()
     progress_every = max(1, num_episodes // 50)
@@ -1028,12 +1057,24 @@ def _run_sequential_evaluation(
         reset_opts = _build_reset_options_for_custom_setup(custom_setup, enforce_fixed_skills=True)
         if randomize_offense_permutation:
             perm = _sample_offense_permutation(env)
-            perm_dict = {env.offense_ids[i]: perm[i] for i in range(len(env.offense_ids))}
+            perm_dict = {offense_ids[i]: perm[i] for i in range(len(offense_ids))}
             reset_opts["offense_player_permutation"] = perm_dict
 
         obs, _ = env.reset(options=reset_opts)
         env.training_team = user_team
         obs["role_flag"] = np.array([role_flag_offense if user_team == Team.OFFENSE else role_flag_defense], dtype=np.float32)
+        selector_state = initialize_rollout_selector_episode(
+            env=env,
+            obs=obs,
+            training_params=training_params,
+            unified_policy=unified_policy,
+            opponent_policy=opponent_policy,
+            user_team=user_team,
+            role_flag_offense=role_flag_offense,
+            selector_intent_selection_mode=intent_selection_mode,
+        )
+        obs = selector_state["obs"]
+        selector_segment_index = int(selector_state["selector_segment_index"])
         _accumulate_intent_selection(eval_diagnostics, env)
 
         done = False
@@ -1043,31 +1084,22 @@ def _run_sequential_evaluation(
         episode_shots: dict[str, list[int]] = {}
 
         while not done:
-            player_strategy = IllegalActionStrategy.BEST_PROB if player_deterministic else IllegalActionStrategy.SAMPLE_PROB
-            opponent_strategy = IllegalActionStrategy.BEST_PROB if opponent_deterministic else IllegalActionStrategy.SAMPLE_PROB
-
-            actions_player = _predict_policy_actions(
-                unified_policy,
-                obs,
-                env,
-                deterministic=player_deterministic,
-                strategy=player_strategy,
+            rollout_actions = predict_joint_policy_actions(
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy if opponent_policy is not None else unified_policy,
+                obs=obs,
+                env=env,
+                player_deterministic=player_deterministic,
+                opponent_deterministic=opponent_deterministic,
+                role_flag_offense=role_flag_offense,
+                role_flag_defense=role_flag_defense,
             )
-            actions_opponent = _predict_policy_actions(
-                opponent_policy if opponent_policy is not None else unified_policy,
-                obs,
-                env,
-                deterministic=opponent_deterministic,
-                strategy=opponent_strategy,
+            full_action = combine_team_actions(
+                env=env,
+                user_team=user_team,
+                resolved_unified=rollout_actions["resolved_unified"],
+                resolved_opponent=rollout_actions["resolved_opponent"],
             )
-
-            full_action = np.zeros(env.n_players, dtype=int)
-            if user_team == Team.OFFENSE:
-                full_action[env.offense_ids] = actions_player[0][env.offense_ids] if isinstance(actions_player, tuple) else actions_player[env.offense_ids]
-                full_action[env.defense_ids] = actions_opponent[0][env.defense_ids] if isinstance(actions_opponent, tuple) else actions_opponent[env.defense_ids]
-            else:
-                full_action[env.defense_ids] = actions_player[0][env.defense_ids] if isinstance(actions_player, tuple) else actions_player[env.defense_ids]
-                full_action[env.offense_ids] = actions_opponent[0][env.offense_ids] if isinstance(actions_opponent, tuple) else actions_opponent[env.offense_ids]
 
             _accumulate_action_mix(eval_diagnostics, full_action, user_team_ids)
             obs, reward, terminated, truncated, info = env.step(full_action)
@@ -1081,6 +1113,23 @@ def _run_sequential_evaluation(
             if not action_results:
                 action_results = getattr(env, "last_action_results", {}) or {}
             last_action_results = action_results
+            done = bool(terminated or truncated)
+            post_step = apply_post_step_rollout_updates(
+                env=env,
+                next_obs=obs,
+                info=info if isinstance(info, dict) else None,
+                done=done,
+                training_params=training_params,
+                unified_policy=unified_policy,
+                opponent_policy=opponent_policy,
+                user_team=user_team,
+                role_flag_offense=role_flag_offense,
+                role_flag_defense=role_flag_defense,
+                selector_segment_index=selector_segment_index,
+                selector_intent_selection_mode=intent_selection_mode,
+            )
+            obs = post_step["obs"]
+            selector_segment_index = int(post_step["selector_segment_index"])
 
             shots_for_step = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
             _accumulate_assist_links(eval_diagnostics, shots_for_step, user_team_ids_set, env)
@@ -1130,14 +1179,11 @@ def _run_sequential_evaluation(
                 user_team,
             )
 
-            obs["role_flag"] = np.array([role_flag_offense if user_team == Team.OFFENSE else role_flag_defense], dtype=np.float32)
-
-            episode_rewards["offense"] += float(reward[env.offense_ids].sum())
-            episode_rewards["defense"] += float(reward[env.defense_ids].sum())
+            episode_rewards["offense"] += float(reward[offense_ids].sum())
+            episode_rewards["defense"] += float(reward[defense_ids].sum())
             step_count += 1
-            done = bool(terminated or truncated)
 
-        shot_clock = getattr(env, "shot_clock", None)
+        shot_clock = get_env_attr(env, "shot_clock", None)
         three_point_distance = float(getattr(env, "three_point_distance", 4.0))
         for pid in per_player_stats:
             per_player_stats[pid]["episodes"] += 1
@@ -1180,6 +1226,7 @@ def _run_parallel_evaluation(
     opponent_deterministic: bool,
     required_params: dict,
     optional_params: dict,
+    training_params: dict | None,
     unified_policy_path: str,
     opponent_policy_path: str | None,
     user_team_name: str,
@@ -1188,6 +1235,7 @@ def _run_parallel_evaluation(
     shot_accumulator: dict[str, list[int]] | None = None,
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
+    intent_selection_mode: str = "learned_sample",
     num_workers: int | None = None,
     progress_callback=None,
 ) -> dict:
@@ -1220,11 +1268,13 @@ def _run_parallel_evaluation(
         initargs=(
             required_params,
             optional_params,
+            training_params,
             unified_policy_path,
             opponent_policy_path,
             user_team_name,
             role_flag_offense,
             role_flag_defense,
+            intent_selection_mode,
             progress_queue,
         ),
     ) as executor:
@@ -1325,6 +1375,7 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
         raise HTTPException(
             status_code=400, detail="Environment not initialized for custom setup validation."
         )
+    base_env = getattr(env, "unwrapped", env)
 
     normalized: dict = {}
     shooting_mode = str(setup.get("shooting_mode") or "random").lower()
@@ -1336,10 +1387,10 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
         positions_raw = setup["initial_positions"]
         if not isinstance(positions_raw, (list, tuple)):
             raise HTTPException(status_code=400, detail="initial_positions must be a list.")
-        if len(positions_raw) != env.n_players:
+        if len(positions_raw) != base_env.n_players:
             raise HTTPException(
                 status_code=400,
-                detail=f"initial_positions must have {env.n_players} entries (one per player).",
+                detail=f"initial_positions must have {base_env.n_players} entries (one per player).",
             )
         positions: list[tuple[int, int]] = []
         seen = set()
@@ -1347,7 +1398,7 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
             if not isinstance(pos, (list, tuple)) or len(pos) != 2:
                 raise HTTPException(status_code=400, detail=f"Invalid position entry: {pos}")
             q, r = int(pos[0]), int(pos[1])
-            if not env._is_valid_position(q, r):
+            if not base_env._is_valid_position(q, r):
                 raise HTTPException(status_code=400, detail=f"Position {(q, r)} is out of bounds.")
             if (q, r) in seen:
                 raise HTTPException(status_code=400, detail=f"Duplicate position {(q, r)} is not allowed.")
@@ -1357,13 +1408,13 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
 
     if setup.get("ball_holder") is not None:
         bh = int(setup["ball_holder"])
-        if bh < 0 or bh >= env.n_players:
+        if bh < 0 or bh >= base_env.n_players:
             raise HTTPException(status_code=400, detail=f"Invalid ball_holder id: {bh}")
         normalized["ball_holder"] = bh
 
     # Validate fixed offense skills if requested
     if shooting_mode == "fixed":
-        offense_ids = getattr(env, "offense_ids", [])
+        offense_ids = getattr(base_env, "offense_ids", [])
         offense_count = len(offense_ids)
         skills = setup.get("offense_skills")
         if not skills or not isinstance(skills, dict):
@@ -1401,6 +1452,7 @@ def run_evaluation(
     opponent_deterministic: bool,
     required_params: dict,
     optional_params: dict,
+    training_params: dict | None,
     unified_policy_path: str,
     opponent_policy_path: str | None,
     user_team_name: str,
@@ -1409,6 +1461,7 @@ def run_evaluation(
     shot_accumulator: dict[str, list[int]] | None = None,
     custom_setup: dict | None = None,
     randomize_offense_permutation: bool = False,
+    intent_selection_mode: str = "learned_sample",
     num_workers: int | None = None,
     progress_callback=None,
 ):
@@ -1451,6 +1504,7 @@ def run_evaluation(
             player_deterministic,
             opponent_deterministic,
             env,
+            training_params,
             unified_policy,
             opponent_policy,
             user_team,
@@ -1459,6 +1513,7 @@ def run_evaluation(
             shot_accumulator=shot_accumulator,
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_permutation,
+            intent_selection_mode=intent_selection_mode,
             progress_callback=progress_callback,
         )
 
@@ -1468,6 +1523,7 @@ def run_evaluation(
         opponent_deterministic,
         required_params,
         optional_params,
+        training_params,
         unified_policy_path,
         opponent_policy_path,
         user_team_name,
@@ -1476,6 +1532,7 @@ def run_evaluation(
         shot_accumulator=shot_accumulator,
         custom_setup=custom_setup,
         randomize_offense_permutation=randomize_offense_permutation,
+        intent_selection_mode=intent_selection_mode,
         num_workers=num_workers,
         progress_callback=progress_callback,
     )
@@ -1535,8 +1592,9 @@ def pass_steal_preview(env, positions: list[tuple[int, int]], ball_holder: int):
     """Return pass steal probabilities for a hypothetical placement."""
     if env is None:
         raise ValueError("Environment not initialized.")
-    if len(positions) != env.n_players:
-        raise ValueError(f"positions must have {env.n_players} entries (got {len(positions)})")
+    base_env = getattr(env, "unwrapped", env)
+    if len(positions) != base_env.n_players:
+        raise ValueError(f"positions must have {base_env.n_players} entries (got {len(positions)})")
 
     seen = set()
     validated_positions: list[tuple[int, int]] = []
@@ -1544,7 +1602,7 @@ def pass_steal_preview(env, positions: list[tuple[int, int]], ball_holder: int):
         if not isinstance(pos, (list, tuple)) or len(pos) != 2:
             raise ValueError(f"Invalid position entry: {pos}")
         q, r = int(pos[0]), int(pos[1])
-        if not env._is_valid_position(q, r):
+        if not base_env._is_valid_position(q, r):
             raise ValueError(f"Position {(q, r)} is out of bounds.")
         if (q, r) in seen:
             raise ValueError(f"Duplicate position {(q, r)} not allowed.")
@@ -1552,44 +1610,44 @@ def pass_steal_preview(env, positions: list[tuple[int, int]], ball_holder: int):
         validated_positions.append((q, r))
 
     ball_holder = int(ball_holder)
-    if ball_holder < 0 or ball_holder >= env.n_players:
+    if ball_holder < 0 or ball_holder >= base_env.n_players:
         raise ValueError(f"Invalid ball_holder id: {ball_holder}")
 
-    orig_positions = list(env.positions)
-    orig_ball_holder = env.ball_holder
+    orig_positions = list(base_env.positions)
+    orig_ball_holder = base_env.ball_holder
     orig_obs = game_state.obs
     orig_prev_obs = game_state.prev_obs
 
     try:
-        env.positions = list(validated_positions)
-        env.ball_holder = ball_holder
-        observer_is_offense = bool(env.training_team == Team.OFFENSE)
-        if hasattr(env, "_build_observation_dict"):
-            dummy_obs = env._build_observation_dict(observer_is_offense)
+        base_env.positions = list(validated_positions)
+        base_env.ball_holder = ball_holder
+        observer_is_offense = bool(base_env.training_team == Team.OFFENSE)
+        if hasattr(base_env, "_build_observation_dict"):
+            dummy_obs = base_env._build_observation_dict(observer_is_offense)
         else:
             dummy_obs = {
-                "obs": env._get_observation(),
-                "action_mask": env._get_action_masks(),
+                "obs": base_env._get_observation(),
+                "action_mask": base_env._get_action_masks(),
                 "role_flag": np.array(
-                    [1.0 if env.training_team == Team.OFFENSE else -1.0],
+                    [1.0 if base_env.training_team == Team.OFFENSE else -1.0],
                     dtype=np.float32,
                 ),
-                "skills": env._get_offense_skills_array(),
+                "skills": base_env._get_offense_skills_array(),
             }
 
-        steal_probs = env.calculate_pass_steal_probabilities(ball_holder)
+        steal_probs = base_env.calculate_pass_steal_probabilities(ball_holder)
         return {
             "steal_probabilities": {int(k): float(v) for k, v in steal_probs.items()},
             "policy_probabilities": _predict_policy_actions(
                 game_state.unified_policy,
                 dummy_obs,
-                env,
+                base_env,
                 deterministic=False,
                 strategy=IllegalActionStrategy.SAMPLE_PROB,
             )[1],
         }
     finally:
-        env.positions = orig_positions
-        env.ball_holder = orig_ball_holder
+        base_env.positions = orig_positions
+        base_env.ball_holder = orig_ball_holder
         game_state.obs = orig_obs
         game_state.prev_obs = orig_prev_obs

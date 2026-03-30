@@ -1,5 +1,3 @@
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -134,14 +132,7 @@ def test_playable_options_include_demo_config(monkeypatch):
     monkeypatch.setenv("BW_PLAYABLE_DEMO_ALTERNATION_NUMBER", "75")
     monkeypatch.delenv("BW_PLAYABLE_DEMO_CHECKPOINT", raising=False)
 
-    app = FastAPI()
-    app.include_router(playable_routes.router)
-    client = TestClient(app)
-
-    response = client.get("/api/playable/options")
-    assert response.status_code == 200, response.text
-
-    body = response.json()
+    body = playable_routes.get_playable_options()
     assert body["status"] == "success"
     assert body["demo"]["enabled"] is True
     assert body["demo"]["available"] is True

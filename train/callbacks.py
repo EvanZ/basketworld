@@ -157,6 +157,12 @@ def build_intent_diversity_callback(args):
         max_action_dim=getattr(args, "intent_disc_max_action_dim", 16),
         disc_lambda_shot=getattr(args, "intent_disc_lambda_shot", 0.0),
         disc_lambda_q=getattr(args, "intent_disc_lambda_q", 0.0),
+        disc_eval_holdout_fraction=getattr(
+            args, "intent_disc_eval_holdout_fraction", 0.25
+        ),
+        disc_current_policy_only=getattr(
+            args, "intent_disc_current_policy_only", True
+        ),
     )
 
 

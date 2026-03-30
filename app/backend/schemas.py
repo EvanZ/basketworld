@@ -74,6 +74,7 @@ class EvaluationRequest(BaseModel):
     opponent_deterministic: bool = True
     custom_setup: CustomEvalSetup | None = None
     randomize_offense_permutation: bool = False
+    intent_selection_mode: Literal["learned_sample", "best_intent", "uniform_random"] = "learned_sample"
 
 
 class SaveEpisodeRequest(BaseModel):
