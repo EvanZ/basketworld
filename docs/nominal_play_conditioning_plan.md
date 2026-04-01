@@ -2,7 +2,42 @@
 
 ## Status
 
-Proposal only. No training-path implementation has been done yet.
+Phase 1 and Phase 2 are implemented:
+
+- low-level policy conditioning now uses policy-side runtime play ids plus embedding lookup
+- low-level set observations no longer expose legacy `intent_*` conditioning keys
+- selector/runtime paths have been refactored onto explicit policy-side conditioning
+- nominal play-name mapping is live in backend/UI
+
+The remaining work is follow-up evaluation, refinement, and future experiments.
+
+## Compatibility Stance
+
+Backward compatibility with the old numeric-intent observation design is **not required**.
+
+That older design should be treated as deprecated and replaced rather than preserved.
+
+Implications:
+
+- no long-term dual-mode conditioning path
+- no need to preserve low-level policy support for scalar numeric play identity
+- implementation should optimize for conceptual clarity, not compatibility shims
+
+## Locked Initial Decisions
+
+The following decisions are now part of the initial implementation plan:
+
+1. remove **all** low-level intent globals from the low-level policy input path
+   - `intent_index` / `intent_index_norm`
+   - `intent_active`
+   - `intent_visible`
+   - `intent_age_norm`
+2. keep intent/play runtime state in the environment and selector machinery
+3. use true policy-side conditioning rather than a dedicated observation key
+4. for the first implementation, carry current play ids as per-env runtime state on the policy/algorithm side rather than threading an explicit tensor through every SB3 call
+5. defer nominal UI play naming to phase 2, after runtime/training conditioning is stable
+
+These choices are intended to reduce architectural ambiguity before implementation starts.
 
 ## Motivation
 
@@ -55,10 +90,13 @@ That means:
 In practical terms:
 
 - selector still chooses an internal play id `z in {0, ..., N-1}`
-- low-level policy receives `z` separately from the environment observation
+- environment/runtime still tracks play state internally
+- low-level policy receives current `z` separately from the environment observation
 - set-attention extractor looks up learned embedding `e_z`
 - extractor injects `e_z` into token features
-- no `intent_index_norm` is exposed to the low-level policy as an ordered scalar
+- no low-level play-conditioning fields are exposed through observation space
+
+This is intended to **replace** the old numeric-intent observation path, not coexist with it indefinitely.
 
 ## Desired Semantics
 
@@ -108,14 +146,11 @@ Proposed behavior:
 - policy forward pass receives `z` through a dedicated conditioning channel
 - low-level observation no longer includes ordered scalar play identity
 
-Open design choice:
+Implementation decision:
 
-- whether to also remove `intent_active`, `intent_visible`, and `intent_age_norm` from low-level observation
-
-Current recommendation:
-
-- remove all play-identity conditioning fields from the low-level observation path
-- if any remain, they should be justified individually rather than inherited from the current design
+- remove all low-level play-conditioning fields from the low-level observation path
+- keep `intent_active`, `intent_visible`, `intent_age`, and related commitment state only as environment/runtime state, logging state, and UI/diagnostic state
+- do not retain a permanent legacy numeric-intent observation mode
 
 ### 2. Embedding Lookup Only
 
@@ -131,6 +166,14 @@ Instead:
 
 - pass the current `z` directly into the policy/extractor
 - perform lookup from that direct id
+
+For the first implementation, the transport mechanism will be:
+
+- maintain per-env current play ids as runtime state on the policy/algorithm side
+- update that state when selector decisions or forced-play assignments occur
+- have the extractor read the current play ids from that runtime state during forward passes
+
+This is less invasive than threading an explicit play-id tensor through every SB3 entry point, while still achieving true policy-side conditioning.
 
 ### 3. Selector Remains Conceptually Separate
 
@@ -204,15 +247,18 @@ Current recommendation:
 ### Phase 1. Policy Conditioning Refactor
 
 1. identify all places where low-level policy reads play identity from observation
-2. add dedicated policy-side play-id input path
-3. switch set-attention extractor to direct play-id embedding lookup
-4. remove ordered scalar play-id usage from low-level extractor
+2. remove all low-level intent globals from the low-level policy observation path
+3. add dedicated policy-side play-id conditioning state
+4. switch set-attention extractor to direct play-id embedding lookup
+5. store current play ids per env on the policy/algorithm runtime side
+6. remove legacy numeric play-conditioning code instead of preserving it as a supported path
 
 ### Phase 2. Selector Routing Refactor
 
 1. keep selector start-of-segment logic
 2. replace observation-patching communication path with direct policy-side conditioning state
 3. ensure VecEnv / rollout code carries current `z` cleanly per env
+4. ensure forced-play / evaluation helpers write the same runtime conditioning state
 
 ### Phase 3. UI Naming Layer
 
@@ -254,9 +300,12 @@ Removing observation-based play conditioning means the rollout stack must carry 
 
 Old checkpoints assume current observation-based play conditioning.
 
-Possible outcome:
+This is acceptable.
 
-- new nominal-conditioning checkpoints are not directly comparable to old checkpoints
+Expected outcome:
+
+- new nominal-conditioning checkpoints will not be directly comparable to old checkpoints
+- old numeric-conditioned checkpoints can be treated as legacy artifacts rather than a supported target
 
 ### 3. Hidden Couplings
 
@@ -272,21 +321,96 @@ These will need review.
 4. How should per-run play-name mapping be versioned across continuations?
 5. Should play names be sampled once per run or once per alternation family?
 
+## Future Experiments
+
+### 1. Discriminator on State/Position Only
+
+Test a discriminator variant that uses state or position features only, without action features.
+
+Motivation:
+
+- reduce reliance on superficial action-signature cues
+- push the DIAYN signal toward distinct spatial/state consequences
+- check whether the current discriminator signal is mostly action-driven
+
+Recommended ablations:
+
+1. `obs + actions`
+2. `obs only`
+3. `actions only`
+
+### 2. Learned Play-Boundary / Reselection Head
+
+Add a separate head that learns whether to keep the current play or sample a new one, instead of relying entirely on deterministic play boundaries.
+
+Motivation:
+
+- let the hierarchy learn play duration explicitly
+- separate "which play" from "when to resample"
+- reduce dependence on hard-coded commitment / pass boundary rules
+
+Main risk:
+
+- easy to collapse into resampling too often or never resampling without additional regularization
+
+### 3. Direct Signal Attribution for the Discriminator
+
+Run controlled replay/eval passes that zero or drop subsets of discriminator inputs.
+
+Examples:
+
+- remove action features
+- remove non-positional observation features
+- scramble temporal order
+- mean-pool sequence inputs before evaluation
+
+Goal:
+
+- identify what the discriminator is actually using to separate plays
+
+### 4. Behavioral Evaluation From Matched Starts
+
+Prioritize causal evaluation over latent geometry.
+
+Examples:
+
+- same initial state, force different plays, compare trajectories
+- per-play distributions of pass count, shot type, shot quality, turnover reason, possession length
+- occupancy / endpoint heatmaps by play
+
+Goal:
+
+- measure whether plays produce stable behavioral differences that matter
+
+### 5. Embedding Structure and Sharing Ablations
+
+Evaluate whether offense and defense should continue to use separate embedding tables and whether embedding dimension should be reduced or regularized.
+
+Examples:
+
+- shared embedding table with role-conditioned projection
+- smaller `intent_embedding_dim`
+- embedding norm penalty or diversity regularization
+
+Goal:
+
+- test whether the current embedding parameterization is larger or less constrained than necessary
+
 ## Recommended Default Decisions
 
 Unless a stronger reason appears, use:
 
 1. embedding-lookup-only conditioning for low-level policy
-2. no ordered scalar play id in low-level observation
-3. stable per-run sampled play-name mapping
-4. internal `z` retained for debugging, external UI shows nominal labels
+2. no low-level intent globals in the low-level observation path
+3. policy-side runtime-state transport for current play ids in the first implementation
+4. stable per-run sampled play-name mapping
+5. internal `z` retained for debugging, external UI shows nominal labels
+6. no long-term backward-compatibility layer for numeric-intent observation conditioning
 
 ## Immediate Next Step
 
-Do not implement yet.
+Immediate next steps should be evaluation-oriented:
 
-When ready, start with:
-
-1. a narrow design pass on how current `z` is carried from selector to policy
-2. identify every place that currently depends on observation-patched intent fields
-3. implement policy-side conditioning first, before UI naming
+1. complete at least one real training run under the nominal-conditioning architecture
+2. monitor selector behavior, play-conditioned sensitivity, and backend/UI stability
+3. use the future experiments above to decide whether to change the discriminator input or selector boundary design next

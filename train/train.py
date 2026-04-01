@@ -37,6 +37,7 @@ if os.path.exists(os.path.expanduser('~/.aws/credentials')):
 # === END CRITICAL SECTION ===
 
 from datetime import datetime
+import json
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
@@ -67,6 +68,11 @@ import time
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
+from basketworld.utils.play_names import (
+    PLAY_NAME_POOL_VERSION,
+    build_model_codename,
+    build_play_name_artifact_payload,
+)
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.utils.wrappers import (
@@ -357,8 +363,32 @@ def main(args):
             "offense_spawn_boundary_margin",
             getattr(args, "offense_spawn_boundary_margin", 0),
         )
-        
+        mlflow.log_param("play_name_pool_version", int(PLAY_NAME_POOL_VERSION))
+        model_codename = build_model_codename(run.info.run_id)
+        mlflow.set_tag("model_codename", model_codename)
+
         print(f"MLflow Run ID: {run.info.run_id}")
+        print(f"Model Codename: {model_codename}")
+
+        try:
+            play_name_payload = build_play_name_artifact_payload(
+                run.info.run_id,
+                int(getattr(args, "num_intents", 0) or 0),
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as f:
+                json.dump(play_name_payload, f, indent=2)
+                play_name_artifact_path = f.name
+            try:
+                mlflow.log_artifact(play_name_artifact_path, artifact_path="metadata")
+            finally:
+                try:
+                    os.unlink(play_name_artifact_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            print(f"[play_names] Failed to log play name mapping artifact: {e}")
 
         # --- If continuing from a prior run, copy over prior model artifacts ---
         # This lets us sample frozen policies from the full history in the new run.

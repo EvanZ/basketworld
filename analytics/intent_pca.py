@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -884,8 +884,13 @@ def _compute_policy_state_embedding(model: PPO, obs: dict) -> np.ndarray:
         raise RuntimeError("Loaded PPO model has no policy object.")
 
     obs_tensor, _ = policy_obj.obs_to_tensor(obs)
-    with torch.no_grad():
-        features = policy_obj.extract_features(obs_tensor)
+    with (
+        policy_obj.runtime_conditioning_context(obs_tensor)
+        if hasattr(policy_obj, "runtime_conditioning_context")
+        else nullcontext()
+    ):
+        with torch.no_grad():
+            features = policy_obj.extract_features(obs_tensor)
     if isinstance(features, tuple):
         features = features[0]
     if features.ndim == 1:

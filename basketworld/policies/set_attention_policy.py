@@ -84,10 +84,8 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self.intent_embedding_enabled = bool(intent_embedding_enabled)
         self.intent_embedding_dim = max(1, int(intent_embedding_dim))
         self.num_intents = max(1, int(num_intents))
-        # Intent globals are appended as trailing [index_norm, active, visible, age_norm].
-        self._intent_globals_dim = 4
-        self._intent_start_idx = max(0, self.global_dim - self._intent_globals_dim)
-        self._has_intent_globals = self.global_dim >= (4 + self._intent_globals_dim)
+        self._runtime_intent_indices: Optional[th.Tensor] = None
+        self._runtime_intent_gate: Optional[th.Tensor] = None
 
         total_tokens = self.n_players + self.num_cls_tokens
         super().__init__(observation_space, features_dim=total_tokens * self.embed_dim)
@@ -98,7 +96,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             token_act(),
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
-        if self.intent_embedding_enabled and self._has_intent_globals:
+        if self.intent_embedding_enabled:
             self.offense_intent_embedding = nn.Embedding(
                 num_embeddings=self.num_intents,
                 embedding_dim=self.intent_embedding_dim,
@@ -129,6 +127,19 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         else:
             self.cls_tokens = None
 
+    def set_runtime_intent_state(
+        self,
+        *,
+        intent_indices: Optional[th.Tensor],
+        intent_gate: Optional[th.Tensor] = None,
+    ) -> None:
+        self._runtime_intent_indices = intent_indices
+        self._runtime_intent_gate = intent_gate
+
+    def clear_runtime_intent_state(self) -> None:
+        self._runtime_intent_indices = None
+        self._runtime_intent_gate = None
+
     def forward(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
         """Compute flattened token embeddings from a set observation.
 
@@ -151,20 +162,21 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             and self.defense_intent_to_token is not None
         ):
             try:
-                start = int(self._intent_start_idx)
-                idx_norm = globals_vec[:, start]
-                active = globals_vec[:, start + 1]
-                visible = globals_vec[:, start + 2]
-                if self.num_intents > 1:
-                    intent_idx = th.round(
-                        idx_norm.clamp(0.0, 1.0) * float(self.num_intents - 1)
-                    ).long()
-                else:
-                    intent_idx = th.zeros_like(idx_norm, dtype=th.long)
+                if self._runtime_intent_indices is None:
+                    raise RuntimeError("Runtime intent state is not set.")
+                intent_idx = self._runtime_intent_indices.to(emb.device, dtype=th.long)
+                if intent_idx.ndim == 0:
+                    intent_idx = intent_idx.unsqueeze(0)
+                intent_idx = intent_idx.reshape(-1)
+                if intent_idx.shape[0] != emb.shape[0]:
+                    if intent_idx.shape[0] == 1 and emb.shape[0] > 1:
+                        intent_idx = intent_idx.expand(emb.shape[0])
+                    else:
+                        raise RuntimeError("Runtime intent indices batch does not match observation batch.")
                 intent_idx = intent_idx.clamp(min=0, max=self.num_intents - 1)
                 role_flag = obs.get("role_flag")
                 if role_flag is None:
-                    is_offense = th.ones_like(idx_norm, dtype=th.bool)
+                    is_offense = th.ones_like(intent_idx, dtype=th.bool)
                 else:
                     if role_flag.ndim == 1:
                         role_flag = role_flag.unsqueeze(-1)
@@ -174,8 +186,19 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
                 off_delta = self.offense_intent_to_token(off_emb)
                 def_delta = self.defense_intent_to_token(def_emb)
                 intent_delta = th.where(is_offense.unsqueeze(-1), off_delta, def_delta)
-                # Hidden intent remains zeroed because visible=0 masks the shift.
-                intent_gate = (active * visible).unsqueeze(-1)
+                if self._runtime_intent_gate is None:
+                    intent_gate = th.ones_like(intent_idx, dtype=emb.dtype, device=emb.device)
+                else:
+                    intent_gate = self._runtime_intent_gate.to(emb.device, dtype=emb.dtype)
+                    if intent_gate.ndim == 0:
+                        intent_gate = intent_gate.unsqueeze(0)
+                    intent_gate = intent_gate.reshape(-1)
+                    if intent_gate.shape[0] != emb.shape[0]:
+                        if intent_gate.shape[0] == 1 and emb.shape[0] > 1:
+                            intent_gate = intent_gate.expand(emb.shape[0])
+                        else:
+                            raise RuntimeError("Runtime intent gate batch does not match observation batch.")
+                intent_gate = intent_gate.unsqueeze(-1)
                 emb = emb + (intent_delta.unsqueeze(1) * intent_gate.unsqueeze(1))
             except Exception:
                 pass
@@ -915,9 +938,21 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         ):
             obs_tensor, _ = self.obs_to_tensor(obs)
 
-        features = self.extract_features(obs_tensor)
-        if not self.share_features_extractor and isinstance(features, tuple):
-            features = features[0]
+        saved_override_indices = getattr(self, "_runtime_intent_override_indices", None)
+        saved_override_gate = getattr(self, "_runtime_intent_override_gate", None)
+        try:
+            if hasattr(self, "clear_runtime_intent_override"):
+                self.clear_runtime_intent_override()
+            with self.runtime_conditioning_context(obs_tensor):
+                features = self.extract_features(obs_tensor)
+                if not self.share_features_extractor and isinstance(features, tuple):
+                    features = features[0]
+        finally:
+            if hasattr(self, "set_runtime_intent_override"):
+                self.set_runtime_intent_override(
+                    saved_override_indices,
+                    saved_override_gate,
+                )
         selector_ctx = self._selector_context_from_features(features)
         assert self.intent_selector_head is not None
         assert self.intent_selector_value_head is not None

@@ -14,6 +14,7 @@ import numpy as np
 from stable_baselines3 import PPO
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
+from basketworld.utils.play_names import lookup_play_name
 
 import app.backend.evaluation as backend_evaluation
 from app.backend.observations import rebuild_observation_from_env
@@ -44,6 +45,7 @@ from app.backend.state import (
     _restore_restorable_backend_state,
     capture_counterfactual_snapshot,
     fail_playbook_progress,
+    get_current_play_name_map,
     get_playbook_progress,
     get_ui_game_state,
     game_state,
@@ -449,6 +451,9 @@ def _build_playbook_ui_state(template_state: dict, env, action_results: dict | N
     state["last_action_results"] = copy.deepcopy(action_results or {})
     state["intent_active_current"] = bool(getattr(env, "intent_active", False))
     state["intent_index_current"] = int(getattr(env, "intent_index", 0))
+    state["current_play_name"] = lookup_play_name(
+        state.get("play_name_map"), state["intent_index_current"]
+    )
     state["intent_age_current"] = int(getattr(env, "intent_age", 0))
     state["pass_steal_probabilities"] = {}
     state["ball_handler_shot_probability"] = None
@@ -1134,6 +1139,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     update_playbook_progress(completed, total_rollouts)
 
         panels = []
+        play_name_map = get_current_play_name_map(int(getattr(base_env, "num_intents", 0) or 0))
         for intent_index in intent_indices:
             panel = panel_accumulators[int(intent_index)]
             rollouts_done = max(1, int(panel["num_rollouts"]))
@@ -1161,6 +1167,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             panels.append(
                 {
                     "intent_index": int(intent_index),
+                    "play_name": lookup_play_name(play_name_map, int(intent_index)),
                     "num_rollouts": int(panel["num_rollouts"]),
                     "avg_steps": float(panel["rollout_lengths_sum"] / rollouts_done),
                     "avg_passes": float(panel["rollout_passes_sum"] / rollouts_done),
@@ -1200,6 +1207,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             "offense_ids": offense_ids,
             "used_parallel": bool(num_workers is not None),
             "num_workers": int(num_workers or 1),
+            "play_name_map": play_name_map,
             "panels": panels,
         }, custom_encoder=_NUMPY_SAFE_ENCODER)
     except HTTPException:

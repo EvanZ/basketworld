@@ -11,6 +11,9 @@ from basketworld.envs.basketworld_env_v2 import ActionType, Team
 from stable_baselines3 import PPO
 
 from basketworld.utils.action_resolution import IllegalActionStrategy
+from basketworld.utils.intent_policy_sensitivity import (
+    sync_policy_runtime_intent_override_from_env,
+)
 
 from app.backend.observations import (
     _build_role_conditioned_obs,
@@ -143,6 +146,11 @@ class MCTSAdvisor:
             conditioned = _build_role_conditioned_obs(obs, role_flag)
             if conditioned is None:
                 return 0.0
+            sync_policy_runtime_intent_override_from_env(
+                policy,
+                env,
+                observer_is_offense=bool(float(role_flag) > 0.0),
+            )
             obs_tensor, _ = policy.policy.obs_to_tensor(conditioned)
             with torch.no_grad():
                 return float(policy.policy.predict_values(obs_tensor).item())

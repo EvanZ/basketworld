@@ -11,6 +11,7 @@ import sys
 import tempfile
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,6 +54,7 @@ from basketworld.utils.intent_discovery import (
 from basketworld.utils.intent_policy_sensitivity import (
     clone_observation_dict,
     patch_intent_in_observation,
+    sync_policy_runtime_intent_override_from_obs,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.mlflow_params import get_mlflow_params, get_mlflow_training_params
@@ -579,8 +581,13 @@ def _compute_policy_state_embedding(model: Any, obs: dict) -> np.ndarray:
         raise RuntimeError("Loaded PPO model has no policy object.")
 
     obs_tensor, _ = policy_obj.obs_to_tensor(obs)
-    with torch.no_grad():
-        features = policy_obj.extract_features(obs_tensor)
+    with (
+        policy_obj.runtime_conditioning_context(obs_tensor)
+        if hasattr(policy_obj, "runtime_conditioning_context")
+        else nullcontext()
+    ):
+        with torch.no_grad():
+            features = policy_obj.extract_features(obs_tensor)
     if isinstance(features, tuple):
         features = features[0]
     if features.ndim == 1:
@@ -632,7 +639,12 @@ def _sample_rollout_action_like_ppo(
     with torch.no_grad():
         obs_tensor, _ = policy_obj.obs_to_tensor(obs)
         if bool(deterministic):
-            actions = policy_obj._predict(obs_tensor, deterministic=True)
+            with (
+                policy_obj.runtime_conditioning_context(obs_tensor)
+                if hasattr(policy_obj, "runtime_conditioning_context")
+                else nullcontext()
+            ):
+                actions = policy_obj._predict(obs_tensor, deterministic=True)
         else:
             actions, _, _ = policy_obj(obs_tensor)
     actions_np = actions.detach().cpu().numpy()
@@ -849,6 +861,7 @@ def _ppo_like_apply_rollout_segment_start(
         visible=float(visible),
         age_norm=0.0,
     )
+    sync_policy_runtime_intent_override_from_obs(policy, patched_obs)
     return {
         "obs": patched_obs,
         "used_selector": bool(used_selector),

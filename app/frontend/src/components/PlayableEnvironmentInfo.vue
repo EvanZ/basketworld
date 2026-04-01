@@ -239,6 +239,7 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
       <article class="env-card">
         <h4>Policies</h4>
         <div class="param-row"><span>Run ID</span><strong class="mono">{{ formatValue(gameState.run_id) }}</strong></div>
+        <div class="param-row"><span>Model codename</span><strong>{{ formatValue(gameState.model_codename) }}</strong></div>
         <div class="param-row"><span>Unified policy</span><strong class="mono">{{ formatValue(gameState.unified_policy_name) }}</strong></div>
         <div class="param-row"><span>Pass mode</span><strong>{{ formatValue(gameState.pass_mode) }}</strong></div>
         <div class="param-row"><span>Pass target strategy</span><strong>{{ formatValue(gameState.pass_target_strategy) }}</strong></div>

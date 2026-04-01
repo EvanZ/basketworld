@@ -824,18 +824,22 @@ class IntentDiversityCallback(BaseCallback):
             feat[start : start + act_take] = act_feat[:act_take]
 
         role_flag = self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0)
-        intent_active = self._extract_scalar_from_obs(
-            obs_payload,
-            "intent_active",
-            env_idx,
-            default=float(info.get("intent_active", 0.0)),
-        )
-        intent_index = self._extract_scalar_from_obs(
-            obs_payload,
-            "intent_index",
-            env_idx,
-            default=float(info.get("intent_index", 0.0)),
-        )
+        intent_active = float(info.get("intent_active", np.nan))
+        if not np.isfinite(intent_active):
+            intent_active = self._extract_scalar_from_obs(
+                obs_payload,
+                "intent_active",
+                env_idx,
+                default=0.0,
+            )
+        intent_index = float(info.get("intent_index", np.nan))
+        if not np.isfinite(intent_index):
+            intent_index = self._extract_scalar_from_obs(
+                obs_payload,
+                "intent_index",
+                env_idx,
+                default=0.0,
+            )
 
         return IntentTransition(
             feature=feat,
@@ -2269,10 +2273,31 @@ class IntentSelectorCallback(BaseCallback):
         )
         return selector_obs
 
+    def _get_role_intent_fields(
+        self, env_idx: int, *, observer_is_offense: bool
+    ) -> dict[str, float]:
+        try:
+            values = self.training_env.env_method(
+                "get_intent_observation_fields",
+                bool(observer_is_offense),
+                indices=[int(env_idx)],
+            )
+        except Exception:
+            return {}
+        if not values:
+            return {}
+        fields = values[0]
+        if not isinstance(fields, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key in ("intent_index", "intent_active", "intent_visible", "intent_age_norm"):
+            try:
+                out[key] = float(np.asarray(fields.get(key, 0.0)).reshape(-1)[0])
+            except Exception:
+                out[key] = 0.0
+        return out
+
     def _apply_selected_intent(self, obs_payload, env_idx: int, intent_index: int) -> None:
-        visible = self._extract_scalar_from_obs(
-            obs_payload, "intent_visible", env_idx, default=1.0
-        )
         try:
             self.training_env.env_method(
                 "set_offense_intent_state",
@@ -2283,6 +2308,11 @@ class IntentSelectorCallback(BaseCallback):
             )
         except Exception:
             pass
+        visible = float(
+            self._get_role_intent_fields(
+                env_idx, observer_is_offense=True
+            ).get("intent_visible", 1.0)
+        )
         patch_intent_in_observation(
             obs_payload,
             int(intent_index),
@@ -2299,7 +2329,8 @@ class IntentSelectorCallback(BaseCallback):
         if self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0) <= 0.0:
             self._episode_start_records_by_env.pop(int(env_idx), None)
             return
-        if self._extract_scalar_from_obs(obs_payload, "intent_active", env_idx, default=0.0) <= 0.5:
+        fields = self._get_role_intent_fields(env_idx, observer_is_offense=True)
+        if float(fields.get("intent_active", 0.0)) <= 0.5:
             self._episode_start_records_by_env.pop(int(env_idx), None)
             return
 

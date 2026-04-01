@@ -9,6 +9,7 @@ from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.intent_policy_sensitivity import (
     clone_observation_dict,
     patch_intent_in_observation,
+    sync_policy_runtime_intent_override_from_env,
 )
 
 from .observations import (
@@ -339,9 +340,13 @@ def apply_rollout_segment_start(
         int(intent_index),
         intent_commitment_steps=int(getattr(base_env, "intent_commitment_steps", 0)),
     )
+    rebuilt_obs = rebuild_observation_from_env(env, current_obs=base_obs)
+    sync_policy_runtime_intent_override_from_env(
+        offense_policy, env, observer_is_offense=True
+    )
     return {
         "applied": True,
-        "obs": rebuild_observation_from_env(env, current_obs=base_obs),
+        "obs": rebuilt_obs,
         "used_selector": bool(result.get("used_selector", False)),
         "intent_index": int(intent_index),
         "alpha": float(result.get("alpha", 0.0) or 0.0),

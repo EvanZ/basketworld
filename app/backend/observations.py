@@ -12,6 +12,9 @@ from basketworld.utils.action_resolution import (
     get_policy_action_probabilities,
     resolve_illegal_actions,
 )
+from basketworld.utils.intent_policy_sensitivity import (
+    sync_policy_runtime_intent_override_from_env,
+)
 from basketworld.utils.wrappers import SetObservationWrapper
 
 from .env_access import env_view
@@ -48,6 +51,8 @@ def _apply_observation_wrappers(env, obs):
 def _apply_intent_fields_for_role(cloned: Dict, env, role_flag_value: float) -> Dict:
     """Recondition role-dependent intent fields for cloned observations."""
     if env is None:
+        return cloned
+    if "players" in cloned and "globals" in cloned:
         return cloned
     base_env = _resolve_base_env(env)
     observer_is_offense = bool(float(role_flag_value) > 0.0)
@@ -88,6 +93,8 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
     if isinstance(obs, dict):
         for key, value in obs.items():
             if key in cloned:
+                continue
+            if key in {"intent_index", "intent_active", "intent_visible", "intent_age_norm"}:
                 continue
             if isinstance(value, np.ndarray):
                 cloned[key] = np.copy(value)
@@ -264,6 +271,11 @@ def _predict_actions_for_team(
 
     raw_actions = None
     try:
+        sync_policy_runtime_intent_override_from_env(
+            policy,
+            env,
+            observer_is_offense=bool(float(role_flag_value) > 0.0),
+        )
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
     except Exception as err:
         global _predict_failure_count
@@ -471,7 +483,13 @@ def _compute_state_values_from_obs(obs_dict: dict | None):
         if offense_obs is None or defense_obs is None:
             return None
 
+        sync_policy_runtime_intent_override_from_env(
+            value_policy, game_state.env, observer_is_offense=True
+        )
         offense_tensor, _ = value_policy.policy.obs_to_tensor(offense_obs)
+        sync_policy_runtime_intent_override_from_env(
+            value_policy, game_state.env, observer_is_offense=False
+        )
         defense_tensor, _ = value_policy.policy.obs_to_tensor(defense_obs)
 
         with torch.no_grad():
@@ -577,6 +595,11 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             conditioned_next_obs, temp_env, role_flag_value
         )
 
+        sync_policy_runtime_intent_override_from_env(
+            value_policy,
+            temp_env,
+            observer_is_offense=bool(float(role_flag_value) > 0.0),
+        )
         next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
         with torch.no_grad():
             next_value = value_policy.policy.predict_values(next_obs_tensor)

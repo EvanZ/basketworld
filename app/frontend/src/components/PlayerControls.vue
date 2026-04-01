@@ -31,6 +31,24 @@ function formatParamCount(n) {
   return String(num);
 }
 
+function lookupPlayName(playNameMap, intentIndex) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx) || !playNameMap || typeof playNameMap !== 'object') return null;
+  const raw = playNameMap[String(idx)] ?? playNameMap[idx];
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+function formatPlayLabel(intentIndex, playNameMap, explicitName = null) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx)) return 'Unknown play';
+  const name = (typeof explicitName === 'string' && explicitName.trim())
+    ? explicitName.trim()
+    : lookupPlayName(playNameMap, idx);
+  return name ? `${name} (z=${idx})` : `z=${idx}`;
+}
+
 const props = defineProps({
   gameState: Object,
   activePlayerId: Number,
@@ -141,7 +159,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -542,7 +560,7 @@ const counterfactualSnapshotIntentSummary = computed(() => {
   if (!active) return 'Inactive';
   const idx = props.gameState?.counterfactual_snapshot_intent_index ?? 0;
   const age = props.gameState?.counterfactual_snapshot_intent_age ?? 0;
-  return `z=${idx}, age=${age}`;
+  return `${formatPlayLabel(idx, props.gameState?.play_name_map)}, age=${age}`;
 });
 const counterfactualSnapshotControlsDisabled = computed(() =>
   counterfactualSnapshotUpdating.value ||
@@ -1837,7 +1855,7 @@ const intentSelectionRows = computed(() => {
   const rows = Object.entries(raw)
     .map(([intent, count]) => ({
       intent: Number(intent),
-      label: `z=${Number(intent)}`,
+      label: formatPlayLabel(Number(intent), props.gameState?.play_name_map),
       count: Number(count || 0),
     }))
     .filter((row) => Number.isFinite(row.intent))
@@ -2301,8 +2319,13 @@ async function copyStatsMarkdown() {
       `${(actionTotal > 0 ? (Number(count) / actionTotal) * 100 : 0).toFixed(1)}%`,
     ]);
     const intentRows = Object.entries(s.intentSelectionCounts || {})
-      .map(([intent, count]) => [`z=${Number(intent)}`, String(Number(count || 0))])
-      .sort((a, b) => Number(a[0].slice(2)) - Number(b[0].slice(2)));
+      .map(([intent, count]) => [
+        formatPlayLabel(Number(intent), props.gameState?.play_name_map),
+        String(Number(count || 0)),
+        Number(intent),
+      ])
+      .sort((a, b) => Number(a[2]) - Number(b[2]))
+      .map(([label, count]) => [label, count]);
     if (Number(s.intentInactiveCount || 0) > 0) {
       intentRows.push(['No intent', String(Number(s.intentInactiveCount || 0))]);
     }
@@ -2503,6 +2526,12 @@ const selectorIntentPreferences = computed(() => {
     currentIntentIndex: payload?.current_intent_index ?? null,
     items,
   };
+});
+const playbookSelectedIntentLabels = computed(() => {
+  const indices = Array.isArray(playbookSelectedIntentIndices.value)
+    ? playbookSelectedIntentIndices.value
+    : [];
+  return indices.map((intentIndex) => formatPlayLabel(intentIndex, props.gameState?.play_name_map));
 });
 const selectorIntentEntropy = computed(() => {
   const items = selectorIntentPreferences.value.items || [];
@@ -4535,7 +4564,7 @@ const stealRisks = computed(() => {
               <thead>
                 <tr>
                   <th>#</th>
-                  <th>Intent</th>
+                  <th>Play</th>
                   <th>Prob</th>
                   <th>Logit</th>
                 </tr>
@@ -4549,7 +4578,7 @@ const stealRisks = computed(() => {
                   :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(item.prob) * 100)).toFixed(2)}%` }"
                 >
                   <td>{{ idx + 1 }}</td>
-                  <td>z={{ item.intent_index }}</td>
+                  <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
                   <td>{{ (Number(item.prob) * 100).toFixed(2) }}%</td>
                   <td>{{ Number(item.logit).toFixed(3) }}</td>
                 </tr>
@@ -4619,7 +4648,7 @@ const stealRisks = computed(() => {
               placeholder="0, 1, 2, 3"
               :disabled="playbookControlsDisabled"
             />
-            <span class="status-note">Parsed: {{ playbookSelectedIntentIndices.join(', ') || 'none' }}</span>
+            <span class="status-note">Parsed: {{ playbookSelectedIntentLabels.join(', ') || 'none' }}</span>
           </div>
 
           <div class="eval-row">
@@ -4743,7 +4772,7 @@ const stealRisks = computed(() => {
             :key="`playbook-debug-${panel.intent_index}`"
             class="playbook-debug-card"
           >
-            <div class="playbook-debug-title">z={{ panel.intent_index }}</div>
+            <div class="playbook-debug-title">{{ formatPlayLabel(panel.intent_index, playbookResult?.play_name_map || props.gameState?.play_name_map, panel.play_name) }}</div>
             <div class="playbook-debug-line">
               Total shots:
               <strong>{{ panel?.shot_stats?.total?.attempts ?? 0 }}</strong>
@@ -5027,6 +5056,10 @@ const stealRisks = computed(() => {
               <span class="param-name">Run ID:</span>
               <span class="param-value">{{ props.gameState.run_id || 'N/A' }}</span>
             </div>
+            <div class="param-item" data-tooltip="Stable nominal codename for the currently loaded model/run.">
+              <span class="param-name">Model codename:</span>
+              <span class="param-value">{{ props.gameState.model_codename || 'N/A' }}</span>
+            </div>
             <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the player's team">
               <div class="policy-label">
                 Player ({{ props.gameState.user_team_name || 'OFFENSE' }})
@@ -5092,6 +5125,14 @@ const stealRisks = computed(() => {
               >
                 <span v-if="policiesLoading">⟳ Loading...</span>
                 <span v-else>⟳ Refresh </span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="$emit('swap-teams-requested')"
+                :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
+                title="Reinitialize the current run with the opposite user-controlled team"
+              >
+                ↔ Swap Teams
               </button>
             </div>
             <div class="policy-status" v-if="policiesLoading">
@@ -5623,8 +5664,8 @@ const stealRisks = computed(() => {
               </template>
               <span v-else class="param-value">{{ props.gameState.intent_active_current ? '✓ Yes' : '✗ No' }}</span>
             </div>
-            <div class="param-item" data-tooltip="Current latent intent index (masked elsewhere when hidden).">
-              <span class="param-name">Current index:</span>
+            <div class="param-item" data-tooltip="Current latent play identity (masked elsewhere when hidden).">
+              <span class="param-name">Current play:</span>
               <input
                 v-if="props.gameState.enable_intent_learning"
                 class="env-param-input"
@@ -5635,7 +5676,9 @@ const stealRisks = computed(() => {
                 v-model.number="intentStateInput.intent_index"
                 :disabled="intentControlsDisabled"
               />
-              <span v-else class="param-value">{{ props.gameState.intent_index_current ?? 'N/A' }}</span>
+              <span v-else class="param-value">
+                {{ formatPlayLabel(props.gameState.intent_index_current, props.gameState?.play_name_map, props.gameState?.current_play_name) }}
+              </span>
             </div>
             <div class="param-item" data-tooltip="Current age of active intent (steps since sampled).">
               <span class="param-name">Current age:</span>

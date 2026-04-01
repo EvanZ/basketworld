@@ -5,6 +5,12 @@ import time
 from threading import Lock
 from fastapi.encoders import jsonable_encoder
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.play_names import (
+    build_model_codename,
+    build_play_name_mapping,
+    lookup_play_name,
+    play_name_seed_key,
+)
 from basketworld.utils.wrappers import SetObservationWrapper
 from app.backend.env_access import env_view, get_env_attr
 
@@ -255,6 +261,44 @@ def _build_counterfactual_snapshot_metadata() -> dict:
         "intent_age": int(env.intent_age or 0),
         "captured_at": float(time.time()),
     }
+
+
+def get_current_play_name_map(num_intents: int | None = None) -> dict[str, str]:
+    env_obj = env_view(game_state.env) if game_state.env else None
+    count = int(
+        max(
+            0,
+            num_intents
+            if num_intents is not None
+            else getattr(env_obj, "num_intents", 0) or 0,
+        )
+    )
+    if count <= 0:
+        return {}
+    seed_key = play_name_seed_key(
+        run_id=getattr(game_state, "run_id", None),
+        unified_policy_key=getattr(game_state, "unified_policy_key", None),
+        unified_policy_path=getattr(game_state, "unified_policy_path", None),
+        run_name=getattr(game_state, "run_name", None),
+        fallback="session",
+    )
+    mapping = build_play_name_mapping(seed_key, count)
+    return {str(int(idx)): str(name) for idx, name in mapping.items()}
+
+
+def get_current_model_codename() -> str | None:
+    seed_key = play_name_seed_key(
+        run_id=getattr(game_state, "run_id", None),
+        unified_policy_key=getattr(game_state, "unified_policy_key", None),
+        unified_policy_path=getattr(game_state, "unified_policy_path", None),
+        run_name=getattr(game_state, "run_name", None),
+        fallback="session",
+    )
+    try:
+        codename = build_model_codename(seed_key)
+    except Exception:
+        return None
+    return str(codename).strip() or None
 
 
 def _capture_restorable_backend_state() -> dict:
@@ -575,6 +619,7 @@ def get_full_game_state(
 
     counterfactual_snapshot = get_counterfactual_snapshot_summary()
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
+    play_name_map = get_current_play_name_map(int(getattr(env, "num_intents", 0) or 0))
 
     state = {
         "players_per_side": int(env.players_per_side or 3),
@@ -679,6 +724,7 @@ def get_full_game_state(
         "intent_visible_to_defense_prob": float(env.intent_visible_to_defense_prob or 0.0),
         "enable_defense_intent_learning": bool(env.enable_defense_intent_learning),
         "defense_intent_null_prob": float(env.defense_intent_null_prob or 1.0),
+        "play_name_map": play_name_map,
         "intent_diversity_enabled": (
             bool(
                 getattr(game_state, "mlflow_training_params", {}).get(
@@ -693,6 +739,7 @@ def get_full_game_state(
         ),
         "intent_active_current": bool(env.intent_active),
         "intent_index_current": int(env.intent_index or 0),
+        "current_play_name": lookup_play_name(play_name_map, int(env.intent_index or 0)),
         "intent_age": int(env.intent_age or 0),
         "intent_commitment_remaining": int(env.intent_commitment_remaining or 0),
         "selector_segment_index_current": int(
@@ -706,6 +753,9 @@ def get_full_game_state(
         ),
         "defense_intent_active_current": bool(env.defense_intent_active),
         "defense_intent_index_current": int(env.defense_intent_index or 0),
+        "current_defense_play_name": lookup_play_name(
+            play_name_map, int(env.defense_intent_index or 0)
+        ),
         "defense_intent_age": int(env.defense_intent_age or 0),
         "defense_intent_commitment_remaining": int(env.defense_intent_commitment_remaining or 0),
         "include_hoop_vector": bool(env.include_hoop_vector),
@@ -740,6 +790,7 @@ def get_full_game_state(
         ),
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),
+        "model_codename": get_current_model_codename(),
         "training_params": getattr(game_state, "mlflow_training_params", None),
         "mlflow_env_defaults": (
             dict(getattr(game_state, "mlflow_env_optional_defaults", {}) or {})
@@ -793,6 +844,24 @@ def get_full_game_state(
             role_flag_offense=1.0,
         )
         if selector_prefs is not None:
+            try:
+                selector_prefs = dict(selector_prefs)
+                selector_prefs["play_name_map"] = play_name_map
+                selector_prefs["current_play_name"] = lookup_play_name(
+                    play_name_map, selector_prefs.get("current_intent_index")
+                )
+                ranked_items = []
+                for item in selector_prefs.get("intent_probs", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    row = dict(item)
+                    row["play_name"] = lookup_play_name(
+                        play_name_map, row.get("intent_index")
+                    )
+                    ranked_items.append(row)
+                selector_prefs["intent_probs"] = ranked_items
+            except Exception:
+                pass
             state["selector_intent_preferences"] = selector_prefs
 
     if include_action_values:

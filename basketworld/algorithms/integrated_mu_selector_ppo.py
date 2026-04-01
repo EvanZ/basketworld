@@ -9,13 +9,16 @@ import torch.nn.functional as F
 import warnings
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.save_util import load_from_zip_file, recursive_getattr
-from stable_baselines3.common.utils import obs_as_tensor
+from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 
 from basketworld.utils.intent_discovery import RunningMeanStd
+from basketworld.utils.intent_rollout_buffer import (
+    IntentConditionedDictRolloutBuffer,
+)
 from basketworld.utils.intent_policy_sensitivity import (
     clone_observation_dict,
     extract_single_env_observation,
@@ -73,6 +76,8 @@ class IntegratedIntentSelectorPPO(PPO):
         self._selector_episode_segment_counts: Optional[np.ndarray] = None
         self._selector_episode_trackable_mask: Optional[np.ndarray] = None
         self._selector_current_obs_selected_mask: Optional[np.ndarray] = None
+        self._policy_runtime_intent_indices: Optional[np.ndarray] = None
+        self._policy_runtime_intent_gate: Optional[np.ndarray] = None
         self._selector_rollout_completed_episode_segment_counts: list[int] = []
         self._selector_rollout_boundary_reason_counts: dict[str, int] = {}
         self._selector_last_metrics: dict[str, float] = {}
@@ -90,6 +95,8 @@ class IntegratedIntentSelectorPPO(PPO):
                 "_selector_episode_segment_counts",
                 "_selector_episode_trackable_mask",
                 "_selector_current_obs_selected_mask",
+                "_policy_runtime_intent_indices",
+                "_policy_runtime_intent_gate",
                 "_selector_rollout_completed_episode_segment_counts",
                 "_selector_rollout_boundary_reason_counts",
                 "_selector_last_metrics",
@@ -99,6 +106,18 @@ class IntegratedIntentSelectorPPO(PPO):
 
     def _setup_model(self) -> None:
         super()._setup_model()
+        if isinstance(self.rollout_buffer, DictRolloutBuffer) and not isinstance(
+            self.rollout_buffer, IntentConditionedDictRolloutBuffer
+        ):
+            self.rollout_buffer = IntentConditionedDictRolloutBuffer(
+                self.n_steps,
+                self.observation_space,
+                self.action_space,
+                device=self.device,
+                gae_lambda=self.gae_lambda,
+                gamma=self.gamma,
+                n_envs=self.n_envs,
+            )
         self._selector_reset_runtime_state(self.n_envs)
         if self.intent_selector_enabled and not self._policy_has_intent_selector():
             raise RuntimeError(
@@ -209,9 +228,12 @@ class IntegratedIntentSelectorPPO(PPO):
         self._selector_episode_segment_counts = np.zeros(env_count, dtype=np.int64)
         self._selector_episode_trackable_mask = np.zeros(env_count, dtype=bool)
         self._selector_current_obs_selected_mask = np.zeros(env_count, dtype=bool)
+        self._policy_runtime_intent_indices = np.zeros(env_count, dtype=np.int64)
+        self._policy_runtime_intent_gate = np.zeros(env_count, dtype=np.float32)
         self._selector_rollout_completed_episode_segment_counts = []
         self._selector_rollout_boundary_reason_counts = {}
         self._selector_last_metrics = {}
+        self._selector_push_policy_runtime_intent_override()
 
     def _selector_ensure_runtime_state(self, n_envs: int) -> None:
         if (
@@ -233,6 +255,81 @@ class IntegratedIntentSelectorPPO(PPO):
     def _selector_reset_rollout_observability(self) -> None:
         self._selector_rollout_completed_episode_segment_counts = []
         self._selector_rollout_boundary_reason_counts = {}
+
+    def _selector_push_policy_runtime_intent_override(self) -> None:
+        policy = getattr(self, "policy", None)
+        if policy is None:
+            return
+        if not hasattr(policy, "set_runtime_intent_override"):
+            return
+        if (
+            self._policy_runtime_intent_indices is None
+            or self._policy_runtime_intent_gate is None
+        ):
+            clearer = getattr(policy, "clear_runtime_intent_override", None)
+            if callable(clearer):
+                clearer()
+            return
+        try:
+            policy.set_runtime_intent_override(
+                self._policy_runtime_intent_indices,
+                self._policy_runtime_intent_gate,
+            )
+        except Exception:
+            pass
+
+    def _selector_sync_policy_runtime_from_obs(self, obs_payload: Any) -> None:
+        batch_size = self._selector_obs_batch_size(obs_payload)
+        if batch_size <= 0:
+            self._policy_runtime_intent_indices = None
+            self._policy_runtime_intent_gate = None
+            self._selector_push_policy_runtime_intent_override()
+            return
+        self._selector_ensure_runtime_state(batch_size)
+        assert self._policy_runtime_intent_indices is not None
+        assert self._policy_runtime_intent_gate is not None
+        for env_idx in range(int(batch_size)):
+            role_flag = self._selector_extract_scalar_from_obs(
+                obs_payload, "role_flag", env_idx, default=0.0
+            )
+            fields = self._selector_get_role_intent_fields(
+                env_idx, observer_is_offense=bool(role_flag > 0.0)
+            )
+            intent_index = int(max(0, float(fields.get("intent_index", 0.0))))
+            intent_active = float(fields.get("intent_active", 0.0))
+            intent_visible = float(fields.get("intent_visible", 1.0))
+            self._policy_runtime_intent_indices[env_idx] = int(intent_index)
+            self._policy_runtime_intent_gate[env_idx] = float(
+                1.0 if (intent_active > 0.5 and intent_visible > 0.5) else 0.0
+            )
+        self._selector_push_policy_runtime_intent_override()
+
+    def _selector_get_role_intent_fields(
+        self, env_idx: int, *, observer_is_offense: bool
+    ) -> dict[str, float]:
+        vec_env = self.get_env()
+        if vec_env is None:
+            return {}
+        try:
+            values = vec_env.env_method(
+                "get_intent_observation_fields",
+                bool(observer_is_offense),
+                indices=[int(env_idx)],
+            )
+        except Exception:
+            return {}
+        if not values:
+            return {}
+        fields = values[0]
+        if not isinstance(fields, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key in ("intent_index", "intent_active", "intent_visible", "intent_age_norm"):
+            try:
+                out[key] = float(np.asarray(fields.get(key, 0.0)).reshape(-1)[0])
+            except Exception:
+                out[key] = 0.0
+        return out
 
     @staticmethod
     def _selector_extract_scalar_from_obs(
@@ -325,9 +422,6 @@ class IntegratedIntentSelectorPPO(PPO):
         self, obs_payload: dict[str, Any], env_idx: int, intent_index: int
     ) -> None:
         vec_env = self.get_env()
-        visible = self._selector_extract_scalar_from_obs(
-            obs_payload, "intent_visible", env_idx, default=1.0
-        )
         if vec_env is not None:
             try:
                 vec_env.env_method(
@@ -339,6 +433,20 @@ class IntegratedIntentSelectorPPO(PPO):
                 )
             except Exception:
                 pass
+        visible = float(
+            self._selector_get_role_intent_fields(
+                env_idx, observer_is_offense=True
+            ).get("intent_visible", 1.0)
+        )
+        if (
+            self._policy_runtime_intent_indices is not None
+            and self._policy_runtime_intent_gate is not None
+            and 0 <= int(env_idx) < len(self._policy_runtime_intent_indices)
+        ):
+            self._policy_runtime_intent_indices[int(env_idx)] = int(intent_index)
+            self._policy_runtime_intent_gate[int(env_idx)] = float(1.0 if visible > 0.5 else 0.0)
+            self._selector_push_policy_runtime_intent_override()
+        # Keep observation metadata aligned for rollout storage and label extraction.
         patch_intent_in_observation(
             obs_payload,
             int(intent_index),
@@ -367,15 +475,16 @@ class IntegratedIntentSelectorPPO(PPO):
     def _selector_episode_is_trackable(self, obs_payload: Any, env_idx: int) -> bool:
         if not isinstance(obs_payload, dict):
             return False
+        role_flag = self._selector_extract_scalar_from_obs(
+            obs_payload, "role_flag", env_idx, default=0.0
+        )
+        if role_flag <= 0.0:
+            return False
+        fields = self._selector_get_role_intent_fields(
+            env_idx, observer_is_offense=True
+        )
         return (
-            self._selector_extract_scalar_from_obs(
-                obs_payload, "role_flag", env_idx, default=0.0
-            )
-            > 0.0
-            and self._selector_extract_scalar_from_obs(
-                obs_payload, "intent_active", env_idx, default=0.0
-            )
-            > 0.5
+            float(fields.get("intent_active", 0.0)) > 0.5
         )
 
     def _selector_mark_episode_start(self, obs_payload: Any, env_idx: int) -> None:
@@ -469,12 +578,10 @@ class IntegratedIntentSelectorPPO(PPO):
             <= 0.0
         ):
             return prepared
-        if (
-            self._selector_extract_scalar_from_obs(
-                obs_payload, "intent_active", env_idx, default=0.0
-            )
-            <= 0.5
-        ):
+        fields = self._selector_get_role_intent_fields(
+            env_idx, observer_is_offense=True
+        )
+        if float(fields.get("intent_active", 0.0)) <= 0.5:
             return prepared
 
         n_envs = self._selector_obs_batch_size(obs_payload)
@@ -654,12 +761,18 @@ class IntegratedIntentSelectorPPO(PPO):
                     self._last_obs, env_idx
                 )
                 self._selector_current_obs_selected_mask[env_idx] = bool(selected)
+        if isinstance(self._last_obs, dict):
+            self._selector_sync_policy_runtime_from_obs(self._last_obs)
 
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 self.policy.reset_noise(env.num_envs)
 
             with torch.no_grad():
+                if isinstance(self._last_obs, dict):
+                    self._selector_sync_policy_runtime_from_obs(self._last_obs)
+                else:
+                    self._selector_sync_policy_runtime_from_obs(None)
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
@@ -736,6 +849,7 @@ class IntegratedIntentSelectorPPO(PPO):
                         new_obs, env_idx, prepared
                     )
                     next_selected_mask[int(env_idx)] = bool(used_selector)
+                self._selector_sync_policy_runtime_from_obs(new_obs)
 
             self._update_info_buffer(infos)
             n_steps += 1
@@ -756,19 +870,35 @@ class IntegratedIntentSelectorPPO(PPO):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]
                     rewards[idx] += self.gamma * terminal_value
 
-            rollout_buffer.add(
-                self._last_obs,
-                actions,
-                rewards,
-                self._last_episode_starts,
-                values,
-                log_probs,
-            )
+            if isinstance(rollout_buffer, IntentConditionedDictRolloutBuffer):
+                rollout_buffer.add(
+                    self._last_obs,
+                    actions,
+                    rewards,
+                    self._last_episode_starts,
+                    values,
+                    log_probs,
+                    intent_indices=self._policy_runtime_intent_indices,
+                    intent_gate=self._policy_runtime_intent_gate,
+                )
+            else:
+                rollout_buffer.add(
+                    self._last_obs,
+                    actions,
+                    rewards,
+                    self._last_episode_starts,
+                    values,
+                    log_probs,
+                )
             self._last_obs = new_obs
             self._last_episode_starts = dones
             self._selector_current_obs_selected_mask = next_selected_mask
 
         with torch.no_grad():
+            if isinstance(new_obs, dict):
+                self._selector_sync_policy_runtime_from_obs(new_obs)
+            else:
+                self._selector_sync_policy_runtime_from_obs(None)
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
@@ -777,7 +907,135 @@ class IntegratedIntentSelectorPPO(PPO):
         return True
 
     def train(self) -> None:
-        super().train()
+        self.policy.set_training_mode(True)
+        clear_override = getattr(self.policy, "clear_runtime_intent_override", None)
+        set_override = getattr(self.policy, "set_runtime_intent_override", None)
+        if callable(clear_override):
+            clear_override()
+
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+
+        entropy_losses: list[float] = []
+        pg_losses: list[float] = []
+        value_losses: list[float] = []
+        clip_fractions: list[float] = []
+
+        continue_training = True
+        approx_kl_divs: list[float] = []
+        loss = None
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    actions = rollout_data.actions.long().flatten()
+
+                if self.use_sde:
+                    self.policy.reset_noise(self.batch_size)
+
+                if callable(set_override):
+                    intent_indices = getattr(rollout_data, "intent_indices", None)
+                    intent_gate = getattr(rollout_data, "intent_gate", None)
+                    if intent_indices is not None:
+                        set_override(intent_indices, intent_gate)
+                    elif callable(clear_override):
+                        clear_override()
+
+                try:
+                    values, log_prob, entropy = self.policy.evaluate_actions(
+                        rollout_data.observations, actions
+                    )
+                finally:
+                    if callable(clear_override):
+                        clear_override()
+
+                values = values.flatten()
+                advantages = rollout_data.advantages
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (
+                        advantages.std() + 1e-8
+                    )
+
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(
+                    ratio, 1 - clip_range, 1 + clip_range
+                )
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                pg_losses.append(policy_loss.item())
+                clip_fraction = torch.mean(
+                    (torch.abs(ratio - 1) > clip_range).float()
+                ).item()
+                clip_fractions.append(clip_fraction)
+
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    values_pred = rollout_data.old_values + torch.clamp(
+                        values - rollout_data.old_values,
+                        -clip_range_vf,
+                        clip_range_vf,
+                    )
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
+
+                if entropy is None:
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
+                entropy_losses.append(entropy_loss.item())
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                with torch.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = torch.mean(
+                        (torch.exp(log_ratio) - 1) - log_ratio
+                    ).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
+
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(
+                            f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}"
+                        )
+                    break
+
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), self.max_grad_norm
+                )
+                self.policy.optimizer.step()
+
+            self._n_updates += 1
+            if not continue_training:
+                break
+
+        explained_var = explained_variance(
+            self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
+        )
+
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", 0.0 if loss is None else loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", torch.exp(self.policy.log_std).mean().item())
+
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", clip_range)
+        if self.clip_range_vf is not None:
+            self.logger.record("train/clip_range_vf", clip_range_vf)
+
         self._selector_log_rollout_segment_metrics()
         self._train_intent_selector()
 

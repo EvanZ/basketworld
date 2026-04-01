@@ -15,6 +15,9 @@ from basketworld.utils.action_resolution import (
     get_policy_action_probabilities,
     resolve_illegal_actions,
 )
+from basketworld.utils.intent_policy_sensitivity import (
+    sync_policy_runtime_intent_override_from_env,
+)
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from stable_baselines3 import PPO
@@ -194,8 +197,12 @@ def _worker_clone_obs_with_role_flag(obs: dict, role_flag_value: float) -> dict:
         for key, value in obs.items():
             if key in cloned:
                 continue
+            if key in {"intent_index", "intent_active", "intent_visible", "intent_age_norm"}:
+                continue
             if isinstance(value, _np.ndarray):
                 cloned[key] = _np.copy(value)
+    if "players" in cloned and "globals" in cloned:
+        return cloned
     observer_is_offense = bool(float(role_flag_value) > 0.0)
     env = _worker_state.get("env")
     base_env = getattr(env, "unwrapped", env)
@@ -245,6 +252,11 @@ def _worker_predict_actions_for_team(
     conditioned_obs = _worker_clone_obs_with_role_flag(base_obs, role_flag_value)
 
     try:
+        sync_policy_runtime_intent_override_from_env(
+            policy,
+            env,
+            observer_is_offense=bool(float(role_flag_value) > 0.0),
+        )
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
     except Exception as err:
         err_count = int(_worker_state.get("predict_failure_count", 0)) + 1

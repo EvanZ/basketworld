@@ -15,6 +15,7 @@ from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.intent_policy_sensitivity import (
     clone_observation_dict,
     patch_intent_in_observation,
+    sync_policy_runtime_intent_override_from_env,
 )
 from basketworld.utils.policy_loading import load_ppo_for_inference
 
@@ -60,6 +61,8 @@ def _recondition_intent_fields_for_role(
     env: Any, obs_dict: dict, observer_is_offense: bool
 ) -> dict:
     if not isinstance(obs_dict, dict):
+        return obs_dict
+    if "players" in obs_dict and "globals" in obs_dict:
         return obs_dict
     base_env = getattr(env, "unwrapped", env)
     try:
@@ -433,6 +436,11 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         """Update role-dependent intent fields after role-flag flips."""
         if not isinstance(obs_dict, dict):
             return
+        # Set-observation pipelines no longer carry intent fields in the low-level
+        # observation dict. Runtime play conditioning is handled policy-side, so do
+        # not re-inject legacy intent keys or overwrite the compact globals vector.
+        if "players" in obs_dict and "globals" in obs_dict:
+            return
         try:
             env = self.env.unwrapped
         except Exception:
@@ -488,6 +496,11 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         # Opponent raw actions and probs
         try:
             self._ensure_opponent_loaded()
+            sync_policy_runtime_intent_override_from_env(
+                self.opponent_policy,
+                self.env,
+                observer_is_offense=bool(opponent_is_offense),
+            )
             opp_actions_raw, _ = self.opponent_policy.predict(
                 opponent_obs, deterministic=self.deterministic_opponent
             )
@@ -769,6 +782,17 @@ class SelfPlayEnvWrapper(gym.Wrapper):
         except Exception:
             pass
         return None
+
+    def get_intent_observation_fields(
+        self, observer_is_offense: bool
+    ):  # pragma: no cover - thin shim
+        try:
+            getter = getattr(self.env.unwrapped, "get_intent_observation_fields", None)
+            if callable(getter):
+                return getter(bool(observer_is_offense))
+        except Exception:
+            pass
+        return {}
 
     def get_profile_stats(self):  # pragma: no cover - thin shim
         try:

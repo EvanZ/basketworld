@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional, Sequence
+from contextlib import nullcontext
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 import torch
@@ -104,7 +105,9 @@ def patch_intent_in_observation(
     globals_arr = obs.get("globals")
     if globals_arr is not None:
         globals_np = np.asarray(globals_arr, dtype=np.float32)
-        # Set-observation wrapper appends intent globals to the 4 base globals.
+        # Legacy set-observation layouts appended intent globals after the 4 base globals.
+        # New nominal conditioning paths leave globals as pure game-state features, so this
+        # block naturally becomes a no-op when those trailing slots are absent.
         if globals_np.shape[-1] >= (_BASE_SET_GLOBAL_DIM + _INTENT_GLOBAL_DIM):
             if batch_index is None:
                 globals_np = np.array(globals_np, copy=True)
@@ -132,7 +135,7 @@ def build_intent_variant_batch(
     active: float = 1.0,
     visible: float = 1.0,
     age_norm: float = 0.0,
-) -> tuple[dict, list[int]]:
+) -> tuple[dict, list[int], np.ndarray]:
     """Repeat one observation into a batch and patch each row with a different intent."""
     intents = (
         [int(z) for z in candidate_intents]
@@ -153,23 +156,173 @@ def build_intent_variant_batch(
             age_norm=age_norm,
             batch_index=batch_idx,
         )
-    return batch, intents
+    gate = np.full(
+        (len(intents),),
+        float(1.0 if (float(active) > 0.5 and float(visible) > 0.5) else 0.0),
+        dtype=np.float32,
+    )
+    return batch, intents, gate
 
 
-def get_policy_action_probabilities_tensor(policy_or_model, obs) -> Optional[np.ndarray]:
+def clear_policy_runtime_intent_override(policy_or_model) -> None:
+    policy_obj = getattr(policy_or_model, "policy", None)
+    if policy_obj is None:
+        policy_obj = policy_or_model
+    clearer = getattr(policy_obj, "clear_runtime_intent_override", None)
+    if callable(clearer):
+        clearer()
+
+
+def set_policy_runtime_intent_override(
+    policy_or_model,
+    intent_indices: Any,
+    intent_gate: Optional[Any] = None,
+) -> None:
+    policy_obj = getattr(policy_or_model, "policy", None)
+    if policy_obj is None:
+        policy_obj = policy_or_model
+    if policy_obj is None:
+        return
+    setter = getattr(policy_obj, "set_runtime_intent_override", None)
+    if not callable(setter):
+        return
+    setter(intent_indices, intent_gate)
+
+
+def sync_policy_runtime_intent_override_from_obs(policy_or_model, obs: Any) -> None:
+    """Update a policy's explicit runtime intent override from observation metadata."""
+    policy_obj = getattr(policy_or_model, "policy", None)
+    if policy_obj is None:
+        policy_obj = policy_or_model
+    if policy_obj is None:
+        return
+
+    setter = getattr(policy_obj, "set_runtime_intent_override", None)
+    clearer = getattr(policy_obj, "clear_runtime_intent_override", None)
+    if not callable(setter):
+        return
+    if not isinstance(obs, dict):
+        if callable(clearer):
+            clearer()
+        return
+
+    batch_size = 1
+    for scalar_key in ("role_flag", "intent_index", "intent_active", "intent_visible", "intent_age_norm"):
+        if scalar_key not in obs:
+            continue
+        try:
+            arr = np.asarray(obs[scalar_key])
+            if arr.ndim >= 2:
+                batch_size = max(1, int(arr.shape[0]))
+                break
+            batch_size = 1
+            break
+        except Exception:
+            continue
+    else:
+        try:
+            players = np.asarray(obs.get("players"))
+            if players.ndim >= 3:
+                batch_size = max(1, int(players.shape[0]))
+            else:
+                batch_size = 1
+        except Exception:
+            batch_size = 1
+
+    def _scalar(key: str, env_idx: int, default: float) -> float:
+        if key not in obs:
+            return float(default)
+        try:
+            arr = np.asarray(obs[key], dtype=np.float32)
+            if arr.ndim == 0:
+                return float(arr)
+            if arr.ndim >= 2 and arr.shape[0] == batch_size:
+                return float(np.asarray(arr[env_idx]).reshape(-1)[0])
+            return float(np.asarray(arr).reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    intent_indices = np.zeros(batch_size, dtype=np.int64)
+    intent_gate = np.zeros(batch_size, dtype=np.float32)
+    for env_idx in range(batch_size):
+        intent_indices[env_idx] = int(max(0, _scalar("intent_index", env_idx, 0.0)))
+        active = _scalar("intent_active", env_idx, 0.0)
+        visible = _scalar("intent_visible", env_idx, 1.0)
+        intent_gate[env_idx] = float(1.0 if (active > 0.5 and visible > 0.5) else 0.0)
+
+    set_policy_runtime_intent_override(policy_obj, intent_indices, intent_gate)
+
+
+def sync_policy_runtime_intent_override_from_env(
+    policy_or_model,
+    env: Any,
+    *,
+    observer_is_offense: bool,
+) -> None:
+    """Update a policy's explicit runtime intent override from env role-conditioned intent state."""
+    policy_obj = getattr(policy_or_model, "policy", None)
+    if policy_obj is None:
+        policy_obj = policy_or_model
+    setter = getattr(policy_obj, "set_runtime_intent_override", None)
+    clearer = getattr(policy_obj, "clear_runtime_intent_override", None)
+    if not callable(setter):
+        return
+    if env is None:
+        if callable(clearer):
+            clearer()
+        return
+    base_env = getattr(env, "unwrapped", env)
+    try:
+        fields = base_env.get_intent_observation_fields(bool(observer_is_offense))
+    except Exception:
+        fields = {}
+    if not isinstance(fields, dict) or not fields:
+        if callable(clearer):
+            clearer()
+        return
+    try:
+        intent_index = int(
+            max(0, float(np.asarray(fields.get("intent_index", [0.0])).reshape(-1)[0]))
+        )
+        active = float(np.asarray(fields.get("intent_active", [0.0])).reshape(-1)[0])
+        visible = float(np.asarray(fields.get("intent_visible", [1.0])).reshape(-1)[0])
+    except Exception:
+        if callable(clearer):
+            clearer()
+        return
+    gate = float(1.0 if (active > 0.5 and visible > 0.5) else 0.0)
+    set_policy_runtime_intent_override(
+        policy_obj,
+        np.asarray([intent_index], dtype=np.int64),
+        np.asarray([gate], dtype=np.float32),
+    )
+
+
+def get_policy_action_probabilities_tensor(
+    policy_or_model,
+    obs,
+    *,
+    intent_indices: Optional[Any] = None,
+    intent_gate: Optional[Any] = None,
+) -> Optional[np.ndarray]:
     """Return action probabilities as a tensor with shape (B, P, A)."""
     policy_obj = None
+    explicit_override = intent_indices is not None
     try:
         policy_obj = getattr(policy_or_model, "policy", None)
         if policy_obj is None:
             policy_obj = policy_or_model
-        if hasattr(policy_obj, "_extract_role_flag") and hasattr(policy_obj, "_current_role_flags"):
-            try:
-                policy_obj._current_role_flags = policy_obj._extract_role_flag(obs)
-            except Exception:
-                policy_obj._current_role_flags = None
+        if explicit_override:
+            set_policy_runtime_intent_override(
+                policy_obj, intent_indices, intent_gate
+            )
         obs_tensor = policy_obj.obs_to_tensor(obs)[0]
-        distributions = policy_obj.get_distribution(obs_tensor)
+        with (
+            policy_obj.runtime_conditioning_context(obs_tensor)
+            if hasattr(policy_obj, "runtime_conditioning_context")
+            else nullcontext()
+        ):
+            distributions = policy_obj.get_distribution(obs_tensor)
         if hasattr(distributions, "action_probabilities"):
             probs = distributions.action_probabilities()
             if probs.ndim == 2:
@@ -195,8 +348,8 @@ def get_policy_action_probabilities_tensor(policy_or_model, obs) -> Optional[np.
     except Exception:
         return None
     finally:
-        if policy_obj is not None and hasattr(policy_obj, "_current_role_flags"):
-            policy_obj._current_role_flags = None
+        if explicit_override:
+            clear_policy_runtime_intent_override(policy_obj)
 
 
 def apply_action_mask_to_probabilities(
@@ -283,7 +436,7 @@ def compute_policy_sensitivity_metrics(
     valid_states = 0
 
     for obs in observations:
-        batch_obs, used_intents = build_intent_variant_batch(
+        batch_obs, used_intents, intent_gate = build_intent_variant_batch(
             clone_observation_dict(obs),
             num_intents=num_intents,
             candidate_intents=intents,
@@ -291,7 +444,12 @@ def compute_policy_sensitivity_metrics(
             visible=visible,
             age_norm=age_norm,
         )
-        probs = get_policy_action_probabilities_tensor(policy_or_model, batch_obs)
+        probs = get_policy_action_probabilities_tensor(
+            policy_or_model,
+            batch_obs,
+            intent_indices=np.asarray(used_intents, dtype=np.int64),
+            intent_gate=intent_gate,
+        )
         if probs is None or probs.ndim != 3 or probs.shape[0] != len(used_intents):
             continue
         if "action_mask" in batch_obs:

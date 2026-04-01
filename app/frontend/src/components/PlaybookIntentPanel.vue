@@ -34,12 +34,19 @@ const sortedPassLinks = computed(() => {
   entries.sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
   return entries;
 });
+
+const panelTitle = computed(() => {
+  const idx = Number(props.panel?.intent_index);
+  if (!Number.isFinite(idx)) return 'Play';
+  const name = typeof props.panel?.play_name === 'string' ? props.panel.play_name.trim() : '';
+  return name ? `${name} (z=${idx})` : `z=${idx}`;
+});
 </script>
 
 <template>
   <div class="playbook-intent-panel">
     <div class="playbook-intent-header">
-      <h5>z={{ panel.intent_index }}</h5>
+      <h5>{{ panelTitle }}</h5>
       <div class="playbook-intent-metrics">
         <span>{{ panel.num_rollouts }} rollouts</span>
         <span>{{ panel.avg_steps?.toFixed?.(2) ?? '0.00' }} avg steps</span>

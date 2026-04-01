@@ -36,6 +36,24 @@ function percentToProbClamp(percent) {
   return clamped / 100;
 }
 
+function lookupPlayName(playNameMap, intentIndex) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx) || !playNameMap || typeof playNameMap !== 'object') return null;
+  const raw = playNameMap[String(idx)] ?? playNameMap[idx];
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+function formatPlayLabel(intentIndex, playNameMap, explicitName = null) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx)) return 'Unknown play';
+  const name = (typeof explicitName === 'string' && explicitName.trim())
+    ? explicitName.trim()
+    : lookupPlayName(playNameMap, idx);
+  return name ? `${name} (z=${idx})` : `z=${idx}`;
+}
+
 function formatActionForDisplay(actionName, actionMeta) {
   const name = typeof actionName === 'string' ? actionName : 'NOOP';
   const metaType = String(actionMeta?.type || '').toUpperCase();
@@ -331,10 +349,11 @@ const boardShotChartLabel = computed(() =>
 );
 const playbookIntentOptions = computed(() => {
   const panels = Array.isArray(playbookAnalysis.value?.panels) ? playbookAnalysis.value.panels : [];
+  const playNameMap = playbookAnalysis.value?.play_name_map || gameState.value?.play_name_map || {};
   return panels
     .map((panel) => ({
       value: Number(panel.intent_index),
-      label: `z=${Number(panel.intent_index)}`,
+      label: formatPlayLabel(panel.intent_index, playNameMap, panel?.play_name),
     }))
     .filter((opt) => Number.isFinite(opt.value));
 });
@@ -871,6 +890,42 @@ async function handlePolicySwap({ target, policyName }) {
   } finally {
     isPolicySwapping.value = false;
   }
+}
+
+async function handleSwapTeams() {
+  if (isLoading.value || isStepRunning.value || isBallHolderUpdating.value) {
+    console.log('[App] Team swap already blocked by an active operation.');
+    return;
+  }
+
+  const baseSetup = initialSetup.value
+    ? { ...initialSetup.value }
+    : (
+        gameState.value?.run_id
+          ? {
+              runId: gameState.value.run_id,
+              userTeam: gameState.value.user_team_name || 'OFFENSE',
+              unifiedPolicyName: gameState.value.unified_policy_name || null,
+              opponentUnifiedPolicyName: gameState.value.opponent_unified_policy_name || null,
+            }
+          : null
+      );
+  if (!baseSetup?.runId) {
+    console.warn('[App] Cannot swap teams without an active run setup.');
+    return;
+  }
+
+  cancelReplayAnimation();
+
+  const currentTeam = String(baseSetup.userTeam || gameState.value?.user_team_name || 'OFFENSE').toUpperCase();
+  const nextTeam = currentTeam === 'DEFENSE' ? 'OFFENSE' : 'DEFENSE';
+  const nextSetup = {
+    ...baseSetup,
+    userTeam: nextTeam,
+  };
+
+  console.log('[App] Swapping user-controlled team:', currentTeam, '->', nextTeam);
+  await handleGameStarted(nextSetup);
 }
 
 async function handleMoveRecorded(moveData) {
@@ -2237,6 +2292,7 @@ onBeforeUnmount(() => {
           @ball-holder-updating="isBallHolderUpdating = $event"
           @ball-holder-changed="handleBallHolderChanged"
           @policy-swap-requested="handlePolicySwap"
+          @swap-teams-requested="handleSwapTeams"
           @selections-changed="handleSelectionsChanged"
           @refresh-policies="handleRefreshPolicies"
           @mcts-options-changed="handleMctsOptionsChanged"
