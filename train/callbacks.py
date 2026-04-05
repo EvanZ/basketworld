@@ -18,6 +18,7 @@ from basketworld.utils.callbacks import (
     PotentialBetaExpScheduleCallback,
     PassLogitBiasExpScheduleCallback,
     PassCurriculumExpScheduleCallback,
+    TaskRewardScaleScheduleCallback,
     IntentRobustnessScheduleCallback,
     EpisodeSampleLogger,
     IntentDiversityCallback,
@@ -132,6 +133,24 @@ def build_pass_curriculum_callback(args, total_planned_ts, timestep_offset):
     )
 
 
+def build_task_reward_scale_callback(args, timestep_offset):
+    """Build DIAYN-first task-reward curriculum callback if requested."""
+    start = getattr(args, "task_reward_scale_start", None)
+    end = getattr(args, "task_reward_scale_end", None)
+    if start is None and end is None:
+        return None
+    start = 1.0 if start is None else float(start)
+    end = start if end is None else float(end)
+    return TaskRewardScaleScheduleCallback(
+        scale_start=start,
+        scale_end=end,
+        warmup_steps=getattr(args, "task_reward_scale_warmup_steps", 0),
+        ramp_steps=getattr(args, "task_reward_scale_ramp_steps", 1),
+        log_freq_rollouts=getattr(args, "mlflow_schedule_log_every_rollouts", 1),
+        timestep_offset=timestep_offset,
+    )
+
+
 def build_intent_diversity_callback(args):
     """Build intent diversity callback when enabled."""
     if not getattr(args, "intent_diversity_enabled", False):
@@ -231,6 +250,7 @@ def build_mixed_callbacks(
     beta_cb: Optional[BaseCallback],
     pass_bias_cb: Optional[BaseCallback],
     pass_curriculum_cb: Optional[BaseCallback],
+    task_reward_scale_cb: Optional[BaseCallback],
     intent_robustness_cb: Optional[BaseCallback],
     intent_diversity_cb: Optional[BaseCallback],
     intent_policy_sensitivity_cb: Optional[BaseCallback],
@@ -252,6 +272,8 @@ def build_mixed_callbacks(
         callbacks.append(pass_bias_cb)
     if pass_curriculum_cb is not None:
         callbacks.append(pass_curriculum_cb)
+    if task_reward_scale_cb is not None:
+        callbacks.append(task_reward_scale_cb)
     if intent_robustness_cb is not None:
         callbacks.append(intent_robustness_cb)
     if intent_diversity_cb is not None:

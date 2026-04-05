@@ -655,6 +655,37 @@ def get_parser() -> argparse.ArgumentParser:
         help="Clip range for normalized intent bonus.",
     )
     parser.add_argument(
+        "--task-reward-scale-start",
+        dest="task_reward_scale_start",
+        type=float,
+        default=None,
+        help=(
+            "Initial scale applied to aggregated environment task reward returned to PPO. "
+            "Use values below 1.0 for DIAYN-first curricula."
+        ),
+    )
+    parser.add_argument(
+        "--task-reward-scale-end",
+        dest="task_reward_scale_end",
+        type=float,
+        default=None,
+        help="Final scale applied to aggregated environment task reward returned to PPO.",
+    )
+    parser.add_argument(
+        "--task-reward-scale-warmup-steps",
+        dest="task_reward_scale_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to hold task reward at the start scale before ramping.",
+    )
+    parser.add_argument(
+        "--task-reward-scale-ramp-steps",
+        dest="task_reward_scale_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps to ramp task reward scale from start to end after warmup.",
+    )
+    parser.add_argument(
         "--intent-disc-lr",
         dest="intent_disc_lr",
         type=float,
@@ -685,7 +716,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--intent-disc-encoder-type",
         dest="intent_disc_encoder_type",
-        choices=["mlp_mean", "gru"],
+        choices=["mlp_mean", "gru", "set_step"],
         default="mlp_mean",
         help="Encoder type for intent discriminator.",
     )
@@ -807,6 +838,34 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Timesteps over which selector influence ramps from alpha-start to alpha-end.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-start",
+        dest="intent_selector_eps_start",
+        type=float,
+        default=0.0,
+        help="Initial uniform-exploration floor mixed into selector sampling when the selector branch is used.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-end",
+        dest="intent_selector_eps_end",
+        type=float,
+        default=0.0,
+        help="Final uniform-exploration floor mixed into selector sampling when the selector branch is used.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-warmup-steps",
+        dest="intent_selector_eps_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to wait before ramping the selector exploration floor.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-ramp-steps",
+        dest="intent_selector_eps_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps over which selector exploration floor ramps from eps-start to eps-end.",
     )
     parser.add_argument(
         "--intent-selector-entropy-coef",

@@ -740,6 +740,38 @@ def get_mlflow_training_params(
         float,
         2.0,
     )
+    training_params["task_reward_scale_start"] = _get_param(
+        params,
+        ["schedule_task_reward_scale_start", "task_reward_scale_start", "task-reward-scale-start"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None,
+    )
+    training_params["task_reward_scale_end"] = _get_param(
+        params,
+        ["schedule_task_reward_scale_end", "task_reward_scale_end", "task-reward-scale-end"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None,
+    )
+    training_params["task_reward_scale_warmup_steps"] = _get_param(
+        params,
+        [
+            "schedule_task_reward_scale_warmup_steps",
+            "task_reward_scale_warmup_steps",
+            "task-reward-scale-warmup-steps",
+        ],
+        int,
+        0,
+    )
+    training_params["task_reward_scale_ramp_steps"] = _get_param(
+        params,
+        [
+            "schedule_task_reward_scale_ramp_steps",
+            "task_reward_scale_ramp_steps",
+            "task-reward-scale-ramp-steps",
+        ],
+        int,
+        1,
+    )
     training_params["intent_disc_encoder_type"] = _get_param(
         params,
         ["intent_disc_encoder_type", "intent-disc-encoder-type"],
@@ -860,6 +892,30 @@ def get_mlflow_training_params(
     training_params["intent_selector_alpha_ramp_steps"] = _get_param(
         params,
         ["intent_selector_alpha_ramp_steps", "intent-selector-alpha-ramp-steps"],
+        int,
+        1,
+    )
+    training_params["intent_selector_eps_start"] = _get_param(
+        params,
+        ["intent_selector_eps_start", "intent-selector-eps-start"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_eps_end"] = _get_param(
+        params,
+        ["intent_selector_eps_end", "intent-selector-eps-end"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_eps_warmup_steps"] = _get_param(
+        params,
+        ["intent_selector_eps_warmup_steps", "intent-selector-eps-warmup-steps"],
+        int,
+        0,
+    )
+    training_params["intent_selector_eps_ramp_steps"] = _get_param(
+        params,
+        ["intent_selector_eps_ramp_steps", "intent-selector-eps-ramp-steps"],
         int,
         1,
     )

@@ -88,6 +88,22 @@ def selector_alpha_current(training_params: dict | None, policy_model: Any) -> f
     return float(start + progress * (end - start))
 
 
+def selector_eps_current(training_params: dict | None, policy_model: Any) -> float:
+    if not isinstance(training_params, dict):
+        return 0.0
+    t = int(getattr(policy_model, "num_timesteps", 0) or 0)
+    start = float(training_params.get("intent_selector_eps_start", 0.0) or 0.0)
+    end = float(training_params.get("intent_selector_eps_end", 0.0) or 0.0)
+    warmup = max(0, int(training_params.get("intent_selector_eps_warmup_steps", 0) or 0))
+    ramp = max(0, int(training_params.get("intent_selector_eps_ramp_steps", 1) or 0))
+    if t < warmup:
+        return float(start)
+    if ramp <= 0:
+        return float(end)
+    progress = min(1.0, max(0.0, (t - warmup) / float(ramp)))
+    return float(start + progress * (end - start))
+
+
 def normalize_selector_intent_selection_mode(mode: str | None) -> str:
     value = str(mode or "learned_sample").strip().lower()
     if value in {"learned_sample", "sample", "runtime_sample", "runtime"}:
@@ -110,6 +126,19 @@ def selector_neutralize_observation(single_obs: dict[str, Any], num_intents: int
         age_norm=0.0,
     )
     return selector_obs
+
+
+def selector_apply_eps_floor(
+    selector_probs: torch.Tensor, selector_eps: torch.Tensor | float
+) -> torch.Tensor:
+    probs = selector_probs.clamp_min(1e-8)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    eps = torch.as_tensor(selector_eps, dtype=probs.dtype, device=probs.device)
+    while eps.ndim < probs.ndim:
+        eps = eps.unsqueeze(-1)
+    uniform = torch.full_like(probs, 1.0 / float(max(1, probs.shape[-1])))
+    mixed = (1.0 - eps) * probs + eps * uniform
+    return mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
 def build_offense_selector_observation(
@@ -150,51 +179,72 @@ def selector_sample_intent(
     rng = rng or np.random.default_rng()
     mode = normalize_selector_intent_selection_mode(selection_mode)
     alpha = selector_alpha_current(training_params, policy_model)
+    selector_eps = selector_eps_current(training_params, policy_model)
 
     if mode == "uniform_random":
         return {
             "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
             "used_selector": False,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
+            "value": None,
+            "selection_mode": mode,
+        }
+
+    try:
+        with torch.no_grad():
+            logits, values = policy_model.policy.get_intent_selector_outputs(selector_obs)
+            logits_t = torch.as_tensor(logits, dtype=torch.float32).reshape(1, -1)
+            values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+            raw_probs_t = torch.softmax(logits_t, dim=-1)
+            mixed_probs_t = selector_apply_eps_floor(raw_probs_t, selector_eps)
+    except Exception:
+        if allow_uniform_fallback:
+            return {
+                "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
+                "used_selector": False,
+                "alpha": float(alpha),
+                "selector_eps": float(selector_eps),
+                "value": None,
+                "selection_mode": mode,
+            }
+        return {
+            "intent_index": None,
+            "used_selector": False,
+            "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": None,
             "selection_mode": mode,
         }
 
     if mode == "best_intent":
-        try:
-            with torch.no_grad():
-                logits, values = policy_model.policy.get_intent_selector_outputs(selector_obs)
-                chosen = torch.argmax(torch.as_tensor(logits), dim=-1).reshape(-1)
-                return {
-                    "intent_index": int(chosen[0].item()),
-                    "used_selector": True,
-                    "alpha": float(alpha),
-                    "value": float(values.reshape(-1)[0].item()),
-                    "selection_mode": mode,
-                }
-        except Exception:
-            pass
+        chosen = torch.argmax(logits_t, dim=-1).reshape(-1)
+        return {
+            "intent_index": int(chosen[0].item()),
+            "used_selector": True,
+            "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
+            "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
+            "selection_mode": mode,
+        }
 
     if alpha > 0.0 and float(rng.random()) < alpha:
-        try:
-            with torch.no_grad():
-                logits, values = policy_model.policy.get_intent_selector_outputs(selector_obs)
-                dist = torch.distributions.Categorical(logits=logits)
-                chosen = dist.sample().reshape(-1)
-                return {
-                    "intent_index": int(chosen[0].item()),
-                    "used_selector": True,
-                    "alpha": float(alpha),
-                    "value": float(values.reshape(-1)[0].item()),
-                    "selection_mode": mode,
-                }
-        except Exception:
-            pass
+        dist = torch.distributions.Categorical(probs=mixed_probs_t)
+        chosen = dist.sample().reshape(-1)
+        return {
+            "intent_index": int(chosen[0].item()),
+            "used_selector": True,
+            "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
+            "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
+            "selection_mode": mode,
+        }
     if allow_uniform_fallback:
         return {
             "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
             "used_selector": False,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": None,
             "selection_mode": mode,
         }
@@ -202,6 +252,7 @@ def selector_sample_intent(
         "intent_index": None,
         "used_selector": False,
         "alpha": float(alpha),
+        "selector_eps": float(selector_eps),
         "value": None,
         "selection_mode": mode,
     }
@@ -249,17 +300,37 @@ def selector_ranked_intent_preferences(
         with torch.no_grad():
             logits, values = policy_obj.get_intent_selector_outputs(selector_obs)
             logits_t = torch.as_tensor(logits, dtype=torch.float32).reshape(1, -1)
-            probs_t = torch.softmax(logits_t, dim=-1)
+            raw_probs_t = torch.softmax(logits_t, dim=-1)
+            alpha_current = float(selector_alpha_current(training_params, offense_policy))
+            eps_current = float(selector_eps_current(training_params, offense_policy))
+            mixed_probs_t = selector_apply_eps_floor(raw_probs_t, eps_current)
         logits_np = logits_t.detach().cpu().numpy().reshape(-1)
-        probs_np = probs_t.detach().cpu().numpy().reshape(-1)
-        order = np.argsort(-probs_np, kind="stable")
+        raw_probs_np = raw_probs_t.detach().cpu().numpy().reshape(-1)
+        mixed_probs_np = mixed_probs_t.detach().cpu().numpy().reshape(-1)
+        num_classes = max(1, raw_probs_np.shape[0])
+        uniform_probs_np = np.full(num_classes, 1.0 / float(num_classes), dtype=np.float32)
+        mode = normalize_selector_intent_selection_mode(None)
+        if mode == "uniform_random":
+            deployed_probs_np = uniform_probs_np
+        elif mode == "best_intent":
+            deployed_probs_np = np.zeros_like(raw_probs_np)
+            deployed_probs_np[int(np.argmax(raw_probs_np))] = 1.0
+        else:
+            deployed_probs_np = (
+                alpha_current * mixed_probs_np
+                + (1.0 - alpha_current) * uniform_probs_np
+            )
+        order = np.argsort(-deployed_probs_np, kind="stable")
         ranked = []
         for rank_idx, class_idx in enumerate(order.tolist(), start=1):
             ranked.append(
                 {
                     "rank": int(rank_idx),
                     "intent_index": int(class_idx),
-                    "prob": float(probs_np[class_idx]),
+                    "prob": float(deployed_probs_np[class_idx]),
+                    "raw_prob": float(raw_probs_np[class_idx]),
+                    "mixed_prob": float(mixed_probs_np[class_idx]),
+                    "deployed_prob": float(deployed_probs_np[class_idx]),
                     "logit": float(logits_np[class_idx]),
                 }
             )
@@ -269,7 +340,9 @@ def selector_ranked_intent_preferences(
             if values_t.numel() > 0:
                 value_estimate = float(values_t[0].item())
         return {
-            "alpha_current": float(selector_alpha_current(training_params, offense_policy)),
+            "alpha_current": float(alpha_current),
+            "eps_current": float(eps_current),
+            "selection_mode": mode,
             "value_estimate": value_estimate,
             "current_intent_index": int(getattr(base_env, "intent_index", 0)),
             "segment_index": int(getattr(base_env, "intent_age", 0)),

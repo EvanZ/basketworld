@@ -397,7 +397,8 @@ def test_playbook_analysis_parallel_path_passes_training_params_and_merges_paylo
     )
 
     assert body["status"] == "success"
-    assert captured["initargs"][2] == isolated_game_state.mlflow_training_params
+    assert captured["initargs"][2]["intent_selector_multiselect_enabled"] is False
+    assert isolated_game_state.mlflow_training_params["intent_selector_multiselect_enabled"] is True
     assert captured["initargs"][3] == isolated_game_state.unified_policy_path
     assert captured["initargs"][4] == isolated_game_state.opponent_policy_path
     panels = {panel["intent_index"]: panel for panel in body["panels"]}
@@ -405,6 +406,7 @@ def test_playbook_analysis_parallel_path_passes_training_params_and_merges_paylo
     assert panels[2]["num_rollouts"] == 4
     assert panels[0]["base_state"] == {"seeded": True}
     assert panels[2]["base_state"] == {"seeded": True}
+    assert body["play_name_map"]
 
 
 def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_state):

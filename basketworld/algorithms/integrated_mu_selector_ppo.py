@@ -38,6 +38,10 @@ class IntegratedIntentSelectorPPO(PPO):
         intent_selector_alpha_end: float = 1.0,
         intent_selector_alpha_warmup_steps: int = 0,
         intent_selector_alpha_ramp_steps: int = 1,
+        intent_selector_eps_start: float = 0.0,
+        intent_selector_eps_end: float = 0.0,
+        intent_selector_eps_warmup_steps: int = 0,
+        intent_selector_eps_ramp_steps: int = 1,
         intent_selector_entropy_coef: float = 0.01,
         intent_selector_usage_reg_coef: float = 0.01,
         intent_selector_value_coef: float = 0.5,
@@ -56,6 +60,14 @@ class IntegratedIntentSelectorPPO(PPO):
         self.intent_selector_alpha_ramp_steps = max(
             0, int(intent_selector_alpha_ramp_steps)
         )
+        self.intent_selector_eps_start = float(
+            np.clip(intent_selector_eps_start, 0.0, 1.0)
+        )
+        self.intent_selector_eps_end = float(np.clip(intent_selector_eps_end, 0.0, 1.0))
+        self.intent_selector_eps_warmup_steps = max(
+            0, int(intent_selector_eps_warmup_steps)
+        )
+        self.intent_selector_eps_ramp_steps = max(0, int(intent_selector_eps_ramp_steps))
         self.intent_selector_entropy_coef = float(max(0.0, intent_selector_entropy_coef))
         self.intent_selector_usage_reg_coef = float(
             max(0.0, intent_selector_usage_reg_coef)
@@ -392,6 +404,43 @@ class IntegratedIntentSelectorPPO(PPO):
             * (self.intent_selector_alpha_end - self.intent_selector_alpha_start)
         )
 
+    def _selector_eps_current(self) -> float:
+        t = int(getattr(self, "num_timesteps", 0))
+        if t < self.intent_selector_eps_warmup_steps:
+            return float(self.intent_selector_eps_start)
+        if self.intent_selector_eps_ramp_steps <= 0:
+            return float(self.intent_selector_eps_end)
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (t - self.intent_selector_eps_warmup_steps)
+                / float(self.intent_selector_eps_ramp_steps),
+            ),
+        )
+        return float(
+            self.intent_selector_eps_start
+            + progress * (self.intent_selector_eps_end - self.intent_selector_eps_start)
+        )
+
+    def _selector_apply_eps_floor(
+        self, selector_probs: torch.Tensor, selector_eps: torch.Tensor | float
+    ) -> torch.Tensor:
+        probs = selector_probs.clamp_min(1e-8)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        eps = torch.as_tensor(
+            selector_eps, dtype=probs.dtype, device=probs.device
+        ).clamp_(0.0, 1.0)
+        if eps.ndim == 0:
+            eps = eps.view(1, 1)
+        elif eps.ndim == 1:
+            eps = eps.unsqueeze(-1)
+        uniform = torch.full_like(
+            probs, 1.0 / float(self.intent_selector_num_intents)
+        )
+        mixed = (1.0 - eps) * probs + eps * uniform
+        return mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
     def _selector_neutralize_observation(self, single_obs: dict[str, Any]) -> dict[str, Any]:
         selector_obs = clone_observation_dict(single_obs)
         patch_intent_in_observation(
@@ -600,7 +649,12 @@ class IntegratedIntentSelectorPPO(PPO):
             try:
                 with torch.no_grad():
                     logits, values = self.policy.get_intent_selector_outputs(selector_obs)
-                    dist = torch.distributions.Categorical(logits=logits)
+                    selector_probs = torch.softmax(logits, dim=-1)
+                    selector_eps = self._selector_eps_current()
+                    mixed_probs = self._selector_apply_eps_floor(
+                        selector_probs, selector_eps
+                    )
+                    dist = torch.distributions.Categorical(probs=mixed_probs)
                     chosen = dist.sample().reshape(-1)
                     chosen_z = int(chosen[0].item())
                     old_log_prob = float(dist.log_prob(chosen).reshape(-1)[0].item())
@@ -618,6 +672,7 @@ class IntegratedIntentSelectorPPO(PPO):
                 if self._selector_episode_segment_counts is not None
                 else 0,
                 "alpha": float(alpha),
+                "selector_eps": float(selector_eps),
                 "old_log_prob": float(old_log_prob),
                 "old_value": float(old_value),
             }
@@ -768,11 +823,21 @@ class IntegratedIntentSelectorPPO(PPO):
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 self.policy.reset_noise(env.num_envs)
 
+            rollout_intent_indices = None
+            rollout_intent_gate = None
             with torch.no_grad():
                 if isinstance(self._last_obs, dict):
                     self._selector_sync_policy_runtime_from_obs(self._last_obs)
                 else:
                     self._selector_sync_policy_runtime_from_obs(None)
+                if self._policy_runtime_intent_indices is not None:
+                    rollout_intent_indices = np.array(
+                        self._policy_runtime_intent_indices, copy=True
+                    )
+                if self._policy_runtime_intent_gate is not None:
+                    rollout_intent_gate = np.array(
+                        self._policy_runtime_intent_gate, copy=True
+                    )
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
@@ -878,8 +943,8 @@ class IntegratedIntentSelectorPPO(PPO):
                     self._last_episode_starts,
                     values,
                     log_probs,
-                    intent_indices=self._policy_runtime_intent_indices,
-                    intent_gate=self._policy_runtime_intent_gate,
+                    intent_indices=rollout_intent_indices,
+                    intent_gate=rollout_intent_gate,
                 )
             else:
                 rollout_buffer.add(
@@ -1073,6 +1138,10 @@ class IntegratedIntentSelectorPPO(PPO):
         chosen_z_np = np.asarray(
             [sample["chosen_z"] for sample in samples], dtype=np.int64
         )
+        selector_eps_np = np.asarray(
+            [sample.get("selector_eps", self._selector_eps_current()) for sample in samples],
+            dtype=np.float32,
+        )
         old_log_prob_np = np.asarray(
             [sample.get("old_log_prob", 0.0) for sample in samples], dtype=np.float32
         )
@@ -1092,7 +1161,13 @@ class IntegratedIntentSelectorPPO(PPO):
         self.policy.set_training_mode(True)
         obs_tensor, _ = self.policy.obs_to_tensor(selector_obs_batch)
         logits, value_pred = self.policy.get_intent_selector_outputs(obs_tensor)
-        dist = torch.distributions.Categorical(logits=logits)
+        selector_prob_tensor = torch.softmax(logits, dim=-1)
+        selector_eps = torch.as_tensor(
+            selector_eps_np, dtype=torch.float32, device=logits.device
+        )
+        prob_tensor = self._selector_apply_eps_floor(selector_prob_tensor, selector_eps)
+        dist = torch.distributions.Categorical(probs=prob_tensor)
+        raw_dist = torch.distributions.Categorical(probs=selector_prob_tensor)
         chosen_z = torch.as_tensor(chosen_z_np, dtype=torch.long, device=logits.device)
         advantage = torch.as_tensor(
             advantages_np, dtype=torch.float32, device=logits.device
@@ -1107,13 +1182,15 @@ class IntegratedIntentSelectorPPO(PPO):
             old_value_np, dtype=torch.float32, device=logits.device
         )
         log_prob = dist.log_prob(chosen_z)
-        entropy = dist.entropy().mean()
-        prob_tensor = torch.softmax(logits, dim=-1)
+        entropy = raw_dist.entropy().mean()
+        effective_entropy = dist.entropy().mean()
         mean_probs = prob_tensor.mean(dim=0)
+        mean_probs_raw = selector_prob_tensor.mean(dim=0)
         usage_kl = torch.sum(
-            mean_probs
+            mean_probs_raw
             * torch.log(
-                mean_probs.clamp_min(1e-8) * float(self.intent_selector_num_intents)
+                mean_probs_raw.clamp_min(1e-8)
+                * float(self.intent_selector_num_intents)
             )
         )
         clip_range = self.clip_range(self._current_progress_remaining)
@@ -1155,8 +1232,11 @@ class IntegratedIntentSelectorPPO(PPO):
             -np.sum(usage_probs[nonzero] * np.log(usage_probs[nonzero]))
         )
         mean_probs_np = mean_probs.detach().cpu().numpy().astype(np.float64, copy=False)
+        mean_probs_raw_np = (
+            mean_probs_raw.detach().cpu().numpy().astype(np.float64, copy=False)
+        )
         top1_np = (
-            torch.argmax(logits, dim=-1)
+            torch.argmax(selector_prob_tensor, dim=-1)
             .detach()
             .cpu()
             .numpy()
@@ -1173,8 +1253,18 @@ class IntegratedIntentSelectorPPO(PPO):
             .numpy()
             .astype(np.float64, copy=False)
         )
+        max_prob_raw_np = (
+            torch.max(selector_prob_tensor, dim=-1)
+            .values.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
         top2_vals = torch.topk(
             prob_tensor, k=min(2, self.intent_selector_num_intents), dim=-1
+        ).values
+        top2_vals_raw = torch.topk(
+            selector_prob_tensor, k=min(2, self.intent_selector_num_intents), dim=-1
         ).values
         if top2_vals.shape[-1] >= 2:
             margin_np = (
@@ -1182,14 +1272,25 @@ class IntegratedIntentSelectorPPO(PPO):
             ).detach().cpu().numpy().astype(np.float64, copy=False)
         else:
             margin_np = max_prob_np.copy()
+        if top2_vals_raw.shape[-1] >= 2:
+            margin_raw_np = (
+                top2_vals_raw[:, 0] - top2_vals_raw[:, 1]
+            ).detach().cpu().numpy().astype(np.float64, copy=False)
+        else:
+            margin_raw_np = max_prob_raw_np.copy()
 
         metrics: dict[str, float] = {
             **self._selector_last_metrics,
             "intent/selector_alpha_current": float(self._selector_alpha_current()),
+            "intent/selector_eps_current": float(self._selector_eps_current()),
+            "intent/selector_eps_sample_mean": float(np.mean(selector_eps_np)),
             "intent/selector_loss": float(total_loss.detach().cpu().item()),
             "intent/selector_policy_loss": float(policy_loss.detach().cpu().item()),
             "intent/selector_value_loss": float(value_loss.detach().cpu().item()),
             "intent/selector_entropy": float(entropy.detach().cpu().item()),
+            "intent/selector_effective_entropy": float(
+                effective_entropy.detach().cpu().item()
+            ),
             "intent/selector_usage_entropy": float(usage_entropy),
             "intent/selector_usage_kl_uniform": float(
                 usage_kl.detach().cpu().item()
@@ -1218,14 +1319,23 @@ class IntegratedIntentSelectorPPO(PPO):
             "intent/selector_confidence_mean": float(np.mean(max_prob_np))
             if max_prob_np.size > 0
             else 0.0,
+            "intent/selector_confidence_raw_mean": float(np.mean(max_prob_raw_np))
+            if max_prob_raw_np.size > 0
+            else 0.0,
             "intent/selector_margin_mean": float(np.mean(margin_np))
             if margin_np.size > 0
+            else 0.0,
+            "intent/selector_margin_raw_mean": float(np.mean(margin_raw_np))
+            if margin_raw_np.size > 0
             else 0.0,
         }
         for z in range(self.intent_selector_num_intents):
             metrics[f"intent/selector_usage_by_intent/{z}"] = float(usage_probs[z])
             metrics[f"intent/selector_prob_mean_by_intent/{z}"] = float(
                 mean_probs_np[z]
+            )
+            metrics[f"intent/selector_prob_raw_mean_by_intent/{z}"] = float(
+                mean_probs_raw_np[z]
             )
             metrics[f"intent/selector_top1_by_intent/{z}"] = float(top1_probs[z])
             selected_mask = chosen_z_np == z

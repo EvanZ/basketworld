@@ -22,6 +22,23 @@ class IntentTransition:
 
 
 @dataclass
+class IntentStepExample:
+    """One single-step discriminator example."""
+
+    obs: Dict[str, np.ndarray]
+    buffer_step_idx: int
+    env_idx: int
+    role_flag: float
+    intent_active: bool
+    intent_index: int
+    training_team: str = ""
+    boundary_reason: str = ""
+    shot_end: float = 0.0
+    shot_quality: float = 0.0
+    shot_quality_mask: float = 0.0
+
+
+@dataclass
 class CompletedIntentEpisode:
     """Completed episode assembled from transitions."""
 
@@ -239,6 +256,90 @@ class TrajectoryEncoderGRU(nn.Module):
         return h_n[-1]
 
 
+class SetStepEncoder(nn.Module):
+    """Single-state set-attention encoder over player tokens and globals."""
+
+    def __init__(
+        self,
+        token_dim: int,
+        global_dim: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        num_cls_tokens: int = 1,
+        include_role_flag: bool = True,
+    ) -> None:
+        super().__init__()
+        self.token_dim = int(token_dim)
+        self.global_dim = int(global_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(max(1, num_heads))
+        self.num_cls_tokens = int(max(0, num_cls_tokens))
+        self.include_role_flag = bool(include_role_flag)
+        extra_global_dim = 1 if self.include_role_flag else 0
+        self.token_mlp = nn.Sequential(
+            nn.Linear(self.token_dim + self.global_dim + extra_global_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(max(0.0, dropout))),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=self.num_heads,
+            dropout=float(max(0.0, dropout)),
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(self.hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(max(0.0, dropout))),
+        )
+        self.ff_norm = nn.LayerNorm(self.hidden_dim)
+        self.cls_tokens = (
+            nn.Parameter(torch.zeros(self.num_cls_tokens, self.hidden_dim))
+            if self.num_cls_tokens > 0
+            else None
+        )
+
+    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if not isinstance(obs, dict):
+            raise ValueError("SetStepEncoder expects a dict observation batch.")
+        if "players" not in obs or "globals" not in obs:
+            raise ValueError("SetStepEncoder requires 'players' and 'globals'.")
+        players = obs["players"]
+        globals_vec = obs["globals"]
+        if players.ndim != 3:
+            raise ValueError(f"Expected players [B, P, T], got {tuple(players.shape)}")
+        if globals_vec.ndim != 2:
+            raise ValueError(f"Expected globals [B, G], got {tuple(globals_vec.shape)}")
+        pieces = [
+            players,
+            globals_vec.unsqueeze(1).expand(-1, players.shape[1], -1),
+        ]
+        if self.include_role_flag and "role_flag" in obs:
+            role_flag = obs["role_flag"]
+            if role_flag.ndim == 1:
+                role_flag = role_flag.unsqueeze(-1)
+            elif role_flag.ndim > 2:
+                role_flag = role_flag.reshape(role_flag.shape[0], -1)
+            pieces.append(role_flag.unsqueeze(1).expand(-1, players.shape[1], -1))
+        tokens = torch.cat(pieces, dim=-1)
+        emb = self.token_mlp(tokens)
+        if self.cls_tokens is not None:
+            cls = self.cls_tokens.unsqueeze(0).expand(emb.shape[0], -1, -1)
+            emb = torch.cat([emb, cls], dim=1)
+        attn_out, _ = self.attn(emb, emb, emb, need_weights=False)
+        emb = self.attn_norm(emb + attn_out)
+        ff_out = self.ff(emb)
+        emb = self.ff_norm(emb + ff_out)
+        if self.num_cls_tokens > 0:
+            cls_slice = emb[:, -self.num_cls_tokens :, :]
+            return cls_slice.mean(dim=1)
+        return emb.mean(dim=1)
+
+
 class IntentDiscriminator(nn.Module):
     """Intent discriminator over either pooled or sequential episode features."""
 
@@ -250,12 +351,16 @@ class IntentDiscriminator(nn.Module):
         dropout: float = 0.1,
         encoder_type: str = "mlp_mean",
         step_dim: int = 64,
+        set_token_dim: int = 0,
+        set_global_dim: int = 0,
+        set_heads: int = 4,
+        set_cls_tokens: int = 1,
         enable_shot_end_head: bool = False,
         enable_shot_quality_head: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_type = str(encoder_type).strip().lower()
-        if self.encoder_type not in {"mlp_mean", "gru"}:
+        if self.encoder_type not in {"mlp_mean", "gru", "set_step"}:
             raise ValueError(f"Unsupported intent discriminator encoder_type={encoder_type!r}")
         self.enable_shot_end_head = bool(enable_shot_end_head)
         self.enable_shot_quality_head = bool(enable_shot_quality_head)
@@ -270,7 +375,7 @@ class IntentDiscriminator(nn.Module):
             self.step_encoder = None
             self.traj_encoder = None
             self.head = None
-        else:
+        elif self.encoder_type == "gru":
             self.net = None
             self.step_encoder = StepEncoder(
                 input_dim=int(input_dim),
@@ -287,6 +392,22 @@ class IntentDiscriminator(nn.Module):
                 nn.Dropout(float(max(0.0, dropout))),
                 nn.Linear(int(hidden_dim), int(num_intents)),
             )
+        else:
+            self.net = None
+            self.step_encoder = SetStepEncoder(
+                token_dim=int(set_token_dim),
+                global_dim=int(set_global_dim),
+                hidden_dim=int(hidden_dim),
+                num_heads=int(max(1, set_heads)),
+                dropout=float(max(0.0, dropout)),
+                num_cls_tokens=int(max(0, set_cls_tokens)),
+                include_role_flag=True,
+            )
+            self.traj_encoder = None
+            self.head = nn.Sequential(
+                nn.Dropout(float(max(0.0, dropout))),
+                nn.Linear(int(hidden_dim), int(num_intents)),
+            )
         self.shot_end_head = (
             nn.Linear(int(hidden_dim), 1) if self.enable_shot_end_head else None
         )
@@ -294,7 +415,7 @@ class IntentDiscriminator(nn.Module):
             nn.Linear(int(hidden_dim), 1) if self.enable_shot_quality_head else None
         )
 
-    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: Any, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         episode_emb = self.encode(x, lengths)
         if self.encoder_type == "mlp_mean":
             assert self.net is not None
@@ -304,7 +425,7 @@ class IntentDiscriminator(nn.Module):
 
     def forward_with_aux(
         self,
-        x: torch.Tensor,
+        x: Any,
         lengths: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         episode_emb = self.encode(x, lengths)
@@ -326,7 +447,7 @@ class IntentDiscriminator(nn.Module):
         )
         return logits, shot_end, shot_quality
 
-    def encode(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def encode(self, x: Any, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the episode embedding prior to the final classifier layer."""
         if self.encoder_type == "mlp_mean":
             if x.ndim == 1:
@@ -340,6 +461,12 @@ class IntentDiscriminator(nn.Module):
             for layer in list(self.net.children())[:-1]:
                 hidden = layer(hidden)
             return hidden
+
+        if self.encoder_type == "set_step":
+            if not isinstance(x, dict):
+                raise ValueError("set_step intent discriminator expects a dict input.")
+            assert self.step_encoder is not None
+            return self.step_encoder(x)
 
         if x.ndim == 2:
             x = x.unsqueeze(1)
@@ -407,6 +534,10 @@ def load_intent_discriminator_from_checkpoint(
             lambda_key="disc_lambda_q",
             head_prefix="shot_quality_head",
         ),
+        set_token_dim=int(config.get("set_token_dim", 0)),
+        set_global_dim=int(config.get("set_global_dim", 0)),
+        set_heads=int(config.get("set_heads", 4)),
+        set_cls_tokens=int(config.get("set_cls_tokens", 1)),
     ).to(device)
     disc.load_state_dict(state_dict)
     disc.eval()
@@ -447,6 +578,50 @@ def flatten_observation_for_env(obs_payload, env_idx: int) -> np.ndarray:
     except Exception:
         pass
     return np.zeros(1, dtype=np.float32)
+
+
+def extract_set_observation_for_env(
+    obs_payload: Any,
+    env_idx: int,
+    *,
+    include_keys: Tuple[str, ...] = ("players", "globals", "role_flag"),
+) -> Optional[Dict[str, np.ndarray]]:
+    """Extract one single-env set observation dict for discriminator use."""
+    if not isinstance(obs_payload, dict):
+        return None
+    out: Dict[str, np.ndarray] = {}
+    for key in include_keys:
+        if key not in obs_payload:
+            continue
+        try:
+            arr = np.asarray(obs_payload[key], dtype=np.float32)
+        except Exception:
+            continue
+        if arr.ndim == 0 or arr.shape[0] <= int(env_idx):
+            continue
+        out[key] = np.array(arr[int(env_idx)], copy=True, dtype=np.float32)
+    if "players" not in out or "globals" not in out:
+        return None
+    if "role_flag" not in out:
+        out["role_flag"] = np.array([1.0], dtype=np.float32)
+    return out
+
+
+def build_step_observation_batch(
+    examples: List[IntentStepExample],
+) -> tuple[Dict[str, np.ndarray], np.ndarray]:
+    """Stack single-step set observations and labels into batched arrays."""
+    if not examples:
+        return {}, np.zeros((0,), dtype=np.int64)
+    keys = ["players", "globals", "role_flag"]
+    batch: Dict[str, np.ndarray] = {}
+    for key in keys:
+        values = [ex.obs[key] for ex in examples if key in ex.obs]
+        if len(values) != len(examples):
+            continue
+        batch[key] = np.stack(values, axis=0).astype(np.float32, copy=False)
+    labels = np.asarray([int(ex.intent_index) for ex in examples], dtype=np.int64)
+    return batch, labels
 
 
 def extract_action_features_for_env(actions_payload, env_idx: int) -> np.ndarray:

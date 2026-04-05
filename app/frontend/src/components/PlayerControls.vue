@@ -312,6 +312,57 @@ const selectorScheduleSummary = computed(() => {
   const rampText = ramp?.toLocaleString?.() || ramp || '0';
   return `warmup ${warmupText}, ramp ${rampText}`;
 });
+const selectorEpsSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const start = selectorTrainingParams.value?.intent_selector_eps_start;
+  const end = selectorTrainingParams.value?.intent_selector_eps_end;
+  if (start === null || start === undefined) return 'N/A';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const selectorEpsScheduleSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.intent_selector_eps_warmup_steps;
+  const ramp = selectorTrainingParams.value?.intent_selector_eps_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
+const selectorMultiselectEnabled = computed(() =>
+  Boolean(selectorTrainingParams.value?.intent_selector_multiselect_enabled)
+);
+const selectorMinPlayStepsSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (!selectorMultiselectEnabled.value) return 'N/A (multiselect off)';
+  return selectorTrainingParams.value?.intent_selector_min_play_steps ?? 'N/A';
+});
+const selectorDecisionBoundaryLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (selectorMultiselectEnabled.value) {
+    return 'Possession start + completed-pass reselection';
+  }
+  return 'Possession start only';
+});
+const taskRewardScaleSummary = computed(() => {
+  const start = selectorTrainingParams.value?.task_reward_scale_start;
+  const end = selectorTrainingParams.value?.task_reward_scale_end;
+  if (start === null || start === undefined) return 'Disabled';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const taskRewardScheduleSummary = computed(() => {
+  const start = selectorTrainingParams.value?.task_reward_scale_start;
+  if (start === null || start === undefined) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.task_reward_scale_warmup_steps;
+  const ramp = selectorTrainingParams.value?.task_reward_scale_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
 const selectorHeadContextLabel = computed(() => {
   const policyClass = String(selectorTrainingParams.value?.policy_class || '');
   return policyClass.includes('SetAttention') ? 'Shared set-attention encoder' : 'Shared policy encoder';
@@ -530,6 +581,13 @@ const PASS_TARGET_STRATEGIES = [
 const intentIndexMax = computed(() =>
   Math.max(0, Number(props.gameState?.num_intents || 1) - 1)
 );
+const currentPlayOptions = computed(() => {
+  const count = Math.max(0, Number(props.gameState?.num_intents || 0));
+  return Array.from({ length: count }, (_, idx) => ({
+    value: idx,
+    label: formatPlayLabel(idx, props.gameState?.play_name_map),
+  }));
+});
 const intentAgeMax = computed(() =>
   Math.max(0, Number(props.gameState?.intent_commitment_steps || 0))
 );
@@ -1235,6 +1293,27 @@ function getPlaybookShotStatsForPanel(panel) {
       makes: Number(stats?.makes || 0),
     };
   });
+}
+
+function getPlaybookPrimaryShooterSummary(panel) {
+  const raw = panel?.primary_shooter_distribution || {};
+  const entries = Object.entries(raw)
+    .map(([key, value]) => {
+      const playerId = Number(key);
+      const count = Number(value?.count || 0);
+      const rate = Number(value?.rate || 0);
+      if (!Number.isFinite(playerId) || count <= 0) return null;
+      return { playerId, count, rate };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.playerId - b.playerId;
+    });
+  if (!entries.length) return 'none';
+  return entries
+    .map((entry) => `P${entry.playerId} ${entry.count} (${(entry.rate * 100).toFixed(0)}%)`)
+    .join(', ');
 }
 
 function formatPlaybookOutcomeKey(rawKey) {
@@ -2522,6 +2601,8 @@ const selectorIntentPreferences = computed(() => {
     : [];
   return {
     alphaCurrent: payload?.alpha_current ?? null,
+    epsCurrent: payload?.eps_current ?? null,
+    selectionMode: payload?.selection_mode ?? 'learned_sample',
     valueEstimate: payload?.value_estimate ?? null,
     currentIntentIndex: payload?.current_intent_index ?? null,
     items,
@@ -2533,9 +2614,9 @@ const playbookSelectedIntentLabels = computed(() => {
     : [];
   return indices.map((intentIndex) => formatPlayLabel(intentIndex, props.gameState?.play_name_map));
 });
-const selectorIntentEntropy = computed(() => {
-  const items = selectorIntentPreferences.value.items || [];
-  if (!Array.isArray(items) || items.length === 0) {
+function computeSelectorIntentDistributionStats(items, fieldName) {
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
     return {
       entropy: null,
       normalizedEntropy: null,
@@ -2543,8 +2624,8 @@ const selectorIntentEntropy = computed(() => {
       normalizedKlToUniform: null,
     };
   }
-  const probs = items
-    .map((item) => Number(item?.prob))
+  const probs = rows
+    .map((item) => Number(item?.[fieldName]))
     .filter((prob) => Number.isFinite(prob) && prob > 0);
   if (!probs.length) {
     return {
@@ -2555,7 +2636,7 @@ const selectorIntentEntropy = computed(() => {
     };
   }
   const entropy = -probs.reduce((sum, prob) => sum + (prob * Math.log(prob)), 0);
-  const maxEntropy = Math.log(items.length);
+  const maxEntropy = Math.log(rows.length);
   const normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : null;
   const klToUniform = maxEntropy > 0 ? (maxEntropy - entropy) : 0;
   const normalizedKlToUniform = maxEntropy > 0 ? (klToUniform / maxEntropy) : null;
@@ -2565,6 +2646,27 @@ const selectorIntentEntropy = computed(() => {
     klToUniform,
     normalizedKlToUniform,
   };
+}
+
+const selectorIntentDistributionStats = computed(() => {
+  const items = selectorIntentPreferences.value.items || [];
+  return {
+    raw: computeSelectorIntentDistributionStats(items, 'raw_prob'),
+    mixed: computeSelectorIntentDistributionStats(items, 'mixed_prob'),
+    deployed: computeSelectorIntentDistributionStats(items, 'deployed_prob'),
+  };
+});
+const selectorIntentEntropy = computed(() => {
+  const items = selectorIntentPreferences.value.items || [];
+  if (!Array.isArray(items) || items.length === 0) {
+    return {
+      entropy: null,
+      normalizedEntropy: null,
+      klToUniform: null,
+      normalizedKlToUniform: null,
+    };
+  }
+  return selectorIntentDistributionStats.value.deployed;
 });
 const hasSelectorIntentPreferences = computed(() =>
   Array.isArray(selectorIntentPreferences.value.items)
@@ -4540,24 +4642,33 @@ const stealRisks = computed(() => {
           <h5>Intent Preferences</h5>
           <p class="entropy-note">
             Selector preferences for the current offense state in fixed intent order.
+            <span v-if="selectorIntentPreferences.selectionMode">
+              Mode {{ String(selectorIntentPreferences.selectionMode) }}
+            </span>
             <span v-if="selectorIntentPreferences.alphaCurrent !== null">
               Alpha {{ Number(selectorIntentPreferences.alphaCurrent).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentPreferences.epsCurrent !== null">
+              · Eps {{ Number(selectorIntentPreferences.epsCurrent).toFixed(3) }}
             </span>
             <span v-if="selectorIntentPreferences.valueEstimate !== null">
               · Value {{ Number(selectorIntentPreferences.valueEstimate).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.entropy !== null">
-              · Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
+              · Deployed Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.normalizedEntropy !== null">
               (norm {{ Number(selectorIntentEntropy.normalizedEntropy).toFixed(3) }})
             </span>
             <span v-if="selectorIntentEntropy.klToUniform !== null">
-              · KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
+              · Deployed KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.normalizedKlToUniform !== null">
               (norm {{ Number(selectorIntentEntropy.normalizedKlToUniform).toFixed(3) }})
             </span>
+          </p>
+          <p class="entropy-note">
+            Raw = selector softmax. Mixed = selector-branch probabilities after epsilon floor. Deployed = final runtime distribution after alpha mixes the selector branch with uniform fallback.
           </p>
           <div class="entropy-table-wrapper">
             <table class="entropy-table">
@@ -4565,7 +4676,9 @@ const stealRisks = computed(() => {
                 <tr>
                   <th>#</th>
                   <th>Play</th>
-                  <th>Prob</th>
+                  <th>Raw</th>
+                  <th>Mixed</th>
+                  <th>Deployed</th>
                   <th>Logit</th>
                 </tr>
               </thead>
@@ -4575,11 +4688,13 @@ const stealRisks = computed(() => {
                   :key="`selector-intent-${item.intent_index}`"
                   class="selector-intent-row"
                   :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
-                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(item.prob) * 100)).toFixed(2)}%` }"
+                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(item.deployed_prob ?? item.prob) * 100)).toFixed(2)}%` }"
                 >
                   <td>{{ idx + 1 }}</td>
                   <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
-                  <td>{{ (Number(item.prob) * 100).toFixed(2) }}%</td>
+                  <td>{{ (Number(item.raw_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
+                  <td>{{ (Number(item.mixed_prob ?? item.raw_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
+                  <td>{{ (Number(item.deployed_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
                   <td>{{ Number(item.logit).toFixed(3) }}</td>
                 </tr>
               </tbody>
@@ -4779,6 +4894,22 @@ const stealRisks = computed(() => {
               attempts /
               <strong>{{ panel?.shot_stats?.total?.makes ?? 0 }}</strong>
               makes
+            </div>
+            <div class="playbook-debug-line">
+              Shot rollout rate:
+              <strong>{{ ((Number(panel?.shot_rollout_rate || 0)) * 100).toFixed(0) }}%</strong>
+            </div>
+            <div class="playbook-debug-line">
+              Avg first shot step:
+              <strong>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</strong>
+            </div>
+            <div class="playbook-debug-line">
+              Avg terminated steps:
+              <strong>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</strong>
+            </div>
+            <div class="playbook-debug-line">
+              Primary shooter:
+              <strong>{{ getPlaybookPrimaryShooterSummary(panel) }}</strong>
             </div>
             <div
               v-for="entry in getPlaybookShotStatsForPanel(panel)"
@@ -5666,16 +5797,20 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Current latent play identity (masked elsewhere when hidden).">
               <span class="param-name">Current play:</span>
-              <input
-                v-if="props.gameState.enable_intent_learning"
-                class="env-param-input"
-                type="number"
-                min="0"
-                :max="intentIndexMax"
-                step="1"
-                v-model.number="intentStateInput.intent_index"
-                :disabled="intentControlsDisabled"
-              />
+              <div v-if="props.gameState.enable_intent_learning" class="param-select-wrapper">
+                <select
+                  v-model.number="intentStateInput.intent_index"
+                  :disabled="intentControlsDisabled"
+                >
+                  <option
+                    v-for="opt in currentPlayOptions"
+                    :key="opt.value"
+                    :value="opt.value"
+                  >
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </div>
               <span v-else class="param-value">
                 {{ formatPlayLabel(props.gameState.intent_index_current, props.gameState?.play_name_map, props.gameState?.current_play_name) }}
               </span>
@@ -5977,6 +6112,18 @@ const stealRisks = computed(() => {
           </div>
 
           <div class="param-category">
+            <h5>Task Reward Curriculum</h5>
+            <div class="param-item" data-tooltip="Scale applied to the aggregated environment task reward returned to PPO. Values below 1.0 create a DIAYN-first curriculum by downweighting basketball reward early.">
+              <span class="param-name">Task reward scale:</span>
+              <span class="param-value">{{ taskRewardScaleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent holding task reward at the start scale, then ramping it back to the end scale.">
+              <span class="param-name">Task reward schedule:</span>
+              <span class="param-value">{{ taskRewardScheduleSummary }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
             <h5>&mu; Selector Architecture</h5>
             <div class="param-item" data-tooltip="Whether the learned high-level play selector head mu(z|s) was enabled for this run.">
               <span class="param-name">Selector enabled:</span>
@@ -5994,9 +6141,9 @@ const stealRisks = computed(() => {
               <span class="param-name">Selector heads:</span>
               <span class="param-value">{{ selectorHeadSummary }}</span>
             </div>
-            <div class="param-item" data-tooltip="Current implementation samples mu only at offense possession start, not every timestep.">
+            <div class="param-item" data-tooltip="Selector decision points. With multiselect off, mu chooses one play at offense possession start. With multiselect on, a completed pass can trigger reselection later in the same possession once the minimum play length is satisfied.">
               <span class="param-name">Decision boundary:</span>
-              <span class="param-value">Offense possession start</span>
+              <span class="param-value">{{ selectorDecisionBoundaryLabel }}</span>
             </div>
             <div class="param-item" data-tooltip="Which selector implementation path trained this checkpoint.">
               <span class="param-name">Integration:</span>
@@ -6014,6 +6161,14 @@ const stealRisks = computed(() => {
               <span class="param-name">Schedule:</span>
               <span class="param-value">{{ selectorScheduleSummary }}</span>
             </div>
+            <div class="param-item" data-tooltip="Uniform exploration floor mixed into selector sampling when the selector branch is active. Larger epsilon keeps broad play exploration alive even if raw selector logits start to collapse.">
+              <span class="param-name">Selector eps:</span>
+              <span class="param-value">{{ selectorEpsSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent before ramping the selector's internal uniform-exploration floor, then the ramp window from eps-start to eps-end.">
+              <span class="param-name">Eps schedule:</span>
+              <span class="param-value">{{ selectorEpsScheduleSummary }}</span>
+            </div>
             <div class="param-item" data-tooltip="Entropy regularization on the selector distribution over intents. This is distinct from low-level PPO action entropy.">
               <span class="param-name">Selector entropy coef:</span>
               <span class="param-value">{{ selectorTrainingParams.intent_selector_entropy_coef ?? 'N/A' }}</span>
@@ -6021,6 +6176,14 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="KL-to-uniform regularization on average selector usage to prevent early play collapse.">
               <span class="param-name">Usage reg coef:</span>
               <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the selector is allowed to choose a new play again within the same possession. When disabled, one selected play remains fixed for the full possession.">
+              <span class="param-name">Multiselect:</span>
+              <span class="param-value">{{ selectorMultiselectEnabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Minimum segment length before a completed pass can trigger selector reselection. This only matters when multiselect is enabled.">
+              <span class="param-name">Min play steps:</span>
+              <span class="param-value">{{ selectorMinPlayStepsSummary }}</span>
             </div>
             <div class="param-item" data-tooltip="Weight on the selector value-loss term in the integrated selector critic path.">
               <span class="param-name">Value coef:</span>
@@ -6034,9 +6197,9 @@ const stealRisks = computed(() => {
               <span class="param-name">Credit target:</span>
               <span class="param-value">{{ selectorCreditAssignmentLabel }}</span>
             </div>
-            <div class="param-item" data-tooltip="The action policy still produces low-level pi(a|s,z); the selector only chooses z at possession start.">
+            <div class="param-item" data-tooltip="The action policy still produces low-level pi(a|s,z). The selector chooses z only at its configured decision boundaries; the low-level policy then executes under that active play id.">
               <span class="param-name">Low-level policy:</span>
-              <span class="param-value">Conditioned on selected z</span>
+              <span class="param-value">pi(a|s,z) under active z</span>
             </div>
           </div>
 

@@ -137,10 +137,11 @@ def _count_rollout_state(
     player_shot_stats: dict[str, dict[str, int]],
     pass_links: dict[str, int],
     pass_path_segments: dict[str, int] | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[int, int]]:
     positions = state.get("positions") or []
     passes_this_state = 0
     shots_this_state = 0
+    shot_attempts_by_player: dict[int, int] = {}
 
     for pid in offense_ids:
         if pid < 0 or pid >= len(positions):
@@ -198,8 +199,11 @@ def _count_rollout_state(
             if isinstance(shot_result, dict) and bool(shot_result.get("success")):
                 shooter_stats["makes"] = int(shooter_stats.get("makes", 0)) + 1
             shots_this_state += 1
+            shot_attempts_by_player[shooter] = int(
+                shot_attempts_by_player.get(shooter, 0)
+            ) + 1
 
-    return passes_this_state, shots_this_state
+    return passes_this_state, shots_this_state, shot_attempts_by_player
 
 
 def _init_playbook_panel_accumulator(offense_ids: list[int]) -> dict:
@@ -220,7 +224,11 @@ def _init_playbook_panel_accumulator(offense_ids: list[int]) -> dict:
         "rollout_lengths_sum": 0,
         "rollout_passes_sum": 0,
         "rollout_shots_sum": 0,
+        "rollouts_with_shot": 0,
+        "first_shot_step_sum": 0,
+        "terminated_rollout_steps_sum": 0,
         "terminated_rollouts": 0,
+        "primary_shooter_counts": {},
         "num_rollouts": 0,
         "base_state": None,
     }
@@ -422,10 +430,15 @@ def _merge_playbook_panel_accumulator(dest: dict, src: dict) -> None:
         "rollout_lengths_sum",
         "rollout_passes_sum",
         "rollout_shots_sum",
+        "rollouts_with_shot",
+        "first_shot_step_sum",
+        "terminated_rollout_steps_sum",
         "terminated_rollouts",
         "num_rollouts",
     ):
         dest[key] = int(dest.get(key, 0)) + int(src.get(key, 0) or 0)
+    for key, count in (src.get("primary_shooter_counts") or {}).items():
+        _increment_count(dest["primary_shooter_counts"], str(key), int(count or 0))
     if dest.get("base_state") is None and src.get("base_state") is not None:
         dest["base_state"] = copy.deepcopy(src.get("base_state"))
 
@@ -533,7 +546,7 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
             panel["base_state"] = copy.deepcopy(initial_ui_state)
 
         rollout_state = _build_playbook_rollout_state(env)
-        passes_count, shots_count = _count_rollout_state(
+        passes_count, shots_count, initial_shot_attempts = _count_rollout_state(
             rollout_state,
             offense_ids,
             panel["player_heatmaps"],
@@ -544,6 +557,10 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
             panel["pass_links"],
             panel["pass_path_segments"],
         )
+        first_shot_step: int | None = 0 if shots_count > 0 else None
+        rollout_shots_by_player = {
+            int(pid): int(count) for pid, count in (initial_shot_attempts or {}).items()
+        }
         rollout_steps = 0
         done = bool(env_view(env).episode_ended)
 
@@ -596,7 +613,7 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
                 panel["player_path_segments"],
                 panel["ball_path_segments"],
             )
-            more_passes, more_shots = _count_rollout_state(
+            more_passes, more_shots, state_shot_attempts = _count_rollout_state(
                 next_rollout_state,
                 offense_ids,
                 panel["player_heatmaps"],
@@ -607,6 +624,12 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
                 panel["pass_links"],
                 panel["pass_path_segments"],
             )
+            if first_shot_step is None and int(more_shots) > 0:
+                first_shot_step = int(rollout_steps) + 1
+            for shooter, count in (state_shot_attempts or {}).items():
+                rollout_shots_by_player[int(shooter)] = int(
+                    rollout_shots_by_player.get(int(shooter), 0)
+                ) + int(count or 0)
             passes_count += more_passes
             shots_count += more_shots
             rollout_steps += 1
@@ -615,7 +638,18 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
         panel["rollout_lengths_sum"] += int(rollout_steps)
         panel["rollout_passes_sum"] += int(passes_count)
         panel["rollout_shots_sum"] += int(shots_count)
+        if first_shot_step is not None:
+            panel["rollouts_with_shot"] += 1
+            panel["first_shot_step_sum"] += int(first_shot_step)
         panel["terminated_rollouts"] += int(bool(done))
+        if bool(done):
+            panel["terminated_rollout_steps_sum"] += int(rollout_steps)
+        if rollout_shots_by_player:
+            primary_shooter = min(
+                rollout_shots_by_player.items(),
+                key=lambda item: (-int(item[1]), int(item[0])),
+            )[0]
+            _increment_count(panel["primary_shooter_counts"], str(primary_shooter), 1)
         panel["num_rollouts"] += 1
         terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
             rollout_state,
@@ -927,6 +961,8 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     offense_ids = [int(pid) for pid in getattr(env, "offense_ids", [])]
     source_label = "snapshot" if bool(req.use_snapshot) else "current"
     training_params = getattr(game_state, "mlflow_training_params", None) or {}
+    playbook_training_params = copy.deepcopy(training_params) if isinstance(training_params, dict) else {}
+    playbook_training_params["intent_selector_multiselect_enabled"] = False
     can_parallelize = bool(
         game_state.env_required_params is not None
         and game_state.unified_policy_path is not None
@@ -1006,7 +1042,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                 initargs=(
                     game_state.env_required_params,
                     game_state.env_optional_params,
-                    game_state.mlflow_training_params,
+                    playbook_training_params,
                     game_state.unified_policy_path,
                     game_state.opponent_policy_path,
                     game_state.user_team.name,
@@ -1051,6 +1087,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         partial or {},
                     )
         else:
+            game_state.mlflow_training_params = playbook_training_params
             completed = 0
             for intent_index in intent_indices:
                 panel = panel_accumulators[int(intent_index)]
@@ -1069,7 +1106,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         panel["base_state"] = copy.deepcopy(initial_state)
 
                     rollout_state = _build_playbook_rollout_state(game_state.env)
-                    passes_count, shots_count = _count_rollout_state(
+                    passes_count, shots_count, initial_shot_attempts = _count_rollout_state(
                         rollout_state,
                         offense_ids,
                         panel["player_heatmaps"],
@@ -1080,6 +1117,11 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         panel["pass_links"],
                         panel["pass_path_segments"],
                     )
+                    first_shot_step: int | None = 0 if shots_count > 0 else None
+                    rollout_shots_by_player = {
+                        int(pid): int(count)
+                        for pid, count in (initial_shot_attempts or {}).items()
+                    }
                     rollout_steps = 0
                     done = bool(env_view(game_state.env).episode_ended)
 
@@ -1105,7 +1147,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                             panel["player_path_segments"],
                             panel["ball_path_segments"],
                         )
-                        more_passes, more_shots = _count_rollout_state(
+                        more_passes, more_shots, state_shot_attempts = _count_rollout_state(
                             next_rollout_state,
                             offense_ids,
                             panel["player_heatmaps"],
@@ -1116,6 +1158,12 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                             panel["pass_links"],
                             panel["pass_path_segments"],
                         )
+                        if first_shot_step is None and int(more_shots) > 0:
+                            first_shot_step = int(rollout_steps) + 1
+                        for shooter, count in (state_shot_attempts or {}).items():
+                            rollout_shots_by_player[int(shooter)] = int(
+                                rollout_shots_by_player.get(int(shooter), 0)
+                            ) + int(count or 0)
                         passes_count += more_passes
                         shots_count += more_shots
                         rollout_steps += 1
@@ -1125,7 +1173,20 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     panel["rollout_lengths_sum"] += int(rollout_steps)
                     panel["rollout_passes_sum"] += int(passes_count)
                     panel["rollout_shots_sum"] += int(shots_count)
+                    if first_shot_step is not None:
+                        panel["rollouts_with_shot"] += 1
+                        panel["first_shot_step_sum"] += int(first_shot_step)
                     panel["terminated_rollouts"] += int(bool(done))
+                    if bool(done):
+                        panel["terminated_rollout_steps_sum"] += int(rollout_steps)
+                    if rollout_shots_by_player:
+                        primary_shooter = min(
+                            rollout_shots_by_player.items(),
+                            key=lambda item: (-int(item[1]), int(item[0])),
+                        )[0]
+                        _increment_count(
+                            panel["primary_shooter_counts"], str(primary_shooter), 1
+                        )
                     panel["num_rollouts"] += 1
                     terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
                         rollout_state,
@@ -1139,16 +1200,28 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     update_playbook_progress(completed, total_rollouts)
 
         panels = []
-        play_name_map = get_current_play_name_map(int(getattr(base_env, "num_intents", 0) or 0))
+        play_name_map = get_current_play_name_map(int(num_intents))
         for intent_index in intent_indices:
             panel = panel_accumulators[int(intent_index)]
             rollouts_done = max(1, int(panel["num_rollouts"]))
+            shot_rollouts = max(0, int(panel.get("rollouts_with_shot", 0) or 0))
+            terminated_rollouts = max(0, int(panel.get("terminated_rollouts", 0) or 0))
             shot_stats_by_player = {
                 str(pid): {
                     "attempts": int((stats or {}).get("attempts", 0) or 0),
                     "makes": int((stats or {}).get("makes", 0) or 0),
                 }
                 for pid, stats in (panel["player_shot_stats"] or {}).items()
+            }
+            primary_shooter_distribution = {
+                str(pid): {
+                    "count": int(count or 0),
+                    "rate": float(int(count or 0) / max(1, shot_rollouts)),
+                }
+                for pid, count in sorted(
+                    (panel.get("primary_shooter_counts") or {}).items(),
+                    key=lambda item: (-int(item[1] or 0), int(item[0])),
+                )
             }
             total_shot_attempts = int(
                 sum(stats["attempts"] for stats in shot_stats_by_player.values())
@@ -1172,6 +1245,17 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     "avg_steps": float(panel["rollout_lengths_sum"] / rollouts_done),
                     "avg_passes": float(panel["rollout_passes_sum"] / rollouts_done),
                     "avg_shots": float(panel["rollout_shots_sum"] / rollouts_done),
+                    "shot_rollout_rate": float(shot_rollouts / rollouts_done),
+                    "avg_first_shot_step": (
+                        float(panel.get("first_shot_step_sum", 0) / shot_rollouts)
+                        if shot_rollouts > 0
+                        else None
+                    ),
+                    "avg_terminated_steps": (
+                        float(panel.get("terminated_rollout_steps_sum", 0) / terminated_rollouts)
+                        if terminated_rollouts > 0
+                        else None
+                    ),
                     "terminated_rate": float(panel["terminated_rollouts"] / rollouts_done),
                     "player_heatmaps": panel["player_heatmaps"],
                     "ball_heatmap": panel["ball_heatmap"],
@@ -1184,6 +1268,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                             "makes": total_shot_makes,
                         },
                     },
+                    "primary_shooter_distribution": primary_shooter_distribution,
                     "terminal_outcomes": terminal_outcomes,
                     "turnover_reasons": turnover_reasons,
                     "pass_links": dict(sorted(panel["pass_links"].items())),
@@ -1218,6 +1303,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     finally:
         if get_playbook_progress().get("status") == "running":
             update_playbook_progress(total_rollouts, total_rollouts)
+        game_state.mlflow_training_params = training_params
         _restore_restorable_backend_state(live_restore_state)
         game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
 

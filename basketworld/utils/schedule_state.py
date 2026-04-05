@@ -27,6 +27,10 @@ def save_schedule_metadata(
     pass_arc_end: Optional[float] = None,
     pass_oob_turnover_prob_start: Optional[float] = None,
     pass_oob_turnover_prob_end: Optional[float] = None,
+    task_reward_scale_start: Optional[float] = None,
+    task_reward_scale_end: Optional[float] = None,
+    task_reward_scale_warmup_steps: int = 0,
+    task_reward_scale_ramp_steps: int = 1,
     spa_start: Optional[int] = None,
     spa_end: Optional[int] = None,
     spa_schedule: str = "linear",
@@ -56,6 +60,10 @@ def save_schedule_metadata(
         pass_arc_end: Ending pass arc degrees
         pass_oob_turnover_prob_start: Starting OOB turnover probability
         pass_oob_turnover_prob_end: Ending OOB turnover probability
+        task_reward_scale_start: Starting task reward scale
+        task_reward_scale_end: Ending task reward scale
+        task_reward_scale_warmup_steps: Warmup steps before task reward ramp starts
+        task_reward_scale_ramp_steps: Ramp steps for task reward scale
         spa_start: Starting steps per alternation
         spa_end: Ending steps per alternation
         spa_schedule: Schedule type for steps per alternation ('linear' or 'constant')
@@ -135,6 +143,24 @@ def save_schedule_metadata(
                     pass_oob_turnover_prob_end
                     if pass_oob_turnover_prob_end is not None
                     else 1.0
+                ),
+            }
+        )
+
+    if task_reward_scale_start is not None:
+        metadata.update(
+            {
+                "schedule_task_reward_scale_start": task_reward_scale_start,
+                "schedule_task_reward_scale_end": (
+                    task_reward_scale_end
+                    if task_reward_scale_end is not None
+                    else task_reward_scale_start
+                ),
+                "schedule_task_reward_scale_warmup_steps": int(
+                    max(0, task_reward_scale_warmup_steps)
+                ),
+                "schedule_task_reward_scale_ramp_steps": int(
+                    max(0, task_reward_scale_ramp_steps)
                 ),
             }
         )
@@ -275,6 +301,36 @@ def load_schedule_metadata(
     if pass_oob_turnover_prob_start is not None:
         metadata["pass_oob_turnover_prob_start"] = pass_oob_turnover_prob_start
         metadata["pass_oob_turnover_prob_end"] = pass_oob_turnover_prob_end
+
+    task_reward_scale_start = get_param("schedule_task_reward_scale_start")
+    if task_reward_scale_start is None:
+        task_reward_scale_start = get_any_param(
+            ["task_reward_scale_start", "task-reward-scale-start"]
+        )
+        task_reward_scale_end = get_any_param(
+            ["task_reward_scale_end", "task-reward-scale-end"]
+        )
+        task_reward_scale_warmup_steps = get_any_param(
+            ["task_reward_scale_warmup_steps", "task-reward-scale-warmup-steps"], int, 0
+        )
+        task_reward_scale_ramp_steps = get_any_param(
+            ["task_reward_scale_ramp_steps", "task-reward-scale-ramp-steps"], int, 1
+        )
+    else:
+        task_reward_scale_end = get_param(
+            "schedule_task_reward_scale_end", float, task_reward_scale_start
+        )
+        task_reward_scale_warmup_steps = get_param(
+            "schedule_task_reward_scale_warmup_steps", int, 0
+        )
+        task_reward_scale_ramp_steps = get_param(
+            "schedule_task_reward_scale_ramp_steps", int, 1
+        )
+    if task_reward_scale_start is not None:
+        metadata["task_reward_scale_start"] = task_reward_scale_start
+        metadata["task_reward_scale_end"] = task_reward_scale_end
+        metadata["task_reward_scale_warmup_steps"] = task_reward_scale_warmup_steps
+        metadata["task_reward_scale_ramp_steps"] = task_reward_scale_ramp_steps
 
     # Load steps per alternation schedule (only include if values exist in MLflow)
     spa_start = get_param("schedule_spa_start", int)

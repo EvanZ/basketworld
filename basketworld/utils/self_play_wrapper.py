@@ -48,6 +48,22 @@ def _selector_alpha_current(training_params: Optional[dict[str, Any]], policy_mo
     return float(start + progress * (end - start))
 
 
+def _selector_eps_current(training_params: Optional[dict[str, Any]], policy_model: Any) -> float:
+    if not isinstance(training_params, dict):
+        return 0.0
+    t = int(getattr(policy_model, "num_timesteps", 0) or 0)
+    start = float(training_params.get("intent_selector_eps_start", 0.0) or 0.0)
+    end = float(training_params.get("intent_selector_eps_end", 0.0) or 0.0)
+    warmup = max(0, int(training_params.get("intent_selector_eps_warmup_steps", 0) or 0))
+    ramp = max(0, int(training_params.get("intent_selector_eps_ramp_steps", 1) or 0))
+    if t < warmup:
+        return float(start)
+    if ramp <= 0:
+        return float(end)
+    progress = min(1.0, max(0.0, (t - warmup) / float(ramp)))
+    return float(start + progress * (end - start))
+
+
 def _normalize_selector_intent_selection_mode(mode: Optional[str]) -> str:
     value = str(mode or "learned_sample").strip().lower()
     if value in {"best_intent", "best", "argmax", "greedy"}:
@@ -95,6 +111,19 @@ def _selector_neutralize_observation(single_obs: dict[str, Any], num_intents: in
     return selector_obs
 
 
+def _selector_apply_eps_floor(
+    selector_probs: torch.Tensor, selector_eps: torch.Tensor | float
+) -> torch.Tensor:
+    probs = selector_probs.clamp_min(1e-8)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    eps = torch.as_tensor(selector_eps, dtype=probs.dtype, device=probs.device)
+    while eps.ndim < probs.ndim:
+        eps = eps.unsqueeze(-1)
+    uniform = torch.full_like(probs, 1.0 / float(max(1, probs.shape[-1])))
+    mixed = (1.0 - eps) * probs + eps * uniform
+    return mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
 def _build_selector_observation(
     env: Any,
     base_obs: dict[str, Any],
@@ -121,6 +150,7 @@ def _sample_selector_intent(
     rng = rng or np.random.default_rng()
     mode = _normalize_selector_intent_selection_mode(selection_mode)
     alpha = _selector_alpha_current(training_params, policy_model)
+    selector_eps = _selector_eps_current(training_params, policy_model)
     policy_obj = getattr(policy_model, "policy", None)
     if policy_obj is None or not hasattr(policy_obj, "get_intent_selector_outputs"):
         if allow_uniform_fallback:
@@ -128,49 +158,68 @@ def _sample_selector_intent(
                 "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
                 "used_selector": False,
                 "alpha": float(alpha),
+                "selector_eps": float(selector_eps),
                 "value": None,
             }
-        return {"intent_index": None, "used_selector": False, "alpha": float(alpha), "value": None}
+        return {
+            "intent_index": None,
+            "used_selector": False,
+            "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
+            "value": None,
+        }
 
     if mode == "uniform_random":
         return {
             "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
             "used_selector": False,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": None,
         }
 
     try:
         with torch.no_grad():
             logits, values = policy_obj.get_intent_selector_outputs(selector_obs)
-            logits_t = torch.as_tensor(logits, dtype=torch.float32)
+            logits_t = torch.as_tensor(logits, dtype=torch.float32).reshape(1, -1)
             values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+            raw_probs_t = torch.softmax(logits_t, dim=-1)
+            mixed_probs_t = _selector_apply_eps_floor(raw_probs_t, selector_eps)
     except Exception:
         if allow_uniform_fallback:
             return {
                 "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
                 "used_selector": False,
                 "alpha": float(alpha),
+                "selector_eps": float(selector_eps),
                 "value": None,
             }
-        return {"intent_index": None, "used_selector": False, "alpha": float(alpha), "value": None}
+        return {
+            "intent_index": None,
+            "used_selector": False,
+            "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
+            "value": None,
+        }
 
     if mode == "best_intent":
-        chosen = torch.argmax(logits_t.reshape(1, -1), dim=-1).reshape(-1)
+        chosen = torch.argmax(logits_t, dim=-1).reshape(-1)
         return {
             "intent_index": int(chosen[0].item()),
             "used_selector": True,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
         }
 
     if alpha > 0.0 and float(rng.random()) < alpha:
-        dist = torch.distributions.Categorical(logits=logits_t)
+        dist = torch.distributions.Categorical(probs=mixed_probs_t)
         chosen = dist.sample().reshape(-1)
         return {
             "intent_index": int(chosen[0].item()),
             "used_selector": True,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
         }
 
@@ -179,9 +228,16 @@ def _sample_selector_intent(
             "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
             "used_selector": False,
             "alpha": float(alpha),
+            "selector_eps": float(selector_eps),
             "value": None,
         }
-    return {"intent_index": None, "used_selector": False, "alpha": float(alpha), "value": None}
+    return {
+        "intent_index": None,
+        "used_selector": False,
+        "alpha": float(alpha),
+        "selector_eps": float(selector_eps),
+        "value": None,
+    }
 
 
 def apply_rollout_segment_start(
@@ -726,6 +782,12 @@ class SelfPlayEnvWrapper(gym.Wrapper):
     ) -> None:  # pragma: no cover - thin shim
         try:
             self.env.unwrapped.set_pass_oob_turnover_prob(float(value))
+        except Exception:
+            pass
+
+    def set_task_reward_scale(self, value: float) -> None:  # pragma: no cover - thin shim
+        try:
+            self.env.unwrapped.set_task_reward_scale(float(value))
         except Exception:
             pass
 

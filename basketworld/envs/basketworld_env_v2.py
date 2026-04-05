@@ -518,6 +518,7 @@ class HexagonBasketballEnv(gym.Env):
         self.made_shot_reward_inside: float = float(made_shot_reward_inside)
         self.made_shot_reward_three: float = float(made_shot_reward_three)
         self.missed_shot_penalty: float = float(missed_shot_penalty)
+        self.task_reward_scale: float = 1.0
         # Absolute assist rewards (legacy; prefer percentage fields below)
         self.potential_assist_reward: float = float(potential_assist_reward)
         self.full_assist_bonus: float = float(full_assist_bonus)
@@ -1752,6 +1753,13 @@ class HexagonBasketballEnv(gym.Env):
     def set_phi_beta(self, value: float) -> None:
         try:
             self.phi_beta = float(value)
+        except Exception:
+            pass
+
+    @profile_section("set_task_reward_scale")
+    def set_task_reward_scale(self, value: float) -> None:
+        try:
+            self.task_reward_scale = float(max(0.0, value))
         except Exception:
             pass
 

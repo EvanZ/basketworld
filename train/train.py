@@ -116,6 +116,7 @@ try:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_task_reward_scale_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
         build_intent_selector_callback,
@@ -158,6 +159,7 @@ except ImportError:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_task_reward_scale_callback,
         build_intent_robustness_callback,
         build_intent_diversity_callback,
         build_intent_selector_callback,
@@ -319,6 +321,22 @@ def main(args):
             mlflow.log_param(
                 "intent_selector_alpha_ramp_steps",
                 getattr(args, "intent_selector_alpha_ramp_steps", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_start",
+                getattr(args, "intent_selector_eps_start", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_end",
+                getattr(args, "intent_selector_eps_end", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_warmup_steps",
+                getattr(args, "intent_selector_eps_warmup_steps", 0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_ramp_steps",
+                getattr(args, "intent_selector_eps_ramp_steps", 1),
             )
             mlflow.log_param(
                 "intent_selector_entropy_coef",
@@ -531,6 +549,18 @@ def main(args):
                 ),
                 intent_selector_alpha_ramp_steps=int(
                     getattr(args, "intent_selector_alpha_ramp_steps", 1)
+                ),
+                intent_selector_eps_start=float(
+                    getattr(args, "intent_selector_eps_start", 0.0)
+                ),
+                intent_selector_eps_end=float(
+                    getattr(args, "intent_selector_eps_end", 0.0)
+                ),
+                intent_selector_eps_warmup_steps=int(
+                    getattr(args, "intent_selector_eps_warmup_steps", 0)
+                ),
+                intent_selector_eps_ramp_steps=int(
+                    getattr(args, "intent_selector_eps_ramp_steps", 1)
                 ),
                 intent_selector_entropy_coef=float(
                     getattr(args, "intent_selector_entropy_coef", 0.01)
@@ -878,6 +908,10 @@ def main(args):
             total_planned_ts,
             timestep_offset,
         )
+        task_reward_scale_callback = build_task_reward_scale_callback(
+            args,
+            timestep_offset,
+        )
         # Optional intent robustness curriculum (null/visibility probability schedule)
         intent_robustness_callback = build_intent_robustness_callback(
             args,
@@ -1091,6 +1125,7 @@ def main(args):
                 beta_callback,
                 pass_bias_callback,
                 pass_curriculum_callback,
+                task_reward_scale_callback,
                 intent_robustness_callback,
                 intent_diversity_callback,
                 intent_policy_sensitivity_callback,
@@ -1215,6 +1250,14 @@ def main(args):
                 ),
                 pass_oob_turnover_prob_end=getattr(
                     args, "pass_oob_turnover_prob_end", None
+                ),
+                task_reward_scale_start=getattr(args, "task_reward_scale_start", None),
+                task_reward_scale_end=getattr(args, "task_reward_scale_end", None),
+                task_reward_scale_warmup_steps=getattr(
+                    args, "task_reward_scale_warmup_steps", 0
+                ),
+                task_reward_scale_ramp_steps=getattr(
+                    args, "task_reward_scale_ramp_steps", 1
                 ),
                 spa_start=spa_start if "spa_start" in locals() else None,
                 spa_end=spa_end if "spa_end" in locals() else None,

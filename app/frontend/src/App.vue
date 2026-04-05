@@ -128,7 +128,7 @@ const selectedPlaybookIntent = ref(null);
 const playbookShowPlayerPaths = ref(true);
 const playbookShowBallPaths = ref(true);
 const playbookShowPassPaths = ref(false);
-const playbookShowShotHeatmap = ref(false);
+const playbookShowShotHeatmap = ref(true);
 const playbookPlayerFilter = ref('all');
 const shotChartTarget = ref('team');
 const assistLinksByPair = ref({});
@@ -385,8 +385,9 @@ const playbookSummaryLabel = computed(() => {
   const rollouts = Number(panel.num_rollouts || 0);
   const avgSteps = Number(panel.avg_steps || 0).toFixed(2);
   const avgPasses = Number(panel.avg_passes || 0).toFixed(2);
+  const avgShots = Number(panel.avg_shots || 0).toFixed(2);
   const terminated = Math.round(Number(panel.terminated_rate || 0) * 100);
-  return `${rollouts} rollouts • ${avgSteps} avg steps • ${avgPasses} avg passes • ${terminated}% terminated`;
+  return `${rollouts} rollouts • ${avgSteps} avg steps • ${avgPasses} avg passes • ${avgShots} avg shots • ${terminated}% terminated`;
 });
 const boardGameHistory = computed(() =>
   isPlaybookBoardPreviewActive.value

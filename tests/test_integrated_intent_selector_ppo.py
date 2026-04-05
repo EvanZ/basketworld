@@ -237,6 +237,38 @@ def test_integrated_selector_uses_full_possession_return(monkeypatch):
     assert "intent/selector_clip_fraction" in logged
 
 
+def test_integrated_selector_eps_floor_preserves_effective_prob_mass():
+    model = _make_model(
+        DummyVecEnv(
+            [
+                lambda: _DummySelectorEnv(
+                    role=1.0, episode_reward=1.0, steps_per_episode=1
+                ),
+                lambda: _DummySelectorEnv(
+                    role=1.0, episode_reward=1.0, steps_per_episode=1
+                ),
+            ]
+        ),
+        intent_selector_eps_start=0.25,
+        intent_selector_eps_end=0.25,
+        intent_selector_eps_warmup_steps=0,
+        intent_selector_eps_ramp_steps=0,
+        n_steps=1,
+        batch_size=2,
+    )
+    selector_probs = torch.tensor(
+        [[0.0, 0.0, 1.0, 0.0]], dtype=torch.float32, device=model.device
+    )
+    mixed = model._selector_apply_eps_floor(selector_probs, 0.25)
+    mixed_np = mixed.detach().cpu().numpy()
+
+    assert np.isclose(model._selector_eps_current(), 0.25)
+    assert np.isclose(mixed_np[0, 0], 0.0625, atol=1e-6)
+    assert np.isclose(mixed_np[0, 1], 0.0625, atol=1e-6)
+    assert np.isclose(mixed_np[0, 2], 0.8125, atol=1e-6)
+    assert np.isclose(mixed_np[0, 3], 0.0625, atol=1e-6)
+
+
 def test_callback_builder_skips_legacy_selector_when_integrated_mode():
     args = SimpleNamespace(
         intent_selector_enabled=True,

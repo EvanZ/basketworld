@@ -215,6 +215,12 @@ class SetObservationWrapper(gym.ObservationWrapper):
         obs_dict["globals"] = globals_vec
         return obs_dict
 
+    def set_task_reward_scale(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_task_reward_scale(float(value))
+        except Exception:
+            pass
+
 
 class MirrorObservationWrapper(gym.Wrapper):
     """Mirror observations/actions across the basket axis for full-episode augmentation."""
@@ -249,6 +255,12 @@ class MirrorObservationWrapper(gym.Wrapper):
         if info is not None:
             info["mirror_episode"] = bool(self._mirror_active)
         return obs, reward, done, truncated, info
+
+    def set_task_reward_scale(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_task_reward_scale(float(value))
+        except Exception:
+            pass
 
     def _maybe_mirror_obs(self, obs):
         if not self._mirror_active or not isinstance(obs, dict):
@@ -404,6 +416,10 @@ class RewardAggregationWrapper(gym.Wrapper):
             training_player_ids = self.env.unwrapped.defense_ids
 
         aggregated_reward = sum(rewards[i] for i in training_player_ids)
+        task_reward_scale = float(getattr(self.env.unwrapped, "task_reward_scale", 1.0))
+        aggregated_reward *= task_reward_scale
+        if info is not None:
+            info["task_reward_scale"] = task_reward_scale
         return obs, aggregated_reward, done, truncated, info
 
 
@@ -768,6 +784,12 @@ class BetaSetterWrapper(gym.Wrapper):
     def set_phi_beta(self, value: float) -> None:  # pragma: no cover
         try:
             self.env.unwrapped.set_phi_beta(float(value))
+        except Exception:
+            pass
+
+    def set_task_reward_scale(self, value: float) -> None:  # pragma: no cover
+        try:
+            self.env.unwrapped.set_task_reward_scale(float(value))
         except Exception:
             pass
 
