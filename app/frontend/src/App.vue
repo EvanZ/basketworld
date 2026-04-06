@@ -6,7 +6,7 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -99,6 +99,7 @@ function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
 const policyProbs = ref(null);   // For AI suggestions
+const templateSandboxMode = ref(false);
 
 function hasAnyProbabilities(probsByPlayer) {
   if (!probsByPlayer) return false;
@@ -317,10 +318,23 @@ const defaultEvalConfig = () => ({
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
 });
+const defaultTemplateAuthoringConfig = () => ({
+  positions: [],
+  ballHolder: null,
+  templateId: 'new_template',
+  weight: 1.0,
+  mirrorable: true,
+  shotClock: 24,
+  jitterByPlayer: {},
+  roleByPlayer: {},
+});
 const evalConfig = ref(defaultEvalConfig());
+const templateConfig = ref(defaultTemplateAuthoringConfig());
 const perPlayerEvalStats = ref({});
 const placementPassPreview = ref({});
 const isEvalPlacementMode = computed(() => evalConfig.value.mode === 'custom');
+const isTemplatePlacementMode = computed(() => activeControlsTab.value === 'template');
+const isBoardEditingMode = computed(() => isEvalPlacementMode.value || isTemplatePlacementMode.value);
 const activeControlsTab = ref('controls');
 const shotChartOptions = computed(() => {
   const opts = [{ label: 'Team', value: 'team' }];
@@ -337,10 +351,10 @@ const hasAssistSankeyData = computed(
   () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
 );
 const showShotChartSelector = computed(
-  () => !isEvalPlacementMode.value && hasShotChartData.value,
+  () => !isBoardEditingMode.value && hasShotChartData.value,
 );
 const showSankeySelector = computed(
-  () => !isEvalPlacementMode.value && hasAssistSankeyData.value,
+  () => !isBoardEditingMode.value && hasAssistSankeyData.value,
 );
 const boardShotChartLabel = computed(() =>
   hasShotChartData.value
@@ -421,13 +435,16 @@ const boardRenderKey = computed(() => {
   ].join('-');
 });
 const boardPolicyProbabilities = computed(() =>
-  isPlaybookBoardPreviewActive.value ? null : policyProbs.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? null : policyProbs.value
 );
 const boardSelectedActionsDisplay = computed(() =>
-  isPlaybookBoardPreviewActive.value ? {} : visibleBoardSelectedActions.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : visibleBoardSelectedActions.value
 );
 const boardShotAccumulatorDisplay = computed(() =>
-  isPlaybookBoardPreviewActive.value ? {} : shotAccumulatorForBoard.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : shotAccumulatorForBoard.value
+);
+const initialControlsTab = computed(() =>
+  templateSandboxMode.value ? 'template' : 'environment'
 );
 const boardShotChartLabelDisplay = computed(() =>
   isPlaybookBoardPreviewActive.value ? '' : boardShotChartLabel.value
@@ -542,6 +559,7 @@ watch(gameState, async (newState, oldState) => {
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
   cancelReplayAnimation();
+  activeControlsTab.value = 'environment';
   
   // Preserve phi shaping parameters (always try to save them, not just when gameState exists)
   let savedPhiParams = null;
@@ -582,6 +600,7 @@ async function handleGameStarted(setupData) {
   error.value = null;
   policyProbs.value = null;
   lastMctsResults.value = null;
+  templateSandboxMode.value = false;
   initialSetup.value = setupData;
   // Keep board hidden but avoid flashing setup screen when we already have a setup
   gameState.value = null;      // Ensure old board is cleared
@@ -615,6 +634,68 @@ async function handleGameStarted(setupData) {
       // Don't create an initial row - wait for first actions
     } else {
       throw new Error(response.message || 'Failed to start game.');
+    }
+  } catch (err) {
+    error.value = err.message;
+    console.error(err);
+  } finally {
+    isLoading.value = false;
+  }
+}
+
+async function handleTemplateSandboxStarted(setupData = {}) {
+  console.log('[App] Opening template sandbox with data:', setupData);
+  cancelReplayAnimation();
+  activeControlsTab.value = 'template';
+
+  moveHistory.value = [];
+  shotAccumulator.value = {};
+  playbookAnalysis.value = null;
+  selectedPlaybookIntent.value = null;
+  assistLinksByPair.value = {};
+  assistLinksByType.value = emptyAssistLinkTypeMap();
+  potentialAssistLinksByPair.value = {};
+  potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  sankeyFlowMode.value = 'assisted';
+  sankeyShotType.value = 'all';
+  currentSelections.value = null;
+  userSelections.value = {};
+  isSelfPlaying.value = false;
+  controlsKey.value += 1;
+  canReplay.value = false;
+  isManualStepping.value = false;
+  replayStates.value = [];
+  currentStepIndex.value = 0;
+  isReplayPaused.value = false;
+
+  isLoading.value = true;
+  error.value = null;
+  policyProbs.value = null;
+  lastMctsResults.value = null;
+  templateSandboxMode.value = true;
+  initialSetup.value = {
+    mode: 'template_sandbox',
+    runId: setupData.runId || null,
+    userTeam: setupData.userTeam || 'OFFENSE',
+  };
+  gameState.value = null;
+  gameHistory.value = [];
+  activePlayerId.value = null;
+  mctsOptionsForStep.value = null;
+  policyOptions.value = [];
+  policyLoadError.value = null;
+
+  try {
+    const response = await initTemplateSandbox({
+      run_id: setupData.runId || null,
+      user_team_name: setupData.userTeam || 'OFFENSE',
+    });
+    if (response.status === 'success') {
+      gameState.value = response.state;
+      gameHistory.value.push(cloneState(response.state));
+      seedTemplateConfigFromGameState();
+    } else {
+      throw new Error(response.message || 'Failed to open template sandbox.');
     }
   } catch (err) {
     error.value = err.message;
@@ -1005,6 +1086,9 @@ function handleMctsToggleChanged(val) {
 
 function handleActiveTabChanged(tab) {
   activeControlsTab.value = tab || 'controls';
+  if (activeControlsTab.value === 'template') {
+    seedTemplateConfigFromGameState();
+  }
 }
 
 function handlePlaybookAnalysisLoaded(result) {
@@ -1104,8 +1188,8 @@ const visibleBoardSelectedActions = computed(() => {
 
 // Handler for Self-Play button click
 function handleSelfPlayButton() {
-  if (activeControlsTab.value === 'eval') {
-    console.log('[App] Self-play disabled in Eval tab');
+  if (templateSandboxMode.value || activeControlsTab.value === 'eval' || activeControlsTab.value === 'template') {
+    console.log('[App] Self-play disabled in sandbox/editing modes');
     return;
   }
   // Get current selections from PlayerControls
@@ -1393,6 +1477,65 @@ function handleEvalConfigChanged(nextConfig) {
   }
 }
 
+function seedTemplateConfigFromGameState() {
+  if (!gameState.value) return;
+  const positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
+  const nPlayers = positions.length;
+  const existing = templateConfig.value || defaultTemplateAuthoringConfig();
+  const nextJitter = {};
+  const nextRole = {};
+  for (let pid = 0; pid < nPlayers; pid += 1) {
+    nextJitter[pid] = Number(existing?.jitterByPlayer?.[pid] ?? existing?.jitterByPlayer?.[String(pid)] ?? 1);
+    nextRole[pid] = String(existing?.roleByPlayer?.[pid] ?? existing?.roleByPlayer?.[String(pid)] ?? '');
+  }
+  templateConfig.value = {
+    ...defaultTemplateAuthoringConfig(),
+    ...existing,
+    positions,
+    ballHolder: gameState.value.ball_holder ?? existing.ballHolder ?? null,
+    shotClock: Number(gameState.value.shot_clock ?? existing.shotClock ?? 24),
+    jitterByPlayer: nextJitter,
+    roleByPlayer: nextRole,
+  };
+}
+
+function handleTemplateConfigChanged(nextConfig) {
+  const current = templateConfig.value || defaultTemplateAuthoringConfig();
+  const merged = {
+    ...defaultTemplateAuthoringConfig(),
+    ...current,
+    ...(nextConfig || {}),
+    jitterByPlayer: {
+      ...(current.jitterByPlayer || {}),
+      ...(nextConfig?.jitterByPlayer || {}),
+    },
+    roleByPlayer: {
+      ...(current.roleByPlayer || {}),
+      ...(nextConfig?.roleByPlayer || {}),
+    },
+  };
+  templateConfig.value = merged;
+
+  if (gameState.value && activeControlsTab.value === 'template') {
+    const patchedState = cloneState(gameState.value);
+    if (Array.isArray(merged.positions) && merged.positions.length === (patchedState.positions?.length || 0)) {
+      patchedState.positions = merged.positions.map((pos) => [pos[0], pos[1]]);
+    }
+    if (merged.ballHolder !== null && merged.ballHolder !== undefined) {
+      patchedState.ball_holder = Number(merged.ballHolder);
+    }
+    if (merged.shotClock !== null && merged.shotClock !== undefined) {
+      patchedState.shot_clock = Number(merged.shotClock);
+    }
+    gameState.value = patchedState;
+    if (gameHistory.value.length > 0) {
+      gameHistory.value[gameHistory.value.length - 1] = cloneState(patchedState);
+    } else {
+      gameHistory.value = [cloneState(patchedState)];
+    }
+  }
+}
+
 function seedEvalConfigFromGameState(copySkills = true) {
   if (!gameState.value) return;
   const positions = (gameState.value.positions || []).map((pos) => [pos[0], pos[1]]);
@@ -1434,6 +1577,32 @@ function handleEvalPlacementUpdate({ playerId, q, r }) {
   positions[playerId] = [q, r];
   handleEvalConfigChanged({ positions });
   refreshPlacementPreview(positions, evalConfig.value.ballHolder);
+}
+
+function ensureTemplatePositionsInitialized() {
+  if (!gameState.value) return;
+  const nPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+  if (!Array.isArray(templateConfig.value.positions) || templateConfig.value.positions.length !== nPlayers) {
+    seedTemplateConfigFromGameState();
+  }
+}
+
+function handleTemplatePlacementUpdate({ playerId, q, r }) {
+  if (playerId === undefined || playerId === null) return;
+  ensureTemplatePositionsInitialized();
+  const positions = Array.isArray(templateConfig.value.positions)
+    ? templateConfig.value.positions.map((pos) => [pos[0], pos[1]])
+    : [];
+  positions[playerId] = [q, r];
+  handleTemplateConfigChanged({ positions });
+}
+
+function handleBoardPlacementUpdate(payload) {
+  if (isTemplatePlacementMode.value) {
+    handleTemplatePlacementUpdate(payload);
+    return;
+  }
+  handleEvalPlacementUpdate(payload);
 }
 
 function buildCustomEvalSetup() {
@@ -1657,7 +1826,9 @@ function handleEvalRunRequested(payload) {
   handleEvaluation();
 }
 
-const liveButtonsDisabled = computed(() => activeControlsTab.value === 'eval');
+const liveButtonsDisabled = computed(() =>
+  templateSandboxMode.value || activeControlsTab.value === 'eval' || activeControlsTab.value === 'template'
+);
 
 function stateHasAnimatedFlash(state) {
   const results = state?.last_action_results;
@@ -1999,7 +2170,11 @@ function handlePlayAgain() {
   perPlayerEvalStats.value = {};
   evalNumEpisodes.value = 100;
   if (initialSetup.value) {
-    handleGameStarted(initialSetup.value);
+    if (initialSetup.value.mode === 'template_sandbox') {
+      handleTemplateSandboxStarted(initialSetup.value);
+    } else {
+      handleGameStarted(initialSetup.value);
+    }
   }
 }
 
@@ -2084,7 +2259,13 @@ function onKeydown(e) {
   }
   if (key === 'n') {
     // New Game
-    if (initialSetup.value) handleGameStarted(initialSetup.value);
+    if (initialSetup.value) {
+      if (initialSetup.value.mode === 'template_sandbox') {
+        handleTemplateSandboxStarted(initialSetup.value);
+      } else {
+        handleGameStarted(initialSetup.value);
+      }
+    }
   } else if (key === 'p') {
     // Self-Play
     if (gameState.value && !gameState.value.done) handleSelfPlayButton();
@@ -2138,7 +2319,11 @@ onBeforeUnmount(() => {
         </header>
 
         <!-- Only render setup when no initialSetup has been chosen -->
-        <GameSetup v-if="!initialSetup" @game-started="handleGameStarted" />
+        <GameSetup
+          v-if="!initialSetup"
+          @game-started="handleGameStarted"
+          @template-sandbox-started="handleTemplateSandboxStarted"
+        />
         
         <div v-if="isLoading" class="loading">Loading Game...</div>
         <div v-if="error" class="error-message">{{ error }}</div>
@@ -2235,23 +2420,24 @@ onBeforeUnmount(() => {
           :selected-actions="boardSelectedActionsDisplay"
           :shot-accumulator="boardShotAccumulatorDisplay"
           :shot-chart-label="boardShotChartLabelDisplay"
-          :placement-mode="isEvalPlacementMode"
-          :placement-editable="evalConfig.placementEditing"
-          :placement-positions="evalConfig.positions"
-          :placement-ball-holder="evalConfig.ballHolder"
-          :placement-pass-probs="placementPassPreview"
+          :placement-mode="isBoardEditingMode"
+          :placement-editable="isTemplatePlacementMode ? true : evalConfig.placementEditing"
+          :placement-positions="isTemplatePlacementMode ? templateConfig.positions : evalConfig.positions"
+          :placement-ball-holder="isTemplatePlacementMode ? templateConfig.ballHolder : evalConfig.ballHolder"
+          :placement-pass-probs="isTemplatePlacementMode ? {} : placementPassPreview"
+          :show-coordinates="isTemplatePlacementMode"
           @update-player-position="handlePlayerPositionUpdate"
-          @update-placement="handleEvalPlacementUpdate"
+          @update-placement="handleBoardPlacementUpdate"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
-          :disable-backend-value-fetches="isPlaybookBoardPreviewActive"
+          :disable-backend-value-fetches="isPlaybookBoardPreviewActive || isTemplatePlacementMode"
           :allow-position-drag="!isPlaybookBoardPreviewActive"
           :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"
         />
         <AssistSankey
-          v-if="!isEvalPlacementMode && hasAssistSankeyData && !isPlaybookBoardPreviewActive"
+          v-if="!isBoardEditingMode && hasAssistSankeyData && !isPlaybookBoardPreviewActive"
           :links="assistSankeyLinks"
           :player-ids="assistSankeyPlayerIds"
           :title="assistSankeyTitle"
@@ -2282,7 +2468,9 @@ onBeforeUnmount(() => {
           :current-shot-clock="currentShotClock"
           :pressure-exposure="pressureExposure"
           :external-selections="isSelfPlaying ? currentSelections : null"
+          :initial-active-tab="initialControlsTab"
           :eval-config="evalConfig"
+          :template-config="templateConfig"
           :eval-num-episodes="evalNumEpisodes"
           :eval-progress="evalProgress"
           :per-player-eval-stats="perPlayerEvalStats"
@@ -2302,6 +2490,7 @@ onBeforeUnmount(() => {
           @counterfactual-replay-loaded="handleCounterfactualReplayLoaded"
           @playbook-analysis-loaded="handlePlaybookAnalysisLoaded"
           @eval-config-changed="handleEvalConfigChanged"
+          @template-config-changed="handleTemplateConfigChanged"
           @eval-run="handleEvalRunRequested"
           @active-tab-changed="handleActiveTabChanged"
           @stats-reset="handleStatsReset"

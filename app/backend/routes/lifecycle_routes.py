@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from basketworld.utils.mlflow_params import (
     get_mlflow_params,
     get_mlflow_phi_shaping_params,
+    get_mlflow_start_template_library,
     get_mlflow_training_params,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
@@ -43,11 +44,13 @@ from app.backend.schemas import (
     InitGameRequest,
     ListPoliciesRequest,
     MCTSAdviseRequest,
+    TemplateBootstrapRequest,
 )
 from app.backend.state import (
     _capture_turn_start_snapshot,
     _role_flag_value_for_team,
     game_state,
+    get_full_game_state,
     get_ui_game_state,
 )
 from fastapi.encoders import jsonable_encoder
@@ -65,6 +68,17 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
     wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
     return env_kwargs, wrapper_kwargs
+
+
+def _load_start_template_library_for_run(
+    mlflow_client: mlflow.tracking.MlflowClient, run_id: str
+) -> dict | None:
+    """Best-effort load of a persisted start-template library artifact."""
+    try:
+        return get_mlflow_start_template_library(mlflow_client, run_id)
+    except Exception as exc:
+        print(f"[start_templates] Failed to load template library for run {run_id}: {exc}")
+        return None
 
 
 def _selector_runtime_active_for_app() -> bool:
@@ -174,6 +188,10 @@ async def init_game(request: InitGameRequest):
             if "RESOURCE_DOES_NOT_EXIST" in msg:
                 raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
             raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
+
+        start_template_library = _load_start_template_library_for_run(
+            mlflow_client, run_id
+        )
 
         # Extract role_flag encoding for backward compatibility (not passed to env)
         game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
@@ -367,10 +385,135 @@ async def init_game(request: InitGameRequest):
     if counts:
         mlflow_training_params["param_counts"] = counts
     game_state.mlflow_training_params = mlflow_training_params
+    game_state.mlflow_start_template_library = copy.deepcopy(start_template_library)
 
     return {
         "status": "success",
         "state": get_ui_game_state(),
+        "seed": int(np.random.randint(0, 2**31 - 1)),
+    }
+
+
+@router.post("/api/template_bootstrap")
+async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
+    """Initialize a model-free sandbox state for template authoring."""
+    global game_state
+
+    request = request or TemplateBootstrapRequest()
+    players_per_side = int(max(1, request.players_per_side or 3))
+    user_team_name = str(request.user_team_name or "OFFENSE").strip().upper()
+    if user_team_name not in {"OFFENSE", "DEFENSE"}:
+        raise HTTPException(status_code=400, detail="user_team_name must be OFFENSE or DEFENSE")
+
+    required_params = {"players": players_per_side}
+    env_optional_params = {}
+    mlflow_training_params: dict = {}
+    run_name = "Template Sandbox"
+    source_run_id = str(request.run_id or "").strip() or None
+
+    if source_run_id:
+        try:
+            setup_mlflow(verbose=False)
+        except Exception as setup_err:
+            print(f"[template_bootstrap] MLflow setup warning: {setup_err}")
+
+        mlflow_client = mlflow.tracking.MlflowClient()
+        try:
+            required_params, optional_params = get_mlflow_params(mlflow_client, source_run_id)
+            mlflow_training_params = get_mlflow_training_params(
+                mlflow_client, source_run_id
+            )
+        except Exception as e:
+            msg = str(e)
+            if "RESOURCE_DOES_NOT_EXIST" in msg:
+                raise HTTPException(status_code=404, detail=f"MLflow run not found: {source_run_id}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch MLflow params for template sandbox: {e}",
+            )
+
+        env_optional_params, _wrapper_only_params = _split_env_and_wrapper_params(optional_params)
+        game_state.mlflow_start_template_library = _load_start_template_library_for_run(
+            mlflow_client, source_run_id
+        )
+        if request.allow_dunks is not None:
+            env_optional_params["allow_dunks"] = bool(request.allow_dunks)
+        run_name = f"Template Sandbox ({source_run_id})"
+    elif request.allow_dunks is not None:
+        env_optional_params["allow_dunks"] = bool(request.allow_dunks)
+        game_state.mlflow_start_template_library = None
+    else:
+        game_state.mlflow_start_template_library = None
+
+    game_state.unified_policy = None
+    game_state.offense_policy = None
+    game_state.defense_policy = None
+    game_state.unified_policy_key = None
+    game_state.opponent_unified_policy_key = None
+    game_state.unified_policy_path = None
+    game_state.opponent_policy_path = None
+
+    env_kwargs = {
+        **required_params,
+        **env_optional_params,
+        "render_mode": "rgb_array",
+    }
+
+    game_state.env = basketworld.HexagonBasketballEnv(**env_kwargs)
+    game_state.obs, _ = game_state.env.reset()
+    game_state.prev_obs = None
+
+    env_read = env_view(game_state.env)
+    sampled_skills = {
+        "layup": list(env_read.offense_layup_pct_by_player or []),
+        "three_pt": list(env_read.offense_three_pt_pct_by_player or []),
+        "dunk": list(env_read.offense_dunk_pct_by_player or []),
+    }
+    game_state.replay_offense_skills = copy.deepcopy(sampled_skills)
+    game_state.sampled_offense_skills = copy.deepcopy(sampled_skills)
+
+    game_state.env_required_params = copy.deepcopy(required_params)
+    game_state.env_optional_params = copy.deepcopy(env_optional_params)
+    if "allow_dunks" not in game_state.env_optional_params:
+        game_state.env_optional_params["allow_dunks"] = bool(getattr(env_read, "allow_dunks", False))
+    game_state.mlflow_env_optional_defaults = copy.deepcopy(game_state.env_optional_params)
+
+    _capture_turn_start_snapshot()
+
+    game_state.user_team = Team[user_team_name]
+    game_state.run_id = source_run_id
+    game_state.run_name = run_name
+    game_state.mlflow_phi_shaping_params = None
+    game_state.mlflow_training_params = mlflow_training_params
+    game_state.counterfactual_snapshot = None
+    game_state.frames = []
+    game_state.reward_history = []
+    game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+    game_state.actions_log = []
+    game_state.episode_states = []
+    game_state.phi_log = []
+    game_state.playable_session = None
+    game_state.selector_segment_index = 0
+    game_state.selector_last_boundary_reason = None
+
+    try:
+        frame = game_state.env.render()
+        if frame is not None:
+            game_state.frames.append(frame)
+    except Exception:
+        pass
+
+    initial_state = get_full_game_state(
+        include_policy_probs=False,
+        include_action_values=False,
+        include_state_values=False,
+    )
+    game_state.episode_states.append(initial_state)
+
+    return {
+        "status": "success",
+        "state": initial_state,
+        "mode": "template_sandbox",
         "seed": int(np.random.randint(0, 2**31 - 1)),
     }
 

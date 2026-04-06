@@ -87,6 +87,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  showCoordinates: {
+    type: Boolean,
+    default: false,
+  },
   playerDisplayNames: {
     type: Object,
     default: () => ({}),
@@ -3513,6 +3517,18 @@ onBeforeUnmount(() => {
           :points="hex.points"
           :class="['court-hex', threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified']"
         />
+        <text
+          v-if="props.showCoordinates"
+          v-for="hex in courtHexPolygons"
+          :key="`coord-${hex.key}`"
+          :x="hex.x"
+          :y="hex.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-coordinate-label"
+        >
+          {{ `${hex.q},${hex.r}` }}
+        </text>
 
         <!-- Offensive Lane (painted area) -->
         <polygon
@@ -3747,7 +3763,14 @@ onBeforeUnmount(() => {
           :key="player.id"
           :class="[
             'player-group',
-            { 'ball-handler-bounce': player.hasBall && draggedPlayerId !== player.id && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id },
+            {
+              'ball-handler-bounce':
+                !props.placementMode
+                && player.hasBall
+                && draggedPlayerId !== player.id
+                && shotJumpPlayerId !== player.id
+                && shotInFlightPlayerId !== player.id,
+            },
             { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
             { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id },
             {
@@ -4672,6 +4695,13 @@ onBeforeUnmount(() => {
 .court-hex.unqualified {
   fill: rgba(41, 49, 88, 0.89);
   stroke: rgba(15, 23, 42, 0.95);
+}
+.court-coordinate-label {
+  fill: rgba(226, 232, 240, 0.78);
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 0.34rem;
+  pointer-events: none;
+  user-select: none;
 }
 .three-point-arc {
   fill: none;

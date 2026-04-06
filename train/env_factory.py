@@ -5,6 +5,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.action_resolution import IllegalActionStrategy
+from basketworld.utils.start_templates import load_start_template_library
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.wrappers import (
     RewardAggregationWrapper,
@@ -18,6 +19,13 @@ from basketworld.utils.wrappers import (
 
 def setup_environment(args, training_team, env_idx=None):
     """Construct a single environment wrapped for training/eval."""
+    start_template_enabled = bool(getattr(args, "start_template_enabled", False))
+    start_template_library = None
+    start_template_path = getattr(args, "start_template_library", None)
+    if start_template_enabled and start_template_path:
+        start_template_library = load_start_template_library(
+            start_template_path, players_per_side=int(args.players)
+        )
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
         court_rows=getattr(args, "court_rows", None),
@@ -97,6 +105,12 @@ def setup_environment(args, training_team, env_idx=None):
         three_second_max_steps=getattr(args, "three_second_max_steps", 3),
         illegal_defense_enabled=args.illegal_defense_enabled,
         offensive_three_seconds_enabled=getattr(args, "offensive_three_seconds", False),
+        start_template_enabled=start_template_enabled,
+        start_template_library=start_template_library,
+        start_template_prob=getattr(args, "start_template_prob", 0.0),
+        start_template_jitter_scale=getattr(args, "start_template_jitter_scale", 1.0),
+        start_template_mirror_prob=getattr(args, "start_template_mirror_prob", 0.5),
+        start_template_strict=getattr(args, "start_template_strict", False),
     )
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
@@ -164,6 +178,10 @@ def setup_environment(args, training_team, env_idx=None):
             "gt_distance",
             "basket_q",
             "basket_r",
+            "start_template_used",
+            "start_template_id",
+            "start_template_mirrored",
+            "start_template_fallback_reason",
         ),
     )
     if env_idx is not None:

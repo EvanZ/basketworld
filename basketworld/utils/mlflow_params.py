@@ -1,3 +1,4 @@
+import tempfile
 import mlflow
 from typing import Any, Callable, Dict, Tuple
 
@@ -772,6 +773,60 @@ def get_mlflow_training_params(
         int,
         1,
     )
+    training_params["start_template_enabled"] = _get_param(
+        params,
+        ["start_template_enabled", "start-template-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["start_template_library"] = _get_param(
+        params,
+        ["start_template_library", "start-template-library"],
+        lambda v: None if v in ("", "None", "null") else str(v),
+        None,
+    )
+    training_params["start_template_library_artifact_path"] = _get_param(
+        params,
+        [
+            "start_template_library_artifact_path",
+            "start-template-library-artifact-path",
+        ],
+        lambda v: None if v in ("", "None", "null") else str(v),
+        None,
+    )
+    training_params["start_template_library_template_count"] = _get_param(
+        params,
+        [
+            "start_template_library_template_count",
+            "start-template-library-template-count",
+        ],
+        lambda v: None if v in ("", "None", "null") else int(v),
+        None,
+    )
+    training_params["start_template_prob"] = _get_param(
+        params,
+        ["start_template_prob", "start-template-prob"],
+        float,
+        0.0,
+    )
+    training_params["start_template_jitter_scale"] = _get_param(
+        params,
+        ["start_template_jitter_scale", "start-template-jitter-scale"],
+        float,
+        1.0,
+    )
+    training_params["start_template_mirror_prob"] = _get_param(
+        params,
+        ["start_template_mirror_prob", "start-template-mirror-prob"],
+        float,
+        0.5,
+    )
+    training_params["start_template_strict"] = _get_param(
+        params,
+        ["start_template_strict", "start-template-strict"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
     training_params["intent_disc_encoder_type"] = _get_param(
         params,
         ["intent_disc_encoder_type", "intent-disc-encoder-type"],
@@ -969,3 +1024,35 @@ def get_mlflow_training_params(
     )
 
     return training_params
+
+
+def get_mlflow_start_template_library(
+    client: mlflow.tracking.MlflowClient, run_id: str
+) -> dict | None:
+    """Fetch and validate the persisted start-template library artifact for a run."""
+    training_params = get_mlflow_training_params(client, run_id)
+    artifact_path = training_params.get("start_template_library_artifact_path")
+    if not artifact_path:
+        return None
+
+    run = client.get_run(run_id)
+    players_per_side = _get_param(
+        run.data.params,
+        ["players"],
+        int,
+        3,
+    )
+
+    try:
+        from basketworld.utils.start_templates import load_start_template_library
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = client.download_artifacts(run_id, artifact_path, tmpdir)
+            return load_start_template_library(
+                local_path,
+                players_per_side=int(players_per_side or 3),
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load start template library artifact '{artifact_path}' for run {run_id}: {exc}"
+        ) from exc

@@ -464,6 +464,48 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--start-template-enabled",
+        dest="start_template_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable optional start-template curriculum for structured reset formations.",
+    )
+    parser.add_argument(
+        "--start-template-library",
+        dest="start_template_library",
+        type=lambda v: None if v == "" or str(v).lower() == "none" else str(v),
+        default=None,
+        help="Path to a JSON or YAML start-template library file.",
+    )
+    parser.add_argument(
+        "--start-template-prob",
+        dest="start_template_prob",
+        type=float,
+        default=0.0,
+        help="Probability that a reset uses a sampled start template instead of default spawning.",
+    )
+    parser.add_argument(
+        "--start-template-jitter-scale",
+        dest="start_template_jitter_scale",
+        type=float,
+        default=1.0,
+        help="Global multiplier applied to per-player template jitter radii.",
+    )
+    parser.add_argument(
+        "--start-template-mirror-prob",
+        dest="start_template_mirror_prob",
+        type=float,
+        default=0.5,
+        help="Probability of mirroring a mirrorable start template left/right.",
+    )
+    parser.add_argument(
+        "--start-template-strict",
+        dest="start_template_strict",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Fail fast on invalid or unreadable start-template libraries instead of disabling the feature.",
+    )
+    parser.add_argument(
         "--deterministic-opponent",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,

@@ -13,7 +13,7 @@ import app.backend.state as backend_state
 import basketworld.utils.mlflow_config as mlflow_config
 from app.backend.routes import admin_routes
 from app.backend.routes import lifecycle_routes
-from app.backend.schemas import InitGameRequest, PlaybookAnalysisRequest, ReplayCounterfactualRequest
+from app.backend.schemas import ApplyStartTemplateRequest, InitGameRequest, PlaybookAnalysisRequest, ReplayCounterfactualRequest, TemplateBootstrapRequest
 from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv, Team
 
 
@@ -432,7 +432,23 @@ def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_sta
         ),
     )
     monkeypatch.setattr(lifecycle_routes, "get_mlflow_phi_shaping_params", lambda client, run_id: {})
-    monkeypatch.setattr(lifecycle_routes, "get_mlflow_training_params", lambda client, run_id: {})
+    monkeypatch.setattr(
+        lifecycle_routes,
+        "get_mlflow_training_params",
+        lambda client, run_id: {
+            "start_template_enabled": True,
+            "start_template_library_artifact_path": "metadata/start_template_library.json",
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle_routes,
+        "get_mlflow_start_template_library",
+        lambda client, run_id: {
+            "version": 1,
+            "players_per_side": 3,
+            "templates": [{"id": "artifact_template"}],
+        },
+    )
     monkeypatch.setattr(lifecycle_routes, "get_unified_policy_path", lambda client, run_id, unified_name=None: "/tmp/fake.zip")
     monkeypatch.setattr(lifecycle_routes, "load_ppo_for_inference", lambda *args, **kwargs: DummyPPO())
     monkeypatch.setattr(lifecycle_routes, "validate_policy_observation_schema", lambda policy, env, obs, **kwargs: obs)
@@ -450,4 +466,242 @@ def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_sta
 
     assert body["status"] == "success"
     assert isolated_game_state.counterfactual_snapshot is None
+    assert body["state"]["training_params"]["start_template_enabled"] is True
+    assert body["state"]["training_params"]["start_template_library_artifact_path"] == "metadata/start_template_library.json"
+    assert body["state"]["start_template_library"]["templates"][0]["id"] == "artifact_template"
+
+
+def test_template_bootstrap_initializes_model_free_sandbox(isolated_game_state):
+    body = asyncio.run(
+        lifecycle_routes.template_bootstrap(
+            TemplateBootstrapRequest(
+                user_team_name="OFFENSE",
+                players_per_side=3,
+                allow_dunks=True,
+            )
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["mode"] == "template_sandbox"
+    assert body["state"]["run_id"] is None
+    assert body["state"]["run_name"] == "Template Sandbox"
+    assert body["state"]["training_params"] == {}
+    assert body["state"]["unified_policy_name"] is None
+    assert len(body["state"]["positions"]) == 6
+    assert body["state"]["ball_holder"] in body["state"]["offense_ids"]
+    assert isolated_game_state.unified_policy is None
+    assert isolated_game_state.defense_policy is None
     assert body["state"]["counterfactual_snapshot_available"] is False
+
+
+def test_template_bootstrap_can_copy_env_params_from_run(monkeypatch, isolated_game_state):
+    monkeypatch.setattr(lifecycle_routes, "setup_mlflow", lambda verbose=False: None)
+
+    class DummyClient:
+        def get_run(self, run_id):
+            assert run_id == "run-123"
+            return object()
+
+    monkeypatch.setattr(lifecycle_routes.mlflow.tracking, "MlflowClient", lambda: DummyClient())
+
+    def fake_get_mlflow_params(_client, run_id):
+        assert run_id == "run-123"
+        return (
+            {"grid_size": 20, "players": 4, "shot_clock": 18},
+            {
+                "court_rows": 9,
+                "court_cols": 10,
+                "allow_dunks": True,
+                "spawn_distance": 5,
+                "use_set_obs": True,
+            },
+        )
+
+    monkeypatch.setattr(lifecycle_routes, "get_mlflow_params", fake_get_mlflow_params)
+    monkeypatch.setattr(
+        lifecycle_routes,
+        "get_mlflow_training_params",
+        lambda _client, run_id: {
+            "start_template_enabled": True,
+            "start_template_library_artifact_path": "metadata/start_template_library.json",
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle_routes,
+        "get_mlflow_start_template_library",
+        lambda _client, run_id: {
+            "version": 1,
+            "players_per_side": 4,
+            "templates": [{"id": "sandbox_template"}],
+        },
+    )
+
+    body = asyncio.run(
+        lifecycle_routes.template_bootstrap(
+            TemplateBootstrapRequest(run_id="run-123", user_team_name="DEFENSE")
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["mode"] == "template_sandbox"
+    assert body["state"]["run_id"] == "run-123"
+    assert body["state"]["run_name"] == "Template Sandbox (run-123)"
+    assert isolated_game_state.env_required_params == {
+        "grid_size": 20,
+        "players": 4,
+        "shot_clock": 18,
+    }
+    assert isolated_game_state.env_optional_params["court_rows"] == 9
+    assert isolated_game_state.env_optional_params["court_cols"] == 10
+    assert isolated_game_state.env_optional_params["spawn_distance"] == 5
+    assert isolated_game_state.env_optional_params["allow_dunks"] is True
+    assert "use_set_obs" not in isolated_game_state.env_optional_params
+    assert isolated_game_state.user_team == Team.DEFENSE
+    assert len(body["state"]["positions"]) == 8
+    assert body["state"]["training_params"]["start_template_enabled"] is True
+    assert body["state"]["start_template_library"]["templates"][0]["id"] == "sandbox_template"
+
+
+def test_apply_start_template_preview_returns_resolved_setup_without_mutating_state(isolated_game_state):
+    _init_live_game(isolated_game_state)
+    isolated_game_state.mlflow_training_params = {
+        "start_template_jitter_scale": 1.0,
+        "start_template_mirror_prob": 0.0,
+    }
+    isolated_game_state.mlflow_start_template_library = {
+        "version": 1,
+        "players_per_side": 3,
+        "templates": [
+            {
+                "id": "preview_template",
+                "weight": 1.0,
+                "mirrorable": True,
+                "shot_clock": 21,
+                "offense": [
+                    {"anchor": [-1, 8], "jitter_radius": 0, "has_ball": True},
+                    {"anchor": [2, 5], "jitter_radius": 0},
+                    {"anchor": [3, 0], "jitter_radius": 0},
+                ],
+                "defense": [
+                    {"anchor": [-1, 7], "jitter_radius": 0},
+                    {"anchor": [1, 5], "jitter_radius": 0},
+                    {"anchor": [3, 2], "jitter_radius": 0},
+                ],
+            }
+        ],
+    }
+
+    baseline_positions = [tuple(pos) for pos in isolated_game_state.env.positions]
+    baseline_ball_holder = int(isolated_game_state.env.ball_holder)
+
+    body = admin_routes.apply_start_template(
+        ApplyStartTemplateRequest(
+            template_id="preview_template",
+            mirrored=False,
+            apply_to_state=False,
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["template_id"] == "preview_template"
+    assert body.get("state") is None
+    assert len(body["resolved_setup"]["positions"]) == 6
+    assert body["resolved_setup"]["ball_holder"] in isolated_game_state.env.offense_ids
+    assert body["resolved_setup"]["shot_clock"] == 21
+    assert [tuple(pos) for pos in isolated_game_state.env.positions] == baseline_positions
+    assert int(isolated_game_state.env.ball_holder) == baseline_ball_holder
+
+
+def test_apply_start_template_updates_live_board_state(isolated_game_state):
+    _init_live_game(isolated_game_state)
+    isolated_game_state.mlflow_training_params = {
+        "start_template_jitter_scale": 1.0,
+        "start_template_mirror_prob": 0.0,
+    }
+    isolated_game_state.mlflow_start_template_library = {
+        "version": 1,
+        "players_per_side": 3,
+        "templates": [
+            {
+                "id": "board_template",
+                "weight": 1.0,
+                "mirrorable": False,
+                "shot_clock": 19,
+                "offense": [
+                    {"anchor": [-1, 8], "jitter_radius": 0},
+                    {"anchor": [2, 5], "jitter_radius": 0, "has_ball": True},
+                    {"anchor": [3, 0], "jitter_radius": 0},
+                ],
+                "defense": [
+                    {"anchor": [-1, 7], "jitter_radius": 0},
+                    {"anchor": [1, 5], "jitter_radius": 0},
+                    {"anchor": [3, 2], "jitter_radius": 0},
+                ],
+            }
+        ],
+    }
+
+    body = admin_routes.apply_start_template(
+        ApplyStartTemplateRequest(
+            template_id="board_template",
+            mirrored=False,
+            apply_to_state=True,
+        )
+    )
+
+    assert body["status"] == "success"
+    assert body["template_id"] == "board_template"
+    assert body["state"]["shot_clock"] == 19
+    assert len(body["state"]["positions"]) == 6
+    assert body["state"]["ball_holder"] in body["state"]["offense_ids"]
+
+
+def test_apply_start_template_with_fixed_seed_is_deterministic(isolated_game_state):
+    _init_live_game(isolated_game_state)
+    isolated_game_state.mlflow_training_params = {
+        "start_template_jitter_scale": 1.0,
+        "start_template_mirror_prob": 0.5,
+    }
+    isolated_game_state.mlflow_start_template_library = {
+        "version": 1,
+        "players_per_side": 3,
+        "templates": [
+            {
+                "id": "deterministic_template",
+                "weight": 1.0,
+                "mirrorable": True,
+                "shot_clock": 20,
+                "offense": [
+                    {"anchor": [-1, 8], "jitter_radius": 1},
+                    {"anchor": [2, 5], "jitter_radius": 1, "has_ball": True},
+                    {"anchor": [3, 0], "jitter_radius": 1},
+                ],
+                "defense": [
+                    {"anchor": [-1, 7], "jitter_radius": 1},
+                    {"anchor": [1, 5], "jitter_radius": 1},
+                    {"anchor": [3, 2], "jitter_radius": 1},
+                ],
+            }
+        ],
+    }
+
+    first = admin_routes.apply_start_template(
+        ApplyStartTemplateRequest(
+            template_id="deterministic_template",
+            mirrored=None,
+            apply_to_state=False,
+            seed=12345,
+        )
+    )
+    second = admin_routes.apply_start_template(
+        ApplyStartTemplateRequest(
+            template_id="deterministic_template",
+            mirrored=None,
+            apply_to_state=False,
+            seed=12345,
+        )
+    )
+
+    assert first["resolved_setup"] == second["resolved_setup"]
+    assert first["mirrored"] == second["mirrored"]

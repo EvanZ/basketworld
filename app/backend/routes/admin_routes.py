@@ -12,6 +12,7 @@ from fastapi.encoders import jsonable_encoder
 import mlflow
 import numpy as np
 from stable_baselines3 import PPO
+from basketworld.utils.start_templates import resolve_start_template
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from basketworld.utils.play_names import lookup_play_name
@@ -26,6 +27,7 @@ from app.backend.rollout_runtime import (
 from app.backend.env_access import env_view
 from app.backend.schemas import (
     ActionRequest,
+    ApplyStartTemplateRequest,
     BatchUpdatePositionRequest,
     PlaybookAnalysisRequest,
     ReplayCounterfactualRequest,
@@ -40,6 +42,7 @@ from app.backend.schemas import (
     UpdateShotClockRequest,
 )
 from app.backend.state import (
+    _capture_turn_start_snapshot,
     _capture_restorable_backend_state,
     _rebuild_cached_obs,
     _restore_restorable_backend_state,
@@ -69,6 +72,74 @@ _NUMPY_SAFE_ENCODER = {
 def _base_env():
     env = game_state.env
     return getattr(env, "unwrapped", env)
+
+
+def _resolve_start_template_request(
+    req: ApplyStartTemplateRequest,
+) -> tuple[dict, bool]:
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    library = getattr(game_state, "mlflow_start_template_library", None)
+    if not library or not isinstance(library, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="No persisted start-template library is available for this run.",
+        )
+
+    template_id = str(req.template_id or "").strip()
+    if not template_id:
+        raise HTTPException(status_code=400, detail="template_id is required.")
+
+    templates = list(library.get("templates") or [])
+    template = next(
+        (dict(item) for item in templates if str(item.get("id", "")).strip() == template_id),
+        None,
+    )
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown start template: {template_id}",
+        )
+
+    env = _base_env()
+    original_rng = getattr(env, "_rng", None)
+    if req.seed is not None:
+        rng = np.random.default_rng(int(req.seed))
+        setattr(env, "_rng", rng)
+    else:
+        rng = original_rng
+        if rng is None:
+            rng = np.random.default_rng()
+            setattr(env, "_rng", rng)
+
+    if req.mirrored is None:
+        mirror_prob = 0.5
+        training_params = getattr(game_state, "mlflow_training_params", None) or {}
+        try:
+            mirror_prob = float(training_params.get("start_template_mirror_prob", 0.5))
+        except Exception:
+            mirror_prob = 0.5
+        mirrored = bool(template.get("mirrorable", False) and float(rng.random()) < mirror_prob)
+    else:
+        mirrored = bool(req.mirrored) and bool(template.get("mirrorable", False))
+
+    training_params = getattr(game_state, "mlflow_training_params", None) or {}
+    try:
+        jitter_scale = float(training_params.get("start_template_jitter_scale", 1.0))
+    except Exception:
+        jitter_scale = 1.0
+
+    try:
+        resolved = resolve_start_template(
+            env,
+            template,
+            jitter_scale=jitter_scale,
+            mirror=mirrored,
+        )
+    finally:
+        if req.seed is not None:
+            setattr(env, "_rng", original_rng)
+    return resolved, mirrored
 
 
 def _heatmap_increment(heatmap: dict[str, list[int]], pos) -> None:
@@ -231,6 +302,64 @@ def _init_playbook_panel_accumulator(offense_ids: list[int]) -> dict:
         "primary_shooter_counts": {},
         "num_rollouts": 0,
         "base_state": None,
+    }
+
+
+@router.post("/api/apply_start_template")
+def apply_start_template(req: ApplyStartTemplateRequest):
+    """Resolve a persisted start template and optionally apply it to the live board."""
+    resolved, mirrored = _resolve_start_template_request(req)
+
+    payload = {
+        "template_id": str(resolved.get("template_id", "")),
+        "mirrored": bool(mirrored),
+        "resolved_setup": {
+            "positions": [
+                [int(pos[0]), int(pos[1])]
+                for pos in (resolved.get("initial_positions") or [])
+            ],
+            "ball_holder": (
+                int(resolved["ball_holder"])
+                if resolved.get("ball_holder") is not None
+                else None
+            ),
+            "shot_clock": (
+                int(resolved["shot_clock"])
+                if resolved.get("shot_clock") is not None
+                else None
+            ),
+        },
+    }
+
+    if not bool(req.apply_to_state):
+        return {"status": "success", **payload}
+
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    env = _base_env()
+    if env_view(env).episode_ended:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot apply a start template after the episode has ended.",
+        )
+
+    env.positions = [tuple(pos) for pos in (resolved.get("initial_positions") or [])]
+    if resolved.get("ball_holder") is not None:
+        env.ball_holder = int(resolved["ball_holder"])
+    if resolved.get("shot_clock") is not None:
+        env.shot_clock = int(resolved["shot_clock"])
+
+    _rebuild_cached_obs()
+    _capture_turn_start_snapshot()
+
+    updated_state = get_ui_game_state()
+    if game_state.episode_states:
+        game_state.episode_states[-1] = updated_state
+
+    return {
+        "status": "success",
+        **payload,
+        "state": updated_state,
     }
 
 

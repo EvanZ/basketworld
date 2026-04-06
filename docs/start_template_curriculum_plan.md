@@ -112,7 +112,7 @@ Core principles:
 - minimal dev-only board authoring tool for template creation
 - optional CLI-driven template library for training
 - reset-time sampling into exact `initial_positions`
-- optional template-specific `ball_holder`
+- optional template-specific initial ball ownership via `has_ball`
 - optional template-specific `shot_clock`
 - template mixing with current spawn logic
 - basic logging of which template was used
@@ -170,13 +170,14 @@ That gives:
 
 ## Template Schema Proposal
 
-Use a small YAML file with normalized, team-local slots.
+Use a small YAML/JSON file with team-scoped entries and no authored slot ids.
 
-Why team-local slots instead of absolute player ids:
+Why slotless team entries instead of absolute player ids or team-local slots:
 
 - avoids hardcoding current absolute index layout
-- cleaner for future changes in players-per-side
-- easier to read and author
+- avoids baking arbitrary player-slot bias into template authoring
+- keeps the schema readable while letting the resolver randomize within-team
+  player-id assignment at reset
 
 Suggested schema:
 
@@ -188,30 +189,25 @@ templates:
     weight: 1.0
     mirrorable: true
     shot_clock: 24
-    ball_holder:
-      team: offense
-      slot: 1
     offense:
-      - slot: 0
-        anchor: [8, 11]
+      - anchor: [8, 11]
         jitter_radius: 1
-      - slot: 1
-        anchor: [7, 9]
+        role: weak_side_spacer
+      - anchor: [7, 9]
         jitter_radius: 0
-      - slot: 2
-        anchor: [11, 9]
+        role: ball_handler
+        has_ball: true
+      - anchor: [11, 9]
         jitter_radius: 1
+        role: strong_side_corner
     defense:
-      - slot: 0
-        anchor: [6, 9]
+      - anchor: [6, 9]
         jitter_radius: 0
         role: on_ball
-      - slot: 1
-        anchor: [9, 9]
+      - anchor: [9, 9]
         jitter_radius: 1
         role: help
-      - slot: 2
-        anchor: [12, 10]
+      - anchor: [12, 10]
         jitter_radius: 1
         role: weak_side_help
 ```
@@ -230,23 +226,25 @@ Per template:
 - `weight`
 - `mirrorable`
 - optional `shot_clock`
-- `ball_holder`
 - `offense[]`
 - `defense[]`
 
 Per player anchor:
 
-- `slot`
 - `anchor`
   - axial `(q, r)` coordinates
 - `jitter_radius`
 - optional `role`
   - metadata only in v1
+- optional `has_ball`
+  - marks the entry that should receive the initial ball
 
 Important:
 
 - `role` does not change gameplay in v1
 - it is only descriptive/debug metadata for the template author
+- the resolver randomly maps same-team entries to concrete env player ids at
+  reset time, so entry order is not treated as a persistent player identity
 
 ## Runtime Behavior
 
@@ -279,7 +277,7 @@ If a template is chosen:
 4. resolve defense anchors with jitter
 5. repair collisions or invalid cells if needed
 6. emit exact `initial_positions`
-7. set `ball_holder`
+7. map one `has_ball` entry, if present, to a concrete env `ball_holder`
 8. optionally set `shot_clock`
 
 ### Legality / Repair Rules
@@ -401,32 +399,29 @@ This should be **minimal**, not a polished full editor.
 
 Goal:
 
-- place offense and defense slots directly on the board
-- choose ball-holder slot
+- place offense and defense entries directly on the board
+- choose which offensive entry starts with the ball
 - export one schema-valid template entry
 
 Recommended first version:
 
 1. enter `Template Mode`
-2. toggle placement target:
-   - offense slot `0/1/2`
-   - defense slot `0/1/2`
-3. click a board hex to assign the slot anchor
+2. drag offense and defense players to the desired anchors
 4. choose:
    - template id
    - weight
    - mirrorable yes/no
-   - ball-holder slot
+   - initial ball-holder entry
    - optional shot clock
-   - per-slot jitter radius
+   - per-entry jitter radius
 5. click `Export Template`
 6. receive YAML/JSON for one template entry
 
 Minimum UI requirements:
 
 - visible `(q, r)` coordinate guidance on hover and/or click
-- clear highlighting of assigned offense/defense slots
-- validation that all required slots are filled
+- clear highlighting of offense/defense entries
+- validation that all required player entries are filled
 - export that matches the training schema exactly
 
 Important constraint:
@@ -525,7 +520,7 @@ Success criteria:
 2. mirrored template resolution
 3. jittered placement legality
 4. collision repair
-5. team-slot to absolute-player-index mapping
+5. randomized within-team entry-to-player-id mapping
 
 ### Integration tests
 

@@ -3,6 +3,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import {
+  applyStartTemplate,
   getActionValues,
   getPlaybookProgress,
   getRewards,
@@ -124,6 +125,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  initialActiveTab: {
+    type: String,
+    default: 'environment',
+  },
   mctsStepRunning: {
     type: Boolean,
     default: false,
@@ -134,6 +139,10 @@ const props = defineProps({
     default: null,
   },
   evalConfig: {
+    type: Object,
+    default: null,
+  },
+  templateConfig: {
     type: Object,
     default: null,
   },
@@ -159,7 +168,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -797,6 +806,200 @@ const defaultEvalConfig = () => ({
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
 });
+const defaultTemplateConfig = () => ({
+  positions: [],
+  ballHolder: null,
+  templateId: 'new_template',
+  weight: 1.0,
+  mirrorable: true,
+  shotClock: 24,
+  jitterByPlayer: {},
+  roleByPlayer: {},
+});
+
+const startTemplateOptions = computed(() => {
+  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+    ? props.gameState.start_template_library.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      return id ? { value: id, label: id } : null;
+    })
+    .filter(Boolean);
+});
+const hasLoadedStartTemplates = computed(() => startTemplateOptions.value.length > 0);
+const selectedStartTemplateDefinition = computed(() => {
+  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+    ? props.gameState.start_template_library.templates
+    : [];
+  const wantedId = String(selectedStartTemplateId.value || '').trim();
+  return templates.find((template) => String(template?.id || '').trim() === wantedId) || null;
+});
+const selectedStartTemplateId = ref('');
+const selectedStartTemplateMirrored = ref(false);
+const startTemplateActionStatus = ref('');
+const startTemplateActionError = ref('');
+
+watch(
+  startTemplateOptions,
+  (options) => {
+    const values = new Set(options.map((opt) => opt.value));
+    if (!values.has(selectedStartTemplateId.value)) {
+      selectedStartTemplateId.value = options[0]?.value || '';
+    }
+  },
+  { immediate: true }
+);
+
+function clearStartTemplateFeedback() {
+  startTemplateActionStatus.value = '';
+  startTemplateActionError.value = '';
+}
+
+function stableStartTemplateSeed(templateId) {
+  const text = String(templateId || '');
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0);
+}
+
+function previewOffsetToAxial(col, row) {
+  const safeCol = Number(col) || 0;
+  const safeRow = Number(row) || 0;
+  return {
+    q: safeCol - ((safeRow - (safeRow & 1)) >> 1),
+    r: safeRow,
+  };
+}
+
+function previewAxialToOffset(q, r) {
+  const safeQ = Number(q) || 0;
+  const safeR = Number(r) || 0;
+  return {
+    col: safeQ + ((safeR - (safeR & 1)) >> 1),
+    row: safeR,
+  };
+}
+
+function previewMirrorAnchor(anchor, courtHeight) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  const { col, row } = previewAxialToOffset(q, r);
+  const mirroredRow = Math.max(0, Number(courtHeight || 0) - 1 - row);
+  const mirrored = previewOffsetToAxial(col, mirroredRow);
+  return [mirrored.q, mirrored.r];
+}
+
+function previewAxialToCartesian(anchor) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  return {
+    x: Math.sqrt(3) * (Number(q) + Number(r) / 2),
+    y: 1.5 * Number(r),
+  };
+}
+
+const startTemplatePreviewModel = computed(() => {
+  const template = selectedStartTemplateDefinition.value;
+  const courtWidth = Number(props.gameState?.court_width || 0);
+  const courtHeight = Number(props.gameState?.court_height || 0);
+  if (!template || courtWidth <= 0 || courtHeight <= 0) return null;
+
+  const boardPoints = [];
+  for (let row = 0; row < courtHeight; row += 1) {
+    for (let col = 0; col < courtWidth; col += 1) {
+      const axial = previewOffsetToAxial(col, row);
+      boardPoints.push(previewAxialToCartesian([axial.q, axial.r]));
+    }
+  }
+  if (!boardPoints.length) return null;
+
+  const xs = boardPoints.map((point) => point.x);
+  const ys = boardPoints.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  const viewBox = { width: 360, height: 240 };
+  const frame = { x: 18, y: 14, width: 324, height: 212 };
+  const rangeX = Math.max(1e-6, maxX - minX);
+  const rangeY = Math.max(1e-6, maxY - minY);
+  const scale = Math.min(frame.width / rangeX, frame.height / rangeY);
+  const usedWidth = rangeX * scale;
+  const usedHeight = rangeY * scale;
+  const originX = frame.x + (frame.width - usedWidth) / 2 - minX * scale;
+  const originY = frame.y + (frame.height - usedHeight) / 2 - minY * scale;
+
+  const mirrored = Boolean(selectedStartTemplateMirrored.value && template?.mirrorable);
+  const entries = [];
+  for (const teamName of ['offense', 'defense']) {
+    const teamEntries = Array.isArray(template?.[teamName]) ? template[teamName] : [];
+    teamEntries.forEach((entry, idx) => {
+      const anchor = Array.isArray(entry?.anchor) ? [...entry.anchor] : [0, 0];
+      const effectiveAnchor = mirrored
+        ? previewMirrorAnchor(anchor, courtHeight)
+        : anchor;
+      const cart = previewAxialToCartesian(effectiveAnchor);
+      entries.push({
+        team: teamName,
+        marker: teamName === 'offense'
+          ? (entry?.has_ball ? 'O.' : 'O')
+          : 'X',
+        x: originX + cart.x * scale,
+        y: originY + cart.y * scale,
+        role: String(entry?.role || ''),
+        key: `${teamName}-${idx}`,
+      });
+    });
+  }
+
+  const court = {
+    ...frame,
+    backboardX: frame.x + 16,
+    hoopX: frame.x + 24,
+    hoopY: frame.y + frame.height / 2,
+    hoopRadius: 4,
+    laneX: frame.x,
+    laneY: frame.y + frame.height * 0.28,
+    laneWidth: frame.width * 0.21,
+    laneHeight: frame.height * 0.44,
+    arcLineX: frame.x + frame.width * 0.29,
+    arcTopY: frame.y + frame.height * 0.16,
+    arcBottomY: frame.y + frame.height * 0.84,
+    arcRadius: frame.height * 0.39,
+  };
+
+  return {
+    templateId: String(template?.id || ''),
+    mirrored,
+    viewBox,
+    court,
+    entries,
+  };
+});
+
+async function handleApplyStartTemplateToBoard() {
+  clearStartTemplateFeedback();
+  if (!selectedStartTemplateId.value) return;
+  try {
+    const res = await applyStartTemplate(
+      selectedStartTemplateId.value,
+      selectedStartTemplateMirrored.value,
+      true,
+      stableStartTemplateSeed(selectedStartTemplateId.value),
+    );
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    startTemplateActionStatus.value = `Loaded ${selectedStartTemplateId.value} onto the current board.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to apply start template to board', err);
+    startTemplateActionError.value = err?.message || 'Failed to load template onto board.';
+  }
+}
 
 const evalConfigSafe = computed(() => {
   const base = defaultEvalConfig();
@@ -807,14 +1010,263 @@ const evalConfigSafe = computed(() => {
     skills: { ...base.skills, ...(incoming.skills || {}) },
   };
 });
+const templateConfigSafe = computed(() => {
+  const base = defaultTemplateConfig();
+  const incoming = props.templateConfig || {};
+  return {
+    ...base,
+    ...incoming,
+    jitterByPlayer: { ...base.jitterByPlayer, ...(incoming.jitterByPlayer || {}) },
+    roleByPlayer: { ...base.roleByPlayer, ...(incoming.roleByPlayer || {}) },
+  };
+});
 
 const evalPlacementEditing = computed(() => evalConfigSafe.value.placementEditing && evalConfigSafe.value.mode === 'custom');
 const evalModeIsCustom = computed(() => evalConfigSafe.value.mode === 'custom');
 const evalOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const templateOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const templateDefenseIds = computed(() => props.gameState?.defense_ids || []);
 const ballStartOptions = computed(() => {
   const ids = evalOffenseIds.value || [];
   return Array.isArray(ids) ? [...ids] : [];
 });
+const templateBallStartOptions = computed(() => {
+  const ids = templateOffenseIds.value || [];
+  return Array.isArray(ids) ? [...ids] : [];
+});
+const templateCopyStatus = ref('');
+
+function sanitizeTemplateId(raw) {
+  const text = String(raw ?? '').trim().toLowerCase();
+  if (!text) return 'new_template';
+  const cleaned = text.replace(/[^a-z0-9_ -]/g, '').replace(/\s+/g, '_').replace(/-+/g, '_');
+  return cleaned || 'new_template';
+}
+
+function emitTemplateConfigUpdate(patch = {}) {
+  const base = templateConfigSafe.value;
+  const next = {
+    ...base,
+    ...(patch || {}),
+    jitterByPlayer: {
+      ...base.jitterByPlayer,
+      ...(patch.jitterByPlayer || {}),
+    },
+    roleByPlayer: {
+      ...base.roleByPlayer,
+      ...(patch.roleByPlayer || {}),
+    },
+  };
+  emit('template-config-changed', next);
+}
+
+function seedTemplateConfigFromGameState() {
+  if (!props.gameState) return;
+  const positions = (props.gameState.positions || []).map((pos) => [pos[0], pos[1]]);
+  const jitterByPlayer = {};
+  const roleByPlayer = {};
+  const offenseIds = Array.isArray(props.gameState.offense_ids) ? props.gameState.offense_ids : [];
+  const defenseIds = Array.isArray(props.gameState.defense_ids) ? props.gameState.defense_ids : [];
+  const ballHolder = props.gameState.ball_holder ?? templateConfigSafe.value.ballHolder ?? null;
+
+  offenseIds.forEach((pid) => {
+    jitterByPlayer[pid] = Number(
+      templateConfigSafe.value.jitterByPlayer?.[pid]
+      ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+      ?? (Number(pid) === Number(ballHolder) ? 0 : 1)
+    );
+    roleByPlayer[pid] = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? (Number(pid) === Number(ballHolder) ? 'ball_handler' : '')
+    );
+  });
+  defenseIds.forEach((pid) => {
+    jitterByPlayer[pid] = Number(
+      templateConfigSafe.value.jitterByPlayer?.[pid]
+      ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+      ?? 1
+    );
+    roleByPlayer[pid] = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    );
+  });
+
+  emitTemplateConfigUpdate({
+    positions,
+    ballHolder,
+    shotClock: Number(props.gameState.shot_clock ?? templateConfigSafe.value.shotClock ?? 24),
+    jitterByPlayer,
+    roleByPlayer,
+  });
+}
+
+function setTemplateBallHolder(val) {
+  const num = val === null || val === '' ? null : Number(val);
+  if (num !== null && !templateBallStartOptions.value.includes(num)) return;
+  const nextRoles = {};
+  for (const pid of templateBallStartOptions.value) {
+    const currentRole = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    );
+    nextRoles[pid] = Number(pid) === Number(num)
+      ? 'ball_handler'
+      : (currentRole === 'ball_handler' ? '' : currentRole);
+  }
+  emitTemplateConfigUpdate({
+    ballHolder: num,
+    roleByPlayer: nextRoles,
+  });
+}
+
+function updateTemplatePlayerJitter(playerId, value) {
+  const num = Math.max(0, Number(value) || 0);
+  emitTemplateConfigUpdate({
+    jitterByPlayer: {
+      [playerId]: num,
+    },
+  });
+}
+
+function updateTemplatePlayerRole(playerId, value) {
+  emitTemplateConfigUpdate({
+    roleByPlayer: {
+      [playerId]: String(value ?? ''),
+    },
+  });
+}
+
+function setTemplateId(value) {
+  emitTemplateConfigUpdate({ templateId: sanitizeTemplateId(value) });
+}
+
+const templatePlayerRows = computed(() => {
+  const positions = Array.isArray(templateConfigSafe.value.positions) ? templateConfigSafe.value.positions : [];
+  const rows = [];
+  const buildRows = (ids, teamLabel) => {
+    (ids || []).forEach((pid, entryIndex) => {
+      const pos = Array.isArray(positions[pid]) ? positions[pid] : [null, null];
+      rows.push({
+        playerId: pid,
+        teamLabel,
+        entryIndex,
+        q: pos[0],
+        r: pos[1],
+        jitter: Number(
+          templateConfigSafe.value.jitterByPlayer?.[pid]
+          ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+          ?? (teamLabel === 'Offense' && Number(pid) === Number(templateConfigSafe.value.ballHolder) ? 0 : 1)
+        ),
+        role: String(
+          templateConfigSafe.value.roleByPlayer?.[pid]
+          ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+          ?? ''
+        ),
+      });
+    });
+  };
+  buildRows(templateOffenseIds.value, 'Offense');
+  buildRows(templateDefenseIds.value, 'Defense');
+  return rows;
+});
+
+function buildTemplateExportEntries(playerIds) {
+  const positions = Array.isArray(templateConfigSafe.value.positions) ? templateConfigSafe.value.positions : [];
+  return (playerIds || []).map((pid) => {
+    const pos = Array.isArray(positions[pid]) ? positions[pid] : [0, 0];
+    const entry = {
+      anchor: [Number(pos[0]) || 0, Number(pos[1]) || 0],
+      jitter_radius: Math.max(
+        0,
+        Number(
+          templateConfigSafe.value.jitterByPlayer?.[pid]
+          ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+          ?? (Number(pid) === Number(templateConfigSafe.value.ballHolder) ? 0 : 1)
+        ) || 0
+      ),
+    };
+    const role = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    ).trim();
+    if (role) entry.role = role;
+    if (Number(pid) === Number(templateConfigSafe.value.ballHolder)) {
+      entry.has_ball = true;
+    }
+    return entry;
+  });
+}
+
+const templateExportObject = computed(() => {
+  const offenseIds = templateOffenseIds.value || [];
+  const defenseIds = templateDefenseIds.value || [];
+  const obj = {
+    id: sanitizeTemplateId(templateConfigSafe.value.templateId),
+    weight: Number(templateConfigSafe.value.weight ?? 1.0) || 1.0,
+    mirrorable: Boolean(templateConfigSafe.value.mirrorable),
+    shot_clock: Math.max(1, Number(templateConfigSafe.value.shotClock ?? 24) || 24),
+    offense: buildTemplateExportEntries(offenseIds),
+    defense: buildTemplateExportEntries(defenseIds),
+  };
+  return obj;
+});
+
+function yamlScalar(value) {
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return JSON.stringify(String(value ?? ''));
+}
+
+function formatTemplateYaml(obj) {
+  const lines = [];
+  lines.push(`id: ${yamlScalar(obj.id)}`);
+  lines.push(`weight: ${obj.weight}`);
+  lines.push(`mirrorable: ${obj.mirrorable ? 'true' : 'false'}`);
+  lines.push(`shot_clock: ${obj.shot_clock}`);
+  for (const teamName of ['offense', 'defense']) {
+    lines.push(`${teamName}:`);
+    for (const entry of obj[teamName]) {
+      lines.push('  -');
+      lines.push(`    anchor: [${entry.anchor[0]}, ${entry.anchor[1]}]`);
+      lines.push(`    jitter_radius: ${entry.jitter_radius}`);
+      if (entry.role) {
+        lines.push(`    role: ${yamlScalar(entry.role)}`);
+      }
+      if (entry.has_ball) {
+        lines.push('    has_ball: true');
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+const templateJsonExport = computed(() => JSON.stringify(templateExportObject.value, null, 2));
+const templateYamlExport = computed(() => formatTemplateYaml(templateExportObject.value));
+
+async function copyTemplateExport(format) {
+  const text = format === 'json' ? templateJsonExport.value : templateYamlExport.value;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error('Clipboard API unavailable');
+    }
+    templateCopyStatus.value = `${String(format).toUpperCase()} copied`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to copy template export', err);
+    templateCopyStatus.value = 'Copy failed';
+  }
+  window.setTimeout(() => {
+    if (templateCopyStatus.value === `${String(format).toUpperCase()} copied` || templateCopyStatus.value === 'Copy failed') {
+      templateCopyStatus.value = '';
+    }
+  }, 2000);
+}
 
 const evalEpisodesInput = ref(props.evalNumEpisodes || 100);
 watch(() => props.evalNumEpisodes, (val) => {
@@ -1625,6 +2077,7 @@ async function handleBallHolderChange(val) {
 const DEV_TABS_STORAGE_KEY = 'basketworld.dev.tab_order';
 const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'environment', label: 'Environment' },
+  { id: 'template', label: 'Template' },
   { id: 'rewards', label: 'Rewards' },
   { id: 'stats', label: 'Stats' },
   { id: 'entropy', label: 'Entropy' },
@@ -1668,7 +2121,7 @@ function loadStoredDevTabOrder() {
   }
 }
 
-const activeTab = ref('environment');
+const activeTab = ref(String(props.initialActiveTab || 'environment'));
 const devTabOrder = ref(loadStoredDevTabOrder());
 const draggedDevTabId = ref(null);
 const orderedDevTabs = computed(() => {
@@ -1752,6 +2205,13 @@ watch(activeTab, async (newTab) => {
     console.warn('Failed to scroll to current shot clock on tab change:', err);
   }
 }, { flush: 'post' });
+
+watch(() => props.initialActiveTab, (nextTab) => {
+  const normalized = String(nextTab || '').trim();
+  if (!normalized || activeTab.value === normalized) return;
+  if (!DEV_TAB_ID_SET.has(normalized)) return;
+  activeTab.value = normalized;
+});
 
 watch(devTabOrder, (newOrder) => {
   if (typeof window === 'undefined') return;
@@ -2656,17 +3116,61 @@ const selectorIntentDistributionStats = computed(() => {
     deployed: computeSelectorIntentDistributionStats(items, 'deployed_prob'),
   };
 });
-const selectorIntentEntropy = computed(() => {
-  const items = selectorIntentPreferences.value.items || [];
-  if (!Array.isArray(items) || items.length === 0) {
-    return {
-      entropy: null,
-      normalizedEntropy: null,
-      klToUniform: null,
-      normalizedKlToUniform: null,
-    };
+const SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY = 'basketworld.selector_intent_plot_mode';
+function loadStoredSelectorIntentPlotMode() {
+  if (typeof window === 'undefined') return 'deployed';
+  try {
+    const raw = String(window.localStorage.getItem(SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY) || '').trim().toLowerCase();
+    return ['raw', 'mixed', 'deployed'].includes(raw) ? raw : 'deployed';
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load selector intent plot mode preference', err);
+    return 'deployed';
   }
-  return selectorIntentDistributionStats.value.deployed;
+}
+const selectedSelectorIntentPlotMode = ref(loadStoredSelectorIntentPlotMode());
+const selectorIntentPlotModeOptions = Object.freeze([
+  { value: 'raw', label: 'Raw' },
+  { value: 'mixed', label: 'Mixed' },
+  { value: 'deployed', label: 'Deployed' },
+]);
+const selectorIntentPlotField = computed(() => {
+  return selectedSelectorIntentPlotMode.value === 'raw'
+    ? 'raw_prob'
+    : selectedSelectorIntentPlotMode.value === 'mixed'
+      ? 'mixed_prob'
+      : 'deployed_prob';
+});
+const selectorIntentPlotLabel = computed(() => {
+  return selectedSelectorIntentPlotMode.value === 'raw'
+    ? 'Raw'
+    : selectedSelectorIntentPlotMode.value === 'mixed'
+      ? 'Mixed'
+      : 'Deployed';
+});
+const selectorIntentEntropy = computed(() => {
+  const stats = selectorIntentDistributionStats.value?.[selectedSelectorIntentPlotMode.value];
+  return stats || {
+    entropy: null,
+    normalizedEntropy: null,
+    klToUniform: null,
+    normalizedKlToUniform: null,
+  };
+});
+function getSelectorIntentPlotProb(item) {
+  const field = selectorIntentPlotField.value;
+  const prob = Number(item?.[field] ?? 0);
+  return Number.isFinite(prob) ? prob : 0;
+}
+watch(selectedSelectorIntentPlotMode, (nextMode) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(
+      SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY,
+      String(nextMode || 'deployed'),
+    );
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist selector intent plot mode preference', err);
+  }
 });
 const hasSelectorIntentPreferences = computed(() =>
   Array.isArray(selectorIntentPreferences.value.items)
@@ -4640,6 +5144,19 @@ const stealRisks = computed(() => {
 
         <div v-if="hasSelectorIntentPreferences" class="param-category selector-intent-card">
           <h5>Intent Preferences</h5>
+          <div class="eval-row selector-plot-row">
+            <label>Plot</label>
+            <select v-model="selectedSelectorIntentPlotMode">
+              <option
+                v-for="opt in selectorIntentPlotModeOptions"
+                :key="`selector-plot-${opt.value}`"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
+            <span class="status-note">Bar widths and entropy summary use {{ selectorIntentPlotLabel.toLowerCase() }} probabilities.</span>
+          </div>
           <p class="entropy-note">
             Selector preferences for the current offense state in fixed intent order.
             <span v-if="selectorIntentPreferences.selectionMode">
@@ -4655,13 +5172,13 @@ const stealRisks = computed(() => {
               · Value {{ Number(selectorIntentPreferences.valueEstimate).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.entropy !== null">
-              · Deployed Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
+              · {{ selectorIntentPlotLabel }} Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.normalizedEntropy !== null">
               (norm {{ Number(selectorIntentEntropy.normalizedEntropy).toFixed(3) }})
             </span>
             <span v-if="selectorIntentEntropy.klToUniform !== null">
-              · Deployed KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
+              · {{ selectorIntentPlotLabel }} KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
             </span>
             <span v-if="selectorIntentEntropy.normalizedKlToUniform !== null">
               (norm {{ Number(selectorIntentEntropy.normalizedKlToUniform).toFixed(3) }})
@@ -4688,7 +5205,7 @@ const stealRisks = computed(() => {
                   :key="`selector-intent-${item.intent_index}`"
                   class="selector-intent-row"
                   :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
-                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(item.deployed_prob ?? item.prob) * 100)).toFixed(2)}%` }"
+                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, getSelectorIntentPlotProb(item) * 100)).toFixed(2)}%` }"
                 >
                   <td>{{ idx + 1 }}</td>
                   <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
@@ -5006,6 +5523,106 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
+    <!-- Template Tab -->
+    <div v-if="activeTab === 'template'" class="tab-content eval-tab template-tab">
+      <div class="eval-row">
+        <label>Template id</label>
+        <input
+          type="text"
+          :value="templateConfigSafe.templateId"
+          @input="setTemplateId($event.target.value)"
+          placeholder="wing_entry_help"
+        />
+        <span class="status-note">Drag players on the board. Hex coordinates are shown directly on the court in this mode.</span>
+      </div>
+
+      <div class="eval-row">
+        <label>Weight</label>
+        <input
+          type="number"
+          min="0.01"
+          step="0.01"
+          :value="templateConfigSafe.weight"
+          @input="emitTemplateConfigUpdate({ weight: Math.max(0.01, Number($event.target.value) || 1.0) })"
+        />
+        <label class="inline-label">
+          <input
+            type="checkbox"
+            :checked="templateConfigSafe.mirrorable"
+            @change="emitTemplateConfigUpdate({ mirrorable: $event.target.checked })"
+          />
+          Mirrorable
+        </label>
+        <label>Shot clock</label>
+        <input
+          type="number"
+          min="1"
+          step="1"
+          :value="templateConfigSafe.shotClock"
+          @input="emitTemplateConfigUpdate({ shotClock: Math.max(1, Number($event.target.value) || 24) })"
+        />
+      </div>
+
+      <div class="eval-row">
+        <label>Ball starts with</label>
+        <select
+          :value="templateConfigSafe.ballHolder ?? ''"
+          @change="setTemplateBallHolder($event.target.value ? Number($event.target.value) : null)"
+        >
+          <option v-if="!templateBallStartOptions.length" disabled value="">No offense players</option>
+          <option v-for="pid in templateBallStartOptions" :key="`template-ball-${pid}`" :value="pid">Player {{ pid }}</option>
+        </select>
+        <button class="ghost-btn" @click="seedTemplateConfigFromGameState()">Use current board positions</button>
+        <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
+      </div>
+
+      <div class="eval-skills template-player-grid">
+        <div class="skills-header template-grid-header">
+          <span>Player</span>
+          <span>Team</span>
+          <span>Entry</span>
+          <span>Anchor</span>
+          <span>Jitter</span>
+          <span>Role</span>
+        </div>
+        <div class="skills-row template-grid-row" v-for="row in templatePlayerRows" :key="`template-player-${row.playerId}`">
+          <span class="skills-player">P{{ row.playerId }}</span>
+          <span>{{ row.teamLabel }}</span>
+          <span>{{ row.entryIndex }}</span>
+          <span>({{ row.q }}, {{ row.r }})</span>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            :value="row.jitter"
+            @input="updateTemplatePlayerJitter(row.playerId, $event.target.value)"
+          />
+          <input
+            type="text"
+            :value="row.role"
+            @input="updateTemplatePlayerRole(row.playerId, $event.target.value)"
+            :placeholder="row.teamLabel === 'Offense' && row.playerId === templateConfigSafe.ballHolder ? 'ball_handler' : 'role'"
+          />
+        </div>
+      </div>
+
+      <div class="eval-row template-export-actions">
+        <button class="ghost-btn" @click="copyTemplateExport('yaml')">Copy YAML</button>
+        <button class="ghost-btn" @click="copyTemplateExport('json')">Copy JSON</button>
+      </div>
+
+      <div class="eval-custom template-export-grid">
+        <div class="template-export-card">
+          <h5>YAML Template Entry</h5>
+          <textarea class="template-export-textarea" readonly :value="templateYamlExport"></textarea>
+        </div>
+        <div class="template-export-card">
+          <h5>JSON Template Entry</h5>
+          <textarea class="template-export-textarea" readonly :value="templateJsonExport"></textarea>
+        </div>
+      </div>
+    </div>
+
     <!-- Eval Tab -->
     <div v-if="activeTab === 'eval'" class="tab-content eval-tab">
       <div class="eval-row">
@@ -5148,7 +5765,111 @@ const stealRisks = computed(() => {
         <div v-if="!props.gameState" class="no-data">
           No game loaded
         </div>
-        <div v-else class="parameters-grid">
+        <div v-else>
+        <div class="parameters-grid">
+          <div v-if="hasLoadedStartTemplates" class="param-category">
+            <h5>Start Templates</h5>
+            <div class="eval-row">
+              <label>Template</label>
+              <select v-model="selectedStartTemplateId">
+                <option v-for="opt in startTemplateOptions" :key="`env-template-${opt.value}`" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+            <div class="eval-row">
+              <label class="inline-label">
+                <input type="checkbox" v-model="selectedStartTemplateMirrored" />
+                Mirror L|R
+              </label>
+              <button
+                class="ghost-btn"
+                @click="handleApplyStartTemplateToBoard"
+                :disabled="!selectedStartTemplateId"
+              >
+                Apply to board
+              </button>
+            </div>
+            <div class="status-note">
+              Apply a template here, then use Playbook with current state. For Eval custom setup, use the existing current-board copy flow in the Eval tab.
+            </div>
+            <div v-if="startTemplatePreviewModel" class="start-template-preview">
+              <svg
+                class="start-template-preview-svg"
+                :viewBox="`0 0 ${startTemplatePreviewModel.viewBox.width} ${startTemplatePreviewModel.viewBox.height}`"
+                role="img"
+                :aria-label="`Schematic preview for ${startTemplatePreviewModel.templateId}${startTemplatePreviewModel.mirrored ? ', mirrored left-right' : ''}`"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="startTemplatePreviewModel.court.x"
+                  :y="startTemplatePreviewModel.court.y"
+                  :width="startTemplatePreviewModel.court.width"
+                  :height="startTemplatePreviewModel.court.height"
+                  rx="8"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.backboardX"
+                  :y1="startTemplatePreviewModel.court.laneY"
+                  :x2="startTemplatePreviewModel.court.backboardX"
+                  :y2="startTemplatePreviewModel.court.laneY + startTemplatePreviewModel.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="startTemplatePreviewModel.court.hoopX"
+                  :cy="startTemplatePreviewModel.court.hoopY"
+                  :r="startTemplatePreviewModel.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="startTemplatePreviewModel.court.laneX"
+                  :y="startTemplatePreviewModel.court.laneY"
+                  :width="startTemplatePreviewModel.court.laneWidth"
+                  :height="startTemplatePreviewModel.court.laneHeight"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.x"
+                  :y1="startTemplatePreviewModel.court.arcTopY"
+                  :x2="startTemplatePreviewModel.court.arcLineX"
+                  :y2="startTemplatePreviewModel.court.arcTopY"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.x"
+                  :y1="startTemplatePreviewModel.court.arcBottomY"
+                  :x2="startTemplatePreviewModel.court.arcLineX"
+                  :y2="startTemplatePreviewModel.court.arcBottomY"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${startTemplatePreviewModel.court.arcLineX} ${startTemplatePreviewModel.court.arcTopY}
+                       A ${startTemplatePreviewModel.court.arcRadius} ${startTemplatePreviewModel.court.arcRadius} 0 0 1 ${startTemplatePreviewModel.court.arcLineX} ${startTemplatePreviewModel.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in startTemplatePreviewModel.entries"
+                  :key="entry.key"
+                  :x="entry.x"
+                  :y="entry.y"
+                  :class="['start-template-preview-marker', `team-${entry.team}`]"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <div class="status-note">
+                Anchor schematic only. Jitter is not shown.
+              </div>
+            </div>
+            <div v-if="startTemplateActionStatus" class="status-note">
+              {{ startTemplateActionStatus }}
+            </div>
+            <div v-if="startTemplateActionError" class="policy-status error">
+              {{ startTemplateActionError }}
+            </div>
+          </div>
           <div class="param-category">
             <h5>Environment Settings</h5>
             <div class="param-item" data-tooltip="Number of players on each team (offense and defense)">
@@ -5898,6 +6619,7 @@ const stealRisks = computed(() => {
             </div>
           </div>
         </div>
+        </div>
       </div>
     </div>
 
@@ -6120,6 +6842,42 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="Timesteps spent holding task reward at the start scale, then ramping it back to the end scale.">
               <span class="param-name">Task reward schedule:</span>
               <span class="param-value">{{ taskRewardScheduleSummary }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Start Templates</h5>
+            <div class="param-item" data-tooltip="Optional curriculum that resolves a sampled formation template into exact initial positions before reset. When disabled, the environment uses the default spawn generator only.">
+              <span class="param-name">Template mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_enabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability that a reset uses a sampled start template instead of the default spawn logic.">
+              <span class="param-name">Template prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Global multiplier applied to per-player jitter radii inside the sampled start template.">
+              <span class="param-name">Jitter scale:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_jitter_scale ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability of mirroring a mirrorable template left/right before resolving player anchors.">
+              <span class="param-name">Mirror prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_mirror_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="If enabled, invalid or unreadable template libraries fail fast instead of silently disabling the start-template feature.">
+              <span class="param-name">Strict mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_strict ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Path to the JSON/YAML template library used for the run.">
+              <span class="param-name">Library:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_library || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="MLflow artifact path for the canonical persisted start-template library logged with the run.">
+              <span class="param-name">Artifact:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_library_artifact_path || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of templates available from the persisted library artifact currently loaded into the UI session.">
+              <span class="param-name">Template count:</span>
+              <span class="param-value">{{ props.gameState.start_template_library?.templates?.length ?? props.gameState.training_params.start_template_library_template_count ?? 'N/A' }}</span>
             </div>
           </div>
 
@@ -7343,6 +8101,48 @@ const stealRisks = computed(() => {
   border: 1px solid var(--app-panel-border);
 }
 
+.start-template-preview {
+  margin-top: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.start-template-preview-svg {
+  width: 100%;
+  max-width: 360px;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+  border: 1px solid rgba(226, 232, 240, 0.16);
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+.start-template-preview-board {
+  fill: transparent;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 2;
+}
+
+.start-template-preview-line {
+  fill: none;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.start-template-preview-marker {
+  fill: rgba(248, 250, 252, 0.96);
+  font-family: "Courier New", monospace;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.start-template-preview-marker.team-defense {
+  fill: rgba(226, 232, 240, 0.82);
+}
+
 .param-category h5 {
   margin: 0 0 0.8rem 0;
   color: var(--app-accent);
@@ -8015,6 +8815,50 @@ const stealRisks = computed(() => {
   display: flex;
   justify-content: flex-end;
   margin-top: 0.25rem;
+}
+.template-player-grid {
+  gap: 0.55rem;
+}
+.template-grid-header,
+.template-grid-row {
+  grid-template-columns: 0.9fr 0.9fr 0.6fr 1fr 0.8fr 1.2fr;
+}
+.template-grid-row span {
+  color: #e2e8f0;
+}
+.template-export-actions {
+  justify-content: flex-end;
+}
+.template-export-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 0.9rem;
+}
+.template-export-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.template-export-card h5 {
+  margin: 0;
+  color: #cbd5e1;
+}
+.template-export-textarea {
+  width: 100%;
+  min-height: 260px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(2, 6, 23, 0.72);
+  color: #e2e8f0;
+  padding: 0.75rem;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 .ghost-btn {
   background: transparent;

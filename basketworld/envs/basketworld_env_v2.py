@@ -31,6 +31,11 @@ import numpy as np
 from gymnasium import spaces
 
 from basketworld.utils.evaluation_helpers import profile_section
+from basketworld.utils.start_templates import (
+    resolve_start_template,
+    sample_start_template,
+    validate_start_template_library,
+)
 from basketworld.envs.core import geometry
 from basketworld.envs.core import movement as movement_core
 from basketworld.envs.core import passing as passing_core
@@ -177,6 +182,12 @@ class HexagonBasketballEnv(gym.Env):
         initial_positions: Optional[List[Tuple[int, int]]] = None,
         initial_ball_holder: Optional[int] = None,
         fixed_shot_clock: Optional[int] = None,
+        start_template_enabled: bool = False,
+        start_template_library: Optional[Dict] = None,
+        start_template_prob: float = 0.0,
+        start_template_jitter_scale: float = 1.0,
+        start_template_mirror_prob: float = 0.5,
+        start_template_strict: bool = False,
         assist_window: int = 2,
         # Illegal action resolution policy (see IllegalActionPolicy)
         illegal_action_policy: str = "noop",
@@ -555,6 +566,29 @@ class HexagonBasketballEnv(gym.Env):
             ]
         self._initial_ball_holder_override: Optional[int] = initial_ball_holder
         self._fixed_shot_clock: Optional[int] = fixed_shot_clock
+        self.start_template_enabled = bool(start_template_enabled)
+        self.start_template_prob = float(max(0.0, min(1.0, start_template_prob)))
+        self.start_template_jitter_scale = float(max(0.0, start_template_jitter_scale))
+        self.start_template_mirror_prob = float(max(0.0, min(1.0, start_template_mirror_prob)))
+        self.start_template_strict = bool(start_template_strict)
+        self.start_template_library: Optional[Dict] = None
+        self.start_template_used: bool = False
+        self.start_template_id: Optional[str] = None
+        self.start_template_mirrored: bool = False
+        self.start_template_fallback_reason: Optional[str] = None
+        if start_template_library is not None:
+            try:
+                self.start_template_library = validate_start_template_library(
+                    dict(start_template_library), players_per_side=self.players_per_side
+                )
+            except Exception as exc:
+                if self.start_template_strict:
+                    raise
+                print(
+                    f"Warning: disabling start-template curriculum due to invalid library: {exc}"
+                )
+                self.start_template_enabled = False
+                self.start_template_library = None
 
         # Per-episode, per-offensive-player baseline shooting percentages
         # Initialized to means; re-sampled each reset.
@@ -947,10 +981,54 @@ class HexagonBasketballEnv(gym.Env):
         opt_positions = None
         opt_ball_holder = None
         opt_shot_clock = None
+        self.start_template_used = False
+        self.start_template_id = None
+        self.start_template_mirrored = False
+        self.start_template_fallback_reason = None
         if options:
             opt_positions = options.get("initial_positions")
             opt_ball_holder = options.get("ball_holder")
             opt_shot_clock = options.get("shot_clock")
+        has_explicit_start_override = (
+            opt_positions is not None
+            or opt_ball_holder is not None
+            or opt_shot_clock is not None
+        )
+
+        if (
+            not has_explicit_start_override
+            and self.start_template_enabled
+            and self.start_template_library is not None
+            and self.start_template_prob > 0.0
+        ):
+            try:
+                if float(self._rng.random()) < float(self.start_template_prob):
+                    sampled_template = sample_start_template(
+                        self.start_template_library, self._rng
+                    )
+                    mirror = bool(sampled_template.get("mirrorable", False)) and (
+                        float(self._rng.random()) < float(self.start_template_mirror_prob)
+                    )
+                    resolved_template = resolve_start_template(
+                        self,
+                        sampled_template,
+                        jitter_scale=self.start_template_jitter_scale,
+                        mirror=mirror,
+                    )
+                    opt_positions = resolved_template.get("initial_positions")
+                    opt_ball_holder = resolved_template.get("ball_holder")
+                    opt_shot_clock = resolved_template.get("shot_clock")
+                    self.start_template_used = True
+                    self.start_template_id = str(
+                        resolved_template.get("template_id") or sampled_template.get("id") or ""
+                    ) or None
+                    self.start_template_mirrored = bool(
+                        resolved_template.get("mirrored", False)
+                    )
+            except Exception as exc:
+                self.start_template_fallback_reason = str(exc)
+                if self.start_template_strict:
+                    raise
 
         # Shot clock setup: option > ctor fixed > random
         if opt_shot_clock is not None:
@@ -1321,6 +1399,7 @@ class HexagonBasketballEnv(gym.Env):
             "action_results": action_results,
             "shot_clock": self.shot_clock,
         }
+        info = self._attach_start_template_stats(info)
 
         # Phi diagnostics and shaping (only if enabled)
         if self.enable_phi_shaping:
@@ -1962,6 +2041,21 @@ class HexagonBasketballEnv(gym.Env):
             float(getattr(self, "_legal_actions_defense", 0.0)),
         )
         info = self._attach_intent_stats(info)
+        info = self._attach_start_template_stats(info)
+        return info
+
+    def _attach_start_template_stats(self, info: Optional[Dict]) -> Dict:
+        if info is None:
+            info = {}
+        info.setdefault("start_template_used", 1.0 if self.start_template_used else 0.0)
+        info.setdefault("start_template_id", self.start_template_id or "")
+        info.setdefault(
+            "start_template_mirrored", 1.0 if self.start_template_mirrored else 0.0
+        )
+        info.setdefault(
+            "start_template_fallback_reason",
+            self.start_template_fallback_reason or "",
+        )
         return info
 
     def _attach_intent_stats(self, info: Optional[Dict]) -> Dict:

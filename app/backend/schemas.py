@@ -23,6 +23,20 @@ class InitGameRequest(BaseModel):
     dunk_pct: float | None = None
 
 
+class TemplateBootstrapRequest(BaseModel):
+    run_id: str | None = None
+    user_team_name: str = "OFFENSE"
+    players_per_side: int = 3
+    allow_dunks: bool | None = None
+
+
+class ApplyStartTemplateRequest(BaseModel):
+    template_id: str
+    mirrored: bool | None = None
+    apply_to_state: bool = True
+    seed: int | None = None
+
+
 class ListPoliciesRequest(BaseModel):
     run_id: str
 

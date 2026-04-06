@@ -55,6 +55,8 @@ class GameState:
         self.mlflow_phi_shaping_params: dict | None = None
         # MLflow training parameters (PPO hyperparameters)
         self.mlflow_training_params: dict | None = None
+        # Persisted start-template library artifact loaded from the MLflow run.
+        self.mlflow_start_template_library: dict | None = None
         # Role flag encoding (for backward compatibility with old models)
         self.role_flag_offense: float = 1.0  # Default to new encoding
         self.role_flag_defense: float = -1.0  # Default to new encoding
@@ -792,6 +794,13 @@ def get_full_game_state(
         "run_name": getattr(game_state, "run_name", None),
         "model_codename": get_current_model_codename(),
         "training_params": getattr(game_state, "mlflow_training_params", None),
+        "start_template_library": (
+            jsonable_encoder(
+                copy.deepcopy(getattr(game_state, "mlflow_start_template_library", None))
+            )
+            if getattr(game_state, "mlflow_start_template_library", None) is not None
+            else None
+        ),
         "mlflow_env_defaults": (
             dict(getattr(game_state, "mlflow_env_optional_defaults", {}) or {})
         ),

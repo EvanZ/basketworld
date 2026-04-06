@@ -203,6 +203,38 @@ def _log_cli_args_artifact() -> None:
         print(f"Warning: failed to log CLI args artifact: {exc}")
 
 
+def _log_start_template_library_artifact(args) -> None:
+    """Log the resolved start-template library as a canonical MLflow artifact."""
+    if not bool(getattr(args, "start_template_enabled", False)):
+        return
+    source_path = getattr(args, "start_template_library", None)
+    if not source_path:
+        return
+    try:
+        from basketworld.utils.start_templates import load_start_template_library
+
+        library = load_start_template_library(
+            source_path,
+            players_per_side=int(getattr(args, "players", 3) or 3),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_name = "start_template_library.json"
+            artifact_path = os.path.join(tmpdir, artifact_name)
+            with open(artifact_path, "w", encoding="utf-8") as f:
+                json.dump(library, f, indent=2)
+            mlflow.log_artifact(artifact_path, artifact_path="metadata")
+        mlflow.log_param(
+            "start_template_library_artifact_path",
+            f"metadata/{artifact_name}",
+        )
+        mlflow.log_param(
+            "start_template_library_template_count",
+            int(len(library.get("templates", []) or [])),
+        )
+    except Exception as exc:
+        print(f"[start_templates] Failed to log template library artifact: {exc}")
+
+
 def main(args):
     """Main training function."""
     
@@ -407,6 +439,7 @@ def main(args):
                     pass
         except Exception as e:
             print(f"[play_names] Failed to log play name mapping artifact: {e}")
+        _log_start_template_library_artifact(args)
 
         # --- If continuing from a prior run, copy over prior model artifacts ---
         # This lets us sample frozen policies from the full history in the new run.

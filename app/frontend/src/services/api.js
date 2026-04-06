@@ -81,6 +81,40 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
     return response.json();
 }
 
+export async function initTemplateSandbox(payload = {}) {
+    const response = await fetch(`${API_BASE_URL}/api/template_bootstrap`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload || {}),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to initialize template sandbox' }));
+        console.error('[API] initTemplateSandbox failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to initialize template sandbox');
+    }
+    return response.json();
+}
+
+export async function applyStartTemplate(templateId, mirrored = null, applyToState = true, seed = null) {
+  const response = await fetch(`${API_BASE_URL}/api/apply_start_template`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      template_id: templateId,
+      mirrored,
+      apply_to_state: Boolean(applyToState),
+      seed,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to apply start template');
+  }
+  return response.json();
+}
+
 export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null) {
     console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions);
     const response = await fetch(`${API_BASE_URL}/api/step`, {

@@ -2,7 +2,7 @@
 import { ref, watch } from 'vue';
 import { listPolicies } from '@/services/api';
 
-const emit = defineEmits(['game-started']);
+const emit = defineEmits(['game-started', 'template-sandbox-started']);
 
 const runId = ref('');
 const userTeam = ref('OFFENSE');
@@ -42,6 +42,13 @@ function startGame() {
         console.log('[GameSetup] Emitting game-started event with:', payload);
         emit('game-started', payload);
     }
+}
+
+function openTemplateSandbox() {
+    emit('template-sandbox-started', {
+        runId: runId.value || null,
+        userTeam: userTeam.value,
+    });
 }
 </script>
 
@@ -91,6 +98,12 @@ function startGame() {
             <button type="submit">
                 Start Game
             </button>
+            <button type="button" class="secondary-btn" @click="openTemplateSandbox">
+                Open Template Sandbox
+            </button>
+            <p class="sandbox-hint">
+                Uses the entered run ID to copy court and player configuration when available. No model is loaded.
+            </p>
         </form>
     </div>
 </template>
@@ -125,6 +138,13 @@ function startGame() {
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+}
+
+.sandbox-hint {
+  margin-top: 0.75rem;
+  margin-bottom: 0;
+  font-size: 0.8rem;
+  color: var(--app-text-muted);
 }
 
 label {
@@ -186,6 +206,10 @@ button:hover {
   transform: translateY(-1px);
   color: var(--app-accent);
   border-color: var(--app-accent-strong);
+}
+
+.secondary-btn {
+  margin-left: 0.75rem;
 }
 
 .error-message {

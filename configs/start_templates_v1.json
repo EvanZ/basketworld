@@ -1,0 +1,242 @@
+{
+  "version": 1,
+  "players_per_side": 3,
+  "templates": [
+    {
+      "id": "wing_entry_help",
+      "weight": 1.0,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {
+          "anchor": [
+            4,
+            1
+          ],
+          "jitter_radius": 1,
+          "role": "weak_side_spacer"
+        },
+        {
+          "anchor": [
+            2,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "ball_handler",
+          "has_ball": true
+        },
+        {
+          "anchor": [
+            1,
+            7
+          ],
+          "jitter_radius": 1,
+          "role": "strong_side_corner"
+        }
+      ],
+      "defense": [
+        {
+          "anchor": [
+            1,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "on_ball"
+        },
+        {
+          "anchor": [
+            2,
+            2
+          ],
+          "jitter_radius": 1,
+          "role": "help"
+        },
+        {
+          "anchor": [
+            0,
+            6
+          ],
+          "jitter_radius": 1,
+          "role": "weak_side_help"
+        }
+      ]
+    },
+    {
+      "id": "top_entry_gap",
+      "weight": 1.0,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {
+          "anchor": [
+            3,
+            0
+          ],
+          "jitter_radius": 1,
+          "role": "lifted_guard"
+        },
+        {
+          "anchor": [
+            3,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "ball_handler",
+          "has_ball": true
+        },
+        {
+          "anchor": [
+            0,
+            7
+          ],
+          "jitter_radius": 1,
+          "role": "corner_spacer"
+        }
+      ],
+      "defense": [
+        {
+          "anchor": [
+            1,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "on_ball"
+        },
+        {
+          "anchor": [
+            2,
+            1
+          ],
+          "jitter_radius": 1,
+          "role": "nail_help"
+        },
+        {
+          "anchor": [
+            -1,
+            6
+          ],
+          "jitter_radius": 1,
+          "role": "low_help"
+        }
+      ]
+    },
+    {
+      "id": "corner_entry_stunt",
+      "weight": 1.0,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {
+          "anchor": [
+            4,
+            2
+          ],
+          "jitter_radius": 1,
+          "role": "high_spacer"
+        },
+        {
+          "anchor": [
+            1,
+            6
+          ],
+          "jitter_radius": 0,
+          "role": "ball_handler",
+          "has_ball": true
+        },
+        {
+          "anchor": [
+            2,
+            3
+          ],
+          "jitter_radius": 1,
+          "role": "slot_receiver"
+        }
+      ],
+      "defense": [
+        {
+          "anchor": [
+            1,
+            5
+          ],
+          "jitter_radius": 0,
+          "role": "on_ball"
+        },
+        {
+          "anchor": [
+            2,
+            2
+          ],
+          "jitter_radius": 1,
+          "role": "stunt_help"
+        },
+        {
+          "anchor": [
+            0,
+            3
+          ],
+          "jitter_radius": 1,
+          "role": "paint_help"
+        }
+      ]
+    },
+    {
+      "id": "elbow_entry_help",
+      "weight": 1.0,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {
+          "anchor": [
+            3,
+            2
+          ],
+          "jitter_radius": 1,
+          "role": "slot_spacer"
+        },
+        {
+          "anchor": [
+            1,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "ball_handler",
+          "has_ball": true
+        },
+        {
+          "anchor": [
+            2,
+            6
+          ],
+          "jitter_radius": 1,
+          "role": "dunker"
+        }
+      ],
+      "defense": [
+        {
+          "anchor": [
+            0,
+            4
+          ],
+          "jitter_radius": 0,
+          "role": "on_ball"
+        },
+        {
+          "anchor": [
+            1,
+            2
+          ],
+          "jitter_radius": 1,
+          "role": "help"
+        },
+        {
+          "anchor": [
+            0,
+            6
+          ],
+          "jitter_radius": 1,
+          "role": "tag"
+        }
+      ]
+    }
+  ]
+}
