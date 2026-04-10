@@ -703,6 +703,8 @@ class IntentDiversityCallback(BaseCallback):
         disc_console_log_every_rollouts: int = 0,
         max_obs_dim: int = 256,
         max_action_dim: int = 16,
+        disc_include_shot_clock: bool = True,
+        disc_include_pressure_exposure: bool = True,
         disc_lambda_shot: float = 0.0,
         disc_lambda_q: float = 0.0,
         disc_eval_holdout_fraction: float = 0.25,
@@ -727,6 +729,8 @@ class IntentDiversityCallback(BaseCallback):
         )
         self.max_obs_dim = int(max(8, max_obs_dim))
         self.max_action_dim = int(max(1, max_action_dim))
+        self.disc_include_shot_clock = bool(disc_include_shot_clock)
+        self.disc_include_pressure_exposure = bool(disc_include_pressure_exposure)
         self.disc_lambda_shot = float(max(0.0, disc_lambda_shot))
         self.disc_lambda_q = float(max(0.0, disc_lambda_q))
         self.disc_eval_holdout_fraction = float(
@@ -738,6 +742,8 @@ class IntentDiversityCallback(BaseCallback):
         self._rollout_counter = 0
         self._episodes = IntentEpisodeBuffer()
         self._step_examples: list[IntentStepExample] = []
+        self._step_episode_id_by_env: dict[int, int] = {}
+        self._next_step_episode_id = 0
         self._bonus_stats = RunningMeanStd()
         self._disc: Optional[IntentDiscriminator] = None
         self._disc_opt: Optional[torch.optim.Optimizer] = None
@@ -821,6 +827,18 @@ class IntentDiversityCallback(BaseCallback):
         except Exception:
             return float(default)
 
+    def _current_step_episode_id(self, env_idx: int) -> int:
+        env_key = int(env_idx)
+        if env_key not in self._step_episode_id_by_env:
+            self._step_episode_id_by_env[env_key] = int(self._next_step_episode_id)
+            self._next_step_episode_id += 1
+        return int(self._step_episode_id_by_env[env_key])
+
+    def _advance_step_episode_id(self, env_idx: int) -> None:
+        env_key = int(env_idx)
+        self._step_episode_id_by_env[env_key] = int(self._next_step_episode_id)
+        self._next_step_episode_id += 1
+
     def _build_transition(
         self, obs_payload, actions_payload, info: dict, env_idx: int
     ) -> IntentTransition:
@@ -867,10 +885,20 @@ class IntentDiversityCallback(BaseCallback):
         obs_payload: Any,
         info: dict,
         env_idx: int,
+        *,
+        episode_id: int,
     ) -> Optional[IntentStepExample]:
         obs_dict = extract_set_observation_for_env(obs_payload, env_idx)
         if obs_dict is None:
             return None
+        globals_arr = np.asarray(obs_dict.get("globals"), dtype=np.float32)
+        if globals_arr.ndim == 1 and globals_arr.shape[0] >= 2:
+            globals_arr = globals_arr.copy()
+            if not self.disc_include_shot_clock:
+                globals_arr[0] = 0.0
+            if not self.disc_include_pressure_exposure:
+                globals_arr[1] = 0.0
+            obs_dict["globals"] = globals_arr
         role_flag = self._extract_scalar_from_obs(
             obs_payload, "role_flag", env_idx, default=0.0
         )
@@ -902,8 +930,11 @@ class IntentDiversityCallback(BaseCallback):
             role_flag=float(role_flag),
             intent_active=bool(intent_active > 0.5),
             intent_index=int(max(0, min(self.num_intents - 1, int(intent_index)))),
+            episode_id=int(episode_id),
             training_team=str(info.get("training_team", "") or ""),
             boundary_reason=str(info.get("intent_segment_boundary_reason", "") or ""),
+            start_template_id=str(info.get("start_template_id", "") or ""),
+            start_template_mirrored=bool(info.get("start_template_mirrored", False)),
             shot_end=float(shot_end),
             shot_quality=float(shot_quality),
             shot_quality_mask=float(shot_quality_mask),
@@ -923,18 +954,34 @@ class IntentDiversityCallback(BaseCallback):
         if self._is_step_discriminator_mode():
             for env_idx in range(n_envs):
                 info = infos[env_idx] or {}
-                ex = self._build_step_example(obs_payload, info, env_idx)
+                episode_id = self._current_step_episode_id(env_idx)
+                ex = self._build_step_example(
+                    obs_payload,
+                    info,
+                    env_idx,
+                    episode_id=episode_id,
+                )
                 if ex is None:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
                     continue
                 if not ex.intent_active:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
                     continue
                 if ex.role_flag <= 0.0:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
                     continue
                 if self.disc_current_policy_only:
                     team = str(ex.training_team or "").strip().lower()
                     if team and team != "offense":
+                        if env_idx < len(dones) and bool(dones[env_idx]):
+                            self._advance_step_episode_id(env_idx)
                         continue
                 self._step_examples.append(ex)
+                if env_idx < len(dones) and bool(dones[env_idx]):
+                    self._advance_step_episode_id(env_idx)
             self._rollout_step_idx += 1
             return True
 
@@ -1022,6 +1069,8 @@ class IntentDiversityCallback(BaseCallback):
                 self._disc_set_heads if self._disc_set_heads > 0 else (4 if int(self.disc_hidden_dim) % 4 == 0 else 1)
             ),
             "set_cls_tokens": int(self._disc_set_cls_tokens),
+            "include_shot_clock": bool(self.disc_include_shot_clock),
+            "include_pressure_exposure": bool(self.disc_include_pressure_exposure),
         }
 
     @staticmethod
@@ -1054,6 +1103,10 @@ class IntentDiversityCallback(BaseCallback):
             "set_global_dim": int(cfg.get("set_global_dim", 0)),
             "set_heads": int(cfg.get("set_heads", 0)),
             "set_cls_tokens": int(cfg.get("set_cls_tokens", 0)),
+            "include_shot_clock": bool(cfg.get("include_shot_clock", True)),
+            "include_pressure_exposure": bool(
+                cfg.get("include_pressure_exposure", True)
+            ),
         }
 
     def validate_discriminator_checkpoint_payload(
@@ -1077,13 +1130,45 @@ class IntentDiversityCallback(BaseCallback):
     def queue_discriminator_checkpoint_restore(
         self, payload: dict[str, Any], *, source: str = "checkpoint payload"
     ) -> bool:
-        ok, reason = self.validate_discriminator_checkpoint_payload(payload)
-        if not ok:
+        if not isinstance(payload, dict):
             print(
                 f"Warning: incompatible intent discriminator checkpoint from {source}; "
-                f"skipping restore ({reason})."
+                "skipping restore (checkpoint payload is not a dict)."
             )
             return False
+        if "state_dict" not in payload:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                "skipping restore (checkpoint payload missing state_dict)."
+            )
+            return False
+        if "config" not in payload:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                "skipping restore (checkpoint payload missing config)."
+            )
+            return False
+        payload_cfg = self._normalize_discriminator_config(payload.get("config"))
+        expected_cfg = self._normalize_discriminator_config(
+            self._discriminator_expected_config()
+        )
+        unresolved_set_dims = (
+            payload_cfg.get("encoder_type") == "set_step"
+            and int(payload_cfg.get("set_token_dim", 0)) > 0
+            and int(payload_cfg.get("set_global_dim", 0)) > 0
+            and (
+                int(expected_cfg.get("set_token_dim", 0)) <= 0
+                or int(expected_cfg.get("set_global_dim", 0)) <= 0
+            )
+        )
+        if not unresolved_set_dims:
+            ok, reason = self.validate_discriminator_checkpoint_payload(payload)
+            if not ok:
+                print(
+                    f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                    f"skipping restore ({reason})."
+                )
+                return False
         self._pending_disc_restore_payload = payload
         self._pending_disc_restore_source = source
         return True
@@ -1196,6 +1281,10 @@ class IntentDiversityCallback(BaseCallback):
                 "set_global_dim": int(self._disc_set_global_dim),
                 "set_heads": int(self._disc_set_heads),
                 "set_cls_tokens": int(self._disc_set_cls_tokens),
+                "include_shot_clock": bool(self.disc_include_shot_clock),
+                "include_pressure_exposure": bool(
+                    self.disc_include_pressure_exposure
+                ),
                 "disc_lambda_shot": float(self.disc_lambda_shot),
                 "disc_lambda_q": float(self.disc_lambda_q),
                 "enable_shot_end_head": bool(self.disc_lambda_shot > 0.0),
@@ -1311,6 +1400,10 @@ class IntentDiversityCallback(BaseCallback):
             payload.get("env_idx", np.full((x_np.shape[0],), -1, dtype=np.int64)),
             dtype=np.int64,
         ).reshape(-1)
+        episode_id_np = np.asarray(
+            payload.get("episode_id", np.full((x_np.shape[0],), -1, dtype=np.int64)),
+            dtype=np.int64,
+        ).reshape(-1)
         episode_length_np = np.asarray(
             payload.get(
                 "episode_length",
@@ -1339,6 +1432,20 @@ class IntentDiversityCallback(BaseCallback):
             ),
             dtype=object,
         ).reshape(-1)
+        start_template_id_np = np.asarray(
+            payload.get(
+                "start_template_id",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        start_template_mirrored_np = np.asarray(
+            payload.get(
+                "start_template_mirrored",
+                np.zeros((x_np.shape[0],), dtype=np.int8),
+            ),
+            dtype=np.int8,
+        ).reshape(-1)
         first_buffer_step_idx_np = np.asarray(
             payload.get(
                 "first_buffer_step_idx",
@@ -1365,10 +1472,13 @@ class IntentDiversityCallback(BaseCallback):
             shot_quality=shot_quality_np,
             shot_quality_mask=shot_quality_mask_np,
             env_idx=env_idx_np,
+            episode_id=episode_id_np,
             episode_length=episode_length_np,
             active_prefix_length=active_prefix_length_np,
             training_team=training_team_np,
             boundary_reason=boundary_reason_np,
+            start_template_id=start_template_id_np,
+            start_template_mirrored=start_template_mirrored_np,
             first_buffer_step_idx=first_buffer_step_idx_np,
             last_buffer_step_idx=last_buffer_step_idx_np,
             has_lengths=np.array([1 if lengths_raw is not None else 0], dtype=np.int8),
@@ -1835,24 +1945,42 @@ class IntentDiversityCallback(BaseCallback):
             int(getattr(self.model, "num_timesteps", 0))
             + (1009 * int(self._rollout_counter))
         )
-        by_intent: dict[int, list[int]] = {}
+        group_to_indices: dict[int, list[int]] = {}
+        group_order: list[int] = []
         for idx, example in enumerate(examples):
-            by_intent.setdefault(int(example.intent_index), []).append(idx)
+            group_id = int(example.episode_id)
+            if group_id < 0:
+                group_id = -(idx + 1)
+            if group_id not in group_to_indices:
+                group_to_indices[group_id] = []
+                group_order.append(group_id)
+            group_to_indices[group_id].append(idx)
+
+        by_intent: dict[int, list[int]] = {}
+        for group_id in group_order:
+            indices = group_to_indices[group_id]
+            if not indices:
+                continue
+            group_intent = int(examples[indices[0]].intent_index)
+            by_intent.setdefault(group_intent, []).append(group_id)
 
         train_idx: set[int] = set()
         holdout_idx: set[int] = set()
-        for indices in by_intent.values():
-            if len(indices) <= 1:
-                train_idx.update(indices)
+        for group_ids in by_intent.values():
+            if len(group_ids) <= 1:
+                for group_id in group_ids:
+                    train_idx.update(group_to_indices.get(int(group_id), []))
                 continue
-            shuffled = np.asarray(indices, dtype=np.int64)
+            shuffled = np.asarray(group_ids, dtype=np.int64)
             rng.shuffle(shuffled)
             holdout_count = int(
                 np.round(float(len(shuffled)) * float(self.disc_eval_holdout_fraction))
             )
             holdout_count = min(len(shuffled) - 1, max(1, holdout_count))
-            holdout_idx.update(int(v) for v in shuffled[:holdout_count].tolist())
-            train_idx.update(int(v) for v in shuffled[holdout_count:].tolist())
+            for group_id in shuffled[:holdout_count].tolist():
+                holdout_idx.update(group_to_indices.get(int(group_id), []))
+            for group_id in shuffled[holdout_count:].tolist():
+                train_idx.update(group_to_indices.get(int(group_id), []))
 
         if not train_idx and holdout_idx:
             first_holdout_idx = min(holdout_idx)
@@ -1940,6 +2068,8 @@ class IntentDiversityCallback(BaseCallback):
         active_prefix_length: list[int] = []
         training_team: list[str] = []
         boundary_reason: list[str] = []
+        start_template_id: list[str] = []
+        start_template_mirrored: list[bool] = []
         first_buffer_step_idx: list[int] = []
         last_buffer_step_idx: list[int] = []
         for episode in episodes:
@@ -1963,12 +2093,20 @@ class IntentDiversityCallback(BaseCallback):
             info = dict(episode.terminal_info or {})
             training_team.append(str(info.get("training_team", "")))
             boundary_reason.append(str(info.get("intent_segment_boundary_reason", "episode_end")))
+            start_template_id.append(str(info.get("start_template_id", "") or ""))
+            start_template_mirrored.append(
+                bool(info.get("start_template_mirrored", False))
+            )
         return {
             "env_idx": np.asarray(env_idx, dtype=np.int64),
             "episode_length": np.asarray(episode_length, dtype=np.int64),
             "active_prefix_length": np.asarray(active_prefix_length, dtype=np.int64),
             "training_team": np.asarray(training_team, dtype=object),
             "boundary_reason": np.asarray(boundary_reason, dtype=object),
+            "start_template_id": np.asarray(start_template_id, dtype=object),
+            "start_template_mirrored": np.asarray(
+                start_template_mirrored, dtype=np.int8
+            ),
             "first_buffer_step_idx": np.asarray(first_buffer_step_idx, dtype=np.int64),
             "last_buffer_step_idx": np.asarray(last_buffer_step_idx, dtype=np.int64),
         }
@@ -1978,6 +2116,7 @@ class IntentDiversityCallback(BaseCallback):
         examples: list[IntentStepExample],
     ) -> dict[str, np.ndarray]:
         env_idx = np.asarray([int(ex.env_idx) for ex in examples], dtype=np.int64)
+        episode_id = np.asarray([int(ex.episode_id) for ex in examples], dtype=np.int64)
         buffer_step_idx = np.asarray(
             [int(ex.buffer_step_idx) for ex in examples], dtype=np.int64
         )
@@ -1985,14 +2124,24 @@ class IntentDiversityCallback(BaseCallback):
         boundary_reason = np.asarray(
             [str(ex.boundary_reason) for ex in examples], dtype=object
         )
+        start_template_id = np.asarray(
+            [str(ex.start_template_id) for ex in examples], dtype=object
+        )
+        start_template_mirrored = np.asarray(
+            [1 if bool(ex.start_template_mirrored) else 0 for ex in examples],
+            dtype=np.int8,
+        )
         role_flag = np.asarray([float(ex.role_flag) for ex in examples], dtype=np.float32)
         ones = np.ones((len(examples),), dtype=np.int64)
         return {
             "env_idx": env_idx,
+            "episode_id": episode_id,
             "episode_length": ones,
             "active_prefix_length": ones,
             "training_team": training_team,
             "boundary_reason": boundary_reason,
+            "start_template_id": start_template_id,
+            "start_template_mirrored": start_template_mirrored,
             "first_buffer_step_idx": buffer_step_idx,
             "last_buffer_step_idx": buffer_step_idx,
             "role_flag_scalar": role_flag,

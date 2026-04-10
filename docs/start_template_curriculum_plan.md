@@ -48,6 +48,59 @@ It is:
 
 - **structured start-state / coverage diversity**
 
+## Critical Discriminator Finding
+
+On `2026-04-06` we found that the current `set_step` discriminator was
+achieving much of its AUC from **temporal globals**, not from geometry-driven
+play structure.
+
+The main shortcut features were:
+
+- `shot_clock`
+- `pressure_exposure`
+
+Why this matters:
+
+- both are time-based / cumulative trajectory signals
+- they are easy to discriminate
+- they confound the intended positive-control test for template-conditioned play
+  learning
+
+Post-hoc evidence on the saved eval batch:
+
+- full baseline AUC: `0.6916`
+- mask `has_ball`: `0.7065`
+- mask ball-identity bundle: `0.6979`
+- position only: `0.5196`
+- position + role only: `0.5100`
+- mask `shot_clock + pressure_exposure`: `0.4850`
+- `shot_clock` alone in the feature sweep: `0.7410`
+
+Interpretation:
+
+1. the dominant shortcut was not ball-holder identity
+2. the dominant shortcut was temporal-global leakage
+3. prior discriminator AUC should not be treated as clean evidence of
+   geometry-based play separation
+
+Current solution:
+
+- discriminator-only config flags now exist:
+  - `--intent-disc-include-shot-clock false`
+  - `--intent-disc-include-pressure-exposure false`
+
+Operational note:
+
+- this changes discriminator checkpoint compatibility
+- continuing from an older run should keep the policy but allow the
+  discriminator to start fresh if these flags differ
+
+Recommended next follow-up after the new run:
+
+- change discriminator holdout splitting from **per-step** to
+  **episode-level / rollout-blocked**
+- the current step-level holdout is still weaker than it should be
+
 ## Current Support
 
 The codebase already has the key primitive we need:
@@ -162,6 +215,11 @@ Recommended first experiment:
 - `start-template-prob = 0.3`
 - `start-template-jitter-scale = 1.0`
 - `start-template-mirror-prob = 0.5`
+
+Updated requirement for the next clean baseline:
+
+- `intent-disc-include-shot-clock = false`
+- `intent-disc-include-pressure-exposure = false`
 
 That gives:
 

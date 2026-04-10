@@ -115,6 +115,68 @@ export async function applyStartTemplate(templateId, mirrored = null, applyToSta
   return response.json();
 }
 
+export async function loadStartTemplateLibrary(path) {
+  const response = await fetch(`${API_BASE_URL}/api/load_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to load start template library');
+  }
+  return response.json();
+}
+
+export async function importStartTemplateLibrary(filename, contents) {
+  const response = await fetch(`${API_BASE_URL}/api/import_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename,
+      contents,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to import start template library');
+  }
+  return response.json();
+}
+
+export async function setStartTemplateLibrary(library, source = 'session_editor', path = null) {
+  const response = await fetch(`${API_BASE_URL}/api/set_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      library,
+      source,
+      path,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update start template library');
+  }
+  return response.json();
+}
+
+export async function saveStartTemplateLibrary(path, library) {
+  const response = await fetch(`${API_BASE_URL}/api/save_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path,
+      library,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to save start template library');
+  }
+  return response.json();
+}
+
 export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null) {
     console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions);
     const response = await fetch(`${API_BASE_URL}/api/step`, {

@@ -267,9 +267,11 @@ def _resolve_entry_position(
     anchor: tuple[int, int],
     effective_radius: int,
     taken_positions: set[tuple[int, int]],
+    valid_cells: list[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
     valid_cells = list(
-        getattr(env, "_valid_axial", ())
+        valid_cells
+        or getattr(env, "_valid_axial", ())
         or getattr(env, "_cell_index", {}).keys()
     )
     if not valid_cells:
@@ -296,6 +298,47 @@ def _resolve_entry_position(
     nearest = [cell for cell, dist in candidates if dist == min_dist]
     choice_idx = int(getattr(env, "_rng").integers(0, len(nearest)))
     return tuple(nearest[choice_idx])
+
+
+def _project_anchor_to_valid_cell(
+    env: Any,
+    anchor: tuple[int, int],
+    *,
+    valid_cells: list[tuple[int, int]],
+) -> tuple[int, int]:
+    anchor = (int(anchor[0]), int(anchor[1]))
+    if anchor in valid_cells:
+        return anchor
+    return _resolve_entry_position(
+        env,
+        anchor=anchor,
+        effective_radius=0,
+        taken_positions=set(),
+        valid_cells=valid_cells,
+    )
+
+
+def _ensure_positions_in_bounds(
+    env: Any,
+    positions: list[tuple[int, int]],
+    *,
+    valid_cells: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    fixed_positions: list[tuple[int, int]] = []
+    taken_positions: set[tuple[int, int]] = set()
+    for pos in positions:
+        candidate = (int(pos[0]), int(pos[1]))
+        if candidate not in valid_cells or candidate in taken_positions:
+            candidate = _resolve_entry_position(
+                env,
+                anchor=candidate,
+                effective_radius=0,
+                taken_positions=taken_positions,
+                valid_cells=valid_cells,
+            )
+        fixed_positions.append(candidate)
+        taken_positions.add(candidate)
+    return fixed_positions
 
 
 def _team_player_ids(env: Any, team_name: str, players_per_side: int) -> list[int]:
@@ -327,6 +370,12 @@ def resolve_start_template(
     placements: list[dict[str, Any]] = []
     ball_holder: int | None = None
     rng = getattr(env, "_rng")
+    valid_cells = list(
+        getattr(env, "_valid_axial", ())
+        or getattr(env, "_cell_index", {}).keys()
+    )
+    if not valid_cells:
+        raise ValueError("env does not expose any valid cells for template resolution")
     for team_name in ("offense", "defense"):
         entries = list(template.get(team_name, []) or [])
         team_ids = _team_player_ids(env, team_name, players_per_side)
@@ -336,7 +385,11 @@ def resolve_start_template(
             )
         assignment_order = [team_ids[int(idx)] for idx in rng.permutation(len(team_ids))]
         for entry, assigned_player_id in zip(entries, assignment_order):
-            anchor = (int(entry["anchor"][0]), int(entry["anchor"][1]))
+            anchor = _project_anchor_to_valid_cell(
+                env,
+                (int(entry["anchor"][0]), int(entry["anchor"][1])),
+                valid_cells=valid_cells,
+            )
             placements.append(
                 {
                     "player_id": int(assigned_player_id),
@@ -365,6 +418,7 @@ def resolve_start_template(
             anchor=tuple(item["anchor"]),
             effective_radius=int(item["jitter_radius"]),
             taken_positions=taken_positions,
+            valid_cells=valid_cells,
         )
         positions[int(item["player_id"])] = chosen
         taken_positions.add(chosen)
@@ -378,6 +432,11 @@ def resolve_start_template(
         resolved_positions = [
             _mirror_anchor(env, tuple(pos)) for pos in resolved_positions
         ]
+    resolved_positions = _ensure_positions_in_bounds(
+        env,
+        resolved_positions,
+        valid_cells=valid_cells,
+    )
 
     result: dict[str, Any] = {
         "template_id": str(template.get("id", "")),

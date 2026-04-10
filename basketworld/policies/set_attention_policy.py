@@ -140,21 +140,11 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self._runtime_intent_indices = None
         self._runtime_intent_gate = None
 
-    def forward(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
-        """Compute flattened token embeddings from a set observation.
-
-        Args:
-            obs: dict with "players" (B, P, T) and "globals" (B, G).
-
-        Returns:
-            Flattened tokens of shape (B, (P + C) * D).
-            This preserves token order: first P player tokens, then C CLS tokens.
-        """
-        players = obs["players"]
-        globals_vec = obs["globals"]
-        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
-        tokens = th.cat([players, g], dim=-1)
-        emb = self.token_mlp(tokens)
+    def _apply_runtime_intent_conditioning(
+        self,
+        emb: th.Tensor,
+        obs: Dict[str, th.Tensor],
+    ) -> th.Tensor:
         if (
             self.offense_intent_embedding is not None
             and self.defense_intent_embedding is not None
@@ -202,10 +192,40 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
                 emb = emb + (intent_delta.unsqueeze(1) * intent_gate.unsqueeze(1))
             except Exception:
                 pass
+        return emb
+
+    def _build_attention_input(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        players = obs["players"]
+        globals_vec = obs["globals"]
+        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
+        tokens = th.cat([players, g], dim=-1)
+        emb = self.token_mlp(tokens)
+        emb = self._apply_runtime_intent_conditioning(emb, obs)
         if self.cls_tokens is not None:
             batch = emb.size(0)
             cls = self.cls_tokens.unsqueeze(0).expand(batch, -1, -1)
             emb = th.cat([emb, cls], dim=1)
+        return emb
+
+    def compute_attention_weights(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        """Return raw per-head attention weights for the current runtime-conditioned obs."""
+        emb = self._build_attention_input(obs)
+        _, attn_weights = self.attn(
+            emb, emb, emb, need_weights=True, average_attn_weights=False
+        )
+        return attn_weights
+
+    def forward(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        """Compute flattened token embeddings from a set observation.
+
+        Args:
+            obs: dict with "players" (B, P, T) and "globals" (B, G).
+
+        Returns:
+            Flattened tokens of shape (B, (P + C) * D).
+            This preserves token order: first P player tokens, then C CLS tokens.
+        """
+        emb = self._build_attention_input(obs)
         attn_out, _ = self.attn(emb, emb, emb, need_weights=False)
         attn_out = self.attn_norm(emb + attn_out)
         return attn_out.reshape(attn_out.size(0), -1)

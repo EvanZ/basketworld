@@ -24,6 +24,15 @@ from basketworld.utils.intent_discovery import (
     load_intent_discriminator_from_checkpoint,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
+from basketworld.utils.wrappers import (
+    TOKEN_Q_IDX,
+    TOKEN_R_IDX,
+    TOKEN_ROLE_IDX,
+    TOKEN_DIST_TO_BALL_IDX,
+    TOKEN_HAS_BALL_IDX,
+    TOKEN_STEAL_RISK_IDX,
+    TOKEN_TURNOVER_PROB_IDX,
+)
 
 
 def _extract_checkpoint_index(path_or_name: str) -> int | None:
@@ -151,6 +160,35 @@ def _load_discriminator_checkpoint(path: str, device: str) -> tuple[IntentDiscri
     return disc, payload
 
 
+def _softmax_probs(logits_np: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits_np, dtype=np.float64)
+    if logits.ndim != 2 or logits.shape[0] == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    denom = np.clip(np.sum(exp_logits, axis=1, keepdims=True), 1e-12, None)
+    return exp_logits / denom
+
+
+def _per_class_auc_ovr(
+    logits_np: np.ndarray,
+    y_np: np.ndarray,
+    *,
+    num_classes: int,
+) -> dict[str, float | None]:
+    probs = _softmax_probs(logits_np)
+    y_true = np.asarray(y_np, dtype=np.int64).reshape(-1)
+    if probs.ndim != 2 or probs.shape[0] == 0 or probs.shape[0] != y_true.size:
+        return {}
+    k = min(int(num_classes), int(probs.shape[1]))
+    aucs: dict[str, float | None] = {}
+    for class_idx in range(k):
+        y_bin = (y_true == class_idx).astype(np.int64)
+        auc = IntentDiversityCallback._binary_auc_from_scores(y_bin, probs[:, class_idx])
+        aucs[str(class_idx)] = None if auc is None else float(auc)
+    return aucs
+
+
 def load_eval_batch(path: str) -> dict[str, Any]:
     with np.load(path, allow_pickle=True) as payload:
         x_np = np.asarray(payload["x"], dtype=np.float32)
@@ -189,13 +227,107 @@ def load_eval_batch(path: str) -> dict[str, Any]:
             if isinstance(raw_encoder, np.generic):
                 raw_encoder = raw_encoder.item()
             meta["encoder_type"] = str(raw_encoder)
+        has_set_obs = bool(
+            int(payload["has_set_obs"][0]) if "has_set_obs" in payload else 0
+        )
+        players_np = (
+            np.asarray(payload["players"], dtype=np.float32)
+            if "players" in payload
+            else np.zeros((0, 0, 0), dtype=np.float32)
+        )
+        globals_np = (
+            np.asarray(payload["globals"], dtype=np.float32)
+            if "globals" in payload
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+        role_flag_np = (
+            np.asarray(payload["role_flag"], dtype=np.float32)
+            if "role_flag" in payload
+            else np.zeros((0, 1), dtype=np.float32)
+        )
+        start_template_id_np = (
+            np.asarray(payload["start_template_id"], dtype=object).reshape(-1)
+            if "start_template_id" in payload
+            else np.full((y_np.shape[0],), "", dtype=object)
+        )
+        start_template_mirrored_np = (
+            np.asarray(payload["start_template_mirrored"], dtype=np.int8).reshape(-1)
+            if "start_template_mirrored" in payload
+            else np.zeros((y_np.shape[0],), dtype=np.int8)
+        )
+        episode_id_np = (
+            np.asarray(payload["episode_id"], dtype=np.int64).reshape(-1)
+            if "episode_id" in payload
+            else np.full((y_np.shape[0],), -1, dtype=np.int64)
+        )
 
     return {
         "x": x_np,
         "y": y_np,
         "lengths": lengths_np,
+        "has_set_obs": has_set_obs,
+        "players": players_np,
+        "globals": globals_np,
+        "role_flag": role_flag_np,
+        "episode_id": episode_id_np,
+        "start_template_id": start_template_id_np,
+        "start_template_mirrored": start_template_mirrored_np,
         "meta": meta,
     }
+
+
+def _batch_input_for_disc(
+    batch: dict[str, Any],
+    *,
+    mask_has_ball: bool = False,
+    mask_ball_identity_bundle: bool = False,
+    mask_temporal_globals: bool = False,
+    mask_nonposition_keep_role: bool = False,
+    mask_nonposition: bool = False,
+) -> tuple[Any, Optional[np.ndarray]]:
+    encoder_type = str(batch.get("meta", {}).get("encoder_type", "") or "").strip().lower()
+    has_set_obs = bool(batch.get("has_set_obs", False))
+    if encoder_type == "set_step" or has_set_obs:
+        players_np = np.asarray(batch.get("players"), dtype=np.float32).copy()
+        globals_np = np.asarray(batch.get("globals"), dtype=np.float32).copy()
+        role_flag_np = np.asarray(batch.get("role_flag"), dtype=np.float32).copy()
+        if players_np.ndim == 3:
+            if mask_has_ball and players_np.shape[-1] > TOKEN_HAS_BALL_IDX:
+                players_np[:, :, TOKEN_HAS_BALL_IDX] = 0.0
+            if mask_ball_identity_bundle:
+                for token_idx in (
+                    TOKEN_HAS_BALL_IDX,
+                    TOKEN_TURNOVER_PROB_IDX,
+                    TOKEN_STEAL_RISK_IDX,
+                    TOKEN_DIST_TO_BALL_IDX,
+                ):
+                    if players_np.shape[-1] > int(token_idx):
+                        players_np[:, :, int(token_idx)] = 0.0
+            if mask_temporal_globals and globals_np.ndim == 2:
+                for global_idx in (0, 1):
+                    if globals_np.shape[-1] > int(global_idx):
+                        globals_np[:, int(global_idx)] = 0.0
+            if mask_nonposition_keep_role or mask_nonposition:
+                original_players = players_np.copy()
+                players_np[:, :, :] = 0.0
+                keep_token_indices = [TOKEN_Q_IDX, TOKEN_R_IDX]
+                if mask_nonposition_keep_role:
+                    keep_token_indices.append(TOKEN_ROLE_IDX)
+                for token_idx in keep_token_indices:
+                    if players_np.shape[-1] > int(token_idx):
+                        players_np[:, :, int(token_idx)] = original_players[:, :, int(token_idx)]
+                globals_np[:, :] = 0.0
+                if mask_nonposition:
+                    role_flag_np[:, :] = 0.0
+        return (
+            {
+                "players": players_np,
+                "globals": globals_np,
+                "role_flag": role_flag_np,
+            },
+            None,
+        )
+    return np.asarray(batch["x"], dtype=np.float32), batch.get("lengths")
 
 
 def score_eval_batch(
@@ -203,30 +335,69 @@ def score_eval_batch(
     disc_path: str,
     *,
     device: str = "cpu",
+    mask_has_ball: bool = False,
+    mask_ball_identity_bundle: bool = False,
+    mask_temporal_globals: bool = False,
+    mask_nonposition_keep_role: bool = False,
+    mask_nonposition: bool = False,
 ) -> dict[str, Any]:
     batch = load_eval_batch(batch_path)
     disc, payload = _load_discriminator_checkpoint(disc_path, device=device)
     disc_config = dict(payload.get("config", {}) or {})
-    x_np = np.asarray(batch["x"], dtype=np.float32)
     y_np = np.asarray(batch["y"], dtype=np.int64).reshape(-1)
-    lengths_np = batch.get("lengths")
+    x_np, lengths_np = _batch_input_for_disc(
+        batch,
+        mask_has_ball=mask_has_ball,
+        mask_ball_identity_bundle=mask_ball_identity_bundle,
+        mask_temporal_globals=mask_temporal_globals,
+        mask_nonposition_keep_role=mask_nonposition_keep_role,
+        mask_nonposition=mask_nonposition,
+    )
 
-    x = torch.as_tensor(x_np, dtype=torch.float32, device=device)
-    lengths = None
-    if lengths_np is not None:
-        lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=device)
+    if isinstance(x_np, dict):
+        x = {
+            key: torch.as_tensor(value, dtype=torch.float32, device=device)
+            for key, value in x_np.items()
+        }
+        lengths = None
+    else:
+        x = torch.as_tensor(np.asarray(x_np, dtype=np.float32), dtype=torch.float32, device=device)
+        lengths = None
+        if lengths_np is not None:
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=device)
     with torch.no_grad():
         logits = disc(x, lengths)
         pred = torch.argmax(logits, dim=-1).detach().cpu().numpy()
     logits_np = logits.detach().cpu().numpy()
+    num_classes = int(disc_config.get("num_intents", logits_np.shape[1])) if logits_np.ndim == 2 else 0
     top1 = float(np.mean(pred == y_np)) if y_np.size else 0.0
     auc = IntentDiversityCallback._multiclass_auc_ovr_macro(
-        logits_np, y_np, num_classes=int(disc_config.get("num_intents", logits_np.shape[1]))
+        logits_np, y_np, num_classes=num_classes
     )
+    label_counts = (
+        np.bincount(y_np.astype(np.int64), minlength=max(0, num_classes)).astype(np.int64)
+        if y_np.size and num_classes > 0
+        else np.zeros((max(0, num_classes),), dtype=np.int64)
+    )
+    pred_counts = (
+        np.bincount(pred.astype(np.int64), minlength=max(0, num_classes)).astype(np.int64)
+        if pred.size and num_classes > 0
+        else np.zeros((max(0, num_classes),), dtype=np.int64)
+    )
+    label_probs = (
+        label_counts.astype(np.float64) / max(float(np.sum(label_counts)), 1.0)
+        if label_counts.size
+        else np.zeros((0,), dtype=np.float64)
+    )
+    pred_probs = (
+        pred_counts.astype(np.float64) / max(float(np.sum(pred_counts)), 1.0)
+        if pred_counts.size
+        else np.zeros((0,), dtype=np.float64)
+    )
+    per_class_auc = _per_class_auc_ovr(logits_np, y_np, num_classes=num_classes)
     confusion = np.zeros((0, 0), dtype=np.int64)
     confusion_row_normalized = np.zeros((0, 0), dtype=np.float64)
     if y_np.size and logits_np.ndim == 2:
-        num_classes = int(disc_config.get("num_intents", logits_np.shape[1]))
         confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
         for truth, pred_idx in zip(y_np.tolist(), pred.tolist()):
             if 0 <= int(truth) < num_classes and 0 <= int(pred_idx) < num_classes:
@@ -244,8 +415,18 @@ def score_eval_batch(
         "stored_batch_meta": dict(batch.get("meta", {})),
         "disc_checkpoint_config": disc_config,
         "disc_checkpoint_meta": dict(payload.get("meta", {}) or {}),
+        "mask_has_ball": bool(mask_has_ball),
+        "mask_ball_identity_bundle": bool(mask_ball_identity_bundle),
+        "mask_temporal_globals": bool(mask_temporal_globals),
+        "mask_nonposition_keep_role": bool(mask_nonposition_keep_role),
+        "mask_nonposition": bool(mask_nonposition),
         "recomputed_top1_acc": top1,
         "recomputed_auc_ovr_macro": None if auc is None else float(auc),
+        "label_count_by_intent": [int(v) for v in label_counts.tolist()],
+        "label_prob_by_intent": [float(v) for v in label_probs.tolist()],
+        "predicted_count_by_intent": [int(v) for v in pred_counts.tolist()],
+        "predicted_prob_by_intent": [float(v) for v in pred_probs.tolist()],
+        "per_class_auc_ovr": per_class_auc,
         "predicted_class_histogram": np.bincount(
             pred.astype(np.int64), minlength=int(disc_config.get("num_intents", 0))
         ).tolist()
@@ -386,11 +567,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional minimum required recomputed one-vs-rest macro AUC. Exits nonzero if unmet.",
     )
+    parser.add_argument(
+        "--mask-has-ball",
+        action="store_true",
+        help="Zero the set-token has_ball feature before scoring the saved eval batch.",
+    )
+    parser.add_argument(
+        "--mask-ball-identity-bundle",
+        action="store_true",
+        help=(
+            "Zero the ball-identity-related token features before scoring: "
+            "has_ball, turnover_prob, steal_risk, and dist_to_ball."
+        ),
+    )
+    parser.add_argument(
+        "--mask-temporal-globals",
+        action="store_true",
+        help=(
+            "Zero the set-step global shot_clock and pressure_exposure channels "
+            "before scoring the saved eval batch."
+        ),
+    )
+    parser.add_argument(
+        "--mask-nonposition-keep-role",
+        action="store_true",
+        help=(
+            "Keep only player q/r coordinates and per-token offense/defense role. "
+            "Zero all other token features and globals."
+        ),
+    )
+    parser.add_argument(
+        "--mask-nonposition",
+        action="store_true",
+        help=(
+            "Keep only player q/r coordinates. Zero all other token features, "
+            "globals, and role_flag."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    enabled_ablation_flags = [
+        bool(args.mask_has_ball),
+        bool(args.mask_ball_identity_bundle),
+        bool(args.mask_temporal_globals),
+        bool(args.mask_nonposition_keep_role),
+        bool(args.mask_nonposition),
+    ]
+    if sum(1 for enabled in enabled_ablation_flags if enabled) > 1:
+        raise RuntimeError(
+            "Choose at most one ablation flag at a time: "
+            "--mask-has-ball, --mask-ball-identity-bundle, --mask-temporal-globals, "
+            "--mask-nonposition-keep-role, or --mask-nonposition."
+        )
     if not os.path.isfile(args.batch_path_or_run_id):
         setup_mlflow(verbose=False)
     batch_path, disc_path = _resolve_inputs(
@@ -398,7 +629,16 @@ def main(argv: list[str] | None = None) -> int:
         disc_path=args.disc_path,
         checkpoint_idx=args.alternation_index,
     )
-    result = score_eval_batch(batch_path, disc_path, device=args.device)
+    result = score_eval_batch(
+        batch_path,
+        disc_path,
+        device=args.device,
+        mask_has_ball=bool(args.mask_has_ball),
+        mask_ball_identity_bundle=bool(args.mask_ball_identity_bundle),
+        mask_temporal_globals=bool(args.mask_temporal_globals),
+        mask_nonposition_keep_role=bool(args.mask_nonposition_keep_role),
+        mask_nonposition=bool(args.mask_nonposition),
+    )
     result["validation"] = validate_eval_result(
         result,
         min_top1=args.min_top1,

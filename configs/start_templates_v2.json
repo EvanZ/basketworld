@@ -4,7 +4,7 @@
   "templates": [
     {
       "id": "wing_entry_help",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -63,7 +63,7 @@
     },
     {
       "id": "top_entry_gap",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -122,7 +122,7 @@
     },
     {
       "id": "corner_entry_stunt",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -181,7 +181,7 @@
     },
     {
       "id": "elbow_entry_help",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -240,7 +240,7 @@
     },
     {
       "id": "paint_pack_shell",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -299,7 +299,7 @@
     },
     {
       "id": "corner_trap_escape",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -358,7 +358,7 @@
     },
     {
       "id": "double_high_horns",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [
@@ -381,7 +381,7 @@
         },
         {
           "anchor": [
-            5,
+            3,
             7
           ],
           "jitter_radius": 0,
@@ -407,7 +407,7 @@
         },
         {
           "anchor": [
-            2,
+            1,
             7
           ],
           "jitter_radius": 0,
@@ -417,7 +417,7 @@
     },
     {
       "id": "empty_corner_dunker",
-      "weight": 1.0,
+      "weight": 1,
       "mirrorable": true,
       "shot_clock": 24,
       "offense": [

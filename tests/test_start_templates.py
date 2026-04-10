@@ -14,6 +14,10 @@ def _sample_library_path() -> Path:
     return Path(__file__).resolve().parents[1] / "configs" / "start_templates_v1.json"
 
 
+def _extreme_library_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "configs" / "start_templates_v2.json"
+
+
 def test_load_and_resolve_sample_start_template_library():
     library = load_start_template_library(_sample_library_path(), players_per_side=3)
     assert library["version"] == 1
@@ -132,3 +136,49 @@ def test_resolved_template_mirror_is_exact_reflection_of_concrete_positions():
     assert mirrored["initial_positions"] == [
         _mirror_anchor(env_a, tuple(pos)) for pos in base["initial_positions"]
     ]
+
+
+def test_resolve_start_template_projects_invalid_anchor_and_keeps_positions_in_bounds():
+    env = HexagonBasketballEnv(players=3, render_mode=None, allow_dunks=True)
+    env._rng = np.random.default_rng(7)
+    template = {
+        "id": "oob_anchor",
+        "mirrorable": True,
+        "offense": [
+            {"anchor": [999, 999], "jitter_radius": 1, "has_ball": True},
+            {"anchor": [2, 4], "jitter_radius": 0},
+            {"anchor": [1, 7], "jitter_radius": 1},
+        ],
+        "defense": [
+            {"anchor": [1, 4], "jitter_radius": 0},
+            {"anchor": [2, 2], "jitter_radius": 1},
+            {"anchor": [0, 6], "jitter_radius": 1},
+        ],
+    }
+
+    resolved = resolve_start_template(env, template, jitter_scale=1.0, mirror=False)
+
+    assert len(set(resolved["initial_positions"])) == env.n_players
+    assert all(tuple(pos) in env._valid_axial for pos in resolved["initial_positions"])
+
+
+def test_all_v2_templates_resolve_in_bounds_with_jitter_and_mirror():
+    library = load_start_template_library(_extreme_library_path(), players_per_side=3)
+
+    for template in library["templates"]:
+        for mirror in (False, True):
+            for seed in range(16):
+                env = HexagonBasketballEnv(players=3, render_mode=None, allow_dunks=True)
+                env._rng = np.random.default_rng(seed)
+                resolved = resolve_start_template(
+                    env,
+                    template,
+                    jitter_scale=1.0,
+                    mirror=mirror,
+                )
+
+                assert len(set(resolved["initial_positions"])) == env.n_players
+                assert all(
+                    tuple(pos) in env._valid_axial
+                    for pos in resolved["initial_positions"]
+                )

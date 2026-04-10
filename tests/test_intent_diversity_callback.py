@@ -44,6 +44,17 @@ class _DummyModel:
         self._last_episode_starts = np.array([False] * n_envs, dtype=bool)
 
 
+class _DummySetObsModel(_DummyModel):
+    def __init__(self, *, token_dim: int = 15, global_dim: int = 4):
+        super().__init__()
+        self.observation_space = SimpleNamespace(
+            spaces={
+                "players": SimpleNamespace(shape=(6, int(token_dim))),
+                "globals": SimpleNamespace(shape=(int(global_dim),)),
+            }
+        )
+
+
 def _make_step_obs(
     role0: float,
     role1: float,
@@ -337,6 +348,57 @@ def test_intent_diversity_callback_logs_holdout_metrics_from_holdout_subset():
     assert np.isclose(logged["intent/disc_auc_ovr_macro_holdout"][0], 0.77)
     assert np.isclose(logged["intent/disc_top1_acc_eval"][0], 0.22)
     assert np.isclose(logged["intent/disc_auc_ovr_macro"][0], 0.77)
+
+
+def test_set_step_discriminator_restore_is_deferred_until_training_start():
+    source_cb = IntentDiversityCallback(
+        enabled=True,
+        num_intents=4,
+        disc_encoder_type="set_step",
+        max_obs_dim=256,
+        max_action_dim=16,
+        disc_hidden_dim=64,
+    )
+    source_model = _DummySetObsModel(token_dim=15, global_dim=4)
+    source_cb.init_callback(source_model)
+    source_cb._on_training_start()
+    source_cb._maybe_build_discriminator(
+        272,
+        set_token_dim=15,
+        set_global_dim=4,
+    )
+    assert source_cb._disc is not None
+    assert source_cb._disc_opt is not None
+    payload = {
+        "state_dict": source_cb._disc.state_dict(),
+        "optimizer_state_dict": source_cb._disc_opt.state_dict(),
+        "config": source_cb._discriminator_expected_config(),
+        "meta": {"rollout_counter": 7},
+    }
+
+    target_cb = IntentDiversityCallback(
+        enabled=True,
+        num_intents=4,
+        disc_encoder_type="set_step",
+        max_obs_dim=256,
+        max_action_dim=16,
+        disc_hidden_dim=64,
+    )
+    assert target_cb.queue_discriminator_checkpoint_restore(payload, source="test")
+    assert target_cb._pending_disc_restore_payload is payload
+    assert target_cb._disc is None
+
+    target_model = _DummySetObsModel(token_dim=15, global_dim=4)
+    target_cb.init_callback(target_model)
+    target_cb._on_training_start()
+
+    assert target_cb._pending_disc_restore_payload is None
+    assert target_cb.has_trained_discriminator()
+    assert target_cb._disc is not None
+    assert target_cb._disc_set_token_dim == 15
+    assert target_cb._disc_set_global_dim == 4
+    for key, value in source_cb._disc.state_dict().items():
+        assert torch.equal(value, target_cb._disc.state_dict()[key])
 
 
 def test_intent_diversity_callback_filters_out_frozen_offense_episodes_by_default():

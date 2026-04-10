@@ -174,6 +174,12 @@ def build_intent_diversity_callback(args):
         disc_dropout=getattr(args, "intent_disc_dropout", 0.1),
         max_obs_dim=getattr(args, "intent_disc_max_obs_dim", 256),
         max_action_dim=getattr(args, "intent_disc_max_action_dim", 16),
+        disc_include_shot_clock=getattr(
+            args, "intent_disc_include_shot_clock", True
+        ),
+        disc_include_pressure_exposure=getattr(
+            args, "intent_disc_include_pressure_exposure", True
+        ),
         disc_lambda_shot=getattr(args, "intent_disc_lambda_shot", 0.0),
         disc_lambda_q=getattr(args, "intent_disc_lambda_q", 0.0),
         disc_eval_holdout_fraction=getattr(

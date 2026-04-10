@@ -16,6 +16,46 @@ Target behavior:
 - the intrinsic reward is computed per step, not per completed segment
 - the discriminator input respects the permutation/invariance goals of the token/set-attention design
 
+## Critical Update
+
+On `2026-04-06` we confirmed that the current `set_step` discriminator could
+recover much of its AUC from temporal-global shortcut features rather than
+geometry-driven play structure.
+
+Main shortcut features:
+
+- `shot_clock`
+- `pressure_exposure`
+
+Observed post-hoc evidence on the saved eval batch:
+
+- full baseline AUC: `0.6916`
+- mask `has_ball`: `0.7065`
+- mask ball-identity bundle: `0.6979`
+- position only: `0.5196`
+- position + role only: `0.5100`
+- mask `shot_clock + pressure_exposure`: `0.4850`
+- `shot_clock` alone in the feature-family sweep: `0.7410`
+
+Interpretation:
+
+1. the main shortcut was not ball-holder identity
+2. the main shortcut was temporal-global leakage
+3. prior discriminator AUC should not be treated as clean evidence of
+   geometry-based play separation
+
+Immediate design consequence for this plan:
+
+- a valid single-step state-only discriminator should **exclude**
+  `shot_clock` and `pressure_exposure` from the discriminator input path
+- those features may still remain available to the policy; this restriction is
+  discriminator-specific
+
+Operational follow-up:
+
+- future discriminator eval should also move from **per-step shuffled holdout**
+  toward **episode-level / rollout-blocked holdout**
+
 ## Why Change It
 
 The current discriminator path has several issues:
@@ -63,11 +103,17 @@ Use:
 - `globals`
 - `role_flag` if needed
 
+But for `globals`, exclude temporal shortcut channels:
+
+- do **not** include `shot_clock`
+- do **not** include `pressure_exposure`
+
 Do **not** use:
 
 - actions
 - action masks
 - flattened player-index vectors as the primary path
+- time-based / cumulative globals that make intent classification trivial
 
 ### Encoder
 

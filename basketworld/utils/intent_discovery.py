@@ -31,8 +31,11 @@ class IntentStepExample:
     role_flag: float
     intent_active: bool
     intent_index: int
+    episode_id: int = -1
     training_team: str = ""
     boundary_reason: str = ""
+    start_template_id: str = ""
+    start_template_mirrored: bool = False
     shot_end: float = 0.0
     shot_quality: float = 0.0
     shot_quality_mask: float = 0.0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 import mlflow
@@ -45,6 +46,9 @@ class IntegratedIntentSelectorPPO(PPO):
         intent_selector_entropy_coef: float = 0.01,
         intent_selector_usage_reg_coef: float = 0.01,
         intent_selector_value_coef: float = 0.5,
+        intent_selector_template_metrics_log_every_rollouts: int = 8,
+        intent_selector_train_every_rollouts: int = 1,
+        intent_selector_max_samples_per_update: int = 0,
         intent_selector_multiselect_enabled: bool = False,
         intent_selector_min_play_steps: int = 3,
         intent_commitment_steps: int = 4,
@@ -73,6 +77,15 @@ class IntegratedIntentSelectorPPO(PPO):
             max(0.0, intent_selector_usage_reg_coef)
         )
         self.intent_selector_value_coef = float(max(0.0, intent_selector_value_coef))
+        self.intent_selector_template_metrics_log_every_rollouts = max(
+            1, int(intent_selector_template_metrics_log_every_rollouts)
+        )
+        self.intent_selector_train_every_rollouts = max(
+            1, int(intent_selector_train_every_rollouts)
+        )
+        self.intent_selector_max_samples_per_update = max(
+            0, int(intent_selector_max_samples_per_update)
+        )
         self.intent_selector_multiselect_enabled = bool(
             intent_selector_multiselect_enabled
         )
@@ -93,6 +106,8 @@ class IntegratedIntentSelectorPPO(PPO):
         self._selector_rollout_completed_episode_segment_counts: list[int] = []
         self._selector_rollout_boundary_reason_counts: dict[str, int] = {}
         self._selector_last_metrics: dict[str, float] = {}
+        self._selector_train_update_count: int = 0
+        self._selector_rollout_update_count: int = 0
         super().__init__(*args, **kwargs)
 
     def _excluded_save_params(self) -> list[str]:
@@ -112,6 +127,8 @@ class IntegratedIntentSelectorPPO(PPO):
                 "_selector_rollout_completed_episode_segment_counts",
                 "_selector_rollout_boundary_reason_counts",
                 "_selector_last_metrics",
+                "_selector_train_update_count",
+                "_selector_rollout_update_count",
             ]
         )
         return excluded
@@ -467,6 +484,38 @@ class IntegratedIntentSelectorPPO(PPO):
         except Exception:
             return False
 
+    @staticmethod
+    def _selector_template_metric_key(template_id: Any) -> str:
+        raw = str(template_id or "").strip()
+        if not raw:
+            return "unknown"
+        key = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
+        return key or "unknown"
+
+    @staticmethod
+    def _selector_is_template_metric(metric_key: str) -> bool:
+        return metric_key.startswith("intent/selector_samples_by_template/") or (
+            "/by_template/" in metric_key
+        )
+
+    def _selector_get_current_template_context(self, env_idx: int) -> tuple[str, bool]:
+        vec_env = self.get_env()
+        if vec_env is None or not hasattr(vec_env, "env_method"):
+            return "", False
+        try:
+            values = vec_env.env_method(
+                "get_start_template_context",
+                indices=[int(env_idx)],
+            )
+            if not values:
+                return "", False
+            context = values[0]
+            if isinstance(context, (tuple, list)) and len(context) >= 2:
+                return str(context[0] or ""), bool(context[1])
+        except Exception:
+            pass
+        return "", False
+
     def _selector_apply_selected_intent(
         self, obs_payload: dict[str, Any], env_idx: int, intent_index: int
     ) -> None:
@@ -647,6 +696,9 @@ class IntegratedIntentSelectorPPO(PPO):
         selector_obs = self._selector_neutralize_observation(start_obs)
         if alpha > 0.0 and np.random.random() < alpha:
             try:
+                start_template_id, start_template_mirrored = (
+                    self._selector_get_current_template_context(env_idx)
+                )
                 with torch.no_grad():
                     logits, values = self.policy.get_intent_selector_outputs(selector_obs)
                     selector_probs = torch.softmax(logits, dim=-1)
@@ -675,6 +727,8 @@ class IntegratedIntentSelectorPPO(PPO):
                 "selector_eps": float(selector_eps),
                 "old_log_prob": float(old_log_prob),
                 "old_value": float(old_value),
+                "start_template_id": str(start_template_id or ""),
+                "start_template_mirrored": bool(start_template_mirrored),
             }
             return prepared
 
@@ -1105,6 +1159,7 @@ class IntegratedIntentSelectorPPO(PPO):
         self._train_intent_selector()
 
     def _train_intent_selector(self) -> None:
+        self._selector_rollout_update_count += 1
         if (
             not self.intent_selector_enabled
             or not self._policy_has_intent_selector()
@@ -1112,8 +1167,21 @@ class IntegratedIntentSelectorPPO(PPO):
         ):
             return
 
+        if (
+            self.intent_selector_train_every_rollouts > 1
+            and (self._selector_rollout_update_count % self.intent_selector_train_every_rollouts) != 0
+        ):
+            return
+
         samples = list(self._selector_completed_samples)
         self._selector_completed_samples = []
+
+        max_samples = int(self.intent_selector_max_samples_per_update)
+        if max_samples > 0 and len(samples) > max_samples:
+            sample_indices = np.random.choice(len(samples), size=max_samples, replace=False)
+            sample_indices = np.asarray(sample_indices, dtype=np.int64)
+            sample_indices.sort()
+            samples = [samples[int(idx)] for idx in sample_indices.tolist()]
 
         selector_obs_batch = self._selector_stack_single_observations(
             [sample["selector_obs"] for sample in samples]
@@ -1235,6 +1303,12 @@ class IntegratedIntentSelectorPPO(PPO):
         mean_probs_raw_np = (
             mean_probs_raw.detach().cpu().numpy().astype(np.float64, copy=False)
         )
+        prob_by_sample_np = (
+            prob_tensor.detach().cpu().numpy().astype(np.float64, copy=False)
+        )
+        prob_raw_by_sample_np = (
+            selector_prob_tensor.detach().cpu().numpy().astype(np.float64, copy=False)
+        )
         top1_np = (
             torch.argmax(selector_prob_tensor, dim=-1)
             .detach()
@@ -1278,9 +1352,27 @@ class IntegratedIntentSelectorPPO(PPO):
             ).detach().cpu().numpy().astype(np.float64, copy=False)
         else:
             margin_raw_np = max_prob_raw_np.copy()
+        template_ids_np = np.asarray(
+            [str(sample.get("start_template_id", "") or "") for sample in samples],
+            dtype=object,
+        )
+
+        self._selector_train_update_count += 1
+        should_log_template_metrics = (
+            self.intent_selector_template_metrics_log_every_rollouts <= 1
+            or (
+                self._selector_train_update_count
+                % self.intent_selector_template_metrics_log_every_rollouts
+            )
+            == 0
+        )
 
         metrics: dict[str, float] = {
-            **self._selector_last_metrics,
+            **{
+                key: value
+                for key, value in self._selector_last_metrics.items()
+                if not self._selector_is_template_metric(key)
+            },
             "intent/selector_alpha_current": float(self._selector_alpha_current()),
             "intent/selector_eps_current": float(self._selector_eps_current()),
             "intent/selector_eps_sample_mean": float(np.mean(selector_eps_np)),
@@ -1343,6 +1435,70 @@ class IntegratedIntentSelectorPPO(PPO):
                 metrics[f"intent/selector_return_by_intent/{z}"] = float(
                     np.mean(returns_np[selected_mask])
                 )
+
+        if should_log_template_metrics:
+            unique_template_ids = sorted(
+                {
+                    str(template_id).strip()
+                    for template_id in template_ids_np.tolist()
+                    if str(template_id).strip()
+                }
+            )
+            for template_id in unique_template_ids:
+                metric_key = self._selector_template_metric_key(template_id)
+                template_mask = template_ids_np == template_id
+                template_count = int(np.sum(template_mask))
+                if template_count <= 0:
+                    continue
+                template_usage_counts = np.bincount(
+                    chosen_z_np[template_mask],
+                    minlength=self.intent_selector_num_intents,
+                ).astype(np.float64)
+                template_usage_probs = template_usage_counts / max(
+                    1.0, float(np.sum(template_usage_counts))
+                )
+                template_nonzero = template_usage_probs > 0.0
+                template_usage_entropy = float(
+                    -np.sum(
+                        template_usage_probs[template_nonzero]
+                        * np.log(template_usage_probs[template_nonzero])
+                    )
+                )
+                template_prob_mean = np.mean(prob_by_sample_np[template_mask], axis=0)
+                template_prob_raw_mean = np.mean(
+                    prob_raw_by_sample_np[template_mask], axis=0
+                )
+                template_top1_counts = np.bincount(
+                    top1_np[template_mask],
+                    minlength=self.intent_selector_num_intents,
+                ).astype(np.float64)
+                template_top1_probs = template_top1_counts / max(
+                    1.0, float(np.sum(template_top1_counts))
+                )
+                metrics[f"intent/selector_samples_by_template/{metric_key}"] = float(
+                    template_count
+                )
+                metrics[
+                    f"intent/selector_usage_entropy_by_template/{metric_key}"
+                ] = float(template_usage_entropy)
+                for z in range(self.intent_selector_num_intents):
+                    metrics[
+                        f"intent/selector_usage_by_template/{metric_key}/{z}"
+                    ] = float(template_usage_probs[z])
+                    metrics[
+                        f"intent/selector_prob_mean_by_template/{metric_key}/{z}"
+                    ] = float(template_prob_mean[z])
+                    metrics[
+                        f"intent/selector_prob_raw_mean_by_template/{metric_key}/{z}"
+                    ] = float(template_prob_raw_mean[z])
+                    metrics[
+                        f"intent/selector_top1_by_template/{metric_key}/{z}"
+                    ] = float(template_top1_probs[z])
+                    template_selected_mask = template_mask & (chosen_z_np == z)
+                    if np.any(template_selected_mask):
+                        metrics[
+                            f"intent/selector_return_by_template/{metric_key}/{z}"
+                        ] = float(np.mean(returns_np[template_selected_mask]))
 
         segment_bucket_order = ["0", "1", "2", "3_plus"]
         for bucket in segment_bucket_order:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import csv
 import glob
@@ -43,10 +44,13 @@ from basketworld.utils.intent_discovery import (
     CompletedIntentEpisode,
     IntentDiscriminator,
     IntentEpisodeBuffer,
+    IntentStepExample,
     IntentTransition,
     build_padded_episode_batch,
+    build_step_observation_batch,
     compute_episode_embeddings,
     extract_action_features_for_env,
+    extract_set_observation_for_env,
     flatten_observation_for_env,
     load_intent_discriminator_from_checkpoint,
 )
@@ -62,14 +66,31 @@ from basketworld.utils.intent_pca import (
 )
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.mlflow_params import get_mlflow_params
+from basketworld.utils.mlflow_params import get_mlflow_start_template_library
 from basketworld.utils.mlflow_params import get_mlflow_training_params
 from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
+from basketworld.utils.start_templates import load_start_template_library
 from train.config import get_args
 from train.env_factory import setup_environment
 
 _PCA_WORKER_STATE = {}
+_TEMP_TEMPLATE_PATHS: list[str] = []
+
+
+def _cleanup_temp_template_paths() -> None:
+    while _TEMP_TEMPLATE_PATHS:
+        path = _TEMP_TEMPLATE_PATHS.pop()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+
+atexit.register(_cleanup_temp_template_paths)
 
 
 def _policy_has_intent_selector(model: PPO) -> bool:
@@ -782,6 +803,22 @@ def _apply_run_params(args, required: dict, optional: dict) -> None:
         args.offensive_three_seconds = optional["offensive_three_seconds_enabled"]
 
 
+def _materialize_start_template_library(library: dict, run_id: str) -> str:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix=f"intent_pca_start_templates_{run_id}_",
+        delete=False,
+    )
+    try:
+        json.dump(library, handle)
+        handle.flush()
+    finally:
+        handle.close()
+    _TEMP_TEMPLATE_PATHS.append(handle.name)
+    return handle.name
+
+
 def _build_env_args(run_id: str | None, model: PPO) -> argparse.Namespace:
     args = get_args([])
     if run_id is not None:
@@ -789,11 +826,84 @@ def _build_env_args(run_id: str | None, model: PPO) -> argparse.Namespace:
         required, optional = get_mlflow_params(client, run_id)
         training_params = get_mlflow_training_params(client, run_id)
         _apply_run_params(args, required, {**optional, **training_params})
+        if bool(getattr(args, "start_template_enabled", False)):
+            library = get_mlflow_start_template_library(client, run_id)
+            if library is not None:
+                args.start_template_library = _materialize_start_template_library(
+                    library, run_id
+                )
     args.use_set_obs = _policy_uses_set_obs(model)
     args.enable_env_profiling = False
     if not bool(args.use_set_obs):
         args.mirror_episode_prob = 0.0
     return args
+
+
+def _restrict_env_args_to_start_template(
+    env_args: argparse.Namespace,
+    *,
+    run_id: str | None,
+    template_id: str | None,
+    mirror_mode: str,
+    jitter_scale_override: float | None,
+) -> None:
+    selected_template_id = str(template_id or "").strip()
+    selected_mirror_mode = str(mirror_mode or "training_match").strip().lower()
+    if (
+        not selected_template_id
+        and selected_mirror_mode == "training_match"
+        and jitter_scale_override is None
+    ):
+        return
+
+    template_path = getattr(env_args, "start_template_library", None)
+    if not template_path:
+        raise RuntimeError(
+            "t-SNE start-template overrides require the analyzed run to expose a start-template library."
+        )
+
+    library = load_start_template_library(
+        template_path,
+        players_per_side=int(getattr(env_args, "players", 3)),
+    )
+
+    if selected_template_id:
+        matching_templates = [
+            dict(template)
+            for template in list(library.get("templates") or [])
+            if str(template.get("id", "")).strip() == selected_template_id
+        ]
+        if not matching_templates:
+            available = ", ".join(
+                sorted(str(template.get("id", "")).strip() for template in library.get("templates", []))
+            )
+            raise RuntimeError(
+                f"Unknown start template id '{selected_template_id}'. Available: {available}"
+            )
+        library = {
+            **dict(library),
+            "templates": matching_templates,
+        }
+
+    env_args.start_template_enabled = True
+    env_args.start_template_prob = 1.0
+    env_args.start_template_strict = True
+    if jitter_scale_override is not None:
+        env_args.start_template_jitter_scale = float(
+            max(0.0, float(jitter_scale_override))
+        )
+    if selected_mirror_mode == "yes":
+        env_args.start_template_mirror_prob = 1.0
+    elif selected_mirror_mode == "no":
+        env_args.start_template_mirror_prob = 0.0
+    elif selected_mirror_mode != "training_match":
+        raise RuntimeError(
+            f"Unsupported start-template mirror mode: {mirror_mode!r}"
+        )
+    env_args.start_template_library = _materialize_start_template_library(
+        library,
+        run_id or "adhoc",
+    )
 
 
 def _make_offense_env_fn(
@@ -1034,12 +1144,24 @@ def _build_transition_single_obs(
     max_action_dim: int,
     rollout_step_idx: int,
     feature_override: np.ndarray | None = None,
+    intent_active_override: bool | None = None,
+    intent_index_override: int | None = None,
 ) -> IntentTransition:
     if feature_override is not None:
         batched_obs = _single_obs_to_batched(obs)
         role_flag = _extract_obs_scalar(batched_obs, "role_flag", 0, default=0.0)
-        intent_active = _extract_obs_scalar(batched_obs, "intent_active", 0, default=0.0)
-        intent_index = _extract_obs_scalar(batched_obs, "intent_index", 0, default=0.0)
+        if intent_active_override is None:
+            intent_active = _extract_obs_scalar(
+                batched_obs, "intent_active", 0, default=0.0
+            )
+        else:
+            intent_active = 1.0 if bool(intent_active_override) else 0.0
+        if intent_index_override is None:
+            intent_index = _extract_obs_scalar(
+                batched_obs, "intent_index", 0, default=0.0
+            )
+        else:
+            intent_index = float(max(0, int(intent_index_override)))
         return IntentTransition(
             feature=np.asarray(feature_override, dtype=np.float32).reshape(-1),
             buffer_step_idx=int(rollout_step_idx),
@@ -1050,14 +1172,72 @@ def _build_transition_single_obs(
         )
     batched_obs = _single_obs_to_batched(obs)
     batched_actions = np.asarray(training_action, dtype=np.int64).reshape(1, -1)
+    info_overrides = {}
+    if intent_active_override is not None:
+        info_overrides["intent_active"] = 1.0 if bool(intent_active_override) else 0.0
+    if intent_index_override is not None:
+        info_overrides["intent_index"] = int(max(0, int(intent_index_override)))
     return _build_transition(
         batched_obs,
         batched_actions,
-        {},
+        info_overrides,
         max_obs_dim=max_obs_dim,
         max_action_dim=max_action_dim,
         rollout_step_idx=rollout_step_idx,
         env_idx=0,
+    )
+
+
+def _build_step_example_single_obs(
+    obs: dict,
+    info: dict,
+    *,
+    rollout_step_idx: int,
+    intent_active_override: bool | None = None,
+    intent_index_override: int | None = None,
+) -> IntentStepExample | None:
+    batched_obs = _single_obs_to_batched(obs)
+    obs_dict = extract_set_observation_for_env(batched_obs, 0)
+    if obs_dict is None:
+        return None
+    role_flag = _extract_obs_scalar(batched_obs, "role_flag", 0, default=0.0)
+    if intent_active_override is None:
+        intent_active = _extract_obs_scalar(batched_obs, "intent_active", 0, default=0.0)
+    else:
+        intent_active = 1.0 if bool(intent_active_override) else 0.0
+    if intent_index_override is None:
+        intent_index = _extract_obs_scalar(batched_obs, "intent_index", 0, default=0.0)
+    else:
+        intent_index = float(max(0, int(intent_index_override)))
+
+    shot_end = 0.0
+    shot_quality = 0.0
+    shot_quality_mask = 0.0
+    try:
+        action_results = info.get("action_results", {}) if isinstance(info, dict) else {}
+        shots = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+        if isinstance(shots, dict) and len(shots) > 0:
+            shot_end = 1.0
+            for shot_result in shots.values():
+                if isinstance(shot_result, dict) and "expected_points" in shot_result:
+                    shot_quality = float(shot_result.get("expected_points", 0.0) or 0.0)
+                    shot_quality_mask = 1.0
+                    break
+    except Exception:
+        pass
+
+    return IntentStepExample(
+        obs=obs_dict,
+        buffer_step_idx=int(rollout_step_idx),
+        env_idx=0,
+        role_flag=float(role_flag),
+        intent_active=bool(intent_active > 0.5),
+        intent_index=int(max(0, int(intent_index))),
+        training_team=str((info or {}).get("training_team", "") or ""),
+        boundary_reason=str((info or {}).get("intent_segment_boundary_reason", "") or ""),
+        shot_end=float(shot_end),
+        shot_quality=float(shot_quality),
+        shot_quality_mask=float(shot_quality_mask),
     )
 
 
@@ -1104,6 +1284,20 @@ def _make_episode_metadata(
         ),
         "assist_full": float(episode_info.get("assists", 0.0)),
         "team_reward_offense": float(episode_info.get("r", 0.0)),
+        "start_template_used": bool(episode_info.get("start_template_used", False)),
+        "start_template_id": (
+            None
+            if episode_info.get("start_template_id") in (None, "")
+            else str(episode_info.get("start_template_id"))
+        ),
+        "start_template_mirrored": bool(
+            episode_info.get("start_template_mirrored", False)
+        ),
+        "start_template_fallback_reason": (
+            None
+            if episode_info.get("start_template_fallback_reason") in (None, "")
+            else str(episode_info.get("start_template_fallback_reason"))
+        ),
     }
 
 
@@ -1124,6 +1318,7 @@ def _init_intent_pca_worker(
     unified_policy_path: str,
     device: str,
     feature_mode: str,
+    debug_collector: bool = False,
     progress_queue=None,
 ):
     global _PCA_WORKER_STATE
@@ -1162,6 +1357,7 @@ def _init_intent_pca_worker(
         "unified_policy": unified_policy,
         "ensure_set_obs": _obs_ensure_set_obs,
         "feature_mode": str(feature_mode),
+        "debug_collector": bool(debug_collector),
         "progress_queue": progress_queue,
     }
 
@@ -1179,6 +1375,7 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
         max_obs_dim,
         max_action_dim,
         collect_disc_episodes,
+        collect_disc_step_examples,
         disc_max_obs_dim,
         disc_max_action_dim,
     ) = args
@@ -1188,6 +1385,7 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
     unified_policy = state["unified_policy"]
     ensure_set_obs = state["ensure_set_obs"]
     feature_mode = str(state.get("feature_mode", "active_prefix_flat"))
+    debug_collector = bool(state.get("debug_collector", False))
     progress_queue = state.get("progress_queue")
     rng = np.random.default_rng(int(seed))
     deterministic_opponent = bool(opponent_deterministic)
@@ -1201,6 +1399,7 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
 
     episodes: list[CompletedIntentEpisode] = []
     disc_episodes: list[CompletedIntentEpisode] = []
+    disc_step_examples: list[IntentStepExample] = []
     metadata: list[dict] = []
     accepted_idx = 0
     env = setup_environment(env_args, Team.OFFENSE)
@@ -1214,7 +1413,14 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
     try:
         while accepted_idx < int(accepted_target):
             reset_seed = int(rng.integers(0, 2**31 - 1))
+            if debug_collector and accepted_idx == 0:
+                print(
+                    f"[IntentPCA][debug] reset start seed={reset_seed}",
+                    flush=True,
+                )
             obs, _ = wrapped_env.reset(seed=reset_seed)
+            if debug_collector and accepted_idx == 0:
+                print("[IntentPCA][debug] reset complete", flush=True)
             obs = ensure_set_obs(unified_policy, wrapped_env, obs)
             if isinstance(obs, dict):
                 obs["role_flag"] = np.array([1.0], dtype=np.float32)
@@ -1237,9 +1443,8 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                 continue
 
             transitions: list[IntentTransition] = []
-            disc_transitions: list[IntentTransition] | None = (
-                [] if bool(collect_disc_episodes) else None
-            )
+            disc_transitions: list[IntentTransition] | None = [] if bool(collect_disc_episodes) else None
+            use_disc_step_examples = bool(collect_disc_step_examples)
             counters = {
                 "pass_attempts": 0,
                 "pass_completions": 0,
@@ -1251,6 +1456,8 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
             final_info = {}
 
             while not done:
+                if debug_collector and accepted_idx == 0 and rollout_step_idx == 0:
+                    print("[IntentPCA][debug] first step predict start", flush=True)
                 raw_training_action, _ = unified_policy.predict(
                     obs, deterministic=bool(player_deterministic)
                 )
@@ -1258,10 +1465,25 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                     raw_training_action,
                     wrapped_env,
                 )
+                if debug_collector and accepted_idx == 0 and rollout_step_idx == 0:
+                    print("[IntentPCA][debug] first step env.step start", flush=True)
                 next_obs, _, terminated, truncated, info = wrapped_env.step(training_action)
+                if debug_collector and accepted_idx == 0 and rollout_step_idx == 0:
+                    print(
+                        f"[IntentPCA][debug] first step env.step complete terminated={terminated} truncated={truncated}",
+                        flush=True,
+                    )
                 next_obs = ensure_set_obs(unified_policy, wrapped_env, next_obs)
                 if isinstance(next_obs, dict):
                     next_obs["role_flag"] = np.array([1.0], dtype=np.float32)
+                current_intent_active = bool(
+                    getattr(wrapped_env.unwrapped, "intent_active", False)
+                )
+                current_intent_index = (
+                    int(getattr(wrapped_env.unwrapped, "intent_index", 0))
+                    if current_intent_active
+                    else 0
+                )
 
                 if disc_transitions is not None:
                     disc_transitions.append(
@@ -1271,8 +1493,20 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                             max_obs_dim=int(disc_max_obs_dim),
                             max_action_dim=int(disc_max_action_dim),
                             rollout_step_idx=rollout_step_idx,
+                            intent_active_override=current_intent_active,
+                            intent_index_override=current_intent_index,
                         )
                     )
+                    if use_disc_step_examples:
+                        disc_step_example = _build_step_example_single_obs(
+                            next_obs,
+                            info or {},
+                            rollout_step_idx=rollout_step_idx,
+                            intent_active_override=current_intent_active,
+                            intent_index_override=current_intent_index,
+                        )
+                        if disc_step_example is not None:
+                            disc_step_examples.append(disc_step_example)
 
                 if feature_mode in {
                     "set_attention_pool",
@@ -1300,6 +1534,8 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                             max_action_dim=int(max_action_dim),
                             rollout_step_idx=rollout_step_idx,
                             feature_override=feature_override,
+                            intent_active_override=current_intent_active,
+                            intent_index_override=current_intent_index,
                         )
                     )
                 else:
@@ -1310,6 +1546,8 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                             max_obs_dim=int(max_obs_dim),
                             max_action_dim=int(max_action_dim),
                             rollout_step_idx=rollout_step_idx,
+                            intent_active_override=current_intent_active,
+                            intent_index_override=current_intent_index,
                         )
                     )
 
@@ -1318,6 +1556,12 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
                 _update_pass_counters(counters, final_info.get("action_results", {}) or {})
                 rollout_step_idx += 1
                 done = bool(terminated or truncated)
+
+            if debug_collector and accepted_idx == 0:
+                print(
+                    f"[IntentPCA][debug] episode complete steps={rollout_step_idx}",
+                    flush=True,
+                )
 
             episode_label_intent_index = _episode_label_intent_index(
                 transitions,
@@ -1395,6 +1639,7 @@ def _run_intent_pca_batch_worker(args: tuple) -> dict:
     return {
         "episodes": episodes,
         "disc_episodes": disc_episodes if disc_episodes else None,
+        "disc_step_examples": disc_step_examples if disc_step_examples else None,
         "metadata": metadata,
     }
 
@@ -1416,8 +1661,10 @@ def _collect_episodes_parallel_workers(
     max_obs_dim: int,
     max_action_dim: int,
     collect_disc_episodes: bool,
+    collect_disc_step_examples: bool,
     disc_max_obs_dim: int,
     disc_max_action_dim: int,
+    debug_collector: bool,
     progress: tqdm,
 ) -> tuple[list[CompletedIntentEpisode], list[dict], list[CompletedIntentEpisode] | None]:
     num_workers = max(1, min(int(num_workers), int(num_episodes)))
@@ -1448,6 +1695,7 @@ def _collect_episodes_parallel_workers(
                 int(max_obs_dim),
                 int(max_action_dim),
                 bool(collect_disc_episodes),
+                bool(collect_disc_step_examples),
                 int(disc_max_obs_dim),
                 int(disc_max_action_dim),
             )
@@ -1458,6 +1706,7 @@ def _collect_episodes_parallel_workers(
     progress_queue = ctx.Queue()
     episodes: list[CompletedIntentEpisode] = []
     disc_episodes: list[CompletedIntentEpisode] = []
+    disc_step_examples: list[IntentStepExample] = []
     metadata: list[dict] = []
 
     with ProcessPoolExecutor(
@@ -1469,6 +1718,7 @@ def _collect_episodes_parallel_workers(
             str(policy_path),
             str(device),
             str(feature_mode),
+            bool(debug_collector),
             progress_queue,
         ),
     ) as executor:
@@ -1489,6 +1739,7 @@ def _collect_episodes_parallel_workers(
                 payload = future.result()
                 episodes.extend(payload.get("episodes", []) or [])
                 disc_episodes.extend(payload.get("disc_episodes", []) or [])
+                disc_step_examples.extend(payload.get("disc_step_examples", []) or [])
                 metadata.extend(payload.get("metadata", []) or [])
 
         while True:
@@ -1503,9 +1754,83 @@ def _collect_episodes_parallel_workers(
     if len(episodes) > int(num_episodes):
         episodes = episodes[: int(num_episodes)]
         metadata = metadata[: int(num_episodes)]
+    if collect_disc_step_examples and disc_step_examples:
+        return episodes, metadata, disc_step_examples[:]
     if disc_episodes:
         disc_episodes = disc_episodes[: int(num_episodes)]
         return episodes, metadata, disc_episodes
+    return episodes, metadata, None
+
+
+def _collect_episodes_inline(
+    *,
+    env_args: argparse.Namespace,
+    policy_path: str,
+    opponent_policy_paths: list[str],
+    num_episodes: int,
+    device: str,
+    feature_mode: str,
+    player_deterministic: bool,
+    opponent_deterministic: bool,
+    intent_source_mode: str,
+    illegal_strategy_name: str,
+    require_active_intent: bool,
+    max_obs_dim: int,
+    max_action_dim: int,
+    collect_disc_episodes: bool,
+    collect_disc_step_examples: bool,
+    disc_max_obs_dim: int,
+    disc_max_action_dim: int,
+    debug_collector: bool,
+    progress: tqdm,
+) -> tuple[list[CompletedIntentEpisode], list[dict], list[CompletedIntentEpisode] | None]:
+    class _InlineProgressQueue:
+        def __init__(self, progress_bar: tqdm):
+            self._progress = progress_bar
+
+        def put_nowait(self, value: int) -> None:
+            try:
+                inc = int(value)
+            except Exception:
+                return
+            if inc <= 0:
+                return
+            remaining = max(0, int(self._progress.total) - int(self._progress.n))
+            self._progress.update(min(inc, remaining))
+
+    batch = (
+        int(num_episodes),
+        0,
+        str(opponent_policy_paths[0] if opponent_policy_paths else policy_path),
+        str(intent_source_mode),
+        bool(require_active_intent),
+        bool(player_deterministic),
+        bool(opponent_deterministic),
+        str(illegal_strategy_name),
+        int(max_obs_dim),
+        int(max_action_dim),
+        bool(collect_disc_episodes),
+        bool(collect_disc_step_examples),
+        int(disc_max_obs_dim),
+        int(disc_max_action_dim),
+    )
+    _init_intent_pca_worker(
+        env_args,
+        str(policy_path),
+        str(device),
+        str(feature_mode),
+        bool(debug_collector),
+        progress_queue=_InlineProgressQueue(progress),
+    )
+    payload = _run_intent_pca_batch_worker(batch)
+    episodes = list(payload.get("episodes", []) or [])
+    metadata = list(payload.get("metadata", []) or [])
+    disc_step_examples = payload.get("disc_step_examples", None)
+    if collect_disc_step_examples and disc_step_examples:
+        return episodes, metadata, list(disc_step_examples)
+    disc_episodes = payload.get("disc_episodes", None)
+    if disc_episodes:
+        return episodes, metadata, list(disc_episodes)
     return episodes, metadata, None
 
 
@@ -1669,6 +1994,10 @@ def _write_embedding_points_csv(
             "episode_idx",
             "intent_index",
             "intent_active_start",
+            "start_template_used",
+            "start_template_id",
+            "start_template_mirrored",
+            "start_template_fallback_reason",
             "outcome",
             "shot_type",
             "episode_length",
@@ -1786,7 +2115,7 @@ def _select_discriminator_eval_episodes(
 
 
 def _compute_discriminator_predictions(
-    episodes,
+    examples,
     *,
     disc_bundle: tuple[IntentDiscriminator, dict],
     max_obs_dim: int,
@@ -1804,7 +2133,7 @@ def _compute_discriminator_predictions(
 
     if encoder_type == "gru":
         x_np, lengths_np, y_true = build_padded_episode_batch(
-            episodes,
+            examples,
             max_obs_dim=disc_max_obs_dim,
             max_action_dim=disc_max_action_dim,
         )
@@ -1812,9 +2141,25 @@ def _compute_discriminator_predictions(
         lengths_tensor = torch.as_tensor(lengths_np, dtype=torch.long, device=device)
         with torch.no_grad():
             logits = disc(x_tensor, lengths_tensor)
+    elif encoder_type == "set_step":
+        batch_np, y_true = build_step_observation_batch(examples)
+        if not batch_np:
+            return (
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0, 0), dtype=np.float32),
+                None,
+            )
+        batch_tensor = {
+            key: torch.as_tensor(value, dtype=torch.float32, device=device)
+            for key, value in batch_np.items()
+        }
+        lengths_np = None
+        with torch.no_grad():
+            logits = disc(batch_tensor, None)
     else:
         x_np, y_true = compute_episode_embeddings(
-            episodes,
+            examples,
             max_obs_dim=disc_max_obs_dim,
             max_action_dim=disc_max_action_dim,
         )
@@ -1981,6 +2326,23 @@ def main() -> int:
         help="Optional override for intent_null_prob during analysis (for cleaner sampling).",
     )
     parser.add_argument(
+        "--start-template-id",
+        default=None,
+        help="Optional template id to isolate during analysis. When set, analysis resets always use this template.",
+    )
+    parser.add_argument(
+        "--start-template-mirror",
+        choices=["training_match", "no", "yes"],
+        default="training_match",
+        help="Override mirror behavior for start-template analysis. training_match preserves the run setting.",
+    )
+    parser.add_argument(
+        "--start-template-jitter-scale-override",
+        type=float,
+        default=None,
+        help="Optional override for start-template jitter scale during analysis. Use 0.0 to probe a fixed anchor layout.",
+    )
+    parser.add_argument(
         "--max-obs-dim",
         type=int,
         default=256,
@@ -2027,6 +2389,11 @@ def main() -> int:
         action="store_true",
         help="Log plot/csv/json artifacts back to the run when a run ID is available.",
     )
+    parser.add_argument(
+        "--debug-collector",
+        action="store_true",
+        help="Print collector stage traces for debugging reset/rollout stalls.",
+    )
     args = parser.parse_args()
 
     setup_mlflow()
@@ -2068,7 +2435,18 @@ def main() -> int:
             f"hidden_dim={disc_cfg.get('hidden_dim', 'unknown')}",
             flush=True,
         )
+    disc_collect_step_examples = bool(
+        disc_bundle is not None
+        and str(((disc_bundle[1] or {}).get("config", {}) or {}).get("encoder_type", "mlp_mean")).strip().lower() == "set_step"
+    )
     env_args = _build_env_args(run_id, model)
+    _restrict_env_args_to_start_template(
+        env_args,
+        run_id=run_id,
+        template_id=args.start_template_id,
+        mirror_mode=str(args.start_template_mirror),
+        jitter_scale_override=args.start_template_jitter_scale_override,
+    )
     if args.override_intent_null_prob is not None:
         env_args.intent_null_prob = float(max(0.0, min(1.0, args.override_intent_null_prob)))
     requested_num_envs = max(1, int(args.num_envs))
@@ -2094,7 +2472,7 @@ def main() -> int:
         opponent_mode=str(args.opponent_mode),
         seed=int(args.seed),
     )
-    worker_mode = "eval_workers"
+    worker_mode = "inline" if requested_num_envs <= 1 else "eval_workers"
     resolved_intent_source = _resolve_intent_source_mode(
         str(args.intent_source), model, env_args
     )
@@ -2106,6 +2484,9 @@ def main() -> int:
         f"collector={worker_mode} "
         f"opponent_mode={opponent_meta.get('opponent_mode', str(args.opponent_mode))} "
         f"intent_source={resolved_intent_source} "
+        f"start_template_id={str(args.start_template_id or 'all')} "
+        f"start_template_mirror={str(args.start_template_mirror)} "
+        f"start_template_jitter_scale={float(getattr(env_args, 'start_template_jitter_scale', 1.0)):.3f} "
         f"player_deterministic={player_deterministic} "
         f"opponent_deterministic={opponent_deterministic} "
         f"require_active_intent={bool(getattr(args, 'require_active_intent', True))} "
@@ -2148,26 +2529,51 @@ def main() -> int:
             default_max_obs_dim=int(args.max_obs_dim),
             default_max_action_dim=int(args.max_action_dim),
         )
-        episodes, metadata, disc_eval_episodes = _collect_episodes_parallel_workers(
-            env_args=env_args,
-            policy_path=str(policy_path),
-            opponent_policy_paths=opponent_policy_paths,
-            num_episodes=int(args.episodes),
-            num_workers=requested_num_envs,
-            device=str(args.device),
-            feature_mode=str(args.feature_mode),
-            player_deterministic=bool(player_deterministic),
-            opponent_deterministic=bool(opponent_deterministic),
-            intent_source_mode=str(args.intent_source),
-            illegal_strategy_name=str(args.illegal_strategy),
-            require_active_intent=bool(getattr(args, "require_active_intent", True)),
-            max_obs_dim=int(args.max_obs_dim),
-            max_action_dim=int(args.max_action_dim),
-            collect_disc_episodes=disc_bundle is not None,
-            disc_max_obs_dim=int(disc_max_obs_dim),
-            disc_max_action_dim=int(disc_max_action_dim),
-            progress=progress,
-        )
+        if worker_mode == "inline":
+            episodes, metadata, disc_eval_episodes = _collect_episodes_inline(
+                env_args=env_args,
+                policy_path=str(policy_path),
+                opponent_policy_paths=opponent_policy_paths,
+                num_episodes=int(args.episodes),
+                device=str(args.device),
+                feature_mode=str(args.feature_mode),
+                player_deterministic=bool(player_deterministic),
+                opponent_deterministic=bool(opponent_deterministic),
+                intent_source_mode=str(args.intent_source),
+                illegal_strategy_name=str(args.illegal_strategy),
+                require_active_intent=bool(getattr(args, "require_active_intent", True)),
+                max_obs_dim=int(args.max_obs_dim),
+                max_action_dim=int(args.max_action_dim),
+                collect_disc_episodes=disc_bundle is not None,
+                collect_disc_step_examples=bool(disc_collect_step_examples),
+                disc_max_obs_dim=int(disc_max_obs_dim),
+                disc_max_action_dim=int(disc_max_action_dim),
+                debug_collector=bool(args.debug_collector),
+                progress=progress,
+            )
+        else:
+            episodes, metadata, disc_eval_episodes = _collect_episodes_parallel_workers(
+                env_args=env_args,
+                policy_path=str(policy_path),
+                opponent_policy_paths=opponent_policy_paths,
+                num_episodes=int(args.episodes),
+                num_workers=requested_num_envs,
+                device=str(args.device),
+                feature_mode=str(args.feature_mode),
+                player_deterministic=bool(player_deterministic),
+                opponent_deterministic=bool(opponent_deterministic),
+                intent_source_mode=str(args.intent_source),
+                illegal_strategy_name=str(args.illegal_strategy),
+                require_active_intent=bool(getattr(args, "require_active_intent", True)),
+                max_obs_dim=int(args.max_obs_dim),
+                max_action_dim=int(args.max_action_dim),
+                collect_disc_episodes=disc_bundle is not None,
+                collect_disc_step_examples=bool(disc_collect_step_examples),
+                disc_max_obs_dim=int(disc_max_obs_dim),
+                disc_max_action_dim=int(disc_max_action_dim),
+                debug_collector=bool(args.debug_collector),
+                progress=progress,
+            )
     finally:
         progress.close()
 
@@ -2298,6 +2704,18 @@ def main() -> int:
         "opponent_mode": opponent_meta.get("opponent_mode", str(args.opponent_mode)),
         "intent_source_requested": str(args.intent_source),
         "intent_source_resolved": resolved_intent_source,
+        "start_template_id": (
+            None if args.start_template_id in (None, "") else str(args.start_template_id)
+        ),
+        "start_template_mirror_mode": str(args.start_template_mirror),
+        "start_template_enabled": bool(getattr(env_args, "start_template_enabled", False)),
+        "start_template_prob": float(getattr(env_args, "start_template_prob", 0.0)),
+        "start_template_jitter_scale": float(
+            getattr(env_args, "start_template_jitter_scale", 1.0)
+        ),
+        "start_template_mirror_prob": float(
+            getattr(env_args, "start_template_mirror_prob", 0.0)
+        ),
         "player_deterministic": bool(player_deterministic),
         "opponent_deterministic": bool(opponent_deterministic),
         "use_set_obs": bool(getattr(env_args, "use_set_obs", False)),
@@ -2317,7 +2735,14 @@ def main() -> int:
         ),
         "discriminator_checkpoint_path": disc_path,
         "discriminator_eval_representation": (
-            "raw_step_features" if disc_bundle is not None else None
+            (
+                "set_step_obs_batch"
+                if disc_bundle is not None
+                and str(((disc_bundle[1] or {}).get("config", {}) or {}).get("encoder_type", "mlp_mean")).strip().lower() == "set_step"
+                else "raw_step_features"
+            )
+            if disc_bundle is not None
+            else None
         ),
         "opponent_sampling_meta": opponent_meta,
         "selector_applied_episodes": int(
@@ -2381,6 +2806,27 @@ def main() -> int:
                 max_obs_dim=disc_max_obs_dim,
                 max_action_dim=disc_max_action_dim,
             )
+            extra_disc_arrays = {}
+        elif disc_encoder_type == "set_step":
+            x_disc_np, y_save_np = build_step_observation_batch(selected_disc_eval_episodes)
+            lengths_save_np = None
+            extra_disc_arrays = {
+                "x_players": np.asarray(
+                    x_disc_np.get("players", np.zeros((0,), dtype=np.float32)),
+                    dtype=np.float32,
+                    copy=False,
+                ),
+                "x_globals": np.asarray(
+                    x_disc_np.get("globals", np.zeros((0,), dtype=np.float32)),
+                    dtype=np.float32,
+                    copy=False,
+                ),
+                "x_role_flag": np.asarray(
+                    x_disc_np.get("role_flag", np.zeros((0,), dtype=np.float32)),
+                    dtype=np.float32,
+                    copy=False,
+                ),
+            }
         else:
             x_disc_np, y_save_np = compute_episode_embeddings(
                 selected_disc_eval_episodes,
@@ -2388,9 +2834,14 @@ def main() -> int:
                 max_action_dim=disc_max_action_dim,
             )
             lengths_save_np = None
+            extra_disc_arrays = {}
         np.savez_compressed(
             pca_disc_eval_batch_path,
-            x=np.asarray(x_disc_np, copy=False),
+            x=(
+                np.asarray(x_disc_np, copy=False)
+                if disc_encoder_type != "set_step"
+                else np.asarray([], dtype=np.float32)
+            ),
             y=np.asarray(y_save_np, dtype=np.int64, copy=False),
             lengths=(
                 np.asarray(lengths_save_np, dtype=np.int64, copy=False)
@@ -2402,6 +2853,7 @@ def main() -> int:
             encoder_type=np.asarray([disc_encoder_type]),
             max_obs_dim=np.asarray([int(disc_max_obs_dim)], dtype=np.int64),
             max_action_dim=np.asarray([int(disc_max_action_dim)], dtype=np.int64),
+            **extra_disc_arrays,
         )
         disc_num_intents = int(
             ((disc_bundle[1] or {}).get("config", {}) or {}).get("num_intents", 0)

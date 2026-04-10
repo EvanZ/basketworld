@@ -383,6 +383,18 @@ def main(args):
                 getattr(args, "intent_selector_value_coef", 0.5),
             )
             mlflow.log_param(
+                "intent_selector_template_metrics_log_every_rollouts",
+                getattr(args, "intent_selector_template_metrics_log_every_rollouts", 8),
+            )
+            mlflow.log_param(
+                "intent_selector_train_every_rollouts",
+                getattr(args, "intent_selector_train_every_rollouts", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_max_samples_per_update",
+                getattr(args, "intent_selector_max_samples_per_update", 0),
+            )
+            mlflow.log_param(
                 "intent_selector_multiselect_enabled",
                 getattr(args, "intent_selector_multiselect_enabled", False),
             )
@@ -603,6 +615,19 @@ def main(args):
                 ),
                 intent_selector_value_coef=float(
                     getattr(args, "intent_selector_value_coef", 0.5)
+                ),
+                intent_selector_template_metrics_log_every_rollouts=int(
+                    getattr(
+                        args,
+                        "intent_selector_template_metrics_log_every_rollouts",
+                        8,
+                    )
+                ),
+                intent_selector_train_every_rollouts=int(
+                    getattr(args, "intent_selector_train_every_rollouts", 1)
+                ),
+                intent_selector_max_samples_per_update=int(
+                    getattr(args, "intent_selector_max_samples_per_update", 0)
                 ),
                 intent_selector_multiselect_enabled=bool(
                     getattr(args, "intent_selector_multiselect_enabled", False)

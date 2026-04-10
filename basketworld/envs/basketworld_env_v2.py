@@ -943,6 +943,10 @@ class HexagonBasketballEnv(gym.Env):
             dtype=np.float32,
         )
 
+    def get_start_template_context(self) -> tuple[str, bool]:
+        """Return current start-template provenance without wrapper attribute lookup."""
+        return str(self.start_template_id or ""), bool(self.start_template_mirrored)
+
     def patch_globals_with_intent_features(
         self, globals_vec: np.ndarray, observer_is_offense: bool
     ) -> np.ndarray:

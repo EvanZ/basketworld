@@ -14,6 +14,19 @@ Current architecture baseline:
 - low-level policy no longer consumes legacy numeric intent observation fields
 - nominal play names are live in backend/UI
 
+Critical current finding:
+
+- for the `set_step` discriminator, `shot_clock` and `pressure_exposure`
+  produced a strong shortcut
+- masking those two globals dropped saved-batch AUC from `0.6916` to `0.4850`
+- masking ball-identity features did **not** materially reduce AUC
+
+Immediate implication:
+
+- future discriminator-focused runs should disable those two globals in the
+  discriminator input path by default
+- discriminator AUC from older runs should be interpreted cautiously
+
 So the next questions are empirical:
 
 1. what signal is actually driving the discriminator?

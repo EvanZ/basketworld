@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 import numpy as np
 import torch
 import time
@@ -57,6 +58,8 @@ class GameState:
         self.mlflow_training_params: dict | None = None
         # Persisted start-template library artifact loaded from the MLflow run.
         self.mlflow_start_template_library: dict | None = None
+        self.start_template_library_source: str | None = None
+        self.start_template_library_path: str | None = None
         # Role flag encoding (for backward compatibility with old models)
         self.role_flag_offense: float = 1.0  # Default to new encoding
         self.role_flag_defense: float = -1.0  # Default to new encoding
@@ -413,8 +416,14 @@ def get_full_game_state(
         compute_policy_probabilities,
         _compute_q_values_for_player,
         _compute_state_values_from_obs,
+        rebuild_observation_from_env,
+        validate_policy_observation_schema,
     )
     from app.backend.selector_runtime import selector_ranked_intent_preferences
+    from basketworld.utils.intent_policy_sensitivity import (
+        clear_policy_runtime_intent_override,
+        sync_policy_runtime_intent_override_from_env,
+    )
 
     # Use FastAPI's jsonable_encoder for numpy-safe encoding
     custom_encoder = {
@@ -523,27 +532,77 @@ def get_full_game_state(
                 and obs_tokens.get("players") is not None
                 and obs_tokens.get("globals") is not None
             ):
-                players_np = np.asarray(obs_tokens["players"], dtype=np.float32)
-                globals_np = np.asarray(obs_tokens["globals"], dtype=np.float32)
-                device = next(extractor.parameters()).device
-                with torch.no_grad():
-                    players_t = torch.as_tensor(players_np, device=device).unsqueeze(0)
-                    globals_t = torch.as_tensor(globals_np, device=device).unsqueeze(0)
-                    g = globals_t.unsqueeze(1).expand(-1, players_t.size(1), -1)
-                    tokens = torch.cat([players_t, g], dim=-1)
-                    emb = extractor.token_mlp(tokens)
-                    cls_tokens = getattr(extractor, "cls_tokens", None)
-                    cls_tokens_list = None
-                    if cls_tokens is not None:
-                        cls_tokens_list = cls_tokens.detach().cpu().tolist()
-                        cls = cls_tokens.unsqueeze(0).expand(emb.size(0), -1, -1)
-                        emb = torch.cat([emb, cls], dim=1)
-                    _, attn_weights = extractor.attn(
-                        emb, emb, emb, need_weights=True, average_attn_weights=False
+                attn_obs = rebuild_observation_from_env(
+                    game_state.env,
+                    current_obs=game_state.obs if isinstance(game_state.obs, dict) else None,
+                )
+                attn_obs = validate_policy_observation_schema(
+                    game_state.unified_policy,
+                    game_state.env,
+                    attn_obs,
+                    policy_label="attention",
+                )
+                role_flag_arr = np.asarray(
+                    (attn_obs or {}).get("role_flag", [1.0]), dtype=np.float32
+                ).reshape(-1)
+                observer_is_offense = bool(float(role_flag_arr[0]) > 0.0)
+                intent_fields = {}
+                try:
+                    base_env = getattr(game_state.env, "unwrapped", game_state.env)
+                    intent_fields = base_env.get_intent_observation_fields(observer_is_offense)
+                except Exception:
+                    intent_fields = {}
+                try:
+                    attention_intent_index = int(
+                        max(
+                            0,
+                            float(np.asarray(intent_fields.get("intent_index", [0.0])).reshape(-1)[0]),
+                        )
                     )
-                    per_head = attn_weights[0].detach().cpu().numpy()
-                    avg_weights = per_head.mean(axis=0).tolist()
-                    per_head_weights = per_head.tolist()
+                    attention_intent_active = bool(
+                        float(np.asarray(intent_fields.get("intent_active", [0.0])).reshape(-1)[0]) > 0.5
+                    )
+                    attention_intent_visible = bool(
+                        float(np.asarray(intent_fields.get("intent_visible", [1.0])).reshape(-1)[0]) > 0.5
+                    )
+                except Exception:
+                    attention_intent_index = 0
+                    attention_intent_active = False
+                    attention_intent_visible = True
+                attention_intent_gate = bool(
+                    attention_intent_active and attention_intent_visible
+                )
+                device = next(extractor.parameters()).device
+                try:
+                    with torch.no_grad():
+                        sync_policy_runtime_intent_override_from_env(
+                            game_state.unified_policy,
+                            game_state.env,
+                            observer_is_offense=observer_is_offense,
+                        )
+                        obs_tensor = policy_obj.obs_to_tensor(attn_obs)[0]
+                        with (
+                            policy_obj.runtime_conditioning_context(obs_tensor)
+                            if hasattr(policy_obj, "runtime_conditioning_context")
+                            else nullcontext()
+                        ):
+                            attn_weights = extractor.compute_attention_weights(obs_tensor)
+                        per_head = attn_weights[0].detach().cpu().numpy()
+                        avg_weights = per_head.mean(axis=0).tolist()
+                        per_head_weights = per_head.tolist()
+                        players_np = (
+                            obs_tensor["players"][0].detach().cpu().numpy()
+                            if isinstance(obs_tensor, dict) and "players" in obs_tensor
+                            else np.asarray(obs_tokens["players"], dtype=np.float32)
+                        )
+                        cls_tokens = getattr(extractor, "cls_tokens", None)
+                        cls_tokens_list = (
+                            cls_tokens.detach().cpu().tolist()
+                            if cls_tokens is not None
+                            else None
+                        )
+                finally:
+                    clear_policy_runtime_intent_override(game_state.unified_policy)
                 labels = []
                 for pid in range(players_np.shape[0]):
                     if pid in (env.offense_ids or []):
@@ -567,6 +626,11 @@ def get_full_game_state(
                     "weights_heads": per_head_weights,
                     "labels": labels,
                     "heads": int(getattr(extractor.attn, "num_heads", 0)),
+                    "runtime_intent_index": int(attention_intent_index),
+                    "runtime_intent_active": bool(attention_intent_active),
+                    "runtime_intent_visible": bool(attention_intent_visible),
+                    "runtime_intent_gate": bool(attention_intent_gate),
+                    "observer_role": "offense" if observer_is_offense else "defense",
                 }
                 if cls_tokens_list is not None:
                     attention_payload["cls_tokens"] = cls_tokens_list
@@ -800,6 +864,12 @@ def get_full_game_state(
             )
             if getattr(game_state, "mlflow_start_template_library", None) is not None
             else None
+        ),
+        "start_template_library_source": getattr(
+            game_state, "start_template_library_source", None
+        ),
+        "start_template_library_path": getattr(
+            game_state, "start_template_library_path", None
         ),
         "mlflow_env_defaults": (
             dict(getattr(game_state, "mlflow_env_optional_defaults", {}) or {})

@@ -37,6 +37,26 @@ class ApplyStartTemplateRequest(BaseModel):
     seed: int | None = None
 
 
+class LoadStartTemplateLibraryRequest(BaseModel):
+    path: str
+
+
+class ImportStartTemplateLibraryRequest(BaseModel):
+    filename: str | None = None
+    contents: str
+
+
+class SetStartTemplateLibraryRequest(BaseModel):
+    library: dict
+    source: str | None = None
+    path: str | None = None
+
+
+class SaveStartTemplateLibraryRequest(BaseModel):
+    path: str
+    library: dict
+
+
 class ListPoliciesRequest(BaseModel):
     run_id: str
 

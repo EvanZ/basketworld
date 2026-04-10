@@ -189,6 +189,18 @@ const shotAccumulatorForBoard = computed(() => {
   if (shotChartTarget.value === 'team' || !shotChartTarget.value) {
     return shotAccumulator.value || {};
   }
+  if (String(shotChartTarget.value).startsWith('intent:')) {
+    const intentKey = String(shotChartTarget.value).slice('intent:'.length);
+    const stats = perIntentEvalStats.value?.[intentKey];
+    if (!stats || !stats.shot_chart) return shotAccumulator.value || {};
+    const converted = {};
+    for (const [key, vals] of Object.entries(stats.shot_chart || {})) {
+      if (!Array.isArray(vals) || vals.length < 2) continue;
+      const [att, mk] = vals;
+      converted[key] = [Number(att) || 0, Number(mk) || 0];
+    }
+    return converted;
+  }
   const pid = Number(shotChartTarget.value);
   const stats = perPlayerEvalStats.value?.[pid] || perPlayerEvalStats.value?.[String(pid)];
   if (!stats || !stats.shot_chart) return shotAccumulator.value || {};
@@ -331,6 +343,7 @@ const defaultTemplateAuthoringConfig = () => ({
 const evalConfig = ref(defaultEvalConfig());
 const templateConfig = ref(defaultTemplateAuthoringConfig());
 const perPlayerEvalStats = ref({});
+const perIntentEvalStats = ref({});
 const placementPassPreview = ref({});
 const isEvalPlacementMode = computed(() => evalConfig.value.mode === 'custom');
 const isTemplatePlacementMode = computed(() => activeControlsTab.value === 'template');
@@ -342,6 +355,24 @@ const shotChartOptions = computed(() => {
   if (Array.isArray(offenseIds)) {
     offenseIds.forEach((pid) => opts.push({ label: `Player ${pid}`, value: String(pid) }));
   }
+  Object.keys(perIntentEvalStats.value || {})
+    .sort((a, b) => {
+      if (a === 'none') return 1;
+      if (b === 'none') return -1;
+      return Number(a) - Number(b);
+    })
+    .forEach((intentKey) => {
+      if (intentKey === 'none') {
+        opts.push({ label: 'No intent', value: 'intent:none' });
+        return;
+      }
+      const idx = Number(intentKey);
+      if (!Number.isFinite(idx)) return;
+      opts.push({
+        label: formatPlayLabel(idx, gameState.value?.play_name_map),
+        value: `intent:${intentKey}`,
+      });
+    });
   return opts;
 });
 const hasShotChartData = computed(
@@ -1671,7 +1702,9 @@ async function handleEvaluation() {
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
+  perIntentEvalStats.value = {};
   
   // Reset stats at the beginning
   console.log('[App] Resetting stats before evaluation');
@@ -1750,6 +1783,7 @@ async function handleEvaluation() {
         evalDiagnostics.potential_assist_links_by_type,
       );
       perPlayerEvalStats.value = response.per_player_stats || {};
+      perIntentEvalStats.value = response.per_intent_stats || {};
       try {
         const totals = Object.values(perPlayerEvalStats.value || {}).reduce(
           (acc, row) => {
@@ -2167,7 +2201,9 @@ function handlePlayAgain() {
   currentStepIndex.value = 0;
   isReplayPaused.value = false;
   isEvaluating.value = false;
+  shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
+  perIntentEvalStats.value = {};
   evalNumEpisodes.value = 100;
   if (initialSetup.value) {
     if (initialSetup.value.mode === 'template_sandbox') {
@@ -2184,7 +2220,9 @@ function clearEvaluationArtifacts() {
   assistLinksByType.value = emptyAssistLinkTypeMap();
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
+  perIntentEvalStats.value = {};
   evalProgress.value = {
     running: false,
     completed: 0,
@@ -2474,6 +2512,7 @@ onBeforeUnmount(() => {
           :eval-num-episodes="evalNumEpisodes"
           :eval-progress="evalProgress"
           :per-player-eval-stats="perPlayerEvalStats"
+          :per-intent-eval-stats="perIntentEvalStats"
           :tabs-mount-el="tabsMountEl"
           :tabs-mount-selector="'#dev-bottom-tabs'"
           @actions-submitted="handleActionsSubmitted" 

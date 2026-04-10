@@ -856,6 +856,15 @@ class SelfPlayEnvWrapper(gym.Wrapper):
             pass
         return {}
 
+    def get_start_template_context(self):  # pragma: no cover - thin shim
+        try:
+            getter = getattr(self.env.unwrapped, "get_start_template_context", None)
+            if callable(getter):
+                return getter()
+        except Exception:
+            pass
+        return "", False
+
     def get_profile_stats(self):  # pragma: no cover - thin shim
         try:
             return self.env.unwrapped.get_profile_stats()

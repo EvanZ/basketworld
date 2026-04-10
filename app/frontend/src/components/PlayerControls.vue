@@ -7,13 +7,17 @@ import {
   getActionValues,
   getPlaybookProgress,
   getRewards,
+  importStartTemplateLibrary,
+  loadStartTemplateLibrary,
   mctsAdvise,
   runPlaybookAnalysis,
+  saveStartTemplateLibrary,
   setOffenseSkills,
   setPassTargetStrategy,
   setPassLogitBias,
   setBallHolder,
   setIntentState,
+  setStartTemplateLibrary,
   captureCounterfactualSnapshot,
   restoreCounterfactualSnapshot,
   replayCounterfactualSnapshot,
@@ -48,6 +52,14 @@ function formatPlayLabel(intentIndex, playNameMap, explicitName = null) {
     ? explicitName.trim()
     : lookupPlayName(playNameMap, idx);
   return name ? `${name} (z=${idx})` : `z=${idx}`;
+}
+
+function deepCloneJson(value, fallback = null) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
 }
 
 const props = defineProps({
@@ -155,6 +167,10 @@ const props = defineProps({
     default: null,
   },
   perPlayerEvalStats: {
+    type: Object,
+    default: null,
+  },
+  perIntentEvalStats: {
     type: Object,
     default: null,
   },
@@ -816,6 +832,156 @@ const defaultTemplateConfig = () => ({
   jitterByPlayer: {},
   roleByPlayer: {},
 });
+const playersPerSideForTemplates = computed(() => {
+  const raw = Number(props.gameState?.players_per_side ?? props.gameState?.players ?? 3);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 3;
+});
+
+function buildDefaultTemplateLibrary() {
+  return {
+    version: 1,
+    players_per_side: playersPerSideForTemplates.value,
+    templates: [],
+  };
+}
+
+function normalizeTemplateLibraryDraft(library) {
+  const source = library && typeof library === 'object' ? library : {};
+  const rawTemplates = Array.isArray(source.templates) ? source.templates : [];
+  return {
+    version: 1,
+    players_per_side: playersPerSideForTemplates.value,
+    templates: rawTemplates.map((template) => deepCloneJson(template, {})).filter(Boolean),
+  };
+}
+
+function buildTemplateLibrarySignature(library, source = '', path = '') {
+  return JSON.stringify({
+    library: normalizeTemplateLibraryDraft(library),
+    source: String(source || ''),
+    path: String(path || ''),
+  });
+}
+
+const templateLibraryDraft = ref(buildDefaultTemplateLibrary());
+const templateLibraryPathInput = ref('');
+const templateLibraryFileInput = ref(null);
+const templateLibraryImportedFilename = ref('');
+const templateLibraryStatus = ref('');
+const templateLibraryError = ref('');
+const templateLibraryDirty = ref(false);
+const templateLibraryRequestPending = ref(false);
+const selectedEditableTemplateId = ref('');
+let lastLoadedTemplateLibrarySignature = '';
+const templateLibrarySource = computed(() => String(props.gameState?.start_template_library_source || '').trim());
+const templateLibrarySessionPath = computed(() => String(props.gameState?.start_template_library_path || '').trim());
+const templateLibrarySessionSignature = computed(() =>
+  buildTemplateLibrarySignature(
+    props.gameState?.start_template_library || null,
+    templateLibrarySource.value,
+    templateLibrarySessionPath.value,
+  )
+);
+
+function clearTemplateLibraryFeedback() {
+  templateLibraryStatus.value = '';
+  templateLibraryError.value = '';
+}
+
+function uniqueTemplateId(baseId, excludeId = null) {
+  const seed = sanitizeTemplateId(baseId || 'new_template');
+  const existing = new Set(
+    (templateLibraryDraft.value?.templates || [])
+      .map((template) => String(template?.id || '').trim())
+      .filter((id) => id && id !== String(excludeId || '').trim())
+  );
+  if (!existing.has(seed)) return seed;
+  let idx = 2;
+  while (existing.has(`${seed}_${idx}`)) {
+    idx += 1;
+  }
+  return `${seed}_${idx}`;
+}
+
+const editableTemplateOptions = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      return id ? { value: id, label: id } : null;
+    })
+    .filter(Boolean);
+});
+
+const selectedEditableTemplateIndex = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  const wantedId = String(selectedEditableTemplateId.value || '').trim();
+  return templates.findIndex((template) => String(template?.id || '').trim() === wantedId);
+});
+
+const selectedEditableTemplate = computed(() => {
+  const idx = selectedEditableTemplateIndex.value;
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return idx >= 0 ? templates[idx] || null : null;
+});
+
+const hasEditableTemplateLibrary = computed(() => editableTemplateOptions.value.length > 0);
+const templateLibraryJsonExport = computed(() => JSON.stringify(templateLibraryDraft.value, null, 2));
+const templateLibrarySourceLabel = computed(() => {
+  if (templateLibrarySource.value === 'local_file') return 'Local file';
+  if (templateLibrarySource.value === 'file_upload') return 'Imported file';
+  if (templateLibrarySource.value === 'mlflow_artifact') return 'Run artifact';
+  if (templateLibrarySource.value === 'session_editor') return 'Session draft';
+  return 'Unsaved draft';
+});
+
+const suppressTemplateConfigBackfill = ref(false);
+
+function syncTemplateLibraryDraftFromState() {
+  const incomingLibrary = props.gameState?.start_template_library;
+  const normalized = normalizeTemplateLibraryDraft(
+    incomingLibrary && typeof incomingLibrary === 'object'
+      ? incomingLibrary
+      : buildDefaultTemplateLibrary()
+  );
+  templateLibraryDraft.value = normalized;
+  if (templateLibrarySource.value === 'file_upload') {
+    templateLibraryImportedFilename.value = templateLibrarySessionPath.value || '';
+  } else {
+    templateLibraryImportedFilename.value = '';
+  }
+  if (templateLibrarySessionPath.value && templateLibrarySource.value !== 'file_upload') {
+    templateLibraryPathInput.value = templateLibrarySessionPath.value;
+  } else if (!templateLibraryPathInput.value) {
+    templateLibraryPathInput.value = 'configs/start_templates_v1.json';
+  }
+  const validIds = new Set(
+    (normalized.templates || [])
+      .map((template) => String(template?.id || '').trim())
+      .filter(Boolean)
+  );
+  if (!validIds.has(selectedEditableTemplateId.value)) {
+    selectedEditableTemplateId.value = normalized.templates?.[0]?.id || '';
+  }
+  templateLibraryDirty.value = false;
+  clearTemplateLibraryFeedback();
+  lastLoadedTemplateLibrarySignature = templateLibrarySessionSignature.value;
+}
+
+watch(
+  templateLibrarySessionSignature,
+  (nextSignature) => {
+    if (!nextSignature || nextSignature === lastLoadedTemplateLibrarySignature) return;
+    syncTemplateLibraryDraftFromState();
+  },
+  { immediate: true }
+);
 
 const startTemplateOptions = computed(() => {
   const templates = Array.isArray(props.gameState?.start_template_library?.templates)
@@ -893,6 +1059,17 @@ function previewMirrorAnchor(anchor, courtHeight) {
   return [mirrored.q, mirrored.r];
 }
 
+function clampTemplateAnchorToCourt(anchor, courtWidth, courtHeight) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  const width = Math.max(1, Math.round(Number(courtWidth) || 0));
+  const height = Math.max(1, Math.round(Number(courtHeight) || 0));
+  const { col, row } = previewAxialToOffset(q, r);
+  const clampedCol = Math.max(0, Math.min(width - 1, Math.round(Number(col) || 0)));
+  const clampedRow = Math.max(0, Math.min(height - 1, Math.round(Number(row) || 0)));
+  const clamped = previewOffsetToAxial(clampedCol, clampedRow);
+  return [clamped.q, clamped.r];
+}
+
 function previewAxialToCartesian(anchor) {
   const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
   return {
@@ -938,7 +1115,11 @@ const startTemplatePreviewModel = computed(() => {
   for (const teamName of ['offense', 'defense']) {
     const teamEntries = Array.isArray(template?.[teamName]) ? template[teamName] : [];
     teamEntries.forEach((entry, idx) => {
-      const anchor = Array.isArray(entry?.anchor) ? [...entry.anchor] : [0, 0];
+      const anchor = clampTemplateAnchorToCourt(
+        Array.isArray(entry?.anchor) ? [...entry.anchor] : [0, 0],
+        courtWidth,
+        courtHeight,
+      );
       const effectiveAnchor = mirrored
         ? previewMirrorAnchor(anchor, courtHeight)
         : anchor;
@@ -1140,6 +1321,20 @@ function updateTemplatePlayerRole(playerId, value) {
   });
 }
 
+function updateTemplatePlayerAnchor(playerId, axisIndex, value) {
+  const positions = Array.isArray(templateConfigSafe.value.positions)
+    ? [...templateConfigSafe.value.positions]
+    : [];
+  const current = Array.isArray(positions[playerId]) ? [...positions[playerId]] : [0, 0];
+  current[axisIndex] = Math.round(Number(value) || 0);
+  positions[playerId] = clampTemplateAnchorToCourt(
+    current,
+    props.gameState?.court_width,
+    props.gameState?.court_height,
+  );
+  emitTemplateConfigUpdate({ positions });
+}
+
 function setTemplateId(value) {
   emitTemplateConfigUpdate({ templateId: sanitizeTemplateId(value) });
 }
@@ -1177,7 +1372,11 @@ const templatePlayerRows = computed(() => {
 function buildTemplateExportEntries(playerIds) {
   const positions = Array.isArray(templateConfigSafe.value.positions) ? templateConfigSafe.value.positions : [];
   return (playerIds || []).map((pid) => {
-    const pos = Array.isArray(positions[pid]) ? positions[pid] : [0, 0];
+    const pos = clampTemplateAnchorToCourt(
+      Array.isArray(positions[pid]) ? positions[pid] : [0, 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
     const entry = {
       anchor: [Number(pos[0]) || 0, Number(pos[1]) || 0],
       jitter_radius: Math.max(
@@ -1216,6 +1415,99 @@ const templateExportObject = computed(() => {
   return obj;
 });
 
+function loadTemplateIntoAuthoringConfig(template) {
+  if (!template) return;
+  const positions = deepCloneJson(props.gameState?.positions, []);
+  const offenseIds = templateOffenseIds.value || [];
+  const defenseIds = templateDefenseIds.value || [];
+  const jitterByPlayer = {};
+  const roleByPlayer = {};
+  let ballHolder = null;
+
+  template.offense?.forEach((entry, idx) => {
+    const pid = offenseIds[idx];
+    if (pid === undefined) return;
+    positions[pid] = clampTemplateAnchorToCourt(
+      [Number(entry?.anchor?.[0]) || 0, Number(entry?.anchor?.[1]) || 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
+    jitterByPlayer[pid] = Math.max(0, Number(entry?.jitter_radius ?? 0) || 0);
+    roleByPlayer[pid] = String(entry?.role || '');
+    if (entry?.has_ball) {
+      ballHolder = Number(pid);
+    }
+  });
+  template.defense?.forEach((entry, idx) => {
+    const pid = defenseIds[idx];
+    if (pid === undefined) return;
+    positions[pid] = clampTemplateAnchorToCourt(
+      [Number(entry?.anchor?.[0]) || 0, Number(entry?.anchor?.[1]) || 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
+    jitterByPlayer[pid] = Math.max(0, Number(entry?.jitter_radius ?? 0) || 0);
+    roleByPlayer[pid] = String(entry?.role || '');
+  });
+
+  suppressTemplateConfigBackfill.value = true;
+  emitTemplateConfigUpdate({
+    positions,
+    ballHolder,
+    templateId: String(template?.id || 'new_template'),
+    weight: Number(template?.weight ?? 1.0) || 1.0,
+    mirrorable: Boolean(template?.mirrorable),
+    shotClock: Math.max(1, Number(template?.shot_clock ?? 24) || 24),
+    jitterByPlayer,
+    roleByPlayer,
+  });
+  nextTick(() => {
+    suppressTemplateConfigBackfill.value = false;
+  });
+}
+
+function replaceSelectedDraftTemplate(nextTemplate, { markDirty = true } = {}) {
+  if (!nextTemplate || selectedEditableTemplateIndex.value < 0) return;
+  const normalized = deepCloneJson(nextTemplate, {});
+  if (!normalized || typeof normalized !== 'object') return;
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates]
+    : [];
+  nextTemplates.splice(selectedEditableTemplateIndex.value, 1, normalized);
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  const nextId = String(normalized.id || '').trim();
+  if (nextId) {
+    selectedEditableTemplateId.value = nextId;
+  }
+  if (markDirty) {
+    templateLibraryDirty.value = true;
+  }
+}
+
+watch(
+  selectedEditableTemplateId,
+  () => {
+    if (!selectedEditableTemplate.value) return;
+    loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+  }
+);
+
+watch(
+  templateExportObject,
+  (nextTemplate) => {
+    if (suppressTemplateConfigBackfill.value) return;
+    if (selectedEditableTemplateIndex.value < 0) return;
+    const selectedId = String(selectedEditableTemplateId.value || '').trim();
+    const authoringId = String(sanitizeTemplateId(templateConfigSafe.value.templateId) || '').trim();
+    if (selectedId && authoringId && selectedId !== authoringId) return;
+    replaceSelectedDraftTemplate(nextTemplate, { markDirty: true });
+  },
+  { deep: true }
+);
+
 function yamlScalar(value) {
   if (typeof value === 'number') return String(value);
   if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -1245,6 +1537,39 @@ function formatTemplateYaml(obj) {
   return lines.join('\n');
 }
 
+function formatTemplateLibraryYaml(library) {
+  const normalized = normalizeTemplateLibraryDraft(library);
+  const lines = [];
+  lines.push(`version: ${Number(normalized.version || 1)}`);
+  lines.push(`players_per_side: ${Number(normalized.players_per_side || playersPerSideForTemplates.value)}`);
+  lines.push('templates:');
+  for (const template of normalized.templates || []) {
+    const block = formatTemplateYaml(template).split('\n');
+    lines.push('  -');
+    block.forEach((line, idx) => {
+      if (idx === 0) {
+        lines.push(`    ${line}`);
+      } else {
+        lines.push(`    ${line}`);
+      }
+    });
+  }
+  return lines.join('\n');
+}
+
+function getTemplateLibrarySerializedPayload(filenameHint = '') {
+  const filename = String(filenameHint || '').trim().toLowerCase();
+  const library = normalizeTemplateLibraryDraft(templateLibraryDraft.value);
+  const useYaml = filename.endsWith('.yaml') || filename.endsWith('.yml');
+  return {
+    contents: useYaml
+      ? formatTemplateLibraryYaml(library)
+      : JSON.stringify(library, null, 2),
+    mimeType: useYaml ? 'text/yaml;charset=utf-8' : 'application/json;charset=utf-8',
+    extension: useYaml ? (filename.endsWith('.yml') ? '.yml' : '.yaml') : '.json',
+  };
+}
+
 const templateJsonExport = computed(() => JSON.stringify(templateExportObject.value, null, 2));
 const templateYamlExport = computed(() => formatTemplateYaml(templateExportObject.value));
 
@@ -1266,6 +1591,301 @@ async function copyTemplateExport(format) {
       templateCopyStatus.value = '';
     }
   }, 2000);
+}
+
+async function copyTemplateLibraryJson() {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(templateLibraryJsonExport.value);
+    } else {
+      throw new Error('Clipboard API unavailable');
+    }
+    templateCopyStatus.value = 'LIB copied';
+  } catch (err) {
+    console.error('[PlayerControls] Failed to copy template library export', err);
+    templateCopyStatus.value = 'Copy failed';
+  }
+  window.setTimeout(() => {
+    if (templateCopyStatus.value === 'LIB copied' || templateCopyStatus.value === 'Copy failed') {
+      templateCopyStatus.value = '';
+    }
+  }, 2000);
+}
+
+function addTemplateFromCurrentBoard() {
+  const nextTemplate = deepCloneJson(templateExportObject.value, {});
+  nextTemplate.id = uniqueTemplateId(nextTemplate.id || 'new_template');
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates, nextTemplate]
+    : [nextTemplate];
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = nextTemplate.id;
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Added ${nextTemplate.id} from current board.`;
+}
+
+function duplicateSelectedTemplate() {
+  const current = selectedEditableTemplate.value;
+  if (!current) return;
+  const copyTemplate = deepCloneJson(current, {});
+  copyTemplate.id = uniqueTemplateId(`${current.id}_copy`);
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates, copyTemplate]
+    : [copyTemplate];
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = copyTemplate.id;
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Duplicated ${current.id} to ${copyTemplate.id}.`;
+}
+
+function deleteSelectedTemplate() {
+  const current = selectedEditableTemplate.value;
+  if (!current) return;
+  const nextTemplates = (templateLibraryDraft.value?.templates || []).filter(
+    (template) => String(template?.id || '').trim() !== String(current.id || '').trim()
+  );
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = nextTemplates[0]?.id || '';
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Deleted ${current.id}.`;
+  if (selectedEditableTemplateId.value) {
+    nextTick(() => {
+      if (selectedEditableTemplate.value) {
+        loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+      }
+    });
+  }
+}
+
+async function handleLoadTemplateLibraryFile() {
+  clearTemplateLibraryFeedback();
+  const path = String(templateLibraryPathInput.value || '').trim();
+  if (!path) {
+    templateLibraryError.value = 'Provide a YAML or JSON template library path.';
+    return;
+  }
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await loadStartTemplateLibrary(path);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || buildDefaultTemplateLibrary());
+    templateLibraryPathInput.value = String(res?.path || path);
+    selectedEditableTemplateId.value = templateLibraryDraft.value.templates?.[0]?.id || '';
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      'local_file',
+      templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = `Loaded ${templateLibraryDraft.value.templates.length} templates from ${templateLibraryPathInput.value}.`;
+    if (selectedEditableTemplate.value) {
+      loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to load template library', err);
+    templateLibraryError.value = err?.message || 'Failed to load template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+function triggerTemplateLibraryChooser() {
+  clearTemplateLibraryFeedback();
+  templateLibraryFileInput.value?.click?.();
+}
+
+async function handleTemplateLibraryFileChosen(event) {
+  clearTemplateLibraryFeedback();
+  const file = event?.target?.files?.[0] || null;
+  if (!file) return;
+  templateLibraryRequestPending.value = true;
+  try {
+    const contents = await file.text();
+    const res = await importStartTemplateLibrary(file.name, contents);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || buildDefaultTemplateLibrary());
+    templateLibraryImportedFilename.value = String(res?.path || file.name || '');
+    selectedEditableTemplateId.value = templateLibraryDraft.value.templates?.[0]?.id || '';
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'file_upload',
+      templateLibraryImportedFilename.value,
+    );
+    templateLibraryStatus.value = `Imported ${templateLibraryDraft.value.templates.length} templates from ${file.name}.`;
+    if (selectedEditableTemplate.value) {
+      loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to import template library file', err);
+    templateLibraryError.value = err?.message || 'Failed to import template library.';
+  } finally {
+    if (event?.target) {
+      event.target.value = '';
+    }
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+async function handlePushTemplateLibraryDraft() {
+  clearTemplateLibraryFeedback();
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await setStartTemplateLibrary(
+      templateLibraryDraft.value,
+      'session_editor',
+      templateLibraryPathInput.value || null,
+    );
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || templateLibraryDraft.value);
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'session_editor',
+      res?.path || templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = 'Draft pushed into the active session library.';
+  } catch (err) {
+    console.error('[PlayerControls] Failed to push template library draft', err);
+    templateLibraryError.value = err?.message || 'Failed to update session template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+async function handleSaveTemplateLibraryFile() {
+  clearTemplateLibraryFeedback();
+  const path = String(templateLibraryPathInput.value || '').trim();
+  if (!path) {
+    templateLibraryError.value = 'Provide a file path before saving.';
+    return;
+  }
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await saveStartTemplateLibrary(path, templateLibraryDraft.value);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || templateLibraryDraft.value);
+    templateLibraryPathInput.value = String(res?.path || path);
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'local_file',
+      templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = `Saved template library to ${templateLibraryPathInput.value}.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to save template library', err);
+    templateLibraryError.value = err?.message || 'Failed to save template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+function handleReloadTemplateLibraryDraft() {
+  syncTemplateLibraryDraftFromState();
+  templateLibraryStatus.value = 'Reloaded the current session template library.';
+}
+
+function downloadTemplateLibraryFile(downloadName = '') {
+  clearTemplateLibraryFeedback();
+  try {
+    const filename = String(
+      downloadName
+      || templateLibraryPathInput.value
+      || templateLibraryImportedFilename.value
+      || ''
+    ).trim() || 'start_templates_library.json';
+    const suggestedName = /\.(ya?ml|json)$/i.test(filename)
+      ? filename.split('/').pop()
+      : `${filename}.json`;
+    const payload = getTemplateLibrarySerializedPayload(suggestedName);
+    const blob = new Blob([payload.contents], { type: payload.mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = suggestedName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    templateLibraryStatus.value = `Downloaded ${suggestedName}.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to download template library', err);
+    templateLibraryError.value = 'Failed to download template library.';
+  }
+}
+
+async function handleSaveTemplateLibraryChooser() {
+  clearTemplateLibraryFeedback();
+  try {
+    const validated = await setStartTemplateLibrary(
+      templateLibraryDraft.value,
+      'session_editor',
+      templateLibraryPathInput.value || null,
+    );
+    if (validated?.state) {
+      emit('state-updated', validated.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(validated?.library || templateLibraryDraft.value);
+    templateLibraryDirty.value = false;
+
+    const preferredName = String(
+      templateLibraryImportedFilename.value
+      || templateLibraryPathInput.value
+      || 'start_templates_library.json'
+    ).trim().split('/').pop() || 'start_templates_library.json';
+
+    if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+      const picker = await window.showSaveFilePicker({
+        suggestedName: preferredName,
+        types: [
+          {
+            description: 'Template libraries',
+            accept: {
+              'application/json': ['.json'],
+              'text/yaml': ['.yaml', '.yml'],
+            },
+          },
+        ],
+      });
+      const payload = getTemplateLibrarySerializedPayload(picker?.name || preferredName);
+      const writable = await picker.createWritable();
+      await writable.write(payload.contents);
+      await writable.close();
+      templateLibraryStatus.value = `Saved template library to ${picker?.name || preferredName}.`;
+      return;
+    }
+
+    downloadTemplateLibraryFile(preferredName);
+    templateLibraryStatus.value = `Browser save dialog unavailable; downloaded ${preferredName} instead.`;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      templateLibraryStatus.value = 'Save cancelled.';
+      return;
+    }
+    console.error('[PlayerControls] Failed to save template library with chooser', err);
+    templateLibraryError.value = err?.message || 'Failed to save template library.';
+  }
 }
 
 const evalEpisodesInput = ref(props.evalNumEpisodes || 100);
@@ -1747,6 +2367,41 @@ function getPlaybookShotStatsForPanel(panel) {
   });
 }
 
+const playbookOffenseColumnIds = computed(() => {
+  const ids = [];
+  const seen = new Set();
+  const pushId = (rawId) => {
+    const playerId = Number(rawId);
+    if (!Number.isFinite(playerId)) return;
+    const key = String(playerId);
+    if (seen.has(key)) return;
+    seen.add(key);
+    ids.push(playerId);
+  };
+
+  const liveOffenseIds = Array.isArray(props.gameState?.offense_ids) ? props.gameState.offense_ids : [];
+  liveOffenseIds.forEach(pushId);
+
+  const panels = Array.isArray(playbookResult.value?.panels) ? playbookResult.value.panels : [];
+  panels.forEach((panel) => {
+    getPlaybookShotStatsForPanel(panel).forEach((entry) => pushId(entry?.playerId));
+  });
+
+  return ids;
+});
+
+function formatPlaybookTotalShots(panel) {
+  const attempts = Number(panel?.shot_stats?.total?.attempts || 0);
+  const makes = Number(panel?.shot_stats?.total?.makes || 0);
+  return `${attempts} / ${makes}`;
+}
+
+function formatPlaybookPlayerShotCell(panel, playerId) {
+  const match = getPlaybookShotStatsForPanel(panel).find((entry) => Number(entry?.playerId) === Number(playerId));
+  if (!match) return '0 / 0';
+  return `${Number(match.attempts || 0)} / ${Number(match.makes || 0)}`;
+}
+
 function getPlaybookPrimaryShooterSummary(panel) {
   const raw = panel?.primary_shooter_distribution || {};
   const entries = Object.entries(raw)
@@ -1766,6 +2421,23 @@ function getPlaybookPrimaryShooterSummary(panel) {
   return entries
     .map((entry) => `P${entry.playerId} ${entry.count} (${(entry.rate * 100).toFixed(0)}%)`)
     .join(', ');
+}
+
+function formatPlaybookOutcomeSummary(panel) {
+  const raw = panel?.terminal_outcomes || {};
+  const entries = Object.entries(raw)
+    .map(([key, count]) => ({
+      key: String(key),
+      count: Number(count || 0),
+      label: formatPlaybookOutcomeKey(key),
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    });
+  if (!entries.length) return 'none';
+  return entries.map((entry) => `${entry.label}: ${entry.count}`).join(', ');
 }
 
 function formatPlaybookOutcomeKey(rawKey) {
@@ -1806,6 +2478,23 @@ function formatPlaybookTurnoverReason(rawKey) {
     default:
       return key.replaceAll('_', ' ');
   }
+}
+
+function formatPlaybookTurnoverSummary(panel) {
+  const raw = panel?.turnover_reasons || {};
+  const entries = Object.entries(raw)
+    .map(([key, count]) => ({
+      key: String(key),
+      count: Number(count || 0),
+      label: formatPlaybookTurnoverReason(key),
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    });
+  if (!entries.length) return 'none';
+  return entries.map((entry) => `${entry.label}: ${entry.count}`).join(', ');
 }
 
 async function handleRunPlaybookAnalysis() {
@@ -2470,6 +3159,45 @@ function aggregatePlayerStats(entries) {
   return base;
 }
 
+function getShotTypePair(shotTypes, key) {
+  const vals = shotTypes?.[key] || [0, 0];
+  return {
+    att: Number(vals[0] || 0),
+    mk: Number(vals[1] || 0),
+  };
+}
+
+function buildEvalAggregateRow(entry) {
+  const shotTypes = entry?.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] };
+  const assistByType = entry?.assist_full_by_type || {};
+  const dunk = getShotTypePair(shotTypes, 'dunk');
+  const two = getShotTypePair(shotTypes, 'two');
+  const three = getShotTypePair(shotTypes, 'three');
+  const attempts = Number(entry?.shots || 0);
+  const makes = Number(entry?.makes || 0);
+  const episodes = Number(entry?.episodes || 0);
+  const points = Number(entry?.points || 0);
+  return {
+    attempts,
+    makes,
+    fg: attempts > 0 ? (makes / attempts) * 100 : 0,
+    dunk,
+    two,
+    three,
+    assists: Number(entry?.assists || 0),
+    potentialAssists: Number(entry?.potential_assists || 0),
+    turnovers: Number(entry?.turnovers || 0),
+    points,
+    episodes,
+    ppp: episodes > 0 ? points / episodes : 0,
+    unassisted: {
+      dunk: Math.max(0, dunk.mk - Number(assistByType.dunk || 0)),
+      two: Math.max(0, two.mk - Number(assistByType.two || 0)),
+      three: Math.max(0, three.mk - Number(assistByType.three || 0)),
+    },
+  };
+}
+
 const selectedEvalStats = computed(() => {
   const stats = props.perPlayerEvalStats || {};
   const offenseIds = offensePlayerIdsForStats.value;
@@ -2507,37 +3235,41 @@ const offensePlayerStatsTable = computed(() => {
   if (!stats || offenseIds.length === 0) return [];
   return offenseIds.map((pid) => {
     const entry = stats[pid] || stats[String(pid)] || {};
-    const attemptSum = Number(entry.shots || 0);
-    const makeSum = Number(entry.makes || 0);
-    const shotTypes = entry.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] };
-    const getPair = (k) => {
-      const vals = shotTypes[k] || [0, 0];
-      return { att: Number(vals[0] || 0), mk: Number(vals[1] || 0) };
-    };
-    const dunk = getPair('dunk');
-    const two = getPair('two');
-    const three = getPair('three');
-    const un = entry.unassisted || {};
-    const af = entry.assist_full_by_type || {};
+    const row = buildEvalAggregateRow(entry);
     return {
       playerId: pid,
-      attempts: attemptSum,
-      makes: makeSum,
-      fg: attemptSum > 0 ? (makeSum / attemptSum) * 100 : 0,
-      dunk,
-      two,
-      three,
-      assists: Number(entry.assists || 0),
-      potentialAssists: Number(entry.potential_assists || 0),
-      turnovers: Number(entry.turnovers || 0),
-      points: Number(entry.points || 0),
-      unassisted: {
-        dunk: Math.max(0, dunk.mk - Number(af.dunk || 0)),
-        two: Math.max(0, two.mk - Number(af.two || 0)),
-        three: Math.max(0, three.mk - Number(af.three || 0)),
-      },
+      ...row,
     };
   });
+});
+
+const perIntentEvalStatsTable = computed(() => {
+  const stats = props.perIntentEvalStats || {};
+  const rows = Object.entries(stats)
+    .map(([intentKey, entry]) => {
+      const base = buildEvalAggregateRow(entry || {});
+      const idx = Number(intentKey);
+      return {
+        intentKey: String(intentKey),
+        label:
+          String(intentKey) === 'none'
+            ? 'No intent'
+            : (Number.isFinite(idx)
+              ? formatPlayLabel(idx, props.gameState?.play_name_map)
+              : String(intentKey)),
+        ...base,
+      };
+    })
+    .filter((row) => row.episodes > 0 || row.attempts > 0 || row.points > 0);
+  rows.sort((a, b) => {
+    if (a.intentKey === 'none') return 1;
+    if (b.intentKey === 'none') return -1;
+    const ai = Number(a.intentKey);
+    const bi = Number(b.intentKey);
+    if (Number.isFinite(ai) && Number.isFinite(bi)) return ai - bi;
+    return a.label.localeCompare(b.label);
+  });
+  return rows;
 });
 
 const CHART_HEX_RADIUS = 12;
@@ -4339,6 +5071,30 @@ const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
 const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
 const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
 const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
+const tokenAttentionRuntimeIntentIndex = computed(() => {
+  const value = tokenAttention.value?.runtime_intent_index;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+});
+const tokenAttentionRuntimeIntentGate = computed(() => Boolean(tokenAttention.value?.runtime_intent_gate));
+const tokenAttentionRuntimeIntentActive = computed(() => Boolean(tokenAttention.value?.runtime_intent_active));
+const tokenAttentionRuntimeIntentVisible = computed(() => Boolean(tokenAttention.value?.runtime_intent_visible));
+const tokenAttentionObserverRole = computed(() => String(tokenAttention.value?.observer_role || ''));
+const tokenAttentionRuntimeSummary = computed(() => {
+  if (!tokenAttention.value) return '';
+  const parts = [];
+  if (tokenAttentionObserverRole.value) {
+    parts.push(`Observer: ${tokenAttentionObserverRole.value}`);
+  }
+  if (tokenAttentionRuntimeIntentIndex.value !== null) {
+    parts.push(
+      `Intent: ${formatPlayLabel(tokenAttentionRuntimeIntentIndex.value, props.gameState?.play_name_map)}`
+    );
+  }
+  parts.push(`Gate: ${tokenAttentionRuntimeIntentGate.value ? 'on' : 'off'}`);
+  parts.push(`Active: ${tokenAttentionRuntimeIntentActive.value ? 'yes' : 'no'}`);
+  parts.push(`Visible: ${tokenAttentionRuntimeIntentVisible.value ? 'yes' : 'no'}`);
+  return parts.join(' · ');
+});
 const attentionView = ref('avg');
 const attentionHeadOptions = computed(() => {
   const count = tokenAttentionHeads.value || 0;
@@ -4906,6 +5662,44 @@ const stealRisks = computed(() => {
           </tbody>
         </table>
       </div>
+      <div v-if="perIntentEvalStatsTable.length" class="per-player-stats">
+        <h4>Per-Intent Offense Stats (Eval)</h4>
+        <div class="status-note">
+          The board shot-chart dropdown above the court now includes these intent labels.
+        </div>
+        <table class="per-player-table">
+          <thead>
+            <tr>
+              <th>Play</th>
+              <th>Episodes</th>
+              <th>FG</th>
+              <th>Dunk</th>
+              <th>2PT</th>
+              <th>3PT</th>
+              <th>Assists</th>
+              <th>Pot. Ast</th>
+              <th>TOV</th>
+              <th>Points</th>
+              <th>PPP</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in perIntentEvalStatsTable" :key="`intent-stat-${row.intentKey}`">
+              <td>{{ row.label }}</td>
+              <td>{{ row.episodes }}</td>
+              <td>{{ row.makes }}/{{ row.attempts }} ({{ row.fg.toFixed(1) }}%)</td>
+              <td>{{ row.dunk.mk }}/{{ row.dunk.att }} ({{ row.unassisted.dunk }})</td>
+              <td>{{ row.two.mk }}/{{ row.two.att }} ({{ row.unassisted.two }})</td>
+              <td>{{ row.three.mk }}/{{ row.three.att }} ({{ row.unassisted.three }})</td>
+              <td>{{ row.assists }}</td>
+              <td>{{ row.potentialAssists }}</td>
+              <td>{{ row.turnovers }}</td>
+              <td>{{ row.points.toFixed(1) }}</td>
+              <td>{{ row.ppp.toFixed(2) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
       <div class="rewards-section">
         <h4>Episode Stats</h4>
         <div class="parameters-grid">
@@ -5398,68 +6192,52 @@ const stealRisks = computed(() => {
           {{ playbookResult.run_to_end ? 'full-possession rollouts' : `a ${playbookResult.max_steps}-step horizon` }}.
           Use the Playbook dropdown above the main board to inspect them.
         </div>
-        <div v-if="playbookResult?.panels?.length" class="playbook-debug-grid">
-          <div
-            v-for="panel in playbookResult.panels"
-            :key="`playbook-debug-${panel.intent_index}`"
-            class="playbook-debug-card"
-          >
-            <div class="playbook-debug-title">{{ formatPlayLabel(panel.intent_index, playbookResult?.play_name_map || props.gameState?.play_name_map, panel.play_name) }}</div>
-            <div class="playbook-debug-line">
-              Total shots:
-              <strong>{{ panel?.shot_stats?.total?.attempts ?? 0 }}</strong>
-              attempts /
-              <strong>{{ panel?.shot_stats?.total?.makes ?? 0 }}</strong>
-              makes
-            </div>
-            <div class="playbook-debug-line">
-              Shot rollout rate:
-              <strong>{{ ((Number(panel?.shot_rollout_rate || 0)) * 100).toFixed(0) }}%</strong>
-            </div>
-            <div class="playbook-debug-line">
-              Avg first shot step:
-              <strong>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</strong>
-            </div>
-            <div class="playbook-debug-line">
-              Avg terminated steps:
-              <strong>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</strong>
-            </div>
-            <div class="playbook-debug-line">
-              Primary shooter:
-              <strong>{{ getPlaybookPrimaryShooterSummary(panel) }}</strong>
-            </div>
-            <div
-              v-for="entry in getPlaybookShotStatsForPanel(panel)"
-              :key="`playbook-debug-${panel.intent_index}-p${entry.playerId}`"
-              class="playbook-debug-line"
-            >
-              P{{ entry.playerId }}:
-              <strong>{{ entry.attempts }}</strong>
-              attempts /
-              <strong>{{ entry.makes }}</strong>
-              makes
-            </div>
-            <div class="playbook-debug-subtitle">Terminal outcomes</div>
-            <div
-              v-for="(count, outcomeKey) in (panel?.terminal_outcomes || {})"
-              :key="`playbook-debug-${panel.intent_index}-outcome-${outcomeKey}`"
-              class="playbook-debug-line"
-            >
-              {{ formatPlaybookOutcomeKey(outcomeKey) }}:
-              <strong>{{ count }}</strong>
-            </div>
-            <template v-if="panel?.turnover_reasons && Object.keys(panel.turnover_reasons).length">
-              <div class="playbook-debug-subtitle">Turnover reasons</div>
-              <div
-                v-for="(count, reasonKey) in panel.turnover_reasons"
-                :key="`playbook-debug-${panel.intent_index}-turnover-${reasonKey}`"
-                class="playbook-debug-line"
+        <div v-if="playbookResult?.panels?.length" class="playbook-summary-table-wrap">
+          <table class="playbook-summary-table">
+            <thead>
+              <tr>
+                <th>Play</th>
+                <th>Rollouts</th>
+                <th>Total Shots</th>
+                <th>Shot Rollout Rate</th>
+                <th>Avg First Shot Step</th>
+                <th>Avg Terminated Steps</th>
+                <th>Primary Shooter</th>
+                <th
+                  v-for="playerId in playbookOffenseColumnIds"
+                  :key="`playbook-summary-head-p${playerId}`"
+                >
+                  P{{ playerId }} Shots
+                </th>
+                <th>Terminal Outcomes</th>
+                <th>Turnover Reasons</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="panel in playbookResult.panels"
+                :key="`playbook-debug-${panel.intent_index}`"
               >
-                {{ formatPlaybookTurnoverReason(reasonKey) }}:
-                <strong>{{ count }}</strong>
-              </div>
-            </template>
-          </div>
+                <td class="playbook-summary-play-cell">
+                  {{ formatPlayLabel(panel.intent_index, playbookResult?.play_name_map || props.gameState?.play_name_map, panel.play_name) }}
+                </td>
+                <td>{{ Number(panel?.num_rollouts || 0) }}</td>
+                <td>{{ formatPlaybookTotalShots(panel) }}</td>
+                <td>{{ ((Number(panel?.shot_rollout_rate || 0)) * 100).toFixed(0) }}%</td>
+                <td>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</td>
+                <td>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</td>
+                <td>{{ getPlaybookPrimaryShooterSummary(panel) }}</td>
+                <td
+                  v-for="playerId in playbookOffenseColumnIds"
+                  :key="`playbook-summary-${panel.intent_index}-p${playerId}`"
+                >
+                  {{ formatPlaybookPlayerShotCell(panel, playerId) }}
+                </td>
+                <td>{{ formatPlaybookOutcomeSummary(panel) }}</td>
+                <td>{{ formatPlaybookTurnoverSummary(panel) }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -5525,100 +6303,356 @@ const stealRisks = computed(() => {
 
     <!-- Template Tab -->
     <div v-if="activeTab === 'template'" class="tab-content eval-tab template-tab">
-      <div class="eval-row">
-        <label>Template id</label>
-        <input
-          type="text"
-          :value="templateConfigSafe.templateId"
-          @input="setTemplateId($event.target.value)"
-          placeholder="wing_entry_help"
-        />
-        <span class="status-note">Drag players on the board. Hex coordinates are shown directly on the court in this mode.</span>
-      </div>
-
-      <div class="eval-row">
-        <label>Weight</label>
-        <input
-          type="number"
-          min="0.01"
-          step="0.01"
-          :value="templateConfigSafe.weight"
-          @input="emitTemplateConfigUpdate({ weight: Math.max(0.01, Number($event.target.value) || 1.0) })"
-        />
-        <label class="inline-label">
+      <div class="template-library-shell">
+        <div class="template-library-toolbar">
           <input
-            type="checkbox"
-            :checked="templateConfigSafe.mirrorable"
-            @change="emitTemplateConfigUpdate({ mirrorable: $event.target.checked })"
+            ref="templateLibraryFileInput"
+            type="file"
+            accept=".json,.yaml,.yml,application/json,text/yaml,text/x-yaml"
+            class="template-file-input-hidden"
+            @change="handleTemplateLibraryFileChosen"
           />
-          Mirrorable
-        </label>
-        <label>Shot clock</label>
-        <input
-          type="number"
-          min="1"
-          step="1"
-          :value="templateConfigSafe.shotClock"
-          @input="emitTemplateConfigUpdate({ shotClock: Math.max(1, Number($event.target.value) || 24) })"
-        />
-      </div>
-
-      <div class="eval-row">
-        <label>Ball starts with</label>
-        <select
-          :value="templateConfigSafe.ballHolder ?? ''"
-          @change="setTemplateBallHolder($event.target.value ? Number($event.target.value) : null)"
-        >
-          <option v-if="!templateBallStartOptions.length" disabled value="">No offense players</option>
-          <option v-for="pid in templateBallStartOptions" :key="`template-ball-${pid}`" :value="pid">Player {{ pid }}</option>
-        </select>
-        <button class="ghost-btn" @click="seedTemplateConfigFromGameState()">Use current board positions</button>
-        <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
-      </div>
-
-      <div class="eval-skills template-player-grid">
-        <div class="skills-header template-grid-header">
-          <span>Player</span>
-          <span>Team</span>
-          <span>Entry</span>
-          <span>Anchor</span>
-          <span>Jitter</span>
-          <span>Role</span>
+          <div class="eval-row template-library-path-row">
+            <label>
+              Save path
+              <span
+                class="template-help"
+                data-tooltip="Optional repo/backend file path used by 'Load from path' and 'Save file'. Use 'Choose file' when you just want to import a local YAML or JSON file through the browser."
+              >?</span>
+            </label>
+            <input
+              v-model="templateLibraryPathInput"
+              class="template-path-input"
+              type="text"
+              placeholder="configs/start_templates_v1.yaml"
+              title="Repo/backend file path used for direct load/save."
+            />
+            <button
+              class="ghost-btn"
+              @click="triggerTemplateLibraryChooser"
+              :disabled="templateLibraryRequestPending"
+              title="Import a local YAML or JSON template file through the browser. This does not save back to that original file."
+            >
+              {{ templateLibraryRequestPending ? 'Loading…' : 'Import file' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleLoadTemplateLibraryFile"
+              :disabled="templateLibraryRequestPending || !templateLibraryPathInput"
+              title="Load the library from the repo/backend file path shown in Save path."
+            >
+              {{ templateLibraryRequestPending ? 'Loading…' : 'Load from path' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleSaveTemplateLibraryChooser"
+              :disabled="templateLibraryRequestPending"
+              title="Open a save dialog and write the current draft to a location you choose. In browsers without save-dialog support, this falls back to a normal download."
+            >
+              Save file
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleSaveTemplateLibraryFile"
+              :disabled="templateLibraryRequestPending"
+              title="Write the current draft to the repo/backend file path shown in Save path."
+            >
+              {{ templateLibraryRequestPending ? 'Saving…' : 'Save to path' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handlePushTemplateLibraryDraft"
+              :disabled="templateLibraryRequestPending || !templateLibraryDirty"
+              title="Replace the active in-session template library used by the current UI session with this draft."
+            >
+              Push to session
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleReloadTemplateLibraryDraft"
+              :disabled="templateLibraryRequestPending"
+              title="Discard local draft changes and reload the current in-session template library."
+            >
+              Reload session
+            </button>
+          </div>
+          <div class="template-library-meta">
+            <span class="status-note">
+              Source:
+              <strong>{{ templateLibrarySourceLabel }}</strong>
+            </span>
+            <span class="status-note">
+              Templates:
+              <strong>{{ templateLibraryDraft.templates?.length || 0 }}</strong>
+            </span>
+            <span v-if="templateLibrarySessionPath && templateLibrarySource !== 'file_upload'" class="status-note">
+              Active path:
+              <strong>{{ templateLibrarySessionPath }}</strong>
+            </span>
+            <span v-if="templateLibraryImportedFilename" class="status-note">
+              Imported file:
+              <strong>{{ templateLibraryImportedFilename }}</strong>
+            </span>
+            <span v-if="templateLibraryDirty" class="status-note template-library-dirty">
+              Local draft has unsaved changes.
+            </span>
+          </div>
+          <div class="status-note">
+            `Import file` loads a browser-selected file into the session only. `Save file` opens a browser save dialog. `Save to path` writes to the backend path shown in `Save path`.
+          </div>
+          <div v-if="templateLibraryStatus" class="status-note">
+            {{ templateLibraryStatus }}
+          </div>
+          <div v-if="templateLibraryError" class="policy-status error">
+            {{ templateLibraryError }}
+          </div>
         </div>
-        <div class="skills-row template-grid-row" v-for="row in templatePlayerRows" :key="`template-player-${row.playerId}`">
-          <span class="skills-player">P{{ row.playerId }}</span>
-          <span>{{ row.teamLabel }}</span>
-          <span>{{ row.entryIndex }}</span>
-          <span>({{ row.q }}, {{ row.r }})</span>
-          <input
-            type="number"
-            min="0"
-            step="1"
-            :value="row.jitter"
-            @input="updateTemplatePlayerJitter(row.playerId, $event.target.value)"
-          />
-          <input
-            type="text"
-            :value="row.role"
-            @input="updateTemplatePlayerRole(row.playerId, $event.target.value)"
-            :placeholder="row.teamLabel === 'Offense' && row.playerId === templateConfigSafe.ballHolder ? 'ball_handler' : 'role'"
-          />
-        </div>
-      </div>
 
-      <div class="eval-row template-export-actions">
-        <button class="ghost-btn" @click="copyTemplateExport('yaml')">Copy YAML</button>
-        <button class="ghost-btn" @click="copyTemplateExport('json')">Copy JSON</button>
-      </div>
-
-      <div class="eval-custom template-export-grid">
-        <div class="template-export-card">
-          <h5>YAML Template Entry</h5>
-          <textarea class="template-export-textarea" readonly :value="templateYamlExport"></textarea>
+        <div class="template-library-picker-card">
+          <div class="eval-row">
+            <label>
+              Selected template
+              <span
+                class="template-help"
+                data-tooltip="The template currently being edited. Selecting a different template loads its anchors, ball handler, jitter, and roles into the board authoring view."
+              >?</span>
+            </label>
+            <select
+              v-model="selectedEditableTemplateId"
+              :disabled="!editableTemplateOptions.length"
+              title="Select which template in the library you want to edit."
+            >
+              <option v-if="!editableTemplateOptions.length" disabled value="">
+                No templates loaded
+              </option>
+              <option
+                v-for="opt in editableTemplateOptions"
+                :key="`editable-template-${opt.value}`"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
+            <button
+              class="ghost-btn"
+              @click="addTemplateFromCurrentBoard"
+              title="Create a new template using the current board positions and current template editor settings."
+            >
+              Add from board
+            </button>
+            <button
+              class="ghost-btn"
+              @click="duplicateSelectedTemplate"
+              :disabled="!selectedEditableTemplate"
+              title="Copy the selected template to a new template id."
+            >
+              Duplicate
+            </button>
+            <button
+              class="ghost-btn template-danger-btn"
+              @click="deleteSelectedTemplate"
+              :disabled="!selectedEditableTemplate"
+              title="Delete the selected template from the draft library."
+            >
+              Delete
+            </button>
+            <button
+              class="ghost-btn"
+              @click="copyTemplateLibraryJson"
+              title="Copy the entire current draft library as JSON."
+            >
+              Copy library JSON
+            </button>
+            <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
+          </div>
+          <div
+            v-if="editableTemplateOptions.length"
+            class="template-library-chip-list"
+          >
+            <button
+              v-for="opt in editableTemplateOptions"
+              :key="`template-chip-${opt.value}`"
+              class="template-chip-btn"
+              :class="{ active: selectedEditableTemplateId === opt.value }"
+              @click="selectedEditableTemplateId = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
         </div>
-        <div class="template-export-card">
-          <h5>JSON Template Entry</h5>
-          <textarea class="template-export-textarea" readonly :value="templateJsonExport"></textarea>
+
+        <div v-if="selectedEditableTemplate" class="template-editor-shell">
+          <div class="eval-row">
+            <label>
+              Template id
+              <span
+                class="template-help"
+                data-tooltip="Stable identifier for this template. This is what training, eval, UI controls, and MLflow artifacts use to reference the template."
+              >?</span>
+            </label>
+            <input
+              type="text"
+              :value="templateConfigSafe.templateId"
+              @input="setTemplateId($event.target.value)"
+              placeholder="wing_entry_help"
+              title="Stable template identifier used everywhere else in the app."
+            />
+            <span class="status-note">Board drags update the selected draft template directly in this tab.</span>
+          </div>
+
+          <div class="eval-row">
+            <label>
+              Weight
+              <span
+                class="template-help"
+                data-tooltip="Relative sampling weight when this library is used during training resets. Higher weight means this template is sampled more often."
+              >?</span>
+            </label>
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              :value="templateConfigSafe.weight"
+              @input="emitTemplateConfigUpdate({ weight: Math.max(0.01, Number($event.target.value) || 1.0) })"
+              title="Relative reset sampling weight for this template."
+            />
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                :checked="templateConfigSafe.mirrorable"
+                @change="emitTemplateConfigUpdate({ mirrorable: $event.target.checked })"
+                title="Allow training/UI to mirror this template left-right."
+              />
+              Mirrorable
+              <span
+                class="template-help"
+                data-tooltip="If enabled, the template can be mirrored left-right. This only permits mirroring; it does not force it."
+              >?</span>
+            </label>
+            <label>
+              Shot clock
+              <span
+                class="template-help"
+                data-tooltip="Optional shot clock value applied when the template resolves. Useful when a template is supposed to represent a later-clock situation."
+              >?</span>
+            </label>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="templateConfigSafe.shotClock"
+              @input="emitTemplateConfigUpdate({ shotClock: Math.max(1, Number($event.target.value) || 24) })"
+              title="Shot clock assigned when this template resolves."
+            />
+          </div>
+
+          <div class="eval-row">
+            <label>
+              Ball starts with
+              <span
+                class="template-help"
+                data-tooltip="Which offense player row gets the has_ball marker in this concrete authoring view. Training still randomizes same-team assignment when the template resolves."
+              >?</span>
+            </label>
+            <select
+              :value="templateConfigSafe.ballHolder ?? ''"
+              @change="setTemplateBallHolder($event.target.value ? Number($event.target.value) : null)"
+              title="Concrete authoring-time ball holder for this template."
+            >
+              <option v-if="!templateBallStartOptions.length" disabled value="">No offense players</option>
+              <option v-for="pid in templateBallStartOptions" :key="`template-ball-${pid}`" :value="pid">Player {{ pid }}</option>
+            </select>
+            <button
+              class="ghost-btn"
+              @click="seedTemplateConfigFromGameState()"
+              title="Overwrite the selected template’s anchors with the current board state."
+            >
+              Use current board positions
+            </button>
+          </div>
+
+          <div class="eval-skills template-player-grid">
+            <div class="skills-header template-grid-header">
+              <span title="Concrete board player row used in the editor.">Player</span>
+              <span title="Whether this row belongs to offense or defense.">Team</span>
+              <span title="Template entry index within that team.">Entry</span>
+              <span title="Anchor hex [q, r] for this entry. You can drag on the board or edit the numbers directly.">Anchor</span>
+              <span title="Per-entry jitter radius before the library-wide jitter scale is applied.">Jitter</span>
+              <span title="Optional semantic tag for later analysis or UI display.">Role</span>
+            </div>
+            <div class="skills-row template-grid-row" v-for="row in templatePlayerRows" :key="`template-player-${row.playerId}`">
+              <span class="skills-player">P{{ row.playerId }}</span>
+              <span>{{ row.teamLabel }}</span>
+              <span>{{ row.entryIndex }}</span>
+              <div class="template-anchor-inputs">
+                <input
+                  type="number"
+                  step="1"
+                  :value="row.q"
+                  @input="updateTemplatePlayerAnchor(row.playerId, 0, $event.target.value)"
+                  title="Anchor q coordinate."
+                />
+                <input
+                  type="number"
+                  step="1"
+                  :value="row.r"
+                  @input="updateTemplatePlayerAnchor(row.playerId, 1, $event.target.value)"
+                  title="Anchor r coordinate."
+                />
+              </div>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                :value="row.jitter"
+                @input="updateTemplatePlayerJitter(row.playerId, $event.target.value)"
+                title="Per-entry jitter radius."
+              />
+              <input
+                type="text"
+                :value="row.role"
+                @input="updateTemplatePlayerRole(row.playerId, $event.target.value)"
+                :placeholder="row.teamLabel === 'Offense' && row.playerId === templateConfigSafe.ballHolder ? 'ball_handler' : 'role'"
+                title="Optional semantic role label."
+              />
+            </div>
+          </div>
+
+          <div class="eval-row template-export-actions">
+            <button
+              class="ghost-btn"
+              @click="copyTemplateExport('yaml')"
+              title="Copy only the selected template entry as YAML."
+            >
+              Copy YAML
+            </button>
+            <button
+              class="ghost-btn"
+              @click="copyTemplateExport('json')"
+              title="Copy only the selected template entry as JSON."
+            >
+              Copy JSON
+            </button>
+          </div>
+
+          <div class="eval-custom template-export-grid">
+            <div class="template-export-card">
+              <h5 title="Selected template only, formatted as YAML.">YAML Template Entry</h5>
+              <textarea class="template-export-textarea" readonly :value="templateYamlExport"></textarea>
+            </div>
+            <div class="template-export-card">
+              <h5 title="Selected template only, formatted as JSON.">JSON Template Entry</h5>
+              <textarea class="template-export-textarea" readonly :value="templateJsonExport"></textarea>
+            </div>
+            <div class="template-export-card">
+              <h5 title="Entire current draft library, formatted as JSON.">JSON Library Draft</h5>
+              <textarea class="template-export-textarea" readonly :value="templateLibraryJsonExport"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="no-data">
+          Load a template library or add a new template from the current board.
         </div>
       </div>
     </div>
@@ -7273,6 +8307,9 @@ const stealRisks = computed(() => {
                 <div class="token-attn-note" v-if="tokenAttentionSubtitle">
                   {{ tokenAttentionSubtitle }}
                 </div>
+                <div class="token-attn-note" v-if="tokenAttentionRuntimeSummary">
+                  {{ tokenAttentionRuntimeSummary }}
+                </div>
                 <div class="token-table-scroll">
                   <table class="observation-table token-table token-attn-table">
                     <thead>
@@ -8685,40 +9722,50 @@ const stealRisks = computed(() => {
   gap: 1rem;
   margin-top: 1rem;
 }
-.playbook-debug-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 0.75rem;
+.playbook-summary-table-wrap {
   margin-top: 0.9rem;
-}
-.playbook-debug-card {
+  overflow-x: auto;
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 12px;
-  padding: 0.75rem 0.9rem;
   background: rgba(15, 23, 42, 0.52);
 }
-.playbook-debug-title {
-  color: #38bdf8;
-  font-weight: 700;
-  margin-bottom: 0.45rem;
+.playbook-summary-table {
+  width: 100%;
+  min-width: 1120px;
+  border-collapse: collapse;
 }
-.playbook-debug-subtitle {
+.playbook-summary-table th,
+.playbook-summary-table td {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  text-align: left;
+  vertical-align: top;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+.playbook-summary-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgba(15, 23, 42, 0.96);
   color: #94a3b8;
   font-size: 0.78rem;
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: uppercase;
-  margin-top: 0.6rem;
-  margin-bottom: 0.15rem;
+  white-space: nowrap;
 }
-.playbook-debug-line {
-  color: #cbd5e1;
-  font-size: 0.92rem;
-  line-height: 1.45;
+.playbook-summary-table tbody tr:last-child td {
+  border-bottom: none;
 }
-.playbook-debug-line strong {
-  color: #f8fafc;
+.playbook-summary-table tbody tr:hover td {
+  background: rgba(30, 41, 59, 0.42);
+}
+.playbook-summary-play-cell {
+  color: #38bdf8 !important;
   font-weight: 700;
+  white-space: nowrap;
 }
 .eval-run-btn {
   padding: 0.5rem 1rem;
@@ -8819,12 +9866,140 @@ const stealRisks = computed(() => {
 .template-player-grid {
   gap: 0.55rem;
 }
+.template-library-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.template-library-toolbar,
+.template-library-picker-card,
+.template-editor-shell {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.85rem;
+  background: rgba(15, 23, 42, 0.5);
+}
+.template-library-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.template-library-path-row {
+  align-items: center;
+}
+.template-file-input-hidden {
+  display: none;
+}
+.template-path-input {
+  flex: 1 1 320px;
+  min-width: 220px;
+}
+.template-library-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+.template-library-dirty {
+  color: #fbbf24;
+}
+.template-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.35rem;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--app-accent);
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  position: relative;
+  vertical-align: middle;
+}
+.template-help[data-tooltip]::before {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.6rem 0.8rem;
+  background: rgba(15, 23, 42, 0.98);
+  color: var(--app-text);
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.4;
+  border-radius: 8px;
+  border: 1px solid var(--app-accent);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 15px rgba(56, 189, 248, 0.15);
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  z-index: 1000;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  pointer-events: none;
+  text-align: left;
+}
+.template-help[data-tooltip]::after {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: var(--app-accent);
+  z-index: 1001;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+.template-help[data-tooltip]:hover::before,
+.template-help[data-tooltip]:hover::after {
+  opacity: 1;
+  visibility: visible;
+}
+.template-library-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.template-chip-btn {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  padding: 0.32rem 0.75rem;
+  background: rgba(15, 23, 42, 0.45);
+  color: #cbd5e1;
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+}
+.template-chip-btn:hover {
+  border-color: #7dd3fc;
+  color: #f8fafc;
+}
+.template-chip-btn.active {
+  border-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+  color: #38bdf8;
+}
 .template-grid-header,
 .template-grid-row {
   grid-template-columns: 0.9fr 0.9fr 0.6fr 1fr 0.8fr 1.2fr;
 }
 .template-grid-row span {
   color: #e2e8f0;
+}
+.template-anchor-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+.template-anchor-inputs input {
+  width: 100%;
 }
 .template-export-actions {
   justify-content: flex-end;
@@ -8870,6 +10045,17 @@ const stealRisks = computed(() => {
 }
 .ghost-btn:hover {
   border-color: #7dd3fc;
+}
+.ghost-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.template-danger-btn {
+  color: #fda4af;
+  border-color: rgba(244, 63, 94, 0.35);
+}
+.template-danger-btn:hover:not(:disabled) {
+  border-color: #fb7185;
 }
 .stats-selector {
   display: flex;

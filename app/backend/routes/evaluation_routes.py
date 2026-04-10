@@ -148,6 +148,7 @@ def run_evaluation(request: EvaluationRequest):
 
     if isinstance(raw_results, dict):
         per_player_stats = raw_results.get("per_player_stats", {}) or {}
+        per_intent_stats = raw_results.get("per_intent_stats", {}) or {}
         eval_diagnostics = raw_results.get("eval_diagnostics", {}) or {}
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
@@ -155,6 +156,7 @@ def run_evaluation(request: EvaluationRequest):
         episode_payload = raw_results.get("results", [])
     else:
         per_player_stats = {}
+        per_intent_stats = {}
         eval_diagnostics = {}
         episode_payload = raw_results
 
@@ -185,6 +187,7 @@ def run_evaluation(request: EvaluationRequest):
         episode_results.append(
             {
                 "episode": r.get("episode") if isinstance(r, dict) else None,
+                "intent_index": r.get("intent_index") if isinstance(r, dict) else None,
                 "final_state": final_state,
                 "steps": r.get("steps") if isinstance(r, dict) else None,
                 "episode_rewards": r.get("episode_rewards") if isinstance(r, dict) else None,
@@ -216,6 +219,7 @@ def run_evaluation(request: EvaluationRequest):
         "current_state": current_game_state,
         "shot_accumulator": shot_accumulator,
         "per_player_stats": per_player_stats,
+        "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,
     })
 

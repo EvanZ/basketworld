@@ -798,6 +798,20 @@ def get_parser() -> argparse.ArgumentParser:
         help="Max flattened action features used by discriminator input.",
     )
     parser.add_argument(
+        "--intent-disc-include-shot-clock",
+        dest="intent_disc_include_shot_clock",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Include shot_clock in set-step discriminator globals.",
+    )
+    parser.add_argument(
+        "--intent-disc-include-pressure-exposure",
+        dest="intent_disc_include_pressure_exposure",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Include pressure_exposure in set-step discriminator globals.",
+    )
+    parser.add_argument(
         "--disc-eval-batch-output",
         dest="disc_eval_batch_output",
         nargs="?",
@@ -929,6 +943,36 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="Value loss coefficient for the integrated selector critic.",
+    )
+    parser.add_argument(
+        "--intent-selector-template-metrics-log-every-rollouts",
+        dest="intent_selector_template_metrics_log_every_rollouts",
+        type=int,
+        default=8,
+        help=(
+            "How often to log per-template selector MLflow metrics. "
+            "Global selector metrics still log every rollout."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-train-every-rollouts",
+        dest="intent_selector_train_every_rollouts",
+        type=int,
+        default=1,
+        help=(
+            "Train the integrated selector every N rollouts instead of every rollout. "
+            "Selector samples accumulate between updates."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-max-samples-per-update",
+        dest="intent_selector_max_samples_per_update",
+        type=int,
+        default=0,
+        help=(
+            "Cap the number of selector samples used in one selector update. "
+            "0 means use all accumulated samples."
+        ),
     )
     parser.add_argument(
         "--intent-selector-multiselect-enabled",

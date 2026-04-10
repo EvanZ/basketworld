@@ -1,9 +1,11 @@
 import copy
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import json
 import logging
 import math
 import multiprocessing as mp
 import os
+from pathlib import Path
 import queue
 from typing import List
 
@@ -12,7 +14,11 @@ from fastapi.encoders import jsonable_encoder
 import mlflow
 import numpy as np
 from stable_baselines3 import PPO
-from basketworld.utils.start_templates import resolve_start_template
+from basketworld.utils.start_templates import (
+    load_start_template_library,
+    resolve_start_template,
+    validate_start_template_library,
+)
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from basketworld.utils.play_names import lookup_play_name
@@ -29,12 +35,16 @@ from app.backend.schemas import (
     ActionRequest,
     ApplyStartTemplateRequest,
     BatchUpdatePositionRequest,
+    ImportStartTemplateLibraryRequest,
+    LoadStartTemplateLibraryRequest,
     PlaybookAnalysisRequest,
     ReplayCounterfactualRequest,
+    SaveStartTemplateLibraryRequest,
     SetBallHolderRequest,
     SetIntentStateRequest,
     SetOffenseSkillsRequest,
     SetPassLogitBiasRequest,
+    SetStartTemplateLibraryRequest,
     SetPressureParamsRequest,
     SetPassTargetStrategyRequest,
     SwapPoliciesRequest,
@@ -72,6 +82,87 @@ _NUMPY_SAFE_ENCODER = {
 def _base_env():
     env = game_state.env
     return getattr(env, "unwrapped", env)
+
+
+def _template_players_per_side() -> int:
+    env = _base_env()
+    players_per_side = getattr(env, "players_per_side", None)
+    if players_per_side is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    return int(players_per_side)
+
+
+def _set_session_start_template_library(
+    library: dict,
+    *,
+    source: str | None,
+    path: str | None,
+) -> dict:
+    normalized = validate_start_template_library(
+        dict(library or {}),
+        players_per_side=_template_players_per_side(),
+    )
+    game_state.mlflow_start_template_library = copy.deepcopy(normalized)
+    game_state.start_template_library_source = str(source or "").strip() or None
+    game_state.start_template_library_path = str(path or "").strip() or None
+    return normalized
+
+
+def _dump_start_template_library(path: str | Path, library: dict) -> Path:
+    file_path = Path(path).expanduser().resolve()
+    suffix = file_path.suffix.lower()
+    if suffix not in {".json", ".yaml", ".yml"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Template library path must end in .json, .yaml, or .yml",
+        )
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if suffix == ".json":
+        payload = json.dumps(library, indent=2)
+    else:
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="PyYAML is required to save YAML template libraries.",
+            ) from exc
+        payload = yaml.safe_dump(
+            library,
+            sort_keys=False,
+            allow_unicode=False,
+            default_flow_style=False,
+        )
+    file_path.write_text(payload, encoding="utf-8")
+    return file_path
+
+
+def _parse_start_template_library_contents(filename: str | None, contents: str) -> dict:
+    raw_name = str(filename or "").strip().lower()
+    text = str(contents or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Uploaded template file is empty.")
+    suffix = Path(raw_name).suffix.lower()
+    if suffix == ".json":
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON template library: {exc}") from exc
+    else:
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="PyYAML is required to import YAML template libraries.",
+            ) from exc
+        try:
+            payload = yaml.safe_load(text)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid YAML template library: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Template library must decode to an object.")
+    return payload
 
 
 def _resolve_start_template_request(
@@ -360,6 +451,88 @@ def apply_start_template(req: ApplyStartTemplateRequest):
         "status": "success",
         **payload,
         "state": updated_state,
+    }
+
+
+@router.post("/api/load_start_template_library")
+def load_start_template_library_route(req: LoadStartTemplateLibraryRequest):
+    path = str(req.path or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    try:
+        library = load_start_template_library(
+            path,
+            players_per_side=_template_players_per_side(),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    normalized = _set_session_start_template_library(
+        library,
+        source="local_file",
+        path=path,
+    )
+    return {
+        "status": "success",
+        "library": jsonable_encoder(normalized, custom_encoder=_NUMPY_SAFE_ENCODER),
+        "path": str(Path(path).expanduser()),
+        "source": "local_file",
+        "state": get_ui_game_state(),
+    }
+
+
+@router.post("/api/import_start_template_library")
+def import_start_template_library_route(req: ImportStartTemplateLibraryRequest):
+    payload = _parse_start_template_library_contents(req.filename, req.contents)
+    normalized = _set_session_start_template_library(
+        payload,
+        source="file_upload",
+        path=req.filename,
+    )
+    return {
+        "status": "success",
+        "library": jsonable_encoder(normalized, custom_encoder=_NUMPY_SAFE_ENCODER),
+        "path": str(req.filename or "").strip() or None,
+        "source": "file_upload",
+        "state": get_ui_game_state(),
+    }
+
+
+@router.post("/api/set_start_template_library")
+def set_start_template_library_route(req: SetStartTemplateLibraryRequest):
+    normalized = _set_session_start_template_library(
+        req.library,
+        source=req.source or "session_editor",
+        path=req.path,
+    )
+    return {
+        "status": "success",
+        "library": jsonable_encoder(normalized, custom_encoder=_NUMPY_SAFE_ENCODER),
+        "path": getattr(game_state, "start_template_library_path", None),
+        "source": getattr(game_state, "start_template_library_source", None),
+        "state": get_ui_game_state(),
+    }
+
+
+@router.post("/api/save_start_template_library")
+def save_start_template_library_route(req: SaveStartTemplateLibraryRequest):
+    path = str(req.path or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required.")
+    normalized = _set_session_start_template_library(
+        req.library,
+        source="local_file",
+        path=path,
+    )
+    file_path = _dump_start_template_library(path, normalized)
+    return {
+        "status": "success",
+        "library": jsonable_encoder(normalized, custom_encoder=_NUMPY_SAFE_ENCODER),
+        "path": str(file_path),
+        "source": "local_file",
+        "state": get_ui_game_state(),
     }
 
 

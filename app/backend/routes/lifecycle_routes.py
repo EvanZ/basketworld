@@ -24,6 +24,7 @@ from basketworld.utils.wrappers import SetObservationWrapper
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
     _compute_q_values_for_player,
+    rebuild_observation_from_env,
     validate_policy_observation_schema,
 )
 from app.backend.rollout_runtime import combine_team_actions, predict_joint_policy_actions
@@ -386,6 +387,17 @@ async def init_game(request: InitGameRequest):
         mlflow_training_params["param_counts"] = counts
     game_state.mlflow_training_params = mlflow_training_params
     game_state.mlflow_start_template_library = copy.deepcopy(start_template_library)
+    if start_template_library is not None:
+        game_state.start_template_library_source = "mlflow_artifact"
+        game_state.start_template_library_path = str(
+            mlflow_training_params.get(
+                "start_template_library_artifact_path",
+                "metadata/start_template_library.json",
+            )
+        )
+    else:
+        game_state.start_template_library_source = None
+        game_state.start_template_library_path = None
 
     return {
         "status": "success",
@@ -436,14 +448,29 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
         game_state.mlflow_start_template_library = _load_start_template_library_for_run(
             mlflow_client, source_run_id
         )
+        if game_state.mlflow_start_template_library is not None:
+            game_state.start_template_library_source = "mlflow_artifact"
+            game_state.start_template_library_path = str(
+                mlflow_training_params.get(
+                    "start_template_library_artifact_path",
+                    "metadata/start_template_library.json",
+                )
+            )
+        else:
+            game_state.start_template_library_source = None
+            game_state.start_template_library_path = None
         if request.allow_dunks is not None:
             env_optional_params["allow_dunks"] = bool(request.allow_dunks)
         run_name = f"Template Sandbox ({source_run_id})"
     elif request.allow_dunks is not None:
         env_optional_params["allow_dunks"] = bool(request.allow_dunks)
         game_state.mlflow_start_template_library = None
+        game_state.start_template_library_source = None
+        game_state.start_template_library_path = None
     else:
         game_state.mlflow_start_template_library = None
+        game_state.start_template_library_source = None
+        game_state.start_template_library_path = None
 
     game_state.unified_policy = None
     game_state.offense_policy = None
@@ -1060,11 +1087,21 @@ def start_self_play():
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
     env_read = env_view(game_state.env)
+    base_env = getattr(game_state.env, "unwrapped", game_state.env)
     init_positions = [(int(q), int(r)) for (q, r) in env_read.positions]
     init_ball_holder = (
         int(env_read.ball_holder) if env_read.ball_holder is not None else None
     )
     init_shot_clock = int(env_read.shot_clock or 24)
+    preserved_intent_state = None
+    if bool(getattr(base_env, "intent_active", False)):
+        preserved_intent_state = {
+            "intent_index": int(getattr(base_env, "intent_index", 0) or 0),
+            "intent_age": int(getattr(base_env, "intent_age", 0) or 0),
+            "intent_commitment_remaining": int(
+                getattr(base_env, "intent_commitment_remaining", 0) or 0
+            ),
+        }
 
     import numpy as _np
 
@@ -1097,7 +1134,39 @@ def start_self_play():
     }
     game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
     game_state.prev_obs = None
-    _initialize_app_selector_runtime_for_episode()
+    game_state.selector_segment_index = 0
+    game_state.selector_last_boundary_reason = None
+    if preserved_intent_state is not None:
+        reset_base_env = getattr(game_state.env, "unwrapped", game_state.env)
+        setter = getattr(reset_base_env, "set_offense_intent_state", None)
+        if callable(setter):
+            setter(
+                int(preserved_intent_state["intent_index"]),
+                intent_active=True,
+                intent_age=int(preserved_intent_state["intent_age"]),
+                intent_commitment_remaining=int(
+                    preserved_intent_state["intent_commitment_remaining"]
+                ),
+            )
+        else:
+            reset_base_env.intent_active = True
+            reset_base_env.intent_index = int(preserved_intent_state["intent_index"])
+            reset_base_env.intent_age = int(preserved_intent_state["intent_age"])
+            reset_base_env.intent_commitment_remaining = int(
+                preserved_intent_state["intent_commitment_remaining"]
+            )
+        game_state.obs = rebuild_observation_from_env(
+            game_state.env,
+            current_obs=game_state.obs,
+        )
+        game_state.obs = validate_policy_observation_schema(
+            game_state.unified_policy,
+            game_state.env,
+            game_state.obs,
+            policy_label="unified_policy",
+        )
+    else:
+        _initialize_app_selector_runtime_for_episode()
     _capture_turn_start_snapshot()
 
     try:

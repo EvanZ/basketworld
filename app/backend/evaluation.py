@@ -369,6 +369,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
     offense_ids = list(env_read.offense_ids or [])
     defense_ids = list(env_read.defense_ids or [])
     per_player_stats = _init_player_stats(int(env_read.n_players or 0))
+    per_intent_stats: dict[str, dict] = {}
     eval_diagnostics = _init_eval_diagnostics()
     user_team_ids = list(offense_ids if user_team == _Team.OFFENSE else defense_ids)
     user_team_ids_set = {int(pid) for pid in user_team_ids}
@@ -399,6 +400,8 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         obs = selector_state["obs"]
         selector_segment_index = int(selector_state["selector_segment_index"])
         _accumulate_intent_selection(eval_diagnostics, env)
+        episode_intent_key = _intent_bucket_key(env)
+        episode_player_stats = _init_player_stats(int(env_read.n_players or 0))
 
         done = False
         step_count = 0
@@ -471,9 +474,22 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                             shot_accumulator[key][1] += 1
                         episode_shots[key][1] += 1
                     _record_shot_for_stats(per_player_stats, sid, env, bool(shot_res.get("success", False)), bool(shot_res.get("assist_full", False)))
+                    _record_shot_for_stats(
+                        episode_player_stats,
+                        sid,
+                        env,
+                        bool(shot_res.get("success", False)),
+                        bool(shot_res.get("assist_full", False)),
+                    )
                     if "assist_passer_id" in shot_res:
                         _record_assist_for_stats(
                             per_player_stats,
+                            int(shot_res.get("assist_passer_id")),
+                            bool(shot_res.get("assist_full", False)),
+                            bool(shot_res.get("assist_potential", False)),
+                        )
+                        _record_assist_for_stats(
+                            episode_player_stats,
                             int(shot_res.get("assist_passer_id")),
                             bool(shot_res.get("assist_full", False)),
                             bool(shot_res.get("assist_potential", False)),
@@ -486,6 +502,9 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 for t in turnovers_raw_step:
                     try:
                         _record_turnover_for_stats(per_player_stats, t.get("player_id"))
+                        _record_turnover_for_stats(
+                            episode_player_stats, t.get("player_id")
+                        )
                     except Exception:
                         continue
             _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
@@ -512,10 +531,20 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         if per_player_stats is not None:
             for pid in per_player_stats:
                 per_player_stats[pid]["steps"] += step_count
+        per_intent_stats[episode_intent_key] = _accumulate_team_stats_from_players(
+            per_intent_stats.get(episode_intent_key),
+            episode_player_stats,
+            user_team_ids,
+            episodes=1,
+            steps=step_count,
+        )
 
         results.append(
             {
                 "episode": ep_idx + 1,
+                "intent_index": (
+                    None if episode_intent_key == "none" else int(episode_intent_key)
+                ),
                 "steps": step_count,
                 "episode_rewards": episode_rewards,
                 "outcome_info": {
@@ -540,6 +569,7 @@ def _run_episode_batch_worker(args: tuple) -> dict:
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": per_player_stats,
+        "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,
     }
 
@@ -562,6 +592,90 @@ def _init_player_stats(n_players: int) -> dict:
             "unassisted": {"dunk": 0, "two": 0, "three": 0},
         }
     return stats
+
+
+def _init_aggregate_stats() -> dict:
+    return {
+        "shots": 0,
+        "makes": 0,
+        "shot_types": {"dunk": [0, 0], "two": [0, 0], "three": [0, 0]},
+        "assist_full_by_type": {"dunk": 0, "two": 0, "three": 0},
+        "assists": 0,
+        "potential_assists": 0,
+        "turnovers": 0,
+        "points": 0.0,
+        "episodes": 0,
+        "steps": 0,
+        "shot_chart": {},
+        "unassisted": {"dunk": 0, "two": 0, "three": 0},
+    }
+
+
+def _merge_aggregate_stats(dest: dict | None, src: dict | None) -> dict:
+    if dest is None:
+        dest = _init_aggregate_stats()
+    if not src:
+        return dest
+
+    dest["shots"] += int(src.get("shots", 0) or 0)
+    dest["makes"] += int(src.get("makes", 0) or 0)
+    dest["assists"] += int(src.get("assists", 0) or 0)
+    dest["potential_assists"] += int(src.get("potential_assists", 0) or 0)
+    dest["turnovers"] += int(src.get("turnovers", 0) or 0)
+    dest["points"] += float(src.get("points", 0.0) or 0.0)
+    dest["episodes"] += int(src.get("episodes", 0) or 0)
+    dest["steps"] += int(src.get("steps", 0) or 0)
+
+    for shot_type in ("dunk", "two", "three"):
+        src_pair = (src.get("shot_types") or {}).get(shot_type, [0, 0])
+        dst_pair = dest["shot_types"].setdefault(shot_type, [0, 0])
+        dst_pair[0] += int(src_pair[0] if isinstance(src_pair, (list, tuple)) else 0)
+        dst_pair[1] += int(src_pair[1] if isinstance(src_pair, (list, tuple)) else 0)
+        dest.setdefault("assist_full_by_type", {}).setdefault(shot_type, 0)
+        dest["assist_full_by_type"][shot_type] += int(
+            (src.get("assist_full_by_type") or {}).get(shot_type, 0) or 0
+        )
+        dest.setdefault("unassisted", {}).setdefault(shot_type, 0)
+        dest["unassisted"][shot_type] += int(
+            (src.get("unassisted") or {}).get(shot_type, 0) or 0
+        )
+
+    for loc, vals in ((src.get("shot_chart") or {}) or {}).items():
+        dst_pair = dest["shot_chart"].setdefault(str(loc), [0, 0])
+        try:
+            att = int(vals[0]) if isinstance(vals, (list, tuple)) and len(vals) > 0 else 0
+            mk = int(vals[1]) if isinstance(vals, (list, tuple)) and len(vals) > 1 else 0
+        except Exception:
+            att, mk = 0, 0
+        dst_pair[0] += att
+        dst_pair[1] += mk
+
+    return dest
+
+
+def _accumulate_team_stats_from_players(
+    dest: dict | None,
+    player_stats: dict | None,
+    team_ids: list[int] | tuple[int, ...],
+    *,
+    episodes: int = 0,
+    steps: int = 0,
+) -> dict:
+    merged = _init_aggregate_stats()
+    merged["episodes"] = int(episodes)
+    merged["steps"] = int(steps)
+    if not player_stats:
+        return _merge_aggregate_stats(dest, merged)
+
+    for pid_raw in team_ids or []:
+        pid = int(pid_raw)
+        entry = player_stats.get(pid)
+        if entry is None:
+            entry = player_stats.get(str(pid))
+        if not isinstance(entry, dict):
+            continue
+        merged = _merge_aggregate_stats(merged, entry)
+    return _merge_aggregate_stats(dest, merged)
 
 
 def _merge_player_stats(dest: dict, src: dict) -> dict:
@@ -618,6 +732,19 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
         for key in ("dunk", "two", "three"):
             dst_un[key] = dst_un.get(key, 0) + int(src_un.get(key, 0) or 0)
     return dest
+
+
+def _intent_bucket_key(env) -> str:
+    if env is None:
+        return "none"
+    if not bool(getattr(env, "enable_intent_learning", False)):
+        return "none"
+    if not bool(getattr(env, "intent_active", False)):
+        return "none"
+    try:
+        return str(int(getattr(env, "intent_index", 0)))
+    except Exception:
+        return "none"
 
 
 def _init_eval_diagnostics() -> dict:
@@ -1059,6 +1186,7 @@ def _run_sequential_evaluation(
     offense_ids = list(env_read.offense_ids or [])
     defense_ids = list(env_read.defense_ids or [])
     per_player_stats = _init_player_stats(int(env_read.n_players or 0))
+    per_intent_stats: dict[str, dict] = {}
     eval_diagnostics = _init_eval_diagnostics()
     user_team_ids = list(offense_ids if user_team == Team.OFFENSE else defense_ids)
     user_team_ids_set = {int(pid) for pid in user_team_ids}
@@ -1088,6 +1216,8 @@ def _run_sequential_evaluation(
         obs = selector_state["obs"]
         selector_segment_index = int(selector_state["selector_segment_index"])
         _accumulate_intent_selection(eval_diagnostics, env)
+        episode_intent_key = _intent_bucket_key(env)
+        episode_player_stats = _init_player_stats(int(env_read.n_players or 0))
 
         done = False
         step_count = 0
@@ -1164,9 +1294,22 @@ def _run_sequential_evaluation(
                             shot_accumulator[key][1] += 1
                         episode_shots[key][1] += 1
                     _record_shot_for_stats(per_player_stats, sid, env, bool(shot_res.get("success", False)), bool(shot_res.get("assist_full", False)))
+                    _record_shot_for_stats(
+                        episode_player_stats,
+                        sid,
+                        env,
+                        bool(shot_res.get("success", False)),
+                        bool(shot_res.get("assist_full", False)),
+                    )
                     if "assist_passer_id" in shot_res:
                         _record_assist_for_stats(
                             per_player_stats,
+                            int(shot_res.get("assist_passer_id")),
+                            bool(shot_res.get("assist_full", False)),
+                            bool(shot_res.get("assist_potential", False)),
+                        )
+                        _record_assist_for_stats(
+                            episode_player_stats,
                             int(shot_res.get("assist_passer_id")),
                             bool(shot_res.get("assist_full", False)),
                             bool(shot_res.get("assist_potential", False)),
@@ -1179,6 +1322,9 @@ def _run_sequential_evaluation(
                 for t in turnovers_raw_step:
                     try:
                         _record_turnover_for_stats(per_player_stats, t.get("player_id"))
+                        _record_turnover_for_stats(
+                            episode_player_stats, t.get("player_id")
+                        )
                     except Exception:
                         continue
             _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
@@ -1200,10 +1346,20 @@ def _run_sequential_evaluation(
         for pid in per_player_stats:
             per_player_stats[pid]["episodes"] += 1
             per_player_stats[pid]["steps"] += step_count
+        per_intent_stats[episode_intent_key] = _accumulate_team_stats_from_players(
+            per_intent_stats.get(episode_intent_key),
+            episode_player_stats,
+            user_team_ids,
+            episodes=1,
+            steps=step_count,
+        )
 
         results.append(
             {
                 "episode": ep_idx + 1,
+                "intent_index": (
+                    None if episode_intent_key == "none" else int(episode_intent_key)
+                ),
                 "steps": step_count,
                 "episode_rewards": episode_rewards,
                 "outcome_info": {
@@ -1228,6 +1384,7 @@ def _run_sequential_evaluation(
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": per_player_stats,
+        "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,
     }
 
@@ -1343,6 +1500,7 @@ def _run_parallel_evaluation(
 
     results = []
     merged_player_stats: dict = {}
+    merged_intent_stats: dict = {}
     merged_eval_diagnostics: dict = _init_eval_diagnostics()
     for payload in batch_results:
         if not payload:
@@ -1363,6 +1521,11 @@ def _run_parallel_evaluation(
                     shot_accumulator[key][0] += att
                     shot_accumulator[key][1] += mk
             merged_player_stats = _merge_player_stats(merged_player_stats, payload.get("per_player_stats") or {})
+            for raw_intent, stats in (payload.get("per_intent_stats") or {}).items():
+                key = str(raw_intent)
+                merged_intent_stats[key] = _merge_aggregate_stats(
+                    merged_intent_stats.get(key), stats or {}
+                )
             merged_eval_diagnostics = _merge_eval_diagnostics(
                 merged_eval_diagnostics, payload.get("eval_diagnostics") or {}
             )
@@ -1373,6 +1536,7 @@ def _run_parallel_evaluation(
         "results": results,
         "shot_accumulator": shot_accumulator if shot_accumulator is not None else {},
         "per_player_stats": merged_player_stats,
+        "per_intent_stats": merged_intent_stats,
         "eval_diagnostics": merged_eval_diagnostics,
     }
 
