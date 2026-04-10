@@ -362,9 +362,8 @@ def main(args):
 
         # Log to MLflow (all generated)
         if not args.no_log_mlflow and all_saved_paths:
-            with mlflow.start_run(run_id=args.run_id):
-                for p in all_saved_paths:
-                    mlflow.log_artifact(p, artifact_path="heatmaps")
+            for p in all_saved_paths:
+                client.log_artifact(args.run_id, p, artifact_path="heatmaps")
             print("Logged heatmaps to MLflow under 'heatmaps/'.")
 
         # Optional: create animated GIFs across alternations
@@ -395,14 +394,17 @@ def main(args):
                         duration=int(args.gif_duration * 1000),
                         loop=0,
                         optimize=False,
-                    )
+                )
                 print("Saved animated GIFs for heatmaps.")
                 if not args.no_log_mlflow:
-                    with mlflow.start_run(run_id=args.run_id):
-                        if len(offense_paths) > 0:
-                            mlflow.log_artifact(offense_gif, artifact_path="heatmaps")
-                        if len(defense_paths) > 0:
-                            mlflow.log_artifact(defense_gif, artifact_path="heatmaps")
+                    if len(offense_paths) > 0:
+                        client.log_artifact(
+                            args.run_id, offense_gif, artifact_path="heatmaps"
+                        )
+                    if len(defense_paths) > 0:
+                        client.log_artifact(
+                            args.run_id, defense_gif, artifact_path="heatmaps"
+                        )
             except Exception as e:
                 print(f"[warn] Failed to create heatmap GIFs: {e}")
 

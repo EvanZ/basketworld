@@ -1,3 +1,4 @@
+import tempfile
 import mlflow
 from typing import Any, Callable, Dict, Tuple
 
@@ -232,6 +233,55 @@ def get_mlflow_params(
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         True,
     )
+    # Intent-learning controls
+    optional["enable_intent_learning"] = _get_param(
+        params,
+        ["enable_intent_learning", "enable-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["num_intents"] = _get_param(
+        params,
+        ["num_intents", "num-intents"],
+        int,
+        8,
+    )
+    optional["intent_commitment_steps"] = _get_param(
+        params,
+        ["intent_commitment_steps", "intent-commitment-steps"],
+        int,
+        4,
+    )
+    optional["intent_null_prob"] = _get_param(
+        params,
+        ["intent_null_prob", "intent-null-prob"],
+        float,
+        0.2,
+    )
+    optional["intent_visible_to_defense_prob"] = _get_param(
+        params,
+        ["intent_visible_to_defense_prob", "intent-visible-to-defense-prob"],
+        float,
+        0.0,
+    )
+    optional["enable_defense_intent_learning"] = _get_param(
+        params,
+        ["enable_defense_intent_learning", "enable-defense-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["defense_intent_null_prob"] = _get_param(
+        params,
+        ["defense_intent_null_prob", "defense-intent-null-prob"],
+        float,
+        1.0,
+    )
+    optional["intent_obs_mode"] = _get_param(
+        params,
+        ["intent_obs_mode", "intent-obs-mode"],
+        str,
+        "private_offense",
+    )
 
     # Reward parameters (to ensure evaluation uses the same reward shaping)
     optional["pass_reward"] = _get_param(
@@ -299,11 +349,60 @@ def get_mlflow_params(
     optional["pass_mode"] = _get_param(
         params, ["pass_mode", "pass-mode"], str, "directional"
     )
+    optional["use_set_obs"] = _get_param(
+        params,
+        ["use_set_obs", "use-set-obs"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["mirror_episode_prob"] = _get_param(
+        params,
+        ["mirror_episode_prob", "mirror-episode-prob"],
+        float,
+        0.0,
+    )
     optional["enable_pass_gating"] = _get_param(
         params,
         ["enable_pass_gating", "enable-pass-gating"],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         True,
+    )
+    # Opponent sampling / self-play parameters. These are needed by offline
+    # analysis tools to reproduce training-time rollout distributions.
+    optional["deterministic_opponent"] = _get_param(
+        params,
+        ["deterministic_opponent", "deterministic-opponent"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["per_env_opponent_sampling"] = _get_param(
+        params,
+        ["per_env_opponent_sampling", "per-env-opponent-sampling"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    optional["opponent_pool_size"] = _get_param(
+        params,
+        [
+            "opponent_pool_size",
+            "opponent-pool-size",
+            "opponent_sample_k",
+            "opponent-sample-k",
+        ],
+        int,
+        10,
+    )
+    optional["opponent_pool_beta"] = _get_param(
+        params,
+        ["opponent_pool_beta", "opponent-pool-beta"],
+        float,
+        0.7,
+    )
+    optional["opponent_pool_exploration"] = _get_param(
+        params,
+        ["opponent_pool_exploration", "opponent-pool-exploration"],
+        float,
+        0.15,
     )
     # Illegal action policy
     optional["illegal_action_policy"] = _get_param(
@@ -555,5 +654,405 @@ def get_mlflow_training_params(
     training_params["pass_mode"] = _get_param(
         params, ["pass_mode", "pass-mode"], str, "directional"
     )
+    training_params["intent_diversity_enabled"] = _get_param(
+        params,
+        ["intent_diversity_enabled", "intent-diversity-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["num_intents"] = _get_param(
+        params,
+        ["num_intents", "num-intents"],
+        int,
+        0,
+    )
+    training_params["intent_commitment_steps"] = _get_param(
+        params,
+        ["intent_commitment_steps", "intent-commitment-steps"],
+        int,
+        4,
+    )
+    training_params["intent_obs_mode"] = _get_param(
+        params,
+        ["intent_obs_mode", "intent-obs-mode"],
+        str,
+        "private_offense",
+    )
+    training_params["intent_null_prob"] = _get_param(
+        params,
+        ["intent_null_prob", "intent-null-prob"],
+        float,
+        0.2,
+    )
+    training_params["intent_null_prob_end"] = _get_param(
+        params,
+        ["intent_null_prob_end", "intent-null-prob-end"],
+        float,
+        None,
+    )
+    training_params["intent_visible_to_defense_prob"] = _get_param(
+        params,
+        ["intent_visible_to_defense_prob", "intent-visible-to-defense-prob"],
+        float,
+        0.0,
+    )
+    training_params["intent_visible_to_defense_prob_end"] = _get_param(
+        params,
+        [
+            "intent_visible_to_defense_prob_end",
+            "intent-visible-to-defense-prob-end",
+        ],
+        float,
+        None,
+    )
+    training_params["enable_defense_intent_learning"] = _get_param(
+        params,
+        ["enable_defense_intent_learning", "enable-defense-intent-learning"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["defense_intent_null_prob"] = _get_param(
+        params,
+        ["defense_intent_null_prob", "defense-intent-null-prob"],
+        float,
+        1.0,
+    )
+    training_params["intent_diversity_beta_target"] = _get_param(
+        params,
+        ["intent_diversity_beta_target", "intent-diversity-beta-target"],
+        float,
+        0.05,
+    )
+    training_params["intent_diversity_warmup_steps"] = _get_param(
+        params,
+        ["intent_diversity_warmup_steps", "intent-diversity-warmup-steps"],
+        int,
+        1_000_000,
+    )
+    training_params["intent_diversity_ramp_steps"] = _get_param(
+        params,
+        ["intent_diversity_ramp_steps", "intent-diversity-ramp-steps"],
+        int,
+        1_000_000,
+    )
+    training_params["intent_diversity_clip"] = _get_param(
+        params,
+        ["intent_diversity_clip", "intent-diversity-clip"],
+        float,
+        2.0,
+    )
+    training_params["task_reward_scale_start"] = _get_param(
+        params,
+        ["schedule_task_reward_scale_start", "task_reward_scale_start", "task-reward-scale-start"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None,
+    )
+    training_params["task_reward_scale_end"] = _get_param(
+        params,
+        ["schedule_task_reward_scale_end", "task_reward_scale_end", "task-reward-scale-end"],
+        lambda v: None if v == "" or v == "None" else float(v),
+        None,
+    )
+    training_params["task_reward_scale_warmup_steps"] = _get_param(
+        params,
+        [
+            "schedule_task_reward_scale_warmup_steps",
+            "task_reward_scale_warmup_steps",
+            "task-reward-scale-warmup-steps",
+        ],
+        int,
+        0,
+    )
+    training_params["task_reward_scale_ramp_steps"] = _get_param(
+        params,
+        [
+            "schedule_task_reward_scale_ramp_steps",
+            "task_reward_scale_ramp_steps",
+            "task-reward-scale-ramp-steps",
+        ],
+        int,
+        1,
+    )
+    training_params["start_template_enabled"] = _get_param(
+        params,
+        ["start_template_enabled", "start-template-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["start_template_library"] = _get_param(
+        params,
+        ["start_template_library", "start-template-library"],
+        lambda v: None if v in ("", "None", "null") else str(v),
+        None,
+    )
+    training_params["start_template_library_artifact_path"] = _get_param(
+        params,
+        [
+            "start_template_library_artifact_path",
+            "start-template-library-artifact-path",
+        ],
+        lambda v: None if v in ("", "None", "null") else str(v),
+        None,
+    )
+    training_params["start_template_library_template_count"] = _get_param(
+        params,
+        [
+            "start_template_library_template_count",
+            "start-template-library-template-count",
+        ],
+        lambda v: None if v in ("", "None", "null") else int(v),
+        None,
+    )
+    training_params["start_template_prob"] = _get_param(
+        params,
+        ["start_template_prob", "start-template-prob"],
+        float,
+        0.0,
+    )
+    training_params["start_template_jitter_scale"] = _get_param(
+        params,
+        ["start_template_jitter_scale", "start-template-jitter-scale"],
+        float,
+        1.0,
+    )
+    training_params["start_template_mirror_prob"] = _get_param(
+        params,
+        ["start_template_mirror_prob", "start-template-mirror-prob"],
+        float,
+        0.5,
+    )
+    training_params["start_template_strict"] = _get_param(
+        params,
+        ["start_template_strict", "start-template-strict"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_disc_encoder_type"] = _get_param(
+        params,
+        ["intent_disc_encoder_type", "intent-disc-encoder-type"],
+        str,
+        "mlp_mean",
+    )
+    training_params["intent_disc_step_dim"] = _get_param(
+        params,
+        ["intent_disc_step_dim", "intent-disc-step-dim"],
+        int,
+        64,
+    )
+    training_params["intent_disc_hidden_dim"] = _get_param(
+        params,
+        ["intent_disc_hidden_dim", "intent-disc-hidden-dim"],
+        int,
+        128,
+    )
+    training_params["intent_disc_dropout"] = _get_param(
+        params,
+        ["intent_disc_dropout", "intent-disc-dropout"],
+        float,
+        0.1,
+    )
+    training_params["intent_disc_lr"] = _get_param(
+        params,
+        ["intent_disc_lr", "intent-disc-lr"],
+        float,
+        3e-4,
+    )
+    training_params["intent_disc_batch_size"] = _get_param(
+        params,
+        ["intent_disc_batch_size", "intent-disc-batch-size"],
+        int,
+        256,
+    )
+    training_params["intent_disc_updates_per_rollout"] = _get_param(
+        params,
+        ["intent_disc_updates_per_rollout", "intent-disc-updates-per-rollout"],
+        int,
+        2,
+    )
+    training_params["intent_disc_max_obs_dim"] = _get_param(
+        params,
+        ["intent_disc_max_obs_dim", "intent-disc-max-obs-dim"],
+        int,
+        256,
+    )
+    training_params["intent_disc_max_action_dim"] = _get_param(
+        params,
+        ["intent_disc_max_action_dim", "intent-disc-max-action-dim"],
+        int,
+        16,
+    )
+    training_params["disc_eval_batch_output"] = _get_param(
+        params,
+        ["disc_eval_batch_output", "disc-eval-batch-output"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_disc_eval_holdout_fraction"] = _get_param(
+        params,
+        [
+            "intent_disc_eval_holdout_fraction",
+            "intent-disc-eval-holdout-fraction",
+        ],
+        float,
+        0.25,
+    )
+    training_params["intent_disc_current_policy_only"] = _get_param(
+        params,
+        [
+            "intent_disc_current_policy_only",
+            "intent-disc-current-policy-only",
+        ],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        True,
+    )
+    training_params["intent_selector_enabled"] = _get_param(
+        params,
+        ["intent_selector_enabled", "intent-selector-enabled"],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_selector_hidden_dim"] = _get_param(
+        params,
+        ["intent_selector_hidden_dim", "intent-selector-hidden-dim"],
+        int,
+        64,
+    )
+    training_params["intent_selector_mode"] = _get_param(
+        params,
+        ["intent_selector_mode", "intent-selector-mode"],
+        str,
+        "callback",
+    )
+    training_params["intent_selector_alpha_start"] = _get_param(
+        params,
+        ["intent_selector_alpha_start", "intent-selector-alpha-start"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_alpha_end"] = _get_param(
+        params,
+        ["intent_selector_alpha_end", "intent-selector-alpha-end"],
+        float,
+        1.0,
+    )
+    training_params["intent_selector_alpha_warmup_steps"] = _get_param(
+        params,
+        [
+            "intent_selector_alpha_warmup_steps",
+            "intent-selector-alpha-warmup-steps",
+        ],
+        int,
+        0,
+    )
+    training_params["intent_selector_alpha_ramp_steps"] = _get_param(
+        params,
+        ["intent_selector_alpha_ramp_steps", "intent-selector-alpha-ramp-steps"],
+        int,
+        1,
+    )
+    training_params["intent_selector_eps_start"] = _get_param(
+        params,
+        ["intent_selector_eps_start", "intent-selector-eps-start"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_eps_end"] = _get_param(
+        params,
+        ["intent_selector_eps_end", "intent-selector-eps-end"],
+        float,
+        0.0,
+    )
+    training_params["intent_selector_eps_warmup_steps"] = _get_param(
+        params,
+        ["intent_selector_eps_warmup_steps", "intent-selector-eps-warmup-steps"],
+        int,
+        0,
+    )
+    training_params["intent_selector_eps_ramp_steps"] = _get_param(
+        params,
+        ["intent_selector_eps_ramp_steps", "intent-selector-eps-ramp-steps"],
+        int,
+        1,
+    )
+    training_params["intent_selector_entropy_coef"] = _get_param(
+        params,
+        ["intent_selector_entropy_coef", "intent-selector-entropy-coef"],
+        float,
+        0.01,
+    )
+    training_params["intent_selector_usage_reg_coef"] = _get_param(
+        params,
+        [
+            "intent_selector_usage_reg_coef",
+            "intent-selector-usage-reg-coef",
+        ],
+        float,
+        0.01,
+    )
+    training_params["intent_selector_value_coef"] = _get_param(
+        params,
+        ["intent_selector_value_coef", "intent-selector-value-coef"],
+        float,
+        0.5,
+    )
+    training_params["intent_selector_multiselect_enabled"] = _get_param(
+        params,
+        [
+            "intent_selector_multiselect_enabled",
+            "intent-selector-multiselect-enabled",
+        ],
+        lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        False,
+    )
+    training_params["intent_selector_min_play_steps"] = _get_param(
+        params,
+        ["intent_selector_min_play_steps", "intent-selector-min-play-steps"],
+        int,
+        3,
+    )
+    training_params["intent_disc_lambda_shot"] = _get_param(
+        params,
+        ["intent_disc_lambda_shot", "intent-disc-lambda-shot"],
+        float,
+        0.0,
+    )
+    training_params["intent_disc_lambda_q"] = _get_param(
+        params,
+        ["intent_disc_lambda_q", "intent-disc-lambda-q"],
+        float,
+        0.0,
+    )
 
     return training_params
+
+
+def get_mlflow_start_template_library(
+    client: mlflow.tracking.MlflowClient, run_id: str
+) -> dict | None:
+    """Fetch and validate the persisted start-template library artifact for a run."""
+    training_params = get_mlflow_training_params(client, run_id)
+    artifact_path = training_params.get("start_template_library_artifact_path")
+    if not artifact_path:
+        return None
+
+    run = client.get_run(run_id)
+    players_per_side = _get_param(
+        run.data.params,
+        ["players"],
+        int,
+        3,
+    )
+
+    try:
+        from basketworld.utils.start_templates import load_start_template_library
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = client.download_artifacts(run_id, artifact_path, tmpdir)
+            return load_start_template_library(
+                local_path,
+                players_per_side=int(players_per_side or 3),
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load start template library artifact '{artifact_path}' for run {run_id}: {exc}"
+        ) from exc

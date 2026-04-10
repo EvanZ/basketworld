@@ -688,13 +688,16 @@ def main(args):
 
         # Log artifacts to MLflow
         if not args.no_log:
-            with mlflow.start_run(run_id=args.run_id):
-                mlflow.log_artifact(elo_csv_path, artifact_path="elo_analysis")
-                mlflow.log_artifact(matchup_csv_path, artifact_path="elo_analysis")
-                mlflow.log_artifact(plot_path, artifact_path="elo_analysis")
-                if heatmap_path:
-                    mlflow.log_artifact(heatmap_path, artifact_path="elo_analysis")
-                print(f"\nLogged artifacts to MLflow run {args.run_id}")
+            client.log_artifact(args.run_id, elo_csv_path, artifact_path="elo_analysis")
+            client.log_artifact(
+                args.run_id, matchup_csv_path, artifact_path="elo_analysis"
+            )
+            client.log_artifact(args.run_id, plot_path, artifact_path="elo_analysis")
+            if heatmap_path:
+                client.log_artifact(
+                    args.run_id, heatmap_path, artifact_path="elo_analysis"
+                )
+            print(f"\nLogged artifacts to MLflow run {args.run_id}")
 
 
 if __name__ == "__main__":

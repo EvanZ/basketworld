@@ -9,9 +9,11 @@ With dual policy enabled, the actor networks are also split to allow offense and
 to learn fundamentally different action selection strategies.
 """
 
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+
 import torch
 import torch.nn as nn
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from gymnasium import spaces
 from stable_baselines3.common.policies import MultiInputActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, CombinedExtractor
@@ -66,6 +68,8 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
         # This allows _get_action_dist_from_latent to access role_flags
         # without changing its method signature
         self._current_role_flags: Optional[torch.Tensor] = None
+        self._runtime_intent_override_indices: Optional[torch.Tensor] = None
+        self._runtime_intent_override_gate: Optional[torch.Tensor] = None
         
         # Initialize parent class
         super().__init__(
@@ -87,6 +91,160 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
+
+    def _iter_runtime_conditioned_extractors(self) -> list[BaseFeaturesExtractor]:
+        extractors: list[BaseFeaturesExtractor] = []
+        for attr_name in ("features_extractor", "pi_features_extractor", "vf_features_extractor"):
+            extractor = getattr(self, attr_name, None)
+            if extractor is None:
+                continue
+            if any(existing is extractor for existing in extractors):
+                continue
+            extractors.append(extractor)
+        return extractors
+
+    def _extract_optional_obs_tensor(
+        self,
+        obs: Any,
+        key: str,
+        *,
+        batch_size: int,
+        dtype: torch.dtype,
+        default: float,
+    ) -> torch.Tensor:
+        try:
+            if hasattr(obs, "__getitem__") and hasattr(obs, "keys") and key in obs:
+                value = obs[key]
+                if not isinstance(value, torch.Tensor):
+                    value = torch.as_tensor(value, dtype=dtype)
+                else:
+                    value = value.to(dtype=dtype)
+                if value.dim() == 0:
+                    value = value.unsqueeze(0).unsqueeze(-1)
+                elif value.dim() == 1:
+                    value = value.unsqueeze(-1)
+                else:
+                    value = value.reshape(value.shape[0], -1)
+                if value.shape[0] == batch_size:
+                    return value[:, :1]
+                if value.shape[0] == 1 and batch_size > 1:
+                    return value[:, :1].expand(batch_size, -1)
+        except Exception:
+            pass
+        return torch.full((batch_size, 1), float(default), dtype=dtype)
+
+    def _extract_intent_runtime_fields(
+        self,
+        obs: Any,
+        *,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_intents = 1
+        try:
+            for extractor in self._iter_runtime_conditioned_extractors():
+                if hasattr(extractor, "num_intents"):
+                    num_intents = max(1, int(getattr(extractor, "num_intents")))
+                    break
+        except Exception:
+            num_intents = 1
+
+        intent_index = self._extract_optional_obs_tensor(
+            obs,
+            "intent_index",
+            batch_size=batch_size,
+            dtype=torch.float32,
+            default=0.0,
+        )
+        intent_active = self._extract_optional_obs_tensor(
+            obs,
+            "intent_active",
+            batch_size=batch_size,
+            dtype=torch.float32,
+            default=0.0,
+        )
+        intent_visible = self._extract_optional_obs_tensor(
+            obs,
+            "intent_visible",
+            batch_size=batch_size,
+            dtype=torch.float32,
+            default=1.0,
+        )
+
+        indices = torch.round(intent_index.squeeze(-1)).long()
+        indices = indices.clamp(min=0, max=max(0, num_intents - 1))
+        gate = (
+            (intent_active.squeeze(-1) > 0.5).to(dtype=torch.float32)
+            * (intent_visible.squeeze(-1) > 0.5).to(dtype=torch.float32)
+        )
+        return indices, gate
+
+    def set_runtime_intent_override(
+        self,
+        intent_indices: Any,
+        intent_gate: Optional[Any] = None,
+    ) -> None:
+        try:
+            indices = torch.as_tensor(intent_indices, dtype=torch.long)
+            if indices.dim() == 0:
+                indices = indices.unsqueeze(0)
+            self._runtime_intent_override_indices = indices.reshape(-1)
+        except Exception:
+            self._runtime_intent_override_indices = None
+
+        if intent_gate is None:
+            self._runtime_intent_override_gate = None
+            return
+        try:
+            gate = torch.as_tensor(intent_gate, dtype=torch.float32)
+            if gate.dim() == 0:
+                gate = gate.unsqueeze(0)
+            self._runtime_intent_override_gate = gate.reshape(-1)
+        except Exception:
+            self._runtime_intent_override_gate = None
+
+    def clear_runtime_intent_override(self) -> None:
+        self._runtime_intent_override_indices = None
+        self._runtime_intent_override_gate = None
+
+    def _prepare_runtime_conditioning(self, obs: Any) -> torch.Tensor:
+        role_flags = self._extract_role_flag(obs)
+        self._current_role_flags = role_flags
+
+        batch_size = int(role_flags.shape[0])
+        use_override = (
+            self._runtime_intent_override_indices is not None
+            and int(self._runtime_intent_override_indices.numel()) == batch_size
+        )
+        if use_override:
+            intent_indices = self._runtime_intent_override_indices
+            intent_gate = self._runtime_intent_override_gate
+            if intent_gate is None:
+                intent_gate = torch.ones(batch_size, dtype=torch.float32)
+        else:
+            intent_indices, intent_gate = self._extract_intent_runtime_fields(
+                obs,
+                batch_size=batch_size,
+            )
+        for extractor in self._iter_runtime_conditioned_extractors():
+            setter = getattr(extractor, "set_runtime_intent_state", None)
+            if callable(setter):
+                setter(intent_indices=intent_indices, intent_gate=intent_gate)
+        return role_flags
+
+    def _clear_runtime_conditioning(self) -> None:
+        self._current_role_flags = None
+        for extractor in self._iter_runtime_conditioned_extractors():
+            clearer = getattr(extractor, "clear_runtime_intent_state", None)
+            if callable(clearer):
+                clearer()
+
+    @contextmanager
+    def runtime_conditioning_context(self, obs: Any):
+        self._prepare_runtime_conditioning(obs)
+        try:
+            yield
+        finally:
+            self._clear_runtime_conditioning()
 
     def _build_mlp_extractor(self) -> None:
         """
@@ -161,12 +319,7 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value (using appropriate critic), log probability of the action
         """
-        # Extract role_flag BEFORE feature extraction
-        role_flags = self._extract_role_flag(obs)
-        
-        # Store role_flags for use in _get_action_dist_from_latent
-        self._current_role_flags = role_flags
-        
+        role_flags = self._prepare_runtime_conditioning(obs)
         try:
             # Preprocess observation if needed
             features = self.extract_features(obs)
@@ -188,8 +341,7 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
             
             return actions, values, log_prob
         finally:
-            # Clear stored role_flags
-            self._current_role_flags = None
+            self._clear_runtime_conditioning()
 
     def _extract_role_flag(self, obs):
         """
@@ -302,18 +454,19 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
         :param obs: Observation
         :return: the estimated values.
         """
-        # Extract role_flag BEFORE feature extraction
-        role_flags = self._extract_role_flag(obs)
-        
-        features = self.extract_features(obs)
-        
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        
-        return self._get_value_from_latent(latent_vf, role_flags)
+        role_flags = self._prepare_runtime_conditioning(obs)
+        try:
+            features = self.extract_features(obs)
+
+            if self.share_features_extractor:
+                latent_pi, latent_vf = self.mlp_extractor(features)
+            else:
+                pi_features, vf_features = features
+                latent_vf = self.mlp_extractor.forward_critic(vf_features)
+
+            return self._get_value_from_latent(latent_vf, role_flags)
+        finally:
+            self._clear_runtime_conditioning()
 
     def evaluate_actions(
         self, obs: torch.Tensor, actions: torch.Tensor
@@ -326,12 +479,7 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
         :param actions: Actions
         :return: estimated value, log likelihood of taking those actions, entropy of the action distribution.
         """
-        # Extract role_flag BEFORE feature extraction
-        role_flags = self._extract_role_flag(obs)
-        
-        # Store role_flags for use in _get_action_dist_from_latent
-        self._current_role_flags = role_flags
-        
+        role_flags = self._prepare_runtime_conditioning(obs)
         try:
             # Preprocess observation if needed
             features = self.extract_features(obs)
@@ -350,8 +498,7 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
             
             return values, log_prob, entropy
         finally:
-            # Clear stored role_flags
-            self._current_role_flags = None
+            self._clear_runtime_conditioning()
 
     def get_distribution(self, obs: torch.Tensor) -> Distribution:
         """
@@ -363,12 +510,7 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
         :param obs: Observation
         :return: the action distribution.
         """
-        # Extract role_flag BEFORE feature extraction
-        role_flags = self._extract_role_flag(obs)
-        
-        # Store role_flags for use in _get_action_dist_from_latent
-        self._current_role_flags = role_flags
-        
+        self._prepare_runtime_conditioning(obs)
         try:
             features = self.extract_features(obs)
             
@@ -380,5 +522,4 @@ class DualCriticActorCriticPolicy(MultiInputActorCriticPolicy):
             
             return self._get_action_dist_from_latent(latent_pi)
         finally:
-            # Clear stored role_flags
-            self._current_role_flags = None
+            self._clear_runtime_conditioning()

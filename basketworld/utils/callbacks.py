@@ -3,11 +3,34 @@ import os
 import csv
 import tempfile
 import random
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import mlflow
+import torch
+import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
+
+from basketworld.utils.intent_discovery import (
+    CompletedIntentEpisode,
+    IntentDiscriminator,
+    IntentEpisodeBuffer,
+    IntentStepExample,
+    IntentTransition,
+    RunningMeanStd,
+    build_padded_episode_batch,
+    build_step_observation_batch,
+    compute_episode_embeddings,
+    extract_set_observation_for_env,
+    extract_action_features_for_env,
+    flatten_observation_for_env,
+)
+from basketworld.utils.intent_policy_sensitivity import (
+    clone_observation_dict,
+    compute_policy_sensitivity_metrics,
+    extract_single_env_observation,
+    patch_intent_in_observation,
+)
 
 
 class TimingCallback(BaseCallback):
@@ -303,7 +326,11 @@ class MLflowCallback(BaseCallback):
                     rejected_move_occupied,
                     step=global_step,
                 )
-                mlflow.log_metric(f"{self.team_name} PPP", ppp_avg, step=global_step)
+                mlflow.log_metric(
+                    _offense_possession_metric_name(self.team_name, "PPP"),
+                    ppp_avg,
+                    step=global_step,
+                )
                 # Log current pass logit bias if custom policy exposes it
                 try:
                     pass_bias = float(
@@ -409,6 +436,13 @@ class GradNormCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         return True
+
+
+def _offense_possession_metric_name(team_label: str, metric_name: str) -> str:
+    """Name offense-possession metrics clearly when grouped under defense episodes."""
+    if str(team_label).strip().lower() == "defense":
+        return f"{team_label} {metric_name} Allowed"
+    return f"{team_label} {metric_name}"
 
 
 class AccumulativeMetricsCallback(BaseCallback):
@@ -590,12 +624,18 @@ class AccumulativeMetricsCallback(BaseCallback):
         expected_ppp_mean = (
             float(np.mean(expected_ppp_values)) if expected_ppp_values else 0.0
         )
-        mlflow.log_metric(f"{team_label} PPP", ppp_mean, step=global_step)
         mlflow.log_metric(
-            f"{team_label} Expected PPP", expected_ppp_mean, step=global_step
+            _offense_possession_metric_name(team_label, "PPP"),
+            ppp_mean,
+            step=global_step,
         )
         mlflow.log_metric(
-            f"{team_label} Expected Points / Episode",
+            _offense_possession_metric_name(team_label, "Expected PPP"),
+            expected_ppp_mean,
+            step=global_step,
+        )
+        mlflow.log_metric(
+            _offense_possession_metric_name(team_label, "Expected Points / Episode"),
             mean_key("expected_points"),
             step=global_step,
         )
@@ -637,6 +677,2797 @@ class AccumulativeMetricsCallback(BaseCallback):
         except Exception:
             pass
 
+
+
+class IntentDiversityCallback(BaseCallback):
+    """DIAYN-style diversity shaping for latent intent episodes.
+
+    This callback is fully gated by `enabled`; when disabled it is a no-op.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        beta_target: float = 0.05,
+        warmup_steps: int = 1_000_000,
+        ramp_steps: int = 1_000_000,
+        bonus_clip: float = 2.0,
+        disc_lr: float = 3e-4,
+        disc_batch_size: int = 256,
+        disc_updates_per_rollout: int = 2,
+        disc_hidden_dim: int = 128,
+        disc_dropout: float = 0.1,
+        disc_encoder_type: str = "mlp_mean",
+        disc_step_dim: int = 64,
+        disc_console_log_every_rollouts: int = 0,
+        max_obs_dim: int = 256,
+        max_action_dim: int = 16,
+        disc_include_shot_clock: bool = True,
+        disc_include_pressure_exposure: bool = True,
+        disc_lambda_shot: float = 0.0,
+        disc_lambda_q: float = 0.0,
+        disc_eval_holdout_fraction: float = 0.25,
+        disc_current_policy_only: bool = True,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.beta_target = float(max(0.0, beta_target))
+        self.warmup_steps = int(max(0, warmup_steps))
+        self.ramp_steps = int(max(1, ramp_steps))
+        self.bonus_clip = float(max(0.0, bonus_clip))
+        self.disc_lr = float(max(1e-8, disc_lr))
+        self.disc_batch_size = int(max(1, disc_batch_size))
+        self.disc_updates_per_rollout = int(max(1, disc_updates_per_rollout))
+        self.disc_hidden_dim = int(max(16, disc_hidden_dim))
+        self.disc_dropout = float(max(0.0, disc_dropout))
+        self.disc_encoder_type = str(disc_encoder_type).strip().lower()
+        self.disc_step_dim = int(max(8, disc_step_dim))
+        self.disc_console_log_every_rollouts = int(
+            max(0, disc_console_log_every_rollouts)
+        )
+        self.max_obs_dim = int(max(8, max_obs_dim))
+        self.max_action_dim = int(max(1, max_action_dim))
+        self.disc_include_shot_clock = bool(disc_include_shot_clock)
+        self.disc_include_pressure_exposure = bool(disc_include_pressure_exposure)
+        self.disc_lambda_shot = float(max(0.0, disc_lambda_shot))
+        self.disc_lambda_q = float(max(0.0, disc_lambda_q))
+        self.disc_eval_holdout_fraction = float(
+            min(0.9, max(0.0, disc_eval_holdout_fraction))
+        )
+        self.disc_current_policy_only = bool(disc_current_policy_only)
+
+        self._rollout_step_idx = 0
+        self._rollout_counter = 0
+        self._episodes = IntentEpisodeBuffer()
+        self._step_examples: list[IntentStepExample] = []
+        self._step_episode_id_by_env: dict[int, int] = {}
+        self._next_step_episode_id = 0
+        self._bonus_stats = RunningMeanStd()
+        self._disc: Optional[IntentDiscriminator] = None
+        self._disc_opt: Optional[torch.optim.Optimizer] = None
+        self._device = torch.device("cpu")
+        self._warned_recompute = False
+        self._last_disc_loss = 0.0
+        self._last_disc_acc = 0.0
+        self._last_disc_trainbatch_acc: Optional[float] = None
+        self._last_disc_trainbatch_auc: Optional[float] = None
+        self._last_disc_eval_acc: Optional[float] = None
+        self._last_disc_auc: Optional[float] = None
+        self._last_disc_pass_ms = 0.0
+        self._last_disc_shot_end_loss = 0.0
+        self._last_disc_shot_quality_loss = 0.0
+        self._defense_unknown_baseline_ppp: Optional[float] = None
+        self._pending_disc_restore_payload: Optional[dict[str, Any]] = None
+        self._pending_disc_restore_source: Optional[str] = None
+        self._latest_disc_eval_batch: Optional[dict[str, Any]] = None
+        self._latest_disc_eval_batch_kind: Optional[str] = None
+        self._disc_set_token_dim = 0
+        self._disc_set_global_dim = 0
+        self._disc_set_heads = 0
+        self._disc_set_cls_tokens = 1
+
+    def _on_training_start(self) -> None:
+        try:
+            policy = getattr(self.model, "policy", None)
+            if policy is not None and hasattr(policy, "device"):
+                self._device = torch.device(policy.device)
+        except Exception:
+            self._device = torch.device("cpu")
+        if self._pending_disc_restore_payload is not None:
+            payload = self._pending_disc_restore_payload
+            source = self._pending_disc_restore_source or "queued payload"
+            self._pending_disc_restore_payload = None
+            self._pending_disc_restore_source = None
+            restored = self.restore_discriminator_checkpoint_payload(
+                payload, source=source
+            )
+            if not restored:
+                print(
+                    f"Warning: failed to restore discriminator checkpoint from {source}; "
+                    "starting intent discriminator from scratch."
+                )
+
+    def _on_rollout_start(self) -> None:
+        self._rollout_step_idx = 0
+        self._rollout_counter += 1
+        self._step_examples = []
+
+    def _is_step_discriminator_mode(self) -> bool:
+        return self.disc_encoder_type == "set_step"
+
+    def _should_console_log_disc(self) -> bool:
+        return self.disc_console_log_every_rollouts > 0 and (
+            self._rollout_counter % self.disc_console_log_every_rollouts
+        ) == 0
+
+    def _beta_current(self) -> float:
+        t = int(getattr(self.model, "num_timesteps", 0))
+        if t < self.warmup_steps:
+            return 0.0
+        if self.ramp_steps <= 0:
+            return float(self.beta_target)
+        progress = min(1.0, max(0.0, (t - self.warmup_steps) / float(self.ramp_steps)))
+        return float(self.beta_target * progress)
+
+    @staticmethod
+    def _extract_scalar_from_obs(obs_payload, key: str, env_idx: int, default: float = 0.0) -> float:
+        try:
+            if not isinstance(obs_payload, dict):
+                return float(default)
+            if key not in obs_payload:
+                return float(default)
+            arr = np.asarray(obs_payload[key], dtype=np.float32)
+            if arr.ndim == 0:
+                return float(arr)
+            if arr.shape[0] <= int(env_idx):
+                return float(default)
+            return float(arr[int(env_idx)].reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    def _current_step_episode_id(self, env_idx: int) -> int:
+        env_key = int(env_idx)
+        if env_key not in self._step_episode_id_by_env:
+            self._step_episode_id_by_env[env_key] = int(self._next_step_episode_id)
+            self._next_step_episode_id += 1
+        return int(self._step_episode_id_by_env[env_key])
+
+    def _advance_step_episode_id(self, env_idx: int) -> None:
+        env_key = int(env_idx)
+        self._step_episode_id_by_env[env_key] = int(self._next_step_episode_id)
+        self._next_step_episode_id += 1
+
+    def _build_transition(
+        self, obs_payload, actions_payload, info: dict, env_idx: int
+    ) -> IntentTransition:
+        obs_feat = flatten_observation_for_env(obs_payload, env_idx)
+        act_feat = extract_action_features_for_env(actions_payload, env_idx)
+        feat = np.zeros(self.max_obs_dim + self.max_action_dim, dtype=np.float32)
+        obs_take = min(self.max_obs_dim, obs_feat.shape[0])
+        if obs_take > 0:
+            feat[:obs_take] = obs_feat[:obs_take]
+        act_take = min(self.max_action_dim, act_feat.shape[0])
+        if act_take > 0:
+            start = self.max_obs_dim
+            feat[start : start + act_take] = act_feat[:act_take]
+
+        role_flag = self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0)
+        intent_active = float(info.get("intent_active", np.nan))
+        if not np.isfinite(intent_active):
+            intent_active = self._extract_scalar_from_obs(
+                obs_payload,
+                "intent_active",
+                env_idx,
+                default=0.0,
+            )
+        intent_index = float(info.get("intent_index", np.nan))
+        if not np.isfinite(intent_index):
+            intent_index = self._extract_scalar_from_obs(
+                obs_payload,
+                "intent_index",
+                env_idx,
+                default=0.0,
+            )
+
+        return IntentTransition(
+            feature=feat,
+            buffer_step_idx=int(self._rollout_step_idx),
+            env_idx=int(env_idx),
+            role_flag=float(role_flag),
+            intent_active=bool(intent_active > 0.5),
+            intent_index=int(max(0, min(self.num_intents - 1, int(intent_index)))),
+        )
+
+    def _build_step_example(
+        self,
+        obs_payload: Any,
+        info: dict,
+        env_idx: int,
+        *,
+        episode_id: int,
+    ) -> Optional[IntentStepExample]:
+        obs_dict = extract_set_observation_for_env(obs_payload, env_idx)
+        if obs_dict is None:
+            return None
+        globals_arr = np.asarray(obs_dict.get("globals"), dtype=np.float32)
+        if globals_arr.ndim == 1 and globals_arr.shape[0] >= 2:
+            globals_arr = globals_arr.copy()
+            if not self.disc_include_shot_clock:
+                globals_arr[0] = 0.0
+            if not self.disc_include_pressure_exposure:
+                globals_arr[1] = 0.0
+            obs_dict["globals"] = globals_arr
+        role_flag = self._extract_scalar_from_obs(
+            obs_payload, "role_flag", env_idx, default=0.0
+        )
+        intent_active = float(info.get("intent_active", np.nan))
+        if not np.isfinite(intent_active):
+            return None
+        intent_index = float(info.get("intent_index", np.nan))
+        if not np.isfinite(intent_index):
+            return None
+        shot_end = 0.0
+        shot_quality = 0.0
+        shot_quality_mask = 0.0
+        try:
+            action_results = info.get("action_results", {})
+            shots = action_results.get("shots", {}) if isinstance(action_results, dict) else {}
+            if isinstance(shots, dict) and len(shots) > 0:
+                shot_end = 1.0
+                for shot_result in shots.values():
+                    if isinstance(shot_result, dict) and "expected_points" in shot_result:
+                        shot_quality = float(shot_result.get("expected_points", 0.0) or 0.0)
+                        shot_quality_mask = 1.0
+                        break
+        except Exception:
+            pass
+        return IntentStepExample(
+            obs=obs_dict,
+            buffer_step_idx=int(self._rollout_step_idx),
+            env_idx=int(env_idx),
+            role_flag=float(role_flag),
+            intent_active=bool(intent_active > 0.5),
+            intent_index=int(max(0, min(self.num_intents - 1, int(intent_index)))),
+            episode_id=int(episode_id),
+            training_team=str(info.get("training_team", "") or ""),
+            boundary_reason=str(info.get("intent_segment_boundary_reason", "") or ""),
+            start_template_id=str(info.get("start_template_id", "") or ""),
+            start_template_mirrored=bool(info.get("start_template_mirrored", False)),
+            shot_end=float(shot_end),
+            shot_quality=float(shot_quality),
+            shot_quality_mask=float(shot_quality_mask),
+        )
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        actions = self.locals.get("actions", None)
+        obs_payload = self.locals.get("new_obs", None)
+        if obs_payload is None:
+            obs_payload = self.locals.get("obs", None)
+
+        n_envs = len(infos) if isinstance(infos, (list, tuple)) else 0
+        if self._is_step_discriminator_mode():
+            for env_idx in range(n_envs):
+                info = infos[env_idx] or {}
+                episode_id = self._current_step_episode_id(env_idx)
+                ex = self._build_step_example(
+                    obs_payload,
+                    info,
+                    env_idx,
+                    episode_id=episode_id,
+                )
+                if ex is None:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
+                    continue
+                if not ex.intent_active:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
+                    continue
+                if ex.role_flag <= 0.0:
+                    if env_idx < len(dones) and bool(dones[env_idx]):
+                        self._advance_step_episode_id(env_idx)
+                    continue
+                if self.disc_current_policy_only:
+                    team = str(ex.training_team or "").strip().lower()
+                    if team and team != "offense":
+                        if env_idx < len(dones) and bool(dones[env_idx]):
+                            self._advance_step_episode_id(env_idx)
+                        continue
+                self._step_examples.append(ex)
+                if env_idx < len(dones) and bool(dones[env_idx]):
+                    self._advance_step_episode_id(env_idx)
+            self._rollout_step_idx += 1
+            return True
+
+        for env_idx in range(n_envs):
+            info = infos[env_idx] or {}
+            tr = self._build_transition(obs_payload, actions, info, env_idx)
+            current_intent = self._episodes.current_intent_index(env_idx)
+            if (
+                current_intent is not None
+                and current_intent != int(tr.intent_index)
+                and not (env_idx < len(dones) and bool(dones[env_idx]))
+            ):
+                self._episodes.close_episode(env_idx)
+            self._episodes.append(env_idx, tr)
+            if env_idx < len(dones) and bool(dones[env_idx]):
+                self._episodes.close_episode(env_idx, terminal_info=info)
+            elif float(info.get("intent_segment_boundary", 0.0)) > 0.5:
+                self._episodes.close_episode(env_idx, terminal_info=info)
+
+        self._rollout_step_idx += 1
+        return True
+
+    def _maybe_build_discriminator(
+        self,
+        input_dim: int,
+        *,
+        set_token_dim: int = 0,
+        set_global_dim: int = 0,
+    ) -> None:
+        if self._disc is not None:
+            return
+        set_heads = 4 if int(self.disc_hidden_dim) % 4 == 0 else 1
+        self._disc_set_token_dim = int(set_token_dim)
+        self._disc_set_global_dim = int(set_global_dim)
+        self._disc_set_heads = int(max(1, set_heads))
+        self._disc = IntentDiscriminator(
+            input_dim=input_dim,
+            hidden_dim=self.disc_hidden_dim,
+            num_intents=self.num_intents,
+            dropout=self.disc_dropout,
+            encoder_type=self.disc_encoder_type,
+            step_dim=self.disc_step_dim,
+            set_token_dim=int(set_token_dim),
+            set_global_dim=int(set_global_dim),
+            set_heads=int(self._disc_set_heads),
+            set_cls_tokens=int(self._disc_set_cls_tokens),
+            enable_shot_end_head=self.disc_lambda_shot > 0.0,
+            enable_shot_quality_head=self.disc_lambda_q > 0.0,
+        ).to(self._device)
+        self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=self.disc_lr)
+
+    def has_trained_discriminator(self) -> bool:
+        return self._disc is not None and self._disc_opt is not None
+
+    def _infer_set_disc_dims_from_model(self) -> tuple[int, int]:
+        if self._disc_set_token_dim > 0 and self._disc_set_global_dim > 0:
+            return int(self._disc_set_token_dim), int(self._disc_set_global_dim)
+        try:
+            obs_space = getattr(self.model, "observation_space", None)
+            spaces = getattr(obs_space, "spaces", None)
+            if isinstance(spaces, dict):
+                token_shape = getattr(spaces.get("players"), "shape", None)
+                global_shape = getattr(spaces.get("globals"), "shape", None)
+                token_dim = int(token_shape[-1]) if token_shape else 0
+                global_dim = int(global_shape[-1]) if global_shape else 0
+                return token_dim, global_dim
+        except Exception:
+            pass
+        return int(self._disc_set_token_dim), int(self._disc_set_global_dim)
+
+    def _discriminator_expected_config(self) -> dict[str, Any]:
+        set_token_dim, set_global_dim = self._infer_set_disc_dims_from_model()
+        return {
+            "input_dim": int(self.max_obs_dim + self.max_action_dim),
+            "hidden_dim": int(self.disc_hidden_dim),
+            "num_intents": int(self.num_intents),
+            "dropout": float(self.disc_dropout),
+            "encoder_type": str(self.disc_encoder_type),
+            "step_dim": int(self.disc_step_dim),
+            "max_obs_dim": int(self.max_obs_dim),
+            "max_action_dim": int(self.max_action_dim),
+            "set_token_dim": int(set_token_dim),
+            "set_global_dim": int(set_global_dim),
+            "set_heads": int(
+                self._disc_set_heads if self._disc_set_heads > 0 else (4 if int(self.disc_hidden_dim) % 4 == 0 else 1)
+            ),
+            "set_cls_tokens": int(self._disc_set_cls_tokens),
+            "include_shot_clock": bool(self.disc_include_shot_clock),
+            "include_pressure_exposure": bool(self.disc_include_pressure_exposure),
+        }
+
+    @staticmethod
+    def _discriminator_aux_state_mismatch(exc: RuntimeError) -> bool:
+        message = str(exc)
+        return (
+            "shot_end_head" in message or "shot_quality_head" in message
+        ) and (
+            "Missing key(s) in state_dict" in message
+            or "Missing key(s):" in message
+            or "Unexpected key(s) in state_dict" in message
+            or "Unexpected key(s):" in message
+        )
+
+    @staticmethod
+    def _normalize_discriminator_config(
+        config: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        cfg = dict(config or {})
+        return {
+            "input_dim": int(cfg.get("input_dim", 0)),
+            "hidden_dim": int(cfg.get("hidden_dim", 0)),
+            "num_intents": int(cfg.get("num_intents", 0)),
+            "dropout": float(cfg.get("dropout", 0.0)),
+            "encoder_type": str(cfg.get("encoder_type", "")),
+            "step_dim": int(cfg.get("step_dim", 0)),
+            "max_obs_dim": int(cfg.get("max_obs_dim", 0)),
+            "max_action_dim": int(cfg.get("max_action_dim", 0)),
+            "set_token_dim": int(cfg.get("set_token_dim", 0)),
+            "set_global_dim": int(cfg.get("set_global_dim", 0)),
+            "set_heads": int(cfg.get("set_heads", 0)),
+            "set_cls_tokens": int(cfg.get("set_cls_tokens", 0)),
+            "include_shot_clock": bool(cfg.get("include_shot_clock", True)),
+            "include_pressure_exposure": bool(
+                cfg.get("include_pressure_exposure", True)
+            ),
+        }
+
+    def validate_discriminator_checkpoint_payload(
+        self, payload: Optional[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        if not isinstance(payload, dict):
+            return False, "checkpoint payload is not a dict"
+        if "state_dict" not in payload:
+            return False, "checkpoint payload missing state_dict"
+        payload_cfg = self._normalize_discriminator_config(payload.get("config"))
+        expected_cfg = self._normalize_discriminator_config(
+            self._discriminator_expected_config()
+        )
+        if payload_cfg != expected_cfg:
+            return (
+                False,
+                f"config mismatch: expected {expected_cfg}, got {payload_cfg}",
+            )
+        return True, ""
+
+    def queue_discriminator_checkpoint_restore(
+        self, payload: dict[str, Any], *, source: str = "checkpoint payload"
+    ) -> bool:
+        if not isinstance(payload, dict):
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                "skipping restore (checkpoint payload is not a dict)."
+            )
+            return False
+        if "state_dict" not in payload:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                "skipping restore (checkpoint payload missing state_dict)."
+            )
+            return False
+        if "config" not in payload:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                "skipping restore (checkpoint payload missing config)."
+            )
+            return False
+        payload_cfg = self._normalize_discriminator_config(payload.get("config"))
+        expected_cfg = self._normalize_discriminator_config(
+            self._discriminator_expected_config()
+        )
+        unresolved_set_dims = (
+            payload_cfg.get("encoder_type") == "set_step"
+            and int(payload_cfg.get("set_token_dim", 0)) > 0
+            and int(payload_cfg.get("set_global_dim", 0)) > 0
+            and (
+                int(expected_cfg.get("set_token_dim", 0)) <= 0
+                or int(expected_cfg.get("set_global_dim", 0)) <= 0
+            )
+        )
+        if not unresolved_set_dims:
+            ok, reason = self.validate_discriminator_checkpoint_payload(payload)
+            if not ok:
+                print(
+                    f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                    f"skipping restore ({reason})."
+                )
+                return False
+        self._pending_disc_restore_payload = payload
+        self._pending_disc_restore_source = source
+        return True
+
+    def restore_discriminator_checkpoint_payload(
+        self, payload: dict[str, Any], *, source: str = "checkpoint payload"
+    ) -> bool:
+        ok, reason = self.validate_discriminator_checkpoint_payload(payload)
+        if not ok:
+            print(
+                f"Warning: incompatible intent discriminator checkpoint from {source}; "
+                f"skipping restore ({reason})."
+            )
+            return False
+        config = self._normalize_discriminator_config(payload.get("config"))
+        self._disc_set_cls_tokens = int(config.get("set_cls_tokens", self._disc_set_cls_tokens))
+        self._maybe_build_discriminator(
+            int(config["input_dim"]),
+            set_token_dim=int(config.get("set_token_dim", 0)),
+            set_global_dim=int(config.get("set_global_dim", 0)),
+        )
+        assert self._disc is not None
+        assert self._disc_opt is not None
+        try:
+            self._disc.load_state_dict(payload["state_dict"], strict=True)
+        except RuntimeError as exc:
+            if self._discriminator_aux_state_mismatch(exc):
+                self._disc.load_state_dict(payload["state_dict"], strict=False)
+                print(
+                    f"Warning: restored discriminator weights from {source} with freshly initialized "
+                    "auxiliary prior heads."
+                )
+            else:
+                raise
+        optimizer_state = payload.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            try:
+                self._disc_opt.load_state_dict(optimizer_state)
+            except Exception as exc:
+                print(
+                    f"Warning: failed to restore discriminator optimizer state from "
+                    f"{source}: {exc}"
+                )
+        meta = payload.get("meta") or {}
+        self._rollout_counter = int(meta.get("rollout_counter", self._rollout_counter))
+        self._last_disc_loss = float(meta.get("last_disc_loss", self._last_disc_loss))
+        self._last_disc_acc = float(
+            meta.get("last_disc_top1_acc", self._last_disc_acc)
+        )
+        trainbatch_acc_value = meta.get(
+            "last_disc_top1_acc_trainbatch", self._last_disc_trainbatch_acc
+        )
+        self._last_disc_trainbatch_acc = (
+            None if trainbatch_acc_value is None else float(trainbatch_acc_value)
+        )
+        trainbatch_auc_value = meta.get(
+            "last_disc_auc_ovr_macro_trainbatch", self._last_disc_trainbatch_auc
+        )
+        self._last_disc_trainbatch_auc = (
+            None if trainbatch_auc_value is None else float(trainbatch_auc_value)
+        )
+        eval_acc_value = meta.get(
+            "last_disc_top1_acc_holdout",
+            meta.get("last_disc_top1_acc_eval", self._last_disc_eval_acc),
+        )
+        self._last_disc_eval_acc = (
+            None if eval_acc_value is None else float(eval_acc_value)
+        )
+        auc_value = meta.get(
+            "last_disc_auc_ovr_macro_holdout",
+            meta.get("last_disc_auc_ovr_macro", self._last_disc_auc),
+        )
+        self._last_disc_auc = None if auc_value is None else float(auc_value)
+        self._last_disc_shot_end_loss = float(
+            meta.get("last_disc_shot_end_loss", self._last_disc_shot_end_loss)
+        )
+        self._last_disc_shot_quality_loss = float(
+            meta.get(
+                "last_disc_shot_quality_loss", self._last_disc_shot_quality_loss
+            )
+        )
+        return True
+
+    def export_discriminator_checkpoint(
+        self,
+        path: str,
+        *,
+        global_step: Optional[int] = None,
+        alternation_idx: Optional[int] = None,
+    ) -> bool:
+        if not self.has_trained_discriminator():
+            return False
+        assert self._disc is not None
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "state_dict": self._disc.state_dict(),
+            "optimizer_state_dict": (
+                self._disc_opt.state_dict() if self._disc_opt is not None else None
+            ),
+            "config": {
+                "input_dim": int(self.max_obs_dim + self.max_action_dim),
+                "hidden_dim": int(self.disc_hidden_dim),
+                "num_intents": int(self.num_intents),
+                "dropout": float(self.disc_dropout),
+                "encoder_type": str(self.disc_encoder_type),
+                "step_dim": int(self.disc_step_dim),
+                "max_obs_dim": int(self.max_obs_dim),
+                "max_action_dim": int(self.max_action_dim),
+                "set_token_dim": int(self._disc_set_token_dim),
+                "set_global_dim": int(self._disc_set_global_dim),
+                "set_heads": int(self._disc_set_heads),
+                "set_cls_tokens": int(self._disc_set_cls_tokens),
+                "include_shot_clock": bool(self.disc_include_shot_clock),
+                "include_pressure_exposure": bool(
+                    self.disc_include_pressure_exposure
+                ),
+                "disc_lambda_shot": float(self.disc_lambda_shot),
+                "disc_lambda_q": float(self.disc_lambda_q),
+                "enable_shot_end_head": bool(self.disc_lambda_shot > 0.0),
+                "enable_shot_quality_head": bool(self.disc_lambda_q > 0.0),
+            },
+            "meta": {
+                "global_step": (
+                    int(global_step)
+                    if global_step is not None
+                    else int(getattr(self.model, "num_timesteps", 0))
+                ),
+                "alternation_idx": (
+                    int(alternation_idx) if alternation_idx is not None else None
+                ),
+                "rollout_counter": int(self._rollout_counter),
+                "last_disc_loss": float(self._last_disc_loss),
+                "last_disc_top1_acc": float(self._last_disc_acc),
+                "last_disc_top1_acc_trainbatch": (
+                    float(self._last_disc_trainbatch_acc)
+                    if self._last_disc_trainbatch_acc is not None
+                    else None
+                ),
+                "last_disc_auc_ovr_macro_trainbatch": (
+                    float(self._last_disc_trainbatch_auc)
+                    if self._last_disc_trainbatch_auc is not None
+                    else None
+                ),
+                "last_disc_top1_acc_holdout": (
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else None
+                ),
+                "last_disc_auc_ovr_macro_holdout": (
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else None
+                ),
+                "last_disc_top1_acc_eval": (
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else None
+                ),
+                "last_disc_auc_ovr_macro": (
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else None
+                ),
+                "last_disc_shot_end_loss": float(self._last_disc_shot_end_loss),
+                "last_disc_shot_quality_loss": float(self._last_disc_shot_quality_loss),
+            },
+        }
+        torch.save(payload, path)
+        return True
+
+    def export_latest_discriminator_eval_batch(
+        self,
+        path: str,
+        *,
+        global_step: Optional[int] = None,
+        alternation_idx: Optional[int] = None,
+    ) -> bool:
+        payload = self._latest_disc_eval_batch
+        if not isinstance(payload, dict):
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        x_raw = payload.get("x")
+        x_np: np.ndarray
+        players_np = np.zeros((0, 0, 0), dtype=np.float32)
+        globals_np = np.zeros((0, 0), dtype=np.float32)
+        role_flag_np = np.zeros((0, 1), dtype=np.float32)
+        has_set_obs = False
+        if isinstance(x_raw, dict):
+            has_set_obs = True
+            players_np = np.asarray(x_raw.get("players", np.zeros((0, 0, 0))), dtype=np.float32)
+            globals_np = np.asarray(x_raw.get("globals", np.zeros((0, 0))), dtype=np.float32)
+            role_flag_np = np.asarray(x_raw.get("role_flag", np.zeros((players_np.shape[0], 1))), dtype=np.float32)
+            flat_parts: list[np.ndarray] = []
+            if players_np.size > 0:
+                flat_parts.append(players_np.reshape(players_np.shape[0], -1))
+            if globals_np.size > 0:
+                flat_parts.append(globals_np.reshape(globals_np.shape[0], -1))
+            if role_flag_np.size > 0:
+                flat_parts.append(role_flag_np.reshape(role_flag_np.shape[0], -1))
+            x_np = (
+                np.concatenate(flat_parts, axis=1).astype(np.float32, copy=False)
+                if flat_parts
+                else np.zeros((0, 1), dtype=np.float32)
+            )
+        else:
+            x_np = np.asarray(x_raw, dtype=np.float32)
+        y_np = np.asarray(payload.get("y"), dtype=np.int64)
+        lengths_raw = payload.get("lengths")
+        lengths_np = (
+            np.asarray(lengths_raw, dtype=np.int64).reshape(-1)
+            if lengths_raw is not None
+            else np.zeros((0,), dtype=np.int64)
+        )
+        shot_end_np = np.asarray(
+            payload.get("shot_end", np.zeros((x_np.shape[0],), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        shot_quality_np = np.asarray(
+            payload.get("shot_quality", np.zeros((x_np.shape[0],), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1)
+        shot_quality_mask_np = np.asarray(
+            payload.get(
+                "shot_quality_mask", np.zeros((x_np.shape[0],), dtype=np.float32)
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+        env_idx_np = np.asarray(
+            payload.get("env_idx", np.full((x_np.shape[0],), -1, dtype=np.int64)),
+            dtype=np.int64,
+        ).reshape(-1)
+        episode_id_np = np.asarray(
+            payload.get("episode_id", np.full((x_np.shape[0],), -1, dtype=np.int64)),
+            dtype=np.int64,
+        ).reshape(-1)
+        episode_length_np = np.asarray(
+            payload.get(
+                "episode_length",
+                np.zeros((x_np.shape[0],), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        active_prefix_length_np = np.asarray(
+            payload.get(
+                "active_prefix_length",
+                np.zeros((x_np.shape[0],), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        training_team_np = np.asarray(
+            payload.get(
+                "training_team",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        boundary_reason_np = np.asarray(
+            payload.get(
+                "boundary_reason",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        start_template_id_np = np.asarray(
+            payload.get(
+                "start_template_id",
+                np.full((x_np.shape[0],), "", dtype=object),
+            ),
+            dtype=object,
+        ).reshape(-1)
+        start_template_mirrored_np = np.asarray(
+            payload.get(
+                "start_template_mirrored",
+                np.zeros((x_np.shape[0],), dtype=np.int8),
+            ),
+            dtype=np.int8,
+        ).reshape(-1)
+        first_buffer_step_idx_np = np.asarray(
+            payload.get(
+                "first_buffer_step_idx",
+                np.full((x_np.shape[0],), -1, dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        last_buffer_step_idx_np = np.asarray(
+            payload.get(
+                "last_buffer_step_idx",
+                np.full((x_np.shape[0],), -1, dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ).reshape(-1)
+        np.savez_compressed(
+            path,
+            x=x_np,
+            y=y_np,
+            lengths=lengths_np,
+            players=players_np,
+            globals=globals_np,
+            role_flag=role_flag_np,
+            shot_end=shot_end_np,
+            shot_quality=shot_quality_np,
+            shot_quality_mask=shot_quality_mask_np,
+            env_idx=env_idx_np,
+            episode_id=episode_id_np,
+            episode_length=episode_length_np,
+            active_prefix_length=active_prefix_length_np,
+            training_team=training_team_np,
+            boundary_reason=boundary_reason_np,
+            start_template_id=start_template_id_np,
+            start_template_mirrored=start_template_mirrored_np,
+            first_buffer_step_idx=first_buffer_step_idx_np,
+            last_buffer_step_idx=last_buffer_step_idx_np,
+            has_lengths=np.array([1 if lengths_raw is not None else 0], dtype=np.int8),
+            global_step=np.array(
+                [
+                    int(global_step)
+                    if global_step is not None
+                    else int(getattr(self.model, "num_timesteps", 0))
+                ],
+                dtype=np.int64,
+            ),
+            alternation_idx=np.array(
+                [int(alternation_idx) if alternation_idx is not None else -1],
+                dtype=np.int64,
+            ),
+            rollout_counter=np.array([int(self._rollout_counter)], dtype=np.int64),
+            num_intents=np.array([int(self.num_intents)], dtype=np.int64),
+            max_obs_dim=np.array([int(self.max_obs_dim)], dtype=np.int64),
+            max_action_dim=np.array([int(self.max_action_dim)], dtype=np.int64),
+            encoder_type=np.array([str(self.disc_encoder_type)], dtype=object),
+            has_set_obs=np.array([1 if has_set_obs else 0], dtype=np.int8),
+            eval_split_kind=np.array(
+                [str(self._latest_disc_eval_batch_kind or "unknown")], dtype=object
+            ),
+            disc_top1_acc_trainbatch=np.array(
+                [
+                    float(self._last_disc_trainbatch_acc)
+                    if self._last_disc_trainbatch_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_auc_ovr_macro_trainbatch=np.array(
+                [
+                    float(self._last_disc_trainbatch_auc)
+                    if self._last_disc_trainbatch_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_top1_acc_holdout=np.array(
+                [
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_auc_ovr_macro_holdout=np.array(
+                [
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_top1_acc_eval=np.array(
+                [
+                    float(self._last_disc_eval_acc)
+                    if self._last_disc_eval_acc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+            disc_auc_ovr_macro=np.array(
+                [
+                    float(self._last_disc_auc)
+                    if self._last_disc_auc is not None
+                    else np.nan
+                ],
+                dtype=np.float32,
+            ),
+        )
+        return True
+
+    @staticmethod
+    def _disc_batch_size(x_np: Any) -> int:
+        if isinstance(x_np, dict):
+            if not x_np:
+                return 0
+            first = next(iter(x_np.values()))
+            arr = np.asarray(first)
+            return int(arr.shape[0]) if arr.ndim >= 1 else 0
+        arr = np.asarray(x_np)
+        return int(arr.shape[0]) if arr.ndim >= 1 else 0
+
+    def _train_discriminator(
+        self,
+        x_np: Any,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+        shot_end_np: Optional[np.ndarray] = None,
+        shot_quality_np: Optional[np.ndarray] = None,
+        shot_quality_mask_np: Optional[np.ndarray] = None,
+    ) -> tuple[float, float]:
+        if self._is_step_discriminator_mode():
+            if not isinstance(x_np, dict):
+                return 0.0, 0.0
+            if not x_np:
+                return 0.0, 0.0
+            n = int(next(iter(x_np.values())).shape[0])
+            if n <= 0:
+                return 0.0, 0.0
+            players = np.asarray(x_np.get("players"), dtype=np.float32)
+            globals_arr = np.asarray(x_np.get("globals"), dtype=np.float32)
+            self._maybe_build_discriminator(
+                0,
+                set_token_dim=int(players.shape[-1]),
+                set_global_dim=int(globals_arr.shape[-1]),
+            )
+        else:
+            if x_np.shape[0] == 0:
+                return 0.0, 0.0
+            input_dim = int(x_np.shape[-1]) if x_np.ndim >= 2 else int(x_np.shape[0])
+            self._maybe_build_discriminator(input_dim)
+
+        assert self._disc is not None
+        assert self._disc_opt is not None
+
+        if self._is_step_discriminator_mode():
+            x = {
+                key: torch.as_tensor(value, dtype=torch.float32, device=self._device)
+                for key, value in x_np.items()
+            }
+            n = int(next(iter(x.values())).shape[0])
+        else:
+            x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+            n = int(x.shape[0])
+        if n <= 0:
+            return 0.0, 0.0
+        y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+        lengths = None
+        if lengths_np is not None and not self._is_step_discriminator_mode():
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        shot_end = None
+        if shot_end_np is not None:
+            shot_end = torch.as_tensor(
+                shot_end_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
+        shot_quality = None
+        if shot_quality_np is not None:
+            shot_quality = torch.as_tensor(
+                shot_quality_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
+        shot_quality_mask = None
+        if shot_quality_mask_np is not None:
+            shot_quality_mask = torch.as_tensor(
+                shot_quality_mask_np, dtype=torch.float32, device=self._device
+            ).reshape(-1)
+
+        self._disc.train()
+        last_loss = 0.0
+        last_acc = 0.0
+        last_shot_end_loss = 0.0
+        last_shot_quality_loss = 0.0
+        for _ in range(self.disc_updates_per_rollout):
+            if n <= self.disc_batch_size:
+                idx = torch.arange(n, device=self._device)
+            else:
+                idx = torch.randint(0, n, (self.disc_batch_size,), device=self._device)
+            if self._is_step_discriminator_mode():
+                xb = {key: value[idx] for key, value in x.items()}
+            else:
+                xb = x[idx]
+            yb = y[idx]
+            lb = lengths[idx] if lengths is not None else None
+            shot_end_b = shot_end[idx] if shot_end is not None else None
+            shot_quality_b = shot_quality[idx] if shot_quality is not None else None
+            shot_quality_mask_b = (
+                shot_quality_mask[idx] if shot_quality_mask is not None else None
+            )
+            logits, shot_end_pred, shot_quality_pred = self._disc.forward_with_aux(
+                xb, lb
+            )
+            loss = F.cross_entropy(logits, yb)
+            shot_end_loss = torch.zeros((), dtype=torch.float32, device=self._device)
+            if (
+                float(self.disc_lambda_shot) > 0.0
+                and shot_end_pred is not None
+                and shot_end_b is not None
+            ):
+                shot_end_loss = F.binary_cross_entropy_with_logits(
+                    shot_end_pred, shot_end_b
+                )
+                loss = loss + float(self.disc_lambda_shot) * shot_end_loss
+            shot_quality_loss = torch.zeros(
+                (), dtype=torch.float32, device=self._device
+            )
+            if (
+                float(self.disc_lambda_q) > 0.0
+                and shot_quality_pred is not None
+                and shot_quality_b is not None
+            ):
+                if shot_quality_mask_b is None:
+                    shot_quality_loss = F.mse_loss(shot_quality_pred, shot_quality_b)
+                    loss = loss + float(self.disc_lambda_q) * shot_quality_loss
+                else:
+                    active = shot_quality_mask_b > 0.5
+                    if bool(torch.any(active)):
+                        shot_quality_loss = F.mse_loss(
+                            shot_quality_pred[active], shot_quality_b[active]
+                        )
+                        loss = loss + float(self.disc_lambda_q) * shot_quality_loss
+            self._disc_opt.zero_grad(set_to_none=True)
+            loss.backward()
+            self._disc_opt.step()
+
+            with torch.no_grad():
+                pred = torch.argmax(logits, dim=-1)
+                acc = (pred == yb).float().mean()
+                last_loss = float(loss.detach().cpu().item())
+                last_acc = float(acc.detach().cpu().item())
+                last_shot_end_loss = float(shot_end_loss.detach().cpu().item())
+                last_shot_quality_loss = float(
+                    shot_quality_loss.detach().cpu().item()
+                )
+        self._last_disc_shot_end_loss = float(last_shot_end_loss)
+        self._last_disc_shot_quality_loss = float(last_shot_quality_loss)
+        return last_loss, last_acc
+
+    def _compute_episode_bonus(
+        self,
+        x_np: Any,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        assert self._disc is not None
+        if self._is_step_discriminator_mode():
+            if not isinstance(x_np, dict) or not x_np:
+                return np.zeros((0,), dtype=np.float32)
+            batch_size = int(next(iter(x_np.values())).shape[0])
+            if batch_size <= 0:
+                return np.zeros((0,), dtype=np.float32)
+            x = {
+                key: torch.as_tensor(value, dtype=torch.float32, device=self._device)
+                for key, value in x_np.items()
+            }
+        else:
+            if x_np.shape[0] == 0:
+                return np.zeros((0,), dtype=np.float32)
+            x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+        lengths = None
+        if lengths_np is not None and not self._is_step_discriminator_mode():
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x, lengths)
+            log_probs = F.log_softmax(logits, dim=-1)
+            chosen = log_probs[torch.arange(log_probs.shape[0], device=self._device), y]
+            bonus = chosen + float(np.log(float(self.num_intents)))
+        return bonus.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    @staticmethod
+    def _binary_auc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
+        """Compute binary ROC-AUC from labels and scores via rank statistic."""
+        y_true_arr = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_score_arr = np.asarray(y_score, dtype=np.float64).reshape(-1)
+        if y_true_arr.size == 0 or y_true_arr.size != y_score_arr.size:
+            return None
+
+        pos = (y_true_arr > 0).astype(np.int64)
+        n_pos = int(np.sum(pos))
+        n_neg = int(pos.size - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return None
+
+        order = np.argsort(y_score_arr, kind="mergesort")
+        sorted_scores = y_score_arr[order]
+        ranks = np.empty_like(sorted_scores, dtype=np.float64)
+        i = 0
+        n = sorted_scores.size
+        while i < n:
+            j = i + 1
+            while j < n and sorted_scores[j] == sorted_scores[i]:
+                j += 1
+            avg_rank = 0.5 * ((i + 1) + j)  # 1-indexed average rank
+            ranks[i:j] = avg_rank
+            i = j
+
+        rank_by_original_index = np.empty_like(ranks)
+        rank_by_original_index[order] = ranks
+        sum_pos_ranks = float(np.sum(rank_by_original_index[pos == 1]))
+        auc = (sum_pos_ranks - (n_pos * (n_pos + 1) / 2.0)) / float(n_pos * n_neg)
+        return float(np.clip(auc, 0.0, 1.0))
+
+    @classmethod
+    def _multiclass_auc_ovr_macro(
+        cls, logits_np: np.ndarray, y_np: np.ndarray, num_classes: int
+    ) -> Optional[float]:
+        """Compute macro OVR ROC-AUC for multiclass logits."""
+        logits = np.asarray(logits_np, dtype=np.float64)
+        y_true = np.asarray(y_np, dtype=np.int64).reshape(-1)
+        if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[0] != y_true.size:
+            return None
+        if num_classes <= 1:
+            return None
+
+        logits = logits - np.max(logits, axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        denom = np.clip(np.sum(exp_logits, axis=1, keepdims=True), 1e-12, None)
+        probs = exp_logits / denom
+
+        aucs: list[float] = []
+        k = min(int(num_classes), int(probs.shape[1]))
+        for class_idx in range(k):
+            y_bin = (y_true == class_idx).astype(np.int64)
+            auc = cls._binary_auc_from_scores(y_bin, probs[:, class_idx])
+            if auc is not None:
+                aucs.append(float(auc))
+        if not aucs:
+            return None
+        return float(np.mean(aucs))
+
+    def _compute_disc_auc(
+        self,
+        x_np: Any,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
+        if self._disc is None:
+            return None
+        if self._is_step_discriminator_mode():
+            if not isinstance(x_np, dict) or not x_np:
+                return None
+            batch_size = int(next(iter(x_np.values())).shape[0])
+            if batch_size <= 0:
+                return None
+            x = {
+                key: torch.as_tensor(value, dtype=torch.float32, device=self._device)
+                for key, value in x_np.items()
+            }
+        else:
+            if x_np.shape[0] == 0:
+                return None
+            x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        lengths = None
+        if lengths_np is not None and not self._is_step_discriminator_mode():
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x, lengths)
+        logits_np = logits.detach().cpu().numpy()
+        return self._multiclass_auc_ovr_macro(
+            logits_np,
+            y_np,
+            num_classes=self.num_intents,
+        )
+
+    def _compute_disc_eval_top1_acc(
+        self,
+        x_np: Any,
+        y_np: np.ndarray,
+        lengths_np: Optional[np.ndarray] = None,
+    ) -> float:
+        if self._disc is None:
+            return 0.0
+        if self._is_step_discriminator_mode():
+            if not isinstance(x_np, dict) or not x_np:
+                return 0.0
+            batch_size = int(next(iter(x_np.values())).shape[0])
+            if batch_size <= 0:
+                return 0.0
+            x = {
+                key: torch.as_tensor(value, dtype=torch.float32, device=self._device)
+                for key, value in x_np.items()
+            }
+        else:
+            if x_np.shape[0] == 0:
+                return 0.0
+            x = torch.as_tensor(x_np, dtype=torch.float32, device=self._device)
+        lengths = None
+        if lengths_np is not None and not self._is_step_discriminator_mode():
+            lengths = torch.as_tensor(lengths_np, dtype=torch.long, device=self._device)
+        self._disc.eval()
+        with torch.no_grad():
+            logits = self._disc(x, lengths)
+            pred = torch.argmax(logits, dim=-1)
+            y = torch.as_tensor(y_np, dtype=torch.long, device=self._device)
+            acc = (pred == y).float().mean()
+        return float(acc.detach().cpu().item())
+
+    def _recompute_returns_and_advantage(self) -> None:
+        try:
+            rollout_buffer = self.model.rollout_buffer
+            policy = self.model.policy
+            with torch.no_grad():
+                obs_tensor, _ = policy.obs_to_tensor(self.model._last_obs)
+                last_values = policy.predict_values(obs_tensor)
+            rollout_buffer.compute_returns_and_advantage(
+                last_values=last_values,
+                dones=self.model._last_episode_starts,
+            )
+        except Exception as e:
+            if not self._warned_recompute:
+                print(
+                    f"[IntentDiversityCallback] Warning: could not recompute returns/advantages: {e}"
+                )
+                self._warned_recompute = True
+
+    @staticmethod
+    def _build_disc_aux_targets(
+        episodes: list[CompletedIntentEpisode],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shot_end = np.asarray(
+            [float(ep.shot_end_label) for ep in episodes], dtype=np.float32
+        )
+        shot_quality = np.asarray(
+            [float(ep.shot_quality_target) for ep in episodes], dtype=np.float32
+        )
+        shot_quality_mask = (shot_end > 0.5).astype(np.float32, copy=False)
+        return shot_end, shot_quality, shot_quality_mask
+
+    def _split_disc_train_holdout_episodes(
+        self, episodes: list[CompletedIntentEpisode]
+    ) -> tuple[list[CompletedIntentEpisode], list[CompletedIntentEpisode]]:
+        if (
+            self.disc_eval_holdout_fraction <= 0.0
+            or len(episodes) < 2
+        ):
+            return list(episodes), []
+
+        rng = np.random.default_rng(
+            int(getattr(self.model, "num_timesteps", 0))
+            + (1009 * int(self._rollout_counter))
+        )
+        by_intent: dict[int, list[int]] = {}
+        for idx, episode in enumerate(episodes):
+            by_intent.setdefault(int(episode.intent_index), []).append(idx)
+
+        train_idx: set[int] = set()
+        holdout_idx: set[int] = set()
+        for indices in by_intent.values():
+            if len(indices) <= 1:
+                train_idx.update(indices)
+                continue
+            shuffled = np.asarray(indices, dtype=np.int64)
+            rng.shuffle(shuffled)
+            holdout_count = int(
+                np.round(float(len(shuffled)) * float(self.disc_eval_holdout_fraction))
+            )
+            holdout_count = min(len(shuffled) - 1, max(1, holdout_count))
+            holdout_idx.update(int(v) for v in shuffled[:holdout_count].tolist())
+            train_idx.update(int(v) for v in shuffled[holdout_count:].tolist())
+
+        if not train_idx:
+            first_holdout_idx = min(holdout_idx)
+            train_idx.add(first_holdout_idx)
+            holdout_idx.remove(first_holdout_idx)
+        if not holdout_idx:
+            return list(episodes), []
+
+        train_eps = [ep for idx, ep in enumerate(episodes) if idx in train_idx]
+        holdout_eps = [ep for idx, ep in enumerate(episodes) if idx in holdout_idx]
+        return train_eps, holdout_eps
+
+    def _split_disc_train_holdout_steps(
+        self, examples: list[IntentStepExample]
+    ) -> tuple[list[IntentStepExample], list[IntentStepExample]]:
+        if self.disc_eval_holdout_fraction <= 0.0 or len(examples) < 2:
+            return list(examples), []
+
+        rng = np.random.default_rng(
+            int(getattr(self.model, "num_timesteps", 0))
+            + (1009 * int(self._rollout_counter))
+        )
+        group_to_indices: dict[int, list[int]] = {}
+        group_order: list[int] = []
+        for idx, example in enumerate(examples):
+            group_id = int(example.episode_id)
+            if group_id < 0:
+                group_id = -(idx + 1)
+            if group_id not in group_to_indices:
+                group_to_indices[group_id] = []
+                group_order.append(group_id)
+            group_to_indices[group_id].append(idx)
+
+        by_intent: dict[int, list[int]] = {}
+        for group_id in group_order:
+            indices = group_to_indices[group_id]
+            if not indices:
+                continue
+            group_intent = int(examples[indices[0]].intent_index)
+            by_intent.setdefault(group_intent, []).append(group_id)
+
+        train_idx: set[int] = set()
+        holdout_idx: set[int] = set()
+        for group_ids in by_intent.values():
+            if len(group_ids) <= 1:
+                for group_id in group_ids:
+                    train_idx.update(group_to_indices.get(int(group_id), []))
+                continue
+            shuffled = np.asarray(group_ids, dtype=np.int64)
+            rng.shuffle(shuffled)
+            holdout_count = int(
+                np.round(float(len(shuffled)) * float(self.disc_eval_holdout_fraction))
+            )
+            holdout_count = min(len(shuffled) - 1, max(1, holdout_count))
+            for group_id in shuffled[:holdout_count].tolist():
+                holdout_idx.update(group_to_indices.get(int(group_id), []))
+            for group_id in shuffled[holdout_count:].tolist():
+                train_idx.update(group_to_indices.get(int(group_id), []))
+
+        if not train_idx and holdout_idx:
+            first_holdout_idx = min(holdout_idx)
+            train_idx.add(first_holdout_idx)
+            holdout_idx.remove(first_holdout_idx)
+        if not holdout_idx:
+            return list(examples), []
+
+        train_examples = [ex for idx, ex in enumerate(examples) if idx in train_idx]
+        holdout_examples = [ex for idx, ex in enumerate(examples) if idx in holdout_idx]
+        return train_examples, holdout_examples
+
+    def _build_disc_batches_from_episodes(
+        self,
+        episodes: list[CompletedIntentEpisode],
+    ) -> tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        lengths_np = None
+        if self.disc_encoder_type == "gru":
+            x_np, lengths_np, y_np = build_padded_episode_batch(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
+        else:
+            x_np, y_np = compute_episode_embeddings(
+                episodes,
+                max_obs_dim=self.max_obs_dim,
+                max_action_dim=self.max_action_dim,
+            )
+        shot_end_np, shot_quality_np, shot_quality_mask_np = self._build_disc_aux_targets(
+            episodes
+        )
+        return (
+            x_np,
+            lengths_np,
+            y_np,
+            shot_end_np,
+            shot_quality_np,
+            shot_quality_mask_np,
+        )
+
+    @staticmethod
+    def _build_disc_aux_targets_from_steps(
+        examples: list[IntentStepExample],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shot_end = np.asarray([float(ex.shot_end) for ex in examples], dtype=np.float32)
+        shot_quality = np.asarray(
+            [float(ex.shot_quality) for ex in examples], dtype=np.float32
+        )
+        shot_quality_mask = np.asarray(
+            [float(ex.shot_quality_mask) for ex in examples], dtype=np.float32
+        )
+        return shot_end, shot_quality, shot_quality_mask
+
+    def _build_disc_batches_from_steps(
+        self,
+        examples: list[IntentStepExample],
+    ) -> tuple[dict[str, np.ndarray], None, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x_np, y_np = build_step_observation_batch(examples)
+        shot_end_np, shot_quality_np, shot_quality_mask_np = (
+            self._build_disc_aux_targets_from_steps(examples)
+        )
+        return (
+            x_np,
+            None,
+            y_np,
+            shot_end_np,
+            shot_quality_np,
+            shot_quality_mask_np,
+        )
+
+    @staticmethod
+    def _build_disc_batch_provenance(
+        episodes: list[CompletedIntentEpisode],
+    ) -> dict[str, np.ndarray]:
+        env_idx: list[int] = []
+        episode_length: list[int] = []
+        active_prefix_length: list[int] = []
+        training_team: list[str] = []
+        boundary_reason: list[str] = []
+        start_template_id: list[str] = []
+        start_template_mirrored: list[bool] = []
+        first_buffer_step_idx: list[int] = []
+        last_buffer_step_idx: list[int] = []
+        for episode in episodes:
+            first_transition = episode.transitions[0] if episode.transitions else None
+            last_transition = episode.transitions[-1] if episode.transitions else None
+            env_idx.append(
+                int(first_transition.env_idx) if first_transition is not None else -1
+            )
+            first_buffer_step_idx.append(
+                int(first_transition.buffer_step_idx)
+                if first_transition is not None
+                else -1
+            )
+            last_buffer_step_idx.append(
+                int(last_transition.buffer_step_idx)
+                if last_transition is not None
+                else -1
+            )
+            episode_length.append(int(episode.length))
+            active_prefix_length.append(int(episode.active_prefix_length))
+            info = dict(episode.terminal_info or {})
+            training_team.append(str(info.get("training_team", "")))
+            boundary_reason.append(str(info.get("intent_segment_boundary_reason", "episode_end")))
+            start_template_id.append(str(info.get("start_template_id", "") or ""))
+            start_template_mirrored.append(
+                bool(info.get("start_template_mirrored", False))
+            )
+        return {
+            "env_idx": np.asarray(env_idx, dtype=np.int64),
+            "episode_length": np.asarray(episode_length, dtype=np.int64),
+            "active_prefix_length": np.asarray(active_prefix_length, dtype=np.int64),
+            "training_team": np.asarray(training_team, dtype=object),
+            "boundary_reason": np.asarray(boundary_reason, dtype=object),
+            "start_template_id": np.asarray(start_template_id, dtype=object),
+            "start_template_mirrored": np.asarray(
+                start_template_mirrored, dtype=np.int8
+            ),
+            "first_buffer_step_idx": np.asarray(first_buffer_step_idx, dtype=np.int64),
+            "last_buffer_step_idx": np.asarray(last_buffer_step_idx, dtype=np.int64),
+        }
+
+    @staticmethod
+    def _build_disc_step_batch_provenance(
+        examples: list[IntentStepExample],
+    ) -> dict[str, np.ndarray]:
+        env_idx = np.asarray([int(ex.env_idx) for ex in examples], dtype=np.int64)
+        episode_id = np.asarray([int(ex.episode_id) for ex in examples], dtype=np.int64)
+        buffer_step_idx = np.asarray(
+            [int(ex.buffer_step_idx) for ex in examples], dtype=np.int64
+        )
+        training_team = np.asarray([str(ex.training_team) for ex in examples], dtype=object)
+        boundary_reason = np.asarray(
+            [str(ex.boundary_reason) for ex in examples], dtype=object
+        )
+        start_template_id = np.asarray(
+            [str(ex.start_template_id) for ex in examples], dtype=object
+        )
+        start_template_mirrored = np.asarray(
+            [1 if bool(ex.start_template_mirrored) else 0 for ex in examples],
+            dtype=np.int8,
+        )
+        role_flag = np.asarray([float(ex.role_flag) for ex in examples], dtype=np.float32)
+        ones = np.ones((len(examples),), dtype=np.int64)
+        return {
+            "env_idx": env_idx,
+            "episode_id": episode_id,
+            "episode_length": ones,
+            "active_prefix_length": ones,
+            "training_team": training_team,
+            "boundary_reason": boundary_reason,
+            "start_template_id": start_template_id,
+            "start_template_mirrored": start_template_mirrored,
+            "first_buffer_step_idx": buffer_step_idx,
+            "last_buffer_step_idx": buffer_step_idx,
+            "role_flag_scalar": role_flag,
+        }
+
+    def _episode_matches_disc_source_filter(
+        self, episode: CompletedIntentEpisode
+    ) -> bool:
+        if not self.disc_current_policy_only:
+            return True
+        info = dict(episode.terminal_info or {})
+        team = str(info.get("training_team", "")).strip().lower()
+        if not team:
+            return True
+        return team == "offense"
+
+    @staticmethod
+    def _usage_entropy(y_np: np.ndarray, num_intents: int) -> tuple[float, float]:
+        if y_np.size == 0:
+            return 0.0, 0.0
+        counts = np.bincount(y_np, minlength=max(1, num_intents)).astype(np.float64)
+        probs = counts / max(1.0, float(np.sum(counts)))
+        probs = np.clip(probs, 1e-12, 1.0)
+        entropy = float(-np.sum(probs * np.log(probs)))
+        min_prob = float(np.min(probs))
+        return entropy, min_prob
+
+    @staticmethod
+    def _episode_points_and_possessions(ep: dict) -> tuple[float, float]:
+        m2 = float(ep.get("made_2pt", 0.0))
+        m3 = float(ep.get("made_3pt", 0.0))
+        md = float(ep.get("made_dunk", 0.0))
+        lane_violation_pts = float(ep.get("defensive_lane_violation", 0.0))
+        att = float(ep.get("attempts", 0.0))
+        tov = float(ep.get("turnover", 0.0))
+        points = (2.0 * m2) + (3.0 * m3) + (2.0 * md) + lane_violation_pts
+        possessions = max(1.0, att + tov + lane_violation_pts)
+        return float(points), float(possessions)
+
+    @classmethod
+    def _episode_ppp(cls, ep: dict) -> float:
+        points, possessions = cls._episode_points_and_possessions(ep)
+        return float(points / possessions)
+
+    @staticmethod
+    def _episode_shot_type_shares(ep: dict) -> tuple[float, float, float]:
+        s2 = float(ep.get("shot_2pt", 0.0))
+        s3 = float(ep.get("shot_3pt", 0.0))
+        sd = float(ep.get("shot_dunk", 0.0))
+        total = s2 + s3 + sd
+        if total <= 0.0:
+            return 0.0, 0.0, 0.0
+        return float(s2 / total), float(s3 / total), float(sd / total)
+
+    def _log_intent_behavior_metrics(self, global_step: int) -> None:
+        episodes = list(getattr(self.model, "ep_info_buffer", []) or [])
+        if not episodes:
+            return
+
+        grouped: dict[int, dict[str, list[float]]] = {}
+        for ep in episodes:
+            try:
+                team = str(ep.get("training_team", "")).strip().lower()
+                if team != "offense":
+                    continue
+                if float(ep.get("intent_active", 0.0)) <= 0.5:
+                    continue
+                z = int(float(ep.get("intent_index", 0.0)))
+            except Exception:
+                continue
+            z = max(0, min(self.num_intents - 1, z))
+            slot = grouped.setdefault(
+                z,
+                {
+                    "points": 0.0,
+                    "possessions": 0.0,
+                    "episodes": 0.0,
+                    "passes": [],
+                    "shot_2pt_share": [],
+                    "shot_3pt_share": [],
+                    "shot_dunk_share": [],
+                },
+            )
+            points, possessions = self._episode_points_and_possessions(ep)
+            slot["points"] += points
+            slot["possessions"] += possessions
+            slot["episodes"] += 1.0
+            slot["passes"].append(float(ep.get("passes", 0.0)))
+            shot_2pt_share, shot_3pt_share, shot_dunk_share = self._episode_shot_type_shares(
+                ep
+            )
+            slot["shot_2pt_share"].append(shot_2pt_share)
+            slot["shot_3pt_share"].append(shot_3pt_share)
+            slot["shot_dunk_share"].append(shot_dunk_share)
+
+        if not grouped:
+            return
+
+        for z, vals in grouped.items():
+            if vals["episodes"] > 0.0:
+                mlflow.log_metric(
+                    f"intent/episodes_by_intent/{z}",
+                    float(vals["episodes"]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/points_by_intent/{z}",
+                    float(vals["points"]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/possessions_by_intent/{z}",
+                    float(vals["possessions"]),
+                    step=global_step,
+                )
+            if vals["possessions"] > 0.0:
+                mlflow.log_metric(
+                    f"intent/ppp_by_intent/{z}",
+                    float(vals["points"] / vals["possessions"]),
+                    step=global_step,
+                )
+            if vals["passes"]:
+                mlflow.log_metric(
+                    f"intent/pass_rate_by_intent/{z}",
+                    float(np.mean(vals["passes"])),
+                    step=global_step,
+                )
+            if vals["shot_2pt_share"]:
+                mlflow.log_metric(
+                    f"intent/shot_2pt_share_by_intent/{z}",
+                    float(np.mean(vals["shot_2pt_share"])),
+                    step=global_step,
+                )
+            if vals["shot_3pt_share"]:
+                # Keep legacy metric name for existing reports; it is the 3PT share.
+                mlflow.log_metric(
+                    f"intent/shot_dist_by_intent/{z}",
+                    float(np.mean(vals["shot_3pt_share"])),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/shot_3pt_share_by_intent/{z}",
+                    float(np.mean(vals["shot_3pt_share"])),
+                    step=global_step,
+                )
+            if vals["shot_dunk_share"]:
+                mlflow.log_metric(
+                    f"intent/shot_dunk_share_by_intent/{z}",
+                    float(np.mean(vals["shot_dunk_share"])),
+                    step=global_step,
+                )
+
+    def _log_defense_unknown_intent_proxy(self, global_step: int) -> None:
+        episodes = list(getattr(self.model, "ep_info_buffer", []) or [])
+        if not episodes:
+            return
+        values: list[float] = []
+        for ep in episodes:
+            try:
+                team = str(ep.get("training_team", "")).strip().lower()
+                if team != "defense":
+                    continue
+                visible = float(ep.get("intent_visible_training_obs", 0.0))
+                if visible > 0.5:
+                    continue
+                values.append(self._episode_ppp(ep))
+            except Exception:
+                continue
+        if not values:
+            return
+        current = float(np.mean(values))
+        if self._defense_unknown_baseline_ppp is None:
+            self._defense_unknown_baseline_ppp = current
+        delta = float(current - float(self._defense_unknown_baseline_ppp))
+        mlflow.log_metric("intent/defense_unknown_intent_ppp", current, step=global_step)
+        mlflow.log_metric(
+            "intent/defense_unknown_intent_delta_vs_baseline",
+            delta,
+            step=global_step,
+        )
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled:
+            return
+
+        global_step = int(getattr(self.model, "num_timesteps", 0))
+        try:
+            self._log_intent_behavior_metrics(global_step)
+            self._log_defense_unknown_intent_proxy(global_step)
+        except Exception:
+            pass
+
+        if self._is_step_discriminator_mode():
+            self._on_rollout_end_step_mode(global_step)
+            return
+
+        episodes = self._episodes.pop_completed(
+            filter_fn=lambda ep: (
+                ep.role_is_offense
+                and ep.active_prefix_length > 0
+                and self._episode_matches_disc_source_filter(ep)
+            )
+        )
+        if not episodes:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=no_completed_offense_intent_episodes",
+                    flush=True,
+                )
+            return
+        beta = self._beta_current()
+        if beta <= 0.0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"skipped=warmup "
+                    f"beta={float(beta):.4f} "
+                    f"episodes={len(episodes)}",
+                    flush=True,
+                )
+            return
+
+        (
+            x_bonus_np,
+            lengths_bonus_np,
+            y_bonus_np,
+            shot_end_bonus_np,
+            shot_quality_bonus_np,
+            shot_quality_mask_bonus_np,
+        ) = self._build_disc_batches_from_episodes(episodes)
+        if x_bonus_np.shape[0] == 0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=empty_discriminator_batch",
+                    flush=True,
+                )
+            return
+
+        train_episodes, holdout_episodes = self._split_disc_train_holdout_episodes(
+            episodes
+        )
+        (
+            x_train_np,
+            lengths_train_np,
+            y_train_np,
+            shot_end_train_np,
+            shot_quality_train_np,
+            shot_quality_mask_train_np,
+        ) = self._build_disc_batches_from_episodes(train_episodes)
+        if holdout_episodes:
+            (
+                x_eval_np,
+                lengths_eval_np,
+                y_eval_np,
+                shot_end_eval_np,
+                shot_quality_eval_np,
+                shot_quality_mask_eval_np,
+            ) = self._build_disc_batches_from_episodes(holdout_episodes)
+            eval_batch_kind = "holdout"
+        else:
+            x_eval_np = np.array(x_bonus_np, copy=True)
+            lengths_eval_np = (
+                None
+                if lengths_bonus_np is None
+                else np.array(lengths_bonus_np, copy=True)
+            )
+            y_eval_np = np.array(y_bonus_np, copy=True)
+            shot_end_eval_np = np.array(shot_end_bonus_np, copy=True)
+            shot_quality_eval_np = np.array(shot_quality_bonus_np, copy=True)
+            shot_quality_mask_eval_np = np.array(
+                shot_quality_mask_bonus_np, copy=True
+            )
+            eval_batch_kind = "trainbatch_fallback"
+
+        eval_batch_provenance = self._build_disc_batch_provenance(
+            holdout_episodes if holdout_episodes else episodes
+        )
+        self._latest_disc_eval_batch = {
+            "x": np.array(x_eval_np, copy=True),
+            "y": np.array(y_eval_np, copy=True),
+            "lengths": (
+                None if lengths_eval_np is None else np.array(lengths_eval_np, copy=True)
+            ),
+            "shot_end": np.array(shot_end_eval_np, copy=True),
+            "shot_quality": np.array(shot_quality_eval_np, copy=True),
+            "shot_quality_mask": np.array(shot_quality_mask_eval_np, copy=True),
+            **eval_batch_provenance,
+        }
+        self._latest_disc_eval_batch_kind = str(eval_batch_kind)
+
+        disc_pass_start = time.perf_counter()
+        if lengths_train_np is None:
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_train_np,
+                y_train_np,
+                shot_end_np=shot_end_train_np,
+                shot_quality_np=shot_quality_train_np,
+                shot_quality_mask_np=shot_quality_mask_train_np,
+            )
+            self._last_disc_trainbatch_acc = self._compute_disc_eval_top1_acc(
+                x_train_np, y_train_np
+            )
+            self._last_disc_trainbatch_auc = self._compute_disc_auc(
+                x_train_np, y_train_np
+            )
+            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
+                x_eval_np, y_eval_np
+            )
+            self._last_disc_auc = self._compute_disc_auc(x_eval_np, y_eval_np)
+            raw_bonus = self._compute_episode_bonus(x_bonus_np, y_bonus_np)
+        else:
+            self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+                x_train_np,
+                y_train_np,
+                lengths_train_np,
+                shot_end_np=shot_end_train_np,
+                shot_quality_np=shot_quality_train_np,
+                shot_quality_mask_np=shot_quality_mask_train_np,
+            )
+            self._last_disc_trainbatch_acc = self._compute_disc_eval_top1_acc(
+                x_train_np, y_train_np, lengths_train_np
+            )
+            self._last_disc_trainbatch_auc = self._compute_disc_auc(
+                x_train_np, y_train_np, lengths_train_np
+            )
+            self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
+                x_eval_np, y_eval_np, lengths_eval_np
+            )
+            self._last_disc_auc = self._compute_disc_auc(
+                x_eval_np, y_eval_np, lengths_eval_np
+            )
+            raw_bonus = self._compute_episode_bonus(x_bonus_np, y_bonus_np, lengths_bonus_np)
+        self._last_disc_pass_ms = float((time.perf_counter() - disc_pass_start) * 1000.0)
+        if raw_bonus.size == 0:
+            return
+
+        self._bonus_stats.update(raw_bonus)
+        norm_bonus = (raw_bonus - float(self._bonus_stats.mean)) / float(self._bonus_stats.std)
+        clipped_bonus = np.clip(norm_bonus, -self.bonus_clip, self.bonus_clip)
+        episode_bonus = (float(beta) * clipped_bonus).astype(np.float32, copy=False)
+
+        rb = self.model.rollout_buffer
+        per_step_bonus_values: list[float] = []
+        for ep_idx, episode in enumerate(episodes):
+            if ep_idx >= clipped_bonus.shape[0]:
+                break
+            active_len = max(1, int(episode.active_prefix_length))
+            per_step = float(episode_bonus[ep_idx] / active_len)
+            per_step_bonus_values.append(per_step)
+            for t_idx, env_idx in episode.active_buffer_indices:
+                if (
+                    0 <= int(t_idx) < rb.rewards.shape[0]
+                    and 0 <= int(env_idx) < rb.rewards.shape[1]
+                ):
+                    rb.rewards[int(t_idx), int(env_idx)] += per_step
+
+        self._recompute_returns_and_advantage()
+
+        if self._should_console_log_disc():
+            try:
+                avg_len = float(
+                    np.mean([float(ep.active_prefix_length) for ep in episodes])
+                    if episodes
+                    else 0.0
+                )
+                train_auc_str = (
+                    f"{float(self._last_disc_trainbatch_auc):.4f}"
+                    if self._last_disc_trainbatch_auc is not None
+                    else "NA"
+                )
+                holdout_acc_str = (
+                    f"{float(self._last_disc_eval_acc):.4f}"
+                    if self._last_disc_eval_acc is not None
+                    else "NA"
+                )
+                holdout_auc_str = (
+                    f"{float(self._last_disc_auc):.4f}"
+                    if self._last_disc_auc is not None
+                    else "NA"
+                )
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"encoder={self.disc_encoder_type} "
+                    f"episodes={len(episodes)} "
+                    f"train_eps={len(train_episodes)} "
+                    f"eval_eps={len(holdout_episodes) if holdout_episodes else len(episodes)} "
+                    f"eval_kind={eval_batch_kind} "
+                    f"avg_len={avg_len:.2f} "
+                    f"updates={self.disc_updates_per_rollout} "
+                    f"disc_ms={float(self._last_disc_pass_ms):.1f} "
+                    f"loss={float(self._last_disc_loss):.4f} "
+                    f"top1={float(self._last_disc_acc):.4f} "
+                    f"top1_train={float(self._last_disc_trainbatch_acc or 0.0):.4f} "
+                    f"auc_train={train_auc_str} "
+                    f"top1_holdout={holdout_acc_str} "
+                    f"auc_holdout={holdout_auc_str} "
+                    f"beta={float(beta):.4f}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
+            mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            if self._last_disc_trainbatch_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_trainbatch",
+                    float(self._last_disc_trainbatch_acc),
+                    step=global_step,
+                )
+            if self._last_disc_trainbatch_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_trainbatch",
+                    float(self._last_disc_trainbatch_auc),
+                    step=global_step,
+                )
+            if float(self.disc_lambda_shot) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_end_loss",
+                    float(self._last_disc_shot_end_loss),
+                    step=global_step,
+                )
+            if float(self.disc_lambda_q) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_quality_loss",
+                    float(self._last_disc_shot_quality_loss),
+                    step=global_step,
+                )
+            if self._last_disc_eval_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_holdout",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_eval",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
+            if self._last_disc_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_holdout",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
+            mlflow.log_metric(
+                "intent/disc_trainbatch_size",
+                float(x_train_np.shape[0]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/disc_holdout_size",
+                float(x_eval_np.shape[0]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/disc_holdout_fraction_realized",
+                float(x_eval_np.shape[0]) / float(max(1, x_bonus_np.shape[0])),
+                step=global_step,
+            )
+            mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
+            mlflow.log_metric("intent/bonus_raw_std", float(np.std(raw_bonus)), step=global_step)
+            mlflow.log_metric(
+                "intent/bonus_norm_mean", float(np.mean(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_norm_std", float(np.std(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_mean", float(np.mean(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_std", float(np.std(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_mean",
+                float(np.mean(episode_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_std",
+                float(np.std(episode_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_mean",
+                float(np.mean(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_std",
+                float(np.std(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric("intent/beta_current", float(beta), step=global_step)
+            usage_entropy, min_prob = self._usage_entropy(y_bonus_np, self.num_intents)
+            mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
+            mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
+        except Exception:
+            pass
+
+    def _on_rollout_end_step_mode(self, global_step: int) -> None:
+        examples = list(self._step_examples)
+        if not examples:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=no_active_offense_intent_steps",
+                    flush=True,
+                )
+            return
+        beta = self._beta_current()
+        if beta <= 0.0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"skipped=warmup "
+                    f"beta={float(beta):.4f} "
+                    f"steps={len(examples)}",
+                    flush=True,
+                )
+            return
+
+        (
+            x_bonus_np,
+            lengths_bonus_np,
+            y_bonus_np,
+            shot_end_bonus_np,
+            shot_quality_bonus_np,
+            shot_quality_mask_bonus_np,
+        ) = self._build_disc_batches_from_steps(examples)
+        if self._disc_batch_size(x_bonus_np) == 0:
+            if self._should_console_log_disc():
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    "skipped=empty_discriminator_batch",
+                    flush=True,
+                )
+            return
+
+        train_examples, holdout_examples = self._split_disc_train_holdout_steps(examples)
+        (
+            x_train_np,
+            lengths_train_np,
+            y_train_np,
+            shot_end_train_np,
+            shot_quality_train_np,
+            shot_quality_mask_train_np,
+        ) = self._build_disc_batches_from_steps(train_examples)
+        if holdout_examples:
+            (
+                x_eval_np,
+                lengths_eval_np,
+                y_eval_np,
+                shot_end_eval_np,
+                shot_quality_eval_np,
+                shot_quality_mask_eval_np,
+            ) = self._build_disc_batches_from_steps(holdout_examples)
+            eval_batch_kind = "holdout"
+        else:
+            x_eval_np = {
+                key: np.array(value, copy=True) for key, value in x_bonus_np.items()
+            }
+            lengths_eval_np = lengths_bonus_np
+            y_eval_np = np.array(y_bonus_np, copy=True)
+            shot_end_eval_np = np.array(shot_end_bonus_np, copy=True)
+            shot_quality_eval_np = np.array(shot_quality_bonus_np, copy=True)
+            shot_quality_mask_eval_np = np.array(
+                shot_quality_mask_bonus_np, copy=True
+            )
+            eval_batch_kind = "trainbatch_fallback"
+
+        eval_batch_provenance = self._build_disc_step_batch_provenance(
+            holdout_examples if holdout_examples else examples
+        )
+        self._latest_disc_eval_batch = {
+            "x": {key: np.array(value, copy=True) for key, value in x_eval_np.items()},
+            "y": np.array(y_eval_np, copy=True),
+            "lengths": None,
+            "shot_end": np.array(shot_end_eval_np, copy=True),
+            "shot_quality": np.array(shot_quality_eval_np, copy=True),
+            "shot_quality_mask": np.array(shot_quality_mask_eval_np, copy=True),
+            **eval_batch_provenance,
+        }
+        self._latest_disc_eval_batch_kind = str(eval_batch_kind)
+
+        disc_pass_start = time.perf_counter()
+        self._last_disc_loss, self._last_disc_acc = self._train_discriminator(
+            x_train_np,
+            y_train_np,
+            shot_end_np=shot_end_train_np,
+            shot_quality_np=shot_quality_train_np,
+            shot_quality_mask_np=shot_quality_mask_train_np,
+        )
+        self._last_disc_trainbatch_acc = self._compute_disc_eval_top1_acc(
+            x_train_np, y_train_np
+        )
+        self._last_disc_trainbatch_auc = self._compute_disc_auc(
+            x_train_np, y_train_np
+        )
+        self._last_disc_eval_acc = self._compute_disc_eval_top1_acc(
+            x_eval_np, y_eval_np
+        )
+        self._last_disc_auc = self._compute_disc_auc(x_eval_np, y_eval_np)
+        raw_bonus = self._compute_episode_bonus(x_bonus_np, y_bonus_np)
+        self._last_disc_pass_ms = float((time.perf_counter() - disc_pass_start) * 1000.0)
+        if raw_bonus.size == 0:
+            return
+
+        self._bonus_stats.update(raw_bonus)
+        norm_bonus = (raw_bonus - float(self._bonus_stats.mean)) / float(
+            self._bonus_stats.std
+        )
+        clipped_bonus = np.clip(norm_bonus, -self.bonus_clip, self.bonus_clip)
+        step_bonus = (float(beta) * clipped_bonus).astype(np.float32, copy=False)
+
+        rb = self.model.rollout_buffer
+        per_step_bonus_values: list[float] = []
+        for ex_idx, example in enumerate(examples):
+            if ex_idx >= step_bonus.shape[0]:
+                break
+            bonus_value = float(step_bonus[ex_idx])
+            per_step_bonus_values.append(bonus_value)
+            t_idx = int(example.buffer_step_idx)
+            env_idx = int(example.env_idx)
+            if 0 <= t_idx < rb.rewards.shape[0] and 0 <= env_idx < rb.rewards.shape[1]:
+                rb.rewards[t_idx, env_idx] += bonus_value
+
+        self._recompute_returns_and_advantage()
+
+        if self._should_console_log_disc():
+            try:
+                train_auc_str = (
+                    f"{float(self._last_disc_trainbatch_auc):.4f}"
+                    if self._last_disc_trainbatch_auc is not None
+                    else "NA"
+                )
+                holdout_acc_str = (
+                    f"{float(self._last_disc_eval_acc):.4f}"
+                    if self._last_disc_eval_acc is not None
+                    else "NA"
+                )
+                holdout_auc_str = (
+                    f"{float(self._last_disc_auc):.4f}"
+                    if self._last_disc_auc is not None
+                    else "NA"
+                )
+                print(
+                    "[IntentDisc] "
+                    f"rollout={self._rollout_counter} "
+                    f"step={global_step} "
+                    f"encoder={self.disc_encoder_type} "
+                    f"steps={len(examples)} "
+                    f"train_steps={len(train_examples)} "
+                    f"eval_steps={len(holdout_examples) if holdout_examples else len(examples)} "
+                    f"eval_kind={eval_batch_kind} "
+                    f"updates={self.disc_updates_per_rollout} "
+                    f"disc_ms={float(self._last_disc_pass_ms):.1f} "
+                    f"loss={float(self._last_disc_loss):.4f} "
+                    f"top1={float(self._last_disc_acc):.4f} "
+                    f"top1_train={float(self._last_disc_trainbatch_acc or 0.0):.4f} "
+                    f"auc_train={train_auc_str} "
+                    f"top1_holdout={holdout_acc_str} "
+                    f"auc_holdout={holdout_auc_str} "
+                    f"beta={float(beta):.4f}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            mlflow.log_metric("intent/disc_loss", float(self._last_disc_loss), step=global_step)
+            mlflow.log_metric("intent/disc_top1_acc", float(self._last_disc_acc), step=global_step)
+            if self._last_disc_trainbatch_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_trainbatch",
+                    float(self._last_disc_trainbatch_acc),
+                    step=global_step,
+                )
+            if self._last_disc_trainbatch_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_trainbatch",
+                    float(self._last_disc_trainbatch_auc),
+                    step=global_step,
+                )
+            if float(self.disc_lambda_shot) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_end_loss",
+                    float(self._last_disc_shot_end_loss),
+                    step=global_step,
+                )
+            if float(self.disc_lambda_q) > 0.0:
+                mlflow.log_metric(
+                    "intent/disc_shot_quality_loss",
+                    float(self._last_disc_shot_quality_loss),
+                    step=global_step,
+                )
+            if self._last_disc_eval_acc is not None:
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_holdout",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    "intent/disc_top1_acc_eval",
+                    float(self._last_disc_eval_acc),
+                    step=global_step,
+                )
+            if self._last_disc_auc is not None:
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro_holdout",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    "intent/disc_auc_ovr_macro",
+                    float(self._last_disc_auc),
+                    step=global_step,
+                )
+            train_size = float(self._disc_batch_size(x_train_np))
+            eval_size = float(self._disc_batch_size(x_eval_np))
+            bonus_size = float(max(1, self._disc_batch_size(x_bonus_np)))
+            mlflow.log_metric("intent/disc_trainbatch_size", train_size, step=global_step)
+            mlflow.log_metric("intent/disc_holdout_size", eval_size, step=global_step)
+            mlflow.log_metric(
+                "intent/disc_holdout_fraction_realized",
+                eval_size / bonus_size,
+                step=global_step,
+            )
+            mlflow.log_metric("intent/bonus_raw_mean", float(np.mean(raw_bonus)), step=global_step)
+            mlflow.log_metric("intent/bonus_raw_std", float(np.std(raw_bonus)), step=global_step)
+            mlflow.log_metric(
+                "intent/bonus_norm_mean", float(np.mean(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_norm_std", float(np.std(norm_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_mean", float(np.mean(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_clipped_std", float(np.std(clipped_bonus)), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_mean",
+                float(np.mean(step_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_episode_std",
+                float(np.std(step_bonus)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_mean",
+                float(np.mean(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/bonus_shaping_per_step_std",
+                float(np.std(per_step_bonus_values)) if per_step_bonus_values else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric("intent/beta_current", float(beta), step=global_step)
+            usage_entropy, min_prob = self._usage_entropy(y_bonus_np, self.num_intents)
+            mlflow.log_metric("intent/usage_entropy", float(usage_entropy), step=global_step)
+            mlflow.log_metric("intent/usage_min_prob", float(min_prob), step=global_step)
+        except Exception:
+            pass
+
+
+class IntentSelectorCallback(BaseCallback):
+    """Learn a high-level selector mu(z|s) and optionally override offense intent starts."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        alpha_start: float = 0.0,
+        alpha_end: float = 1.0,
+        warmup_steps: int = 0,
+        ramp_steps: int = 1,
+        entropy_coef: float = 0.01,
+        usage_reg_coef: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.alpha_start = float(alpha_start)
+        self.alpha_end = float(alpha_end)
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.ramp_steps = max(0, int(ramp_steps))
+        self.entropy_coef = float(max(0.0, entropy_coef))
+        self.usage_reg_coef = float(max(0.0, usage_reg_coef))
+
+        self._device = torch.device("cpu")
+        self._return_stats = RunningMeanStd()
+        self._episode_start_records_by_env: dict[int, dict] = {}
+        self._completed_selector_samples: list[dict] = []
+
+    @staticmethod
+    def _extract_scalar_from_obs(
+        obs_payload, key: str, env_idx: int, default: float = 0.0
+    ) -> float:
+        try:
+            if not isinstance(obs_payload, dict) or key not in obs_payload:
+                return float(default)
+            arr = np.asarray(obs_payload[key], dtype=np.float32)
+            if arr.ndim == 0:
+                return float(arr)
+            if arr.shape[0] <= int(env_idx):
+                return float(default)
+            return float(np.asarray(arr[int(env_idx)]).reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _obs_batch_size(obs_payload) -> int:
+        try:
+            if not isinstance(obs_payload, dict):
+                return 0
+            for value in obs_payload.values():
+                arr = np.asarray(value)
+                if arr.ndim >= 1:
+                    return int(arr.shape[0])
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _stack_single_observations(single_obs_list: list[dict]) -> dict:
+        if not single_obs_list:
+            raise ValueError("single_obs_list cannot be empty")
+        keys = list(single_obs_list[0].keys())
+        batched: dict[str, np.ndarray] = {}
+        for key in keys:
+            batched[key] = np.stack(
+                [np.asarray(obs[key]) for obs in single_obs_list], axis=0
+            )
+        return batched
+
+    def _alpha_current(self) -> float:
+        t = int(getattr(self.model, "num_timesteps", 0))
+        if t < self.warmup_steps:
+            return float(self.alpha_start)
+        if self.ramp_steps <= 0:
+            return float(self.alpha_end)
+        progress = min(
+            1.0, max(0.0, (t - self.warmup_steps) / float(self.ramp_steps))
+        )
+        return float(self.alpha_start + progress * (self.alpha_end - self.alpha_start))
+
+    def _neutralize_selector_observation(self, single_obs: dict) -> dict:
+        selector_obs = clone_observation_dict(single_obs)
+        patch_intent_in_observation(
+            selector_obs,
+            0,
+            self.num_intents,
+            active=0.0,
+            visible=0.0,
+            age_norm=0.0,
+        )
+        return selector_obs
+
+    def _get_role_intent_fields(
+        self, env_idx: int, *, observer_is_offense: bool
+    ) -> dict[str, float]:
+        try:
+            values = self.training_env.env_method(
+                "get_intent_observation_fields",
+                bool(observer_is_offense),
+                indices=[int(env_idx)],
+            )
+        except Exception:
+            return {}
+        if not values:
+            return {}
+        fields = values[0]
+        if not isinstance(fields, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key in ("intent_index", "intent_active", "intent_visible", "intent_age_norm"):
+            try:
+                out[key] = float(np.asarray(fields.get(key, 0.0)).reshape(-1)[0])
+            except Exception:
+                out[key] = 0.0
+        return out
+
+    def _apply_selected_intent(self, obs_payload, env_idx: int, intent_index: int) -> None:
+        try:
+            self.training_env.env_method(
+                "set_offense_intent_state",
+                int(intent_index),
+                indices=[int(env_idx)],
+                intent_active=True,
+                intent_age=0,
+            )
+        except Exception:
+            pass
+        visible = float(
+            self._get_role_intent_fields(
+                env_idx, observer_is_offense=True
+            ).get("intent_visible", 1.0)
+        )
+        patch_intent_in_observation(
+            obs_payload,
+            int(intent_index),
+            self.num_intents,
+            active=1.0,
+            visible=visible,
+            age_norm=0.0,
+            batch_index=env_idx,
+        )
+
+    def _maybe_select_for_episode_start(self, obs_payload, env_idx: int) -> None:
+        if not self.enabled or not isinstance(obs_payload, dict):
+            return
+        if self._extract_scalar_from_obs(obs_payload, "role_flag", env_idx, default=0.0) <= 0.0:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        fields = self._get_role_intent_fields(env_idx, observer_is_offense=True)
+        if float(fields.get("intent_active", 0.0)) <= 0.5:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+
+        alpha = self._alpha_current()
+        if alpha <= 0.0 or np.random.random() >= alpha:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+
+        n_envs = self._obs_batch_size(obs_payload)
+        if n_envs <= 0:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        try:
+            start_obs = extract_single_env_observation(
+                obs_payload,
+                env_idx=env_idx,
+                expected_batch_size=n_envs,
+            )
+        except Exception:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        selector_obs = self._neutralize_selector_observation(start_obs)
+        policy = getattr(self.model, "policy", None)
+        if policy is None:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        try:
+            was_training = bool(getattr(policy, "training", False))
+            if hasattr(policy, "eval"):
+                policy.eval()
+            with torch.no_grad():
+                logits = policy.get_intent_selector_logits(selector_obs)
+                dist = torch.distributions.Categorical(logits=logits)
+                chosen_z = int(dist.sample().reshape(-1)[0].item())
+        except Exception:
+            self._episode_start_records_by_env.pop(int(env_idx), None)
+            return
+        finally:
+            try:
+                if was_training and hasattr(policy, "train"):
+                    policy.train()
+            except Exception:
+                pass
+
+        self._apply_selected_intent(obs_payload, env_idx, chosen_z)
+        self._episode_start_records_by_env[int(env_idx)] = {
+            "selector_obs": selector_obs,
+            "chosen_z": int(chosen_z),
+            "alpha": float(alpha),
+        }
+
+    def _on_training_start(self) -> None:
+        if not self.enabled:
+            return
+        policy = getattr(self.model, "policy", None)
+        if policy is None or not hasattr(policy, "has_intent_selector") or not policy.has_intent_selector():
+            raise RuntimeError(
+                "Intent selector callback requires a policy with intent_selector_enabled=True."
+            )
+        try:
+            self._device = torch.device(policy.device)
+        except Exception:
+            self._device = torch.device("cpu")
+        self._episode_start_records_by_env = {}
+        self._completed_selector_samples = []
+
+    def _on_rollout_start(self) -> None:
+        if not self.enabled:
+            return
+        obs_payload = getattr(self.model, "_last_obs", None)
+        if not isinstance(obs_payload, dict):
+            return
+        n_envs = self._obs_batch_size(obs_payload)
+        if n_envs <= 0:
+            return
+        episode_starts = getattr(self.model, "_last_episode_starts", None)
+        if episode_starts is None or len(np.asarray(episode_starts).reshape(-1)) != n_envs:
+            episode_starts = np.ones(n_envs, dtype=bool)
+        else:
+            episode_starts = np.asarray(episode_starts, dtype=bool).reshape(-1)
+        for env_idx in range(n_envs):
+            if bool(episode_starts[env_idx]):
+                self._maybe_select_for_episode_start(obs_payload, env_idx)
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
+        obs_payload = self.locals.get("new_obs", None)
+        if not isinstance(obs_payload, dict) or not isinstance(infos, (list, tuple)):
+            return True
+        n_envs = min(len(infos), len(dones), self._obs_batch_size(obs_payload))
+        for env_idx in range(n_envs):
+            if not bool(dones[env_idx]):
+                continue
+            start_record = self._episode_start_records_by_env.pop(int(env_idx), None)
+            episode_info = infos[env_idx].get("episode") if isinstance(infos[env_idx], dict) else None
+            if (
+                start_record is not None
+                and isinstance(episode_info, dict)
+                and "r" in episode_info
+            ):
+                self._completed_selector_samples.append(
+                    {
+                        **start_record,
+                        "episode_return": float(episode_info.get("r", 0.0)),
+                    }
+                )
+            self._maybe_select_for_episode_start(obs_payload, env_idx)
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled or not self._completed_selector_samples:
+            return
+
+        policy = getattr(self.model, "policy", None)
+        if policy is None:
+            self._completed_selector_samples = []
+            return
+
+        samples = list(self._completed_selector_samples)
+        self._completed_selector_samples = []
+        selector_obs_batch = self._stack_single_observations(
+            [sample["selector_obs"] for sample in samples]
+        )
+        returns_np = np.asarray(
+            [sample["episode_return"] for sample in samples], dtype=np.float32
+        )
+        chosen_z_np = np.asarray([sample["chosen_z"] for sample in samples], dtype=np.int64)
+        returns_norm = (returns_np - float(self._return_stats.mean)) / float(
+            self._return_stats.std
+        )
+        self._return_stats.update(returns_np)
+
+        obs_tensor, _ = policy.obs_to_tensor(selector_obs_batch)
+        logits = policy.get_intent_selector_logits(obs_tensor)
+        dist = torch.distributions.Categorical(logits=logits)
+        chosen_z = torch.as_tensor(chosen_z_np, dtype=torch.long, device=logits.device)
+        advantage = torch.as_tensor(
+            returns_norm, dtype=torch.float32, device=logits.device
+        )
+        log_prob = dist.log_prob(chosen_z)
+        entropy = dist.entropy().mean()
+        prob_tensor = torch.softmax(logits, dim=-1)
+        mean_probs = prob_tensor.mean(dim=0)
+        usage_kl = torch.sum(
+            mean_probs * torch.log(mean_probs.clamp_min(1e-8) * float(self.num_intents))
+        )
+        policy_loss = -(advantage * log_prob).mean()
+        total_loss = (
+            policy_loss
+            - float(self.entropy_coef) * entropy
+            + float(self.usage_reg_coef) * usage_kl
+        )
+
+        optimizer = getattr(policy, "optimizer", None)
+        if optimizer is None:
+            return
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        global_step = int(getattr(self.model, "num_timesteps", 0))
+        usage_counts = np.bincount(chosen_z_np, minlength=self.num_intents).astype(np.float64)
+        usage_probs = usage_counts / max(1.0, float(np.sum(usage_counts)))
+        nonzero = usage_probs > 0.0
+        usage_entropy = float(-np.sum(usage_probs[nonzero] * np.log(usage_probs[nonzero])))
+        mean_probs_np = mean_probs.detach().cpu().numpy().astype(np.float64, copy=False)
+        top1_np = torch.argmax(logits, dim=-1).detach().cpu().numpy().astype(np.int64, copy=False)
+        top1_counts = np.bincount(top1_np, minlength=self.num_intents).astype(np.float64)
+        top1_probs = top1_counts / max(1.0, float(np.sum(top1_counts)))
+        max_prob_np = torch.max(prob_tensor, dim=-1).values.detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
+        top2_vals = torch.topk(prob_tensor, k=min(2, self.num_intents), dim=-1).values
+        if top2_vals.shape[-1] >= 2:
+            margin_np = (
+                top2_vals[:, 0] - top2_vals[:, 1]
+            ).detach().cpu().numpy().astype(np.float64, copy=False)
+        else:
+            margin_np = max_prob_np.copy()
+        try:
+            mlflow.log_metric(
+                "intent/selector_alpha_current",
+                float(self._alpha_current()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_loss", float(total_loss.detach().cpu().item()), step=global_step
+            )
+            mlflow.log_metric(
+                "intent/selector_policy_loss",
+                float(policy_loss.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_entropy",
+                float(entropy.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_usage_entropy",
+                float(usage_entropy),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_usage_kl_uniform",
+                float(usage_kl.detach().cpu().item()),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_return_mean",
+                float(np.mean(returns_np)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_samples",
+                float(len(samples)),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_confidence_mean",
+                float(np.mean(max_prob_np)) if max_prob_np.size > 0 else 0.0,
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/selector_margin_mean",
+                float(np.mean(margin_np)) if margin_np.size > 0 else 0.0,
+                step=global_step,
+            )
+            for z in range(self.num_intents):
+                mlflow.log_metric(
+                    f"intent/selector_usage_by_intent/{z}",
+                    float(usage_probs[z]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/selector_prob_mean_by_intent/{z}",
+                    float(mean_probs_np[z]),
+                    step=global_step,
+                )
+                mlflow.log_metric(
+                    f"intent/selector_top1_by_intent/{z}",
+                    float(top1_probs[z]),
+                    step=global_step,
+                )
+                selected_mask = chosen_z_np == z
+                if np.any(selected_mask):
+                    mlflow.log_metric(
+                        f"intent/selector_return_by_intent/{z}",
+                        float(np.mean(returns_np[selected_mask])),
+                        step=global_step,
+                    )
+        except Exception:
+            pass
+
+
+class IntentPolicySensitivityCallback(BaseCallback):
+    """Log how strongly offense action distributions depend on latent intent."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        num_intents: int = 8,
+        sample_states: int = 32,
+        log_freq_rollouts: int = 4,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.num_intents = max(1, int(num_intents))
+        self.sample_states = max(1, int(sample_states))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self._sampled_states: list[dict] = []
+        self._sampled_seen = 0
+        self._rollout_counter = 0
+
+    @staticmethod
+    def _extract_role_flag(obs_payload, env_idx: int, n_envs: int) -> float:
+        try:
+            if not isinstance(obs_payload, dict) or "role_flag" not in obs_payload:
+                return 0.0
+            role = np.asarray(obs_payload["role_flag"], dtype=np.float32)
+            if role.ndim == 0:
+                return float(role)
+            if role.shape[0] == int(n_envs):
+                return float(np.asarray(role[int(env_idx)]).reshape(-1)[0])
+        except Exception:
+            pass
+        return 0.0
+
+    def _on_rollout_start(self) -> None:
+        self._sampled_states = []
+        self._sampled_seen = 0
+
+    def _maybe_add_state(self, obs_payload, env_idx: int, n_envs: int) -> None:
+        try:
+            state = extract_single_env_observation(
+                obs_payload,
+                env_idx=env_idx,
+                expected_batch_size=n_envs,
+            )
+        except Exception:
+            return
+        self._sampled_seen += 1
+        if len(self._sampled_states) < self.sample_states:
+            self._sampled_states.append(state)
+            return
+        replace_idx = random.randint(0, self._sampled_seen - 1)
+        if replace_idx < self.sample_states:
+            self._sampled_states[replace_idx] = state
+
+    def _on_step(self) -> bool:
+        if not self.enabled:
+            return True
+        infos = self.locals.get("infos", [])
+        obs_payload = self.locals.get("new_obs", None)
+        if obs_payload is None:
+            obs_payload = self.locals.get("obs", None)
+        if obs_payload is None or not isinstance(infos, (list, tuple)):
+            return True
+
+        n_envs = len(infos)
+        for env_idx in range(n_envs):
+            if self._extract_role_flag(obs_payload, env_idx, n_envs) <= 0.0:
+                continue
+            self._maybe_add_state(obs_payload, env_idx, n_envs)
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self.enabled:
+            return
+        self._rollout_counter += 1
+        if not self._sampled_states:
+            return
+        if (self._rollout_counter % self.log_freq_rollouts) != 0:
+            return
+
+        try:
+            metrics = compute_policy_sensitivity_metrics(
+                self.model,
+                self._sampled_states,
+                num_intents=self.num_intents,
+                active=1.0,
+                visible=1.0,
+                age_norm=0.0,
+            )
+            if metrics.get("num_pairs", 0.0) <= 0.0:
+                return
+            global_step = int(getattr(self.model, "num_timesteps", 0))
+            mlflow.log_metric(
+                "intent/policy_kl_mean",
+                float(metrics["policy_kl_mean"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_kl_max",
+                float(metrics["policy_kl_max"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_tv_mean",
+                float(metrics["policy_tv_mean"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/action_flip_rate",
+                float(metrics["action_flip_rate"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_sensitivity_samples",
+                float(metrics["num_states"]),
+                step=global_step,
+            )
+            mlflow.log_metric(
+                "intent/policy_sensitivity_pairs",
+                float(metrics["num_pairs"]),
+                step=global_step,
+            )
+        except Exception:
+            pass
 
 
 # --- Entropy Schedules ---
@@ -969,6 +3800,156 @@ class PassCurriculumExpScheduleCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # Throttled: avoid per-step update/logging
+        return True
+
+
+class TaskRewardScaleScheduleCallback(BaseCallback):
+    """Schedule the scale applied to aggregated task reward returned to PPO.
+
+    This affects the environment reward path, including phi shaping, but does not
+    affect the DIAYN bonus added later by IntentDiversityCallback.
+    """
+
+    def __init__(
+        self,
+        scale_start: float,
+        scale_end: float,
+        warmup_steps: int = 0,
+        ramp_steps: int = 1,
+        log_freq_rollouts: int = 1,
+        timestep_offset: int = 0,
+    ):
+        super().__init__()
+        self.scale_start = float(max(0.0, scale_start))
+        self.scale_end = float(max(0.0, scale_end))
+        self.warmup_steps = int(max(0, warmup_steps))
+        self.ramp_steps = int(max(0, ramp_steps))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self.timestep_offset = int(timestep_offset)
+        self._rollouts = 0
+
+    def _current_scale(self, t: int) -> float:
+        if t < self.warmup_steps:
+            return float(self.scale_start)
+        if self.ramp_steps <= 0:
+            return float(self.scale_end)
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (float(t) - float(self.warmup_steps)) / float(self.ramp_steps),
+            ),
+        )
+        return float(self.scale_start + progress * (self.scale_end - self.scale_start))
+
+    def _apply_current(self, log_to_mlflow: bool = True) -> None:
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
+            scale = self._current_scale(t)
+            vecenv = self.model.get_env()
+            try:
+                if vecenv is not None and hasattr(vecenv, "env_method"):
+                    vecenv.env_method("set_task_reward_scale", float(scale))
+            except Exception:
+                pass
+            if log_to_mlflow:
+                step = int(t + self.timestep_offset)
+                try:
+                    mlflow.log_metric("task_reward_scale_config", float(scale), step=step)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current(log_to_mlflow=True)
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current(log_to_mlflow=False)
+
+    def _on_rollout_end(self) -> None:
+        self._rollouts += 1
+        self._apply_current(
+            log_to_mlflow=(self._rollouts % self.log_freq_rollouts == 0)
+        )
+
+    def _on_step(self) -> bool:
+        return True
+
+
+class IntentRobustnessScheduleCallback(BaseCallback):
+    """Schedule intent null/visibility probabilities for robustness curriculum.
+
+    - null_prob(t): linear from null_start -> null_end
+    - visible_prob(t): linear from visible_start -> visible_end
+    Applies via VecEnv.env_method on wrapped environments.
+    """
+
+    def __init__(
+        self,
+        null_start: float,
+        null_end: float,
+        visible_start: float,
+        visible_end: float,
+        total_planned_timesteps: int,
+        log_freq_rollouts: int = 1,
+        timestep_offset: int = 0,
+    ):
+        super().__init__()
+        self.null_start = float(max(0.0, min(1.0, null_start)))
+        self.null_end = float(max(0.0, min(1.0, null_end)))
+        self.visible_start = float(max(0.0, min(1.0, visible_start)))
+        self.visible_end = float(max(0.0, min(1.0, visible_end)))
+        self.total = int(max(1, total_planned_timesteps))
+        self.log_freq_rollouts = max(1, int(log_freq_rollouts))
+        self.timestep_offset = int(timestep_offset)
+        self._rollouts = 0
+
+    def _linear(self, start: float, end: float, t: int) -> float:
+        progress = min(1.0, max(0.0, t / float(self.total)))
+        return float(start + (end - start) * progress)
+
+    def _apply_current(self, log_to_mlflow: bool = True) -> None:
+        try:
+            t = int(getattr(self.model, "num_timesteps", 0)) - self.timestep_offset
+            null_prob = self._linear(self.null_start, self.null_end, t)
+            visible_prob = self._linear(self.visible_start, self.visible_end, t)
+            vecenv = self.model.get_env()
+            try:
+                if vecenv is not None and hasattr(vecenv, "env_method"):
+                    vecenv.env_method("set_intent_null_prob", float(null_prob))
+                    vecenv.env_method(
+                        "set_intent_visible_to_defense_prob", float(visible_prob)
+                    )
+            except Exception:
+                pass
+            if log_to_mlflow:
+                step = int(t + self.timestep_offset)
+                try:
+                    mlflow.log_metric("intent/null_prob_config", float(null_prob), step=step)
+                    mlflow.log_metric(
+                        "intent/visible_to_defense_prob_config",
+                        float(visible_prob),
+                        step=step,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_training_start(self) -> None:
+        self._apply_current(log_to_mlflow=True)
+
+    def _on_rollout_start(self) -> None:
+        self._apply_current(log_to_mlflow=False)
+
+    def _on_rollout_end(self) -> None:
+        self._rollouts += 1
+        self._apply_current(
+            log_to_mlflow=(self._rollouts % self.log_freq_rollouts == 0)
+        )
+
+    def _on_step(self) -> bool:
         return True
 
 

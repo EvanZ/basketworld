@@ -81,6 +81,102 @@ export async function initGame(runId, userTeamName, offensePolicyName = null, de
     return response.json();
 }
 
+export async function initTemplateSandbox(payload = {}) {
+    const response = await fetch(`${API_BASE_URL}/api/template_bootstrap`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload || {}),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to initialize template sandbox' }));
+        console.error('[API] initTemplateSandbox failed:', response.status, errorData);
+        throw new Error(errorData.detail || 'Failed to initialize template sandbox');
+    }
+    return response.json();
+}
+
+export async function applyStartTemplate(templateId, mirrored = null, applyToState = true, seed = null) {
+  const response = await fetch(`${API_BASE_URL}/api/apply_start_template`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      template_id: templateId,
+      mirrored,
+      apply_to_state: Boolean(applyToState),
+      seed,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to apply start template');
+  }
+  return response.json();
+}
+
+export async function loadStartTemplateLibrary(path) {
+  const response = await fetch(`${API_BASE_URL}/api/load_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to load start template library');
+  }
+  return response.json();
+}
+
+export async function importStartTemplateLibrary(filename, contents) {
+  const response = await fetch(`${API_BASE_URL}/api/import_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename,
+      contents,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to import start template library');
+  }
+  return response.json();
+}
+
+export async function setStartTemplateLibrary(library, source = 'session_editor', path = null) {
+  const response = await fetch(`${API_BASE_URL}/api/set_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      library,
+      source,
+      path,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update start template library');
+  }
+  return response.json();
+}
+
+export async function saveStartTemplateLibrary(path, library) {
+  const response = await fetch(`${API_BASE_URL}/api/save_start_template_library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path,
+      library,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to save start template library');
+  }
+  return response.json();
+}
+
 export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null) {
     console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions);
     const response = await fetch(`${API_BASE_URL}/api/step`, {
@@ -310,7 +406,14 @@ export async function getPhiLog() {
   return response.json();
 }
 
-export async function runEvaluation(numEpisodes = 100, playerDeterministic = false, opponentDeterministic = true, customSetup = null, randomizeOffensePermutation = false) {
+export async function runEvaluation(
+  numEpisodes = 100,
+  playerDeterministic = false,
+  opponentDeterministic = true,
+  customSetup = null,
+  randomizeOffensePermutation = false,
+  intentSelectionMode = 'learned_sample',
+) {
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -320,11 +423,21 @@ export async function runEvaluation(numEpisodes = 100, playerDeterministic = fal
       opponent_deterministic: opponentDeterministic,
       custom_setup: customSetup || null,
       randomize_offense_permutation: Boolean(randomizeOffensePermutation),
+      intent_selection_mode: String(intentSelectionMode || 'learned_sample'),
     }),
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to run evaluation');
+  }
+  return response.json();
+}
+
+export async function getEvaluationProgress() {
+  const response = await fetch(`${API_BASE_URL}/api/evaluation_progress`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to get evaluation progress');
   }
   return response.json();
 }
@@ -393,6 +506,90 @@ export async function setBallHolder(playerId) {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to set ball holder');
+  }
+  return response.json();
+}
+
+export async function setIntentState(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_intent_state`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set intent state');
+  }
+  return response.json();
+}
+
+export async function captureCounterfactualSnapshot() {
+  const response = await fetch(`${API_BASE_URL}/api/capture_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to capture snapshot');
+  }
+  return response.json();
+}
+
+export async function restoreCounterfactualSnapshot() {
+  const response = await fetch(`${API_BASE_URL}/api/restore_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to restore snapshot');
+  }
+  return response.json();
+}
+
+export async function replayCounterfactualSnapshot(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/replay_counterfactual_snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player_deterministic: payload.player_deterministic ?? true,
+      opponent_deterministic: payload.opponent_deterministic ?? true,
+      max_steps: payload.max_steps ?? 256,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to replay counterfactual snapshot');
+  }
+  return response.json();
+}
+
+export async function runPlaybookAnalysis(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/playbook_analysis`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      intent_indices: Array.isArray(payload.intent_indices) ? payload.intent_indices : [],
+      num_rollouts: payload.num_rollouts ?? 16,
+      max_steps: payload.max_steps ?? 8,
+      run_to_end: payload.run_to_end ?? false,
+      use_snapshot: payload.use_snapshot ?? true,
+      player_deterministic: payload.player_deterministic ?? false,
+      opponent_deterministic: payload.opponent_deterministic ?? true,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to run playbook analysis');
+  }
+  return response.json();
+}
+
+export async function getPlaybookProgress() {
+  const response = await fetch(`${API_BASE_URL}/api/playbook_progress`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch playbook progress');
   }
   return response.json();
 }

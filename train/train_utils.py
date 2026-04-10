@@ -137,14 +137,16 @@ def resolve_phi_beta_schedule(args, previous_schedule_meta, new_training_timeste
 
 def resolve_spa_schedule(args, schedule_mode: str, previous_schedule_meta, base_alt_idx: int):
     """Resolve steps-per-alternation start/end/schedule and continuation offset."""
-    if args.continue_run_id and previous_schedule_meta:
-        # Use prior schedule metadata if present
+    if args.continue_run_id and previous_schedule_meta and schedule_mode == "extend":
+        # In extend mode, keep the original SPA schedule and continue it forward.
         spa_start = previous_schedule_meta.get("spa_start", args.steps_per_alternation)
         spa_end = previous_schedule_meta.get(
             "spa_end", args.steps_per_alternation_end or args.steps_per_alternation
         )
         spa_schedule = previous_schedule_meta.get("spa_schedule", args.steps_per_alternation_schedule)
     else:
+        # In restart/constant mode, respect the current launch config instead of
+        # silently inheriting the previous run's SPA schedule.
         spa_start = args.steps_per_alternation
         spa_end = args.steps_per_alternation_end if args.steps_per_alternation_end is not None else args.steps_per_alternation
         spa_schedule = args.steps_per_alternation_schedule

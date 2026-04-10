@@ -18,7 +18,12 @@ from basketworld.utils.callbacks import (
     PotentialBetaExpScheduleCallback,
     PassLogitBiasExpScheduleCallback,
     PassCurriculumExpScheduleCallback,
+    TaskRewardScaleScheduleCallback,
+    IntentRobustnessScheduleCallback,
     EpisodeSampleLogger,
+    IntentDiversityCallback,
+    IntentSelectorCallback,
+    IntentPolicySensitivityCallback,
 )
 from basketworld.utils.mlflow_logger import MLflowWriter
 
@@ -128,6 +133,121 @@ def build_pass_curriculum_callback(args, total_planned_ts, timestep_offset):
     )
 
 
+def build_task_reward_scale_callback(args, timestep_offset):
+    """Build DIAYN-first task-reward curriculum callback if requested."""
+    start = getattr(args, "task_reward_scale_start", None)
+    end = getattr(args, "task_reward_scale_end", None)
+    if start is None and end is None:
+        return None
+    start = 1.0 if start is None else float(start)
+    end = start if end is None else float(end)
+    return TaskRewardScaleScheduleCallback(
+        scale_start=start,
+        scale_end=end,
+        warmup_steps=getattr(args, "task_reward_scale_warmup_steps", 0),
+        ramp_steps=getattr(args, "task_reward_scale_ramp_steps", 1),
+        log_freq_rollouts=getattr(args, "mlflow_schedule_log_every_rollouts", 1),
+        timestep_offset=timestep_offset,
+    )
+
+
+def build_intent_diversity_callback(args):
+    """Build intent diversity callback when enabled."""
+    if not getattr(args, "intent_diversity_enabled", False):
+        return None
+    return IntentDiversityCallback(
+        enabled=True,
+        num_intents=getattr(args, "num_intents", 8),
+        beta_target=getattr(args, "intent_diversity_beta_target", 0.05),
+        warmup_steps=getattr(args, "intent_diversity_warmup_steps", 1_000_000),
+        ramp_steps=getattr(args, "intent_diversity_ramp_steps", 1_000_000),
+        bonus_clip=getattr(args, "intent_diversity_clip", 2.0),
+        disc_lr=getattr(args, "intent_disc_lr", 3e-4),
+        disc_batch_size=getattr(args, "intent_disc_batch_size", 256),
+        disc_updates_per_rollout=getattr(args, "intent_disc_updates_per_rollout", 2),
+        disc_hidden_dim=getattr(args, "intent_disc_hidden_dim", 128),
+        disc_encoder_type=getattr(args, "intent_disc_encoder_type", "mlp_mean"),
+        disc_step_dim=getattr(args, "intent_disc_step_dim", 64),
+        disc_console_log_every_rollouts=getattr(
+            args, "intent_disc_console_log_every_rollouts", 0
+        ),
+        disc_dropout=getattr(args, "intent_disc_dropout", 0.1),
+        max_obs_dim=getattr(args, "intent_disc_max_obs_dim", 256),
+        max_action_dim=getattr(args, "intent_disc_max_action_dim", 16),
+        disc_include_shot_clock=getattr(
+            args, "intent_disc_include_shot_clock", True
+        ),
+        disc_include_pressure_exposure=getattr(
+            args, "intent_disc_include_pressure_exposure", True
+        ),
+        disc_lambda_shot=getattr(args, "intent_disc_lambda_shot", 0.0),
+        disc_lambda_q=getattr(args, "intent_disc_lambda_q", 0.0),
+        disc_eval_holdout_fraction=getattr(
+            args, "intent_disc_eval_holdout_fraction", 0.25
+        ),
+        disc_current_policy_only=getattr(
+            args, "intent_disc_current_policy_only", True
+        ),
+    )
+
+
+def build_intent_robustness_callback(args, total_planned_ts, timestep_offset):
+    """Build intent robustness curriculum scheduler if requested."""
+    if not getattr(args, "enable_intent_learning", False):
+        return None
+    null_end = getattr(args, "intent_null_prob_end", None)
+    visible_end = getattr(args, "intent_visible_to_defense_prob_end", None)
+    if null_end is None and visible_end is None:
+        return None
+    null_start = float(getattr(args, "intent_null_prob", 0.2))
+    visible_start = float(getattr(args, "intent_visible_to_defense_prob", 0.0))
+    null_end = float(null_start if null_end is None else null_end)
+    visible_end = float(visible_start if visible_end is None else visible_end)
+    return IntentRobustnessScheduleCallback(
+        null_start=null_start,
+        null_end=null_end,
+        visible_start=visible_start,
+        visible_end=visible_end,
+        total_planned_timesteps=total_planned_ts,
+        log_freq_rollouts=getattr(args, "mlflow_schedule_log_every_rollouts", 1),
+        timestep_offset=timestep_offset,
+    )
+
+
+def build_intent_policy_sensitivity_callback(args):
+    """Build intent policy sensitivity diagnostics when intent learning is enabled."""
+    if not getattr(args, "enable_intent_learning", False):
+        return None
+    if not getattr(args, "intent_policy_sensitivity_enabled", True):
+        return None
+    return IntentPolicySensitivityCallback(
+        enabled=True,
+        num_intents=getattr(args, "num_intents", 8),
+        sample_states=getattr(args, "intent_policy_sensitivity_sample_states", 32),
+        log_freq_rollouts=getattr(
+            args, "intent_policy_sensitivity_log_every_rollouts", 4
+        ),
+    )
+
+
+def build_intent_selector_callback(args):
+    """Build high-level intent selector callback when enabled."""
+    if not getattr(args, "intent_selector_enabled", False):
+        return None
+    if str(getattr(args, "intent_selector_mode", "callback")).lower() != "callback":
+        return None
+    return IntentSelectorCallback(
+        enabled=True,
+        num_intents=getattr(args, "num_intents", 8),
+        alpha_start=getattr(args, "intent_selector_alpha_start", 0.0),
+        alpha_end=getattr(args, "intent_selector_alpha_end", 1.0),
+        warmup_steps=getattr(args, "intent_selector_alpha_warmup_steps", 0),
+        ramp_steps=getattr(args, "intent_selector_alpha_ramp_steps", 1),
+        entropy_coef=getattr(args, "intent_selector_entropy_coef", 0.01),
+        usage_reg_coef=getattr(args, "intent_selector_usage_reg_coef", 0.01),
+    )
+
+
 def build_mixed_callbacks(
     args,
     global_alt: int,
@@ -136,6 +256,11 @@ def build_mixed_callbacks(
     beta_cb: Optional[BaseCallback],
     pass_bias_cb: Optional[BaseCallback],
     pass_curriculum_cb: Optional[BaseCallback],
+    task_reward_scale_cb: Optional[BaseCallback],
+    intent_robustness_cb: Optional[BaseCallback],
+    intent_diversity_cb: Optional[BaseCallback],
+    intent_policy_sensitivity_cb: Optional[BaseCallback],
+    intent_selector_cb: Optional[BaseCallback],
 ) -> List[BaseCallback]:
     """Assemble callbacks for mixed training."""
     callbacks: List[BaseCallback] = [
@@ -153,6 +278,16 @@ def build_mixed_callbacks(
         callbacks.append(pass_bias_cb)
     if pass_curriculum_cb is not None:
         callbacks.append(pass_curriculum_cb)
+    if task_reward_scale_cb is not None:
+        callbacks.append(task_reward_scale_cb)
+    if intent_robustness_cb is not None:
+        callbacks.append(intent_robustness_cb)
+    if intent_diversity_cb is not None:
+        callbacks.append(intent_diversity_cb)
+    if intent_policy_sensitivity_cb is not None:
+        callbacks.append(intent_policy_sensitivity_cb)
+    if intent_selector_cb is not None:
+        callbacks.append(intent_selector_cb)
     if args.episode_sample_prob > 0.0 and args.log_episode_artifacts:
         callbacks.append(
             EpisodeSampleLogger(

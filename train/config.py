@@ -252,6 +252,23 @@ def get_parser() -> argparse.ArgumentParser:
         help="Number of CLS tokens for set-attention policy (2 for dual critics).",
     )
     parser.add_argument(
+        "--set-intent-embedding-enabled",
+        dest="set_intent_embedding_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help=(
+            "Enable explicit learned intent embedding in set-attention extractor "
+            "(applies only when intent globals are present)."
+        ),
+    )
+    parser.add_argument(
+        "--set-intent-embedding-dim",
+        dest="set_intent_embedding_dim",
+        type=int,
+        default=16,
+        help="Embedding dimension for latent intent conditioning in set-attention extractor.",
+    )
+    parser.add_argument(
         "--mirror-episode-prob",
         type=float,
         default=0.0,
@@ -447,6 +464,48 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--start-template-enabled",
+        dest="start_template_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable optional start-template curriculum for structured reset formations.",
+    )
+    parser.add_argument(
+        "--start-template-library",
+        dest="start_template_library",
+        type=lambda v: None if v == "" or str(v).lower() == "none" else str(v),
+        default=None,
+        help="Path to a JSON or YAML start-template library file.",
+    )
+    parser.add_argument(
+        "--start-template-prob",
+        dest="start_template_prob",
+        type=float,
+        default=0.0,
+        help="Probability that a reset uses a sampled start template instead of default spawning.",
+    )
+    parser.add_argument(
+        "--start-template-jitter-scale",
+        dest="start_template_jitter_scale",
+        type=float,
+        default=1.0,
+        help="Global multiplier applied to per-player template jitter radii.",
+    )
+    parser.add_argument(
+        "--start-template-mirror-prob",
+        dest="start_template_mirror_prob",
+        type=float,
+        default=0.5,
+        help="Probability of mirroring a mirrorable start template left/right.",
+    )
+    parser.add_argument(
+        "--start-template-strict",
+        dest="start_template_strict",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Fail fast on invalid or unreadable start-template libraries instead of disabling the feature.",
+    )
+    parser.add_argument(
         "--deterministic-opponent",
         type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         default=False,
@@ -524,6 +583,445 @@ def get_parser() -> argparse.ArgumentParser:
         default=False,
         help="Expose set-based token observations under 'players' and 'globals' "
         "(keeps existing obs keys).",
+    )
+    parser.add_argument(
+        "--enable-intent-learning",
+        dest="enable_intent_learning",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable latent intent state/features for emergent play learning.",
+    )
+    parser.add_argument(
+        "--num-intents",
+        dest="num_intents",
+        type=int,
+        default=8,
+        help="Number of latent intent categories when intent learning is enabled.",
+    )
+    parser.add_argument(
+        "--intent-commitment-steps",
+        dest="intent_commitment_steps",
+        type=int,
+        default=4,
+        help="Commitment horizon (steps) for an active intent state.",
+    )
+    parser.add_argument(
+        "--intent-null-prob",
+        dest="intent_null_prob",
+        type=float,
+        default=0.2,
+        help="Probability of sampling no active intent for an episode.",
+    )
+    parser.add_argument(
+        "--intent-visible-to-defense-prob",
+        dest="intent_visible_to_defense_prob",
+        type=float,
+        default=0.0,
+        help="Probability that defense-visible intent is exposed in an episode.",
+    )
+    parser.add_argument(
+        "--enable-defense-intent-learning",
+        dest="enable_defense_intent_learning",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable a separate latent intent state for the defense policy.",
+    )
+    parser.add_argument(
+        "--defense-intent-null-prob",
+        dest="defense_intent_null_prob",
+        type=float,
+        default=1.0,
+        help="Probability of sampling no active defense intent for an episode.",
+    )
+    parser.add_argument(
+        "--intent-null-prob-end",
+        dest="intent_null_prob_end",
+        type=float,
+        default=None,
+        help=(
+            "Optional target for scheduling intent null probability over training. "
+            "If omitted, intent_null_prob remains constant."
+        ),
+    )
+    parser.add_argument(
+        "--intent-visible-to-defense-prob-end",
+        dest="intent_visible_to_defense_prob_end",
+        type=float,
+        default=None,
+        help=(
+            "Optional target for scheduling defense-visible intent probability over training. "
+            "If omitted, intent_visible_to_defense_prob remains constant."
+        ),
+    )
+    parser.add_argument(
+        "--intent-obs-mode",
+        dest="intent_obs_mode",
+        type=str,
+        choices=["private_offense", "public", "hidden"],
+        default="private_offense",
+        help="Intent observability mode for role-conditioned observations.",
+    )
+    parser.add_argument(
+        "--intent-diversity-enabled",
+        dest="intent_diversity_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable DIAYN-style diversity bonus for latent intent learning.",
+    )
+    parser.add_argument(
+        "--intent-diversity-beta-target",
+        dest="intent_diversity_beta_target",
+        type=float,
+        default=0.05,
+        help="Target scale for intent diversity bonus.",
+    )
+    parser.add_argument(
+        "--intent-diversity-warmup-steps",
+        dest="intent_diversity_warmup_steps",
+        type=int,
+        default=1_000_000,
+        help="Number of timesteps before diversity bonus starts.",
+    )
+    parser.add_argument(
+        "--intent-diversity-ramp-steps",
+        dest="intent_diversity_ramp_steps",
+        type=int,
+        default=1_000_000,
+        help="Timesteps to ramp diversity beta from 0 to target after warmup.",
+    )
+    parser.add_argument(
+        "--intent-diversity-clip",
+        dest="intent_diversity_clip",
+        type=float,
+        default=2.0,
+        help="Clip range for normalized intent bonus.",
+    )
+    parser.add_argument(
+        "--task-reward-scale-start",
+        dest="task_reward_scale_start",
+        type=float,
+        default=None,
+        help=(
+            "Initial scale applied to aggregated environment task reward returned to PPO. "
+            "Use values below 1.0 for DIAYN-first curricula."
+        ),
+    )
+    parser.add_argument(
+        "--task-reward-scale-end",
+        dest="task_reward_scale_end",
+        type=float,
+        default=None,
+        help="Final scale applied to aggregated environment task reward returned to PPO.",
+    )
+    parser.add_argument(
+        "--task-reward-scale-warmup-steps",
+        dest="task_reward_scale_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to hold task reward at the start scale before ramping.",
+    )
+    parser.add_argument(
+        "--task-reward-scale-ramp-steps",
+        dest="task_reward_scale_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps to ramp task reward scale from start to end after warmup.",
+    )
+    parser.add_argument(
+        "--intent-disc-lr",
+        dest="intent_disc_lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate for intent discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-batch-size",
+        dest="intent_disc_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for intent discriminator updates.",
+    )
+    parser.add_argument(
+        "--intent-disc-updates-per-rollout",
+        dest="intent_disc_updates_per_rollout",
+        type=int,
+        default=2,
+        help="Number of discriminator updates at each rollout end.",
+    )
+    parser.add_argument(
+        "--intent-disc-hidden-dim",
+        dest="intent_disc_hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden dimension for MLP discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-encoder-type",
+        dest="intent_disc_encoder_type",
+        choices=["mlp_mean", "gru", "set_step"],
+        default="mlp_mean",
+        help="Encoder type for intent discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-step-dim",
+        dest="intent_disc_step_dim",
+        type=int,
+        default=64,
+        help="Per-step embedding dimension for GRU discriminator.",
+    )
+    parser.add_argument(
+        "--intent-disc-console-log-every-rollouts",
+        dest="intent_disc_console_log_every_rollouts",
+        type=int,
+        default=0,
+        help="Print discriminator pass summary every N rollouts. 0 disables console tracing.",
+    )
+    parser.add_argument(
+        "--intent-disc-dropout",
+        dest="intent_disc_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout for discriminator MLP.",
+    )
+    parser.add_argument(
+        "--intent-disc-max-obs-dim",
+        dest="intent_disc_max_obs_dim",
+        type=int,
+        default=256,
+        help="Max flattened observation features used by discriminator input.",
+    )
+    parser.add_argument(
+        "--intent-disc-max-action-dim",
+        dest="intent_disc_max_action_dim",
+        type=int,
+        default=16,
+        help="Max flattened action features used by discriminator input.",
+    )
+    parser.add_argument(
+        "--intent-disc-include-shot-clock",
+        dest="intent_disc_include_shot_clock",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Include shot_clock in set-step discriminator globals.",
+    )
+    parser.add_argument(
+        "--intent-disc-include-pressure-exposure",
+        dest="intent_disc_include_pressure_exposure",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Include pressure_exposure in set-step discriminator globals.",
+    )
+    parser.add_argument(
+        "--disc-eval-batch-output",
+        dest="disc_eval_batch_output",
+        nargs="?",
+        const=True,
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help=(
+            "Export discriminator eval batches alongside alternation checkpoints. "
+            "Can be passed as a bare flag or with an explicit true/false value."
+        ),
+    )
+    parser.add_argument(
+        "--intent-disc-eval-holdout-fraction",
+        dest="intent_disc_eval_holdout_fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of completed intent episodes reserved for discriminator holdout "
+            "metrics each rollout. 0 disables the split and falls back to train-batch eval."
+        ),
+    )
+    parser.add_argument(
+        "--intent-disc-current-policy-only",
+        dest="intent_disc_current_policy_only",
+        nargs="?",
+        const=True,
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help=(
+            "Train/evaluate the intent discriminator only on offense episodes "
+            "generated by the current training-side policy. Disable to include "
+            "frozen-opponent offense episodes from defense-training envs too."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-enabled",
+        dest="intent_selector_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Enable a learned high-level selector mu(z|s) for offense intent at possession start.",
+    )
+    parser.add_argument(
+        "--intent-selector-mode",
+        dest="intent_selector_mode",
+        choices=["callback", "integrated"],
+        default="callback",
+        help="Selector implementation path: legacy callback prototype or integrated PPO path.",
+    )
+    parser.add_argument(
+        "--intent-selector-hidden-dim",
+        dest="intent_selector_hidden_dim",
+        type=int,
+        default=64,
+        help="Hidden width for the intent selector head.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-start",
+        dest="intent_selector_alpha_start",
+        type=float,
+        default=0.0,
+        help="Initial probability of using the learned selector instead of uniform intent sampling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-end",
+        dest="intent_selector_alpha_end",
+        type=float,
+        default=1.0,
+        help="Final probability of using the learned selector instead of uniform intent sampling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-warmup-steps",
+        dest="intent_selector_alpha_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to wait before ramping selector-driven play calling.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-ramp-steps",
+        dest="intent_selector_alpha_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps over which selector influence ramps from alpha-start to alpha-end.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-start",
+        dest="intent_selector_eps_start",
+        type=float,
+        default=0.0,
+        help="Initial uniform-exploration floor mixed into selector sampling when the selector branch is used.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-end",
+        dest="intent_selector_eps_end",
+        type=float,
+        default=0.0,
+        help="Final uniform-exploration floor mixed into selector sampling when the selector branch is used.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-warmup-steps",
+        dest="intent_selector_eps_warmup_steps",
+        type=int,
+        default=0,
+        help="Timesteps to wait before ramping the selector exploration floor.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-ramp-steps",
+        dest="intent_selector_eps_ramp_steps",
+        type=int,
+        default=1,
+        help="Timesteps over which selector exploration floor ramps from eps-start to eps-end.",
+    )
+    parser.add_argument(
+        "--intent-selector-entropy-coef",
+        dest="intent_selector_entropy_coef",
+        type=float,
+        default=0.01,
+        help="Entropy regularization coefficient for the high-level intent selector.",
+    )
+    parser.add_argument(
+        "--intent-selector-usage-reg-coef",
+        dest="intent_selector_usage_reg_coef",
+        type=float,
+        default=0.01,
+        help="KL-to-uniform regularization coefficient to keep selector intent usage broad during ramp-in.",
+    )
+    parser.add_argument(
+        "--intent-selector-value-coef",
+        dest="intent_selector_value_coef",
+        type=float,
+        default=0.5,
+        help="Value loss coefficient for the integrated selector critic.",
+    )
+    parser.add_argument(
+        "--intent-selector-template-metrics-log-every-rollouts",
+        dest="intent_selector_template_metrics_log_every_rollouts",
+        type=int,
+        default=8,
+        help=(
+            "How often to log per-template selector MLflow metrics. "
+            "Global selector metrics still log every rollout."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-train-every-rollouts",
+        dest="intent_selector_train_every_rollouts",
+        type=int,
+        default=1,
+        help=(
+            "Train the integrated selector every N rollouts instead of every rollout. "
+            "Selector samples accumulate between updates."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-max-samples-per-update",
+        dest="intent_selector_max_samples_per_update",
+        type=int,
+        default=0,
+        help=(
+            "Cap the number of selector samples used in one selector update. "
+            "0 means use all accumulated samples."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-multiselect-enabled",
+        dest="intent_selector_multiselect_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=False,
+        help="Allow integrated selector reselection on completed pass boundaries within a possession.",
+    )
+    parser.add_argument(
+        "--intent-selector-min-play-steps",
+        dest="intent_selector_min_play_steps",
+        type=int,
+        default=3,
+        help="Minimum segment length before a completed pass can trigger selector reselection.",
+    )
+    parser.add_argument(
+        "--intent-disc-lambda-shot",
+        dest="intent_disc_lambda_shot",
+        type=float,
+        default=0.0,
+        help="Auxiliary BCE weight for discriminator shot-end prior.",
+    )
+    parser.add_argument(
+        "--intent-disc-lambda-q",
+        dest="intent_disc_lambda_q",
+        type=float,
+        default=0.0,
+        help="Auxiliary MSE weight for discriminator shot-quality prior.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-enabled",
+        dest="intent_policy_sensitivity_enabled",
+        type=lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
+        default=True,
+        help="Log diagnostic metrics for policy sensitivity to latent intent.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-sample-states",
+        dest="intent_policy_sensitivity_sample_states",
+        type=int,
+        default=32,
+        help="Reservoir sample size of offense states per rollout for intent sensitivity diagnostics.",
+    )
+    parser.add_argument(
+        "--intent-policy-sensitivity-log-every-rollouts",
+        dest="intent_policy_sensitivity_log_every_rollouts",
+        type=int,
+        default=4,
+        help="How often to log intent policy-sensitivity metrics.",
     )
     parser.add_argument(
         "--mask-occupied-moves",

@@ -259,6 +259,648 @@ Add:
 
 Then integrate via callbacks or custom PPO training step.
 
+### Current implementation status
+
+The codebase currently implements a simplified first-pass discriminator, not the richer
+`TrajectoryEncoder` design described above.
+
+Files:
+
+1. `basketworld/utils/intent_discovery.py`
+2. `basketworld/utils/callbacks.py`
+
+What is implemented today:
+
+1. `IntentEpisodeBuffer`
+   - Stores per-step transitions until an episode ends.
+
+2. `IntentTransition.feature`
+   - Per step, build one flat feature vector by concatenating:
+     - flattened observation for that env index
+     - flattened action for that env index
+
+3. `compute_episode_embeddings(...)`
+   - Stack all step features in the episode.
+   - Take the mean over time.
+   - Pad or truncate to a fixed length of `max_obs_dim + max_action_dim`.
+   - Current callback defaults:
+     - `max_obs_dim = 256`
+     - `max_action_dim = 16`
+     - total discriminator input dim = `272`
+
+4. `IntentDiscriminator`
+   - A small MLP:
+     - `Linear(input_dim, hidden_dim)`
+     - `ReLU`
+     - `Dropout`
+     - `Linear(hidden_dim, num_intents)`
+   - This is a classifier over the mean-pooled episode embedding.
+
+5. Diversity bonus
+   - Compute `log q(z | episode_embedding) + log(num_intents)`.
+   - Normalize with a running mean/std.
+   - Clip.
+   - Multiply by `beta`.
+   - Spread evenly across the episode steps in the rollout buffer.
+
+Important limitation of the current implementation:
+
+1. Temporal order is discarded.
+2. Pass-receive order, cut timing, and multi-step structure are not modeled explicitly.
+3. The discriminator is therefore weaker than the original plan's intended
+   trajectory-aware version.
+
+### Worked numerical example of the current discriminator
+
+This example uses small vectors for readability. The real code uses up to `256`
+observation dims plus `16` action dims before padding/truncation.
+
+Assume:
+
+1. `num_intents = 8`
+2. true sampled intent for this episode is `z = 2`
+3. episode length is `3` steps
+4. for illustration, we show only the first `4` observation dims and first `2` action dims
+
+Per-step features:
+
+1. Step 0
+   - flattened observation slice = `[0.80, -0.25, 0.33, 1.00]`
+   - flattened action slice = `[4.00, 0.00]`
+   - concatenated step feature = `[0.80, -0.25, 0.33, 1.00, 4.00, 0.00]`
+
+2. Step 1
+   - flattened observation slice = `[0.78, -0.10, 0.40, 1.00]`
+   - flattened action slice = `[7.00, 1.00]`
+   - concatenated step feature = `[0.78, -0.10, 0.40, 1.00, 7.00, 1.00]`
+
+3. Step 2
+   - flattened observation slice = `[0.75, 0.05, 0.52, 1.00]`
+   - flattened action slice = `[9.00, 0.00]`
+   - concatenated step feature = `[0.75, 0.05, 0.52, 1.00, 9.00, 0.00]`
+
+Episode embedding:
+
+1. Stack the 3 step vectors.
+2. Mean-pool over time:
+
+`x_episode = mean(step_0, step_1, step_2)`
+
+`x_episode = [0.7767, -0.1000, 0.4167, 1.0000, 6.6667, 0.3333]`
+
+3. In the real implementation, this vector is then padded/truncated to length `272`.
+
+Classifier pass:
+
+1. Feed `x_episode` into the MLP.
+2. Suppose the discriminator outputs logits:
+
+`[0.2, -0.4, 1.1, 0.3, -0.2, 0.0, -0.5, 0.1]`
+
+3. Softmax gives intent probabilities:
+
+`q(z | episode) = [0.116, 0.064, 0.286, 0.128, 0.078, 0.095, 0.058, 0.105]`
+
+4. Since the true intent is `z = 2`, the chosen probability is:
+
+`q(z=2 | episode) = 0.286`
+
+Raw diversity bonus:
+
+1. Current formula:
+
+`bonus_raw = log q(z | episode) + log(num_intents)`
+
+2. With `num_intents = 8`:
+
+`bonus_raw = log(0.286) + log(8)`
+
+`bonus_raw = -1.2528 + 2.0794 = 0.8266`
+
+Normalization and reward injection:
+
+1. Suppose the running bonus statistics at this point are:
+   - running mean = `0.5000`
+   - running std = `0.2500`
+
+2. Normalized bonus:
+
+`bonus_norm = (0.8266 - 0.5000) / 0.2500 = 1.3064`
+
+3. Suppose clip range is `[-2, 2]`, so clipped bonus stays `1.3064`.
+
+4. Suppose current `beta = 0.05` and episode length is `3`:
+
+`per_step_bonus = beta * clipped_bonus / episode_length`
+
+`per_step_bonus = 0.05 * 1.3064 / 3 = 0.0218`
+
+5. The callback adds `+0.0218` to each of the 3 offense steps in the rollout buffer for this
+   episode before recomputing returns and advantages.
+
+Interpretation:
+
+1. If the discriminator can confidently identify the sampled intent from the episode summary,
+   the episode receives positive shaping reward.
+2. If the discriminator is uncertain, the raw bonus is smaller or negative.
+3. Because the current embedding is only a mean over flat step features, the discriminator can
+   miss sequence structure even when the policy is using the latent.
+
+### Proposed trajectory encoder upgrade (GRU first)
+
+The simplest meaningful upgrade is to replace mean pooling with a small GRU over the
+step sequence.
+
+Current path:
+
+1. `step feature`
+2. mean over time
+3. MLP
+4. logits over intents
+
+Proposed path:
+
+1. `step feature`
+2. step encoder MLP
+3. GRU over time
+4. final hidden state
+5. discriminator head
+6. logits over intents
+
+This keeps the reward-shaping logic unchanged while preserving order information.
+
+#### Files and classes to change
+
+File: `basketworld/utils/intent_discovery.py`
+
+Add or replace:
+
+1. `build_padded_episode_batch(...)`
+   - Input: `List[CompletedIntentEpisode]`
+   - Output:
+     - `x_steps: [B, T_max, D]`
+     - `lengths: [B]`
+     - `y: [B]`
+
+2. `StepEncoder`
+   - Small MLP applied independently to each step.
+   - Example:
+     - `Linear(D, d_step)`
+     - `ReLU`
+     - optional dropout
+
+3. `TrajectoryEncoderGRU`
+   - `GRU(input_size=d_step, hidden_size=d_hidden, batch_first=True)`
+   - Returns one episode embedding per sequence.
+
+4. `IntentDiscriminator`
+   - Wrap:
+     - step encoder
+     - GRU
+     - final classifier head
+
+File: `basketworld/utils/callbacks.py`
+
+Modify:
+
+1. `_train_discriminator(...)`
+   - Train on padded sequences plus lengths, not a pre-averaged matrix.
+
+2. `_compute_episode_bonus(...)`
+   - Run the same GRU discriminator forward pass and compute:
+     - `log q(z | trajectory) + log(num_intents)`
+
+3. Keep rollout-buffer reward injection exactly the same.
+
+#### Tensor shapes
+
+Recommended first cut:
+
+1. raw step feature dim:
+   - `D = 272`
+   - from `256` obs dims + `16` action dims
+
+2. step encoder dim:
+   - `d_step = 64`
+
+3. GRU hidden dim:
+   - `d_hidden = 128`
+
+4. intents:
+   - `K = 8`
+
+For a minibatch of `B = 32` episodes with max episode length `T_max = 6`:
+
+1. raw padded batch:
+   - `x_steps.shape = [32, 6, 272]`
+
+2. after step MLP:
+   - `x_step_emb.shape = [32, 6, 64]`
+
+3. after GRU:
+   - `h_seq.shape = [32, 6, 128]`
+
+4. final episode embedding:
+   - `h_episode.shape = [32, 128]`
+
+5. logits:
+   - `logits.shape = [32, 8]`
+
+#### Variable-length handling
+
+Episodes are short but not identical in length, so the GRU should use sequence lengths.
+
+Implementation approach:
+
+1. Build padded tensor with zeros on the right.
+2. Build `lengths` array with true episode lengths.
+3. Use `torch.nn.utils.rnn.pack_padded_sequence(...)`.
+4. Use the GRU final hidden state `h_n[-1]` as the episode embedding.
+
+That avoids letting padding steps affect the episode representation.
+
+#### Numerical example
+
+Suppose one episode has 3 steps and each step feature is already reduced to 4 dims for
+illustration only:
+
+1. `x1 = [0.8, 0.1, 0.0, 1.0]`
+2. `x2 = [0.4, 0.9, 0.0, 0.0]`
+3. `x3 = [0.2, 0.3, 1.0, 0.0]`
+
+Let the GRU hidden size be 2. Conceptually:
+
+1. `h1 = GRU(x1, h0)`
+   - `h1 = [0.30, -0.10]`
+
+2. `h2 = GRU(x2, h1)`
+   - `h2 = [0.52, 0.08]`
+
+3. `h3 = GRU(x3, h2)`
+   - `h3 = [0.71, 0.41]`
+
+Episode embedding:
+
+1. `h_episode = h3 = [0.71, 0.41]`
+
+Classifier head:
+
+1. logits over 4 intents for illustration:
+   - `[0.1, -0.3, 1.2, 0.0]`
+
+2. softmax:
+   - `[0.171, 0.115, 0.518, 0.196]`
+
+3. if true intent is `z = 2`:
+   - `q(z=2 | trajectory) = 0.518`
+
+Compare with the same three steps in a different order:
+
+1. `x1 = [0.2, 0.3, 1.0, 0.0]`
+2. `x2 = [0.4, 0.9, 0.0, 0.0]`
+3. `x3 = [0.8, 0.1, 0.0, 1.0]`
+
+The mean of the three vectors is identical, so the current implementation cannot
+distinguish them after pooling.
+
+But the GRU hidden-state path will generally be different:
+
+1. `h1' = [0.12, 0.28]`
+2. `h2' = [0.33, 0.35]`
+3. `h3' = [0.44, 0.09]`
+
+So:
+
+1. current discriminator:
+   - same episode embedding for both orders
+   - same logits
+
+2. GRU discriminator:
+   - different final hidden state
+   - different logits
+
+This is exactly why a trajectory encoder is a better fit for learned plays.
+
+#### What stays the same
+
+1. `IntentEpisodeBuffer` can stay.
+2. Per-episode bonus formula can stay.
+3. Running mean/std normalization can stay.
+4. Reward injection into rollout buffer can stay.
+5. Logged metrics can stay:
+   - `intent/disc_loss`
+   - `intent/disc_top1_acc`
+   - `intent/disc_auc_ovr_macro`
+   - `intent/beta_current`
+
+#### Minimal config additions
+
+If we implement this cleanly, add discriminator-specific config like:
+
+1. `--intent-disc-encoder-type gru`
+2. `--intent-disc-step-dim 64`
+3. `--intent-disc-hidden-dim 128`
+4. `--intent-disc-dropout 0.1`
+
+Defaults should keep the current MLP/mean-pooling path available for ablations.
+
+#### Implementation checklist (ready to code)
+
+This is the concrete order of work to replace the current mean-pooled discriminator with
+the GRU version while minimizing risk.
+
+##### Step 1: Extend `intent_discovery.py`
+
+Add these classes and functions.
+
+1. New step encoder:
+
+```python
+class StepEncoder(nn.Module):
+    def __init__(self, input_dim: int, step_dim: int, dropout: float = 0.1) -> None: ...
+    def forward(self, x_steps: torch.Tensor) -> torch.Tensor: ...
+```
+
+Expected shapes:
+
+1. input: `x_steps.shape == [B, T, D]`
+2. output: `x_step_emb.shape == [B, T, d_step]`
+
+2. New GRU trajectory encoder:
+
+```python
+class TrajectoryEncoderGRU(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 1, dropout: float = 0.0) -> None: ...
+    def forward(self, x_steps: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor: ...
+```
+
+Expected behavior:
+
+1. use `pack_padded_sequence`
+2. return final hidden state with shape `[B, d_hidden]`
+
+3. Replace current `IntentDiscriminator` with an encoder-aware version:
+
+```python
+class IntentDiscriminator(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        num_intents: int,
+        encoder_type: str = "mlp_mean",
+        hidden_dim: int = 128,
+        step_dim: int = 64,
+        dropout: float = 0.1,
+    ) -> None: ...
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor: ...
+```
+
+Expected modes:
+
+1. `encoder_type == "mlp_mean"`
+   - preserve current behavior for ablation/backward comparison
+2. `encoder_type == "gru"`
+   - use `StepEncoder + TrajectoryEncoderGRU + classifier head`
+
+4. Add padded-batch builder:
+
+```python
+def build_padded_episode_batch(
+    episodes: List[CompletedIntentEpisode],
+    max_obs_dim: int = 256,
+    max_action_dim: int = 16,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ...
+```
+
+Return:
+
+1. `x_steps`: shape `[B, T_max, D]`
+2. `lengths`: shape `[B]`
+3. `labels`: shape `[B]`
+
+Implementation notes:
+
+1. reuse the current `IntentTransition.feature`
+2. pad on the right with zeros
+3. skip empty episodes
+4. keep `D = max_obs_dim + max_action_dim`
+
+##### Step 2: Update discriminator training in `callbacks.py`
+
+Modify the current callback methods.
+
+1. `_maybe_build_discriminator(...)`
+
+Current:
+
+```python
+def _maybe_build_discriminator(self, input_dim: int) -> None: ...
+```
+
+Recommended:
+
+```python
+def _maybe_build_discriminator(self, input_dim: int) -> None: ...
+```
+
+Same signature, but instantiate `IntentDiscriminator` with:
+
+1. `encoder_type`
+2. `step_dim`
+3. `hidden_dim`
+4. `dropout`
+
+2. `_train_discriminator(...)`
+
+Current:
+
+```python
+def _train_discriminator(self, x_np: np.ndarray, y_np: np.ndarray) -> tuple[float, float]: ...
+```
+
+Recommended replacement:
+
+```python
+def _train_discriminator(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> tuple[float, float]:
+    ...
+```
+
+Behavior:
+
+1. if `encoder_type == "mlp_mean"`:
+   - ignore `lengths_np`
+   - preserve current path
+2. if `encoder_type == "gru"`:
+   - sample minibatch indices over episodes
+   - pass both `xb` and `lengths_b` into discriminator
+
+3. `_compute_episode_bonus(...)`
+
+Current:
+
+```python
+def _compute_episode_bonus(self, x_np: np.ndarray, y_np: np.ndarray) -> np.ndarray: ...
+```
+
+Recommended replacement:
+
+```python
+def _compute_episode_bonus(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> np.ndarray:
+    ...
+```
+
+4. `_compute_disc_auc(...)`
+
+Current:
+
+```python
+def _compute_disc_auc(self, x_np: np.ndarray, y_np: np.ndarray) -> Optional[float]: ...
+```
+
+Recommended replacement:
+
+```python
+def _compute_disc_auc(
+    self,
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    lengths_np: np.ndarray | None = None,
+) -> Optional[float]:
+    ...
+```
+
+##### Step 3: Replace rollout-end feature preparation
+
+Current rollout-end path:
+
+```python
+x_np, y_np = compute_episode_embeddings(...)
+```
+
+Replace with:
+
+```python
+if self.disc_encoder_type == "gru":
+    x_np, lengths_np, y_np = build_padded_episode_batch(...)
+else:
+    x_np, y_np = compute_episode_embeddings(...)
+    lengths_np = None
+```
+
+Then pass `lengths_np` through:
+
+1. `_train_discriminator(...)`
+2. `_compute_disc_auc(...)`
+3. `_compute_episode_bonus(...)`
+
+##### Step 4: Add config plumbing
+
+File: `train/config.py`
+
+Add CLI args:
+
+```python
+parser.add_argument("--intent-disc-encoder-type", choices=["mlp_mean", "gru"], default="mlp_mean")
+parser.add_argument("--intent-disc-step-dim", type=int, default=64)
+parser.add_argument("--intent-disc-hidden-dim", type=int, default=128)
+parser.add_argument("--intent-disc-dropout", type=float, default=0.1)
+```
+
+File: `train/callbacks.py`
+
+Pass the new args into the diversity callback constructor.
+
+File: `basketworld/utils/mlflow_params.py`
+
+Parse and expose the new fields so dev mode can inspect them.
+
+##### Step 5: Keep metrics and reward shaping unchanged
+
+Do not change these initially:
+
+1. `intent/disc_loss`
+2. `intent/disc_top1_acc`
+3. `intent/disc_auc_ovr_macro`
+4. `intent/bonus_raw_mean`
+5. `intent/bonus_norm_mean`
+6. `intent/beta_current`
+
+Do not change:
+
+1. `RunningMeanStd`
+2. clipping logic
+3. reward injection into rollout buffer
+4. return/advantage recomputation
+
+This isolates the experiment to the discriminator representation.
+
+##### Step 6: Add tests before long runs
+
+Add:
+
+1. `tests/test_intent_discovery_gru.py`
+
+Recommended test cases:
+
+1. `build_padded_episode_batch` returns correct shapes for variable-length episodes
+2. padded timesteps do not change the final hidden-state embedding
+3. `IntentDiscriminator(..., encoder_type="gru")` returns logits of shape `[B, K]`
+4. reordered step sequences produce different GRU embeddings
+5. `encoder_type="mlp_mean"` path still matches current behavior
+
+2. Update:
+
+1. `tests/test_intent_diversity_callback.py`
+   - cover the new `lengths_np` path
+   - ensure bonus computation still returns finite values
+
+##### Step 7: Diagnostic run sequence
+
+Run these in order:
+
+1. `encoder_type = mlp_mean`
+   - confirm baseline reproduces current behavior
+
+2. `encoder_type = gru`, `beta = 0`
+   - confirm code path runs
+   - confirm no NaNs / shape errors
+
+3. `encoder_type = gru`, diversity enabled
+   - compare:
+     - `intent/disc_auc_ovr_macro`
+     - `intent/disc_top1_acc`
+     - `intent/policy_kl_mean`
+     - `intent/action_flip_rate`
+     - PPP
+
+##### Acceptance criteria for the GRU upgrade
+
+Treat the GRU upgrade as justified if:
+
+1. `policy_kl_mean` remains nonzero
+2. `disc_auc_ovr_macro` rises above the mean-pooling baseline
+3. `disc_top1_acc` rises above the mean-pooling baseline
+4. PPP does not collapse further versus the current intent-enabled baseline
+
+If AUC/top1 do not improve materially over mean pooling, then the next bottleneck is
+likely the step features themselves, not just sequence aggregation.
+
 ## H) Callbacks + metrics
 
 Files:
@@ -290,6 +932,766 @@ Recommended schedule:
 3. Stage 2:
    - increase unknown/no-intent fraction for defense robustness
    - periodic eval against intent-free offense
+
+4. Stage 3:
+   - keep low-level play execution `pi(a | s, z)` and learned latent play space
+   - introduce a learned high-level play selector `mu(z | s_context)`
+   - ramp selector influence from uniform intent sampling to selector-driven intent sampling
+   - preserve coverage regularization so previously learned plays do not collapse
+
+## Stage 3 extension: learned play selection `mu(z | s)`
+
+Once the latent play space is clearly formed, the next architectural step is to learn
+which play to call, not just how to execute a sampled play.
+
+Current system:
+
+1. offense intent `z` is sampled externally
+2. policy learns `pi(a_t | s_t, z)`
+3. diversity objective shapes the latent play space
+
+Stage 3 system:
+
+1. high-level selector learns `mu(z | s_context)`
+2. selector chooses or samples `z` at possession start
+3. low-level policy executes `pi(a_t | s_t, z)` for the commitment window
+
+This turns the current latent play discovery setup into a hierarchical play-calling
+architecture.
+
+### Why stage it instead of learning `mu` from the beginning
+
+Jointly learning:
+
+1. what each play means
+2. how to execute it
+3. when to select it
+
+is possible, but substantially less stable.
+
+Main failure modes:
+
+1. selector collapse
+   - `mu` quickly concentrates on a few lucky intents
+   - other intents receive too little data to become useful plays
+
+2. moving semantics
+   - while `pi(a | s, z)` is still changing what each `z` means, `mu` is trying to
+     optimize on top of a drifting codebook
+
+3. premature rejection
+   - an intent that starts weak can be abandoned before it has enough experience to improve
+
+The current random-sampling phase is therefore best understood as forced coverage for
+playbook formation.
+
+### High-level selector design
+
+The minimal selector should choose offense intent once per possession from a compact
+context representation:
+
+`z ~ mu(z | s_context)`
+
+Recommended `s_context` contents:
+
+1. offense player positions
+2. defense player positions
+3. ball holder
+4. shot clock / game clock context
+5. score differential / period context if available
+
+The selector does not need the full primitive action history. It only needs enough
+context to decide which latent play is appropriate for the current possession start.
+
+### Recommended implementation choice
+
+Recommended first implementation:
+
+1. reuse the existing offense state encoder / set-attention trunk
+2. add a separate selector head on top of that shared representation
+3. output categorical logits over `num_intents`
+4. call the selector once per possession, not every step
+5. keep the selected `z` fixed for the existing commitment window
+
+This is the best first version because:
+
+1. it matches the semantics of a play call
+2. it reuses the strongest existing court-state representation
+3. it avoids duplicating a second full state encoder
+4. it is easier to stabilize than a per-step selector
+
+So the intended architecture is:
+
+1. shared state encoder
+2. selector head `mu(z | s_context)`
+3. low-level action policy `pi(a | s, z)`
+
+and not:
+
+1. a fully separate selector network as the first implementation
+2. a per-step selector that changes `z` every timestep
+
+Per-step `mu(z_t | s_t)` is possible in principle, but without extra switching costs or
+dwell constraints it stops behaving like a play caller and starts behaving like a noisy
+latent mode switcher.
+
+### Runtime sampling schedule
+
+Do not hard-switch from:
+
+1. `z ~ Uniform`
+
+to:
+
+2. `z ~ mu(z | s_context)`
+
+Instead, use a mixture schedule:
+
+`z ~ (1 - alpha) * Uniform + alpha * mu(z | s_context)`
+
+where:
+
+1. `alpha = 0` during latent play discovery
+2. `alpha` is ramped upward only after the play space is stable
+
+Recommended selector ramp:
+
+1. `0M - 150M`:
+   - `alpha = 0`
+   - pure random coverage
+
+2. `150M - 250M`:
+   - ramp `alpha: 0 -> 1`
+   - keep selector entropy high
+   - optionally freeze or partially freeze low-level policy for part of this window
+
+3. `250M+`:
+   - allow selector-dominant play calling
+   - optionally fine-tune jointly
+
+### Training objective with selector
+
+Low-level policy remains conditioned on `z`:
+
+`pi(a_t | s_t, z)`
+
+High-level selector receives task reward through the chosen play and should also be
+regularized for coverage:
+
+`L_total = L_PPO_low_level + lambda_sel * L_selector + lambda_cov * L_usage_reg`
+
+Where:
+
+1. `L_PPO_low_level`
+   - normal PPO objective for the primitive policy
+
+2. `L_selector`
+   - selector objective for choosing better plays under task reward
+   - implementation can be PPO-style if the selector is treated as a once-per-possession action
+
+3. `L_usage_reg`
+   - entropy/KL/usage regularization to prevent immediate collapse onto a few intents
+
+### How `mu` actually learns which play to call
+
+The selector should be treated as a slower-timescale policy whose action is the choice
+of latent play at possession start.
+
+Mechanism:
+
+1. selector sees possession-start context `s_context`
+2. selector chooses `z`
+3. low-level policy executes the possession under `pi(a | s, z)`
+4. possession ends and produces return `R_possession`
+5. selector is updated so that choices of `z` that led to better returns in that context
+   become more likely
+
+So the learning signal is:
+
+1. not "which play looks good in the abstract"
+2. but "which play choice improved downstream possession reward in this context"
+
+This is why Stage 3 only makes sense after the latent play space is already somewhat
+stable. If `z` semantics are still drifting, then `mu` is trying to optimize over labels
+whose meaning is moving underneath it.
+
+Recommended credit assignment model:
+
+1. treat selector choice as a once-per-possession categorical action
+2. assign selector return from the resulting possession return
+3. optimize selector with PPO-style policy gradient or equivalent episodic objective
+4. keep low-level `pi(a | s, z)` training separate but concurrent
+
+In other words:
+
+1. `mu` learns play selection from possession outcomes
+2. `pi(a | s, z)` learns play execution from step-level PPO updates
+
+This separation of timescales is the core reason the architecture is learnable.
+
+### Recommended stabilization strategy
+
+When `mu` turns on:
+
+1. initialize selector with near-uniform logits
+2. keep high selector entropy early
+3. add KL-to-uniform or minimum-usage regularization
+4. use lower LR for low-level `pi(a | s, z)` during the first selector phase
+5. consider freezing low-level policy for a short warm-start window while `mu` begins learning
+
+This makes Stage 3 mostly about learning play selection, not rewriting the meaning of the
+latent plays again from scratch.
+
+### File/class modification plan for `mu`
+
+#### A) Environment intent sampling
+
+File: `basketworld/envs/basketworld_env_v2.py`
+
+Current reset path samples `intent_id` from RNG.
+
+For Stage 3, refactor reset-time offense intent sampling into a strategy hook:
+
+1. default:
+   - uniform random sampler (current behavior)
+
+2. selector-enabled:
+   - query high-level selector for possession-start offense intent
+
+Recommended helper:
+
+1. `sample_offense_intent_id(...)`
+2. `sample_defense_intent_id(...)` if defense selector is ever added later
+
+#### B) High-level selector module
+
+New file suggestion:
+
+`basketworld/utils/intent_selector.py`
+
+Add:
+
+1. `IntentSelector`
+   - selector head over the existing shared offense encoder representation
+   - outputs logits over `num_intents`
+   - intended to run once per possession
+
+2. `sample_intent_with_mixture(...)`
+   - combines uniform prior with selector distribution using current `alpha`
+
+3. `compute_selector_usage_metrics(...)`
+   - selector entropy
+   - selector top-1 frequency
+   - per-intent usage histogram
+
+#### C) Training integration
+
+Files:
+
+1. `train/train.py`
+2. `train/callbacks.py`
+3. optionally `basketworld/utils/callbacks.py`
+
+Add:
+
+1. selector creation and optimizer
+2. selector schedule params:
+   - `selector_enabled`
+   - `selector_alpha_start`
+   - `selector_alpha_end`
+   - `selector_alpha_warmup_steps`
+   - `selector_alpha_ramp_steps`
+   - `selector_entropy_coef`
+   - `selector_usage_reg_coef`
+
+3. MLflow logging:
+   - `intent/selector_entropy`
+   - `intent/selector_usage_by_intent/<z>`
+   - `intent/selector_top1_by_intent/<z>`
+   - `intent/selector_alpha_current`
+
+#### D) Policy/runtime boundary
+
+Keep the low-level policy interface unchanged:
+
+1. policy still receives `z` in observation/globals
+2. low-level policy still outputs primitive actions
+3. selector head only runs at possession start / play-selection time
+
+This keeps Stage 3 compatible with the current low-level architecture and isolates the
+new complexity to possession-start play selection.
+
+### Integrated `mu` selector implementation target
+
+The callback-based selector prototype is acceptable for smoke testing, but it is not the
+final architecture. The integrated `mu` selector solution is to keep `mu` inside the same policy object and
+the same PPO optimization pass, while still treating it as a slower-timescale decision.
+
+Desired end state:
+
+1. one shared set-attention encoder
+2. one low-level action head for primitive actions
+3. one high-level selector head `mu(z | s_context)`
+4. one PPO training loop that optimizes both heads together
+
+That means:
+
+1. `mu` is not a separate standalone policy/network
+2. `mu` is also not trained as a callback-side afterthought
+3. selector log-prob, entropy, and advantage should be first-class rollout data
+
+#### Why this is the integrated solution
+
+It removes the main ambiguity in the prototype:
+
+1. selector is produced by the same policy object that owns the low-level action head
+2. selector exploration/entropy is part of the same training step
+3. selector credit assignment is explicit in rollout storage, not inferred later by a callback
+4. selector and low-level policy can share a coherent optimizer/update schedule
+
+In other words, this is still "one policy" in the architectural sense:
+
+1. shared encoder
+2. multiple heads
+3. unified training graph
+
+#### Recommended algorithm structure
+
+Add a custom PPO variant for hierarchical play selection.
+
+New file suggestion:
+
+`basketworld/algorithms/hierarchical_intent_ppo.py`
+
+This should subclass SB3 PPO rather than trying to force the logic through callbacks.
+
+Recommended helper classes:
+
+1. `HierarchicalIntentRolloutBuffer`
+2. `SelectorDecisionRecord`
+
+The reason is simple: selector decisions are not emitted every timestep, so they do not
+fit cleanly into the existing per-step-only rollout schema without explicit bookkeeping.
+
+#### Rollout-time semantics
+
+Selector should run only at possession start or play-selection boundary.
+
+Intent source precedence should remain explicit:
+
+1. explicit user/admin override of `z`
+2. otherwise selector choice `mu(z | s_context)`
+3. otherwise fallback env/default intent sampling
+
+This is required so that:
+
+1. Playbook analysis can still force a chosen intent
+2. counterfactual replay can still hold state fixed and swap only `z`
+3. UI debugging can still compare same-state behavior under different forced plays
+4. eval can still support forced-intent ablations in addition to selector-driven play calling
+
+For each environment `env_idx`:
+
+1. detect whether this timestep is a selector boundary
+   - initially: episode start / possession start
+   - later: commitment-window boundary when offense still has a live possession
+   - allow the selector to re-emit the same `z`; reselection does not imply forced play change
+
+2. build selector context from the current observation
+   - clone observation
+   - neutralize current intent fields so selector does not read the already-sampled `z`
+   - feed this context into selector head
+
+3. compute selector distribution
+   - `p_sel = mu(z | s_context)`
+   - optionally mix with uniform:
+     - `p_mix = (1 - alpha) * Uniform + alpha * p_sel`
+
+4. sample or argmax a play `z`
+   - during training: sample from `p_mix`
+   - during deterministic eval: argmax or deterministic mixture rule
+
+5. write selected `z` into env state and observation fields
+   - this becomes the play seen by the low-level policy for the commitment window
+   - if an explicit override is present, skip selector sampling and write the forced `z` instead
+
+6. store one selector-decision record
+   - selector log-prob
+   - selector entropy
+   - selected `z`
+   - boundary timestep
+   - env index
+   - selector segment start step
+   - selector segment end step once known
+   - optional selector value estimate if using a selector critic
+
+Then normal low-level PPO rollout collection continues step-by-step.
+
+#### Recommended rollout buffer additions
+
+Minimal buffer additions:
+
+1. `selector_episode_start_mask[t, env]`
+   - whether a selector decision happened here
+
+2. `selector_chosen_z[t, env]`
+   - chosen intent ID for this boundary
+
+3. `selector_log_prob[t, env]`
+   - log-prob of chosen `z` under the selector distribution used at rollout time
+
+4. `selector_entropy[t, env]`
+   - entropy of selector distribution at decision time
+
+5. `selector_alpha[t, env]`
+   - current mixture coefficient `alpha`
+
+6. `selector_return[t, env]`
+   - possession/window return assigned later
+
+7. `selector_advantage[t, env]`
+   - normalized advantage used for selector loss
+
+Recommended if doing full PPO-style selector learning:
+
+8. `selector_value[t, env]`
+   - selector baseline estimate
+
+9. `selector_value_target[t, env]`
+   - target for selector value loss
+
+10. `selector_valid_mask[t, env]`
+   - whether this timestep holds a real selector decision to optimize
+
+11. `selector_segment_id[t, env]`
+   - identifies which selector-controlled commitment segment a step belongs to
+
+12. `selector_boundary_type[t, env]`
+   - possession start vs commitment-expiry reselection
+
+13. `selector_next_boundary_mask[t, env]`
+   - whether this segment ended because another selector choice happened before episode end
+
+#### Recommended selector credit assignment
+
+The selector action should receive credit from the possession it initiated.
+
+For the initial integrated `mu` selector implementation:
+
+1. selector decision happens at possession start
+2. possession ends with return `R_possession`
+3. assign `R_possession` back to the selector decision that chose `z`
+
+Two acceptable versions:
+
+1. REINFORCE-style integrated loss
+   - `A_selector = normalized(R_possession)`
+   - simplest first integrated version
+
+2. PPO-style selector critic
+   - add selector value head
+   - `A_selector = R_possession - V_selector(s_context)`
+   - preferred long-term version
+
+Recommended implementation order:
+
+1. first integrated version: integrated REINFORCE-style selector loss
+2. second refinement: add selector critic and clipped PPO-style selector objective
+
+Extension once commitment-expiry reselection is enabled:
+
+1. selector may act multiple times within one possession
+2. each selector choice should receive credit primarily from the segment it controlled
+3. preferred target:
+   - commitment-window rewards accumulated until next selector boundary or episode end
+   - plus bootstrap from selector value at the next selector boundary
+
+Recommended long-term target for reselection:
+
+`R_sel(t_k) = sum_{t=t_k}^{t_{k+1}-1} gamma^(t-t_k) r_t + gamma^Delta * V_sel(s_{t_{k+1}})`
+
+Where:
+
+1. `t_k` is a selector decision time
+2. `t_{k+1}` is the next selector boundary or episode end
+3. `V_sel` is a selector-specific baseline/value head
+
+This is important because one-shot terminal shot reward is too sparse to cleanly train the
+initial play choice once multiple play selections can happen in the same possession.
+
+#### Recommended policy changes
+
+File:
+
+`basketworld/policies/set_attention_policy.py`
+
+The policy already has the right high-level shape:
+
+1. shared set-attention encoder
+2. low-level action head
+3. selector head over shared features
+
+For the integrated `mu` selector version, extend policy API with explicit selector methods:
+
+1. `get_selector_context(obs)`
+   - returns shared context tensor for selector
+
+2. `get_intent_selector_distribution(obs, alpha)`
+   - returns selector distribution and optionally mixture distribution
+
+3. `sample_intent_selector(obs, alpha, deterministic=False)`
+   - returns:
+     - selected `z`
+     - selector log-prob
+     - selector entropy
+     - optional selector value
+
+These should be used by the custom PPO algorithm during rollout collection, not by a callback.
+
+#### Recommended training losses
+
+Unified objective should look like:
+
+`L_total = L_PPO_low_level + lambda_sel * L_selector_policy + lambda_sel_v * L_selector_value - lambda_sel_ent * H_selector + lambda_usage * L_usage_reg`
+
+Where:
+
+1. `L_PPO_low_level`
+   - existing primitive-action PPO loss
+
+2. `L_selector_policy`
+   - selector policy gradient term
+   - REINFORCE-style first, PPO-style later if selector critic is added
+
+3. `L_selector_value`
+   - optional selector baseline loss
+
+4. `H_selector`
+   - selector entropy bonus
+
+5. `L_usage_reg`
+   - KL-to-uniform or equivalent coverage penalty over selector usage
+
+Important:
+
+1. low-level PPO entropy and selector entropy are distinct terms
+2. both live in the same total loss, but they regularize different heads
+
+#### Recommended file modification plan for the integrated `mu` selector version
+
+1. `basketworld/policies/set_attention_policy.py`
+   - expose selector distribution/log-prob/value helpers
+
+2. `basketworld/algorithms/hierarchical_intent_ppo.py`
+   - custom PPO subclass
+   - rollout collection with selector-boundary handling
+   - unified selector + low-level loss computation
+
+3. `basketworld/algorithms/hierarchical_rollout_buffer.py`
+   - selector decision storage
+   - possession-return assignment
+   - selector advantage computation
+
+4. `basketworld/envs/basketworld_env_v2.py`
+   - selector boundary hook remains possession start initially
+   - later add commitment-window reselection hook when offense possession is still alive
+   - selector should be called automatically at commitment expiry, not every primitive step
+   - preserve explicit intent override hook with precedence above selector choice
+
+5. `train/train.py`
+   - instantiate hierarchical PPO when selector is enabled in clean mode
+
+6. `train/config.py`
+   - keep selector schedule/regularization flags
+   - add explicit switch between:
+     - callback prototype
+     - integrated `mu` selector PPO path
+
+#### Recommended implementation order
+
+Implemented status:
+
+1. current callback selector exists only as a prototype / legacy comparison path
+2. custom integrated PPO selector path is implemented
+3. selector loss has been moved into PPO train step
+4. selector critic is implemented
+5. first multi-selection slice is implemented:
+   - segment boundary on completed pass after `intent_selector_min_play_steps`
+   - fallback boundary on `intent_commitment_steps`
+   - segment return + selector-value bootstrap target
+6. discriminator auxiliary priors are implemented:
+   - `lambda_shot`
+   - `lambda_q`
+
+Remaining implementation order:
+
+1. preserve forced-intent override behavior across:
+   - dev app gameplay
+   - Playbook analysis
+   - counterfactual replay
+   - eval-time ablations
+2. add learned `continue current play vs reselect` decision at eligible pass boundaries
+3. decide whether alpha miss at a segment boundary should:
+   - keep current `z`
+   - or resample uniformly
+4. add a cleaner explicit max-segment-length control if `intent_commitment_steps` and
+   selector segment horizon should diverge
+
+#### Success criteria for the integrated `mu` selector version
+
+The integrated `mu` selector implementation should replace the prototype only if it achieves:
+
+1. same or better latent-play separability
+2. same or better PPP / possession efficiency
+3. selector metrics that are easier to interpret
+4. no callback-side mutation of rollout starts
+5. explicit first-class selector data in rollout storage
+
+### Evaluation criteria for `mu`
+
+Treat the selector as successful if:
+
+1. latent play separability remains strong
+   - `disc_auc_ovr_macro`
+   - `disc_top1_acc`
+
+2. task performance improves
+   - PPP / win rate / turnover rate
+
+3. selector does not collapse immediately
+   - healthy selector entropy
+   - nontrivial usage across intents during ramp
+
+4. counterfactual play selection makes sense in fixed states
+   - same state, different selected `z`, different continuation
+   - similar states, selector chooses similar plays
+
+### Open research questions from Playbook analysis
+
+The Playbook tooling surfaced several questions that should be treated as active
+research items before the selector design is considered settled.
+
+#### 1) Is the current commitment window long enough?
+
+Current evidence suggests `intent_commitment_steps = 8` may be too short for many
+intent-conditioned possessions to reach a meaningful shot state from a fixed start.
+
+Questions:
+
+1. how often does a possession produce a shot while `z` is still active?
+2. how often does the decisive shot/turnover happen only after commitment expires?
+3. does increasing commitment length improve:
+   - selector learnability
+   - per-intent interpretability
+   - counterfactual trajectory separation
+
+Recommended experiments:
+
+1. compare Playbook rollouts at commitment lengths `8`, `12`, `16`, and full-possession
+2. log fraction of episodes where first shot occurs before commitment expires
+3. log fraction of episodes where first turnover occurs before commitment expires
+4. compare discriminator metrics and policy sensitivity under these settings
+
+#### 2) What return should train `mu`?
+
+Current status:
+
+1. possession-start selector path now has a selector critic
+2. multi-selection path now uses segment return plus optional selector-value bootstrap
+   at the next selector boundary
+
+Open issue:
+
+The current first-slice segment target is a practical implementation, not yet a settled
+final design.
+
+Remaining questions:
+
+1. is full-possession return still the right signal for the possession-start-only regime?
+2. would segment learning improve if credit were restricted to:
+   - commitment-window return only
+   - discounted return with heavier early weighting
+   - return through the first shot state
+   - return through the first major branch event (shot, turnover, foul)
+3. should selector bootstrap be:
+   - undiscounted
+   - gamma-discounted
+   - or learned with a separate boundary-specific formulation?
+4. does longer commitment reduce this credit-assignment noise enough to keep
+   full-possession return in the non-multiselect regime?
+
+Recommended experiments:
+
+1. compare selector learning under:
+   - full-possession return
+   - commitment-window return
+   - first-shot / first-terminal-event return
+   - segment return + bootstrap at next selector boundary
+2. measure selector entropy, collapse, and per-intent usage under each variant
+3. compare downstream PPP and stability of learned play selection
+
+Additional note:
+
+This branch has now crossed the threshold where segment return + selector-value bootstrap
+is no longer purely hypothetical. The open question is no longer whether segmentation is
+needed, but whether the current first implementation is the right segment credit target.
+
+#### 3) Should `mu` resample a new play when commitment expires?
+
+Current status:
+
+1. the first multiselect implementation is in place
+2. reselection can now happen within a possession
+3. practical boundaries are:
+   - completed pass after `intent_selector_min_play_steps`
+   - commitment timeout at `intent_commitment_steps`
+
+Questions:
+
+1. should reselection happen automatically at every eligible boundary, or should the
+   model learn a `continue vs reselect` decision?
+2. on a segment boundary where selector alpha does not fire, should the system:
+   - keep current `z`
+   - or resample uniformly as the current first-slice implementation does?
+3. should the selector be allowed to repeat the same `z` after a learned reselect?
+4. does reselection improve shot creation enough to justify the added credit-assignment complexity?
+5. does reselection make the current commitment window more usable, or does it simply hide that `K` is too short?
+
+Recommended default if this is implemented:
+
+1. keep reselection constrained to meaningful candidate boundaries, not every primitive step
+2. allow selector to choose the same `z` again
+3. treat each selector choice as controlling one segment, with segment-level credit
+4. next refinement should be a learned pass-boundary `continue vs reselect` head
+
+#### 4) Should play selection include the initial ball handler?
+
+Current `mu` chooses only `z`, while ball handler is part of the state/context.
+This allows `mu` to learn "given current ball handler, pick play `z`", but not
+"choose who should initiate the play."
+
+Questions:
+
+1. is play quality bottlenecked by who starts with the ball?
+2. does the low-level policy already learn effective "entry pass to initiator" behavior?
+3. would high-level play calling improve if selector chose:
+   - play only: `mu(z | s_context)`
+   - ball handler then play: `mu(h, z | s_context)`
+   - factorized head: `mu_h(h | s), mu_z(z | s, h)`
+
+This should remain a later-stage research branch, not part of the first selector rollout.
+
+### Practical recommendation
+
+Do not implement Stage 3 until:
+
+1. latent play space is visibly present in metrics and analysis
+2. at least some intents are behaviorally interpretable
+3. low-level execution is stable enough that `z` semantics are not drifting wildly
+
+At the current stage of the project, Stage 3 should be treated as the next architecture
+branch after latent play discovery is sufficiently mature, not as a config toggle to
+turn on immediately.
 
 ## Real examples (emergent, not handcrafted)
 
@@ -362,6 +1764,8 @@ Fix:
 3. Add diversity objective (phase 2) and track intent separability.
 4. Harden defense with unknown/no-intent curriculum.
 5. Add post-hoc clustering notebook/report to interpret learned intents.
+6. After latent play space stabilizes, add Stage 3 selector `mu(z | s_context)` with
+   mixture ramp from uniform to selector-driven play calling.
 
 ## Success criteria
 
@@ -370,6 +1774,225 @@ Fix:
 3. Defense remains strong when offense intent is unknown (human proxy).
 4. Turning off intent learning returns baseline behavior cleanly.
 5. Playable app and development mode remain functional with legacy non-intent models and unchanged API contracts.
+
+## Future work
+
+### 1) Full DIAYN skill pretraining track
+
+If joint task+diversity training under PPO does not produce strong intent separation, add a two-stage pipeline:
+
+1. Stage A: skill discovery pretraining in the same environment dynamics with task reward disabled (intrinsic-only objective).
+2. Stage B: downstream task training where PPO learns to use discovered skills for scoring/winning.
+
+Design notes:
+
+1. Keep latent skill/intent `z` discrete (`num_intents = K`) with commitment window.
+2. Train discriminator `q(z | trajectory)` and maximize MI-style bonus.
+3. Preserve environment dynamics/opponents/observation schema so transfer is not confounded by distribution shift.
+4. Evaluate pretraining quality before transfer using:
+   - `intent/disc_top1_acc`
+   - `intent/disc_auc_ovr_macro`
+   - `intent/usage_entropy`
+   - per-intent behavior spread metrics.
+5. Transfer options:
+   - Freeze low-level skill-conditioned policy and train only high-level chooser.
+   - Or fine-tune low-level policy with small LR after warmup.
+
+Implementation caution:
+
+1. Canonical DIAYN uses entropy-maximizing actor-critic (often SAC). Since current stack is PPO + discrete actions, this should be treated as a dedicated research branch, not an in-place toggle.
+2. Keep backward compatibility by version-tagging checkpoints and observation schema.
+
+### 2) Learned play selector track
+
+If the latent play space becomes stable and interpretable, add the high-level
+selector described in Stage 3:
+
+1. selector chooses offense play `z`
+2. low-level policy executes `pi(a | s, z)`
+3. selector is ramped in gradually from uniform sampling
+
+This should be treated as a hierarchical-control branch, not folded into the original
+latent-play discovery code path without clear ablations.
+
+### 3) Inductive priors for play-learning track
+
+Current status:
+
+1. weak discriminator priors are now implemented as optional auxiliary heads
+2. current implemented priors are:
+   - `shot_end`
+   - `shot_quality`
+3. current knobs are:
+   - `intent_disc_lambda_shot`
+   - `intent_disc_lambda_q`
+
+Why this was added:
+
+If pure intent-ID prediction is not producing human-legible play structure, add weak
+supervised inductive priors to the discriminator/trajectory encoder so the learned
+representation is nudged toward "play completion" rather than arbitrary separability.
+
+Core idea:
+
+1. Keep the main intent-classification objective:
+   - `CE(z_logits, true_intent)`
+2. Add auxiliary heads on the same trajectory representation, for example:
+   - `shot_end` head: did the play/segment end in a shot attempt?
+   - `shot_quality` head: what was the final shot EP / make probability / expected value?
+3. Train with a multi-task loss such as:
+   - `CE(z_logits, true_intent) + lambda_shot * BCE(shot_logit, shot_end_label) + lambda_q * MSE(quality_pred, final_shot_quality)`
+
+Why this is interesting:
+
+1. It provides structure similar in spirit to the "priors / supervision help diversity"
+   observation from DIAYN-style work, but adapted to basketball-play discovery.
+2. It may bias the learned latent space toward possessions/segments that terminate in
+   a recognizable offensive outcome instead of only maximizing trajectory-level
+   distinguishability.
+3. It could make intents more behaviorally interpretable even if plain discriminator
+   AUC/top-1 already looks acceptable.
+
+Important cautions:
+
+1. Do not make this a hard requirement that every play must end in a shot.
+2. If `lambda_shot` is too large, all intents may collapse toward generic
+   shot-seeking behavior.
+3. This idea likely fits segment-based/multi-selection play learning better than the
+   current one-intent-per-possession setup, because "play completion" is more natural
+   at a selector segment boundary than at an entire possession boundary.
+4. If explored, treat `lambda_shot` and `lambda_q` as small research knobs with
+   explicit ablations, not default production settings.
+
+Suggested experiments:
+
+1. Compare plain discriminator loss vs:
+   - `+ lambda_shot * BCE(...)`
+   - `+ lambda_q * MSE(...)`
+   - both together
+2. Measure not only discriminator metrics, but also:
+   - deterministic Playbook distinctness from fixed starts
+   - first-shot timing / shot-end frequency while `z` is active
+   - shot-quality spread by intent
+   - selector sensitivity and collapse
+3. Compare plain intent-ID vs priors on the now-implemented segment-based path
+4. Revisit whether additional priors are useful, for example:
+   - assisted shot
+   - shot zone
+   - turnover-end
+
+### 4) Multi-selection play learning with pass boundaries
+
+Current status:
+
+The first multi-selection implementation is now in the codebase.
+
+Current environment constraint:
+
+1. possessions already terminate on shot attempt
+2. possessions already terminate on turnover / violation / dead-ball terminal
+3. therefore the only practical intra-possession boundary candidate is a completed pass
+
+Practical first design:
+
+1. let `mu` choose `z_0` at possession start
+2. keep `z_k` active for a short play segment
+3. if a completed pass occurs after a minimum number of steps, allow a reselection
+4. if no pass occurs, force reselection at the commitment horizon
+
+Implemented first slice:
+
+1. `min_play_steps` gate before a completed pass can create a new segment
+2. timeout boundary at `intent_commitment_steps`
+3. selector target uses segment return plus optional selector-value bootstrap
+4. discriminator segments close on selector boundaries and episode terminal
+
+Not yet implemented:
+
+1. learned `continue vs reselect` boundary head
+2. explicit separate `max_play_steps` distinct from commitment horizon
+3. keep-current-`z` fallback on alpha miss at a boundary
+
+Recommended first heuristics:
+
+1. `min_play_steps = 3`
+2. `max_play_steps = 6`
+3. eligible reselection event = successful completed pass with possession still alive
+4. selector may either:
+   - keep the same `z`
+   - or sample a new `z`
+
+Why this branch is attractive:
+
+1. it defines "play" at a more natural medium-horizon timescale (`4-6` steps) rather
+   than forcing one play label to explain an entire possession
+2. it aligns better with inductive priors like:
+   - does this play segment end in a shot?
+   - does this segment improve shot quality?
+3. it may make learned plays more behaviorally legible in Playbook analysis
+
+Credit-assignment implication:
+
+1. full-possession return is no longer the right default
+2. each selector decision should get:
+   - segment return up to the next pass-boundary / terminal
+   - plus selector-value bootstrap at the next selector boundary
+
+Research questions:
+
+1. does allowing reselection only on completed passes improve play distinctness?
+2. should every eligible pass trigger reselection, or should the model learn a
+   "continue current play vs end current play" decision?
+3. does a fixed `3-6` step play horizon produce more interpretable plays than
+   possession-level intents?
+4. do pass-boundary segments improve deterministic Playbook differences from fixed starts?
+
+Suggested experiments:
+
+1. compare:
+   - possession-level selector
+   - current implemented pass-boundary / commitment-timeout selector
+   - learned reselection decision at eligible passes
+2. evaluate:
+   - discriminator metrics
+   - selector stability / collapse
+   - fixed-start deterministic Playbook divergence
+   - shot-quality improvement by segment
+
+### 5) Defensive latent plays track
+
+Extend latent play learning to defense with its own latent variable, separate from offense.
+
+Core idea:
+
+1. Offense uses `z_off`.
+2. Defense uses `z_def`.
+3. Each side gets its own embedding/discriminator/diversity bonus.
+
+Why separate latents first:
+
+1. Reduces role interference versus forcing one shared latent to serve both teams.
+2. Makes diagnostics clearer (`offense_*` metrics vs `defense_*` metrics).
+
+Proposed training sequence:
+
+1. Stabilize offense-intent learning first.
+2. Enable defense-intent with smaller `beta` and longer warmup/ramp.
+3. Add role-specific monitoring:
+   - `intent/offense_disc_*`, `intent/defense_disc_*`
+   - role-specific usage entropy/min-prob
+   - defense robustness vs unknown offense intent.
+
+Security/observability rule:
+
+1. No privileged leakage across roles:
+   - defense never directly observes offense-private latent embedding;
+   - offense never directly observes defense-private latent embedding unless an explicit experiment enables it.
+
+Longer-term generalization:
+
+1. Explore shared latent space with role conditioning (`z + role_flag`) only after separate-latent baselines are stable.
+2. Compare against separate-latent baseline on robustness and exploitability before adopting shared-latent design.
 
 ## ChatGPT 5.4 Critique of Plan
 

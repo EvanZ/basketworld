@@ -17,6 +17,9 @@ from app.backend.playable_session_store import (
     playable_session_store,
 )
 from app.backend.routes.lifecycle_routes import init_game as init_game_route
+from app.backend.routes.lifecycle_routes import (
+    _initialize_app_selector_runtime_for_episode,
+)
 from app.backend.routes.lifecycle_routes import step as lifecycle_step
 from app.backend.schemas import (
     ActionRequest,
@@ -840,6 +843,7 @@ def _reset_playable_possession(session: dict[str, Any]) -> dict[str, Any]:
 
     game_state.obs, _ = env.reset(options=reset_options)
     game_state.prev_obs = None
+    _initialize_app_selector_runtime_for_episode()
     _capture_turn_start_snapshot()
 
     game_state.sampled_offense_skills = (

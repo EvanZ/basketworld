@@ -863,91 +863,15 @@ def main(args):
     encoding_version = optional.pop("role_flag_encoding_version")
     print(f"[EVALUATE] Using role_flag encoding ({encoding_version}): offense={role_flag_offense}, defense={role_flag_defense}")
 
-    # Re-open the original run context to log new artifacts to the correct run
-    with mlflow.start_run(run_id=args.run_id):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            if args.all_alternations:
-                print("Evaluating across all alternations...")
-                rows = []
-                pairs = list_models_by_alternation(client, args.run_id)
-                uni = list_unified_by_alternation(client, args.run_id)
-                if args.use_unified or (not pairs and uni):
-                    for alt_idx, uni_art in tqdm(
-                        uni.items(), desc="Alternations (unified)"
-                    ):
-                        uni_path = client.download_artifacts(
-                            args.run_id, uni_art, temp_dir
-                        )
-                        results = run_eval_for_unified(
-                            uni_path,
-                            args.episodes,
-                            required,
-                            optional,
-                            args,
-                            client,
-                            args.run_id,
-                            temp_dir,
-                        )
-                        row = summarize_to_row(results, alt_idx)
-                        rows.append(row)
-                elif pairs:
-                    for alt_idx, pair in tqdm(
-                        pairs.items(), desc="Alternations (paired)"
-                    ):
-                        offense_policy_path = client.download_artifacts(
-                            args.run_id, pair["offense"], temp_dir
-                        )
-                        defense_policy_path = client.download_artifacts(
-                            args.run_id, pair["defense"], temp_dir
-                        )
-                        results = run_eval_for_pair(
-                            offense_policy_path,
-                            defense_policy_path,
-                            args.episodes,
-                            required,
-                            optional,
-                            args,
-                            client,
-                            args.run_id,
-                            temp_dir,
-                            role_flag_offense,
-                            role_flag_defense,
-                        )
-                        row = summarize_to_row(results, alt_idx)
-                        rows.append(row)
-                else:
-                    print("No artifacts found under models/ for paired or unified.")
-
-                # Write CSV
-                csv_path = os.path.join(temp_dir, "evaluation_by_alternation.csv")
-                if rows:
-                    fieldnames = list(rows[0].keys())
-                    with open(csv_path, "w", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerows(rows)
-                    mlflow.log_artifact(csv_path, artifact_path="metrics")
-                    print(f"Logged CSV: {csv_path}")
-                else:
-                    print("No rows to write.")
-            else:
-                # --- Download latest matched pair (by alternation) and run single evaluation set ---
-                print(f"Fetching latest models from MLflow Run ID: {args.run_id}")
-                pairs = list_models_by_alternation(client, args.run_id)
-                uni = list_unified_by_alternation(client, args.run_id)
-                if args.use_unified or (not pairs and uni):
-                    if not uni:
-                        print("No unified artifacts found under 'models/'.")
-                        artifacts = client.list_artifacts(args.run_id, "models")
-                        print("Artifacts:")
-                        for f in artifacts:
-                            print(" -", f.path)
-                        return
-                    latest_idx = max(uni.keys())
-                    uni_path = client.download_artifacts(
-                        args.run_id, uni[latest_idx], temp_dir
-                    )
-                    print(f"Loading unified policy for alternation {latest_idx}...")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        if args.all_alternations:
+            print("Evaluating across all alternations...")
+            rows = []
+            pairs = list_models_by_alternation(client, args.run_id)
+            uni = list_unified_by_alternation(client, args.run_id)
+            if args.use_unified or (not pairs and uni):
+                for alt_idx, uni_art in tqdm(uni.items(), desc="Alternations (unified)"):
+                    uni_path = client.download_artifacts(args.run_id, uni_art, temp_dir)
                     results = run_eval_for_unified(
                         uni_path,
                         args.episodes,
@@ -958,17 +882,16 @@ def main(args):
                         args.run_id,
                         temp_dir,
                     )
-                    analyze_results(results, args.episodes)
-                elif pairs:
-                    latest_idx = max(pairs.keys())
-                    latest_pair = pairs[latest_idx]
+                    row = summarize_to_row(results, alt_idx)
+                    rows.append(row)
+            elif pairs:
+                for alt_idx, pair in tqdm(pairs.items(), desc="Alternations (paired)"):
                     offense_policy_path = client.download_artifacts(
-                        args.run_id, latest_pair["offense"], temp_dir
+                        args.run_id, pair["offense"], temp_dir
                     )
                     defense_policy_path = client.download_artifacts(
-                        args.run_id, latest_pair["defense"], temp_dir
+                        args.run_id, pair["defense"], temp_dir
                     )
-                    print(f"Loading policies for alternation {latest_idx}...")
                     results = run_eval_for_pair(
                         offense_policy_path,
                         defense_policy_path,
@@ -982,9 +905,76 @@ def main(args):
                         role_flag_offense,
                         role_flag_defense,
                     )
-                    analyze_results(results, args.episodes)
-                else:
-                    print("No paired or unified artifacts found under 'models/'.")
+                    row = summarize_to_row(results, alt_idx)
+                    rows.append(row)
+            else:
+                print("No artifacts found under models/ for paired or unified.")
+
+            # Write CSV
+            csv_path = os.path.join(temp_dir, "evaluation_by_alternation.csv")
+            if rows:
+                fieldnames = list(rows[0].keys())
+                with open(csv_path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                client.log_artifact(args.run_id, csv_path, artifact_path="metrics")
+                print(f"Logged CSV: {csv_path}")
+            else:
+                print("No rows to write.")
+        else:
+            # --- Download latest matched pair (by alternation) and run single evaluation set ---
+            print(f"Fetching latest models from MLflow Run ID: {args.run_id}")
+            pairs = list_models_by_alternation(client, args.run_id)
+            uni = list_unified_by_alternation(client, args.run_id)
+            if args.use_unified or (not pairs and uni):
+                if not uni:
+                    print("No unified artifacts found under 'models/'.")
+                    artifacts = client.list_artifacts(args.run_id, "models")
+                    print("Artifacts:")
+                    for f in artifacts:
+                        print(" -", f.path)
+                    return
+                latest_idx = max(uni.keys())
+                uni_path = client.download_artifacts(args.run_id, uni[latest_idx], temp_dir)
+                print(f"Loading unified policy for alternation {latest_idx}...")
+                results = run_eval_for_unified(
+                    uni_path,
+                    args.episodes,
+                    required,
+                    optional,
+                    args,
+                    client,
+                    args.run_id,
+                    temp_dir,
+                )
+                analyze_results(results, args.episodes)
+            elif pairs:
+                latest_idx = max(pairs.keys())
+                latest_pair = pairs[latest_idx]
+                offense_policy_path = client.download_artifacts(
+                    args.run_id, latest_pair["offense"], temp_dir
+                )
+                defense_policy_path = client.download_artifacts(
+                    args.run_id, latest_pair["defense"], temp_dir
+                )
+                print(f"Loading policies for alternation {latest_idx}...")
+                results = run_eval_for_pair(
+                    offense_policy_path,
+                    defense_policy_path,
+                    args.episodes,
+                    required,
+                    optional,
+                    args,
+                    client,
+                    args.run_id,
+                    temp_dir,
+                    role_flag_offense,
+                    role_flag_defense,
+                )
+                analyze_results(results, args.episodes)
+            else:
+                print("No paired or unified artifacts found under 'models/'.")
 
 
 if __name__ == "__main__":

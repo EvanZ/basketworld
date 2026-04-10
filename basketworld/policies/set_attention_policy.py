@@ -41,6 +41,9 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
       3) Shared token MLP:
          token_mlp: (B, P, T+G) -> (B, P, D)
          D = embed_dim
+      3b) Optional role-selected intent conditioning:
+         offense/defense intent embedding -> projected to token dim and added to
+         every player token for the acting role only
       4) Optional learned CLS tokens:
          cls_tokens: (C, D) where C = num_cls_tokens
          append -> (B, P+C, D)
@@ -62,6 +65,9 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         token_mlp_dim: int = 64,
         num_cls_tokens: int = 2,
         token_activation: str = "relu",
+        intent_embedding_enabled: bool = False,
+        intent_embedding_dim: int = 16,
+        num_intents: int = 8,
     ):
         players_space = observation_space.spaces.get("players")
         globals_space = observation_space.spaces.get("globals")
@@ -75,6 +81,11 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
         self.token_dim = int(token_dim)
         self.global_dim = int(global_dim)
         self.num_cls_tokens = int(num_cls_tokens)
+        self.intent_embedding_enabled = bool(intent_embedding_enabled)
+        self.intent_embedding_dim = max(1, int(intent_embedding_dim))
+        self.num_intents = max(1, int(num_intents))
+        self._runtime_intent_indices: Optional[th.Tensor] = None
+        self._runtime_intent_gate: Optional[th.Tensor] = None
 
         total_tokens = self.n_players + self.num_cls_tokens
         super().__init__(observation_space, features_dim=total_tokens * self.embed_dim)
@@ -85,12 +96,124 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             token_act(),
             nn.Linear(token_mlp_dim, self.embed_dim),
         )
+        if self.intent_embedding_enabled:
+            self.offense_intent_embedding = nn.Embedding(
+                num_embeddings=self.num_intents,
+                embedding_dim=self.intent_embedding_dim,
+            )
+            self.defense_intent_embedding = nn.Embedding(
+                num_embeddings=self.num_intents,
+                embedding_dim=self.intent_embedding_dim,
+            )
+            self.offense_intent_to_token = nn.Linear(
+                self.intent_embedding_dim, self.embed_dim, bias=False
+            )
+            self.defense_intent_to_token = nn.Linear(
+                self.intent_embedding_dim, self.embed_dim, bias=False
+            )
+            nn.init.normal_(self.offense_intent_embedding.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.defense_intent_embedding.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.offense_intent_to_token.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.defense_intent_to_token.weight, mean=0.0, std=0.02)
+        else:
+            self.offense_intent_embedding = None
+            self.defense_intent_embedding = None
+            self.offense_intent_to_token = None
+            self.defense_intent_to_token = None
         self.attn = nn.MultiheadAttention(self.embed_dim, n_heads, batch_first=True)
         self.attn_norm = nn.LayerNorm(self.embed_dim)
         if self.num_cls_tokens > 0:
             self.cls_tokens = nn.Parameter(th.zeros(self.num_cls_tokens, self.embed_dim))
         else:
             self.cls_tokens = None
+
+    def set_runtime_intent_state(
+        self,
+        *,
+        intent_indices: Optional[th.Tensor],
+        intent_gate: Optional[th.Tensor] = None,
+    ) -> None:
+        self._runtime_intent_indices = intent_indices
+        self._runtime_intent_gate = intent_gate
+
+    def clear_runtime_intent_state(self) -> None:
+        self._runtime_intent_indices = None
+        self._runtime_intent_gate = None
+
+    def _apply_runtime_intent_conditioning(
+        self,
+        emb: th.Tensor,
+        obs: Dict[str, th.Tensor],
+    ) -> th.Tensor:
+        if (
+            self.offense_intent_embedding is not None
+            and self.defense_intent_embedding is not None
+            and self.offense_intent_to_token is not None
+            and self.defense_intent_to_token is not None
+        ):
+            try:
+                if self._runtime_intent_indices is None:
+                    raise RuntimeError("Runtime intent state is not set.")
+                intent_idx = self._runtime_intent_indices.to(emb.device, dtype=th.long)
+                if intent_idx.ndim == 0:
+                    intent_idx = intent_idx.unsqueeze(0)
+                intent_idx = intent_idx.reshape(-1)
+                if intent_idx.shape[0] != emb.shape[0]:
+                    if intent_idx.shape[0] == 1 and emb.shape[0] > 1:
+                        intent_idx = intent_idx.expand(emb.shape[0])
+                    else:
+                        raise RuntimeError("Runtime intent indices batch does not match observation batch.")
+                intent_idx = intent_idx.clamp(min=0, max=self.num_intents - 1)
+                role_flag = obs.get("role_flag")
+                if role_flag is None:
+                    is_offense = th.ones_like(intent_idx, dtype=th.bool)
+                else:
+                    if role_flag.ndim == 1:
+                        role_flag = role_flag.unsqueeze(-1)
+                    is_offense = role_flag.squeeze(-1) > 0.0
+                off_emb = self.offense_intent_embedding(intent_idx)
+                def_emb = self.defense_intent_embedding(intent_idx)
+                off_delta = self.offense_intent_to_token(off_emb)
+                def_delta = self.defense_intent_to_token(def_emb)
+                intent_delta = th.where(is_offense.unsqueeze(-1), off_delta, def_delta)
+                if self._runtime_intent_gate is None:
+                    intent_gate = th.ones_like(intent_idx, dtype=emb.dtype, device=emb.device)
+                else:
+                    intent_gate = self._runtime_intent_gate.to(emb.device, dtype=emb.dtype)
+                    if intent_gate.ndim == 0:
+                        intent_gate = intent_gate.unsqueeze(0)
+                    intent_gate = intent_gate.reshape(-1)
+                    if intent_gate.shape[0] != emb.shape[0]:
+                        if intent_gate.shape[0] == 1 and emb.shape[0] > 1:
+                            intent_gate = intent_gate.expand(emb.shape[0])
+                        else:
+                            raise RuntimeError("Runtime intent gate batch does not match observation batch.")
+                intent_gate = intent_gate.unsqueeze(-1)
+                emb = emb + (intent_delta.unsqueeze(1) * intent_gate.unsqueeze(1))
+            except Exception:
+                pass
+        return emb
+
+    def _build_attention_input(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        players = obs["players"]
+        globals_vec = obs["globals"]
+        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
+        tokens = th.cat([players, g], dim=-1)
+        emb = self.token_mlp(tokens)
+        emb = self._apply_runtime_intent_conditioning(emb, obs)
+        if self.cls_tokens is not None:
+            batch = emb.size(0)
+            cls = self.cls_tokens.unsqueeze(0).expand(batch, -1, -1)
+            emb = th.cat([emb, cls], dim=1)
+        return emb
+
+    def compute_attention_weights(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        """Return raw per-head attention weights for the current runtime-conditioned obs."""
+        emb = self._build_attention_input(obs)
+        _, attn_weights = self.attn(
+            emb, emb, emb, need_weights=True, average_attn_weights=False
+        )
+        return attn_weights
 
     def forward(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
         """Compute flattened token embeddings from a set observation.
@@ -102,15 +225,7 @@ class SetAttentionExtractor(BaseFeaturesExtractor):
             Flattened tokens of shape (B, (P + C) * D).
             This preserves token order: first P player tokens, then C CLS tokens.
         """
-        players = obs["players"]
-        globals_vec = obs["globals"]
-        g = globals_vec.unsqueeze(1).expand(-1, players.size(1), -1)
-        tokens = th.cat([players, g], dim=-1)
-        emb = self.token_mlp(tokens)
-        if self.cls_tokens is not None:
-            batch = emb.size(0)
-            cls = self.cls_tokens.unsqueeze(0).expand(batch, -1, -1)
-            emb = th.cat([emb, cls], dim=1)
+        emb = self._build_attention_input(obs)
         attn_out, _ = self.attn(emb, emb, emb, need_weights=False)
         attn_out = self.attn_norm(emb + attn_out)
         return attn_out.reshape(attn_out.size(0), -1)
@@ -372,6 +487,11 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         num_cls_tokens: int = 2,
         token_activation: str = "relu",
         head_activation: str = "tanh",
+        intent_embedding_enabled: bool = False,
+        intent_embedding_dim: int = 16,
+        num_intents: int = 8,
+        intent_selector_enabled: bool = False,
+        intent_selector_hidden_dim: int = 64,
         **kwargs,
     ):
         head_arch = kwargs.get("net_arch")
@@ -384,6 +504,13 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         features_extractor_kwargs.setdefault("token_mlp_dim", token_mlp_dim)
         features_extractor_kwargs.setdefault("num_cls_tokens", num_cls_tokens)
         features_extractor_kwargs.setdefault("token_activation", token_activation)
+        features_extractor_kwargs.setdefault(
+            "intent_embedding_enabled", intent_embedding_enabled
+        )
+        features_extractor_kwargs.setdefault(
+            "intent_embedding_dim", intent_embedding_dim
+        )
+        features_extractor_kwargs.setdefault("num_intents", num_intents)
         kwargs["features_extractor_kwargs"] = features_extractor_kwargs
         effective_embed_dim = int(features_extractor_kwargs["embed_dim"])
 
@@ -427,6 +554,8 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         self.embed_dim = int(effective_embed_dim)
         if self.embed_dim <= 0:
             raise ValueError("embed_dim must be positive.")
+        self.intent_selector_enabled = bool(intent_selector_enabled)
+        self.intent_selector_hidden_dim = max(16, int(intent_selector_hidden_dim))
 
         self.token_head_mlp_pi = None
         self.token_head_mlp_vf = None
@@ -452,6 +581,20 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
                     self.token_head_mlp_vf, self.vf_embed_dim = self._build_token_head_mlp(
                         self.embed_dim, head_arch["vf"]
                     )
+
+        self.intent_selector_head = None
+        self.intent_selector_value_head = None
+        if self.intent_selector_enabled:
+            self.intent_selector_head = nn.Sequential(
+                nn.Linear(self.embed_dim, self.intent_selector_hidden_dim),
+                self._head_activation(),
+                nn.Linear(self.intent_selector_hidden_dim, int(num_intents)),
+            )
+            self.intent_selector_value_head = nn.Sequential(
+                nn.Linear(self.embed_dim, self.intent_selector_hidden_dim),
+                self._head_activation(),
+                nn.Linear(self.intent_selector_hidden_dim, 1),
+            )
 
         if self.use_dual_policy:
             self.action_head_offense = nn.Linear(self.pi_embed_dim, self.actions_per_player)
@@ -495,6 +638,21 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             ]:
                 nn.init.orthogonal_(net.weight, gain=gain)
                 nn.init.constant_(net.bias, 0)
+            if self.intent_selector_head is not None:
+                selector_first = self.intent_selector_head[0]
+                selector_last = self.intent_selector_head[-1]
+                nn.init.orthogonal_(selector_first.weight, gain=1.0)
+                nn.init.constant_(selector_first.bias, 0)
+                # Start near-uniform so selector ramp-in does not begin collapsed.
+                nn.init.constant_(selector_last.weight, 0)
+                nn.init.constant_(selector_last.bias, 0)
+            if self.intent_selector_value_head is not None:
+                selector_value_first = self.intent_selector_value_head[0]
+                selector_value_last = self.intent_selector_value_head[-1]
+                nn.init.orthogonal_(selector_value_first.weight, gain=1.0)
+                nn.init.constant_(selector_value_first.bias, 0)
+                nn.init.constant_(selector_value_last.weight, 0)
+                nn.init.constant_(selector_value_last.bias, 0)
             if self.use_dual_policy:
                 for net in [
                     self.action_head_offense,
@@ -773,6 +931,63 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
         total_tokens = self.token_players + self.num_cls_tokens
         return latent.reshape(batch, total_tokens, self.embed_dim)
 
+    def has_intent_selector(self) -> bool:
+        return bool(self.intent_selector_head is not None and self.intent_selector_enabled)
+
+    def has_intent_selector_value_head(self) -> bool:
+        return bool(
+            self.intent_selector_value_head is not None and self.intent_selector_enabled
+        )
+
+    def _selector_context_from_features(self, features: th.Tensor) -> th.Tensor:
+        tokens = self._split_tokens(features)
+        if self.num_cls_tokens >= 1:
+            return tokens[:, self.token_players, :]
+        return tokens[:, : self.token_players, :].mean(dim=1)
+
+    def get_intent_selector_outputs(self, obs: Any) -> tuple[th.Tensor, th.Tensor]:
+        if not self.has_intent_selector():
+            raise RuntimeError("Intent selector head is not enabled for this policy.")
+        if not self.has_intent_selector_value_head():
+            raise RuntimeError("Intent selector value head is not enabled for this policy.")
+
+        obs_tensor = obs
+        if not (
+            isinstance(obs_tensor, dict)
+            and all(isinstance(value, th.Tensor) for value in obs_tensor.values())
+        ):
+            obs_tensor, _ = self.obs_to_tensor(obs)
+
+        saved_override_indices = getattr(self, "_runtime_intent_override_indices", None)
+        saved_override_gate = getattr(self, "_runtime_intent_override_gate", None)
+        try:
+            if hasattr(self, "clear_runtime_intent_override"):
+                self.clear_runtime_intent_override()
+            with self.runtime_conditioning_context(obs_tensor):
+                features = self.extract_features(obs_tensor)
+                if not self.share_features_extractor and isinstance(features, tuple):
+                    features = features[0]
+        finally:
+            if hasattr(self, "set_runtime_intent_override"):
+                self.set_runtime_intent_override(
+                    saved_override_indices,
+                    saved_override_gate,
+                )
+        selector_ctx = self._selector_context_from_features(features)
+        assert self.intent_selector_head is not None
+        assert self.intent_selector_value_head is not None
+        logits = self.intent_selector_head(selector_ctx)
+        values = self.intent_selector_value_head(selector_ctx).reshape(-1)
+        return logits, values
+
+    def get_intent_selector_logits(self, obs: Any) -> th.Tensor:
+        logits, _ = self.get_intent_selector_outputs(obs)
+        return logits
+
+    def predict_intent_selector_values(self, obs: Any) -> th.Tensor:
+        _, values = self.get_intent_selector_outputs(obs)
+        return values
+
     def _get_action_logits(self, latent_pi: th.Tensor) -> th.Tensor:
         """Compute per-player action logits from token embeddings.
 
@@ -870,8 +1085,27 @@ class SetAttentionDualCriticPolicy(DualCriticActorCriticPolicy):
             return super().load_state_dict(state_dict, strict=False)
 
         result = super().load_state_dict(state_dict, strict=False)
-        missing = [key for key in result.missing_keys if not str(key).startswith("pointer_")]
-        unexpected = [key for key in result.unexpected_keys if not str(key).startswith("pointer_")]
+        allowed_prefixes = (
+            "pointer_",
+            "intent_selector_head",
+            "intent_selector_value_head",
+            "features_extractor.intent_embedding",
+            "features_extractor.intent_to_global",
+            "features_extractor.offense_intent_embedding",
+            "features_extractor.defense_intent_embedding",
+            "features_extractor.offense_intent_to_token",
+            "features_extractor.defense_intent_to_token",
+        )
+        missing = [
+            key
+            for key in result.missing_keys
+            if not str(key).startswith(allowed_prefixes)
+        ]
+        unexpected = [
+            key
+            for key in result.unexpected_keys
+            if not str(key).startswith(allowed_prefixes)
+        ]
         if missing or unexpected:
             missing_msg = ", ".join(missing) if missing else "None"
             unexpected_msg = ", ".join(unexpected) if unexpected else "None"

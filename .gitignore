@@ -55,6 +55,9 @@ mlartifacts/
 
 # data
 data/
+analytics/__pycache__/
+analytics/intent_pca/
+analytics/intent_*
 *.csv
 
 

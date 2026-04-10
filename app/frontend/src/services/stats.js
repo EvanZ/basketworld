@@ -26,6 +26,8 @@ export function getDefaultStats() {
     points: 0,
     rewardSum: 0,
     episodeStepsSum: 0,
+    intentSelectionCounts: {},
+    intentInactiveCount: 0,
     turnoverReasons: {},
     actionMix: {
       noop: 0,
@@ -82,6 +84,8 @@ export function loadStats() {
       points: Number(parsed.points) || 0,
       rewardSum: Number(parsed.rewardSum) || 0,
       episodeStepsSum: Number(parsed.episodeStepsSum) || 0,
+      intentSelectionCounts: normalizeNumberRecord(parsed.intentSelectionCounts),
+      intentInactiveCount: Number(parsed.intentInactiveCount) || 0,
       turnoverReasons: normalizeNumberRecord(parsed.turnoverReasons),
       actionMix: {
         noop: Number(parsed?.actionMix?.noop) || 0,

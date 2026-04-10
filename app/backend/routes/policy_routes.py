@@ -5,6 +5,7 @@ from app.backend.observations import (
     _compute_q_values_for_player,
     _compute_state_values_from_obs,
 )
+from app.backend.env_access import env_view
 from app.backend.schemas import SetPhiParamsRequest
 from app.backend.state import game_state
 
@@ -79,18 +80,19 @@ def get_action_masks_debug():
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     try:
+        env = env_view(game_state.env)
         action_mask = game_state.obs["action_mask"]
         debug_info = {
-            "enable_pass_gating": getattr(game_state.env, "enable_pass_gating", None),
-            "pass_arc_degrees": getattr(game_state.env, "pass_arc_degrees", None),
+            "enable_pass_gating": env.enable_pass_gating,
+            "pass_arc_degrees": env.pass_arc_degrees,
             "ball_holder": (
-                int(game_state.env.ball_holder)
-                if game_state.env.ball_holder is not None
+                int(env.ball_holder)
+                if env.ball_holder is not None
                 else None
             ),
-            "positions": [(int(q), int(r)) for q, r in game_state.env.positions],
-            "offense_ids": list(game_state.env.offense_ids),
-            "defense_ids": list(game_state.env.defense_ids),
+            "positions": [(int(q), int(r)) for q, r in env.positions],
+            "offense_ids": list(env.offense_ids),
+            "defense_ids": list(env.defense_ids),
             "action_masks": {},
         }
         action_names = [
@@ -109,7 +111,7 @@ def get_action_masks_debug():
             "PASS_SW",
             "PASS_SE",
         ]
-        for player_id in range(game_state.env.n_players):
+        for player_id in range(env.n_players):
             mask = action_mask[player_id].tolist()
             debug_info["action_masks"][player_id] = {
                 "mask": mask,
@@ -121,7 +123,7 @@ def get_action_masks_debug():
             ball_holder = debug_info["ball_holder"]
             debug_info["pass_gating_debug"] = {}
             for dir_idx in range(6):
-                has_teammate = game_state.env._has_teammate_in_pass_arc(
+                has_teammate = env._has_teammate_in_pass_arc(
                     ball_holder, dir_idx
                 )
                 debug_info["pass_gating_debug"][f"direction_{dir_idx}"] = {
@@ -139,7 +141,8 @@ def get_action_values(player_id: int):
     """Calculate one-step Q-values for all actions for a player."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    if game_state.env.episode_ended:
+    env = env_view(game_state.env)
+    if env.episode_ended:
         return jsonable_encoder({})
     action_values = _compute_q_values_for_player(player_id, game_state)
     return jsonable_encoder(action_values)
@@ -150,7 +153,8 @@ def get_state_values():
     """Get value function estimates for the pre-step state (offense/defense)."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
-    if game_state.env.episode_ended:
+    env = env_view(game_state.env)
+    if env.episode_ended:
         return {"offensive_value": 0.0, "defensive_value": 0.0}
     try:
         obs_to_use = game_state.prev_obs if game_state.prev_obs is not None else game_state.obs
@@ -173,17 +177,18 @@ def get_shot_probability(player_id: int):
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
     try:
-        player_pos = game_state.env.positions[player_id]
-        basket_pos = game_state.env.basket_position
-        distance = game_state.env._hex_distance(player_pos, basket_pos)
-        base_prob = game_state.env._calculate_base_shot_probability(player_id, distance)
-        final_prob = game_state.env._calculate_shot_probability(player_id, distance)
+        env = getattr(game_state.env, "unwrapped", game_state.env)
+        player_pos = env.positions[player_id]
+        basket_pos = env.basket_position
+        distance = env._hex_distance(player_pos, basket_pos)
+        base_prob = env._calculate_base_shot_probability(player_id, distance)
+        final_prob = env._calculate_shot_probability(player_id, distance)
         return {
             "player_id": player_id,
             "shot_probability": float(base_prob),
             "shot_probability_final": float(final_prob),
             "distance": int(distance),
-            "is_three": bool(game_state.env._is_three_point_hex(tuple(player_pos))),
+            "is_three": bool(env._is_three_point_hex(tuple(player_pos))),
         }
     except Exception as e:
         return {"player_id": player_id, "shot_probability": 0.0, "error": str(e)}

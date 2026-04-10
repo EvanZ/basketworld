@@ -427,9 +427,8 @@ def main(args):
 
         # Log to MLflow all generated
         if not args.no_log_mlflow and all_saved_paths:
-            with mlflow.start_run(run_id=args.run_id):
-                for p in all_saved_paths:
-                    mlflow.log_artifact(p, artifact_path="shotcharts")
+            for p in all_saved_paths:
+                client.log_artifact(args.run_id, p, artifact_path="shotcharts")
             print("Logged shotcharts to MLflow under 'shotcharts/'.")
 
         # Optional: create animated GIF over the sequence
@@ -448,8 +447,9 @@ def main(args):
                     )
                     print(f"Saved GIF: {gif_path}")
                     if not args.no_log_mlflow:
-                        with mlflow.start_run(run_id=args.run_id):
-                            mlflow.log_artifact(gif_path, artifact_path="shotcharts")
+                        client.log_artifact(
+                            args.run_id, gif_path, artifact_path="shotcharts"
+                        )
             except Exception as e:
                 print(f"[warn] Failed to create shotchart GIF: {e}")
 

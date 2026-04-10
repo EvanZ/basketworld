@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from enum import Enum
 from typing import List, Optional
 
@@ -23,13 +24,13 @@ def get_policy_action_probabilities(policy, obs) -> Optional[List[np.ndarray]]:
         policy_obj = getattr(policy, "policy", None)
         if policy_obj is None:
             return None
-        if hasattr(policy_obj, "_extract_role_flag") and hasattr(policy_obj, "_current_role_flags"):
-            try:
-                policy_obj._current_role_flags = policy_obj._extract_role_flag(obs)
-            except Exception:
-                policy_obj._current_role_flags = None
         obs_tensor = policy_obj.obs_to_tensor(obs)[0]
-        distributions = policy_obj.get_distribution(obs_tensor)
+        with (
+            policy_obj.runtime_conditioning_context(obs_tensor)
+            if hasattr(policy_obj, "runtime_conditioning_context")
+            else nullcontext()
+        ):
+            distributions = policy_obj.get_distribution(obs_tensor)
         if hasattr(distributions, "action_probabilities"):
             probs = distributions.action_probabilities()
             if probs.ndim == 2:
@@ -44,9 +45,6 @@ def get_policy_action_probabilities(policy, obs) -> Optional[List[np.ndarray]]:
         ]
     except Exception:
         return None
-    finally:
-        if policy_obj is not None and hasattr(policy_obj, "_current_role_flags"):
-            policy_obj._current_role_flags = None
 
 
 def _choose_legal(

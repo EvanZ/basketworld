@@ -5,6 +5,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.action_resolution import IllegalActionStrategy
+from basketworld.utils.start_templates import load_start_template_library
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.wrappers import (
     RewardAggregationWrapper,
@@ -18,6 +19,13 @@ from basketworld.utils.wrappers import (
 
 def setup_environment(args, training_team, env_idx=None):
     """Construct a single environment wrapped for training/eval."""
+    start_template_enabled = bool(getattr(args, "start_template_enabled", False))
+    start_template_library = None
+    start_template_path = getattr(args, "start_template_library", None)
+    if start_template_enabled and start_template_path:
+        start_template_library = load_start_template_library(
+            start_template_path, players_per_side=int(args.players)
+        )
     env = basketworld.HexagonBasketballEnv(
         grid_size=args.grid_size,
         court_rows=getattr(args, "court_rows", None),
@@ -78,6 +86,18 @@ def setup_environment(args, training_team, env_idx=None):
         egocentric_rotate_to_hoop=args.egocentric_rotate_to_hoop,
         include_hoop_vector=args.include_hoop_vector,
         normalize_obs=args.normalize_obs,
+        enable_intent_learning=getattr(args, "enable_intent_learning", False),
+        num_intents=getattr(args, "num_intents", 8),
+        intent_commitment_steps=getattr(args, "intent_commitment_steps", 4),
+        intent_null_prob=getattr(args, "intent_null_prob", 0.2),
+        intent_visible_to_defense_prob=getattr(
+            args, "intent_visible_to_defense_prob", 0.0
+        ),
+        enable_defense_intent_learning=getattr(
+            args, "enable_defense_intent_learning", False
+        ),
+        defense_intent_null_prob=getattr(args, "defense_intent_null_prob", 1.0),
+        intent_obs_mode=getattr(args, "intent_obs_mode", "private_offense"),
         mask_occupied_moves=args.mask_occupied_moves,
         enable_pass_gating=getattr(args, "enable_pass_gating", True),
         three_second_lane_width=getattr(args, "three_second_lane_width", 1),
@@ -85,6 +105,12 @@ def setup_environment(args, training_team, env_idx=None):
         three_second_max_steps=getattr(args, "three_second_max_steps", 3),
         illegal_defense_enabled=args.illegal_defense_enabled,
         offensive_three_seconds_enabled=getattr(args, "offensive_three_seconds", False),
+        start_template_enabled=start_template_enabled,
+        start_template_library=start_template_library,
+        start_template_prob=getattr(args, "start_template_prob", 0.0),
+        start_template_jitter_scale=getattr(args, "start_template_jitter_scale", 1.0),
+        start_template_mirror_prob=getattr(args, "start_template_mirror_prob", 0.5),
+        start_template_strict=getattr(args, "start_template_strict", False),
     )
     env = EpisodeStatsWrapper(env)
     env = RewardAggregationWrapper(env)
@@ -134,6 +160,15 @@ def setup_environment(args, training_team, env_idx=None):
             "pointer_pass_target_entropy",
             "pointer_pass_target_entropy_norm",
             "pointer_pass_target_kl_uniform",
+            "intent_index",
+            "intent_active",
+            "intent_visible_training_obs",
+            "intent_age",
+            "intent_commitment_remaining",
+            "offense_intent_index",
+            "offense_intent_active",
+            "defense_intent_index",
+            "defense_intent_active",
             "gt_is_three",
             "gt_is_dunk",
             "gt_points",
@@ -143,6 +178,10 @@ def setup_environment(args, training_team, env_idx=None):
             "gt_distance",
             "basket_q",
             "basket_r",
+            "start_template_used",
+            "start_template_id",
+            "start_template_mirrored",
+            "start_template_fallback_reason",
         ),
     )
     if env_idx is not None:

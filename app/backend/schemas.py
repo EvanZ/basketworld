@@ -23,6 +23,40 @@ class InitGameRequest(BaseModel):
     dunk_pct: float | None = None
 
 
+class TemplateBootstrapRequest(BaseModel):
+    run_id: str | None = None
+    user_team_name: str = "OFFENSE"
+    players_per_side: int = 3
+    allow_dunks: bool | None = None
+
+
+class ApplyStartTemplateRequest(BaseModel):
+    template_id: str
+    mirrored: bool | None = None
+    apply_to_state: bool = True
+    seed: int | None = None
+
+
+class LoadStartTemplateLibraryRequest(BaseModel):
+    path: str
+
+
+class ImportStartTemplateLibraryRequest(BaseModel):
+    filename: str | None = None
+    contents: str
+
+
+class SetStartTemplateLibraryRequest(BaseModel):
+    library: dict
+    source: str | None = None
+    path: str | None = None
+
+
+class SaveStartTemplateLibraryRequest(BaseModel):
+    path: str
+    library: dict
+
+
 class ListPoliciesRequest(BaseModel):
     run_id: str
 
@@ -74,6 +108,7 @@ class EvaluationRequest(BaseModel):
     opponent_deterministic: bool = True
     custom_setup: CustomEvalSetup | None = None
     randomize_offense_permutation: bool = False
+    intent_selection_mode: Literal["learned_sample", "best_intent", "uniform_random"] = "learned_sample"
 
 
 class SaveEpisodeRequest(BaseModel):
@@ -98,6 +133,28 @@ class SetBallHolderRequest(BaseModel):
 
 class BatchUpdatePositionRequest(BaseModel):
     updates: List[UpdatePositionRequest]
+
+
+class SetIntentStateRequest(BaseModel):
+    active: bool
+    intent_index: int
+    intent_age: int
+
+
+class ReplayCounterfactualRequest(BaseModel):
+    player_deterministic: bool = True
+    opponent_deterministic: bool = True
+    max_steps: int = 256
+
+
+class PlaybookAnalysisRequest(BaseModel):
+    intent_indices: List[int]
+    num_rollouts: int = 16
+    max_steps: int = 8
+    run_to_end: bool = False
+    use_snapshot: bool = True
+    player_deterministic: bool = False
+    opponent_deterministic: bool = True
 
 
 class OffenseSkillsPayload(BaseModel):

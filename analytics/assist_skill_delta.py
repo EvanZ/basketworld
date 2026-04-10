@@ -138,187 +138,180 @@ def run_episodes_and_log_csv(args):
     # Inject std params from run if present
     optional.update(_extract_std_params_from_run(client, args.run_id))
 
-    # Open run context to log artifact back to same run
-    with mlflow.start_run(run_id=args.run_id):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Choose policy artifact
-            pairs = _list_models_by_alternation(client, args.run_id)
-            uni = _list_unified_by_alternation(client, args.run_id)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Choose policy artifact
+        pairs = _list_models_by_alternation(client, args.run_id)
+        uni = _list_unified_by_alternation(client, args.run_id)
 
-            policy = None
+        policy = None
+        policy_kind = "unified"
+
+        if args.use_unified or (not pairs and uni):
+            if not uni:
+                raise RuntimeError(
+                    "No unified policy artifacts found under models/ for this run."
+                )
+            latest_idx = max(uni.keys())
+            uni_path = client.download_artifacts(args.run_id, uni[latest_idx], temp_dir)
+            policy = PPO.load(uni_path)
             policy_kind = "unified"
-
-            if args.use_unified or (not pairs and uni):
-                if not uni:
-                    raise RuntimeError(
-                        "No unified policy artifacts found under models/ for this run."
-                    )
-                latest_idx = max(uni.keys())
-                uni_path = client.download_artifacts(
-                    args.run_id, uni[latest_idx], temp_dir
+        else:
+            if not pairs:
+                raise RuntimeError(
+                    "No paired policy artifacts found under models/ for this run."
                 )
-                policy = PPO.load(uni_path)
-                policy_kind = "unified"
-            else:
-                if not pairs:
-                    raise RuntimeError(
-                        "No paired policy artifacts found under models/ for this run."
-                    )
-                latest_idx = max(pairs.keys())
-                pair = pairs[latest_idx]
-                offense_path = client.download_artifacts(
-                    args.run_id, pair["offense"], temp_dir
-                )
-                defense_path = client.download_artifacts(
-                    args.run_id, pair["defense"], temp_dir
-                )
-                offense_policy = PPO.load(offense_path)
-                defense_policy = PPO.load(defense_path)
-                policy = (offense_policy, defense_policy)
-                policy_kind = "paired"
-
-            # Create env
-            env = HexagonBasketballEnv(
-                **required,
-                **optional,
+            latest_idx = max(pairs.keys())
+            pair = pairs[latest_idx]
+            offense_path = client.download_artifacts(
+                args.run_id, pair["offense"], temp_dir
             )
+            defense_path = client.download_artifacts(
+                args.run_id, pair["defense"], temp_dir
+            )
+            offense_policy = PPO.load(offense_path)
+            defense_policy = PPO.load(defense_path)
+            policy = (offense_policy, defense_policy)
+            policy_kind = "paired"
 
-            rows = []
-            for _ in range(args.episodes):
-                obs, info = env.reset()
-                done = False
-                # Capture initial ball holder safely (can become None later in episode)
-                initial_ball_holder = (
-                    env.ball_holder
-                    if env.ball_holder is not None
-                    else (env.offense_ids[0] if env.offense_ids else 0)
-                )
-                final_info = None
-                while not done:
-                    if policy_kind == "unified":
-                        full_action, _ = policy.predict(obs, deterministic=args.deterministic_unified)  # type: ignore[union-attr]
+        # Create env
+        env = HexagonBasketballEnv(
+            **required,
+            **optional,
+        )
+
+        rows = []
+        for _ in range(args.episodes):
+            obs, info = env.reset()
+            done = False
+            # Capture initial ball holder safely (can become None later in episode)
+            initial_ball_holder = (
+                env.ball_holder
+                if env.ball_holder is not None
+                else (env.offense_ids[0] if env.offense_ids else 0)
+            )
+            final_info = None
+            while not done:
+                if policy_kind == "unified":
+                    full_action, _ = policy.predict(obs, deterministic=args.deterministic_unified)  # type: ignore[union-attr]
+                else:
+                    offense_policy, defense_policy = policy  # type: ignore[misc]
+                    off_action, _ = offense_policy.predict(
+                        obs, deterministic=args.deterministic_offense
+                    )
+                    def_action, _ = defense_policy.predict(
+                        obs, deterministic=args.deterministic_defense
+                    )
+                    full_action = np.zeros(env.n_players, dtype=int)
+                    for pid in range(env.n_players):
+                        full_action[pid] = (
+                            off_action[pid] if pid in env.offense_ids else def_action[pid]
+                        )
+
+                obs, reward, done, _, step_info = env.step(full_action)
+                final_info = step_info
+
+            # Episode ended; compute row
+            action_results = (final_info or {}).get("action_results", {})
+            potential_assist = 0
+            bh_pct = 0.0
+            tm_pct = 0.0
+
+            if action_results.get("shots"):
+                shooter_id = int(list(action_results["shots"].keys())[0])
+                shot_result = list(action_results["shots"].values())[0]
+                if shot_result.get("assist_potential") and not shot_result.get("success"):
+                    potential_assist = 1
+                    passer_id = int(
+                        shot_result.get("assist_passer_id", initial_ball_holder)
+                    )
+                    # Resolve percentages from offense arrays if IDs are offense
+                    if passer_id in env.offense_ids and shooter_id in env.offense_ids:
+                        bh_pct = float(env.offense_dunk_pct_by_player[passer_id])
+                        tm_pct = float(env.offense_dunk_pct_by_player[shooter_id])
                     else:
-                        offense_policy, defense_policy = policy  # type: ignore[misc]
-                        off_action, _ = offense_policy.predict(
-                            obs, deterministic=args.deterministic_offense
-                        )
-                        def_action, _ = defense_policy.predict(
-                            obs, deterministic=args.deterministic_defense
-                        )
-                        full_action = np.zeros(env.n_players, dtype=int)
-                        for pid in range(env.n_players):
-                            full_action[pid] = (
-                                off_action[pid]
-                                if pid in env.offense_ids
-                                else def_action[pid]
-                            )
-
-                    obs, reward, done, _, step_info = env.step(full_action)
-                    final_info = step_info
-
-                # Episode ended; compute row
-                action_results = (final_info or {}).get("action_results", {})
-                potential_assist = 0
-                bh_pct = 0.0
-                tm_pct = 0.0
-
-                if action_results.get("shots"):
-                    shooter_id = int(list(action_results["shots"].keys())[0])
-                    shot_result = list(action_results["shots"].values())[0]
-                    if shot_result.get("assist_potential") and not shot_result.get("success"):
-                        potential_assist = 1
-                        passer_id = int(
-                            shot_result.get("assist_passer_id", initial_ball_holder)
-                        )
-                        # Resolve percentages from offense arrays if IDs are offense
-                        if (
-                            passer_id in env.offense_ids
-                            and shooter_id in env.offense_ids
-                        ):
-                            bh_pct = float(env.offense_dunk_pct_by_player[passer_id])
-                            tm_pct = float(env.offense_dunk_pct_by_player[shooter_id])
-                        else:
-                            # Fallback to initial pairing if something odd occurred
-                            bh_off, tm_off = _pair_for_non_potential(
-                                env, initial_ball_holder
-                            )
-                            bh_pct = float(env.offense_dunk_pct_by_player[bh_off])
-                            tm_pct = float(env.offense_dunk_pct_by_player[tm_off])
-                    else:
-                        # No potential assist on shot; use non-potential pairing
+                        # Fallback to initial pairing if something odd occurred
                         bh_off, tm_off = _pair_for_non_potential(
                             env, initial_ball_holder
                         )
                         bh_pct = float(env.offense_dunk_pct_by_player[bh_off])
                         tm_pct = float(env.offense_dunk_pct_by_player[tm_off])
                 else:
-                    # Turnover/no shot; use non-potential pairing
+                    # No potential assist on shot; use non-potential pairing
                     bh_off, tm_off = _pair_for_non_potential(env, initial_ball_holder)
                     bh_pct = float(env.offense_dunk_pct_by_player[bh_off])
                     tm_pct = float(env.offense_dunk_pct_by_player[tm_off])
+            else:
+                # Turnover/no shot; use non-potential pairing
+                bh_off, tm_off = _pair_for_non_potential(env, initial_ball_holder)
+                bh_pct = float(env.offense_dunk_pct_by_player[bh_off])
+                tm_pct = float(env.offense_dunk_pct_by_player[tm_off])
 
-                delta = float(bh_pct - tm_pct)
-                rows.append(
-                    {
-                        "delta": delta,
-                        "potential_assist": int(potential_assist),
-                        "ball_handler_pct": float(bh_pct),
-                        "teammate_pct": float(tm_pct),
-                    }
+            delta = float(bh_pct - tm_pct)
+            rows.append(
+                {
+                    "delta": delta,
+                    "potential_assist": int(potential_assist),
+                    "ball_handler_pct": float(bh_pct),
+                    "teammate_pct": float(tm_pct),
+                }
+            )
+
+        # --- Logistic Regression: predict potential_assist from delta ---
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.model_selection import train_test_split
+            from sklearn.metrics import roc_auc_score
+
+            # Prepare data
+            X = np.array([[float(r["delta"])] for r in rows], dtype=float)
+            y = np.array([int(r["potential_assist"]) for r in rows], dtype=int)
+            if len(np.unique(y)) >= 2 and len(y) >= 5:
+                # Stratify only if both classes present
+                strat = y if (np.sum(y == 0) > 0 and np.sum(y == 1) > 0) else None
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=strat
                 )
-
-            # --- Logistic Regression: predict potential_assist from delta ---
-            try:
-                from sklearn.linear_model import LogisticRegression
-                from sklearn.model_selection import train_test_split
-                from sklearn.metrics import roc_auc_score
-
-                # Prepare data
-                X = np.array([[float(r["delta"])] for r in rows], dtype=float)
-                y = np.array([int(r["potential_assist"]) for r in rows], dtype=int)
-                if len(np.unique(y)) >= 2 and len(y) >= 5:
-                    # Stratify only if both classes present
-                    strat = y if (np.sum(y == 0) > 0 and np.sum(y == 1) > 0) else None
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=0.2, random_state=42, stratify=strat
+                clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+                clf.fit(X_train, y_train)
+                y_prob = clf.predict_proba(X_test)[:, 1]
+                auc = float(roc_auc_score(y_test, y_prob))
+                client.log_metric(args.run_id, "assist_delta_auc", auc)
+                # Log coefficients as params for quick inspection
+                try:
+                    client.log_param(
+                        args.run_id, "assist_delta_coef", float(clf.coef_[0, 0])
                     )
-                    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
-                    clf.fit(X_train, y_train)
-                    y_prob = clf.predict_proba(X_test)[:, 1]
-                    auc = float(roc_auc_score(y_test, y_prob))
-                    mlflow.log_metric("assist_delta_auc", auc)
-                    # Log coefficients as params for quick inspection
-                    try:
-                        mlflow.log_param("assist_delta_coef", float(clf.coef_[0, 0]))
-                        mlflow.log_param(
-                            "assist_delta_intercept", float(clf.intercept_[0])
-                        )
-                    except Exception:
-                        pass
-                    print(f"AUC (holdout 20%): {auc:.4f}")
-                else:
-                    print("Skipping AUC: insufficient class variety or sample size.")
-            except ImportError:
-                print("scikit-learn not installed; skipping AUC computation.")
-            except Exception as e:
-                print(f"AUC computation failed: {e}")
+                    client.log_param(
+                        args.run_id,
+                        "assist_delta_intercept",
+                        float(clf.intercept_[0]),
+                    )
+                except Exception:
+                    pass
+                print(f"AUC (holdout 20%): {auc:.4f}")
+            else:
+                print("Skipping AUC: insufficient class variety or sample size.")
+        except ImportError:
+            print("scikit-learn not installed; skipping AUC computation.")
+        except Exception as e:
+            print(f"AUC computation failed: {e}")
 
-            # Write CSV and log
-            out_path = os.path.join(temp_dir, "assist_skill_delta.csv")
-            with open(out_path, "w", newline="") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "delta",
-                        "potential_assist",
-                        "ball_handler_pct",
-                        "teammate_pct",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerows(rows)
-            mlflow.log_artifact(out_path, artifact_path="analysis")
-            print(f"Logged CSV to MLflow: {out_path}")
+        # Write CSV and log
+        out_path = os.path.join(temp_dir, "assist_skill_delta.csv")
+        with open(out_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "delta",
+                    "potential_assist",
+                    "ball_handler_pct",
+                    "teammate_pct",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        client.log_artifact(args.run_id, out_path, artifact_path="analysis")
+        print(f"Logged CSV to MLflow: {out_path}")
 
 
 def main():

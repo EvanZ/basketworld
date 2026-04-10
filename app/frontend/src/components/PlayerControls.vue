@@ -1,15 +1,26 @@
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import {
+  applyStartTemplate,
   getActionValues,
+  getPlaybookProgress,
   getRewards,
+  importStartTemplateLibrary,
+  loadStartTemplateLibrary,
   mctsAdvise,
+  runPlaybookAnalysis,
+  saveStartTemplateLibrary,
   setOffenseSkills,
   setPassTargetStrategy,
   setPassLogitBias,
   setBallHolder,
+  setIntentState,
+  setStartTemplateLibrary,
+  captureCounterfactualSnapshot,
+  restoreCounterfactualSnapshot,
+  replayCounterfactualSnapshot,
   setShotPressureParams,
   setPassInterceptionParams,
   setDefenderPressureParams,
@@ -23,6 +34,32 @@ function formatParamCount(n) {
   if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(2)}M`;
   if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`;
   return String(num);
+}
+
+function lookupPlayName(playNameMap, intentIndex) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx) || !playNameMap || typeof playNameMap !== 'object') return null;
+  const raw = playNameMap[String(idx)] ?? playNameMap[idx];
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
+function formatPlayLabel(intentIndex, playNameMap, explicitName = null) {
+  const idx = Number(intentIndex);
+  if (!Number.isFinite(idx)) return 'Unknown play';
+  const name = (typeof explicitName === 'string' && explicitName.trim())
+    ? explicitName.trim()
+    : lookupPlayName(playNameMap, idx);
+  return name ? `${name} (z=${idx})` : `z=${idx}`;
+}
+
+function deepCloneJson(value, fallback = null) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
 }
 
 const props = defineProps({
@@ -100,6 +137,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  initialActiveTab: {
+    type: String,
+    default: 'environment',
+  },
   mctsStepRunning: {
     type: Boolean,
     default: false,
@@ -113,11 +154,23 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  templateConfig: {
+    type: Object,
+    default: null,
+  },
   evalNumEpisodes: {
     type: Number,
     default: 100,
   },
+  evalProgress: {
+    type: Object,
+    default: null,
+  },
   perPlayerEvalStats: {
+    type: Object,
+    default: null,
+  },
+  perIntentEvalStats: {
     type: Object,
     default: null,
   },
@@ -131,7 +184,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -262,6 +315,116 @@ function buildDisplaySelections(selections) {
 }
 
 const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
+const selectorTrainingParams = computed(() => props.gameState?.training_params || {});
+const selectorEnabled = computed(() =>
+  Boolean(selectorTrainingParams.value?.intent_selector_enabled)
+);
+const selectorAlphaSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const start = selectorTrainingParams.value?.intent_selector_alpha_start;
+  const end = selectorTrainingParams.value?.intent_selector_alpha_end;
+  if (start === null || start === undefined) return 'N/A';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const selectorScheduleSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.intent_selector_alpha_warmup_steps;
+  const ramp = selectorTrainingParams.value?.intent_selector_alpha_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
+const selectorEpsSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const start = selectorTrainingParams.value?.intent_selector_eps_start;
+  const end = selectorTrainingParams.value?.intent_selector_eps_end;
+  if (start === null || start === undefined) return 'N/A';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const selectorEpsScheduleSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.intent_selector_eps_warmup_steps;
+  const ramp = selectorTrainingParams.value?.intent_selector_eps_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
+const selectorMultiselectEnabled = computed(() =>
+  Boolean(selectorTrainingParams.value?.intent_selector_multiselect_enabled)
+);
+const selectorMinPlayStepsSummary = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (!selectorMultiselectEnabled.value) return 'N/A (multiselect off)';
+  return selectorTrainingParams.value?.intent_selector_min_play_steps ?? 'N/A';
+});
+const selectorDecisionBoundaryLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (selectorMultiselectEnabled.value) {
+    return 'Possession start + completed-pass reselection';
+  }
+  return 'Possession start only';
+});
+const taskRewardScaleSummary = computed(() => {
+  const start = selectorTrainingParams.value?.task_reward_scale_start;
+  const end = selectorTrainingParams.value?.task_reward_scale_end;
+  if (start === null || start === undefined) return 'Disabled';
+  if (end === null || end === undefined || Number(start) === Number(end)) {
+    return String(start);
+  }
+  return `${start} → ${end}`;
+});
+const taskRewardScheduleSummary = computed(() => {
+  const start = selectorTrainingParams.value?.task_reward_scale_start;
+  if (start === null || start === undefined) return 'Disabled';
+  const warmup = selectorTrainingParams.value?.task_reward_scale_warmup_steps;
+  const ramp = selectorTrainingParams.value?.task_reward_scale_ramp_steps;
+  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
+  const rampText = ramp?.toLocaleString?.() || ramp || '0';
+  return `warmup ${warmupText}, ramp ${rampText}`;
+});
+const selectorHeadContextLabel = computed(() => {
+  const policyClass = String(selectorTrainingParams.value?.policy_class || '');
+  return policyClass.includes('SetAttention') ? 'Shared set-attention encoder' : 'Shared policy encoder';
+});
+const selectorMode = computed(() =>
+  String(selectorTrainingParams.value?.intent_selector_mode || 'callback').toLowerCase()
+);
+const selectorUsesIntegratedPath = computed(() => selectorMode.value === 'integrated');
+const selectorImplementationLabel = computed(() => {
+  return selectorUsesIntegratedPath.value ? 'Integrated PPO path' : 'Callback prototype';
+});
+const selectorValueCoef = computed(() => selectorTrainingParams.value?.intent_selector_value_coef);
+const selectorCriticEnabled = computed(() =>
+  Boolean(
+    selectorEnabled.value
+    && selectorUsesIntegratedPath.value
+    && selectorValueCoef.value !== null
+    && selectorValueCoef.value !== undefined
+  )
+);
+const selectorHeadSummary = computed(() => {
+  if (!selectorEnabled.value) return 'N/A';
+  if (selectorCriticEnabled.value) return 'Intent logits + selector value head';
+  return 'Intent logits head';
+});
+const selectorObjectiveLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  if (selectorCriticEnabled.value) return 'Clipped PPO selector loss + full-possession value baseline';
+  if (selectorUsesIntegratedPath.value) return 'Integrated selector policy loss';
+  return 'Callback-side selector prototype';
+});
+const selectorCreditAssignmentLabel = computed(() => {
+  if (!selectorEnabled.value) return 'Disabled';
+  return selectorCriticEnabled.value
+    ? 'Full-possession return against selector value baseline'
+    : 'Full-possession return';
+});
 const movesColumnCount = computed(() => (allPlayerIds.value?.length || 0) + 4);
 const pressureExposureDisplay = computed(() => {
   const val = Number(props.pressureExposure);
@@ -363,6 +526,35 @@ const passLogitBiasInput = ref(0);
 const passLogitBiasDefault = 0.0;
 const passLogitBiasUpdating = ref(false);
 const passLogitBiasError = ref(null);
+const intentStateInput = ref({
+  active: false,
+  intent_index: 0,
+  intent_age: 0,
+});
+const intentStateUpdating = ref(false);
+const intentStateError = ref(null);
+const counterfactualSnapshotUpdating = ref(false);
+const counterfactualSnapshotError = ref(null);
+const playbookIntentInput = ref('');
+const playbookNumRollouts = ref(24);
+const playbookMaxSteps = ref(8);
+const playbookRunToEnd = ref(false);
+const playbookUseSnapshot = ref(true);
+const playbookPlayerDeterministic = ref(false);
+const playbookOpponentDeterministic = ref(true);
+const playbookRunning = ref(false);
+const playbookError = ref(null);
+const playbookResult = ref(null);
+const playbookProgress = ref({
+  running: false,
+  completed: 0,
+  total: 0,
+  fraction: 0,
+  status: 'idle',
+  error: null,
+});
+let playbookProgressPollHandle = null;
+let playbookProgressPollBusy = false;
 const pressureParamsInput = ref({
   three_pt_extra_hex_decay: 0.05,
   shot_pressure_enabled: true,
@@ -411,6 +603,59 @@ const PASS_TARGET_STRATEGIES = [
   { value: 'nearest', label: 'Nearest (legacy)' },
   { value: 'best_ev', label: 'Best EV' },
 ];
+const intentIndexMax = computed(() =>
+  Math.max(0, Number(props.gameState?.num_intents || 1) - 1)
+);
+const currentPlayOptions = computed(() => {
+  const count = Math.max(0, Number(props.gameState?.num_intents || 0));
+  return Array.from({ length: count }, (_, idx) => ({
+    value: idx,
+    label: formatPlayLabel(idx, props.gameState?.play_name_map),
+  }));
+});
+const intentAgeMax = computed(() =>
+  Math.max(0, Number(props.gameState?.intent_commitment_steps || 0))
+);
+const intentControlsDisabled = computed(() =>
+  intentStateUpdating.value ||
+  !props.gameState ||
+  !props.gameState.enable_intent_learning ||
+  props.gameState.done ||
+  props.isEvaluating ||
+  props.isReplaying ||
+  props.isManualStepping
+);
+const counterfactualSnapshotAvailable = computed(() =>
+  Boolean(props.gameState?.counterfactual_snapshot_available)
+);
+const counterfactualSnapshotStep = computed(() =>
+  props.gameState?.counterfactual_snapshot_step ?? null
+);
+const counterfactualSnapshotShotClock = computed(() =>
+  props.gameState?.counterfactual_snapshot_shot_clock ?? null
+);
+const counterfactualSnapshotBallHolder = computed(() =>
+  props.gameState?.counterfactual_snapshot_ball_holder ?? null
+);
+const counterfactualSnapshotIntentSummary = computed(() => {
+  if (!counterfactualSnapshotAvailable.value) return 'None';
+  const active = Boolean(props.gameState?.counterfactual_snapshot_intent_active);
+  if (!active) return 'Inactive';
+  const idx = props.gameState?.counterfactual_snapshot_intent_index ?? 0;
+  const age = props.gameState?.counterfactual_snapshot_intent_age ?? 0;
+  return `${formatPlayLabel(idx, props.gameState?.play_name_map)}, age=${age}`;
+});
+const counterfactualSnapshotControlsDisabled = computed(() =>
+  counterfactualSnapshotUpdating.value ||
+  !props.gameState ||
+  props.isEvaluating ||
+  props.isReplaying
+);
+const playbookControlsDisabled = computed(() =>
+  playbookRunning.value ||
+  !props.gameState ||
+  props.isEvaluating
+);
 
 const passTargetStrategyValue = computed(() => {
   const val = props.gameState?.pass_target_strategy || 'nearest';
@@ -457,6 +702,30 @@ watch(() => props.gameState?.pass_logit_bias, (val) => {
     passLogitBiasInput.value = Number.isFinite(num) ? num : 0;
   }
 }, { immediate: true });
+
+watch(
+  () => [
+    props.gameState?.intent_active_current,
+    props.gameState?.intent_index_current,
+    props.gameState?.intent_age,
+    props.gameState?.num_intents,
+    props.gameState?.intent_commitment_steps,
+  ],
+  () => {
+    intentStateInput.value = {
+      active: Boolean(props.gameState?.intent_active_current),
+      intent_index: Math.max(
+        0,
+        Math.min(intentIndexMax.value, Number(props.gameState?.intent_index_current ?? 0) || 0),
+      ),
+      intent_age: Math.max(
+        0,
+        Math.min(intentAgeMax.value, Number(props.gameState?.intent_age ?? 0) || 0),
+      ),
+    };
+  },
+  { immediate: true }
+);
 
 function syncPressureParamsInputs(state) {
   const src = state || {};
@@ -551,7 +820,367 @@ const defaultEvalConfig = () => ({
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
+  intentSelectionMode: 'learned_sample',
 });
+const defaultTemplateConfig = () => ({
+  positions: [],
+  ballHolder: null,
+  templateId: 'new_template',
+  weight: 1.0,
+  mirrorable: true,
+  shotClock: 24,
+  jitterByPlayer: {},
+  roleByPlayer: {},
+});
+const playersPerSideForTemplates = computed(() => {
+  const raw = Number(props.gameState?.players_per_side ?? props.gameState?.players ?? 3);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 3;
+});
+
+function buildDefaultTemplateLibrary() {
+  return {
+    version: 1,
+    players_per_side: playersPerSideForTemplates.value,
+    templates: [],
+  };
+}
+
+function normalizeTemplateLibraryDraft(library) {
+  const source = library && typeof library === 'object' ? library : {};
+  const rawTemplates = Array.isArray(source.templates) ? source.templates : [];
+  return {
+    version: 1,
+    players_per_side: playersPerSideForTemplates.value,
+    templates: rawTemplates.map((template) => deepCloneJson(template, {})).filter(Boolean),
+  };
+}
+
+function buildTemplateLibrarySignature(library, source = '', path = '') {
+  return JSON.stringify({
+    library: normalizeTemplateLibraryDraft(library),
+    source: String(source || ''),
+    path: String(path || ''),
+  });
+}
+
+const templateLibraryDraft = ref(buildDefaultTemplateLibrary());
+const templateLibraryPathInput = ref('');
+const templateLibraryFileInput = ref(null);
+const templateLibraryImportedFilename = ref('');
+const templateLibraryStatus = ref('');
+const templateLibraryError = ref('');
+const templateLibraryDirty = ref(false);
+const templateLibraryRequestPending = ref(false);
+const selectedEditableTemplateId = ref('');
+let lastLoadedTemplateLibrarySignature = '';
+const templateLibrarySource = computed(() => String(props.gameState?.start_template_library_source || '').trim());
+const templateLibrarySessionPath = computed(() => String(props.gameState?.start_template_library_path || '').trim());
+const templateLibrarySessionSignature = computed(() =>
+  buildTemplateLibrarySignature(
+    props.gameState?.start_template_library || null,
+    templateLibrarySource.value,
+    templateLibrarySessionPath.value,
+  )
+);
+
+function clearTemplateLibraryFeedback() {
+  templateLibraryStatus.value = '';
+  templateLibraryError.value = '';
+}
+
+function uniqueTemplateId(baseId, excludeId = null) {
+  const seed = sanitizeTemplateId(baseId || 'new_template');
+  const existing = new Set(
+    (templateLibraryDraft.value?.templates || [])
+      .map((template) => String(template?.id || '').trim())
+      .filter((id) => id && id !== String(excludeId || '').trim())
+  );
+  if (!existing.has(seed)) return seed;
+  let idx = 2;
+  while (existing.has(`${seed}_${idx}`)) {
+    idx += 1;
+  }
+  return `${seed}_${idx}`;
+}
+
+const editableTemplateOptions = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      return id ? { value: id, label: id } : null;
+    })
+    .filter(Boolean);
+});
+
+const selectedEditableTemplateIndex = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  const wantedId = String(selectedEditableTemplateId.value || '').trim();
+  return templates.findIndex((template) => String(template?.id || '').trim() === wantedId);
+});
+
+const selectedEditableTemplate = computed(() => {
+  const idx = selectedEditableTemplateIndex.value;
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return idx >= 0 ? templates[idx] || null : null;
+});
+
+const hasEditableTemplateLibrary = computed(() => editableTemplateOptions.value.length > 0);
+const templateLibraryJsonExport = computed(() => JSON.stringify(templateLibraryDraft.value, null, 2));
+const templateLibrarySourceLabel = computed(() => {
+  if (templateLibrarySource.value === 'local_file') return 'Local file';
+  if (templateLibrarySource.value === 'file_upload') return 'Imported file';
+  if (templateLibrarySource.value === 'mlflow_artifact') return 'Run artifact';
+  if (templateLibrarySource.value === 'session_editor') return 'Session draft';
+  return 'Unsaved draft';
+});
+
+const suppressTemplateConfigBackfill = ref(false);
+
+function syncTemplateLibraryDraftFromState() {
+  const incomingLibrary = props.gameState?.start_template_library;
+  const normalized = normalizeTemplateLibraryDraft(
+    incomingLibrary && typeof incomingLibrary === 'object'
+      ? incomingLibrary
+      : buildDefaultTemplateLibrary()
+  );
+  templateLibraryDraft.value = normalized;
+  if (templateLibrarySource.value === 'file_upload') {
+    templateLibraryImportedFilename.value = templateLibrarySessionPath.value || '';
+  } else {
+    templateLibraryImportedFilename.value = '';
+  }
+  if (templateLibrarySessionPath.value && templateLibrarySource.value !== 'file_upload') {
+    templateLibraryPathInput.value = templateLibrarySessionPath.value;
+  } else if (!templateLibraryPathInput.value) {
+    templateLibraryPathInput.value = 'configs/start_templates_v1.json';
+  }
+  const validIds = new Set(
+    (normalized.templates || [])
+      .map((template) => String(template?.id || '').trim())
+      .filter(Boolean)
+  );
+  if (!validIds.has(selectedEditableTemplateId.value)) {
+    selectedEditableTemplateId.value = normalized.templates?.[0]?.id || '';
+  }
+  templateLibraryDirty.value = false;
+  clearTemplateLibraryFeedback();
+  lastLoadedTemplateLibrarySignature = templateLibrarySessionSignature.value;
+}
+
+watch(
+  templateLibrarySessionSignature,
+  (nextSignature) => {
+    if (!nextSignature || nextSignature === lastLoadedTemplateLibrarySignature) return;
+    syncTemplateLibraryDraftFromState();
+  },
+  { immediate: true }
+);
+
+const startTemplateOptions = computed(() => {
+  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+    ? props.gameState.start_template_library.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      return id ? { value: id, label: id } : null;
+    })
+    .filter(Boolean);
+});
+const hasLoadedStartTemplates = computed(() => startTemplateOptions.value.length > 0);
+const selectedStartTemplateDefinition = computed(() => {
+  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+    ? props.gameState.start_template_library.templates
+    : [];
+  const wantedId = String(selectedStartTemplateId.value || '').trim();
+  return templates.find((template) => String(template?.id || '').trim() === wantedId) || null;
+});
+const selectedStartTemplateId = ref('');
+const selectedStartTemplateMirrored = ref(false);
+const startTemplateActionStatus = ref('');
+const startTemplateActionError = ref('');
+
+watch(
+  startTemplateOptions,
+  (options) => {
+    const values = new Set(options.map((opt) => opt.value));
+    if (!values.has(selectedStartTemplateId.value)) {
+      selectedStartTemplateId.value = options[0]?.value || '';
+    }
+  },
+  { immediate: true }
+);
+
+function clearStartTemplateFeedback() {
+  startTemplateActionStatus.value = '';
+  startTemplateActionError.value = '';
+}
+
+function stableStartTemplateSeed(templateId) {
+  const text = String(templateId || '');
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0);
+}
+
+function previewOffsetToAxial(col, row) {
+  const safeCol = Number(col) || 0;
+  const safeRow = Number(row) || 0;
+  return {
+    q: safeCol - ((safeRow - (safeRow & 1)) >> 1),
+    r: safeRow,
+  };
+}
+
+function previewAxialToOffset(q, r) {
+  const safeQ = Number(q) || 0;
+  const safeR = Number(r) || 0;
+  return {
+    col: safeQ + ((safeR - (safeR & 1)) >> 1),
+    row: safeR,
+  };
+}
+
+function previewMirrorAnchor(anchor, courtHeight) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  const { col, row } = previewAxialToOffset(q, r);
+  const mirroredRow = Math.max(0, Number(courtHeight || 0) - 1 - row);
+  const mirrored = previewOffsetToAxial(col, mirroredRow);
+  return [mirrored.q, mirrored.r];
+}
+
+function clampTemplateAnchorToCourt(anchor, courtWidth, courtHeight) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  const width = Math.max(1, Math.round(Number(courtWidth) || 0));
+  const height = Math.max(1, Math.round(Number(courtHeight) || 0));
+  const { col, row } = previewAxialToOffset(q, r);
+  const clampedCol = Math.max(0, Math.min(width - 1, Math.round(Number(col) || 0)));
+  const clampedRow = Math.max(0, Math.min(height - 1, Math.round(Number(row) || 0)));
+  const clamped = previewOffsetToAxial(clampedCol, clampedRow);
+  return [clamped.q, clamped.r];
+}
+
+function previewAxialToCartesian(anchor) {
+  const [q, r] = Array.isArray(anchor) ? anchor : [0, 0];
+  return {
+    x: Math.sqrt(3) * (Number(q) + Number(r) / 2),
+    y: 1.5 * Number(r),
+  };
+}
+
+const startTemplatePreviewModel = computed(() => {
+  const template = selectedStartTemplateDefinition.value;
+  const courtWidth = Number(props.gameState?.court_width || 0);
+  const courtHeight = Number(props.gameState?.court_height || 0);
+  if (!template || courtWidth <= 0 || courtHeight <= 0) return null;
+
+  const boardPoints = [];
+  for (let row = 0; row < courtHeight; row += 1) {
+    for (let col = 0; col < courtWidth; col += 1) {
+      const axial = previewOffsetToAxial(col, row);
+      boardPoints.push(previewAxialToCartesian([axial.q, axial.r]));
+    }
+  }
+  if (!boardPoints.length) return null;
+
+  const xs = boardPoints.map((point) => point.x);
+  const ys = boardPoints.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  const viewBox = { width: 360, height: 240 };
+  const frame = { x: 18, y: 14, width: 324, height: 212 };
+  const rangeX = Math.max(1e-6, maxX - minX);
+  const rangeY = Math.max(1e-6, maxY - minY);
+  const scale = Math.min(frame.width / rangeX, frame.height / rangeY);
+  const usedWidth = rangeX * scale;
+  const usedHeight = rangeY * scale;
+  const originX = frame.x + (frame.width - usedWidth) / 2 - minX * scale;
+  const originY = frame.y + (frame.height - usedHeight) / 2 - minY * scale;
+
+  const mirrored = Boolean(selectedStartTemplateMirrored.value && template?.mirrorable);
+  const entries = [];
+  for (const teamName of ['offense', 'defense']) {
+    const teamEntries = Array.isArray(template?.[teamName]) ? template[teamName] : [];
+    teamEntries.forEach((entry, idx) => {
+      const anchor = clampTemplateAnchorToCourt(
+        Array.isArray(entry?.anchor) ? [...entry.anchor] : [0, 0],
+        courtWidth,
+        courtHeight,
+      );
+      const effectiveAnchor = mirrored
+        ? previewMirrorAnchor(anchor, courtHeight)
+        : anchor;
+      const cart = previewAxialToCartesian(effectiveAnchor);
+      entries.push({
+        team: teamName,
+        marker: teamName === 'offense'
+          ? (entry?.has_ball ? 'O.' : 'O')
+          : 'X',
+        x: originX + cart.x * scale,
+        y: originY + cart.y * scale,
+        role: String(entry?.role || ''),
+        key: `${teamName}-${idx}`,
+      });
+    });
+  }
+
+  const court = {
+    ...frame,
+    backboardX: frame.x + 16,
+    hoopX: frame.x + 24,
+    hoopY: frame.y + frame.height / 2,
+    hoopRadius: 4,
+    laneX: frame.x,
+    laneY: frame.y + frame.height * 0.28,
+    laneWidth: frame.width * 0.21,
+    laneHeight: frame.height * 0.44,
+    arcLineX: frame.x + frame.width * 0.29,
+    arcTopY: frame.y + frame.height * 0.16,
+    arcBottomY: frame.y + frame.height * 0.84,
+    arcRadius: frame.height * 0.39,
+  };
+
+  return {
+    templateId: String(template?.id || ''),
+    mirrored,
+    viewBox,
+    court,
+    entries,
+  };
+});
+
+async function handleApplyStartTemplateToBoard() {
+  clearStartTemplateFeedback();
+  if (!selectedStartTemplateId.value) return;
+  try {
+    const res = await applyStartTemplate(
+      selectedStartTemplateId.value,
+      selectedStartTemplateMirrored.value,
+      true,
+      stableStartTemplateSeed(selectedStartTemplateId.value),
+    );
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    startTemplateActionStatus.value = `Loaded ${selectedStartTemplateId.value} onto the current board.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to apply start template to board', err);
+    startTemplateActionError.value = err?.message || 'Failed to load template onto board.';
+  }
+}
 
 const evalConfigSafe = computed(() => {
   const base = defaultEvalConfig();
@@ -562,20 +1191,752 @@ const evalConfigSafe = computed(() => {
     skills: { ...base.skills, ...(incoming.skills || {}) },
   };
 });
+const templateConfigSafe = computed(() => {
+  const base = defaultTemplateConfig();
+  const incoming = props.templateConfig || {};
+  return {
+    ...base,
+    ...incoming,
+    jitterByPlayer: { ...base.jitterByPlayer, ...(incoming.jitterByPlayer || {}) },
+    roleByPlayer: { ...base.roleByPlayer, ...(incoming.roleByPlayer || {}) },
+  };
+});
 
 const evalPlacementEditing = computed(() => evalConfigSafe.value.placementEditing && evalConfigSafe.value.mode === 'custom');
 const evalModeIsCustom = computed(() => evalConfigSafe.value.mode === 'custom');
 const evalOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const templateOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const templateDefenseIds = computed(() => props.gameState?.defense_ids || []);
 const ballStartOptions = computed(() => {
   const ids = evalOffenseIds.value || [];
   return Array.isArray(ids) ? [...ids] : [];
 });
+const templateBallStartOptions = computed(() => {
+  const ids = templateOffenseIds.value || [];
+  return Array.isArray(ids) ? [...ids] : [];
+});
+const templateCopyStatus = ref('');
+
+function sanitizeTemplateId(raw) {
+  const text = String(raw ?? '').trim().toLowerCase();
+  if (!text) return 'new_template';
+  const cleaned = text.replace(/[^a-z0-9_ -]/g, '').replace(/\s+/g, '_').replace(/-+/g, '_');
+  return cleaned || 'new_template';
+}
+
+function emitTemplateConfigUpdate(patch = {}) {
+  const base = templateConfigSafe.value;
+  const next = {
+    ...base,
+    ...(patch || {}),
+    jitterByPlayer: {
+      ...base.jitterByPlayer,
+      ...(patch.jitterByPlayer || {}),
+    },
+    roleByPlayer: {
+      ...base.roleByPlayer,
+      ...(patch.roleByPlayer || {}),
+    },
+  };
+  emit('template-config-changed', next);
+}
+
+function seedTemplateConfigFromGameState() {
+  if (!props.gameState) return;
+  const positions = (props.gameState.positions || []).map((pos) => [pos[0], pos[1]]);
+  const jitterByPlayer = {};
+  const roleByPlayer = {};
+  const offenseIds = Array.isArray(props.gameState.offense_ids) ? props.gameState.offense_ids : [];
+  const defenseIds = Array.isArray(props.gameState.defense_ids) ? props.gameState.defense_ids : [];
+  const ballHolder = props.gameState.ball_holder ?? templateConfigSafe.value.ballHolder ?? null;
+
+  offenseIds.forEach((pid) => {
+    jitterByPlayer[pid] = Number(
+      templateConfigSafe.value.jitterByPlayer?.[pid]
+      ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+      ?? (Number(pid) === Number(ballHolder) ? 0 : 1)
+    );
+    roleByPlayer[pid] = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? (Number(pid) === Number(ballHolder) ? 'ball_handler' : '')
+    );
+  });
+  defenseIds.forEach((pid) => {
+    jitterByPlayer[pid] = Number(
+      templateConfigSafe.value.jitterByPlayer?.[pid]
+      ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+      ?? 1
+    );
+    roleByPlayer[pid] = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    );
+  });
+
+  emitTemplateConfigUpdate({
+    positions,
+    ballHolder,
+    shotClock: Number(props.gameState.shot_clock ?? templateConfigSafe.value.shotClock ?? 24),
+    jitterByPlayer,
+    roleByPlayer,
+  });
+}
+
+function setTemplateBallHolder(val) {
+  const num = val === null || val === '' ? null : Number(val);
+  if (num !== null && !templateBallStartOptions.value.includes(num)) return;
+  const nextRoles = {};
+  for (const pid of templateBallStartOptions.value) {
+    const currentRole = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    );
+    nextRoles[pid] = Number(pid) === Number(num)
+      ? 'ball_handler'
+      : (currentRole === 'ball_handler' ? '' : currentRole);
+  }
+  emitTemplateConfigUpdate({
+    ballHolder: num,
+    roleByPlayer: nextRoles,
+  });
+}
+
+function updateTemplatePlayerJitter(playerId, value) {
+  const num = Math.max(0, Number(value) || 0);
+  emitTemplateConfigUpdate({
+    jitterByPlayer: {
+      [playerId]: num,
+    },
+  });
+}
+
+function updateTemplatePlayerRole(playerId, value) {
+  emitTemplateConfigUpdate({
+    roleByPlayer: {
+      [playerId]: String(value ?? ''),
+    },
+  });
+}
+
+function updateTemplatePlayerAnchor(playerId, axisIndex, value) {
+  const positions = Array.isArray(templateConfigSafe.value.positions)
+    ? [...templateConfigSafe.value.positions]
+    : [];
+  const current = Array.isArray(positions[playerId]) ? [...positions[playerId]] : [0, 0];
+  current[axisIndex] = Math.round(Number(value) || 0);
+  positions[playerId] = clampTemplateAnchorToCourt(
+    current,
+    props.gameState?.court_width,
+    props.gameState?.court_height,
+  );
+  emitTemplateConfigUpdate({ positions });
+}
+
+function setTemplateId(value) {
+  emitTemplateConfigUpdate({ templateId: sanitizeTemplateId(value) });
+}
+
+const templatePlayerRows = computed(() => {
+  const positions = Array.isArray(templateConfigSafe.value.positions) ? templateConfigSafe.value.positions : [];
+  const rows = [];
+  const buildRows = (ids, teamLabel) => {
+    (ids || []).forEach((pid, entryIndex) => {
+      const pos = Array.isArray(positions[pid]) ? positions[pid] : [null, null];
+      rows.push({
+        playerId: pid,
+        teamLabel,
+        entryIndex,
+        q: pos[0],
+        r: pos[1],
+        jitter: Number(
+          templateConfigSafe.value.jitterByPlayer?.[pid]
+          ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+          ?? (teamLabel === 'Offense' && Number(pid) === Number(templateConfigSafe.value.ballHolder) ? 0 : 1)
+        ),
+        role: String(
+          templateConfigSafe.value.roleByPlayer?.[pid]
+          ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+          ?? ''
+        ),
+      });
+    });
+  };
+  buildRows(templateOffenseIds.value, 'Offense');
+  buildRows(templateDefenseIds.value, 'Defense');
+  return rows;
+});
+
+function buildTemplateExportEntries(playerIds) {
+  const positions = Array.isArray(templateConfigSafe.value.positions) ? templateConfigSafe.value.positions : [];
+  return (playerIds || []).map((pid) => {
+    const pos = clampTemplateAnchorToCourt(
+      Array.isArray(positions[pid]) ? positions[pid] : [0, 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
+    const entry = {
+      anchor: [Number(pos[0]) || 0, Number(pos[1]) || 0],
+      jitter_radius: Math.max(
+        0,
+        Number(
+          templateConfigSafe.value.jitterByPlayer?.[pid]
+          ?? templateConfigSafe.value.jitterByPlayer?.[String(pid)]
+          ?? (Number(pid) === Number(templateConfigSafe.value.ballHolder) ? 0 : 1)
+        ) || 0
+      ),
+    };
+    const role = String(
+      templateConfigSafe.value.roleByPlayer?.[pid]
+      ?? templateConfigSafe.value.roleByPlayer?.[String(pid)]
+      ?? ''
+    ).trim();
+    if (role) entry.role = role;
+    if (Number(pid) === Number(templateConfigSafe.value.ballHolder)) {
+      entry.has_ball = true;
+    }
+    return entry;
+  });
+}
+
+const templateExportObject = computed(() => {
+  const offenseIds = templateOffenseIds.value || [];
+  const defenseIds = templateDefenseIds.value || [];
+  const obj = {
+    id: sanitizeTemplateId(templateConfigSafe.value.templateId),
+    weight: Number(templateConfigSafe.value.weight ?? 1.0) || 1.0,
+    mirrorable: Boolean(templateConfigSafe.value.mirrorable),
+    shot_clock: Math.max(1, Number(templateConfigSafe.value.shotClock ?? 24) || 24),
+    offense: buildTemplateExportEntries(offenseIds),
+    defense: buildTemplateExportEntries(defenseIds),
+  };
+  return obj;
+});
+
+function loadTemplateIntoAuthoringConfig(template) {
+  if (!template) return;
+  const positions = deepCloneJson(props.gameState?.positions, []);
+  const offenseIds = templateOffenseIds.value || [];
+  const defenseIds = templateDefenseIds.value || [];
+  const jitterByPlayer = {};
+  const roleByPlayer = {};
+  let ballHolder = null;
+
+  template.offense?.forEach((entry, idx) => {
+    const pid = offenseIds[idx];
+    if (pid === undefined) return;
+    positions[pid] = clampTemplateAnchorToCourt(
+      [Number(entry?.anchor?.[0]) || 0, Number(entry?.anchor?.[1]) || 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
+    jitterByPlayer[pid] = Math.max(0, Number(entry?.jitter_radius ?? 0) || 0);
+    roleByPlayer[pid] = String(entry?.role || '');
+    if (entry?.has_ball) {
+      ballHolder = Number(pid);
+    }
+  });
+  template.defense?.forEach((entry, idx) => {
+    const pid = defenseIds[idx];
+    if (pid === undefined) return;
+    positions[pid] = clampTemplateAnchorToCourt(
+      [Number(entry?.anchor?.[0]) || 0, Number(entry?.anchor?.[1]) || 0],
+      props.gameState?.court_width,
+      props.gameState?.court_height,
+    );
+    jitterByPlayer[pid] = Math.max(0, Number(entry?.jitter_radius ?? 0) || 0);
+    roleByPlayer[pid] = String(entry?.role || '');
+  });
+
+  suppressTemplateConfigBackfill.value = true;
+  emitTemplateConfigUpdate({
+    positions,
+    ballHolder,
+    templateId: String(template?.id || 'new_template'),
+    weight: Number(template?.weight ?? 1.0) || 1.0,
+    mirrorable: Boolean(template?.mirrorable),
+    shotClock: Math.max(1, Number(template?.shot_clock ?? 24) || 24),
+    jitterByPlayer,
+    roleByPlayer,
+  });
+  nextTick(() => {
+    suppressTemplateConfigBackfill.value = false;
+  });
+}
+
+function replaceSelectedDraftTemplate(nextTemplate, { markDirty = true } = {}) {
+  if (!nextTemplate || selectedEditableTemplateIndex.value < 0) return;
+  const normalized = deepCloneJson(nextTemplate, {});
+  if (!normalized || typeof normalized !== 'object') return;
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates]
+    : [];
+  nextTemplates.splice(selectedEditableTemplateIndex.value, 1, normalized);
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  const nextId = String(normalized.id || '').trim();
+  if (nextId) {
+    selectedEditableTemplateId.value = nextId;
+  }
+  if (markDirty) {
+    templateLibraryDirty.value = true;
+  }
+}
+
+watch(
+  selectedEditableTemplateId,
+  () => {
+    if (!selectedEditableTemplate.value) return;
+    loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+  }
+);
+
+watch(
+  templateExportObject,
+  (nextTemplate) => {
+    if (suppressTemplateConfigBackfill.value) return;
+    if (selectedEditableTemplateIndex.value < 0) return;
+    const selectedId = String(selectedEditableTemplateId.value || '').trim();
+    const authoringId = String(sanitizeTemplateId(templateConfigSafe.value.templateId) || '').trim();
+    if (selectedId && authoringId && selectedId !== authoringId) return;
+    replaceSelectedDraftTemplate(nextTemplate, { markDirty: true });
+  },
+  { deep: true }
+);
+
+function yamlScalar(value) {
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return JSON.stringify(String(value ?? ''));
+}
+
+function formatTemplateYaml(obj) {
+  const lines = [];
+  lines.push(`id: ${yamlScalar(obj.id)}`);
+  lines.push(`weight: ${obj.weight}`);
+  lines.push(`mirrorable: ${obj.mirrorable ? 'true' : 'false'}`);
+  lines.push(`shot_clock: ${obj.shot_clock}`);
+  for (const teamName of ['offense', 'defense']) {
+    lines.push(`${teamName}:`);
+    for (const entry of obj[teamName]) {
+      lines.push('  -');
+      lines.push(`    anchor: [${entry.anchor[0]}, ${entry.anchor[1]}]`);
+      lines.push(`    jitter_radius: ${entry.jitter_radius}`);
+      if (entry.role) {
+        lines.push(`    role: ${yamlScalar(entry.role)}`);
+      }
+      if (entry.has_ball) {
+        lines.push('    has_ball: true');
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+function formatTemplateLibraryYaml(library) {
+  const normalized = normalizeTemplateLibraryDraft(library);
+  const lines = [];
+  lines.push(`version: ${Number(normalized.version || 1)}`);
+  lines.push(`players_per_side: ${Number(normalized.players_per_side || playersPerSideForTemplates.value)}`);
+  lines.push('templates:');
+  for (const template of normalized.templates || []) {
+    const block = formatTemplateYaml(template).split('\n');
+    lines.push('  -');
+    block.forEach((line, idx) => {
+      if (idx === 0) {
+        lines.push(`    ${line}`);
+      } else {
+        lines.push(`    ${line}`);
+      }
+    });
+  }
+  return lines.join('\n');
+}
+
+function getTemplateLibrarySerializedPayload(filenameHint = '') {
+  const filename = String(filenameHint || '').trim().toLowerCase();
+  const library = normalizeTemplateLibraryDraft(templateLibraryDraft.value);
+  const useYaml = filename.endsWith('.yaml') || filename.endsWith('.yml');
+  return {
+    contents: useYaml
+      ? formatTemplateLibraryYaml(library)
+      : JSON.stringify(library, null, 2),
+    mimeType: useYaml ? 'text/yaml;charset=utf-8' : 'application/json;charset=utf-8',
+    extension: useYaml ? (filename.endsWith('.yml') ? '.yml' : '.yaml') : '.json',
+  };
+}
+
+const templateJsonExport = computed(() => JSON.stringify(templateExportObject.value, null, 2));
+const templateYamlExport = computed(() => formatTemplateYaml(templateExportObject.value));
+
+async function copyTemplateExport(format) {
+  const text = format === 'json' ? templateJsonExport.value : templateYamlExport.value;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error('Clipboard API unavailable');
+    }
+    templateCopyStatus.value = `${String(format).toUpperCase()} copied`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to copy template export', err);
+    templateCopyStatus.value = 'Copy failed';
+  }
+  window.setTimeout(() => {
+    if (templateCopyStatus.value === `${String(format).toUpperCase()} copied` || templateCopyStatus.value === 'Copy failed') {
+      templateCopyStatus.value = '';
+    }
+  }, 2000);
+}
+
+async function copyTemplateLibraryJson() {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(templateLibraryJsonExport.value);
+    } else {
+      throw new Error('Clipboard API unavailable');
+    }
+    templateCopyStatus.value = 'LIB copied';
+  } catch (err) {
+    console.error('[PlayerControls] Failed to copy template library export', err);
+    templateCopyStatus.value = 'Copy failed';
+  }
+  window.setTimeout(() => {
+    if (templateCopyStatus.value === 'LIB copied' || templateCopyStatus.value === 'Copy failed') {
+      templateCopyStatus.value = '';
+    }
+  }, 2000);
+}
+
+function addTemplateFromCurrentBoard() {
+  const nextTemplate = deepCloneJson(templateExportObject.value, {});
+  nextTemplate.id = uniqueTemplateId(nextTemplate.id || 'new_template');
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates, nextTemplate]
+    : [nextTemplate];
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = nextTemplate.id;
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Added ${nextTemplate.id} from current board.`;
+}
+
+function duplicateSelectedTemplate() {
+  const current = selectedEditableTemplate.value;
+  if (!current) return;
+  const copyTemplate = deepCloneJson(current, {});
+  copyTemplate.id = uniqueTemplateId(`${current.id}_copy`);
+  const nextTemplates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? [...templateLibraryDraft.value.templates, copyTemplate]
+    : [copyTemplate];
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = copyTemplate.id;
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Duplicated ${current.id} to ${copyTemplate.id}.`;
+}
+
+function deleteSelectedTemplate() {
+  const current = selectedEditableTemplate.value;
+  if (!current) return;
+  const nextTemplates = (templateLibraryDraft.value?.templates || []).filter(
+    (template) => String(template?.id || '').trim() !== String(current.id || '').trim()
+  );
+  templateLibraryDraft.value = {
+    ...normalizeTemplateLibraryDraft(templateLibraryDraft.value),
+    templates: nextTemplates,
+  };
+  selectedEditableTemplateId.value = nextTemplates[0]?.id || '';
+  templateLibraryDirty.value = true;
+  clearTemplateLibraryFeedback();
+  templateLibraryStatus.value = `Deleted ${current.id}.`;
+  if (selectedEditableTemplateId.value) {
+    nextTick(() => {
+      if (selectedEditableTemplate.value) {
+        loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+      }
+    });
+  }
+}
+
+async function handleLoadTemplateLibraryFile() {
+  clearTemplateLibraryFeedback();
+  const path = String(templateLibraryPathInput.value || '').trim();
+  if (!path) {
+    templateLibraryError.value = 'Provide a YAML or JSON template library path.';
+    return;
+  }
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await loadStartTemplateLibrary(path);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || buildDefaultTemplateLibrary());
+    templateLibraryPathInput.value = String(res?.path || path);
+    selectedEditableTemplateId.value = templateLibraryDraft.value.templates?.[0]?.id || '';
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      'local_file',
+      templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = `Loaded ${templateLibraryDraft.value.templates.length} templates from ${templateLibraryPathInput.value}.`;
+    if (selectedEditableTemplate.value) {
+      loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to load template library', err);
+    templateLibraryError.value = err?.message || 'Failed to load template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+function triggerTemplateLibraryChooser() {
+  clearTemplateLibraryFeedback();
+  templateLibraryFileInput.value?.click?.();
+}
+
+async function handleTemplateLibraryFileChosen(event) {
+  clearTemplateLibraryFeedback();
+  const file = event?.target?.files?.[0] || null;
+  if (!file) return;
+  templateLibraryRequestPending.value = true;
+  try {
+    const contents = await file.text();
+    const res = await importStartTemplateLibrary(file.name, contents);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || buildDefaultTemplateLibrary());
+    templateLibraryImportedFilename.value = String(res?.path || file.name || '');
+    selectedEditableTemplateId.value = templateLibraryDraft.value.templates?.[0]?.id || '';
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'file_upload',
+      templateLibraryImportedFilename.value,
+    );
+    templateLibraryStatus.value = `Imported ${templateLibraryDraft.value.templates.length} templates from ${file.name}.`;
+    if (selectedEditableTemplate.value) {
+      loadTemplateIntoAuthoringConfig(selectedEditableTemplate.value);
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to import template library file', err);
+    templateLibraryError.value = err?.message || 'Failed to import template library.';
+  } finally {
+    if (event?.target) {
+      event.target.value = '';
+    }
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+async function handlePushTemplateLibraryDraft() {
+  clearTemplateLibraryFeedback();
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await setStartTemplateLibrary(
+      templateLibraryDraft.value,
+      'session_editor',
+      templateLibraryPathInput.value || null,
+    );
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || templateLibraryDraft.value);
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'session_editor',
+      res?.path || templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = 'Draft pushed into the active session library.';
+  } catch (err) {
+    console.error('[PlayerControls] Failed to push template library draft', err);
+    templateLibraryError.value = err?.message || 'Failed to update session template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+async function handleSaveTemplateLibraryFile() {
+  clearTemplateLibraryFeedback();
+  const path = String(templateLibraryPathInput.value || '').trim();
+  if (!path) {
+    templateLibraryError.value = 'Provide a file path before saving.';
+    return;
+  }
+  templateLibraryRequestPending.value = true;
+  try {
+    const res = await saveStartTemplateLibrary(path, templateLibraryDraft.value);
+    if (res?.state) {
+      emit('state-updated', res.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(res?.library || templateLibraryDraft.value);
+    templateLibraryPathInput.value = String(res?.path || path);
+    templateLibraryDirty.value = false;
+    lastLoadedTemplateLibrarySignature = buildTemplateLibrarySignature(
+      templateLibraryDraft.value,
+      res?.source || 'local_file',
+      templateLibraryPathInput.value,
+    );
+    templateLibraryStatus.value = `Saved template library to ${templateLibraryPathInput.value}.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to save template library', err);
+    templateLibraryError.value = err?.message || 'Failed to save template library.';
+  } finally {
+    templateLibraryRequestPending.value = false;
+  }
+}
+
+function handleReloadTemplateLibraryDraft() {
+  syncTemplateLibraryDraftFromState();
+  templateLibraryStatus.value = 'Reloaded the current session template library.';
+}
+
+function downloadTemplateLibraryFile(downloadName = '') {
+  clearTemplateLibraryFeedback();
+  try {
+    const filename = String(
+      downloadName
+      || templateLibraryPathInput.value
+      || templateLibraryImportedFilename.value
+      || ''
+    ).trim() || 'start_templates_library.json';
+    const suggestedName = /\.(ya?ml|json)$/i.test(filename)
+      ? filename.split('/').pop()
+      : `${filename}.json`;
+    const payload = getTemplateLibrarySerializedPayload(suggestedName);
+    const blob = new Blob([payload.contents], { type: payload.mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = suggestedName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    templateLibraryStatus.value = `Downloaded ${suggestedName}.`;
+  } catch (err) {
+    console.error('[PlayerControls] Failed to download template library', err);
+    templateLibraryError.value = 'Failed to download template library.';
+  }
+}
+
+async function handleSaveTemplateLibraryChooser() {
+  clearTemplateLibraryFeedback();
+  try {
+    const validated = await setStartTemplateLibrary(
+      templateLibraryDraft.value,
+      'session_editor',
+      templateLibraryPathInput.value || null,
+    );
+    if (validated?.state) {
+      emit('state-updated', validated.state);
+    }
+    templateLibraryDraft.value = normalizeTemplateLibraryDraft(validated?.library || templateLibraryDraft.value);
+    templateLibraryDirty.value = false;
+
+    const preferredName = String(
+      templateLibraryImportedFilename.value
+      || templateLibraryPathInput.value
+      || 'start_templates_library.json'
+    ).trim().split('/').pop() || 'start_templates_library.json';
+
+    if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+      const picker = await window.showSaveFilePicker({
+        suggestedName: preferredName,
+        types: [
+          {
+            description: 'Template libraries',
+            accept: {
+              'application/json': ['.json'],
+              'text/yaml': ['.yaml', '.yml'],
+            },
+          },
+        ],
+      });
+      const payload = getTemplateLibrarySerializedPayload(picker?.name || preferredName);
+      const writable = await picker.createWritable();
+      await writable.write(payload.contents);
+      await writable.close();
+      templateLibraryStatus.value = `Saved template library to ${picker?.name || preferredName}.`;
+      return;
+    }
+
+    downloadTemplateLibraryFile(preferredName);
+    templateLibraryStatus.value = `Browser save dialog unavailable; downloaded ${preferredName} instead.`;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      templateLibraryStatus.value = 'Save cancelled.';
+      return;
+    }
+    console.error('[PlayerControls] Failed to save template library with chooser', err);
+    templateLibraryError.value = err?.message || 'Failed to save template library.';
+  }
+}
 
 const evalEpisodesInput = ref(props.evalNumEpisodes || 100);
 watch(() => props.evalNumEpisodes, (val) => {
   const safe = Number.isFinite(val) ? Number(val) : 100;
   evalEpisodesInput.value = safe;
 });
+
+const evalProgressSafe = computed(() => {
+  const incoming = props.evalProgress && typeof props.evalProgress === 'object'
+    ? props.evalProgress
+    : {};
+  const total = Math.max(0, Number(incoming.total || evalEpisodesInput.value || 0));
+  const rawCompleted = Math.max(0, Number(incoming.completed || 0));
+  const completed = total > 0 ? Math.min(total, rawCompleted) : rawCompleted;
+  const fraction = total > 0
+    ? Math.max(0, Math.min(1, Number.isFinite(Number(incoming.fraction)) ? Number(incoming.fraction) : (completed / total)))
+    : 0;
+  return {
+    running: Boolean(incoming.running),
+    completed,
+    total,
+    fraction,
+    status: String(incoming.status || 'idle'),
+    error: incoming.error || null,
+  };
+});
+
+const evalProgressPercent = computed(() => `${(evalProgressSafe.value.fraction * 100).toFixed(1)}%`);
+
+const playbookProgressSafe = computed(() => {
+  const incoming = playbookProgress.value && typeof playbookProgress.value === 'object'
+    ? playbookProgress.value
+    : {};
+  const total = Math.max(0, Number(incoming.total || 0));
+  const rawCompleted = Math.max(0, Number(incoming.completed || 0));
+  const completed = total > 0 ? Math.min(total, rawCompleted) : rawCompleted;
+  const fraction = total > 0
+    ? Math.max(0, Math.min(1, Number.isFinite(Number(incoming.fraction)) ? Number(incoming.fraction) : (completed / total)))
+    : 0;
+  return {
+    running: Boolean(incoming.running),
+    completed,
+    total,
+    fraction,
+    status: String(incoming.status || 'idle'),
+    error: incoming.error || null,
+  };
+});
+
+const playbookProgressPercent = computed(() => `${(playbookProgressSafe.value.fraction * 100).toFixed(1)}%`);
 
 function updateEvalEpisodes(val) {
   const safe = Math.max(1, Number(val) || 1);
@@ -657,6 +2018,13 @@ function setEvalShootingMode(mode) {
 
 function setEvalRandomizePermutation(val) {
   emitEvalConfigUpdate({ randomizeOffensePermutation: !!val });
+}
+
+function setEvalIntentSelectionMode(mode) {
+  const normalized = ['learned_sample', 'best_intent', 'uniform_random'].includes(String(mode))
+    ? String(mode)
+    : 'learned_sample';
+  emitEvalConfigUpdate({ intentSelectionMode: normalized });
 }
 
 function updateEvalSkill(idx, key, value) {
@@ -815,6 +2183,373 @@ async function resetPassLogitBiasDefault() {
   if (!props.gameState) return;
   passLogitBiasInput.value = passLogitBiasDefault;
   await applyPassLogitBiasOverride();
+}
+
+async function applyIntentStateOverride() {
+  if (!props.gameState || intentControlsDisabled.value) return;
+  intentStateUpdating.value = true;
+  intentStateError.value = null;
+  try {
+    const payload = {
+      active: Boolean(intentStateInput.value.active),
+      intent_index: Math.max(
+        0,
+        Math.min(intentIndexMax.value, Number(intentStateInput.value.intent_index) || 0),
+      ),
+      intent_age: Math.max(
+        0,
+        Math.min(intentAgeMax.value, Number(intentStateInput.value.intent_age) || 0),
+      ),
+    };
+    const res = await setIntentState(payload);
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to update intent state');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to update intent state', err);
+    intentStateError.value = err?.message || 'Failed to update intent state';
+  } finally {
+    intentStateUpdating.value = false;
+  }
+}
+
+function resetIntentStateInputs() {
+  intentStateInput.value = {
+    active: Boolean(props.gameState?.intent_active_current),
+    intent_index: Math.max(
+      0,
+      Math.min(intentIndexMax.value, Number(props.gameState?.intent_index_current ?? 0) || 0),
+    ),
+    intent_age: Math.max(
+      0,
+      Math.min(intentAgeMax.value, Number(props.gameState?.intent_age ?? 0) || 0),
+    ),
+  };
+  intentStateError.value = null;
+}
+
+async function handleCaptureCounterfactualSnapshot() {
+  if (!props.gameState || counterfactualSnapshotControlsDisabled.value) return;
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await captureCounterfactualSnapshot();
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to capture snapshot');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to capture counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to capture snapshot';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+async function handleRestoreCounterfactualSnapshot() {
+  if (!props.gameState || counterfactualSnapshotControlsDisabled.value) return;
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await restoreCounterfactualSnapshot();
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to restore snapshot');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to restore counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to restore snapshot';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+async function handleReplayCounterfactualSnapshot() {
+  if (
+    !props.gameState ||
+    counterfactualSnapshotControlsDisabled.value ||
+    !counterfactualSnapshotAvailable.value ||
+    props.gameState.done
+  ) {
+    return;
+  }
+  counterfactualSnapshotUpdating.value = true;
+  counterfactualSnapshotError.value = null;
+  try {
+    const res = await replayCounterfactualSnapshot({
+      player_deterministic: true,
+      opponent_deterministic: true,
+    });
+    if (res?.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
+      emit('counterfactual-replay-loaded', res);
+    } else {
+      throw new Error(res?.detail || 'Failed to replay from current branch state');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to replay counterfactual snapshot', err);
+    counterfactualSnapshotError.value = err?.message || 'Failed to replay current state';
+  } finally {
+    counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+function resetPlaybookProgressState(total = 0) {
+  playbookProgress.value = {
+    running: total > 0,
+    completed: 0,
+    total: Math.max(0, Number(total || 0)),
+    fraction: 0,
+    status: total > 0 ? 'running' : 'idle',
+    error: null,
+  };
+}
+
+function stopPlaybookProgressPolling() {
+  if (playbookProgressPollHandle !== null) {
+    clearInterval(playbookProgressPollHandle);
+    playbookProgressPollHandle = null;
+  }
+}
+
+async function pollPlaybookProgressOnce() {
+  if (playbookProgressPollBusy) return;
+  playbookProgressPollBusy = true;
+  try {
+    const payload = await getPlaybookProgress();
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      ...(payload || {}),
+    };
+  } catch (err) {
+    console.error('[PlayerControls] Failed to fetch playbook progress', err);
+  } finally {
+    playbookProgressPollBusy = false;
+  }
+}
+
+function startPlaybookProgressPolling(total = 0) {
+  stopPlaybookProgressPolling();
+  resetPlaybookProgressState(total);
+  void pollPlaybookProgressOnce();
+  playbookProgressPollHandle = window.setInterval(() => {
+    void pollPlaybookProgressOnce();
+  }, 750);
+}
+
+function getPlaybookShotStatsForPanel(panel) {
+  const rawByPlayer = panel?.shot_stats?.by_player || {};
+  const offenseIds = Array.isArray(props.gameState?.offense_ids)
+    ? props.gameState.offense_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id))
+    : [];
+  const seen = new Set();
+  const orderedIds = [];
+  for (const pid of offenseIds) {
+    const key = String(pid);
+    seen.add(key);
+    orderedIds.push(key);
+  }
+  for (const key of Object.keys(rawByPlayer)) {
+    if (!seen.has(String(key))) {
+      orderedIds.push(String(key));
+    }
+  }
+  return orderedIds.map((key) => {
+    const stats = rawByPlayer?.[key] || {};
+    return {
+      playerId: Number(key),
+      attempts: Number(stats?.attempts || 0),
+      makes: Number(stats?.makes || 0),
+    };
+  });
+}
+
+const playbookOffenseColumnIds = computed(() => {
+  const ids = [];
+  const seen = new Set();
+  const pushId = (rawId) => {
+    const playerId = Number(rawId);
+    if (!Number.isFinite(playerId)) return;
+    const key = String(playerId);
+    if (seen.has(key)) return;
+    seen.add(key);
+    ids.push(playerId);
+  };
+
+  const liveOffenseIds = Array.isArray(props.gameState?.offense_ids) ? props.gameState.offense_ids : [];
+  liveOffenseIds.forEach(pushId);
+
+  const panels = Array.isArray(playbookResult.value?.panels) ? playbookResult.value.panels : [];
+  panels.forEach((panel) => {
+    getPlaybookShotStatsForPanel(panel).forEach((entry) => pushId(entry?.playerId));
+  });
+
+  return ids;
+});
+
+function formatPlaybookTotalShots(panel) {
+  const attempts = Number(panel?.shot_stats?.total?.attempts || 0);
+  const makes = Number(panel?.shot_stats?.total?.makes || 0);
+  return `${attempts} / ${makes}`;
+}
+
+function formatPlaybookPlayerShotCell(panel, playerId) {
+  const match = getPlaybookShotStatsForPanel(panel).find((entry) => Number(entry?.playerId) === Number(playerId));
+  if (!match) return '0 / 0';
+  return `${Number(match.attempts || 0)} / ${Number(match.makes || 0)}`;
+}
+
+function getPlaybookPrimaryShooterSummary(panel) {
+  const raw = panel?.primary_shooter_distribution || {};
+  const entries = Object.entries(raw)
+    .map(([key, value]) => {
+      const playerId = Number(key);
+      const count = Number(value?.count || 0);
+      const rate = Number(value?.rate || 0);
+      if (!Number.isFinite(playerId) || count <= 0) return null;
+      return { playerId, count, rate };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.playerId - b.playerId;
+    });
+  if (!entries.length) return 'none';
+  return entries
+    .map((entry) => `P${entry.playerId} ${entry.count} (${(entry.rate * 100).toFixed(0)}%)`)
+    .join(', ');
+}
+
+function formatPlaybookOutcomeSummary(panel) {
+  const raw = panel?.terminal_outcomes || {};
+  const entries = Object.entries(raw)
+    .map(([key, count]) => ({
+      key: String(key),
+      count: Number(count || 0),
+      label: formatPlaybookOutcomeKey(key),
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    });
+  if (!entries.length) return 'none';
+  return entries.map((entry) => `${entry.label}: ${entry.count}`).join(', ');
+}
+
+function formatPlaybookOutcomeKey(rawKey) {
+  const key = String(rawKey || '').trim();
+  switch (key) {
+    case 'shot_make':
+      return 'Made shots';
+    case 'shot_miss':
+      return 'Missed shots';
+    case 'turnover':
+      return 'Turnovers';
+    case 'defensive_violation':
+      return 'Defensive violations';
+    case 'shot_clock_expiration':
+      return 'Shot clock expirations';
+    case 'horizon_cutoff':
+      return 'Horizon cutoffs';
+    case 'other_terminal':
+      return 'Other terminal';
+    default:
+      return key.replaceAll('_', ' ');
+  }
+}
+
+function formatPlaybookTurnoverReason(rawKey) {
+  const key = String(rawKey || '').trim();
+  switch (key) {
+    case 'steal':
+      return 'Steal';
+    case 'out_of_bounds':
+      return 'Out of bounds';
+    case 'pressure':
+      return 'Pressure';
+    case 'offensive_three_seconds':
+      return 'Offensive 3 seconds';
+    case 'unknown':
+      return 'Unknown';
+    default:
+      return key.replaceAll('_', ' ');
+  }
+}
+
+function formatPlaybookTurnoverSummary(panel) {
+  const raw = panel?.turnover_reasons || {};
+  const entries = Object.entries(raw)
+    .map(([key, count]) => ({
+      key: String(key),
+      count: Number(count || 0),
+      label: formatPlaybookTurnoverReason(key),
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    });
+  if (!entries.length) return 'none';
+  return entries.map((entry) => `${entry.label}: ${entry.count}`).join(', ');
+}
+
+async function handleRunPlaybookAnalysis() {
+  if (!props.gameState || playbookControlsDisabled.value) return;
+  if (!playbookSelectedIntentIndices.value.length) {
+    playbookError.value = 'Provide at least one valid intent index.';
+    return;
+  }
+  if (playbookUseSnapshot.value && !counterfactualSnapshotAvailable.value) {
+    playbookError.value = 'Capture a snapshot first, or switch the source to current state.';
+    return;
+  }
+
+  playbookRunning.value = true;
+  playbookError.value = null;
+  const totalRollouts = playbookSelectedIntentIndices.value.length * Number(playbookNumRollouts.value || 16);
+  startPlaybookProgressPolling(totalRollouts);
+  try {
+    const res = await runPlaybookAnalysis({
+      intent_indices: playbookSelectedIntentIndices.value,
+      num_rollouts: Number(playbookNumRollouts.value || 16),
+      max_steps: Number(playbookMaxSteps.value || 8),
+      run_to_end: Boolean(playbookRunToEnd.value),
+      use_snapshot: Boolean(playbookUseSnapshot.value),
+      player_deterministic: Boolean(playbookPlayerDeterministic.value),
+      opponent_deterministic: Boolean(playbookOpponentDeterministic.value),
+    });
+    if (res?.status === 'success') {
+      playbookResult.value = res;
+      emit('playbook-analysis-loaded', res);
+      playbookProgress.value = {
+        ...playbookProgress.value,
+        running: false,
+        completed: Number(res?.total_rollouts || totalRollouts || 0),
+        total: Number(res?.total_rollouts || totalRollouts || 0),
+        fraction: 1,
+        status: 'completed',
+        error: null,
+      };
+    } else {
+      throw new Error(res?.detail || 'Failed to generate playbook analysis');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to run playbook analysis', err);
+    playbookError.value = err?.message || 'Failed to run playbook analysis';
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      running: false,
+      status: 'failed',
+      error: err?.message || 'Failed to run playbook analysis',
+    };
+  } finally {
+    stopPlaybookProgressPolling();
+    playbookRunning.value = false;
+  }
 }
 
 function _normalizePressurePayload(input) {
@@ -1028,7 +2763,62 @@ async function handleBallHolderChange(val) {
 }
 
 // Add rewards tracking
-const activeTab = ref('environment');
+const DEV_TABS_STORAGE_KEY = 'basketworld.dev.tab_order';
+const DEFAULT_DEV_TABS = Object.freeze([
+  { id: 'environment', label: 'Environment' },
+  { id: 'template', label: 'Template' },
+  { id: 'rewards', label: 'Rewards' },
+  { id: 'stats', label: 'Stats' },
+  { id: 'entropy', label: 'Entropy' },
+  { id: 'policy', label: 'Policy' },
+  { id: 'playbook', label: 'Playbook' },
+  { id: 'advisor', label: 'Advisor' },
+  { id: 'moves', label: 'Moves' },
+  { id: 'eval', label: 'Eval' },
+  { id: 'training', label: 'Training' },
+  { id: 'phi', label: 'Phi Shaping' },
+  { id: 'observation', label: 'Observation' },
+  { id: 'attention', label: 'Attention' },
+]);
+const DEFAULT_DEV_TAB_ORDER = DEFAULT_DEV_TABS.map((tab) => tab.id);
+const DEV_TAB_ID_SET = new Set(DEFAULT_DEV_TAB_ORDER);
+
+function normalizeDevTabOrder(rawOrder) {
+  const candidateOrder = Array.isArray(rawOrder) ? rawOrder : [];
+  const seen = new Set();
+  const normalized = [];
+  for (const tabId of candidateOrder) {
+    if (typeof tabId !== 'string' || seen.has(tabId) || !DEV_TAB_ID_SET.has(tabId)) continue;
+    seen.add(tabId);
+    normalized.push(tabId);
+  }
+  for (const tabId of DEFAULT_DEV_TAB_ORDER) {
+    if (!seen.has(tabId)) normalized.push(tabId);
+  }
+  return normalized;
+}
+
+function loadStoredDevTabOrder() {
+  if (typeof window === 'undefined') return [...DEFAULT_DEV_TAB_ORDER];
+  try {
+    const raw = window.localStorage.getItem(DEV_TABS_STORAGE_KEY);
+    if (!raw) return [...DEFAULT_DEV_TAB_ORDER];
+    return normalizeDevTabOrder(JSON.parse(raw));
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load tab order preference', err);
+    return [...DEFAULT_DEV_TAB_ORDER];
+  }
+}
+
+const activeTab = ref(String(props.initialActiveTab || 'environment'));
+const devTabOrder = ref(loadStoredDevTabOrder());
+const draggedDevTabId = ref(null);
+const orderedDevTabs = computed(() => {
+  const tabsById = new Map(DEFAULT_DEV_TABS.map((tab) => [tab.id, tab]));
+  return devTabOrder.value
+    .map((tabId) => tabsById.get(tabId))
+    .filter((tab) => Boolean(tab));
+});
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
@@ -1105,6 +2895,52 @@ watch(activeTab, async (newTab) => {
   }
 }, { flush: 'post' });
 
+watch(() => props.initialActiveTab, (nextTab) => {
+  const normalized = String(nextTab || '').trim();
+  if (!normalized || activeTab.value === normalized) return;
+  if (!DEV_TAB_ID_SET.has(normalized)) return;
+  activeTab.value = normalized;
+});
+
+watch(devTabOrder, (newOrder) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(DEV_TABS_STORAGE_KEY, JSON.stringify(newOrder));
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist tab order preference', err);
+  }
+});
+
+function handleDevTabDragStart(tabId, event) {
+  draggedDevTabId.value = tabId;
+  if (event?.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', tabId);
+  }
+}
+
+function handleDevTabDragOver(event) {
+  if (!draggedDevTabId.value) return;
+  event.dataTransfer.dropEffect = 'move';
+}
+
+function handleDevTabDrop(targetTabId) {
+  const sourceTabId = draggedDevTabId.value;
+  draggedDevTabId.value = null;
+  if (!sourceTabId || sourceTabId === targetTabId) return;
+  const nextOrder = [...devTabOrder.value];
+  const sourceIndex = nextOrder.indexOf(sourceTabId);
+  const targetIndex = nextOrder.indexOf(targetTabId);
+  if (sourceIndex === -1 || targetIndex === -1) return;
+  nextOrder.splice(sourceIndex, 1);
+  nextOrder.splice(targetIndex, 0, sourceTabId);
+  devTabOrder.value = nextOrder;
+}
+
+function handleDevTabDragEnd() {
+  draggedDevTabId.value = null;
+}
+
 // Move tracking is now handled by parent component
 
 // --- Stats tracking (persistent across sessions) ---
@@ -1126,6 +2962,10 @@ const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, M
 
 function ensureStatsDiagnosticFields(target) {
   if (!target || typeof target !== 'object') return;
+  if (!target.intentSelectionCounts || typeof target.intentSelectionCounts !== 'object') {
+    target.intentSelectionCounts = {};
+  }
+  target.intentInactiveCount = Number(target.intentInactiveCount || 0);
   if (!target.turnoverReasons || typeof target.turnoverReasons !== 'object') {
     target.turnoverReasons = {};
   }
@@ -1238,6 +3078,23 @@ const actionMixRows = computed(() => {
   };
 });
 
+const intentSelectionRows = computed(() => {
+  const raw = statsState.value?.intentSelectionCounts || {};
+  const rows = Object.entries(raw)
+    .map(([intent, count]) => ({
+      intent: Number(intent),
+      label: formatPlayLabel(Number(intent), props.gameState?.play_name_map),
+      count: Number(count || 0),
+    }))
+    .filter((row) => Number.isFinite(row.intent))
+    .sort((a, b) => a.intent - b.intent);
+  return {
+    rows,
+    inactiveCount: Number(statsState.value?.intentInactiveCount || 0),
+    total: rows.reduce((acc, row) => acc + row.count, 0) + Number(statsState.value?.intentInactiveCount || 0),
+  };
+});
+
 const rewardBreakdownRows = computed(() => {
   const rb = statsState.value?.rewardBreakdown || {};
   return [
@@ -1302,6 +3159,45 @@ function aggregatePlayerStats(entries) {
   return base;
 }
 
+function getShotTypePair(shotTypes, key) {
+  const vals = shotTypes?.[key] || [0, 0];
+  return {
+    att: Number(vals[0] || 0),
+    mk: Number(vals[1] || 0),
+  };
+}
+
+function buildEvalAggregateRow(entry) {
+  const shotTypes = entry?.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] };
+  const assistByType = entry?.assist_full_by_type || {};
+  const dunk = getShotTypePair(shotTypes, 'dunk');
+  const two = getShotTypePair(shotTypes, 'two');
+  const three = getShotTypePair(shotTypes, 'three');
+  const attempts = Number(entry?.shots || 0);
+  const makes = Number(entry?.makes || 0);
+  const episodes = Number(entry?.episodes || 0);
+  const points = Number(entry?.points || 0);
+  return {
+    attempts,
+    makes,
+    fg: attempts > 0 ? (makes / attempts) * 100 : 0,
+    dunk,
+    two,
+    three,
+    assists: Number(entry?.assists || 0),
+    potentialAssists: Number(entry?.potential_assists || 0),
+    turnovers: Number(entry?.turnovers || 0),
+    points,
+    episodes,
+    ppp: episodes > 0 ? points / episodes : 0,
+    unassisted: {
+      dunk: Math.max(0, dunk.mk - Number(assistByType.dunk || 0)),
+      two: Math.max(0, two.mk - Number(assistByType.two || 0)),
+      three: Math.max(0, three.mk - Number(assistByType.three || 0)),
+    },
+  };
+}
+
 const selectedEvalStats = computed(() => {
   const stats = props.perPlayerEvalStats || {};
   const offenseIds = offensePlayerIdsForStats.value;
@@ -1339,37 +3235,41 @@ const offensePlayerStatsTable = computed(() => {
   if (!stats || offenseIds.length === 0) return [];
   return offenseIds.map((pid) => {
     const entry = stats[pid] || stats[String(pid)] || {};
-    const attemptSum = Number(entry.shots || 0);
-    const makeSum = Number(entry.makes || 0);
-    const shotTypes = entry.shot_types || { dunk: [0, 0], two: [0, 0], three: [0, 0] };
-    const getPair = (k) => {
-      const vals = shotTypes[k] || [0, 0];
-      return { att: Number(vals[0] || 0), mk: Number(vals[1] || 0) };
-    };
-    const dunk = getPair('dunk');
-    const two = getPair('two');
-    const three = getPair('three');
-    const un = entry.unassisted || {};
-    const af = entry.assist_full_by_type || {};
+    const row = buildEvalAggregateRow(entry);
     return {
       playerId: pid,
-      attempts: attemptSum,
-      makes: makeSum,
-      fg: attemptSum > 0 ? (makeSum / attemptSum) * 100 : 0,
-      dunk,
-      two,
-      three,
-      assists: Number(entry.assists || 0),
-      potentialAssists: Number(entry.potential_assists || 0),
-      turnovers: Number(entry.turnovers || 0),
-      points: Number(entry.points || 0),
-      unassisted: {
-        dunk: Math.max(0, dunk.mk - Number(af.dunk || 0)),
-        two: Math.max(0, two.mk - Number(af.two || 0)),
-        three: Math.max(0, three.mk - Number(af.three || 0)),
-      },
+      ...row,
     };
   });
+});
+
+const perIntentEvalStatsTable = computed(() => {
+  const stats = props.perIntentEvalStats || {};
+  const rows = Object.entries(stats)
+    .map(([intentKey, entry]) => {
+      const base = buildEvalAggregateRow(entry || {});
+      const idx = Number(intentKey);
+      return {
+        intentKey: String(intentKey),
+        label:
+          String(intentKey) === 'none'
+            ? 'No intent'
+            : (Number.isFinite(idx)
+              ? formatPlayLabel(idx, props.gameState?.play_name_map)
+              : String(intentKey)),
+        ...base,
+      };
+    })
+    .filter((row) => row.episodes > 0 || row.attempts > 0 || row.points > 0);
+  rows.sort((a, b) => {
+    if (a.intentKey === 'none') return 1;
+    if (b.intentKey === 'none') return -1;
+    const ai = Number(a.intentKey);
+    const bi = Number(b.intentKey);
+    if (Number.isFinite(ai) && Number.isFinite(bi)) return ai - bi;
+    return a.label.localeCompare(b.label);
+  });
+  return rows;
 });
 
 const CHART_HEX_RADIUS = 12;
@@ -1607,6 +3507,15 @@ function applyEvaluationStats(
   }
 
   if (evalDiagnostics && typeof evalDiagnostics === 'object') {
+    const intentRaw = evalDiagnostics.intent_selection_counts || {};
+    next.intentSelectionCounts = {};
+    for (const [intent, count] of Object.entries(intentRaw)) {
+      const idx = Number(intent);
+      if (!Number.isFinite(idx)) continue;
+      next.intentSelectionCounts[String(idx)] = Number(count || 0);
+    }
+    next.intentInactiveCount = Number(evalDiagnostics.intent_inactive_count || 0);
+
     const reasonsRaw = evalDiagnostics.turnover_reasons || {};
     next.turnoverReasons = {};
     for (const [reason, count] of Object.entries(reasonsRaw)) {
@@ -1645,6 +3554,7 @@ function applyEvaluationStats(
 
 function resetStats() {
   statsState.value = resetStatsStorage();
+  emit('stats-reset');
 }
 
 async function copyStatsMarkdown() {
@@ -1679,6 +3589,17 @@ async function copyStatsMarkdown() {
       String(count),
       `${(actionTotal > 0 ? (Number(count) / actionTotal) * 100 : 0).toFixed(1)}%`,
     ]);
+    const intentRows = Object.entries(s.intentSelectionCounts || {})
+      .map(([intent, count]) => [
+        formatPlayLabel(Number(intent), props.gameState?.play_name_map),
+        String(Number(count || 0)),
+        Number(intent),
+      ])
+      .sort((a, b) => Number(a[2]) - Number(b[2]))
+      .map(([label, count]) => [label, count]);
+    if (Number(s.intentInactiveCount || 0) > 0) {
+      intentRows.push(['No intent', String(Number(s.intentInactiveCount || 0))]);
+    }
     const rb = s.rewardBreakdown || {};
     const rewardRows = [
       ['Total reward', Number(rb.totalReward || 0).toFixed(2)],
@@ -1717,6 +3638,11 @@ async function copyStatsMarkdown() {
       '| Action | Count | Rate |',
       '| --- | --- | --- |',
       table(actionRows),
+      '',
+      '## Offense Intent Starts',
+      '| Intent | Count |',
+      '| --- | --- |',
+      table(intentRows.length ? intentRows : [['(none)', '0']]),
       '',
       '## Reward Decomposition',
       '| Component | Value |',
@@ -1857,6 +3783,184 @@ const entropyTotals = computed(() => {
 });
 
 const hasEntropyData = computed(() => entropyRows.value.some((row) => row.entropy !== null && row.entropy !== undefined));
+const policyTeamLabel = computed(() => props.gameState?.user_team_name || 'OFFENSE');
+const selectorIntentPreferences = computed(() => {
+  const payload = props.gameState?.selector_intent_preferences;
+  const items = Array.isArray(payload?.intent_probs)
+    ? [...payload.intent_probs].sort(
+      (a, b) => Number(a?.intent_index ?? 0) - Number(b?.intent_index ?? 0),
+    )
+    : [];
+  return {
+    alphaCurrent: payload?.alpha_current ?? null,
+    epsCurrent: payload?.eps_current ?? null,
+    selectionMode: payload?.selection_mode ?? 'learned_sample',
+    valueEstimate: payload?.value_estimate ?? null,
+    currentIntentIndex: payload?.current_intent_index ?? null,
+    items,
+  };
+});
+const playbookSelectedIntentLabels = computed(() => {
+  const indices = Array.isArray(playbookSelectedIntentIndices.value)
+    ? playbookSelectedIntentIndices.value
+    : [];
+  return indices.map((intentIndex) => formatPlayLabel(intentIndex, props.gameState?.play_name_map));
+});
+function computeSelectorIntentDistributionStats(items, fieldName) {
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    return {
+      entropy: null,
+      normalizedEntropy: null,
+      klToUniform: null,
+      normalizedKlToUniform: null,
+    };
+  }
+  const probs = rows
+    .map((item) => Number(item?.[fieldName]))
+    .filter((prob) => Number.isFinite(prob) && prob > 0);
+  if (!probs.length) {
+    return {
+      entropy: null,
+      normalizedEntropy: null,
+      klToUniform: null,
+      normalizedKlToUniform: null,
+    };
+  }
+  const entropy = -probs.reduce((sum, prob) => sum + (prob * Math.log(prob)), 0);
+  const maxEntropy = Math.log(rows.length);
+  const normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : null;
+  const klToUniform = maxEntropy > 0 ? (maxEntropy - entropy) : 0;
+  const normalizedKlToUniform = maxEntropy > 0 ? (klToUniform / maxEntropy) : null;
+  return {
+    entropy,
+    normalizedEntropy,
+    klToUniform,
+    normalizedKlToUniform,
+  };
+}
+
+const selectorIntentDistributionStats = computed(() => {
+  const items = selectorIntentPreferences.value.items || [];
+  return {
+    raw: computeSelectorIntentDistributionStats(items, 'raw_prob'),
+    mixed: computeSelectorIntentDistributionStats(items, 'mixed_prob'),
+    deployed: computeSelectorIntentDistributionStats(items, 'deployed_prob'),
+  };
+});
+const SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY = 'basketworld.selector_intent_plot_mode';
+function loadStoredSelectorIntentPlotMode() {
+  if (typeof window === 'undefined') return 'deployed';
+  try {
+    const raw = String(window.localStorage.getItem(SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY) || '').trim().toLowerCase();
+    return ['raw', 'mixed', 'deployed'].includes(raw) ? raw : 'deployed';
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load selector intent plot mode preference', err);
+    return 'deployed';
+  }
+}
+const selectedSelectorIntentPlotMode = ref(loadStoredSelectorIntentPlotMode());
+const selectorIntentPlotModeOptions = Object.freeze([
+  { value: 'raw', label: 'Raw' },
+  { value: 'mixed', label: 'Mixed' },
+  { value: 'deployed', label: 'Deployed' },
+]);
+const selectorIntentPlotField = computed(() => {
+  return selectedSelectorIntentPlotMode.value === 'raw'
+    ? 'raw_prob'
+    : selectedSelectorIntentPlotMode.value === 'mixed'
+      ? 'mixed_prob'
+      : 'deployed_prob';
+});
+const selectorIntentPlotLabel = computed(() => {
+  return selectedSelectorIntentPlotMode.value === 'raw'
+    ? 'Raw'
+    : selectedSelectorIntentPlotMode.value === 'mixed'
+      ? 'Mixed'
+      : 'Deployed';
+});
+const selectorIntentEntropy = computed(() => {
+  const stats = selectorIntentDistributionStats.value?.[selectedSelectorIntentPlotMode.value];
+  return stats || {
+    entropy: null,
+    normalizedEntropy: null,
+    klToUniform: null,
+    normalizedKlToUniform: null,
+  };
+});
+function getSelectorIntentPlotProb(item) {
+  const field = selectorIntentPlotField.value;
+  const prob = Number(item?.[field] ?? 0);
+  return Number.isFinite(prob) ? prob : 0;
+}
+watch(selectedSelectorIntentPlotMode, (nextMode) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(
+      SELECTOR_INTENT_PLOT_MODE_STORAGE_KEY,
+      String(nextMode || 'deployed'),
+    );
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist selector intent plot mode preference', err);
+  }
+});
+const hasSelectorIntentPreferences = computed(() =>
+  Array.isArray(selectorIntentPreferences.value.items)
+  && selectorIntentPreferences.value.items.length > 0
+);
+const policyRowsByPlayer = computed(() => {
+  if (!props.gameState || !policyProbabilities.value) return [];
+
+  return userControlledPlayerIds.value.map((pid) => {
+    const probs =
+      policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
+    const mask = props.gameState?.action_mask?.[pid];
+    const normalized = normalizeLegalProbs(probs, mask);
+    if (!Array.isArray(normalized)) {
+      return { playerId: pid, actions: [] };
+    }
+
+    const actions = [];
+    for (let i = 0; i < normalized.length && i < actionNames.length; i += 1) {
+      const allowed = !Array.isArray(mask) || Number(mask[i]) > 0;
+      if (!allowed) continue;
+      const prob = Number(normalized[i]);
+      if (!Number.isFinite(prob)) continue;
+      actions.push({
+        action: actionNames[i] || `ACTION_${i}`,
+        prob,
+      });
+    }
+
+    actions.sort((a, b) => String(a.action).localeCompare(String(b.action)));
+    return { playerId: pid, actions };
+  });
+});
+const hasPolicyData = computed(() =>
+  policyRowsByPlayer.value.some((row) => Array.isArray(row.actions) && row.actions.length > 0)
+);
+
+function isSelectedPolicyAction(playerId, actionName) {
+  const selected =
+    selectedActions.value?.[playerId]
+    ?? selectedActions.value?.[String(playerId)]
+    ?? null;
+  return selected === actionName;
+}
+
+const playbookSelectedIntentIndices = computed(() => {
+  const maxIntent = Math.max(0, Number(props.gameState?.num_intents || 1) - 1);
+  const raw = String(playbookIntentInput.value || '')
+    .split(',')
+    .map((part) => Number(part.trim()))
+    .filter((val) => Number.isFinite(val));
+  const out = [];
+  for (const val of raw) {
+    const idx = Math.max(0, Math.min(maxIntent, Math.round(val)));
+    if (!out.includes(idx)) out.push(idx);
+  }
+  return out;
+});
 
 // Shot probability display is handled on the board
 
@@ -1962,6 +4066,20 @@ watch(() => props.gameState, async (newGameState) => {
     valueRange.value = { min: 0, max: 0 };
   }
 }, { immediate: true });
+
+watch(
+  () => [props.gameState?.num_intents, props.gameState?.intent_commitment_steps],
+  ([numIntents, commitment]) => {
+    if (!playbookIntentInput.value) {
+      const count = Math.max(1, Math.min(4, Number(numIntents || 1)));
+      playbookIntentInput.value = Array.from({ length: count }, (_, idx) => idx).join(', ');
+    }
+    if (!playbookMaxSteps.value || playbookMaxSteps.value <= 0) {
+      playbookMaxSteps.value = Math.max(1, Number(commitment || 8));
+    }
+  },
+  { immediate: true },
+);
 
 
 // Watch for the list of players to be populated, then set the first one as active.
@@ -2641,6 +4759,10 @@ onMounted(() => {
   emit('active-tab-changed', activeTab.value);
 });
 
+onBeforeUnmount(() => {
+  stopPlaybookProgressPolling();
+});
+
 watch(resolvedTabsMount, () => {
   nextTick(() => refreshTabsTeleportTarget());
 });
@@ -2914,7 +5036,8 @@ const tokenFeatureLabels = [
   'dist_to_nearest_opp',
   'dist_to_nearest_team',
 ];
-const tokenGlobalLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
+const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
+const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible', 'intent_age_norm'];
 
 const tokenPlayers = computed(() => {
   const players = obsTokens.value?.players;
@@ -2926,11 +5049,52 @@ const tokenGlobals = computed(() => {
   return Array.isArray(globals) ? globals : [];
 });
 
+const tokenGlobalLabels = computed(() => {
+  const provided = obsTokens.value?.globals_labels;
+  if (Array.isArray(provided) && provided.length > 0) {
+    return provided;
+  }
+  const labels = [...tokenGlobalBaseLabels];
+  const extras = Math.max(0, tokenGlobals.value.length - labels.length);
+  if (extras > 0) {
+    const intentTake = Math.min(tokenGlobalIntentLabels.length, extras);
+    labels.push(...tokenGlobalIntentLabels.slice(0, intentTake));
+    for (let idx = intentTake; idx < extras; idx += 1) {
+      labels.push(`global_${tokenGlobalBaseLabels.length + idx}`);
+    }
+  }
+  return labels;
+});
+
 const tokenAttention = computed(() => obsTokens.value?.attention || null);
 const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
 const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
 const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
 const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
+const tokenAttentionRuntimeIntentIndex = computed(() => {
+  const value = tokenAttention.value?.runtime_intent_index;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+});
+const tokenAttentionRuntimeIntentGate = computed(() => Boolean(tokenAttention.value?.runtime_intent_gate));
+const tokenAttentionRuntimeIntentActive = computed(() => Boolean(tokenAttention.value?.runtime_intent_active));
+const tokenAttentionRuntimeIntentVisible = computed(() => Boolean(tokenAttention.value?.runtime_intent_visible));
+const tokenAttentionObserverRole = computed(() => String(tokenAttention.value?.observer_role || ''));
+const tokenAttentionRuntimeSummary = computed(() => {
+  if (!tokenAttention.value) return '';
+  const parts = [];
+  if (tokenAttentionObserverRole.value) {
+    parts.push(`Observer: ${tokenAttentionObserverRole.value}`);
+  }
+  if (tokenAttentionRuntimeIntentIndex.value !== null) {
+    parts.push(
+      `Intent: ${formatPlayLabel(tokenAttentionRuntimeIntentIndex.value, props.gameState?.play_name_map)}`
+    );
+  }
+  parts.push(`Gate: ${tokenAttentionRuntimeIntentGate.value ? 'on' : 'off'}`);
+  parts.push(`Active: ${tokenAttentionRuntimeIntentActive.value ? 'yes' : 'no'}`);
+  parts.push(`Visible: ${tokenAttentionRuntimeIntentVisible.value ? 'yes' : 'no'}`);
+  return parts.join(' · ');
+});
 const attentionView = ref('avg');
 const attentionHeadOptions = computed(() => {
   const count = tokenAttentionHeads.value || 0;
@@ -3073,7 +5237,7 @@ const tokenRows = computed(() => {
 
 const tokenGlobalRows = computed(() => {
   return tokenGlobals.value.map((value, idx) => ({
-    label: tokenGlobalLabels[idx] || `global_${idx}`,
+    label: tokenGlobalLabels.value[idx] || `global_${idx}`,
     value,
   }));
 });
@@ -3263,71 +5427,18 @@ const stealRisks = computed(() => {
       <div class="tabs-content-shell">
     <!-- Tab Navigation -->
     <div class="tab-navigation">
-      <button 
-        :class="{ active: activeTab === 'environment' }"
-        @click="activeTab = 'environment'"
+      <button
+        v-for="tab in orderedDevTabs"
+        :key="tab.id"
+        :class="{ active: activeTab === tab.id, dragging: draggedDevTabId === tab.id }"
+        draggable="true"
+        @click="activeTab = tab.id"
+        @dragstart="handleDevTabDragStart(tab.id, $event)"
+        @dragover.prevent="handleDevTabDragOver"
+        @drop="handleDevTabDrop(tab.id)"
+        @dragend="handleDevTabDragEnd"
       >
-        Environment
-      </button>
-      <button 
-        :class="{ active: activeTab === 'rewards' }"
-        @click="activeTab = 'rewards'"
-      >
-        Rewards
-      </button>
-      <button 
-        :class="{ active: activeTab === 'stats' }"
-        @click="activeTab = 'stats'"
-      >
-        Stats
-      </button>
-      <button 
-        :class="{ active: activeTab === 'entropy' }"
-        @click="activeTab = 'entropy'"
-      >
-        Entropy
-      </button>
-      <button 
-        :class="{ active: activeTab === 'advisor' }"
-        @click="activeTab = 'advisor'"
-      >
-        Advisor
-      </button>
-      <button 
-        :class="{ active: activeTab === 'moves' }"
-        @click="activeTab = 'moves'"
-      >
-        Moves
-      </button>
-      <button 
-        :class="{ active: activeTab === 'eval' }"
-        @click="activeTab = 'eval'"
-      >
-        Eval
-      </button>
-      <button 
-        :class="{ active: activeTab === 'training' }"
-        @click="activeTab = 'training'"
-      >
-        Training
-      </button>
-      <button 
-        :class="{ active: activeTab === 'phi' }"
-        @click="activeTab = 'phi'"
-      >
-        Phi Shaping
-      </button>
-      <button 
-        :class="{ active: activeTab === 'observation' }"
-        @click="activeTab = 'observation'"
-      >
-        Observation
-      </button>
-      <button 
-        :class="{ active: activeTab === 'attention' }"
-        @click="activeTab = 'attention'"
-      >
-        Attention
+        {{ tab.label }}
       </button>
     </div>
 
@@ -3551,6 +5662,44 @@ const stealRisks = computed(() => {
           </tbody>
         </table>
       </div>
+      <div v-if="perIntentEvalStatsTable.length" class="per-player-stats">
+        <h4>Per-Intent Offense Stats (Eval)</h4>
+        <div class="status-note">
+          The board shot-chart dropdown above the court now includes these intent labels.
+        </div>
+        <table class="per-player-table">
+          <thead>
+            <tr>
+              <th>Play</th>
+              <th>Episodes</th>
+              <th>FG</th>
+              <th>Dunk</th>
+              <th>2PT</th>
+              <th>3PT</th>
+              <th>Assists</th>
+              <th>Pot. Ast</th>
+              <th>TOV</th>
+              <th>Points</th>
+              <th>PPP</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in perIntentEvalStatsTable" :key="`intent-stat-${row.intentKey}`">
+              <td>{{ row.label }}</td>
+              <td>{{ row.episodes }}</td>
+              <td>{{ row.makes }}/{{ row.attempts }} ({{ row.fg.toFixed(1) }}%)</td>
+              <td>{{ row.dunk.mk }}/{{ row.dunk.att }} ({{ row.unassisted.dunk }})</td>
+              <td>{{ row.two.mk }}/{{ row.two.att }} ({{ row.unassisted.two }})</td>
+              <td>{{ row.three.mk }}/{{ row.three.att }} ({{ row.unassisted.three }})</td>
+              <td>{{ row.assists }}</td>
+              <td>{{ row.potentialAssists }}</td>
+              <td>{{ row.turnovers }}</td>
+              <td>{{ row.points.toFixed(1) }}</td>
+              <td>{{ row.ppp.toFixed(2) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
       <div class="rewards-section">
         <h4>Episode Stats</h4>
         <div class="parameters-grid">
@@ -3618,6 +5767,42 @@ const stealRisks = computed(() => {
             >
               <span class="param-name">{{ row.label }}:</span>
               <span class="param-value">{{ row.count }} ({{ row.rate.toFixed(1) }}%)</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
+              Offense Intent Starts
+              <span
+                class="category-help"
+                title="Count of offense intent index at episode start during evaluation. This reflects the active offense intent sampled/applied when each eval episode began."
+                aria-label="Offense intent starts help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Total number of evaluated episode starts counted for offense intent.">
+              <span class="param-name">Total starts:</span>
+              <span class="param-value">{{ intentSelectionRows.total }}</span>
+            </div>
+            <div
+              v-for="row in intentSelectionRows.rows"
+              :key="`intent-start-${row.intent}`"
+              class="param-item"
+              data-tooltip="Number of evaluation episodes that started with this offense intent index active."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.count }}</span>
+            </div>
+            <div
+              v-if="intentSelectionRows.inactiveCount > 0"
+              class="param-item"
+              data-tooltip="Episodes where offense intent learning was enabled but no active intent was present at episode start."
+            >
+              <span class="param-name">No intent:</span>
+              <span class="param-value">{{ intentSelectionRows.inactiveCount }}</span>
+            </div>
+            <div v-if="intentSelectionRows.total === 0" class="param-item" data-tooltip="No offense intent start counts were recorded in this evaluation window.">
+              <span class="param-name">(none)</span>
+              <span class="param-value">0</span>
             </div>
           </div>
           <div class="param-category">
@@ -3690,8 +5875,8 @@ const stealRisks = computed(() => {
           </div>
         </div>
         <div style="display:flex; gap: 0.5rem;">
-          <button class="new-game-button" @click="resetStats">Reset Stats</button>
-          <button class="submit-button" @click="copyStatsMarkdown">Copy</button>
+          <button type="button" class="new-game-button" @click="resetStats">Reset Stats</button>
+          <button type="button" class="submit-button" @click="copyStatsMarkdown">Copy</button>
         </div>
       </div>
     </div>
@@ -3741,6 +5926,318 @@ const stealRisks = computed(() => {
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Policy Tab -->
+    <div v-if="activeTab === 'policy'" class="tab-content">
+      <div class="entropy-section">
+        <h4>Policy Probabilities ({{ policyTeamLabel }})</h4>
+        <p class="entropy-note">Legal-action probabilities for the current state, filtered to the selected team.</p>
+
+        <div v-if="hasSelectorIntentPreferences" class="param-category selector-intent-card">
+          <h5>Intent Preferences</h5>
+          <div class="eval-row selector-plot-row">
+            <label>Plot</label>
+            <select v-model="selectedSelectorIntentPlotMode">
+              <option
+                v-for="opt in selectorIntentPlotModeOptions"
+                :key="`selector-plot-${opt.value}`"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
+            <span class="status-note">Bar widths and entropy summary use {{ selectorIntentPlotLabel.toLowerCase() }} probabilities.</span>
+          </div>
+          <p class="entropy-note">
+            Selector preferences for the current offense state in fixed intent order.
+            <span v-if="selectorIntentPreferences.selectionMode">
+              Mode {{ String(selectorIntentPreferences.selectionMode) }}
+            </span>
+            <span v-if="selectorIntentPreferences.alphaCurrent !== null">
+              Alpha {{ Number(selectorIntentPreferences.alphaCurrent).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentPreferences.epsCurrent !== null">
+              · Eps {{ Number(selectorIntentPreferences.epsCurrent).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentPreferences.valueEstimate !== null">
+              · Value {{ Number(selectorIntentPreferences.valueEstimate).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.entropy !== null">
+              · {{ selectorIntentPlotLabel }} Entropy {{ Number(selectorIntentEntropy.entropy).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.normalizedEntropy !== null">
+              (norm {{ Number(selectorIntentEntropy.normalizedEntropy).toFixed(3) }})
+            </span>
+            <span v-if="selectorIntentEntropy.klToUniform !== null">
+              · {{ selectorIntentPlotLabel }} KL-U {{ Number(selectorIntentEntropy.klToUniform).toFixed(3) }}
+            </span>
+            <span v-if="selectorIntentEntropy.normalizedKlToUniform !== null">
+              (norm {{ Number(selectorIntentEntropy.normalizedKlToUniform).toFixed(3) }})
+            </span>
+          </p>
+          <p class="entropy-note">
+            Raw = selector softmax. Mixed = selector-branch probabilities after epsilon floor. Deployed = final runtime distribution after alpha mixes the selector branch with uniform fallback.
+          </p>
+          <div class="entropy-table-wrapper">
+            <table class="entropy-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Play</th>
+                  <th>Raw</th>
+                  <th>Mixed</th>
+                  <th>Deployed</th>
+                  <th>Logit</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(item, idx) in selectorIntentPreferences.items"
+                  :key="`selector-intent-${item.intent_index}`"
+                  class="selector-intent-row"
+                  :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
+                  :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, getSelectorIntentPlotProb(item) * 100)).toFixed(2)}%` }"
+                >
+                  <td>{{ idx + 1 }}</td>
+                  <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
+                  <td>{{ (Number(item.raw_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
+                  <td>{{ (Number(item.mixed_prob ?? item.raw_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
+                  <td>{{ (Number(item.deployed_prob ?? item.prob ?? 0) * 100).toFixed(2) }}%</td>
+                  <td>{{ Number(item.logit).toFixed(3) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div v-if="!policyProbabilities || !hasPolicyData" class="no-data">
+          No policy probabilities available yet.
+        </div>
+        <div v-else class="parameters-grid">
+          <div
+            v-for="row in policyRowsByPlayer"
+            :key="`policy-${row.playerId}`"
+            class="param-category"
+          >
+            <h5>Player {{ row.playerId }}</h5>
+            <div v-if="!row.actions.length" class="no-data">
+              No legal actions available.
+            </div>
+            <div v-else class="entropy-table-wrapper">
+              <table class="entropy-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Action</th>
+                    <th>Prob</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="(action, idx) in row.actions"
+                    :key="`${row.playerId}-${action.action}`"
+                    :class="[
+                      'probability-bar-row',
+                      { 'current-intent-row': isSelectedPolicyAction(row.playerId, action.action) }
+                    ]"
+                    :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, Number(action.prob) * 100)).toFixed(2)}%` }"
+                  >
+                    <td>{{ idx + 1 }}</td>
+                    <td>{{ action.action }}</td>
+                    <td>{{ (action.prob * 100).toFixed(2) }}%</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Playbook Tab -->
+    <div v-if="activeTab === 'playbook'" class="tab-content">
+      <div class="entropy-section">
+        <h4>Playbook</h4>
+        <p class="entropy-note">
+          Aggregate intent-conditioned rollout patterns from the current state or a captured snapshot. The main board renders trajectory overlays after generation.
+        </p>
+
+        <div class="playbook-controls">
+          <div class="eval-row">
+            <label>Intent indices</label>
+            <input
+              type="text"
+              v-model="playbookIntentInput"
+              placeholder="0, 1, 2, 3"
+              :disabled="playbookControlsDisabled"
+            />
+            <span class="status-note">Parsed: {{ playbookSelectedIntentLabels.join(', ') || 'none' }}</span>
+          </div>
+
+          <div class="eval-row">
+            <label>Rollouts</label>
+            <input
+              type="number"
+              min="1"
+              max="512"
+              v-model.number="playbookNumRollouts"
+              :disabled="playbookControlsDisabled"
+            />
+            <label>Horizon</label>
+            <input
+              type="number"
+              min="1"
+              max="256"
+              v-model.number="playbookMaxSteps"
+              :disabled="playbookControlsDisabled || playbookRunToEnd"
+            />
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookRunToEnd"
+                :disabled="playbookControlsDisabled"
+              />
+              Run to end
+            </label>
+            <button
+              class="eval-run-btn"
+              @click="handleRunPlaybookAnalysis"
+              :disabled="playbookControlsDisabled"
+            >
+              {{ playbookRunning ? 'Generating…' : 'Generate' }}
+            </button>
+          </div>
+
+          <div v-if="playbookRunning" class="eval-progress-wrap">
+            <div
+              class="eval-progress-bar"
+              :aria-valuenow="playbookProgressSafe.completed"
+              :aria-valuemin="0"
+              :aria-valuemax="Math.max(1, playbookProgressSafe.total)"
+              role="progressbar"
+            >
+              <div
+                class="eval-progress-fill"
+                :class="{ indeterminate: playbookProgressSafe.total <= 0 }"
+                :style="playbookProgressSafe.total > 0 ? { width: playbookProgressPercent } : null"
+              />
+            </div>
+            <span class="eval-status">
+              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || (playbookSelectedIntentIndices.length * Number(playbookNumRollouts || 0)) }}
+            </span>
+            <span class="eval-status" v-if="playbookProgressSafe.total > 0">({{ playbookProgressPercent }})</span>
+          </div>
+
+          <div class="eval-row">
+            <label class="inline-label">
+              <input
+                type="radio"
+                :checked="playbookUseSnapshot"
+                @change="playbookUseSnapshot = true"
+                :disabled="playbookControlsDisabled"
+              />
+              Snapshot source
+            </label>
+            <label class="inline-label">
+              <input
+                type="radio"
+                :checked="!playbookUseSnapshot"
+                @change="playbookUseSnapshot = false"
+                :disabled="playbookControlsDisabled"
+              />
+              Current state source
+            </label>
+            <span class="status-note" v-if="playbookUseSnapshot">
+              {{ counterfactualSnapshotAvailable ? 'Using captured snapshot as pinned start state.' : 'No snapshot available yet.' }}
+            </span>
+          </div>
+
+          <div class="eval-row">
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookPlayerDeterministic"
+                :disabled="playbookControlsDisabled"
+              />
+              Player deterministic
+            </label>
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                v-model="playbookOpponentDeterministic"
+                :disabled="playbookControlsDisabled"
+              />
+              Opponent deterministic
+            </label>
+            <span class="status-note">
+              {{ playbookRunToEnd
+                ? 'Rollouts continue until the possession ends; Horizon is ignored.'
+                : 'Fully deterministic rollouts from the same source state collapse to a single trajectory.' }}
+            </span>
+          </div>
+        </div>
+
+        <div class="policy-status error" v-if="playbookError">
+          {{ playbookError }}
+        </div>
+
+        <div v-if="!playbookResult?.panels?.length" class="no-data">
+          No playbook preview generated yet.
+        </div>
+        <div v-else class="status-note">
+          Generated {{ playbookResult.panels.length }} intent trajectories using
+          {{ playbookResult.run_to_end ? 'full-possession rollouts' : `a ${playbookResult.max_steps}-step horizon` }}.
+          Use the Playbook dropdown above the main board to inspect them.
+        </div>
+        <div v-if="playbookResult?.panels?.length" class="playbook-summary-table-wrap">
+          <table class="playbook-summary-table">
+            <thead>
+              <tr>
+                <th>Play</th>
+                <th>Rollouts</th>
+                <th>Total Shots</th>
+                <th>Shot Rollout Rate</th>
+                <th>Avg First Shot Step</th>
+                <th>Avg Terminated Steps</th>
+                <th>Primary Shooter</th>
+                <th
+                  v-for="playerId in playbookOffenseColumnIds"
+                  :key="`playbook-summary-head-p${playerId}`"
+                >
+                  P{{ playerId }} Shots
+                </th>
+                <th>Terminal Outcomes</th>
+                <th>Turnover Reasons</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="panel in playbookResult.panels"
+                :key="`playbook-debug-${panel.intent_index}`"
+              >
+                <td class="playbook-summary-play-cell">
+                  {{ formatPlayLabel(panel.intent_index, playbookResult?.play_name_map || props.gameState?.play_name_map, panel.play_name) }}
+                </td>
+                <td>{{ Number(panel?.num_rollouts || 0) }}</td>
+                <td>{{ formatPlaybookTotalShots(panel) }}</td>
+                <td>{{ ((Number(panel?.shot_rollout_rate || 0)) * 100).toFixed(0) }}%</td>
+                <td>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</td>
+                <td>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</td>
+                <td>{{ getPlaybookPrimaryShooterSummary(panel) }}</td>
+                <td
+                  v-for="playerId in playbookOffenseColumnIds"
+                  :key="`playbook-summary-${panel.intent_index}-p${playerId}`"
+                >
+                  {{ formatPlaybookPlayerShotCell(panel, playerId) }}
+                </td>
+                <td>{{ formatPlaybookOutcomeSummary(panel) }}</td>
+                <td>{{ formatPlaybookTurnoverSummary(panel) }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -3804,6 +6301,362 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
+    <!-- Template Tab -->
+    <div v-if="activeTab === 'template'" class="tab-content eval-tab template-tab">
+      <div class="template-library-shell">
+        <div class="template-library-toolbar">
+          <input
+            ref="templateLibraryFileInput"
+            type="file"
+            accept=".json,.yaml,.yml,application/json,text/yaml,text/x-yaml"
+            class="template-file-input-hidden"
+            @change="handleTemplateLibraryFileChosen"
+          />
+          <div class="eval-row template-library-path-row">
+            <label>
+              Save path
+              <span
+                class="template-help"
+                data-tooltip="Optional repo/backend file path used by 'Load from path' and 'Save file'. Use 'Choose file' when you just want to import a local YAML or JSON file through the browser."
+              >?</span>
+            </label>
+            <input
+              v-model="templateLibraryPathInput"
+              class="template-path-input"
+              type="text"
+              placeholder="configs/start_templates_v1.yaml"
+              title="Repo/backend file path used for direct load/save."
+            />
+            <button
+              class="ghost-btn"
+              @click="triggerTemplateLibraryChooser"
+              :disabled="templateLibraryRequestPending"
+              title="Import a local YAML or JSON template file through the browser. This does not save back to that original file."
+            >
+              {{ templateLibraryRequestPending ? 'Loading…' : 'Import file' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleLoadTemplateLibraryFile"
+              :disabled="templateLibraryRequestPending || !templateLibraryPathInput"
+              title="Load the library from the repo/backend file path shown in Save path."
+            >
+              {{ templateLibraryRequestPending ? 'Loading…' : 'Load from path' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleSaveTemplateLibraryChooser"
+              :disabled="templateLibraryRequestPending"
+              title="Open a save dialog and write the current draft to a location you choose. In browsers without save-dialog support, this falls back to a normal download."
+            >
+              Save file
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleSaveTemplateLibraryFile"
+              :disabled="templateLibraryRequestPending"
+              title="Write the current draft to the repo/backend file path shown in Save path."
+            >
+              {{ templateLibraryRequestPending ? 'Saving…' : 'Save to path' }}
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handlePushTemplateLibraryDraft"
+              :disabled="templateLibraryRequestPending || !templateLibraryDirty"
+              title="Replace the active in-session template library used by the current UI session with this draft."
+            >
+              Push to session
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleReloadTemplateLibraryDraft"
+              :disabled="templateLibraryRequestPending"
+              title="Discard local draft changes and reload the current in-session template library."
+            >
+              Reload session
+            </button>
+          </div>
+          <div class="template-library-meta">
+            <span class="status-note">
+              Source:
+              <strong>{{ templateLibrarySourceLabel }}</strong>
+            </span>
+            <span class="status-note">
+              Templates:
+              <strong>{{ templateLibraryDraft.templates?.length || 0 }}</strong>
+            </span>
+            <span v-if="templateLibrarySessionPath && templateLibrarySource !== 'file_upload'" class="status-note">
+              Active path:
+              <strong>{{ templateLibrarySessionPath }}</strong>
+            </span>
+            <span v-if="templateLibraryImportedFilename" class="status-note">
+              Imported file:
+              <strong>{{ templateLibraryImportedFilename }}</strong>
+            </span>
+            <span v-if="templateLibraryDirty" class="status-note template-library-dirty">
+              Local draft has unsaved changes.
+            </span>
+          </div>
+          <div class="status-note">
+            `Import file` loads a browser-selected file into the session only. `Save file` opens a browser save dialog. `Save to path` writes to the backend path shown in `Save path`.
+          </div>
+          <div v-if="templateLibraryStatus" class="status-note">
+            {{ templateLibraryStatus }}
+          </div>
+          <div v-if="templateLibraryError" class="policy-status error">
+            {{ templateLibraryError }}
+          </div>
+        </div>
+
+        <div class="template-library-picker-card">
+          <div class="eval-row">
+            <label>
+              Selected template
+              <span
+                class="template-help"
+                data-tooltip="The template currently being edited. Selecting a different template loads its anchors, ball handler, jitter, and roles into the board authoring view."
+              >?</span>
+            </label>
+            <select
+              v-model="selectedEditableTemplateId"
+              :disabled="!editableTemplateOptions.length"
+              title="Select which template in the library you want to edit."
+            >
+              <option v-if="!editableTemplateOptions.length" disabled value="">
+                No templates loaded
+              </option>
+              <option
+                v-for="opt in editableTemplateOptions"
+                :key="`editable-template-${opt.value}`"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
+            <button
+              class="ghost-btn"
+              @click="addTemplateFromCurrentBoard"
+              title="Create a new template using the current board positions and current template editor settings."
+            >
+              Add from board
+            </button>
+            <button
+              class="ghost-btn"
+              @click="duplicateSelectedTemplate"
+              :disabled="!selectedEditableTemplate"
+              title="Copy the selected template to a new template id."
+            >
+              Duplicate
+            </button>
+            <button
+              class="ghost-btn template-danger-btn"
+              @click="deleteSelectedTemplate"
+              :disabled="!selectedEditableTemplate"
+              title="Delete the selected template from the draft library."
+            >
+              Delete
+            </button>
+            <button
+              class="ghost-btn"
+              @click="copyTemplateLibraryJson"
+              title="Copy the entire current draft library as JSON."
+            >
+              Copy library JSON
+            </button>
+            <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
+          </div>
+          <div
+            v-if="editableTemplateOptions.length"
+            class="template-library-chip-list"
+          >
+            <button
+              v-for="opt in editableTemplateOptions"
+              :key="`template-chip-${opt.value}`"
+              class="template-chip-btn"
+              :class="{ active: selectedEditableTemplateId === opt.value }"
+              @click="selectedEditableTemplateId = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="selectedEditableTemplate" class="template-editor-shell">
+          <div class="eval-row">
+            <label>
+              Template id
+              <span
+                class="template-help"
+                data-tooltip="Stable identifier for this template. This is what training, eval, UI controls, and MLflow artifacts use to reference the template."
+              >?</span>
+            </label>
+            <input
+              type="text"
+              :value="templateConfigSafe.templateId"
+              @input="setTemplateId($event.target.value)"
+              placeholder="wing_entry_help"
+              title="Stable template identifier used everywhere else in the app."
+            />
+            <span class="status-note">Board drags update the selected draft template directly in this tab.</span>
+          </div>
+
+          <div class="eval-row">
+            <label>
+              Weight
+              <span
+                class="template-help"
+                data-tooltip="Relative sampling weight when this library is used during training resets. Higher weight means this template is sampled more often."
+              >?</span>
+            </label>
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              :value="templateConfigSafe.weight"
+              @input="emitTemplateConfigUpdate({ weight: Math.max(0.01, Number($event.target.value) || 1.0) })"
+              title="Relative reset sampling weight for this template."
+            />
+            <label class="inline-label">
+              <input
+                type="checkbox"
+                :checked="templateConfigSafe.mirrorable"
+                @change="emitTemplateConfigUpdate({ mirrorable: $event.target.checked })"
+                title="Allow training/UI to mirror this template left-right."
+              />
+              Mirrorable
+              <span
+                class="template-help"
+                data-tooltip="If enabled, the template can be mirrored left-right. This only permits mirroring; it does not force it."
+              >?</span>
+            </label>
+            <label>
+              Shot clock
+              <span
+                class="template-help"
+                data-tooltip="Optional shot clock value applied when the template resolves. Useful when a template is supposed to represent a later-clock situation."
+              >?</span>
+            </label>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="templateConfigSafe.shotClock"
+              @input="emitTemplateConfigUpdate({ shotClock: Math.max(1, Number($event.target.value) || 24) })"
+              title="Shot clock assigned when this template resolves."
+            />
+          </div>
+
+          <div class="eval-row">
+            <label>
+              Ball starts with
+              <span
+                class="template-help"
+                data-tooltip="Which offense player row gets the has_ball marker in this concrete authoring view. Training still randomizes same-team assignment when the template resolves."
+              >?</span>
+            </label>
+            <select
+              :value="templateConfigSafe.ballHolder ?? ''"
+              @change="setTemplateBallHolder($event.target.value ? Number($event.target.value) : null)"
+              title="Concrete authoring-time ball holder for this template."
+            >
+              <option v-if="!templateBallStartOptions.length" disabled value="">No offense players</option>
+              <option v-for="pid in templateBallStartOptions" :key="`template-ball-${pid}`" :value="pid">Player {{ pid }}</option>
+            </select>
+            <button
+              class="ghost-btn"
+              @click="seedTemplateConfigFromGameState()"
+              title="Overwrite the selected template’s anchors with the current board state."
+            >
+              Use current board positions
+            </button>
+          </div>
+
+          <div class="eval-skills template-player-grid">
+            <div class="skills-header template-grid-header">
+              <span title="Concrete board player row used in the editor.">Player</span>
+              <span title="Whether this row belongs to offense or defense.">Team</span>
+              <span title="Template entry index within that team.">Entry</span>
+              <span title="Anchor hex [q, r] for this entry. You can drag on the board or edit the numbers directly.">Anchor</span>
+              <span title="Per-entry jitter radius before the library-wide jitter scale is applied.">Jitter</span>
+              <span title="Optional semantic tag for later analysis or UI display.">Role</span>
+            </div>
+            <div class="skills-row template-grid-row" v-for="row in templatePlayerRows" :key="`template-player-${row.playerId}`">
+              <span class="skills-player">P{{ row.playerId }}</span>
+              <span>{{ row.teamLabel }}</span>
+              <span>{{ row.entryIndex }}</span>
+              <div class="template-anchor-inputs">
+                <input
+                  type="number"
+                  step="1"
+                  :value="row.q"
+                  @input="updateTemplatePlayerAnchor(row.playerId, 0, $event.target.value)"
+                  title="Anchor q coordinate."
+                />
+                <input
+                  type="number"
+                  step="1"
+                  :value="row.r"
+                  @input="updateTemplatePlayerAnchor(row.playerId, 1, $event.target.value)"
+                  title="Anchor r coordinate."
+                />
+              </div>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                :value="row.jitter"
+                @input="updateTemplatePlayerJitter(row.playerId, $event.target.value)"
+                title="Per-entry jitter radius."
+              />
+              <input
+                type="text"
+                :value="row.role"
+                @input="updateTemplatePlayerRole(row.playerId, $event.target.value)"
+                :placeholder="row.teamLabel === 'Offense' && row.playerId === templateConfigSafe.ballHolder ? 'ball_handler' : 'role'"
+                title="Optional semantic role label."
+              />
+            </div>
+          </div>
+
+          <div class="eval-row template-export-actions">
+            <button
+              class="ghost-btn"
+              @click="copyTemplateExport('yaml')"
+              title="Copy only the selected template entry as YAML."
+            >
+              Copy YAML
+            </button>
+            <button
+              class="ghost-btn"
+              @click="copyTemplateExport('json')"
+              title="Copy only the selected template entry as JSON."
+            >
+              Copy JSON
+            </button>
+          </div>
+
+          <div class="eval-custom template-export-grid">
+            <div class="template-export-card">
+              <h5 title="Selected template only, formatted as YAML.">YAML Template Entry</h5>
+              <textarea class="template-export-textarea" readonly :value="templateYamlExport"></textarea>
+            </div>
+            <div class="template-export-card">
+              <h5 title="Selected template only, formatted as JSON.">JSON Template Entry</h5>
+              <textarea class="template-export-textarea" readonly :value="templateJsonExport"></textarea>
+            </div>
+            <div class="template-export-card">
+              <h5 title="Entire current draft library, formatted as JSON.">JSON Library Draft</h5>
+              <textarea class="template-export-textarea" readonly :value="templateLibraryJsonExport"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="no-data">
+          Load a template library or add a new template from the current board.
+        </div>
+      </div>
+    </div>
+
     <!-- Eval Tab -->
     <div v-if="activeTab === 'eval'" class="tab-content eval-tab">
       <div class="eval-row">
@@ -3834,9 +6687,20 @@ const stealRisks = computed(() => {
         >
           {{ props.isEvaluating ? 'Evaluating…' : 'Run Eval' }}
         </button>
-        <span v-if="props.isEvaluating" class="eval-status">
-          Running {{ evalEpisodesInput }} episodes…
-        </span>
+        <div v-if="props.isEvaluating" class="eval-progress-wrap">
+          <div class="eval-progress-bar" :aria-valuenow="evalProgressSafe.completed" :aria-valuemin="0" :aria-valuemax="Math.max(1, evalProgressSafe.total)" role="progressbar">
+            <div
+              class="eval-progress-fill"
+              :class="{ indeterminate: evalProgressSafe.total <= 0 }"
+              :style="evalProgressSafe.total > 0 ? { width: evalProgressPercent } : null"
+            ></div>
+          </div>
+          <span class="eval-status">
+            {{ evalProgressSafe.completed }}/{{ evalProgressSafe.total || evalEpisodesInput }}
+            episodes
+            <span v-if="evalProgressSafe.total > 0">({{ evalProgressPercent }})</span>
+          </span>
+        </div>
       </div>
 
       <div class="eval-row">
@@ -3848,6 +6712,22 @@ const stealRisks = computed(() => {
           />
           Randomize offense player slots each episode (shuffle positions)
         </label>
+      </div>
+
+      <div class="eval-row">
+        <label>Intent selection</label>
+        <select
+          :value="evalConfigSafe.intentSelectionMode"
+          :disabled="props.isEvaluating || !selectorEnabled"
+          @change="setEvalIntentSelectionMode($event.target.value)"
+        >
+          <option value="learned_sample">Learned sample</option>
+          <option value="best_intent">Best intent (argmax)</option>
+          <option value="uniform_random">Uniform random</option>
+        </select>
+        <span v-if="!selectorEnabled" class="status-note">
+          Selector is not enabled for this checkpoint.
+        </span>
       </div>
 
       <div v-if="evalModeIsCustom" class="eval-custom">
@@ -3919,7 +6799,111 @@ const stealRisks = computed(() => {
         <div v-if="!props.gameState" class="no-data">
           No game loaded
         </div>
-        <div v-else class="parameters-grid">
+        <div v-else>
+        <div class="parameters-grid">
+          <div v-if="hasLoadedStartTemplates" class="param-category">
+            <h5>Start Templates</h5>
+            <div class="eval-row">
+              <label>Template</label>
+              <select v-model="selectedStartTemplateId">
+                <option v-for="opt in startTemplateOptions" :key="`env-template-${opt.value}`" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+            <div class="eval-row">
+              <label class="inline-label">
+                <input type="checkbox" v-model="selectedStartTemplateMirrored" />
+                Mirror L|R
+              </label>
+              <button
+                class="ghost-btn"
+                @click="handleApplyStartTemplateToBoard"
+                :disabled="!selectedStartTemplateId"
+              >
+                Apply to board
+              </button>
+            </div>
+            <div class="status-note">
+              Apply a template here, then use Playbook with current state. For Eval custom setup, use the existing current-board copy flow in the Eval tab.
+            </div>
+            <div v-if="startTemplatePreviewModel" class="start-template-preview">
+              <svg
+                class="start-template-preview-svg"
+                :viewBox="`0 0 ${startTemplatePreviewModel.viewBox.width} ${startTemplatePreviewModel.viewBox.height}`"
+                role="img"
+                :aria-label="`Schematic preview for ${startTemplatePreviewModel.templateId}${startTemplatePreviewModel.mirrored ? ', mirrored left-right' : ''}`"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="startTemplatePreviewModel.court.x"
+                  :y="startTemplatePreviewModel.court.y"
+                  :width="startTemplatePreviewModel.court.width"
+                  :height="startTemplatePreviewModel.court.height"
+                  rx="8"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.backboardX"
+                  :y1="startTemplatePreviewModel.court.laneY"
+                  :x2="startTemplatePreviewModel.court.backboardX"
+                  :y2="startTemplatePreviewModel.court.laneY + startTemplatePreviewModel.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="startTemplatePreviewModel.court.hoopX"
+                  :cy="startTemplatePreviewModel.court.hoopY"
+                  :r="startTemplatePreviewModel.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="startTemplatePreviewModel.court.laneX"
+                  :y="startTemplatePreviewModel.court.laneY"
+                  :width="startTemplatePreviewModel.court.laneWidth"
+                  :height="startTemplatePreviewModel.court.laneHeight"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.x"
+                  :y1="startTemplatePreviewModel.court.arcTopY"
+                  :x2="startTemplatePreviewModel.court.arcLineX"
+                  :y2="startTemplatePreviewModel.court.arcTopY"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="startTemplatePreviewModel.court.x"
+                  :y1="startTemplatePreviewModel.court.arcBottomY"
+                  :x2="startTemplatePreviewModel.court.arcLineX"
+                  :y2="startTemplatePreviewModel.court.arcBottomY"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${startTemplatePreviewModel.court.arcLineX} ${startTemplatePreviewModel.court.arcTopY}
+                       A ${startTemplatePreviewModel.court.arcRadius} ${startTemplatePreviewModel.court.arcRadius} 0 0 1 ${startTemplatePreviewModel.court.arcLineX} ${startTemplatePreviewModel.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in startTemplatePreviewModel.entries"
+                  :key="entry.key"
+                  :x="entry.x"
+                  :y="entry.y"
+                  :class="['start-template-preview-marker', `team-${entry.team}`]"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <div class="status-note">
+                Anchor schematic only. Jitter is not shown.
+              </div>
+            </div>
+            <div v-if="startTemplateActionStatus" class="status-note">
+              {{ startTemplateActionStatus }}
+            </div>
+            <div v-if="startTemplateActionError" class="policy-status error">
+              {{ startTemplateActionError }}
+            </div>
+          </div>
           <div class="param-category">
             <h5>Environment Settings</h5>
             <div class="param-item" data-tooltip="Number of players on each team (offense and defense)">
@@ -3957,6 +6941,10 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="MLflow run ID used for currently loaded policies/state.">
               <span class="param-name">Run ID:</span>
               <span class="param-value">{{ props.gameState.run_id || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Stable nominal codename for the currently loaded model/run.">
+              <span class="param-name">Model codename:</span>
+              <span class="param-value">{{ props.gameState.model_codename || 'N/A' }}</span>
             </div>
             <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the player's team">
               <div class="policy-label">
@@ -4023,6 +7011,14 @@ const stealRisks = computed(() => {
               >
                 <span v-if="policiesLoading">⟳ Loading...</span>
                 <span v-else>⟳ Refresh </span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="$emit('swap-teams-requested')"
+                :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
+                title="Reinitialize the current run with the opposite user-controlled team"
+              >
+                ↔ Swap Teams
               </button>
             </div>
             <div class="policy-status" v-if="policiesLoading">
@@ -4379,43 +7375,36 @@ const stealRisks = computed(() => {
             </div>
             <div class="param-item" data-tooltip="Bias added to pass action logits in the policy network. Positive = encourage passing.">
               <span class="param-name">Pass logit bias:</span>
+              <input
+                class="env-param-input"
+                type="number"
+                step="0.05"
+                v-model.number="passLogitBiasInput"
+                :disabled="passLogitBiasUpdating"
+              />
             </div>
-            <div class="offense-skills-editor">
-              <div class="offense-skills-row header">`
-                `
-                <span>Setting</span>
-                <span>Bias</span>
-                <span></span>
-                <span></span>
-              </div>
-              <div class="offense-skills-row">
-                <span class="skills-player">Pass logit bias</span>
-                <div class="offense-skill-input">
-                  <input type="number" step="0.05" v-model.number="passLogitBiasInput" :disabled="passLogitBiasUpdating" />
-                  <span class="offense-skill-default">Default {{ passLogitBiasDefault.toFixed(2) }}</span>
-                </div>
-                <span></span>
-                <span></span>
-              </div>
-              <div class="offense-skill-actions">
-                <button
-                  class="refresh-policies-btn"
-                  @click="resetPassLogitBiasDefault"
-                  :disabled="passLogitBiasUpdating"
-                >
-                  Reset 
-                </button>
-                <button
-                  class="refresh-policies-btn"
-                  @click="applyPassLogitBiasOverride"
-                  :disabled="passLogitBiasUpdating"
-                >
-                  {{ passLogitBiasUpdating ? 'Saving...' : 'Apply ' }}
-                </button>
-              </div>
-              <div class="policy-status error" v-if="passLogitBiasError">
-                {{ passLogitBiasError }}
-              </div>
+            <div class="param-item" data-tooltip="Default pass logit bias from the loaded policy/config.">
+              <span class="param-name">Default bias:</span>
+              <span class="param-value">{{ passLogitBiasDefault.toFixed(2) }}</span>
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="resetPassLogitBiasDefault"
+                :disabled="passLogitBiasUpdating"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyPassLogitBiasOverride"
+                :disabled="passLogitBiasUpdating"
+              >
+                {{ passLogitBiasUpdating ? 'Saving...' : 'Apply' }}
+              </button>
+            </div>
+            <div class="policy-status error" v-if="passLogitBiasError">
+              {{ passLogitBiasError }}
             </div>
           </div>
 
@@ -4462,6 +7451,208 @@ const stealRisks = computed(() => {
               <span class="param-value">{{ props.gameState.offensive_lane_hexes?.length || 0 }} hexes</span>
             </div>
           </div>
+
+          <div class="param-category">
+            <h5>Counterfactual Snapshot</h5>
+            <div class="param-item" data-tooltip="Whether a branch point snapshot is currently stored for restoring the exact current state later.">
+              <span class="param-name">Snapshot stored:</span>
+              <span class="param-value">{{ counterfactualSnapshotAvailable ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Step index captured when the snapshot was stored.">
+              <span class="param-name">Captured step:</span>
+              <span class="param-value">{{ counterfactualSnapshotStep ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Shot clock value in the stored snapshot.">
+              <span class="param-name">Snapshot shot clock:</span>
+              <span class="param-value">{{ counterfactualSnapshotShotClock ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Ball holder stored in the snapshot.">
+              <span class="param-name">Snapshot ball holder:</span>
+              <span class="param-value">{{ counterfactualSnapshotBallHolder ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent state stored in the snapshot.">
+              <span class="param-name">Snapshot intent:</span>
+              <span class="param-value">{{ counterfactualSnapshotIntentSummary }}</span>
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="handleCaptureCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled"
+              >
+                <font-awesome-icon :icon="['fas', 'camera']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Saving...' : 'Capture' }}</span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="handleRestoreCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled || !counterfactualSnapshotAvailable"
+              >
+                <font-awesome-icon :icon="['fas', 'redo']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Restoring...' : 'Restore' }}</span>
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="handleReplayCounterfactualSnapshot"
+                :disabled="counterfactualSnapshotControlsDisabled || !counterfactualSnapshotAvailable || props.gameState?.done"
+                data-tooltip="Autoplay deterministically from the current live state. Restore the snapshot first if you want to branch from the saved point."
+              >
+                <font-awesome-icon :icon="['fas', 'play']" />
+                <span>{{ counterfactualSnapshotUpdating ? 'Playing...' : 'Play' }}</span>
+              </button>
+            </div>
+            <div class="policy-status error" v-if="counterfactualSnapshotError">
+              {{ counterfactualSnapshotError }}
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Intent Learning</h5>
+            <div class="param-item" data-tooltip="Whether latent intent/play learning is enabled in this environment.">
+              <span class="param-name">Enabled:</span>
+              <span class="param-value">{{ props.gameState.enable_intent_learning ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of latent intent categories available to offense when intent is active.">
+              <span class="param-name">Num intents:</span>
+              <span class="param-value">{{ props.gameState.num_intents ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent observability mode (private_offense, public, hidden).">
+              <span class="param-name">Observation mode:</span>
+              <span class="param-value">{{ props.gameState.intent_obs_mode || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured commitment window for active intent state.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ props.gameState.intent_commitment_steps ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured probability of null/no-intent episodes.">
+              <span class="param-name">Null intent prob:</span>
+              <span class="param-value">{{ props.gameState.intent_null_prob != null ? (props.gameState.intent_null_prob * 100).toFixed(1) + '%' : 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Configured probability of exposing intent to defense.">
+              <span class="param-name">Visible-to-defense prob:</span>
+              <span class="param-value">{{ props.gameState.intent_visible_to_defense_prob != null ? (props.gameState.intent_visible_to_defense_prob * 100).toFixed(1) + '%' : 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether intent-diversity objective is enabled for the model run loaded in this session.">
+              <span class="param-name">Diversity enabled:</span>
+              <span class="param-value">{{ props.gameState.intent_diversity_enabled == null ? 'N/A' : (props.gameState.intent_diversity_enabled ? '✓ Yes' : '✗ No') }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether current possession has an active latent intent.">
+              <span class="param-name">Current active:</span>
+              <template v-if="props.gameState.enable_intent_learning">
+                <label class="param-value">
+                  <input
+                    type="checkbox"
+                    v-model="intentStateInput.active"
+                    :disabled="intentControlsDisabled"
+                  />
+                  <span>{{ intentStateInput.active ? ' Enabled' : ' Disabled' }}</span>
+                </label>
+              </template>
+              <span v-else class="param-value">{{ props.gameState.intent_active_current ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current latent play identity (masked elsewhere when hidden).">
+              <span class="param-name">Current play:</span>
+              <div v-if="props.gameState.enable_intent_learning" class="param-select-wrapper">
+                <select
+                  v-model.number="intentStateInput.intent_index"
+                  :disabled="intentControlsDisabled"
+                >
+                  <option
+                    v-for="opt in currentPlayOptions"
+                    :key="opt.value"
+                    :value="opt.value"
+                  >
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </div>
+              <span v-else class="param-value">
+                {{ formatPlayLabel(props.gameState.intent_index_current, props.gameState?.play_name_map, props.gameState?.current_play_name) }}
+              </span>
+            </div>
+            <div class="param-item" data-tooltip="Current age of active intent (steps since sampled).">
+              <span class="param-name">Current age:</span>
+              <input
+                v-if="props.gameState.enable_intent_learning"
+                class="env-param-input"
+                type="number"
+                min="0"
+                :max="intentAgeMax"
+                step="1"
+                v-model.number="intentStateInput.intent_age"
+                :disabled="intentControlsDisabled"
+              />
+              <span v-else class="param-value">{{ props.gameState.intent_age ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Remaining commitment steps before intent can be reconsidered.">
+              <span class="param-name">Commitment remaining:</span>
+              <span class="param-value">{{ props.gameState.intent_commitment_remaining ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether this possession's intent is currently visible to the defense role.">
+              <span class="param-name">Current defense-visible:</span>
+              <span class="param-value">{{ props.gameState.intent_visible_to_defense_current ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="offense-skill-actions" v-if="props.gameState.enable_intent_learning">
+              <button
+                class="refresh-policies-btn"
+                @click="resetIntentStateInputs"
+                :disabled="intentStateUpdating"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyIntentStateOverride"
+                :disabled="intentControlsDisabled"
+              >
+                {{ intentStateUpdating ? 'Saving...' : 'Apply' }}
+              </button>
+              <div class="policy-status error" v-if="intentStateError">
+                {{ intentStateError }}
+              </div>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector</h5>
+            <div class="param-item" data-tooltip="Whether the learned play selector mu(z|s) was enabled in the loaded training run.">
+              <span class="param-name">Enabled:</span>
+              <span class="param-value">{{ selectorEnabled ? '✓ Yes' : '✗ No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Which selector implementation path trained this checkpoint.">
+              <span class="param-name">Path:</span>
+              <span class="param-value">{{ selectorImplementationLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation mixes uniform intent sampling with selector-driven play calling using alpha.">
+              <span class="param-name">Alpha schedule:</span>
+              <span class="param-value">{{ selectorAlphaSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Warmup and ramp window controlling when selector-driven play calling begins to replace uniform sampling.">
+              <span class="param-name">Warmup / ramp:</span>
+              <span class="param-value">{{ selectorScheduleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Entropy regularization applied to the selector's categorical distribution over intents.">
+              <span class="param-name">Entropy coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_entropy_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Coverage regularizer that penalizes selector collapse by pushing average usage back toward uniform.">
+              <span class="param-name">Usage reg coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Integrated selector runs add a selector critic/value head on top of the shared selector context.">
+              <span class="param-name">Selector critic:</span>
+              <span class="param-value">{{ selectorCriticEnabled ? '✓ Enabled' : '✗ No / not logged' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Weight on the selector value loss when the integrated selector critic is enabled.">
+              <span class="param-name">Value coef:</span>
+              <span class="param-value">{{ selectorValueCoef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="The selector uses the shared set-attention state encoder and emits intent logits, plus a selector value estimate in the integrated critic path.">
+              <span class="param-name">Architecture:</span>
+              <span class="param-value">{{ selectorEnabled ? `${selectorHeadContextLabel}, ${selectorHeadSummary}` : 'N/A' }}</span>
+            </div>
+          </div>
+        </div>
         </div>
       </div>
     </div>
@@ -4567,6 +7758,240 @@ const stealRisks = computed(() => {
             <div class="param-item" v-if="paramCounts" data-tooltip="Value head parameters (offense/defense critics).">
               <span class="param-name">Params (value):</span>
               <span class="param-value">{{ formatParamCount(paramCounts.value_heads) }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Discriminator Architecture</h5>
+            <div class="param-item" data-tooltip="Whether the DIAYN-style intent discriminator bonus was enabled during training.">
+              <span class="param-name">Intent diversity:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_enabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Encoder used to summarize the intent-conditioned trajectory before classification.">
+              <span class="param-name">Encoder:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_encoder_type || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Hidden width of the discriminator MLP head.">
+              <span class="param-name">Hidden dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_hidden_dim ?? 'N/A' }}</span>
+            </div>
+            <div
+              class="param-item"
+              v-if="props.gameState.training_params.intent_disc_encoder_type === 'gru'"
+              data-tooltip="Per-step embedding width before the GRU consumes the trajectory."
+            >
+              <span class="param-name">Step dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_step_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Dropout applied inside the discriminator network.">
+              <span class="param-name">Dropout:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_dropout ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Maximum flattened observation features passed into the discriminator per step.">
+              <span class="param-name">Max obs dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_max_obs_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Maximum flattened action features passed into the discriminator per step.">
+              <span class="param-name">Max action dim:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_max_action_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Optimizer learning rate for the intent discriminator.">
+              <span class="param-name">Disc LR:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_lr?.toExponential?.(2) || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Batch size for discriminator updates at rollout end.">
+              <span class="param-name">Disc batch size:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_batch_size ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many discriminator optimization passes run after each rollout.">
+              <span class="param-name">Updates/rollout:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_disc_updates_per_rollout ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether training exported the discriminator eval batch artifact after each alternation checkpoint.">
+              <span class="param-name">Eval batch output:</span>
+              <span class="param-value">{{ props.gameState.training_params.disc_eval_batch_output ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Intent Objective</h5>
+            <div class="param-item" data-tooltip="Number of discrete latent plays available to the policy.">
+              <span class="param-name">Num intents:</span>
+              <span class="param-value">{{ props.gameState.training_params.num_intents ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many steps an active intent stays in force before it deactivates.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_commitment_steps ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Who can observe the latent intent in the model observation.">
+              <span class="param-name">Obs mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_obs_mode || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability of sampling no offense intent. If scheduled, this is the start value.">
+              <span class="param-name">Null prob:</span>
+              <span class="param-value" v-if="props.gameState.training_params.intent_null_prob_end != null">
+                {{ props.gameState.training_params.intent_null_prob }} → {{ props.gameState.training_params.intent_null_prob_end }}
+              </span>
+              <span class="param-value" v-else>{{ props.gameState.training_params.intent_null_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability that the offense intent is visible to defense. If scheduled, this is the start value.">
+              <span class="param-name">Defense-visible prob:</span>
+              <span class="param-value" v-if="props.gameState.training_params.intent_visible_to_defense_prob_end != null">
+                {{ props.gameState.training_params.intent_visible_to_defense_prob }} → {{ props.gameState.training_params.intent_visible_to_defense_prob_end }}
+              </span>
+              <span class="param-value" v-else>{{ props.gameState.training_params.intent_visible_to_defense_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether a separate latent intent is also trained for the defense.">
+              <span class="param-name">Defense intent:</span>
+              <span class="param-value">{{ props.gameState.training_params.enable_defense_intent_learning ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" v-if="props.gameState.training_params.enable_defense_intent_learning" data-tooltip="Probability of sampling no defense intent.">
+              <span class="param-name">Defense null prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.defense_intent_null_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Target scale for the DIAYN-style intrinsic bonus once fully ramped.">
+              <span class="param-name">Beta target:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_beta_target ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of timesteps before the intent diversity reward starts contributing.">
+              <span class="param-name">Warmup steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_warmup_steps?.toLocaleString?.() || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of timesteps used to ramp the diversity beta from zero to target.">
+              <span class="param-name">Ramp steps:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_ramp_steps?.toLocaleString?.() || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Clip range applied to the normalized discriminator bonus before reward shaping.">
+              <span class="param-name">Bonus clip:</span>
+              <span class="param-value">{{ props.gameState.training_params.intent_diversity_clip ?? 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Task Reward Curriculum</h5>
+            <div class="param-item" data-tooltip="Scale applied to the aggregated environment task reward returned to PPO. Values below 1.0 create a DIAYN-first curriculum by downweighting basketball reward early.">
+              <span class="param-name">Task reward scale:</span>
+              <span class="param-value">{{ taskRewardScaleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent holding task reward at the start scale, then ramping it back to the end scale.">
+              <span class="param-name">Task reward schedule:</span>
+              <span class="param-value">{{ taskRewardScheduleSummary }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Start Templates</h5>
+            <div class="param-item" data-tooltip="Optional curriculum that resolves a sampled formation template into exact initial positions before reset. When disabled, the environment uses the default spawn generator only.">
+              <span class="param-name">Template mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_enabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability that a reset uses a sampled start template instead of the default spawn logic.">
+              <span class="param-name">Template prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Global multiplier applied to per-player jitter radii inside the sampled start template.">
+              <span class="param-name">Jitter scale:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_jitter_scale ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Probability of mirroring a mirrorable template left/right before resolving player anchors.">
+              <span class="param-name">Mirror prob:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_mirror_prob ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="If enabled, invalid or unreadable template libraries fail fast instead of silently disabling the start-template feature.">
+              <span class="param-name">Strict mode:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_strict ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Path to the JSON/YAML template library used for the run.">
+              <span class="param-name">Library:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_library || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="MLflow artifact path for the canonical persisted start-template library logged with the run.">
+              <span class="param-name">Artifact:</span>
+              <span class="param-value">{{ props.gameState.training_params.start_template_library_artifact_path || 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of templates available from the persisted library artifact currently loaded into the UI session.">
+              <span class="param-name">Template count:</span>
+              <span class="param-value">{{ props.gameState.start_template_library?.templates?.length ?? props.gameState.training_params.start_template_library_template_count ?? 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector Architecture</h5>
+            <div class="param-item" data-tooltip="Whether the learned high-level play selector head mu(z|s) was enabled for this run.">
+              <span class="param-name">Selector enabled:</span>
+              <span class="param-value">{{ selectorEnabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current implementation uses the same shared set-attention encoder for low-level control and selector context.">
+              <span class="param-name">Selector context:</span>
+              <span class="param-value">{{ selectorHeadContextLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Hidden width of the selector head MLP before intent logits.">
+              <span class="param-name">Head hidden dim:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_hidden_dim ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the selector path includes a learned value baseline/critic in addition to intent logits.">
+              <span class="param-name">Selector heads:</span>
+              <span class="param-value">{{ selectorHeadSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Selector decision points. With multiselect off, mu chooses one play at offense possession start. With multiselect on, a completed pass can trigger reselection later in the same possession once the minimum play length is satisfied.">
+              <span class="param-name">Decision boundary:</span>
+              <span class="param-value">{{ selectorDecisionBoundaryLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Which selector implementation path trained this checkpoint.">
+              <span class="param-name">Integration:</span>
+              <span class="param-value">{{ selectorImplementationLabel }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>&mu; Selector Mechanics</h5>
+            <div class="param-item" data-tooltip="mu does not fully replace uniform intent sampling immediately. It mixes between uniform play sampling and selector-driven play choice using alpha.">
+              <span class="param-name">Alpha schedule:</span>
+              <span class="param-value">{{ selectorAlphaSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent before selector usage begins, followed by the selector ramp window.">
+              <span class="param-name">Schedule:</span>
+              <span class="param-value">{{ selectorScheduleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Uniform exploration floor mixed into selector sampling when the selector branch is active. Larger epsilon keeps broad play exploration alive even if raw selector logits start to collapse.">
+              <span class="param-name">Selector eps:</span>
+              <span class="param-value">{{ selectorEpsSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Timesteps spent before ramping the selector's internal uniform-exploration floor, then the ramp window from eps-start to eps-end.">
+              <span class="param-name">Eps schedule:</span>
+              <span class="param-value">{{ selectorEpsScheduleSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Entropy regularization on the selector distribution over intents. This is distinct from low-level PPO action entropy.">
+              <span class="param-name">Selector entropy coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_entropy_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="KL-to-uniform regularization on average selector usage to prevent early play collapse.">
+              <span class="param-name">Usage reg coef:</span>
+              <span class="param-value">{{ selectorTrainingParams.intent_selector_usage_reg_coef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the selector is allowed to choose a new play again within the same possession. When disabled, one selected play remains fixed for the full possession.">
+              <span class="param-name">Multiselect:</span>
+              <span class="param-value">{{ selectorMultiselectEnabled ? '✓ Enabled' : '✗ Disabled' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Minimum segment length before a completed pass can trigger selector reselection. This only matters when multiselect is enabled.">
+              <span class="param-name">Min play steps:</span>
+              <span class="param-value">{{ selectorMinPlayStepsSummary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Weight on the selector value-loss term in the integrated selector critic path.">
+              <span class="param-name">Value coef:</span>
+              <span class="param-value">{{ selectorValueCoef ?? 'N/A' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How selector updates are optimized in this checkpoint.">
+              <span class="param-name">Objective:</span>
+              <span class="param-value">{{ selectorObjectiveLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current integrated selector critic still trains on full-possession return; segment-return reselection is a later planned extension.">
+              <span class="param-name">Credit target:</span>
+              <span class="param-value">{{ selectorCreditAssignmentLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="The action policy still produces low-level pi(a|s,z). The selector chooses z only at its configured decision boundaries; the low-level policy then executes under that active play id.">
+              <span class="param-name">Low-level policy:</span>
+              <span class="param-value">pi(a|s,z) under active z</span>
             </div>
           </div>
 
@@ -4882,6 +8307,9 @@ const stealRisks = computed(() => {
                 <div class="token-attn-note" v-if="tokenAttentionSubtitle">
                   {{ tokenAttentionSubtitle }}
                 </div>
+                <div class="token-attn-note" v-if="tokenAttentionRuntimeSummary">
+                  {{ tokenAttentionRuntimeSummary }}
+                </div>
                 <div class="token-table-scroll">
                   <table class="observation-table token-table token-attn-table">
                     <thead>
@@ -4972,7 +8400,7 @@ const stealRisks = computed(() => {
   padding: 0.5rem 1rem;
   border: 1px solid var(--app-panel-border);
   background-color: transparent;
-  cursor: pointer;
+  cursor: grab;
   border-bottom: 1px solid transparent;
   font-weight: 500;
   color: var(--app-text-muted);
@@ -4985,6 +8413,11 @@ const stealRisks = computed(() => {
 .tab-navigation button:hover {
   color: var(--app-text);
   background-color: rgba(255, 255, 255, 0.03);
+}
+
+.tab-navigation button.dragging {
+  opacity: 0.6;
+  cursor: grabbing;
 }
 
 .tab-navigation button.active {
@@ -5356,6 +8789,44 @@ const stealRisks = computed(() => {
   color: var(--app-accent);
 }
 
+.selector-intent-card {
+  margin-bottom: 1rem;
+}
+
+.probability-bar-row,
+.selector-intent-row {
+  --selector-prob-width: 0%;
+  background-image: linear-gradient(90deg, rgba(56, 189, 248, 0.24), rgba(56, 189, 248, 0.24));
+  background-repeat: no-repeat;
+  background-size: var(--selector-prob-width) 100%;
+  transition: background-size 160ms ease-out;
+}
+
+.probability-bar-row td,
+.selector-intent-row td {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  text-shadow: 0 1px 0 rgba(2, 6, 23, 0.8);
+}
+
+.probability-bar-row:hover td,
+.selector-intent-row:hover td {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.current-intent-row {
+  background-color: rgba(244, 114, 182, 0.06);
+  background-image: linear-gradient(90deg, rgba(244, 114, 182, 0.24), rgba(244, 114, 182, 0.24));
+  background-repeat: no-repeat;
+  background-size: var(--selector-prob-width) 100%;
+}
+
+.current-intent-row td {
+  font-weight: 600;
+  font-size: larger;
+}
+
 .no-rewards {
   text-align: center;
   padding: 2rem;
@@ -5667,6 +9138,48 @@ const stealRisks = computed(() => {
   border: 1px solid var(--app-panel-border);
 }
 
+.start-template-preview {
+  margin-top: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.start-template-preview-svg {
+  width: 100%;
+  max-width: 360px;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+  border: 1px solid rgba(226, 232, 240, 0.16);
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+.start-template-preview-board {
+  fill: transparent;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 2;
+}
+
+.start-template-preview-line {
+  fill: none;
+  stroke: rgba(248, 250, 252, 0.92);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.start-template-preview-marker {
+  fill: rgba(248, 250, 252, 0.96);
+  font-family: "Courier New", monospace;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.start-template-preview-marker.team-defense {
+  fill: rgba(226, 232, 240, 0.82);
+}
+
 .param-category h5 {
   margin: 0 0 0.8rem 0;
   color: var(--app-accent);
@@ -5865,6 +9378,9 @@ const stealRisks = computed(() => {
 }
 
 .refresh-policies-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
   padding: 0.35rem 0.75rem;
   font-size: 0.8rem;
   border-radius: 6px;
@@ -5934,7 +9450,8 @@ const stealRisks = computed(() => {
 
 .offense-skill-actions {
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 0.5rem;
   margin-top: 0.25rem;
 }
@@ -6187,6 +9704,69 @@ const stealRisks = computed(() => {
   align-items: center;
   gap: 0.35rem;
 }
+.playbook-controls .eval-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.playbook-controls .inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.playbook-results-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.playbook-summary-table-wrap {
+  margin-top: 0.9rem;
+  overflow-x: auto;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.52);
+}
+.playbook-summary-table {
+  width: 100%;
+  min-width: 1120px;
+  border-collapse: collapse;
+}
+.playbook-summary-table th,
+.playbook-summary-table td {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  text-align: left;
+  vertical-align: top;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+.playbook-summary-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgba(15, 23, 42, 0.96);
+  color: #94a3b8;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.playbook-summary-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.playbook-summary-table tbody tr:hover td {
+  background: rgba(30, 41, 59, 0.42);
+}
+.playbook-summary-play-cell {
+  color: #38bdf8 !important;
+  font-weight: 700;
+  white-space: nowrap;
+}
 .eval-run-btn {
   padding: 0.5rem 1rem;
   border-radius: 12px;
@@ -6199,8 +9779,43 @@ const stealRisks = computed(() => {
   opacity: 0.6;
   cursor: not-allowed;
 }
+.eval-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.eval-progress-bar {
+  width: 180px;
+  height: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.eval-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #38bdf8);
+}
+.eval-progress-fill.indeterminate {
+  animation: indeterminate-progress 1.5s linear infinite;
+}
 .eval-status {
   color: #38bdf8;
+}
+@keyframes indeterminate-progress {
+  0% {
+    transform: translateX(-100%);
+    width: 35%;
+  }
+  50% {
+    transform: translateX(150%);
+  }
+  100% {
+    transform: translateX(-100%);
+    width: 35%;
+  }
 }
 .eval-custom {
   display: flex;
@@ -6248,6 +9863,178 @@ const stealRisks = computed(() => {
   justify-content: flex-end;
   margin-top: 0.25rem;
 }
+.template-player-grid {
+  gap: 0.55rem;
+}
+.template-library-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.template-library-toolbar,
+.template-library-picker-card,
+.template-editor-shell {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.85rem;
+  background: rgba(15, 23, 42, 0.5);
+}
+.template-library-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.template-library-path-row {
+  align-items: center;
+}
+.template-file-input-hidden {
+  display: none;
+}
+.template-path-input {
+  flex: 1 1 320px;
+  min-width: 220px;
+}
+.template-library-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+.template-library-dirty {
+  color: #fbbf24;
+}
+.template-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.35rem;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--app-accent);
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  position: relative;
+  vertical-align: middle;
+}
+.template-help[data-tooltip]::before {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.6rem 0.8rem;
+  background: rgba(15, 23, 42, 0.98);
+  color: var(--app-text);
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.4;
+  border-radius: 8px;
+  border: 1px solid var(--app-accent);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 15px rgba(56, 189, 248, 0.15);
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  z-index: 1000;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  pointer-events: none;
+  text-align: left;
+}
+.template-help[data-tooltip]::after {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-top-color: var(--app-accent);
+  z-index: 1001;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+.template-help[data-tooltip]:hover::before,
+.template-help[data-tooltip]:hover::after {
+  opacity: 1;
+  visibility: visible;
+}
+.template-library-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.template-chip-btn {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  padding: 0.32rem 0.75rem;
+  background: rgba(15, 23, 42, 0.45);
+  color: #cbd5e1;
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+}
+.template-chip-btn:hover {
+  border-color: #7dd3fc;
+  color: #f8fafc;
+}
+.template-chip-btn.active {
+  border-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+  color: #38bdf8;
+}
+.template-grid-header,
+.template-grid-row {
+  grid-template-columns: 0.9fr 0.9fr 0.6fr 1fr 0.8fr 1.2fr;
+}
+.template-grid-row span {
+  color: #e2e8f0;
+}
+.template-anchor-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+.template-anchor-inputs input {
+  width: 100%;
+}
+.template-export-actions {
+  justify-content: flex-end;
+}
+.template-export-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 0.9rem;
+}
+.template-export-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.template-export-card h5 {
+  margin: 0;
+  color: #cbd5e1;
+}
+.template-export-textarea {
+  width: 100%;
+  min-height: 260px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(2, 6, 23, 0.72);
+  color: #e2e8f0;
+  padding: 0.75rem;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
 .ghost-btn {
   background: transparent;
   color: #38bdf8;
@@ -6258,6 +10045,17 @@ const stealRisks = computed(() => {
 }
 .ghost-btn:hover {
   border-color: #7dd3fc;
+}
+.ghost-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.template-danger-btn {
+  color: #fda4af;
+  border-color: rgba(244, 63, 94, 0.35);
+}
+.template-danger-btn:hover:not(:disabled) {
+  border-color: #fb7185;
 }
 .stats-selector {
   display: flex;

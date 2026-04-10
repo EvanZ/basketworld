@@ -37,12 +37,14 @@ if os.path.exists(os.path.expanduser('~/.aws/credentials')):
 # === END CRITICAL SECTION ===
 
 from datetime import datetime
+import json
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Logger, HumanOutputFormat
+from basketworld.algorithms import IntegratedIntentSelectorPPO
 from basketworld.utils.mlflow_logger import MLflowWriter
 from basketworld.utils.callbacks import MLflowCallback
 from basketworld.utils.schedule_state import (
@@ -66,6 +68,11 @@ import time
 import basketworld
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
+from basketworld.utils.play_names import (
+    PLAY_NAME_POOL_VERSION,
+    build_model_codename,
+    build_play_name_artifact_payload,
+)
 from basketworld.utils.self_play_wrapper import SelfPlayEnvWrapper
 from basketworld.utils.action_resolution import IllegalActionStrategy
 from basketworld.utils.wrappers import (
@@ -96,6 +103,7 @@ try:
         get_random_policy_from_artifacts,
         get_opponent_policy_pool_for_envs,
         get_latest_policy_path,
+        get_latest_discriminator_checkpoint_path,
         get_latest_unified_policy_path,
         get_max_alternation_index,
         transfer_critic_weights,
@@ -108,6 +116,11 @@ try:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_task_reward_scale_callback,
+        build_intent_robustness_callback,
+        build_intent_diversity_callback,
+        build_intent_selector_callback,
+        build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -126,6 +139,7 @@ except ImportError:
         get_random_policy_from_artifacts,
         get_opponent_policy_pool_for_envs,
         get_latest_policy_path,
+        get_latest_discriminator_checkpoint_path,
         get_latest_unified_policy_path,
         get_max_alternation_index,
         transfer_critic_weights,
@@ -145,6 +159,11 @@ except ImportError:
         build_beta_callback,
         build_pass_bias_callback,
         build_pass_curriculum_callback,
+        build_task_reward_scale_callback,
+        build_intent_robustness_callback,
+        build_intent_diversity_callback,
+        build_intent_selector_callback,
+        build_intent_policy_sensitivity_callback,
         build_mixed_callbacks,
         build_mixed_logger,
         log_opponent_mapping,
@@ -165,6 +184,57 @@ except RuntimeError:
 torch.__config__.show()
 
 
+def _log_cli_args_artifact() -> None:
+    """Log the raw CLI invocation as an MLflow text artifact."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = os.path.join(tmpdir, "cli_args.txt")
+            with open(artifact_path, "w", encoding="utf-8") as f:
+                f.write("cwd:\n")
+                f.write(f"{os.getcwd()}\n\n")
+                f.write("argv_raw:\n")
+                for arg in sys.argv:
+                    f.write(f"{arg}\n")
+                f.write("\nargv_shell_quoted:\n")
+                f.write(" ".join(shlex.quote(arg) for arg in sys.argv))
+                f.write("\n")
+            mlflow.log_artifact(artifact_path, artifact_path="run_context")
+    except Exception as exc:
+        print(f"Warning: failed to log CLI args artifact: {exc}")
+
+
+def _log_start_template_library_artifact(args) -> None:
+    """Log the resolved start-template library as a canonical MLflow artifact."""
+    if not bool(getattr(args, "start_template_enabled", False)):
+        return
+    source_path = getattr(args, "start_template_library", None)
+    if not source_path:
+        return
+    try:
+        from basketworld.utils.start_templates import load_start_template_library
+
+        library = load_start_template_library(
+            source_path,
+            players_per_side=int(getattr(args, "players", 3) or 3),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_name = "start_template_library.json"
+            artifact_path = os.path.join(tmpdir, artifact_name)
+            with open(artifact_path, "w", encoding="utf-8") as f:
+                json.dump(library, f, indent=2)
+            mlflow.log_artifact(artifact_path, artifact_path="metadata")
+        mlflow.log_param(
+            "start_template_library_artifact_path",
+            f"metadata/{artifact_name}",
+        )
+        mlflow.log_param(
+            "start_template_library_template_count",
+            int(len(library.get("templates", []) or [])),
+        )
+    except Exception as exc:
+        print(f"[start_templates] Failed to log template library artifact: {exc}")
+
+
 def main(args):
     """Main training function."""
     
@@ -179,6 +249,12 @@ def main(args):
         if not args.use_dual_critic:
             print(f"[Config] Auto-enabling --use-dual-critic due to --init-critic-from-run")
             args.use_dual_critic = True
+
+    # --- Auto-enable dual critic if set-based observations are requested ---
+    # Set-attention policy currently depends on dual critics.
+    if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
+        print("[Config] Auto-enabling --use-dual-critic due to --use-set-obs")
+        args.use_dual_critic = True
 
     # --- Set up Device ---
     device = get_device(args.device)
@@ -225,6 +301,7 @@ def main(args):
 
     with mlflow.start_run(run_name=args.mlflow_run_name) as run:
         print("MLflow tracking URI:", mlflow.get_tracking_uri())
+        _log_cli_args_artifact()
         # Log hyperparameters
         mlflow.log_params(vars(args))
         
@@ -234,10 +311,6 @@ def main(args):
         mlflow.log_param("role_flag_defense_value", -1.0)
         mlflow.log_param("role_flag_encoding_version", "symmetric")  # "symmetric" vs "legacy"
         
-        if getattr(args, "use_set_obs", False) and not args.use_dual_critic:
-            print("[Warning] Set-attention policy requires dual critics; enabling use_dual_critic.")
-            args.use_dual_critic = True
-
         # Log policy architecture (single vs dual critic, single vs dual policy)
         mlflow.log_param("use_dual_critic", args.use_dual_critic)
         mlflow.log_param("use_dual_policy", args.use_dual_policy)
@@ -253,15 +326,132 @@ def main(args):
             mlflow.log_param("set_heads", getattr(args, "set_heads", 4))
             mlflow.log_param("set_token_mlp_dim", getattr(args, "set_token_mlp_dim", 64))
             mlflow.log_param("set_cls_tokens", getattr(args, "set_cls_tokens", 2))
+            mlflow.log_param(
+                "intent_selector_enabled",
+                getattr(args, "intent_selector_enabled", False),
+            )
+            mlflow.log_param(
+                "intent_selector_hidden_dim",
+                getattr(args, "intent_selector_hidden_dim", 64),
+            )
+            mlflow.log_param(
+                "intent_selector_mode",
+                getattr(args, "intent_selector_mode", "callback"),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_start",
+                getattr(args, "intent_selector_alpha_start", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_end",
+                getattr(args, "intent_selector_alpha_end", 1.0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_warmup_steps",
+                getattr(args, "intent_selector_alpha_warmup_steps", 0),
+            )
+            mlflow.log_param(
+                "intent_selector_alpha_ramp_steps",
+                getattr(args, "intent_selector_alpha_ramp_steps", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_start",
+                getattr(args, "intent_selector_eps_start", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_end",
+                getattr(args, "intent_selector_eps_end", 0.0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_warmup_steps",
+                getattr(args, "intent_selector_eps_warmup_steps", 0),
+            )
+            mlflow.log_param(
+                "intent_selector_eps_ramp_steps",
+                getattr(args, "intent_selector_eps_ramp_steps", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_entropy_coef",
+                getattr(args, "intent_selector_entropy_coef", 0.01),
+            )
+            mlflow.log_param(
+                "intent_selector_usage_reg_coef",
+                getattr(args, "intent_selector_usage_reg_coef", 0.01),
+            )
+            mlflow.log_param(
+                "intent_selector_value_coef",
+                getattr(args, "intent_selector_value_coef", 0.5),
+            )
+            mlflow.log_param(
+                "intent_selector_template_metrics_log_every_rollouts",
+                getattr(args, "intent_selector_template_metrics_log_every_rollouts", 8),
+            )
+            mlflow.log_param(
+                "intent_selector_train_every_rollouts",
+                getattr(args, "intent_selector_train_every_rollouts", 1),
+            )
+            mlflow.log_param(
+                "intent_selector_max_samples_per_update",
+                getattr(args, "intent_selector_max_samples_per_update", 0),
+            )
+            mlflow.log_param(
+                "intent_selector_multiselect_enabled",
+                getattr(args, "intent_selector_multiselect_enabled", False),
+            )
+            mlflow.log_param(
+                "intent_selector_min_play_steps",
+                getattr(args, "intent_selector_min_play_steps", 3),
+            )
+            mlflow.log_param(
+                "intent_disc_lambda_shot",
+                getattr(args, "intent_disc_lambda_shot", 0.0),
+            )
+            mlflow.log_param(
+                "intent_disc_lambda_q",
+                getattr(args, "intent_disc_lambda_q", 0.0),
+            )
         mlflow.log_param("set_token_activation", getattr(args, "set_token_activation", "relu"))
         mlflow.log_param("set_head_activation", getattr(args, "set_head_activation", "tanh"))
         mlflow.log_param("mirror_episode_prob", getattr(args, "mirror_episode_prob", 0.0))
         mlflow.log_param(
+            "disc_eval_batch_output",
+            getattr(args, "disc_eval_batch_output", False),
+        )
+        mlflow.log_param(
+            "intent_disc_current_policy_only",
+            getattr(args, "intent_disc_current_policy_only", True),
+        )
+        mlflow.log_param(
             "offense_spawn_boundary_margin",
             getattr(args, "offense_spawn_boundary_margin", 0),
         )
-        
+        mlflow.log_param("play_name_pool_version", int(PLAY_NAME_POOL_VERSION))
+        model_codename = build_model_codename(run.info.run_id)
+        mlflow.set_tag("model_codename", model_codename)
+
         print(f"MLflow Run ID: {run.info.run_id}")
+        print(f"Model Codename: {model_codename}")
+
+        try:
+            play_name_payload = build_play_name_artifact_payload(
+                run.info.run_id,
+                int(getattr(args, "num_intents", 0) or 0),
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as f:
+                json.dump(play_name_payload, f, indent=2)
+                play_name_artifact_path = f.name
+            try:
+                mlflow.log_artifact(play_name_artifact_path, artifact_path="metadata")
+            finally:
+                try:
+                    os.unlink(play_name_artifact_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            print(f"[play_names] Failed to log play name mapping artifact: {e}")
+        _log_start_template_library_artifact(args)
 
         # --- If continuing from a prior run, copy over prior model artifacts ---
         # This lets us sample frozen policies from the full history in the new run.
@@ -306,12 +496,37 @@ def main(args):
                 print("[Info] Using --net-arch for set-attention head MLP.")
             else:
                 print("[Info] Using --net-arch-pi/vf for set-attention head MLP.")
+            if getattr(args, "intent_selector_enabled", False):
+                if not getattr(args, "enable_intent_learning", False):
+                    raise ValueError(
+                        "--intent-selector-enabled requires --enable-intent-learning."
+                    )
+                if str(getattr(args, "intent_obs_mode", "private_offense")).lower() == "hidden":
+                    raise ValueError(
+                        "--intent-selector-enabled is incompatible with --intent-obs-mode hidden "
+                        "because the low-level policy would not see the selected play."
+                    )
             policy_kwargs["embed_dim"] = int(getattr(args, "set_embed_dim", 64))
             policy_kwargs["n_heads"] = int(getattr(args, "set_heads", 4))
             policy_kwargs["token_mlp_dim"] = int(getattr(args, "set_token_mlp_dim", 64))
             policy_kwargs["num_cls_tokens"] = int(getattr(args, "set_cls_tokens", 2))
             policy_kwargs["token_activation"] = str(getattr(args, "set_token_activation", "relu"))
             policy_kwargs["head_activation"] = str(getattr(args, "set_head_activation", "tanh"))
+            policy_kwargs["intent_embedding_enabled"] = bool(
+                getattr(args, "set_intent_embedding_enabled", True)
+                and getattr(args, "enable_intent_learning", False)
+            )
+            policy_kwargs["intent_embedding_dim"] = int(
+                getattr(args, "set_intent_embedding_dim", 16)
+            )
+            policy_kwargs["num_intents"] = int(getattr(args, "num_intents", 8))
+            policy_kwargs["intent_selector_enabled"] = bool(
+                getattr(args, "intent_selector_enabled", False)
+                and getattr(args, "enable_intent_learning", False)
+            )
+            policy_kwargs["intent_selector_hidden_dim"] = int(
+                getattr(args, "intent_selector_hidden_dim", 64)
+            )
             print(
                 "Set-attention config:",
                 f"embed_dim={policy_kwargs['embed_dim']}",
@@ -320,9 +535,17 @@ def main(args):
                 f"num_cls_tokens={policy_kwargs['num_cls_tokens']}",
                 f"token_activation={policy_kwargs['token_activation']}",
                 f"head_activation={policy_kwargs['head_activation']}",
+                f"intent_embedding_enabled={policy_kwargs['intent_embedding_enabled']}",
+                f"intent_embedding_dim={policy_kwargs['intent_embedding_dim']}",
+                f"intent_selector_enabled={policy_kwargs['intent_selector_enabled']}",
+                f"intent_selector_hidden_dim={policy_kwargs['intent_selector_hidden_dim']}",
                 f"mirror_episode_prob={getattr(args, 'mirror_episode_prob', 0.0)}",
             )
         else:
+            if getattr(args, "intent_selector_enabled", False):
+                raise ValueError(
+                    "--intent-selector-enabled currently requires --use-set-obs."
+                )
             # Prevent the policy from learning directly from action_mask
             policy_kwargs["features_extractor_class"] = MaskAgnosticCombinedExtractor
         
@@ -345,6 +568,77 @@ def main(args):
 
         print("Initializing unified policy...")
         unified_policy = None
+        selector_mode = str(
+            getattr(args, "intent_selector_mode", "callback")
+        ).lower()
+        use_integrated_intent_selector = bool(
+            getattr(args, "intent_selector_enabled", False)
+            and selector_mode == "integrated"
+        )
+        algorithm_class = (
+            IntegratedIntentSelectorPPO if use_integrated_intent_selector else PPO
+        )
+        algo_kwargs = {}
+        if use_integrated_intent_selector:
+            algo_kwargs.update(
+                intent_selector_enabled=True,
+                num_intents=int(getattr(args, "num_intents", 8)),
+                intent_selector_alpha_start=float(
+                    getattr(args, "intent_selector_alpha_start", 0.0)
+                ),
+                intent_selector_alpha_end=float(
+                    getattr(args, "intent_selector_alpha_end", 1.0)
+                ),
+                intent_selector_alpha_warmup_steps=int(
+                    getattr(args, "intent_selector_alpha_warmup_steps", 0)
+                ),
+                intent_selector_alpha_ramp_steps=int(
+                    getattr(args, "intent_selector_alpha_ramp_steps", 1)
+                ),
+                intent_selector_eps_start=float(
+                    getattr(args, "intent_selector_eps_start", 0.0)
+                ),
+                intent_selector_eps_end=float(
+                    getattr(args, "intent_selector_eps_end", 0.0)
+                ),
+                intent_selector_eps_warmup_steps=int(
+                    getattr(args, "intent_selector_eps_warmup_steps", 0)
+                ),
+                intent_selector_eps_ramp_steps=int(
+                    getattr(args, "intent_selector_eps_ramp_steps", 1)
+                ),
+                intent_selector_entropy_coef=float(
+                    getattr(args, "intent_selector_entropy_coef", 0.01)
+                ),
+                intent_selector_usage_reg_coef=float(
+                    getattr(args, "intent_selector_usage_reg_coef", 0.01)
+                ),
+                intent_selector_value_coef=float(
+                    getattr(args, "intent_selector_value_coef", 0.5)
+                ),
+                intent_selector_template_metrics_log_every_rollouts=int(
+                    getattr(
+                        args,
+                        "intent_selector_template_metrics_log_every_rollouts",
+                        8,
+                    )
+                ),
+                intent_selector_train_every_rollouts=int(
+                    getattr(args, "intent_selector_train_every_rollouts", 1)
+                ),
+                intent_selector_max_samples_per_update=int(
+                    getattr(args, "intent_selector_max_samples_per_update", 0)
+                ),
+                intent_selector_multiselect_enabled=bool(
+                    getattr(args, "intent_selector_multiselect_enabled", False)
+                ),
+                intent_selector_min_play_steps=int(
+                    getattr(args, "intent_selector_min_play_steps", 3)
+                ),
+                intent_commitment_steps=int(
+                    getattr(args, "intent_commitment_steps", 4)
+                ),
+            )
 
         if args.continue_run_id:
             print(f"Continuing from run {args.continue_run_id}...")
@@ -361,8 +655,14 @@ def main(args):
                         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
                         "SetAttentionExtractor": SetAttentionExtractor,
                     }
-                    unified_policy = PPO.load(
-                        uni_local, env=temp_env, device=device, custom_objects=custom_objects
+                    if getattr(args, "intent_selector_enabled", False):
+                        custom_objects["policy_kwargs"] = policy_kwargs
+                    unified_policy = algorithm_class.load(
+                        uni_local,
+                        env=temp_env,
+                        device=device,
+                        custom_objects=custom_objects,
+                        **algo_kwargs,
                     )
                     print(
                         f"  - Loaded latest unified policy: {os.path.basename(uni_art)}"
@@ -385,7 +685,7 @@ def main(args):
             else:
                 policy_class = PassBiasDualCriticPolicy if args.use_dual_critic else PassBiasMultiInputPolicy
             
-            unified_policy = PPO(
+            unified_policy = algorithm_class(
                 policy_class,
                 temp_env,
                 verbose=1,
@@ -399,6 +699,7 @@ def main(args):
                 policy_kwargs=policy_kwargs,
                 target_kl=args.target_kl,
                 device=device,
+                **algo_kwargs,
             )
             
             # --- Transfer critic weights if requested ---
@@ -665,6 +966,60 @@ def main(args):
             total_planned_ts,
             timestep_offset,
         )
+        task_reward_scale_callback = build_task_reward_scale_callback(
+            args,
+            timestep_offset,
+        )
+        # Optional intent robustness curriculum (null/visibility probability schedule)
+        intent_robustness_callback = build_intent_robustness_callback(
+            args,
+            total_planned_ts,
+            timestep_offset,
+        )
+        # Optional DIAYN-style intent diversity objective
+        intent_diversity_callback = build_intent_diversity_callback(args)
+        if (
+            args.continue_run_id
+            and intent_diversity_callback is not None
+            and getattr(intent_diversity_callback, "enabled", False)
+        ):
+            try:
+                client = mlflow.tracking.MlflowClient()
+                disc_art = get_latest_discriminator_checkpoint_path(
+                    client, args.continue_run_id
+                )
+                if disc_art:
+                    with tempfile.TemporaryDirectory() as _tmp_disc_dir:
+                        disc_local = client.download_artifacts(
+                            args.continue_run_id, disc_art, _tmp_disc_dir
+                        )
+                        disc_payload = torch.load(
+                            disc_local, map_location="cpu", weights_only=False
+                        )
+                    queued = (
+                        intent_diversity_callback.queue_discriminator_checkpoint_restore(
+                            disc_payload,
+                            source=f"{args.continue_run_id}:{os.path.basename(disc_art)}",
+                        )
+                    )
+                    if queued:
+                        print(
+                            f"Queued intent discriminator restore from "
+                            f"{os.path.basename(disc_art)}"
+                        )
+                else:
+                    print(
+                        "No prior intent discriminator checkpoint found; "
+                        "intent diversity metrics will resume from a fresh probe."
+                    )
+            except Exception as e:
+                print("Warning: failed to queue prior intent discriminator:", e)
+        # Optional high-level selector mu(z|s) for offense play calling.
+        intent_selector_callback = build_intent_selector_callback(args)
+        # Optional diagnostic for whether the policy actually responds to latent intent.
+        intent_policy_sensitivity_callback = build_intent_policy_sensitivity_callback(
+            args
+        )
 
         for i in range(args.alternations):
             print("-" * 50)
@@ -828,6 +1183,11 @@ def main(args):
                 beta_callback,
                 pass_bias_callback,
                 pass_curriculum_callback,
+                task_reward_scale_callback,
+                intent_robustness_callback,
+                intent_diversity_callback,
+                intent_policy_sensitivity_callback,
+                intent_selector_callback,
             )
             
             # Single learn() call trains both offense and defense together
@@ -865,6 +1225,37 @@ def main(args):
                 )
                 unified_policy.save(unified_model_path)
                 mlflow.log_artifact(unified_model_path, artifact_path="models")
+                if (
+                    intent_diversity_callback is not None
+                    and getattr(intent_diversity_callback, "enabled", False)
+                    and getattr(
+                        intent_diversity_callback, "has_trained_discriminator", None
+                    ) is not None
+                    and intent_diversity_callback.has_trained_discriminator()
+                ):
+                    disc_ckpt_path = os.path.join(
+                        tmpdir, f"intent_disc_iter_{global_alt}.pt"
+                    )
+                    saved = intent_diversity_callback.export_discriminator_checkpoint(
+                        disc_ckpt_path,
+                        global_step=int(unified_policy.num_timesteps),
+                        alternation_idx=int(global_alt),
+                    )
+                    if saved:
+                        mlflow.log_artifact(disc_ckpt_path, artifact_path="models")
+                    if bool(getattr(args, "disc_eval_batch_output", False)):
+                        disc_eval_batch_path = os.path.join(
+                            tmpdir, f"intent_disc_eval_batch_iter_{global_alt}.npz"
+                        )
+                        batch_saved = (
+                            intent_diversity_callback.export_latest_discriminator_eval_batch(
+                                disc_eval_batch_path,
+                                global_step=int(unified_policy.num_timesteps),
+                                alternation_idx=int(global_alt),
+                            )
+                        )
+                        if batch_saved:
+                            mlflow.log_artifact(disc_eval_batch_path, artifact_path="models")
             print(f"Logged unified model for alternation {global_alt} to MLflow")
 
             # --- 3. Run Evaluation Phase ---
@@ -917,6 +1308,14 @@ def main(args):
                 ),
                 pass_oob_turnover_prob_end=getattr(
                     args, "pass_oob_turnover_prob_end", None
+                ),
+                task_reward_scale_start=getattr(args, "task_reward_scale_start", None),
+                task_reward_scale_end=getattr(args, "task_reward_scale_end", None),
+                task_reward_scale_warmup_steps=getattr(
+                    args, "task_reward_scale_warmup_steps", 0
+                ),
+                task_reward_scale_ramp_steps=getattr(
+                    args, "task_reward_scale_ramp_steps", 1
                 ),
                 spa_start=spa_start if "spa_start" in locals() else None,
                 spa_end=spa_end if "spa_end" in locals() else None,

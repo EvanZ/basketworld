@@ -31,6 +31,11 @@ import numpy as np
 from gymnasium import spaces
 
 from basketworld.utils.evaluation_helpers import profile_section
+from basketworld.utils.start_templates import (
+    resolve_start_template,
+    sample_start_template,
+    validate_start_template_library,
+)
 from basketworld.envs.core import geometry
 from basketworld.envs.core import movement as movement_core
 from basketworld.envs.core import passing as passing_core
@@ -164,10 +169,25 @@ class HexagonBasketballEnv(gym.Env):
         mask_occupied_moves: bool = False,
         # Pass gating: mask out passes without teammates in arc
         enable_pass_gating: bool = True,
+        # Intent-learning controls (default-off for backward compatibility)
+        enable_intent_learning: bool = False,
+        num_intents: int = 8,
+        intent_commitment_steps: int = 4,
+        intent_null_prob: float = 0.2,
+        intent_visible_to_defense_prob: float = 0.0,
+        enable_defense_intent_learning: bool = False,
+        defense_intent_null_prob: float = 1.0,
+        intent_obs_mode: str = "private_offense",  # "private_offense" | "public" | "hidden"
         # Deterministic overrides (optional)
         initial_positions: Optional[List[Tuple[int, int]]] = None,
         initial_ball_holder: Optional[int] = None,
         fixed_shot_clock: Optional[int] = None,
+        start_template_enabled: bool = False,
+        start_template_library: Optional[Dict] = None,
+        start_template_prob: float = 0.0,
+        start_template_jitter_scale: float = 1.0,
+        start_template_mirror_prob: float = 0.5,
+        start_template_strict: bool = False,
         assist_window: int = 2,
         # Illegal action resolution policy (see IllegalActionPolicy)
         illegal_action_policy: str = "noop",
@@ -222,6 +242,35 @@ class HexagonBasketballEnv(gym.Env):
         self.mask_occupied_moves = bool(mask_occupied_moves)
         # Pass gating: mask out passes without teammates in arc
         self.enable_pass_gating = bool(enable_pass_gating)
+        # Intent-learning configuration and runtime state
+        self.enable_intent_learning = bool(enable_intent_learning)
+        self.num_intents = max(1, int(num_intents))
+        self.intent_commitment_steps = max(1, int(intent_commitment_steps))
+        self.intent_null_prob = float(max(0.0, min(1.0, intent_null_prob)))
+        self.intent_visible_to_defense_prob = float(
+            max(0.0, min(1.0, intent_visible_to_defense_prob))
+        )
+        self.enable_defense_intent_learning = bool(enable_defense_intent_learning)
+        self.defense_intent_null_prob = float(
+            max(0.0, min(1.0, defense_intent_null_prob))
+        )
+        mode = str(intent_obs_mode or "private_offense").lower()
+        if mode not in ("private_offense", "public", "hidden"):
+            mode = "private_offense"
+        self.intent_obs_mode = mode
+        # Offense intent state is kept on the legacy attribute names for backward
+        # compatibility with existing code and checkpoints.
+        self.intent_index: int = 0
+        self.intent_active: bool = False
+        self.intent_age: int = 0
+        self.intent_commitment_remaining: int = 0
+        self._intent_visible_to_defense: bool = False
+        # Defense intent state is separate and never exposed to offense unless a
+        # future observation mode explicitly opts in.
+        self.defense_intent_index: int = 0
+        self.defense_intent_active: bool = False
+        self.defense_intent_age: int = 0
+        self.defense_intent_commitment_remaining: int = 0
         normalized_pass_mode = str(pass_mode).lower()
         if normalized_pass_mode not in ("directional", "pointer_targeted"):
             normalized_pass_mode = "directional"
@@ -375,14 +424,29 @@ class HexagonBasketballEnv(gym.Env):
             shape=(self.players_per_side * 3,),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Dict(
-            {
-                "obs": state_space,
-                "action_mask": action_mask_space,
-                "role_flag": role_flag_space,
-                "skills": skills_space,
-            }
-        )
+        obs_spaces: Dict[str, spaces.Space] = {
+            "obs": state_space,
+            "action_mask": action_mask_space,
+            "role_flag": role_flag_space,
+            "skills": skills_space,
+        }
+        if self.enable_intent_learning or self.enable_defense_intent_learning:
+            obs_spaces["intent_index"] = spaces.Box(
+                low=0.0,
+                high=float(max(0, self.num_intents - 1)),
+                shape=(1,),
+                dtype=np.float32,
+            )
+            obs_spaces["intent_active"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            obs_spaces["intent_visible"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            obs_spaces["intent_age_norm"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+        self.observation_space = spaces.Dict(obs_spaces)
 
         # --- Hexagonal Grid Directions ---
         # These are the 6 axial direction vectors for a pointy-topped hexagonal grid.
@@ -465,6 +529,7 @@ class HexagonBasketballEnv(gym.Env):
         self.made_shot_reward_inside: float = float(made_shot_reward_inside)
         self.made_shot_reward_three: float = float(made_shot_reward_three)
         self.missed_shot_penalty: float = float(missed_shot_penalty)
+        self.task_reward_scale: float = 1.0
         # Absolute assist rewards (legacy; prefer percentage fields below)
         self.potential_assist_reward: float = float(potential_assist_reward)
         self.full_assist_bonus: float = float(full_assist_bonus)
@@ -501,6 +566,29 @@ class HexagonBasketballEnv(gym.Env):
             ]
         self._initial_ball_holder_override: Optional[int] = initial_ball_holder
         self._fixed_shot_clock: Optional[int] = fixed_shot_clock
+        self.start_template_enabled = bool(start_template_enabled)
+        self.start_template_prob = float(max(0.0, min(1.0, start_template_prob)))
+        self.start_template_jitter_scale = float(max(0.0, start_template_jitter_scale))
+        self.start_template_mirror_prob = float(max(0.0, min(1.0, start_template_mirror_prob)))
+        self.start_template_strict = bool(start_template_strict)
+        self.start_template_library: Optional[Dict] = None
+        self.start_template_used: bool = False
+        self.start_template_id: Optional[str] = None
+        self.start_template_mirrored: bool = False
+        self.start_template_fallback_reason: Optional[str] = None
+        if start_template_library is not None:
+            try:
+                self.start_template_library = validate_start_template_library(
+                    dict(start_template_library), players_per_side=self.players_per_side
+                )
+            except Exception as exc:
+                if self.start_template_strict:
+                    raise
+                print(
+                    f"Warning: disabling start-template curriculum due to invalid library: {exc}"
+                )
+                self.start_template_enabled = False
+                self.start_template_library = None
 
         # Per-episode, per-offensive-player baseline shooting percentages
         # Initialized to means; re-sampled each reset.
@@ -655,8 +743,8 @@ class HexagonBasketballEnv(gym.Env):
 
     @profile_section("_is_between_points")
     def _is_between_points(
-        self,
-        point: Tuple[int, int],
+        self, 
+        point: Tuple[int, int], 
         line_start: Tuple[int, int],
         line_end: Tuple[int, int]
     ) -> bool:
@@ -672,6 +760,214 @@ class HexagonBasketballEnv(gym.Env):
             True if point projects onto the line segment (not just the infinite line)
         """
         return geometry.is_between_points(point, line_start, line_end)
+
+    def _training_observer_is_offense(self) -> bool:
+        return self.training_team == Team.OFFENSE
+
+    def _intent_enabled_for_role(self, observer_is_offense: bool) -> bool:
+        if observer_is_offense:
+            return bool(self.enable_intent_learning)
+        return bool(self.enable_defense_intent_learning)
+
+    def _get_role_intent_state(
+        self, observer_is_offense: bool
+    ) -> Tuple[int, bool, int, int]:
+        if observer_is_offense:
+            return (
+                int(self.intent_index),
+                bool(self.intent_active),
+                int(self.intent_age),
+                int(self.intent_commitment_remaining),
+            )
+        return (
+            int(self.defense_intent_index),
+            bool(self.defense_intent_active),
+            int(self.defense_intent_age),
+            int(self.defense_intent_commitment_remaining),
+        )
+
+    def _set_role_intent_state(
+        self,
+        observer_is_offense: bool,
+        *,
+        intent_index: int,
+        intent_active: bool,
+        intent_age: int,
+        intent_commitment_remaining: int,
+    ) -> None:
+        if observer_is_offense:
+            self.intent_index = int(intent_index)
+            self.intent_active = bool(intent_active)
+            self.intent_age = int(intent_age)
+            self.intent_commitment_remaining = int(intent_commitment_remaining)
+            return
+        self.defense_intent_index = int(intent_index)
+        self.defense_intent_active = bool(intent_active)
+        self.defense_intent_age = int(intent_age)
+        self.defense_intent_commitment_remaining = int(intent_commitment_remaining)
+
+    def _sample_role_intent_for_episode(self, observer_is_offense: bool) -> None:
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        null_prob = (
+            float(self.intent_null_prob)
+            if observer_is_offense
+            else float(self.defense_intent_null_prob)
+        )
+        if not enabled:
+            self._set_role_intent_state(
+                observer_is_offense,
+                intent_index=0,
+                intent_active=False,
+                intent_age=0,
+                intent_commitment_remaining=0,
+            )
+            return
+
+        intent_active = bool(self._rng.random() >= null_prob)
+        intent_index = (
+            int(self._rng.integers(0, self.num_intents)) if intent_active else 0
+        )
+        self._set_role_intent_state(
+            observer_is_offense,
+            intent_index=intent_index,
+            intent_active=intent_active,
+            intent_age=0,
+            intent_commitment_remaining=int(self.intent_commitment_steps),
+        )
+
+    def _sample_intent_for_episode(self) -> None:
+        """Sample/initialize offense and defense latent intent state for the episode."""
+        self._sample_role_intent_for_episode(observer_is_offense=True)
+        self._sample_role_intent_for_episode(observer_is_offense=False)
+        self._intent_visible_to_defense = bool(
+            self._rng.random() < self.intent_visible_to_defense_prob
+        )
+
+    def _advance_intent_clock(self) -> None:
+        for observer_is_offense in (True, False):
+            if not self._intent_enabled_for_role(observer_is_offense):
+                continue
+            intent_index, intent_active, intent_age, intent_commitment_remaining = (
+                self._get_role_intent_state(observer_is_offense)
+            )
+            if not intent_active:
+                continue
+            if int(intent_commitment_remaining) <= 0:
+                self._set_role_intent_state(
+                    observer_is_offense,
+                    intent_index=int(intent_index),
+                    intent_active=False,
+                    intent_age=int(intent_age),
+                    intent_commitment_remaining=0,
+                )
+                continue
+            self._set_role_intent_state(
+                observer_is_offense,
+                intent_index=int(intent_index),
+                intent_active=True,
+                intent_age=int(intent_age) + 1,
+                intent_commitment_remaining=max(0, int(intent_commitment_remaining) - 1),
+            )
+
+    def _offense_intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
+        if not self.enable_intent_learning or not self.intent_active:
+            return False
+        if self.intent_obs_mode == "public":
+            return True
+        if self.intent_obs_mode == "hidden":
+            return False
+        if observer_is_offense:
+            return True
+        return bool(self._intent_visible_to_defense)
+
+    def _intent_visible_for_observer(self, observer_is_offense: bool) -> bool:
+        """Return whether the observer can see its own latent intent fields."""
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        _, active, _, _ = self._get_role_intent_state(observer_is_offense)
+        if not enabled or not active:
+            return False
+        if observer_is_offense:
+            return self._offense_intent_visible_for_observer(True)
+        return True
+
+    def get_intent_observation_fields(
+        self, observer_is_offense: bool
+    ) -> Dict[str, np.ndarray]:
+        """Return role-conditioned own-intent features as observation fields."""
+        if not (self.enable_intent_learning or self.enable_defense_intent_learning):
+            return {}
+        enabled = self._intent_enabled_for_role(observer_is_offense)
+        if not enabled:
+            return {
+                "intent_index": np.array([0.0], dtype=np.float32),
+                "intent_active": np.array([0.0], dtype=np.float32),
+                "intent_visible": np.array([0.0], dtype=np.float32),
+                "intent_age_norm": np.array([0.0], dtype=np.float32),
+            }
+        visible = self._intent_visible_for_observer(bool(observer_is_offense))
+        intent_index, active, intent_age, intent_commitment_remaining = (
+            self._get_role_intent_state(observer_is_offense)
+        )
+        masked_index = int(intent_index) if (active and visible) else 0
+        age_norm = (
+            float(intent_age) / float(max(1, self.intent_commitment_steps))
+            if active
+            else 0.0
+        )
+        age_norm = float(max(0.0, min(1.0, age_norm)))
+        return {
+            "intent_index": np.array([float(masked_index)], dtype=np.float32),
+            "intent_active": np.array([1.0 if active else 0.0], dtype=np.float32),
+            "intent_visible": np.array([1.0 if visible else 0.0], dtype=np.float32),
+            "intent_age_norm": np.array([age_norm], dtype=np.float32),
+        }
+
+    def get_intent_global_features(self, observer_is_offense: bool) -> np.ndarray:
+        """Return compact intent globals for set-observation pipelines."""
+        if not (self.enable_intent_learning or self.enable_defense_intent_learning):
+            return np.zeros(0, dtype=np.float32)
+        fields = self.get_intent_observation_fields(bool(observer_is_offense))
+        intent_index = float(fields["intent_index"][0])
+        intent_index_norm = (
+            intent_index / float(max(1, self.num_intents - 1))
+            if self.num_intents > 1
+            else intent_index
+        )
+        return np.array(
+            [
+                float(intent_index_norm),
+                float(fields["intent_active"][0]),
+                float(fields["intent_visible"][0]),
+                float(fields["intent_age_norm"][0]),
+            ],
+            dtype=np.float32,
+        )
+
+    def get_start_template_context(self) -> tuple[str, bool]:
+        """Return current start-template provenance without wrapper attribute lookup."""
+        return str(self.start_template_id or ""), bool(self.start_template_mirrored)
+
+    def patch_globals_with_intent_features(
+        self, globals_vec: np.ndarray, observer_is_offense: bool
+    ) -> np.ndarray:
+        """Overwrite trailing globals slots with role-conditioned intent features."""
+        arr = np.asarray(globals_vec, dtype=np.float32).reshape(-1).copy()
+        feats = self.get_intent_global_features(bool(observer_is_offense))
+        if feats.size == 0:
+            return arr
+        if arr.shape[0] >= feats.shape[0]:
+            arr[-feats.shape[0] :] = feats
+        return arr
+
+    def _build_observation_dict(self, observer_is_offense: bool) -> Dict[str, np.ndarray]:
+        obs = {
+            "obs": self._get_observation(),
+            "action_mask": self._get_action_masks(),
+            "role_flag": np.array([1.0 if observer_is_offense else -1.0], dtype=np.float32),
+            "skills": self._get_offense_skills_array(),
+        }
+        obs.update(self.get_intent_observation_fields(observer_is_offense))
+        return obs
 
     @profile_section("reset")
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -689,10 +985,54 @@ class HexagonBasketballEnv(gym.Env):
         opt_positions = None
         opt_ball_holder = None
         opt_shot_clock = None
+        self.start_template_used = False
+        self.start_template_id = None
+        self.start_template_mirrored = False
+        self.start_template_fallback_reason = None
         if options:
             opt_positions = options.get("initial_positions")
             opt_ball_holder = options.get("ball_holder")
             opt_shot_clock = options.get("shot_clock")
+        has_explicit_start_override = (
+            opt_positions is not None
+            or opt_ball_holder is not None
+            or opt_shot_clock is not None
+        )
+
+        if (
+            not has_explicit_start_override
+            and self.start_template_enabled
+            and self.start_template_library is not None
+            and self.start_template_prob > 0.0
+        ):
+            try:
+                if float(self._rng.random()) < float(self.start_template_prob):
+                    sampled_template = sample_start_template(
+                        self.start_template_library, self._rng
+                    )
+                    mirror = bool(sampled_template.get("mirrorable", False)) and (
+                        float(self._rng.random()) < float(self.start_template_mirror_prob)
+                    )
+                    resolved_template = resolve_start_template(
+                        self,
+                        sampled_template,
+                        jitter_scale=self.start_template_jitter_scale,
+                        mirror=mirror,
+                    )
+                    opt_positions = resolved_template.get("initial_positions")
+                    opt_ball_holder = resolved_template.get("ball_holder")
+                    opt_shot_clock = resolved_template.get("shot_clock")
+                    self.start_template_used = True
+                    self.start_template_id = str(
+                        resolved_template.get("template_id") or sampled_template.get("id") or ""
+                    ) or None
+                    self.start_template_mirrored = bool(
+                        resolved_template.get("mirrored", False)
+                    )
+            except Exception as exc:
+                self.start_template_fallback_reason = str(exc)
+                if self.start_template_strict:
+                    raise
 
         # Shot clock setup: option > ctor fixed > random
         if opt_shot_clock is not None:
@@ -724,6 +1064,8 @@ class HexagonBasketballEnv(gym.Env):
         self._first_step_after_reset = True
         # Initialize cached phi value (Φ(s₀) = 0 for PBRS)
         self._cached_phi = 0.0
+        # Initialize latent intent state for this episode
+        self._sample_intent_for_episode()
 
         # Sample per-player baseline shooting percentages for OFFENSE for this episode
         # Use truncated normal around means with stds, clamped to [0.01, 0.99]
@@ -773,15 +1115,9 @@ class HexagonBasketballEnv(gym.Env):
             # Random offensive player starts with ball
             self.ball_holder = int(self._rng.choice(self.offense_ids))
 
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks(),
-            "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": self._get_offense_skills_array(),
-        }
+        obs = self._build_observation_dict(
+            observer_is_offense=self._training_observer_is_offense()
+        )
         mask = obs["action_mask"]
         try:
             offense_mask = mask[self.offense_ids]
@@ -808,6 +1144,7 @@ class HexagonBasketballEnv(gym.Env):
             raise ValueError("Episode has ended. Call reset() to start a new episode.")
 
         self.step_count += 1
+        self._advance_intent_clock()
 
         # Compute Phi(s) at start of step (for logs and optional shaping)
         # Use cached value from previous step to avoid redundant calculation (telescoping)
@@ -853,15 +1190,9 @@ class HexagonBasketballEnv(gym.Env):
                     done = True
                     self.episode_ended = done
 
-                    obs = {
-                        "obs": self._get_observation(),
-                        "action_mask": self._get_action_masks(),
-                        "role_flag": np.array(
-                            [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                            dtype=np.float32,
-                        ),
-                        "skills": self._get_offense_skills_array(),
-                    }
+                    obs = self._build_observation_dict(
+                        observer_is_offense=self._training_observer_is_offense()
+                    )
                     info = self._attach_legal_action_stats(
                         {
                             "training_team": self.training_team.name,
@@ -1064,20 +1395,15 @@ class HexagonBasketballEnv(gym.Env):
         self._pending_action_probs = None
         self._pending_pointer_pass_targets = {}
 
-        obs = {
-            "obs": self._get_observation(),
-            "action_mask": self._get_action_masks(),
-            "role_flag": np.array(
-                [1.0 if self.training_team == Team.OFFENSE else -1.0],
-                dtype=np.float32,
-            ),
-            "skills": self._get_offense_skills_array(),
-        }
+        obs = self._build_observation_dict(
+            observer_is_offense=self._training_observer_is_offense()
+        )
         info = {
             "training_team": self.training_team.name,
             "action_results": action_results,
             "shot_clock": self.shot_clock,
         }
+        info = self._attach_start_template_stats(info)
 
         # Phi diagnostics and shaping (only if enabled)
         if self.enable_phi_shaping:
@@ -1513,6 +1839,13 @@ class HexagonBasketballEnv(gym.Env):
         except Exception:
             pass
 
+    @profile_section("set_task_reward_scale")
+    def set_task_reward_scale(self, value: float) -> None:
+        try:
+            self.task_reward_scale = float(max(0.0, value))
+        except Exception:
+            pass
+
     # --- Schedulable setters for passing curriculum ---
     @profile_section("set_pass_arc_degrees")
     def set_pass_arc_degrees(self, value: float) -> None:
@@ -1543,6 +1876,60 @@ class HexagonBasketballEnv(gym.Env):
             normalized = str(mode).lower()
             if normalized in ("directional", "pointer_targeted"):
                 self.pass_mode = normalized
+        except Exception:
+            pass
+
+    @profile_section("set_intent_null_prob")
+    def set_intent_null_prob(self, value: float) -> None:
+        try:
+            self.intent_null_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
+    @profile_section("set_intent_visible_to_defense_prob")
+    def set_intent_visible_to_defense_prob(self, value: float) -> None:
+        try:
+            self.intent_visible_to_defense_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
+    @profile_section("set_defense_intent_null_prob")
+    def set_defense_intent_null_prob(self, value: float) -> None:
+        try:
+            self.defense_intent_null_prob = float(max(0.0, min(1.0, value)))
+        except Exception:
+            pass
+
+    @profile_section("set_offense_intent_state")
+    def set_offense_intent_state(
+        self,
+        intent_index: int,
+        *,
+        intent_active: bool = True,
+        intent_age: int = 0,
+        intent_commitment_remaining: Optional[int] = None,
+    ) -> None:
+        try:
+            z = int(max(0, min(max(1, int(self.num_intents)) - 1, int(intent_index))))
+            active = bool(intent_active) and bool(self.enable_intent_learning)
+            age = int(max(0, int(intent_age)))
+            if intent_commitment_remaining is None:
+                remaining = (
+                    max(0, int(self.intent_commitment_steps) - age) if active else 0
+                )
+            else:
+                remaining = int(max(0, int(intent_commitment_remaining)))
+            if not active:
+                z = 0
+                age = 0
+                remaining = 0
+            self._set_role_intent_state(
+                True,
+                intent_index=z,
+                intent_active=active,
+                intent_age=age,
+                intent_commitment_remaining=remaining,
+            )
         except Exception:
             pass
 
@@ -1657,6 +2044,52 @@ class HexagonBasketballEnv(gym.Env):
             "legal_actions_defense",
             float(getattr(self, "_legal_actions_defense", 0.0)),
         )
+        info = self._attach_intent_stats(info)
+        info = self._attach_start_template_stats(info)
+        return info
+
+    def _attach_start_template_stats(self, info: Optional[Dict]) -> Dict:
+        if info is None:
+            info = {}
+        info.setdefault("start_template_used", 1.0 if self.start_template_used else 0.0)
+        info.setdefault("start_template_id", self.start_template_id or "")
+        info.setdefault(
+            "start_template_mirrored", 1.0 if self.start_template_mirrored else 0.0
+        )
+        info.setdefault(
+            "start_template_fallback_reason",
+            self.start_template_fallback_reason or "",
+        )
+        return info
+
+    def _attach_intent_stats(self, info: Optional[Dict]) -> Dict:
+        if info is None:
+            info = {}
+        training_observer_is_offense = self._training_observer_is_offense()
+        training_intent_index, training_intent_active, training_intent_age, training_remaining = (
+            self._get_role_intent_state(training_observer_is_offense)
+        )
+        training_visible = self._offense_intent_visible_for_observer(
+            training_observer_is_offense
+        )
+        info.setdefault(
+            "intent_index",
+            float(training_intent_index if training_intent_active else 0),
+        )
+        info.setdefault("intent_active", 1.0 if training_intent_active else 0.0)
+        info.setdefault(
+            "intent_visible_training_obs",
+            1.0 if training_visible else 0.0,
+        )
+        info.setdefault("intent_age", float(training_intent_age))
+        info.setdefault(
+            "intent_commitment_remaining",
+            float(training_remaining),
+        )
+        info.setdefault("offense_intent_index", float(self.intent_index if self.intent_active else 0))
+        info.setdefault("offense_intent_active", 1.0 if self.intent_active else 0.0)
+        info.setdefault("defense_intent_index", float(self.defense_intent_index if self.defense_intent_active else 0))
+        info.setdefault("defense_intent_active", 1.0 if self.defense_intent_active else 0.0)
         return info
 
     @profile_section("render")

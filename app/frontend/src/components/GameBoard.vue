@@ -7,6 +7,10 @@ const props = defineProps({
     type: Array,
     required: true,
   },
+  playbookOverlay: {
+    type: Object,
+    default: null,
+  },
   activePlayerId: {
     type: Number,
     default: null,
@@ -83,6 +87,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  showCoordinates: {
+    type: Boolean,
+    default: false,
+  },
   playerDisplayNames: {
     type: Object,
     default: () => ({}),
@@ -105,6 +113,7 @@ const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'ad
 
 const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
 const SQRT3 = Math.sqrt(3);
+const HEX_HALF_WIDTH = HEX_RADIUS * SQRT3 * 0.5;
 const PASS_COS_EPS = 1e-9;
 // Axial direction vectors (q, r) aligned with ActionType ordering (E, NE, NW, W, SW, SE)
 const HEX_DIRECTIONS = [
@@ -115,6 +124,7 @@ const HEX_DIRECTIONS = [
   [-1, 1],
   [0, 1],
 ];
+const PLAYBOOK_TRAJECTORY_COLORS = ['#38bdf8', '#34d399', '#f472b6', '#f59e0b', '#a78bfa', '#fb7185'];
 const PASS_ACTION_TO_DIR = {
   PASS_E: 0,
   PASS_NE: 1,
@@ -617,6 +627,13 @@ const courtLayout = computed(() => {
     return hexes;
 });
 
+const courtHexPolygons = computed(() =>
+  courtLayout.value.map((hex) => ({
+    ...hex,
+    points: hexPointsFor(hex.x, hex.y, HEX_RADIUS),
+  }))
+);
+
 const shotCountsMap = computed(() => props.shotAccumulator || {});
 const shotChartLabel = computed(() => props.shotChartLabel || '');
 const shotChartTitlePos = computed(() => {
@@ -697,25 +714,35 @@ const maxShotAttempts = computed(() => {
 });
 
 function volumeFill(att) {
-  const t = Math.max(0, Math.min(1, att / maxShotAttempts.value));
+  return volumeFillFor(att, maxShotAttempts.value, 0.75);
+}
+
+function volumeFillFor(att, maxAttempts, alpha = 0.75) {
+  const denom = Number(maxAttempts) > 0 ? Number(maxAttempts) : 1;
+  const t = Math.max(0, Math.min(1, att / denom));
   // Lerp from deep navy to accent orange
   const start = [15, 23, 42];     // dark base
   const end = [251, 146, 60];     // warm accent
   const r = Math.round(start[0] + (end[0] - start[0]) * t);
   const g = Math.round(start[1] + (end[1] - start[1]) * t);
   const b = Math.round(start[2] + (end[2] - start[2]) * t);
-  return `rgba(${r}, ${g}, ${b}, ${0.75})`;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function volumeStroke(att) {
-  const t = Math.max(0, Math.min(1, att / maxShotAttempts.value));
+  return volumeStrokeFor(att, maxShotAttempts.value, 0.9);
+}
+
+function volumeStrokeFor(att, maxAttempts, alpha = 0.9) {
+  const denom = Number(maxAttempts) > 0 ? Number(maxAttempts) : 1;
+  const t = Math.max(0, Math.min(1, att / denom));
   // Slightly brighter stroke
   const start = [56, 189, 248];
   const end = [251, 191, 36];
   const r = Math.round(start[0] + (end[0] - start[0]) * t);
   const g = Math.round(start[1] + (end[1] - start[1]) * t);
   const b = Math.round(start[2] + (end[2] - start[2]) * t);
-  return `rgba(${r}, ${g}, ${b}, 0.9)`;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function hexPointsFor(x, y, radius = HEX_RADIUS) {
@@ -730,8 +757,335 @@ function hexPointsFor(x, y, radius = HEX_RADIUS) {
   return pts.join(' ');
 }
 
-const showPlayers = computed(() => !hasShotCounts.value);
-const showValueAnnotations = computed(() => !hasShotCounts.value);
+function normalizeTrajectorySegment(rawSegment) {
+  if (!rawSegment || typeof rawSegment !== 'object') return null;
+  const start = Array.isArray(rawSegment.from) ? rawSegment.from : null;
+  const end = Array.isArray(rawSegment.to) ? rawSegment.to : null;
+  if (!start || !end || start.length < 2 || end.length < 2) return null;
+  const startQ = Number(start[0]);
+  const startR = Number(start[1]);
+  const endQ = Number(end[0]);
+  const endR = Number(end[1]);
+  const count = Number(rawSegment.count || 0);
+  if (
+    [startQ, startR, endQ, endR, count].some((value) => Number.isNaN(value))
+    || count <= 0
+  ) {
+    return null;
+  }
+  return {
+    from: [startQ, startR],
+    to: [endQ, endR],
+    count,
+  };
+}
+
+function buildArrowheadPoints(tipX, tipY, dirX, dirY, length, width) {
+  const norm = Math.hypot(dirX, dirY) || 1;
+  const ux = dirX / norm;
+  const uy = dirY / norm;
+  const px = -uy;
+  const py = ux;
+  const baseX = tipX - (ux * length);
+  const baseY = tipY - (uy * length);
+  const leftX = baseX + (px * width * 0.5);
+  const leftY = baseY + (py * width * 0.5);
+  const rightX = baseX - (px * width * 0.5);
+  const rightY = baseY - (py * width * 0.5);
+  return `${tipX},${tipY} ${leftX},${leftY} ${rightX},${rightY}`;
+}
+
+const hasPlaybookOverlay = computed(() => {
+  const overlay = props.playbookOverlay;
+  if (!overlay || typeof overlay !== 'object') return false;
+  if (overlay.base_state) return true;
+  const hasBallSegments = Array.isArray(overlay.ball_path_segments) && overlay.ball_path_segments.length > 0;
+  const byPlayer = overlay.player_path_segments && typeof overlay.player_path_segments === 'object'
+    ? Object.values(overlay.player_path_segments)
+    : [];
+  const hasPlayerSegments = byPlayer.some((segments) => Array.isArray(segments) && segments.length > 0);
+  return hasBallSegments || hasPlayerSegments;
+});
+
+const showPlayers = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value);
+const showValueAnnotations = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value);
+
+const playbookPlayerColorMap = computed(() => {
+  const gs = currentGameState.value;
+  const offenseIds = Array.isArray(gs?.offense_ids) ? gs.offense_ids : [];
+  const colorMap = {};
+  offenseIds.forEach((rawId, idx) => {
+    const pid = Number(rawId);
+    if (!Number.isFinite(pid)) return;
+    colorMap[pid] = PLAYBOOK_TRAJECTORY_COLORS[idx % PLAYBOOK_TRAJECTORY_COLORS.length];
+  });
+  return colorMap;
+});
+
+const playbookSelectedPlayerId = computed(() => {
+  const raw = String(props.playbookOverlay?.display?.playerFilter || 'all');
+  if (raw === 'all') return null;
+  const pid = Number(raw);
+  return Number.isFinite(pid) ? pid : null;
+});
+
+const playbookShowPlayerPaths = computed(() =>
+  hasPlaybookOverlay.value && props.playbookOverlay?.display?.showPlayerPaths !== false
+);
+
+const playbookShowBallPaths = computed(() =>
+  hasPlaybookOverlay.value && props.playbookOverlay?.display?.showBallPaths !== false
+);
+
+const playbookShowPassPaths = computed(() =>
+  hasPlaybookOverlay.value && props.playbookOverlay?.display?.showPassPaths === true
+);
+
+const playbookShowShotHeatmap = computed(() =>
+  hasPlaybookOverlay.value && props.playbookOverlay?.display?.showShotHeatmap === true
+);
+
+const playbookMaxPlayerSegmentCount = computed(() => {
+  if (!hasPlaybookOverlay.value) return 1;
+  let maxCount = 1;
+  const byPlayer = props.playbookOverlay?.player_path_segments || {};
+  for (const segments of Object.values(byPlayer)) {
+    if (!Array.isArray(segments)) continue;
+    for (const segment of segments) {
+      const normalized = normalizeTrajectorySegment(segment);
+      if (normalized && normalized.count > maxCount) {
+        maxCount = normalized.count;
+      }
+    }
+  }
+  return maxCount;
+});
+
+const playbookMaxBallSegmentCount = computed(() => {
+  if (!hasPlaybookOverlay.value) return 1;
+  let maxCount = 1;
+  const segments = Array.isArray(props.playbookOverlay?.ball_path_segments)
+    ? props.playbookOverlay.ball_path_segments
+    : [];
+  for (const segment of segments) {
+    const normalized = normalizeTrajectorySegment(segment);
+    if (normalized && normalized.count > maxCount) {
+      maxCount = normalized.count;
+    }
+  }
+  return maxCount;
+});
+
+const playbookPlayerPathSegments = computed(() => {
+  if (!playbookShowPlayerPaths.value) return [];
+  const byPlayer = props.playbookOverlay?.player_path_segments || {};
+  const segments = [];
+  const colorMap = playbookPlayerColorMap.value;
+  const selectedPid = playbookSelectedPlayerId.value;
+
+  for (const [rawPid, rawSegments] of Object.entries(byPlayer)) {
+    const pid = Number(rawPid);
+    if (selectedPid !== null && pid !== selectedPid) continue;
+    const color = colorMap[pid] || PLAYBOOK_TRAJECTORY_COLORS[Math.abs(pid) % PLAYBOOK_TRAJECTORY_COLORS.length];
+    if (!Array.isArray(rawSegments)) continue;
+    for (const rawSegment of rawSegments) {
+      const normalized = normalizeTrajectorySegment(rawSegment);
+      if (!normalized) continue;
+      const start = axialToCartesian(normalized.from[0], normalized.from[1]);
+      const end = axialToCartesian(normalized.to[0], normalized.to[1]);
+      const ratio = Math.max(0, Math.min(1, normalized.count / playbookMaxPlayerSegmentCount.value));
+      segments.push({
+        key: `playbook-player-${pid}-${normalized.from.join(',')}-${normalized.to.join(',')}`,
+        playerId: pid,
+        color,
+        count: normalized.count,
+        x1: start.x,
+        y1: start.y,
+        x2: end.x,
+        y2: end.y,
+        strokeWidth: 1.5 + (6 * Math.sqrt(ratio)),
+        opacity: 0.14 + (0.72 * Math.sqrt(ratio)),
+      });
+    }
+  }
+
+  segments.sort((a, b) => a.count - b.count);
+  return segments;
+});
+
+const playbookBallPathSegments = computed(() => {
+  if (!playbookShowBallPaths.value) return [];
+  const rawSegments = Array.isArray(props.playbookOverlay?.ball_path_segments)
+    ? props.playbookOverlay.ball_path_segments
+    : [];
+  const segments = [];
+  for (const rawSegment of rawSegments) {
+    const normalized = normalizeTrajectorySegment(rawSegment);
+    if (!normalized) continue;
+    const start = axialToCartesian(normalized.from[0], normalized.from[1]);
+    const end = axialToCartesian(normalized.to[0], normalized.to[1]);
+    const ratio = Math.max(0, Math.min(1, normalized.count / playbookMaxBallSegmentCount.value));
+    segments.push({
+      key: `playbook-ball-${normalized.from.join(',')}-${normalized.to.join(',')}`,
+      count: normalized.count,
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      strokeWidth: 2 + (7 * Math.sqrt(ratio)),
+      opacity: 0.16 + (0.7 * Math.sqrt(ratio)),
+    });
+  }
+  segments.sort((a, b) => a.count - b.count);
+  return segments;
+});
+
+const playbookMaxPassSegmentCount = computed(() => {
+  if (!hasPlaybookOverlay.value) return 1;
+  let maxCount = 1;
+  const segments = Array.isArray(props.playbookOverlay?.pass_path_segments)
+    ? props.playbookOverlay.pass_path_segments
+    : [];
+  for (const segment of segments) {
+    const normalized = normalizeTrajectorySegment(segment);
+    if (normalized && normalized.count > maxCount) {
+      maxCount = normalized.count;
+    }
+  }
+  return maxCount;
+});
+
+const playbookPassPathSegments = computed(() => {
+  if (!playbookShowPassPaths.value) return [];
+  const rawSegments = Array.isArray(props.playbookOverlay?.pass_path_segments)
+    ? props.playbookOverlay.pass_path_segments
+    : [];
+  const segments = [];
+  for (const rawSegment of rawSegments) {
+    const normalized = normalizeTrajectorySegment(rawSegment);
+    if (!normalized) continue;
+    const passerId = Number(rawSegment?.passer_id);
+    const receiverId = Number(rawSegment?.receiver_id);
+    if (
+      playbookSelectedPlayerId.value !== null
+      && Number.isFinite(passerId)
+      && passerId !== playbookSelectedPlayerId.value
+    ) {
+      continue;
+    }
+    const start = axialToCartesian(normalized.from[0], normalized.from[1]);
+    const end = axialToCartesian(normalized.to[0], normalized.to[1]);
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const norm = Math.hypot(dx, dy);
+    if (norm <= 1e-6) continue;
+    const hexDist = Math.max(1, hexDistance(normalized.from, normalized.to));
+    const distanceScale = Math.pow(hexDist, 0.8);
+    const ratio = Math.max(0, Math.min(1, normalized.count / playbookMaxPassSegmentCount.value));
+    const startOffset = HEX_RADIUS * 0.45;
+    const endOffset = HEX_RADIUS * 0.7;
+    const headLength = HEX_RADIUS * (0.12 + (0.10 * distanceScale));
+    const headWidth = HEX_RADIUS * (0.10 + (0.08 * distanceScale));
+    const barHalfWidth = HEX_RADIUS * 0.21;
+    const barStrokeWidth = 1.6 + (1.0 * distanceScale);
+    const ux = dx / norm;
+    const uy = dy / norm;
+    const nx = -uy;
+    const ny = ux;
+    const startTipX = start.x + ((dx / norm) * startOffset);
+    const startTipY = start.y + ((dy / norm) * startOffset);
+    const endBarX = end.x - (ux * endOffset);
+    const endBarY = end.y - (uy * endOffset);
+    segments.push({
+      key: `playbook-pass-${normalized.from.join(',')}-${normalized.to.join(',')}`,
+      passerColor: playbookPlayerColorMap.value[passerId] || '#fbbf24',
+      receiverColor: playbookPlayerColorMap.value[receiverId] || '#fbbf24',
+      count: normalized.count,
+      opacity: 0.18 + (0.5 * Math.sqrt(ratio)),
+      startPoints: buildArrowheadPoints(startTipX, startTipY, dx, dy, headLength, headWidth),
+      receiveBarX1: endBarX + (nx * barHalfWidth),
+      receiveBarY1: endBarY + (ny * barHalfWidth),
+      receiveBarX2: endBarX - (nx * barHalfWidth),
+      receiveBarY2: endBarY - (ny * barHalfWidth),
+      receiveBarStrokeWidth: barStrokeWidth,
+    });
+  }
+  segments.sort((a, b) => a.count - b.count);
+  return segments;
+});
+
+const playbookStartMarkers = computed(() => {
+  if (!playbookShowPlayerPaths.value) return [];
+  const gs = currentGameState.value;
+  if (!gs || !Array.isArray(gs.positions)) return [];
+  const offenseIds = Array.isArray(gs.offense_ids) ? gs.offense_ids : [];
+  const ballHolder = Number(gs.ball_holder);
+  const selectedPid = playbookSelectedPlayerId.value;
+  return offenseIds
+    .map((rawPid) => {
+      const pid = Number(rawPid);
+      if (selectedPid !== null && pid !== selectedPid) return null;
+      const pos = gs.positions?.[pid];
+      if (!Number.isFinite(pid) || !Array.isArray(pos) || pos.length < 2) return null;
+      const point = axialToCartesian(Number(pos[0]), Number(pos[1]));
+      return {
+        key: `playbook-start-${pid}`,
+        id: pid,
+        x: point.x,
+        y: point.y,
+        color: playbookPlayerColorMap.value[pid] || PLAYBOOK_TRAJECTORY_COLORS[Math.abs(pid) % PLAYBOOK_TRAJECTORY_COLORS.length],
+        hasBall: pid === ballHolder,
+        label: getPlayerJerseyNumber(pid),
+      };
+    })
+    .filter(Boolean);
+});
+
+const playbookShotHeatmapCounts = computed(() => {
+  if (!playbookShowShotHeatmap.value) return {};
+  const selectedPid = playbookSelectedPlayerId.value;
+  const src = selectedPid === null
+    ? (props.playbookOverlay?.shot_heatmap || {})
+    : (props.playbookOverlay?.player_shot_heatmaps?.[String(selectedPid)] || {});
+  const out = {};
+  for (const [rawKey, val] of Object.entries(src)) {
+    if (!Array.isArray(val) || val.length < 1) continue;
+    const attempts = Number(val[0]) || 0;
+    if (attempts <= 0) continue;
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (Number.isNaN(q) || Number.isNaN(r)) continue;
+    out[`${q},${r}`] = { attempts };
+  }
+  return out;
+});
+
+const playbookShotOverlayPoints = computed(() => {
+  if (!playbookShowShotHeatmap.value) return [];
+  const entries = Object.entries(playbookShotHeatmapCounts.value || {});
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  return entries.map(([key, value]) => {
+    const q = Number(key.split(',')[0]);
+    const r = Number(key.split(',')[1]);
+    const { x, y } = axialToCartesian(q, r);
+    return {
+      key,
+      x,
+      y,
+      attempts: Number(value.attempts || 0),
+    };
+  });
+});
+
+const playbookMaxShotAttempts = computed(() => {
+  let max = 0;
+  for (const pt of playbookShotOverlayPoints.value) {
+    if (pt.attempts > max) max = pt.attempts;
+  }
+  return max || 1;
+});
 
 const shotLegendConfig = computed(() => {
   if (!hasShotCounts.value || courtLayout.value.length === 0) return null;
@@ -1192,6 +1546,18 @@ const courtBounds = computed(() => {
     maxX: Math.max(...xs),
     minY: Math.min(...ys),
     maxY: Math.max(...ys),
+  };
+});
+
+const courtBackdropRect = computed(() => {
+  if (courtLayout.value.length === 0) return null;
+  const { minX, maxX, minY, maxY } = courtBounds.value;
+  const epsilon = 0.75;
+  return {
+    x: minX - HEX_HALF_WIDTH - epsilon,
+    y: minY - HEX_RADIUS - epsilon,
+    width: (maxX - minX) + (2 * HEX_HALF_WIDTH) + (2 * epsilon),
+    height: (maxY - minY) + (2 * HEX_RADIUS) + (2 * epsilon),
   };
 });
 
@@ -3110,21 +3476,59 @@ onBeforeUnmount(() => {
           <stop offset="0%" stop-color="rgba(15,23,42,0.85)" />
           <stop offset="100%" stop-color="rgba(251,146,60,0.95)" />
         </linearGradient>
+        <mask
+          v-if="courtBackdropRect"
+          id="court-gap-mask"
+          maskUnits="userSpaceOnUse"
+          maskContentUnits="userSpaceOnUse"
+        >
+          <rect
+            :x="courtBackdropRect.x"
+            :y="courtBackdropRect.y"
+            :width="courtBackdropRect.width"
+            :height="courtBackdropRect.height"
+            fill="white"
+          />
+          <polygon
+            v-for="hex in courtHexPolygons"
+            :key="`court-gap-mask-${hex.key}`"
+            :points="hex.points"
+            fill="black"
+            stroke="black"
+            stroke-width="2"
+          />
+        </mask>
       </defs>
       <g :transform="boardTransform">
+        <rect
+          v-if="courtBackdropRect"
+          :x="courtBackdropRect.x"
+          :y="courtBackdropRect.y"
+          :width="courtBackdropRect.width"
+          :height="courtBackdropRect.height"
+          class="court-gap-fill"
+          mask="url(#court-gap-mask)"
+        />
+
         <!-- Draw qualified (blue) and unqualified (dark) court hexes -->
         <polygon
-          v-for="hex in courtLayout"
+          v-for="hex in courtHexPolygons"
           :key="hex.key"
-          :points="[...Array(6)].map((_, i) => {
-            const angle_deg = 60 * i + 30;
-            const angle_rad = Math.PI / 180 * angle_deg;
-            const xPoint = hex.x + HEX_RADIUS * Math.cos(angle_rad);
-            const yPoint = hex.y + HEX_RADIUS * Math.sin(angle_rad);
-            return `${xPoint},${yPoint}`;
-          }).join(' ')"
+          :points="hex.points"
           :class="['court-hex', threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified']"
         />
+        <text
+          v-if="props.showCoordinates"
+          v-for="hex in courtHexPolygons"
+          :key="`coord-${hex.key}`"
+          :x="hex.x"
+          :y="hex.y"
+          dy=".35em"
+          text-anchor="middle"
+          class="court-coordinate-label"
+        >
+          {{ `${hex.q},${hex.r}` }}
+        </text>
 
         <!-- Offensive Lane (painted area) -->
         <polygon
@@ -3138,6 +3542,15 @@ onBeforeUnmount(() => {
             return `${xPoint},${yPoint}`;
           }).join(' ')"
           class="offensive-lane"
+        />
+
+        <rect
+          v-if="courtBackdropRect"
+          :x="courtBackdropRect.x"
+          :y="courtBackdropRect.y"
+          :width="courtBackdropRect.width"
+          :height="courtBackdropRect.height"
+          class="court-gap-boundary"
         />
 
         <!-- 3PT line outline -->
@@ -3191,6 +3604,104 @@ onBeforeUnmount(() => {
 
         <!-- Draw the basket -->
         <circle :cx="basketPosition.x" :cy="basketPosition.y" :r="HEX_RADIUS * 0.8" class="basket-rim" />
+
+        <!-- Aggregated Playbook overlay -->
+        <g v-if="hasPlaybookOverlay" class="playbook-overlay">
+          <polygon
+            v-for="pt in playbookShotOverlayPoints"
+            :key="`playbook-shot-${pt.key}`"
+            :points="hexPointsFor(pt.x, pt.y, HEX_RADIUS)"
+            :fill="volumeFillFor(pt.attempts, playbookMaxShotAttempts, 0.48)"
+            :stroke="volumeStrokeFor(pt.attempts, playbookMaxShotAttempts, 0.72)"
+            stroke-width="1.1"
+            class="playbook-shot-heat-hex"
+          />
+          <text
+            v-for="pt in playbookShotOverlayPoints"
+            :key="`playbook-shot-label-${pt.key}`"
+            :x="pt.x"
+            :y="pt.y"
+            text-anchor="middle"
+            dominant-baseline="middle"
+            class="playbook-shot-count-text"
+          >
+            {{ pt.attempts }}
+          </text>
+          <line
+            v-for="segment in playbookPlayerPathSegments"
+            :key="segment.key"
+            :x1="segment.x1"
+            :y1="segment.y1"
+            :x2="segment.x2"
+            :y2="segment.y2"
+            :stroke="segment.color"
+            :stroke-width="segment.strokeWidth"
+            :opacity="segment.opacity"
+            class="playbook-player-segment"
+          />
+          <line
+            v-for="segment in playbookBallPathSegments"
+            :key="segment.key"
+            :x1="segment.x1"
+            :y1="segment.y1"
+            :x2="segment.x2"
+            :y2="segment.y2"
+            :stroke="ballColor"
+            :stroke-width="segment.strokeWidth"
+            :opacity="segment.opacity"
+            class="playbook-ball-segment"
+          />
+          <g
+            v-for="segment in playbookPassPathSegments"
+            :key="segment.key"
+            class="playbook-pass-segment"
+            :style="{ opacity: segment.opacity }"
+          >
+            <polygon
+              :points="segment.startPoints"
+              :fill="segment.passerColor"
+              class="playbook-pass-origin-head"
+            />
+            <line
+              :x1="segment.receiveBarX1"
+              :y1="segment.receiveBarY1"
+              :x2="segment.receiveBarX2"
+              :y2="segment.receiveBarY2"
+              :stroke="segment.receiverColor"
+              :stroke-width="segment.receiveBarStrokeWidth"
+              class="playbook-pass-receive-bar"
+            />
+          </g>
+          <g
+            v-for="marker in playbookStartMarkers"
+            :key="marker.key"
+            class="playbook-start-marker"
+          >
+            <circle
+              :cx="marker.x"
+              :cy="marker.y"
+              :r="HEX_RADIUS * 0.46"
+              :stroke="marker.color"
+              class="playbook-start-shell"
+            />
+            <circle
+              v-if="marker.hasBall"
+              :cx="marker.x"
+              :cy="marker.y"
+              :r="HEX_RADIUS * 0.62"
+              class="playbook-start-ball-ring"
+            />
+            <text
+              :x="marker.x"
+              :y="marker.y"
+              dy=".32em"
+              text-anchor="middle"
+              class="playbook-start-label"
+            >
+              {{ marker.label }}
+            </text>
+          </g>
+        </g>
 
         <!-- Draw Ghost Trails -->
         <g 
@@ -3252,7 +3763,14 @@ onBeforeUnmount(() => {
           :key="player.id"
           :class="[
             'player-group',
-            { 'ball-handler-bounce': player.hasBall && draggedPlayerId !== player.id && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id },
+            {
+              'ball-handler-bounce':
+                !props.placementMode
+                && player.hasBall
+                && draggedPlayerId !== player.id
+                && shotJumpPlayerId !== player.id
+                && shotInFlightPlayerId !== player.id,
+            },
             { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
             { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id },
             {
@@ -4153,29 +4671,48 @@ onBeforeUnmount(() => {
   width: 100%;
   height: auto;
 }
+.court-gap-fill {
+  fill: rgba(58, 70, 108, 0.92);
+  pointer-events: none;
+}
+.court-gap-boundary {
+  fill: none;
+  stroke: white;
+  stroke-width: 0.08rem;
+  stroke-linejoin: round;
+  pointer-events: none;
+  filter: drop-shadow(0px 0px 5px rgba(203, 240, 69, 0.35));
+}
 .court-hex {
   stroke: rgba(15, 23, 42, 0.6);
   stroke-width: 0.1rem;
 }
 .court-hex.qualified {
-  fill: rgba(59, 130, 246, 0.35);
+  fill: rgba(44, 91, 246, 0.35);
   stroke: #fef3c781;
   stroke-width: 0.05rem;
 }
 .court-hex.unqualified {
-  fill: rgba(38, 47, 77, 0.89);
+  fill: rgba(41, 49, 88, 0.89);
   stroke: rgba(15, 23, 42, 0.95);
+}
+.court-coordinate-label {
+  fill: rgba(226, 232, 240, 0.78);
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 0.34rem;
+  pointer-events: none;
+  user-select: none;
 }
 .three-point-arc {
   fill: none;
-  stroke: #fb923c;
-  stroke-width: 0.3rem;
-  stroke-linecap: square;
+  stroke: #f5f5e5;
+  stroke-width: 0.22rem;
+  stroke-linecap: round;
   /* stroke-dasharray: 4 8; */
-  filter: drop-shadow(0px 0px 4px rgba(0, 0, 0, 0.6));
+  filter: drop-shadow(0px 0px 3px rgba(225, 244, 223, 0.6));
 }
 .offensive-lane {
-  fill: rgba(243, 4, 104, 0.397);
+  fill: rgba(218, 3, 68, 0.631);
   stroke: rgba(255, 140, 140, 0.5);
   stroke-width: 1;
 }
@@ -4183,6 +4720,7 @@ onBeforeUnmount(() => {
   stroke: white;
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease, fill 0.2s ease;
+  filter: drop-shadow(0px 0px 1px rgba(204, 218, 246, 0.892));
 }
 .player-user {
   fill: #007bff;
@@ -4199,6 +4737,7 @@ onBeforeUnmount(() => {
   stroke: white;
   stroke-width: 0.05rem;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
+  filter: drop-shadow(0px 0px 1px rgba(242, 165, 242, 0.88));
 }
 .player-ai {
   fill: #dc3545;
@@ -4556,6 +5095,72 @@ onBeforeUnmount(() => {
   fill: var(--app-text-muted, #cbe1e0);
   font-size: 0.8rem;
   font-weight: 500;
+}
+
+.playbook-overlay {
+  pointer-events: none;
+}
+
+.playbook-shot-heat-hex {
+  mix-blend-mode: screen;
+}
+
+.playbook-shot-count-text {
+  fill: rgba(248, 250, 252, 0.96);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  stroke: rgba(15, 23, 42, 0.85);
+  stroke-width: 2.25px;
+  paint-order: stroke fill;
+  pointer-events: none;
+}
+
+.playbook-player-segment {
+  fill: none;
+  stroke-linecap: round;
+  mix-blend-mode: screen;
+}
+
+.playbook-ball-segment {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 10 7;
+  filter: drop-shadow(0 0 7px rgba(255, 165, 0, 0.28));
+}
+
+.playbook-pass-segment {
+  pointer-events: none;
+}
+
+.playbook-pass-origin-head {
+  filter: drop-shadow(0 0 2px rgba(15, 23, 42, 0.35));
+}
+
+.playbook-pass-receive-bar {
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 2px rgba(15, 23, 42, 0.35));
+}
+
+.playbook-start-shell {
+  fill: rgba(15, 23, 42, 0.82);
+  stroke-width: 3;
+}
+
+.playbook-start-ball-ring {
+  fill: none;
+  stroke: #f59e0b;
+  stroke-width: 3.5;
+  stroke-dasharray: 7 5;
+}
+
+.playbook-start-label {
+  fill: #f8fafc;
+  font-size: 0.78rem;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(15, 23, 42, 0.95);
+  stroke-width: 2px;
 }
 
 /* --- Outcome Indicator Styles --- */

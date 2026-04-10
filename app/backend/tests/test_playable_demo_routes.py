@@ -1,5 +1,3 @@
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -13,6 +11,17 @@ class DummyPlayableEnv:
         self.shot_clock = 24
         self.last_action_results = {}
         self.pass_mode = "directional"
+        self.training_team = None
+        self.shot_clock_steps = 24
+        self.min_shot_clock = 24
+        self.offense_layup_pct_by_player = [0.6]
+        self.offense_three_pt_pct_by_player = [0.35]
+        self.offense_dunk_pct_by_player = [0.2]
+
+    def reset(self, options=None):
+        if isinstance(options, dict) and "shot_clock" in options:
+            self.shot_clock = int(options["shot_clock"])
+        return {"obs": []}, {}
 
 
 def _build_dummy_playable_state(*, demo_mode: bool = False) -> GameState:
@@ -123,14 +132,7 @@ def test_playable_options_include_demo_config(monkeypatch):
     monkeypatch.setenv("BW_PLAYABLE_DEMO_ALTERNATION_NUMBER", "75")
     monkeypatch.delenv("BW_PLAYABLE_DEMO_CHECKPOINT", raising=False)
 
-    app = FastAPI()
-    app.include_router(playable_routes.router)
-    client = TestClient(app)
-
-    response = client.get("/api/playable/options")
-    assert response.status_code == 200, response.text
-
-    body = response.json()
+    body = playable_routes.get_playable_options()
     assert body["status"] == "success"
     assert body["demo"]["enabled"] is True
     assert body["demo"]["available"] is True
@@ -164,3 +166,26 @@ def test_playable_demo_takeover_turns_demo_into_live_game(monkeypatch):
     assert payload["config"]["period_mode"] == "quarters"
     assert payload["config"]["period_length_minutes"] == 7
     assert target_state.playable_session["demo_mode"] is False
+
+
+def test_reset_playable_possession_runs_selector_episode_init(monkeypatch):
+    target_state = _build_dummy_playable_state(demo_mode=False)
+    target_state.user_team = None
+    captured = {"called": 0}
+
+    def fake_selector_init():
+        captured["called"] += 1
+
+    monkeypatch.setattr(playable_routes, "game_state", target_state)
+    monkeypatch.setattr(playable_routes, "_capture_turn_start_snapshot", lambda: None)
+    monkeypatch.setattr(playable_routes, "get_ui_game_state", lambda: {"done": False})
+    monkeypatch.setattr(
+        playable_routes,
+        "_initialize_app_selector_runtime_for_episode",
+        fake_selector_init,
+    )
+
+    state = playable_routes._reset_playable_possession(target_state.playable_session)
+
+    assert state == {"done": False}
+    assert captured["called"] == 1

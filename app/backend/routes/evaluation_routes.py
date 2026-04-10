@@ -12,7 +12,14 @@ from app.backend.evaluation import (
     validate_custom_eval_setup as eval_validate_custom_eval_setup,
 )
 from app.backend.schemas import EvaluationRequest, PassStealPreviewRequest
-from app.backend.state import game_state, get_ui_game_state
+from app.backend.state import (
+    game_state,
+    get_ui_game_state,
+    reset_evaluation_progress,
+    update_evaluation_progress,
+    fail_evaluation_progress,
+    get_evaluation_progress,
+)
 
 
 router = APIRouter()
@@ -68,12 +75,14 @@ def run_evaluation(request: EvaluationRequest):
     opponent_deterministic = request.opponent_deterministic
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
     randomize_offense_perm = bool(getattr(request, "randomize_offense_permutation", False))
+    intent_selection_mode = str(getattr(request, "intent_selection_mode", "learned_sample") or "learned_sample")
 
     # Log shot clock configuration before evaluation
     print(f"[Evaluation] Starting {num_episodes} episodes (parallel)")
     print("[Evaluation] Configuration:")
     print(f"  - Player deterministic: {player_deterministic}")
     print(f"  - Opponent deterministic: {opponent_deterministic}")
+    print(f"  - Intent selection mode: {intent_selection_mode}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
     print(f"  - User team: {game_state.user_team.name}")
     print(f"  - Unified policy (user): {game_state.unified_policy_key}")
@@ -110,12 +119,14 @@ def run_evaluation(request: EvaluationRequest):
         num_workers = max(2, min(mp.cpu_count(), 16, num_episodes))
 
     try:
+        reset_evaluation_progress(num_episodes)
         raw_results = eval_run_evaluation(
             num_episodes=num_episodes,
             player_deterministic=player_deterministic,
             opponent_deterministic=opponent_deterministic,
             required_params=game_state.env_required_params,
             optional_params=game_state.env_optional_params,
+            training_params=game_state.mlflow_training_params,
             unified_policy_path=game_state.unified_policy_path,
             opponent_policy_path=game_state.opponent_policy_path,
             user_team_name=game_state.user_team.name,
@@ -124,16 +135,20 @@ def run_evaluation(request: EvaluationRequest):
             shot_accumulator=shot_accumulator,
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_perm,
+            intent_selection_mode=intent_selection_mode,
             num_workers=num_workers,
+            progress_callback=update_evaluation_progress,
         )
     except Exception as e:
         import traceback
 
         traceback.print_exc()
+        fail_evaluation_progress(str(e))
         raise HTTPException(status_code=500, detail=f"Failed to run evaluation: {e}")
 
     if isinstance(raw_results, dict):
         per_player_stats = raw_results.get("per_player_stats", {}) or {}
+        per_intent_stats = raw_results.get("per_intent_stats", {}) or {}
         eval_diagnostics = raw_results.get("eval_diagnostics", {}) or {}
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
@@ -141,6 +156,7 @@ def run_evaluation(request: EvaluationRequest):
         episode_payload = raw_results.get("results", [])
     else:
         per_player_stats = {}
+        per_intent_stats = {}
         eval_diagnostics = {}
         episode_payload = raw_results
 
@@ -171,6 +187,7 @@ def run_evaluation(request: EvaluationRequest):
         episode_results.append(
             {
                 "episode": r.get("episode") if isinstance(r, dict) else None,
+                "intent_index": r.get("intent_index") if isinstance(r, dict) else None,
                 "final_state": final_state,
                 "steps": r.get("steps") if isinstance(r, dict) else None,
                 "episode_rewards": r.get("episode_rewards") if isinstance(r, dict) else None,
@@ -193,6 +210,8 @@ def run_evaluation(request: EvaluationRequest):
     except Exception:
         pass
 
+    update_evaluation_progress(len(episode_results), len(episode_results))
+
     return _to_jsonable({
         "status": "success",
         "num_episodes": len(episode_results),
@@ -200,5 +219,11 @@ def run_evaluation(request: EvaluationRequest):
         "current_state": current_game_state,
         "shot_accumulator": shot_accumulator,
         "per_player_stats": per_player_stats,
+        "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,
     })
+
+
+@router.get("/api/evaluation_progress")
+def evaluation_progress():
+    return _to_jsonable(get_evaluation_progress())
