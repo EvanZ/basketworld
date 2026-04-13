@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Any, NamedTuple, Sequence
@@ -25,6 +26,7 @@ from basketworld.utils.action_resolution import (
 )
 from basketworld.utils.mask_agnostic_extractor import MaskAgnosticCombinedExtractor
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
+from benchmarks.sbx_phase_a import PhaseAPolicySpec, init_phase_a_policy_params
 from benchmarks.common import (
     Timer,
     benchmark_args_snapshot,
@@ -47,6 +49,10 @@ SQRT3 = float(np.sqrt(3.0))
 
 class KernelStatic(NamedTuple):
     cell_coords: Any
+    basket_distance_by_cell: Any
+    cell_distance_matrix: Any
+    non_basket_cell_mask: Any
+    offense_spawn_candidate_mask: Any
     move_mask_by_cell: Any
     three_point_by_cell: Any
     basket_position: Any
@@ -76,7 +82,13 @@ class KernelStatic(NamedTuple):
     steal_position_weight_min: Any
     three_point_distance: Any
     three_pt_extra_hex_decay: Any
+    shot_clock_min: Any
+    shot_clock_max: Any
     three_second_max_steps: Any
+    defense_min_spawn_distance: Any
+    max_spawn_distance_enabled: Any
+    max_spawn_distance: Any
+    defender_spawn_distance: Any
     defender_guard_distance: Any
     illegal_defense_enabled: Any
     offensive_three_seconds_enabled: Any
@@ -94,6 +106,9 @@ class KernelStatic(NamedTuple):
     base_layup_pct: Any
     base_three_pt_pct: Any
     base_dunk_pct: Any
+    layup_std: Any
+    three_pt_std: Any
+    dunk_std: Any
     training_player_mask: Any
     training_role_flag: Any
     task_reward_scale: Any
@@ -154,6 +169,19 @@ def parse_args(argv=None):
         type=int,
         default=0,
         help="Base seed used when sampling env snapshots into the JAX batch.",
+    )
+    parser.add_argument(
+        "--phase-a-policy-hidden-dims",
+        type=int,
+        nargs="+",
+        default=[128, 128],
+        help="Hidden layer widths for the reduced flat JAX policy used in compiled rollout benchmarks.",
+    )
+    parser.add_argument(
+        "--phase-a-policy-seed",
+        type=int,
+        default=0,
+        help="Random seed used to initialize the reduced flat JAX policy for compiled rollout benchmarks.",
     )
     return parser.parse_args(argv)
 
@@ -334,6 +362,34 @@ def stack_state_snapshots(
 
 def build_kernel_static_from_env(env, xp) -> KernelStatic:
     cells = sorted(env._move_mask_by_cell.keys())
+    basket_position = np.asarray(env.basket_position, dtype=np.int32)
+    basket_distance = np.asarray(
+        [env._hex_distance(cell, env.basket_position) for cell in cells],
+        dtype=np.int32,
+    )
+    cell_distance_matrix = np.asarray(
+        [
+            [env._hex_distance(src, dst) for dst in cells]
+            for src in cells
+        ],
+        dtype=np.int32,
+    )
+    non_basket_mask = np.asarray(
+        [0 if np.array_equal(np.asarray(cell, dtype=np.int32), basket_position) else 1 for cell in cells],
+        dtype=np.int8,
+    )
+    offense_min_spawn = max(0, int(getattr(env, "spawn_distance", 0)))
+    defense_min_spawn = max(0, int(getattr(env, "spawn_distance", 0)) - 1)
+    max_spawn_distance = getattr(env, "max_spawn_distance", None)
+    max_spawn_enabled = max_spawn_distance is not None
+    max_spawn_value = int(max_spawn_distance) if max_spawn_enabled else -1
+    offense_spawn_candidate_mask = (
+        (non_basket_mask == 1)
+        & (basket_distance >= offense_min_spawn)
+        & ((basket_distance <= max_spawn_value) if max_spawn_enabled else np.ones_like(basket_distance, dtype=bool))
+    ).astype(np.int8)
+    if int(np.sum(offense_spawn_candidate_mask)) < int(env.players_per_side):
+        offense_spawn_candidate_mask = non_basket_mask.copy()
     move_masks = np.stack(
         [np.asarray(env._move_mask_by_cell[cell], dtype=np.int8) for cell in cells],
         axis=0,
@@ -379,9 +435,13 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
 
     return KernelStatic(
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
+        basket_distance_by_cell=xp.asarray(basket_distance, dtype=xp.int32),
+        cell_distance_matrix=xp.asarray(cell_distance_matrix, dtype=xp.int32),
+        non_basket_cell_mask=xp.asarray(non_basket_mask, dtype=xp.int8),
+        offense_spawn_candidate_mask=xp.asarray(offense_spawn_candidate_mask, dtype=xp.int8),
         move_mask_by_cell=xp.asarray(move_masks, dtype=xp.int8),
         three_point_by_cell=xp.asarray(three_point_mask, dtype=xp.int8),
-        basket_position=xp.asarray(np.asarray(env.basket_position, dtype=np.int32), dtype=xp.int32),
+        basket_position=xp.asarray(basket_position, dtype=xp.int32),
         hex_directions=xp.asarray(np.asarray(env.hex_directions, dtype=np.int32), dtype=xp.int32),
         offense_ids=xp.asarray(np.asarray(env.offense_ids, dtype=np.int32), dtype=xp.int32),
         defense_ids=xp.asarray(np.asarray(env.defense_ids, dtype=np.int32), dtype=xp.int32),
@@ -423,7 +483,13 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         three_pt_extra_hex_decay=xp.asarray(
             float(env.three_pt_extra_hex_decay), dtype=xp.float32
         ),
+        shot_clock_min=xp.asarray(int(env.min_shot_clock), dtype=xp.int32),
+        shot_clock_max=xp.asarray(int(env.shot_clock_steps), dtype=xp.int32),
         three_second_max_steps=xp.asarray(float(env.three_second_max_steps), dtype=xp.float32),
+        defense_min_spawn_distance=xp.asarray(float(defense_min_spawn), dtype=xp.float32),
+        max_spawn_distance_enabled=xp.asarray(1 if max_spawn_enabled else 0, dtype=xp.int8),
+        max_spawn_distance=xp.asarray(float(max_spawn_value), dtype=xp.float32),
+        defender_spawn_distance=xp.asarray(float(env.defender_spawn_distance), dtype=xp.float32),
         defender_guard_distance=xp.asarray(float(env.defender_guard_distance), dtype=xp.float32),
         illegal_defense_enabled=xp.asarray(1 if env.illegal_defense_enabled else 0, dtype=xp.int8),
         offensive_three_seconds_enabled=xp.asarray(
@@ -445,6 +511,9 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         base_layup_pct=xp.asarray(float(env.layup_pct), dtype=xp.float32),
         base_three_pt_pct=xp.asarray(float(env.three_pt_pct), dtype=xp.float32),
         base_dunk_pct=xp.asarray(float(env.dunk_pct), dtype=xp.float32),
+        layup_std=xp.asarray(float(env.layup_std), dtype=xp.float32),
+        three_pt_std=xp.asarray(float(env.three_pt_std), dtype=xp.float32),
+        dunk_std=xp.asarray(float(env.dunk_std), dtype=xp.float32),
         training_player_mask=xp.asarray(training_player_mask, dtype=xp.float32),
         training_role_flag=xp.asarray(float(training_role_flag), dtype=xp.float32),
         task_reward_scale=xp.asarray(
@@ -1032,6 +1101,19 @@ def build_set_observation_batch(static: KernelStatic, state: KernelState, jnp):
     }
 
 
+def build_phase_a_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
+    batch_size = state.positions.shape[0]
+    role_flag = jnp.full((batch_size, 1), static.training_role_flag, dtype=jnp.float32)
+    return jnp.concatenate(
+        [
+            build_observation_vector_batch(static, state, jnp),
+            role_flag,
+            build_offense_skill_deltas_batch(static, state, jnp),
+        ],
+        axis=1,
+    ).astype(jnp.float32)
+
+
 def build_aggregated_reward_batch(static: KernelStatic, rewards, jnp):
     scaled = rewards.astype(jnp.float32) * static.training_player_mask[None, :]
     return jnp.sum(scaled, axis=1) * static.task_reward_scale
@@ -1414,6 +1496,284 @@ def _step_batch_minimal_impl(static: KernelStatic, state: KernelState, actions, 
     return jax.vmap(per_state)(state, actions, rng_keys)
 
 
+def _resolve_team_player_ids(static, jax, jnp):
+    is_training_offense = static.training_role_flag > 0.0
+    training_ids = jax.lax.cond(
+        is_training_offense,
+        lambda _: static.offense_ids,
+        lambda _: static.defense_ids,
+        operand=None,
+    )
+    opponent_ids = jax.lax.cond(
+        is_training_offense,
+        lambda _: static.defense_ids,
+        lambda _: static.offense_ids,
+        operand=None,
+    )
+    return training_ids.astype(jnp.int32), opponent_ids.astype(jnp.int32)
+
+
+def _phase_a_policy_forward_logits(params, flat_obs, jnp):
+    x = flat_obs
+    for layer_idx, (weights, bias) in enumerate(params):
+        x = jnp.matmul(x, weights) + bias
+        if layer_idx < len(params) - 1:
+            x = jnp.tanh(x)
+    return x
+
+
+def _masked_categorical_actions_jax(logits, action_mask, sample_key, jax, jnp):
+    legal = action_mask > 0
+    has_legal = jnp.any(legal, axis=-1, keepdims=True)
+    noop_mask = jnp.zeros_like(legal)
+    noop_mask = noop_mask.at[..., 0].set(True)
+    effective_legal = jnp.where(has_legal, legal, noop_mask)
+    masked_logits = jnp.where(
+        effective_legal,
+        logits,
+        jnp.full_like(logits, -1.0e9),
+    )
+    sampled = jax.random.categorical(sample_key, masked_logits, axis=-1).astype(jnp.int32)
+    deterministic = jnp.argmax(masked_logits, axis=-1).astype(jnp.int32)
+    return sampled, deterministic, masked_logits
+
+
+def _sample_uniform_legal_actions_jax(action_mask, sample_key, jax, jnp):
+    zero_logits = jnp.zeros(action_mask.shape, dtype=jnp.float32)
+    sampled, _, _ = _masked_categorical_actions_jax(
+        zero_logits,
+        action_mask,
+        sample_key,
+        jax,
+        jnp,
+    )
+    return sampled
+
+
+def _assemble_full_actions_jax(
+    training_actions,
+    opponent_actions,
+    training_ids,
+    opponent_ids,
+    n_players: int,
+    jnp,
+):
+    batch_size = training_actions.shape[0]
+    full_actions = jnp.zeros((batch_size, int(n_players)), dtype=jnp.int32)
+    full_actions = full_actions.at[:, training_ids].set(training_actions)
+    full_actions = full_actions.at[:, opponent_ids].set(opponent_actions)
+    return full_actions
+
+
+def _replace_done_states(next_state: KernelState, reset_state: KernelState, done, jnp):
+    done_bool = done.astype(jnp.bool_)
+
+    replaced = []
+    for current_value, reset_value in zip(next_state, reset_state):
+        if getattr(current_value, "ndim", 0) <= 1:
+            replaced.append(jnp.where(done_bool, reset_value, current_value))
+        else:
+            expand_shape = (done_bool.shape[0],) + (1,) * (current_value.ndim - 1)
+            done_expand = done_bool.reshape(expand_shape)
+            replaced.append(jnp.where(done_expand, reset_value, current_value))
+    return KernelState(*replaced)
+
+
+def _sample_index_from_mask(mask, key, jax, jnp):
+    mask_bool = mask.astype(jnp.bool_)
+    logits = jnp.where(mask_bool, jnp.zeros(mask_bool.shape, dtype=jnp.float32), -jnp.inf)
+    return jax.random.categorical(key, logits, axis=-1).astype(jnp.int32)
+
+
+def _sample_unique_indices_from_mask(mask, count: int, key, jax, jnp):
+    gumbels = jax.random.gumbel(key, shape=mask.shape, dtype=jnp.float32)
+    masked_scores = jnp.where(mask.astype(jnp.bool_), gumbels, -jnp.inf)
+    _, indices = jax.lax.top_k(masked_scores, int(count))
+    return indices.astype(jnp.int32)
+
+
+def _sample_clamped_probabilities(mean, std, shape, key, jax, jnp):
+    std_scalar = jnp.asarray(std, dtype=jnp.float32)
+    mean_scalar = jnp.asarray(mean, dtype=jnp.float32)
+    sampled = mean_scalar + (std_scalar * jax.random.normal(key, shape=shape, dtype=jnp.float32))
+    deterministic = jnp.full(shape, mean_scalar, dtype=jnp.float32)
+    return jnp.clip(
+        jnp.where(std_scalar > 0.0, sampled, deterministic),
+        0.01,
+        0.99,
+    )
+
+
+def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
+    offense_count = int(static.offense_ids.shape[0])
+    cell_count = int(static.cell_coords.shape[0])
+    offense_key, match_key, defense_key = jax.random.split(key, 3)
+    offense_cell_indices = _sample_unique_indices_from_mask(
+        static.offense_spawn_candidate_mask,
+        offense_count,
+        offense_key,
+        jax,
+        jnp,
+    )
+
+    taken_mask = jnp.zeros((cell_count,), dtype=jnp.bool_)
+    taken_mask = taken_mask.at[offense_cell_indices].set(True)
+    offense_match_order = jax.random.permutation(
+        match_key,
+        jnp.arange(offense_count, dtype=jnp.int32),
+    )
+    defense_choice_keys = jax.random.split(defense_key, offense_count)
+    defense_cell_indices = jnp.full((offense_count,), -1, dtype=jnp.int32)
+
+    for idx in range(offense_count):
+        offense_slot = offense_match_order[idx]
+        offense_cell_idx = offense_cell_indices[offense_slot]
+        offense_dist = static.basket_distance_by_cell[offense_cell_idx].astype(jnp.float32)
+        dist_to_offense = static.cell_distance_matrix[:, offense_cell_idx].astype(jnp.float32)
+        non_basket_available = static.non_basket_cell_mask.astype(jnp.bool_) & (~taken_mask)
+        within_max = jnp.where(
+            static.max_spawn_distance_enabled.astype(jnp.bool_),
+            static.basket_distance_by_cell.astype(jnp.float32) <= static.max_spawn_distance,
+            jnp.ones_like(static.basket_distance_by_cell, dtype=jnp.bool_),
+        )
+        strict_mask = (
+            non_basket_available
+            & within_max
+            & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
+            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+            & (jnp.abs(dist_to_offense - static.defender_spawn_distance) <= 1.0)
+        )
+        closer_mask = (
+            non_basket_available
+            & within_max
+            & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
+            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+        )
+        ranged_mask = (
+            non_basket_available
+            & within_max
+            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+        )
+        fallback_mask = non_basket_available
+        candidate_mask = jnp.where(
+            jnp.any(strict_mask),
+            strict_mask,
+            jnp.where(
+                jnp.any(closer_mask),
+                closer_mask,
+                jnp.where(jnp.any(ranged_mask), ranged_mask, fallback_mask),
+            ),
+        )
+        masked_distance = jnp.where(
+            candidate_mask,
+            dist_to_offense,
+            jnp.full((cell_count,), jnp.inf, dtype=jnp.float32),
+        )
+        min_distance = jnp.min(masked_distance)
+        closest_mask = candidate_mask & (dist_to_offense == min_distance)
+        chosen_cell_idx = _sample_index_from_mask(
+            closest_mask,
+            defense_choice_keys[idx],
+            jax,
+            jnp,
+        )
+        defense_cell_indices = defense_cell_indices.at[idx].set(chosen_cell_idx)
+        taken_mask = taken_mask.at[chosen_cell_idx].set(True)
+
+    positions = jnp.zeros(
+        (int(static.role_encoding.shape[0]), 2),
+        dtype=jnp.int32,
+    )
+    positions = positions.at[static.offense_ids].set(static.cell_coords[offense_cell_indices])
+    positions = positions.at[static.defense_ids].set(static.cell_coords[defense_cell_indices])
+    return positions
+
+
+def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
+    n_players = int(static.role_encoding.shape[0])
+    offense_count = int(static.offense_ids.shape[0])
+    (
+        shot_clock_key,
+        layup_key,
+        three_key,
+        dunk_key,
+        positions_key,
+        holder_key,
+    ) = jax.random.split(key, 6)
+
+    shot_clock = jax.random.randint(
+        shot_clock_key,
+        shape=(),
+        minval=static.shot_clock_min,
+        maxval=static.shot_clock_max + 1,
+        dtype=jnp.int32,
+    )
+    layup_samples = _sample_clamped_probabilities(
+        static.base_layup_pct,
+        static.layup_std,
+        (offense_count,),
+        layup_key,
+        jax,
+        jnp,
+    )
+    three_samples = _sample_clamped_probabilities(
+        static.base_three_pt_pct,
+        static.three_pt_std,
+        (offense_count,),
+        three_key,
+        jax,
+        jnp,
+    )
+    dunk_samples = _sample_clamped_probabilities(
+        static.base_dunk_pct,
+        static.dunk_std,
+        (offense_count,),
+        dunk_key,
+        jax,
+        jnp,
+    )
+    layup_pct = jnp.full((n_players,), static.base_layup_pct, dtype=jnp.float32)
+    layup_pct = layup_pct.at[static.offense_ids].set(layup_samples)
+    three_pt_pct = jnp.full((n_players,), static.base_three_pt_pct, dtype=jnp.float32)
+    three_pt_pct = three_pt_pct.at[static.offense_ids].set(three_samples)
+    dunk_pct = jnp.full((n_players,), static.base_dunk_pct, dtype=jnp.float32)
+    dunk_pct = dunk_pct.at[static.offense_ids].set(dunk_samples)
+
+    positions = _sample_reset_positions_single(static, positions_key, jax, jnp)
+    holder_offset = jax.random.randint(
+        holder_key,
+        shape=(),
+        minval=0,
+        maxval=offense_count,
+        dtype=jnp.int32,
+    )
+    ball_holder = static.offense_ids[holder_offset]
+    return KernelState(
+        positions=positions,
+        ball_holder=ball_holder,
+        shot_clock=shot_clock,
+        step_count=jnp.asarray(0, dtype=jnp.int32),
+        episode_ended=jnp.asarray(0, dtype=jnp.int8),
+        pressure_exposure=jnp.asarray(0.0, dtype=jnp.float32),
+        offense_lane_steps=jnp.zeros((n_players,), dtype=jnp.float32),
+        defense_lane_steps=jnp.zeros((n_players,), dtype=jnp.float32),
+        cached_phi=jnp.asarray(0.0, dtype=jnp.float32),
+        offense_score=jnp.asarray(0.0, dtype=jnp.float32),
+        defense_score=jnp.asarray(0.0, dtype=jnp.float32),
+        assist_active=jnp.asarray(0, dtype=jnp.int8),
+        assist_passer=jnp.asarray(-1, dtype=jnp.int32),
+        assist_recipient=jnp.asarray(-1, dtype=jnp.int32),
+        assist_expires_at=jnp.asarray(-1, dtype=jnp.int32),
+        layup_pct=layup_pct,
+        three_pt_pct=three_pt_pct,
+        dunk_pct=dunk_pct,
+    )
+
+
+def reset_batch_minimal(static: KernelStatic, rng_keys, jax, jnp):
+    return jax.vmap(lambda key: _reset_single_minimal(static, key, jax, jnp))(rng_keys)
+
+
 def step_batch(static: KernelStatic, state: KernelState, actions, rng_keys, jax, jnp):
     if (
         bool(np.asarray(static.enable_phi_shaping))
@@ -1450,6 +1810,9 @@ def compile_hotspot_kernels(jax, jnp):
 
 
 def compile_transition_kernels(jax, jnp):
+    def _reset_batch_kernel(static, rng_keys):
+        return reset_batch_minimal(static, rng_keys, jax, jnp)
+
     def _step_batch_kernel(static, state, actions, rng_keys):
         return _step_batch_minimal_impl(static, state, actions, rng_keys, jax, jnp)
 
@@ -1470,9 +1833,140 @@ def compile_transition_kernels(jax, jnp):
         return next_obs, aggregated_reward, out.done
 
     return {
+        "reset_batch_minimal": jax.jit(_reset_batch_kernel),
         "step_batch_minimal": jax.jit(_step_batch_kernel),
         "rollout_like_minimal": jax.jit(_rollout_like_kernel),
         "sb3_payload_minimal_device": jax.jit(_sb3_payload_kernel),
+    }
+
+
+def compile_compiled_rollout_kernels(jax, jnp):
+    def _compiled_rollout_random_opponent_kernel(
+        static,
+        initial_state,
+        rollout_key,
+        horizon: int,
+    ):
+        training_ids, opponent_ids = _resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, opponent_key, env_key, reset_key = jax.random.split(key, 4)
+            masks = build_action_masks_batch(static, state, jnp)
+            opponent_mask = masks[:, opponent_ids, :]
+            opponent_actions = _sample_uniform_legal_actions_jax(
+                opponent_mask,
+                opponent_key,
+                jax,
+                jnp,
+            )
+            training_actions = _sample_uniform_legal_actions_jax(
+                masks[:, training_ids, :],
+                key,
+                jax,
+                jnp,
+            )
+            full_actions = _assemble_full_actions_jax(
+                training_actions,
+                opponent_actions,
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            out = _step_batch_minimal_impl(static, state, full_actions, env_keys, jax, jnp)
+            reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            next_state = _replace_done_states(out.state, reset_state, out.done, jnp)
+            aggregated_reward = build_aggregated_reward_batch(static, out.rewards, jnp)
+            return (next_state, key), (
+                aggregated_reward,
+                out.done.astype(jnp.int8),
+            )
+
+        return jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+
+    def _compiled_rollout_phase_a_policy_kernel(
+        static,
+        initial_state,
+        policy_params,
+        rollout_key,
+        horizon: int,
+    ):
+        training_ids, opponent_ids = _resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+        training_player_count = int(training_ids.shape[0])
+        action_dim = ACTION_COUNT
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            masks = build_action_masks_batch(static, state, jnp)
+            training_mask = masks[:, training_ids, :]
+            opponent_mask = masks[:, opponent_ids, :]
+
+            flat_obs = build_phase_a_flat_observation_batch(static, state, jnp)
+            flat_logits = _phase_a_policy_forward_logits(policy_params, flat_obs, jnp)
+            logits = flat_logits.reshape(
+                flat_logits.shape[0],
+                training_player_count,
+                action_dim,
+            )
+            training_actions, _, _ = _masked_categorical_actions_jax(
+                logits,
+                training_mask,
+                policy_key,
+                jax,
+                jnp,
+            )
+            opponent_actions = _sample_uniform_legal_actions_jax(
+                opponent_mask,
+                opponent_key,
+                jax,
+                jnp,
+            )
+            full_actions = _assemble_full_actions_jax(
+                training_actions,
+                opponent_actions,
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            out = _step_batch_minimal_impl(static, state, full_actions, env_keys, jax, jnp)
+            reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            next_state = _replace_done_states(out.state, reset_state, out.done, jnp)
+            aggregated_reward = build_aggregated_reward_batch(static, out.rewards, jnp)
+            return (next_state, key), (
+                aggregated_reward,
+                out.done.astype(jnp.int8),
+            )
+
+        return jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+
+    return {
+        "compiled_rollout_legal_random_minimal": jax.jit(
+            _compiled_rollout_random_opponent_kernel,
+            static_argnums=(3,),
+        ),
+        "compiled_rollout_phase_a_policy_minimal": jax.jit(
+            _compiled_rollout_phase_a_policy_kernel,
+            static_argnums=(4,),
+        ),
     }
 
 
@@ -1600,6 +2094,37 @@ def benchmark_host_callable(
     return {
         "iterations": int(iterations),
         "batch_size": int(batch_size),
+        "total_states": int(total_items),
+        "elapsed_sec": float(elapsed_sec),
+        "states_per_sec": (float(total_items) / elapsed_sec) if elapsed_sec > 0.0 else 0.0,
+        "mean_batch_latency_ms": (timer.elapsed_ns / max(1, int(iterations)) / 1e6),
+    }
+
+
+def benchmark_compiled_rollout_call(
+    fn,
+    batch_size: int,
+    horizon: int,
+    iterations: int,
+    *call_args,
+    progress=None,
+    progress_label: str | None = None,
+):
+    if progress is not None and progress_label:
+        progress.set_postfix_str(progress_label, refresh=False)
+    with Timer() as timer:
+        result = None
+        for _ in range(int(iterations)):
+            result = fn(*call_args)
+            if progress is not None:
+                progress.update(1)
+        _block_until_ready_tree(result)
+    elapsed_sec = timer.elapsed_ns / 1e9
+    total_items = int(batch_size) * int(horizon) * int(iterations)
+    return {
+        "iterations": int(iterations),
+        "batch_size": int(batch_size),
+        "horizon": int(horizon),
         "total_states": int(total_items),
         "elapsed_sec": float(elapsed_sec),
         "states_per_sec": (float(total_items) / elapsed_sec) if elapsed_sec > 0.0 else 0.0,
@@ -1784,6 +2309,91 @@ def _normalize_probs_per_player(
     return out
 
 
+def _masked_sample_actions_from_prob_tensor(
+    torch_mod,
+    probs,
+    action_mask,
+    *,
+    deterministic: bool,
+):
+    probs_t = probs.to(dtype=torch_mod.float32)
+    if probs_t.ndim == 2:
+        probs_t = probs_t.unsqueeze(0)
+    mask_t = torch_mod.as_tensor(action_mask, dtype=torch_mod.float32, device=probs_t.device)
+    if mask_t.ndim == 2:
+        mask_t = mask_t.unsqueeze(0)
+
+    masked = probs_t * mask_t
+    totals = masked.sum(dim=-1, keepdim=True)
+    has_legal = totals > 0.0
+
+    fallback = torch_mod.zeros_like(masked)
+    fallback[..., 0] = 1.0
+    normalized = torch_mod.where(has_legal, masked / torch_mod.clamp_min(totals, 1e-12), fallback)
+
+    if deterministic:
+        sampled = torch_mod.argmax(normalized, dim=-1)
+    else:
+        sampled = torch_mod.distributions.Categorical(probs=normalized).sample()
+    return sampled.to(dtype=torch_mod.int64), normalized
+
+
+def _get_policy_action_probabilities_tensor(policy, obs):
+    policy_obj = getattr(policy, "policy", None)
+    if policy_obj is None:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    try:
+        obs_tensor = policy_obj.obs_to_tensor(obs)[0]
+        with (
+            policy_obj.runtime_conditioning_context(obs_tensor)
+            if hasattr(policy_obj, "runtime_conditioning_context")
+            else nullcontext()
+        ):
+            distributions = policy_obj.get_distribution(obs_tensor)
+        if hasattr(distributions, "action_probabilities"):
+            probs = distributions.action_probabilities()
+            if probs.ndim == 2:
+                probs = probs.unsqueeze(0)
+            return probs.to(dtype=torch.float32)
+        stacked = torch.stack(
+            [dist.probs.to(dtype=torch.float32) for dist in distributions.distribution],
+            dim=1,
+        )
+        return stacked
+    except Exception:
+        return None
+
+
+def sample_masked_policy_actions_host(
+    *,
+    policy,
+    obs,
+    action_mask: np.ndarray,
+    deterministic: bool,
+) -> np.ndarray:
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - torch is expected in benchmark env
+        raise RuntimeError("PyTorch is required for masked policy sampling.") from exc
+
+    probs = _get_policy_action_probabilities_tensor(policy, obs)
+    if probs is None:
+        raise RuntimeError("Policy probabilities are unavailable for masked sampling.")
+
+    sampled, _ = _masked_sample_actions_from_prob_tensor(
+        torch,
+        probs,
+        action_mask,
+        deterministic=deterministic,
+    )
+    return sampled.detach().cpu().numpy().astype(np.int64, copy=False)
+
+
 def _team_player_ids_from_static(static: KernelStatic) -> tuple[np.ndarray, np.ndarray]:
     training_mask = np.asarray(static.training_player_mask, dtype=np.float32)
     training_ids = np.flatnonzero(training_mask > 0.5).astype(np.int64)
@@ -1853,6 +2463,46 @@ def run_self_play_bridge_once(
     return full_actions
 
 
+def run_self_play_bridge_masked_sampling_once(
+    *,
+    training_policy,
+    opponent_policy,
+    host_obs: dict[str, np.ndarray],
+    training_player_ids: np.ndarray,
+    opponent_player_ids: np.ndarray,
+    deterministic_training: bool = False,
+    deterministic_opponent: bool = False,
+) -> np.ndarray:
+    action_mask = np.asarray(host_obs["action_mask"], dtype=np.int8)
+    batch_size = int(action_mask.shape[0])
+    n_players = int(action_mask.shape[1])
+
+    training_mask = action_mask[:, training_player_ids, :]
+    opponent_obs = build_opponent_observation_host(host_obs)
+    opponent_mask = action_mask[:, opponent_player_ids, :]
+
+    training_actions = sample_masked_policy_actions_host(
+        policy=training_policy,
+        obs=host_obs,
+        action_mask=training_mask,
+        deterministic=deterministic_training,
+    )
+    opponent_actions = sample_masked_policy_actions_host(
+        policy=opponent_policy,
+        obs=opponent_obs,
+        action_mask=opponent_mask,
+        deterministic=deterministic_opponent,
+    )
+
+    training_actions = _normalize_batched_actions(training_actions, batch_size)
+    opponent_actions = _normalize_batched_actions(opponent_actions, batch_size)
+
+    full_actions = np.zeros((batch_size, n_players), dtype=np.int64)
+    full_actions[:, training_player_ids] = training_actions
+    full_actions[:, opponent_player_ids] = opponent_actions
+    return full_actions
+
+
 def _transition_benchmark_inputs(static, state, batch_size: int, jax, jnp):
     masks = build_action_masks_batch(static, state, jnp)
     actions = _pick_deterministic_legal_actions(masks, jnp)
@@ -1889,15 +2539,21 @@ def run_jax_kernel_benchmark(args):
     kernels = compile_hotspot_kernels(jax, jnp)
     transition_blockers = _minimal_transition_scope_blockers(args)
     transition_kernels = None if transition_blockers else compile_transition_kernels(jax, jnp)
+    compiled_rollout_kernels = (
+        None if transition_blockers else compile_compiled_rollout_kernels(jax, jnp)
+    )
     transition_kernel_count = 0 if transition_kernels is None else len(transition_kernels)
     adapter_metric_count = 0 if transition_kernels is None else 1
     policy_bridge_enabled = transition_kernels is not None and bool(getattr(args, "use_set_obs", False))
-    policy_bridge_metric_count = 5 if policy_bridge_enabled else 0
+    policy_bridge_metric_count = 7 if policy_bridge_enabled else 0
+    compiled_rollout_enabled = compiled_rollout_kernels is not None
+    compiled_rollout_metric_count = 2 if compiled_rollout_enabled else 0
     total_progress_iters = (
         len(kernels) * (int(args.warmup_iters) + int(args.benchmark_iters))
         + transition_kernel_count * (int(args.warmup_iters) + int(args.benchmark_iters))
         + adapter_metric_count * (int(args.warmup_iters) + int(args.benchmark_iters))
         + policy_bridge_metric_count * (int(args.warmup_iters) + int(args.benchmark_iters))
+        + compiled_rollout_metric_count * (int(args.warmup_iters) + int(args.benchmark_iters))
     )
     progress = build_progress(
         total=total_progress_iters,
@@ -1933,6 +2589,7 @@ def run_jax_kernel_benchmark(args):
 
         transition_scope = {
             "implemented": [
+                "reduced reset_batch benchmark",
                 "legal-action-only reduced step_batch",
                 "pointer_targeted pass mode",
                 "deterministic legal-action selection for benchmark rollouts",
@@ -1954,7 +2611,24 @@ def run_jax_kernel_benchmark(args):
                 "opponent policy predict on flipped-role host payload",
                 "opponent action-probability extraction",
                 "self-play action resolution and full-action assembly",
+                "masked policy-action sampling without host-side illegal-action repair",
                 "end-to-end bridge benchmark including JAX adapter output",
+            ],
+        }
+        compiled_rollout_scope = {
+            "required_features": [
+                "reduced transition scope",
+            ],
+            "implemented": [
+                "pure JAX rollout loop via lax.scan",
+                "reduced reset_batch sampled on device for done episodes",
+                "on-device legal-random opponent actions",
+                "reduced flat JAX policy inside the compiled loop",
+                "on-device masked action sampling for training-team actions",
+            ],
+            "limitations": [
+                "uses a reduced flat JAX policy, not the current SB3/Torch policy stack",
+                "uses a legal-random opponent, not self-play parity",
             ],
         }
         transition_warmup_metrics = {}
@@ -1963,11 +2637,15 @@ def run_jax_kernel_benchmark(args):
         adapter_metrics = {}
         policy_bridge_warmup_metrics = {}
         policy_bridge_metrics = {}
+        compiled_rollout_warmup_metrics = {}
+        compiled_rollout_metrics = {}
         if transition_blockers:
             transition_scope["status"] = "skipped"
             transition_scope["blocked_by"] = transition_blockers
             policy_bridge_scope["status"] = "skipped"
             policy_bridge_scope["blocked_by"] = list(transition_blockers)
+            compiled_rollout_scope["status"] = "skipped"
+            compiled_rollout_scope["blocked_by"] = list(transition_blockers)
         else:
             transition_scope["status"] = "enabled"
             actions, rng_keys = _transition_benchmark_inputs(
@@ -1979,9 +2657,13 @@ def run_jax_kernel_benchmark(args):
             )
             for name, fn in transition_kernels.items():
                 call_args = (
-                    (static, state, actions, rng_keys)
-                    if name == "step_batch_minimal"
-                    else (static, state, rng_keys)
+                    (static, rng_keys)
+                    if name == "reset_batch_minimal"
+                    else (
+                        (static, state, actions, rng_keys)
+                        if name == "step_batch_minimal"
+                        else (static, state, rng_keys)
+                    )
                 )
                 transition_warmup_metrics[name] = benchmark_compiled_call(
                     fn,
@@ -1993,9 +2675,13 @@ def run_jax_kernel_benchmark(args):
                 )
             for name, fn in transition_kernels.items():
                 call_args = (
-                    (static, state, actions, rng_keys)
-                    if name == "step_batch_minimal"
-                    else (static, state, rng_keys)
+                    (static, rng_keys)
+                    if name == "reset_batch_minimal"
+                    else (
+                        (static, state, actions, rng_keys)
+                        if name == "step_batch_minimal"
+                        else (static, state, rng_keys)
+                    )
                 )
                 transition_metrics[name] = benchmark_compiled_call(
                     fn,
@@ -2085,12 +2771,37 @@ def run_jax_kernel_benchmark(args):
                             deterministic_opponent=False,
                         )
 
+                    def _bridge_masked_sampling_host_once():
+                        return run_self_play_bridge_masked_sampling_once(
+                            training_policy=training_policy,
+                            opponent_policy=training_policy,
+                            host_obs=host_obs_seed,
+                            training_player_ids=training_player_ids,
+                            opponent_player_ids=opponent_player_ids,
+                            deterministic_training=False,
+                            deterministic_opponent=False,
+                        )
+
+                    def _bridge_masked_sampling_with_adapter_once():
+                        host_obs, _, _ = jax.device_get(adapter_fn(static, state, rng_keys))
+                        return run_self_play_bridge_masked_sampling_once(
+                            training_policy=training_policy,
+                            opponent_policy=training_policy,
+                            host_obs=host_obs,
+                            training_player_ids=training_player_ids,
+                            opponent_player_ids=opponent_player_ids,
+                            deterministic_training=False,
+                            deterministic_opponent=False,
+                        )
+
                     policy_functions = {
                         "training_policy_predict_host": _training_predict_once,
                         "opponent_policy_predict_host": _opponent_predict_once,
                         "opponent_action_probabilities_host": _opponent_probs_once,
                         "self_play_bridge_host": _bridge_host_once,
                         "self_play_bridge_with_adapter": _bridge_with_adapter_once,
+                        "self_play_bridge_masked_sampling_host": _bridge_masked_sampling_host_once,
+                        "self_play_bridge_masked_sampling_with_adapter": _bridge_masked_sampling_with_adapter_once,
                     }
                     for name, fn in policy_functions.items():
                         policy_bridge_warmup_metrics[name] = benchmark_host_callable(
@@ -2113,6 +2824,61 @@ def run_jax_kernel_benchmark(args):
                         policy_env.close()
                     except Exception:
                         pass
+
+            compiled_rollout_scope["status"] = "enabled"
+            training_ids_np, _ = _team_player_ids_from_static(static)
+            flat_obs_seed = np.asarray(
+                jax.device_get(build_phase_a_flat_observation_batch(static, state, jnp)),
+                dtype=np.float32,
+            )
+            mask_seed = np.asarray(
+                jax.device_get(build_action_masks_batch(static, state, jnp))[:, training_ids_np, :],
+                dtype=np.int8,
+            )
+            policy_spec = PhaseAPolicySpec(
+                flat_obs_dim=int(flat_obs_seed.shape[1]),
+                training_player_count=int(mask_seed.shape[1]),
+                action_dim_per_player=int(mask_seed.shape[2]),
+                total_action_dim=int(mask_seed.shape[1] * mask_seed.shape[2]),
+                hidden_dims=tuple(int(v) for v in getattr(args, "phase_a_policy_hidden_dims", [128, 128])),
+            )
+            policy_params = init_phase_a_policy_params(
+                jax,
+                jnp,
+                policy_spec,
+                seed=int(getattr(args, "phase_a_policy_seed", 0)),
+            )
+            rollout_seed = jax.random.PRNGKey(int(getattr(args, "seed", 0)) + 4242)
+            compiled_rollout_call_specs = {
+                "compiled_rollout_legal_random_minimal": (
+                    compiled_rollout_kernels["compiled_rollout_legal_random_minimal"],
+                    (static, state, rollout_seed, int(args.horizon)),
+                ),
+                "compiled_rollout_phase_a_policy_minimal": (
+                    compiled_rollout_kernels["compiled_rollout_phase_a_policy_minimal"],
+                    (static, state, policy_params, rollout_seed, int(args.horizon)),
+                ),
+            }
+            for name, (fn, call_args) in compiled_rollout_call_specs.items():
+                compiled_rollout_warmup_metrics[name] = benchmark_compiled_rollout_call(
+                    fn,
+                    int(args.kernel_batch_size),
+                    int(args.horizon),
+                    int(args.warmup_iters),
+                    *call_args,
+                    progress=progress,
+                    progress_label=f"warmup:{name}",
+                )
+            for name, (fn, call_args) in compiled_rollout_call_specs.items():
+                compiled_rollout_metrics[name] = benchmark_compiled_rollout_call(
+                    fn,
+                    int(args.kernel_batch_size),
+                    int(args.horizon),
+                    int(args.benchmark_iters),
+                    *call_args,
+                    progress=progress,
+                    progress_label=f"benchmark:{name}",
+                )
     finally:
         progress.close()
 
@@ -2136,12 +2902,12 @@ def run_jax_kernel_benchmark(args):
                 "batched raw observation vector assembly",
                 "batched set-observation payload assembly",
                 "reduced-scope legal-action step_batch benchmark",
+                "reduced-scope reset_batch benchmark",
                 "reduced-scope rollout-like benchmark path",
                 "host-side SB3-style payload transfer benchmark",
                 "env->kernel snapshot bridge for current benchmark config",
             ],
             "excluded": [
-                "pure JAX reset_batch",
                 "full-scope pure JAX step_batch",
                 "intent observation fields",
                 "full current self-play wrapper path",
@@ -2150,6 +2916,7 @@ def run_jax_kernel_benchmark(args):
         },
         "transition_scope": transition_scope,
         "policy_bridge_scope": policy_bridge_scope,
+        "compiled_rollout_scope": compiled_rollout_scope,
         "warmup_metrics": warmup_metrics,
         "metrics": metrics,
         "transition_warmup_metrics": transition_warmup_metrics,
@@ -2158,6 +2925,8 @@ def run_jax_kernel_benchmark(args):
         "adapter_metrics": adapter_metrics,
         "policy_bridge_warmup_metrics": policy_bridge_warmup_metrics,
         "policy_bridge_metrics": policy_bridge_metrics,
+        "compiled_rollout_warmup_metrics": compiled_rollout_warmup_metrics,
+        "compiled_rollout_metrics": compiled_rollout_metrics,
     }
 
 
@@ -2184,6 +2953,11 @@ def print_summary(result):
                 f"mean_batch_latency_ms={metrics['mean_batch_latency_ms']:.4f}"
             )
         for name, metrics in result.get("policy_bridge_metrics", {}).items():
+            print(
+                f"{name}: states_per_sec={metrics['states_per_sec']:.2f} "
+                f"mean_batch_latency_ms={metrics['mean_batch_latency_ms']:.4f}"
+            )
+        for name, metrics in result.get("compiled_rollout_metrics", {}).items():
             print(
                 f"{name}: states_per_sec={metrics['states_per_sec']:.2f} "
                 f"mean_batch_latency_ms={metrics['mean_batch_latency_ms']:.4f}"
