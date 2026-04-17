@@ -246,3 +246,5 @@ def test_jax_step_batch_matches_env_for_deterministic_shot():
     assert bool(np.asarray(out.done)[0]) == bool(env_done)
     assert int(np.asarray(next_state.ball_holder)[0]) == int(-1 if env.ball_holder is None else env.ball_holder)
     assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert float(np.asarray(next_state.offense_score)[0]) == pytest.approx(2.0, abs=1e-6)
+    assert float(np.asarray(next_state.defense_score)[0]) == pytest.approx(0.0, abs=1e-6)

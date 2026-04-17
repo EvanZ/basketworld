@@ -20,6 +20,7 @@ dependencies = [
     "torch>=2.0",
     "torchvision",
     "stable-baselines3==2.2.1",
+    "optax>=0.2.8",
     "pytest",
     "black",
     "isort",

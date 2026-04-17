@@ -780,6 +780,7 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         "base_probability": base_prob,
         "pressure_multiplier": pressure_multiplier,
         "probability": probability,
+        "shot_value": shot_value,
         "expected_points": expected_points,
     }
 
@@ -1298,6 +1299,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             if_state = _single_state_to_batched(shot_clock_state, jnp)
             shot_profile = build_shot_profile_batch(static, if_state, jnp)
             shot_probabilities = shot_profile["probability"][0]
+            shot_values = shot_profile["shot_value"][0]
             shot_ep_all = shot_profile["expected_points"][0]
 
             def _do_shot(_):
@@ -1312,6 +1314,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     assist_expires_at,
                     jnp.asarray(True),
                     success,
+                    shot_values[safe_holder],
                     shot_ep_all[safe_holder],
                     jnp.asarray(False),
                     jnp.asarray(False),
@@ -1348,6 +1351,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     jnp.asarray(False),
                     jnp.asarray(False),
                     jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
                     theft,
                     ~theft,
                 )
@@ -1360,6 +1364,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_expires_at,
                 shot_active,
                 shot_success,
+                shot_value,
                 shot_expected_points,
                 turnover_from_action,
                 pass_success,
@@ -1377,6 +1382,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                         assist_expires_at,
                         jnp.asarray(False),
                         jnp.asarray(False),
+                        jnp.asarray(0.0, dtype=jnp.float32),
                         jnp.asarray(0.0, dtype=jnp.float32),
                         jnp.asarray(False),
                         jnp.asarray(False),
@@ -1409,6 +1415,15 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=assist_passer,
                 assist_recipient=assist_recipient,
                 assist_expires_at=assist_expires_at,
+            )
+            shooter_is_offense = static.role_encoding[shot_shooter] > 0.0
+            scored_points = shot_value * shot_success.astype(jnp.float32)
+            final_state = _replace_state(
+                final_state,
+                offense_score=final_state.offense_score
+                + jnp.where(shooter_is_offense, scored_points, 0.0),
+                defense_score=final_state.defense_score
+                + jnp.where(shooter_is_offense, 0.0, scored_points),
             )
 
             per_team_pass = static.pass_reward / static.offense_ids.shape[0]

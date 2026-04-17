@@ -59,6 +59,7 @@ analytics/__pycache__/
 analytics/intent_pca/
 analytics/intent_*
 benchmarks/results/
+benchmarks/jax_phase_a_train_scaffold.json
 *.csv
 
 
