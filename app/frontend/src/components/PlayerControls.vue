@@ -62,6 +62,15 @@ function deepCloneJson(value, fallback = null) {
   }
 }
 
+function prettyJson(value) {
+  if (value === null || value === undefined) return 'N/A';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 const props = defineProps({
   gameState: Object,
   activePlayerId: Number,
@@ -2776,6 +2785,7 @@ const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'moves', label: 'Moves' },
   { id: 'eval', label: 'Eval' },
   { id: 'training', label: 'Training' },
+  { id: 'jax', label: 'JAX' },
   { id: 'phi', label: 'Phi Shaping' },
   { id: 'observation', label: 'Observation' },
   { id: 'attention', label: 'Attention' },
@@ -2813,11 +2823,36 @@ function loadStoredDevTabOrder() {
 const activeTab = ref(String(props.initialActiveTab || 'environment'));
 const devTabOrder = ref(loadStoredDevTabOrder());
 const draggedDevTabId = ref(null);
+const modelCapabilities = computed(() => {
+  const raw = props.gameState?.model_capabilities;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const isJaxModel = computed(() => String(props.gameState?.model_backend || '').startsWith('jax'));
+const jaxModelMetadata = computed(() => {
+  const raw = props.gameState?.model_metadata;
+  return raw && typeof raw === 'object' ? raw : null;
+});
+const jaxFrozenConfigText = computed(() => prettyJson(jaxModelMetadata.value?.frozen_config || null));
+const jaxTrainerConfigText = computed(() => prettyJson(jaxModelMetadata.value?.trainer_config || null));
+const jaxPolicySpecText = computed(() => prettyJson(jaxModelMetadata.value?.policy_spec || null));
+
+function isDevTabVisible(tabId) {
+  const caps = modelCapabilities.value || {};
+  if (tabId === 'advisor') return caps.mcts !== false;
+  if (tabId === 'playbook') return caps.playbook !== false;
+  if (tabId === 'attention') return caps.attention !== false;
+  if (tabId === 'environment' || tabId === 'training') return caps.env_training_tabs !== false;
+  if (tabId === 'observation') return caps.observation_panel !== false;
+  if (tabId === 'eval') return caps.eval !== false;
+  if (tabId === 'jax') return isJaxModel.value;
+  return true;
+}
+
 const orderedDevTabs = computed(() => {
   const tabsById = new Map(DEFAULT_DEV_TABS.map((tab) => [tab.id, tab]));
   return devTabOrder.value
     .map((tabId) => tabsById.get(tabId))
-    .filter((tab) => Boolean(tab));
+    .filter((tab) => Boolean(tab) && isDevTabVisible(tab.id));
 });
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
@@ -2894,6 +2929,14 @@ watch(activeTab, async (newTab) => {
     console.warn('Failed to scroll to current shot clock on tab change:', err);
   }
 }, { flush: 'post' });
+
+watch(orderedDevTabs, (tabs) => {
+  const visibleIds = tabs.map((tab) => tab.id);
+  if (visibleIds.length === 0) return;
+  if (!visibleIds.includes(activeTab.value)) {
+    activeTab.value = visibleIds[0];
+  }
+}, { immediate: true });
 
 watch(() => props.initialActiveTab, (nextTab) => {
   const normalized = String(nextTab || '').trim();
@@ -8058,6 +8101,52 @@ const stealRisks = computed(() => {
       </div>
     </div>
 
+    <!-- JAX Tab -->
+    <div v-if="activeTab === 'jax'" class="tab-content">
+      <div class="parameters-section">
+        <h4>JAX Model Metadata</h4>
+        <div v-if="!props.gameState || !isJaxModel" class="no-data">
+          No JAX model loaded.
+        </div>
+        <div v-else class="parameters-grid">
+          <div class="param-category">
+            <h5>Runtime</h5>
+            <div class="param-item">
+              <span class="param-name">Backend:</span>
+              <span class="param-value">{{ props.gameState.model_backend || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Checkpoint:</span>
+              <span class="param-value">{{ jaxModelMetadata?.checkpoint_path || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Saved at:</span>
+              <span class="param-value">{{ jaxModelMetadata?.saved_at || 'N/A' }}</span>
+            </div>
+            <div class="param-item">
+              <span class="param-name">Update:</span>
+              <span class="param-value">{{ jaxModelMetadata?.update_index ?? 'N/A' }}</span>
+            </div>
+          </div>
+
+          <div class="param-category">
+            <h5>Frozen Env Config</h5>
+            <pre class="jax-config-pre">{{ jaxFrozenConfigText }}</pre>
+          </div>
+
+          <div class="param-category">
+            <h5>Trainer Config</h5>
+            <pre class="jax-config-pre">{{ jaxTrainerConfigText }}</pre>
+          </div>
+
+          <div class="param-category">
+            <h5>Policy Spec</h5>
+            <pre class="jax-config-pre">{{ jaxPolicySpecText }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Phi Shaping Tab -->
     <div v-if="activeTab === 'phi'" class="tab-content">
       <PhiShaping ref="phiRef" :game-state="props.gameState" />
@@ -8430,6 +8519,21 @@ const stealRisks = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+
+.jax-config-pre {
+  margin: 0;
+  padding: 0.75rem;
+  max-height: 18rem;
+  overflow: auto;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--app-text);
+  font-size: 0.85rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Player tabs */

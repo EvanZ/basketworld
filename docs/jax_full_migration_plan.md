@@ -18,7 +18,7 @@ What is **not** proven yet:
 
 - full feature parity with the current architecture
 - long-run learning quality
-- operational readiness for checkpointing, resume, and deployment
+- deployment readiness
 
 So this is no longer a benchmark plan. It is a migration plan.
 
@@ -53,9 +53,9 @@ Current exploratory JAX code lives in:
 - [benchmarks/jax_kernel.py](/home/evanzamir/basketworld/benchmarks/jax_kernel.py)
 - [benchmarks/jax_phase_a_policy.py](/home/evanzamir/basketworld/benchmarks/jax_phase_a_policy.py)
 - [benchmarks/jax_phase_a_optim.py](/home/evanzamir/basketworld/benchmarks/jax_phase_a_optim.py)
-- [benchmarks/jax_phase_a_train.py](/home/evanzamir/basketworld/benchmarks/jax_phase_a_train.py)
+- [basketworld_jax/train/main.py](/home/evanzamir/basketworld/basketworld_jax/train/main.py)
 
-Those are the right place for prototype work, but not for the long-term stack.
+The benchmark files are still useful for older exploratory slices, but the reduced trainer itself now belongs under `basketworld_jax`, not under `benchmarks/`.
 
 The long-term JAX package should live in a new parallel package, for example:
 
@@ -81,21 +81,36 @@ This migration should **not** start by:
 - porting every current model or callback before the reduced JAX path is operational
 - threading JAX through the current self-play wrapper and expecting the speedup to survive
 
+## Terminology
+
+Do not use migration-stage labels like "Phase 1 / 2 / 3" in ongoing planning.
+
+Use:
+
+- `Foundation` for the package/trainer/checkpointing baseline
+- `Learnability` for training-quality validation
+- `Dev App Integration` for backend/frontend checkpoint loading and interactive testing
+- `Representation Parity`, `Self-Play Parity`, `Advanced Features`, and `Cutover` for later capability milestones
+
+Important distinction:
+
+- migration milestone names should stay capability-based, not implementation-specific
+
 ## Migration Principle
 
 The migration should expand capability in this order:
 
-1. operational reduced JAX stack
-2. deployment-capable reduced JAX stack
-3. stronger training regime
+1. foundation
+2. learnability
+3. dev-app integration
 4. representation parity
 5. self-play parity
 6. advanced feature parity
-7. full cutover
+7. cutover
 
 That order is important. It keeps the project moving through real milestones instead of disappearing into full-parity work too early.
 
-## Phase 1: Operationalize The Reduced JAX Stack
+## Foundation
 
 Purpose:
 
@@ -103,7 +118,7 @@ Purpose:
 
 Scope:
 
-- keep the current reduced Phase A semantics
+- keep the current reduced pointer-targeted JAX semantics
 - keep the flat observation path
 - keep the MLP actor-critic
 - keep the legal-random opponent
@@ -129,9 +144,41 @@ Exit criteria:
 - checkpoint
 - reproduce a run from config
 
-At the end of this phase, the reduced JAX trainer should be a real training system.
+At the end of this milestone, the reduced JAX trainer should be a real training system.
 
-## Phase 2: Prove Learnability And Operational Quality
+Current status:
+
+- `basketworld_jax/` package skeleton exists
+- stable reduced actor-critic and optimizer code has moved into:
+  - [actor_critic.py](/home/evanzamir/basketworld/basketworld_jax/models/actor_critic.py)
+  - [adam.py](/home/evanzamir/basketworld/basketworld_jax/optim/adam.py)
+- the reduced actor-critic now uses Flax Linen under the existing helper API
+- stable trainer datatypes and PPO batch / GAE helpers have moved into:
+  - [types.py](/home/evanzamir/basketworld/basketworld_jax/train/types.py)
+- rollout, eval, PPO update, and benchmark/runtime helpers now exist in:
+  - [runtime.py](/home/evanzamir/basketworld/basketworld_jax/train/runtime.py)
+- the reduced env subset needed by the current JAX trainer now exists in:
+  - [minimal.py](/home/evanzamir/basketworld/basketworld_jax/env/minimal.py)
+- the canonical reduced trainer entrypoint now exists in:
+  - [main.py](/home/evanzamir/basketworld/basketworld_jax/train/main.py)
+- checkpointing is live through:
+  - [checkpoint.py](/home/evanzamir/basketworld/basketworld_jax/checkpoints/checkpoint.py)
+- checkpoint state now uses Orbax, with sidecar metadata for run/config/history fields
+- the reduced train loop now supports:
+  - periodic checkpoint save
+  - final checkpoint save
+  - resume from checkpoint
+- checkpoint validation currently enforces rollout-shape and PPO-config compatibility while allowing `num_updates` to increase on resume
+- legacy pickle checkpoints remain loadable for transition purposes
+
+Foundation is now considered complete.
+
+Non-blocking cleanup that can happen later:
+
+- remove leftover benchmark-era compatibility shims once they are no longer needed
+- standardize run/config objects beyond the current argparse path
+
+## Learnability
 
 Purpose:
 
@@ -159,9 +206,9 @@ Exit criteria:
 - credible behavioral learning signal
 - repeatable training outcomes
 
-If Phase 2 fails, do not move to parity work yet. Fix training quality first.
+This is an active workstream. If learnability fails, do not move to parity work yet. Fix training quality first.
 
-## Phase 3: Add Deployment-Capable Inference
+## Dev App Integration
 
 Purpose:
 
@@ -187,7 +234,39 @@ Exit criteria:
 
 This is the first real deployment milestone.
 
-## Phase 4: Representation Parity
+Initial dev-app scope for JAX models:
+
+- keep player controls
+- keep self-play
+- keep the Observation panel
+- keep Eval
+- add backend capability flags so unsupported panels can be disabled cleanly
+- disable Playbook, MCTS, and Attention panels for JAX models at first
+- disable the current Environment and Training tabs for JAX models if needed
+- add a dedicated JAX tab showing JAX-specific env/training/checkpoint metadata
+
+Pragmatic rule:
+
+- the frontend should branch on backend-reported model capabilities, not on checkpoint naming conventions or ad hoc heuristics
+
+Current backend status:
+
+- the backend now has a unified inference adapter seam for both SB3 and JAX models
+- the current JAX trainer logs Orbax checkpoints to MLflow artifacts
+- the current JAX path can now be loaded in the dev app from MLflow `run_id`
+- `/api/init_game` can now resolve a JAX checkpoint artifact from MLflow and build the reduced env directly from checkpoint metadata
+- backend state payloads now expose:
+  - `model_backend`
+  - `model_capabilities`
+  - `model_metadata`
+- the dev frontend can now initialize JAX models through the same MLflow `run_id` flow used by SB3
+- the dev controls tabs now capability-gate unsupported panels and expose a JAX metadata tab
+- self-play and interactive controls now run without app-level errors against the JAX model
+- the remaining work here is feature hardening, not basic load/run viability
+
+Dev App Integration is now considered complete for the current reduced JAX stack.
+
+## Representation Parity
 
 Purpose:
 
@@ -211,7 +290,7 @@ Exit criteria:
 
 This is the point where the reduced stack starts to resemble the current model class more closely.
 
-## Phase 5: Training-System Parity
+## Self-Play Parity
 
 Purpose:
 
@@ -233,7 +312,7 @@ Exit criteria:
 - no dependency on current Torch/SB3 rollout plumbing
 - self-play training works end to end in the JAX path
 
-## Phase 6: Advanced Feature Parity
+## Advanced Feature Parity
 
 Purpose:
 
@@ -258,7 +337,7 @@ Exit criteria:
 
 This phase should be explicitly selective, not automatic.
 
-## Phase 7: Cutover
+## Cutover
 
 Purpose:
 
@@ -281,16 +360,14 @@ Exit criteria:
 
 ## Recommended Immediate Sequence
 
-The next concrete phases should be:
+The next concrete work should be:
 
-1. create `basketworld_jax/` package skeleton
-2. move the current reduced JAX actor-critic and trainer into package modules
-3. convert the reduced MLP actor-critic to Flax Linen
-4. add checkpoint save/load and resume
-5. run a reproducible long training job
-6. add backend inference adapter for the reduced JAX model
+1. run longer JAX training jobs and judge learning quality, not just throughput
+2. tighten eval and checkpoint-selection criteria
+3. decide which representation upgrade is actually needed next
+4. expand only the features required for useful testing and migration
 
-That is the shortest path from “prototype that works” to “new stack we can actually use.”
+That is the shortest path from “package-native JAX stack that runs” to “new stack we can actually rely on.”
 
 ## Mapping From Current Code To Future JAX Ownership
 
@@ -348,4 +425,3 @@ Continue the migration if all three remain true:
 3. the new package path stays cleaner than trying to hybridize with the old stack
 
 If any of those stop being true, pause and reassess before expanding parity scope.
-

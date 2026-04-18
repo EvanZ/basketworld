@@ -17,10 +17,15 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_training_params,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
-from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
 from basketworld.utils.wrappers import SetObservationWrapper
 
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    get_policy_metadata,
+    load_inference_policy,
+)
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
     _compute_q_values_for_player,
@@ -80,6 +85,26 @@ def _load_start_template_library_for_run(
     except Exception as exc:
         print(f"[start_templates] Failed to load template library for run {run_id}: {exc}")
         return None
+
+
+def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, dict | None]:
+    metadata = get_policy_metadata(policy_obj) or {}
+    frozen_config = dict(metadata.get("frozen_config", {}) or {})
+    if not frozen_config:
+        raise HTTPException(
+            status_code=400,
+            detail="JAX Phase A checkpoint is missing frozen_config metadata.",
+        )
+    training_team = frozen_config.get("training_team")
+    if isinstance(training_team, str):
+        frozen_config["training_team"] = (
+            Team.DEFENSE if training_team.strip().lower() == "defense" else Team.OFFENSE
+        )
+    trainer_config = dict(metadata.get("trainer_config", {}) or {})
+    required_params: dict = {}
+    optional_params = dict(frozen_config)
+    phi_params = {}
+    return required_params, optional_params, trainer_config, phi_params
 
 
 def _selector_runtime_active_for_app() -> bool:
@@ -175,39 +200,18 @@ async def init_game(request: InitGameRequest):
     mlflow_client = mlflow.tracking.MlflowClient()
 
     run_name = request.run_name
-    run_id = request.run_id
+    run_id = str(request.run_id or "").strip()
     unified_policy_name = request.unified_policy_name
     opponent_unified_policy_name = request.opponent_unified_policy_name
+    if not run_id:
+        raise HTTPException(status_code=400, detail="init_game requires run_id.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
-            mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
-            mlflow_training_params = get_mlflow_training_params(mlflow_client, run_id)
-        except Exception as e:
-            msg = str(e)
-            if "RESOURCE_DOES_NOT_EXIST" in msg:
-                raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
-
-        start_template_library = _load_start_template_library_for_run(
-            mlflow_client, run_id
-        )
-
-        # Extract role_flag encoding for backward compatibility (not passed to env)
-        game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
-        game_state.role_flag_defense = optional_params.pop("role_flag_defense_value", -1.0)
-        optional_params.pop("role_flag_encoding_version", None)
-
-        # Apply request overrides for optional parameters
-        if request.spawn_distance is not None:
-            optional_params["spawn_distance"] = request.spawn_distance
-        if request.defender_spawn_distance is not None:
-            optional_params["defender_spawn_distance"] = request.defender_spawn_distance
-        if request.allow_dunks is not None:
-            optional_params["allow_dunks"] = request.allow_dunks
-        if request.dunk_pct is not None:
-            optional_params["dunk_pct"] = request.dunk_pct
+        required_params: dict
+        optional_params: dict
+        mlflow_phi_params: dict
+        mlflow_training_params: dict
+        start_template_library: dict | None
 
         try:
             unified_path = get_unified_policy_path(mlflow_client, run_id, unified_policy_name)
@@ -226,15 +230,58 @@ async def init_game(request: InitGameRequest):
                     raise HTTPException(status_code=404, detail=f"Opponent policy not found for run {run_id}")
                 raise HTTPException(status_code=500, detail=f"Failed to download opponent policy: {e}")
 
-        game_state.unified_policy = load_ppo_for_inference(unified_path, device="cpu")
+        game_state.unified_policy = load_inference_policy(unified_path, device="cpu")
         game_state.offense_policy = None
         game_state.defense_policy = (
-            load_ppo_for_inference(opponent_unified_path, device="cpu")
+            load_inference_policy(opponent_unified_path, device="cpu")
             if opponent_unified_path
             else None
         )
+
+        if get_policy_backend_kind(game_state.unified_policy) == "jax_phase_a":
+            (
+                required_params,
+                optional_params,
+                mlflow_training_params,
+                mlflow_phi_params,
+            ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
+            start_template_library = None
+        else:
+            try:
+                required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
+                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
+                mlflow_training_params = get_mlflow_training_params(mlflow_client, run_id)
+            except Exception as e:
+                msg = str(e)
+                if "RESOURCE_DOES_NOT_EXIST" in msg:
+                    raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
+                raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
+
+            start_template_library = _load_start_template_library_for_run(
+                mlflow_client, run_id
+            )
+
+        # Extract role_flag encoding for backward compatibility (not passed to env)
+        game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
+        game_state.role_flag_defense = optional_params.pop("role_flag_defense_value", -1.0)
+        optional_params.pop("role_flag_encoding_version", None)
+
+        # Apply request overrides for optional parameters
+        if request.spawn_distance is not None:
+            optional_params["spawn_distance"] = request.spawn_distance
+        if request.defender_spawn_distance is not None:
+            optional_params["defender_spawn_distance"] = request.defender_spawn_distance
+        if request.allow_dunks is not None:
+            optional_params["allow_dunks"] = request.allow_dunks
+        if request.dunk_pct is not None:
+            optional_params["dunk_pct"] = request.dunk_pct
+
         game_state.unified_policy_key = os.path.basename(unified_path)
         game_state.opponent_unified_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
+        game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
+        game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
+        game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
 
         env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(optional_params)
         use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
@@ -247,6 +294,11 @@ async def init_game(request: InitGameRequest):
             game_state.env = SetObservationWrapper(game_state.env)
 
         def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
+            if policy_obj is None:
+                return
+            if hasattr(policy_obj, "set_pass_mode"):
+                policy_obj.set_pass_mode(mode_value)
+                return
             policy = getattr(policy_obj, "policy", None)
             if policy is None:
                 return
@@ -299,8 +351,8 @@ async def init_game(request: InitGameRequest):
         _capture_turn_start_snapshot()
 
         game_state.user_team = Team[request.user_team_name.upper()]
-        game_state.run_id = request.run_id
-        game_state.run_name = run_name or request.run_id
+        game_state.run_id = run_id
+        game_state.run_name = run_name or run_id
         game_state.mlflow_phi_shaping_params = mlflow_phi_params
         game_state.mlflow_training_params = mlflow_training_params
         game_state.counterfactual_snapshot = None
@@ -477,6 +529,10 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     game_state.defense_policy = None
     game_state.unified_policy_key = None
     game_state.opponent_unified_policy_key = None
+    game_state.unified_policy_backend = None
+    game_state.defense_policy_backend = None
+    game_state.unified_policy_capabilities = None
+    game_state.defense_policy_capabilities = None
     game_state.unified_policy_path = None
     game_state.opponent_policy_path = None
 

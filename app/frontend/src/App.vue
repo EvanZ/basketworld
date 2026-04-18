@@ -640,14 +640,14 @@ async function handleGameStarted(setupData) {
   // Clear options; PlayerControls will re-emit with the persisted toggle state
   mctsOptionsForStep.value = null;
   try {
-    const response = await initGame(
-      setupData.runId,
-      setupData.userTeam,
-      setupData.offensePolicyName,
-      setupData.defensePolicyName,
-      setupData.unifiedPolicyName ?? null,
-      setupData.opponentUnifiedPolicyName ?? null,
-    );
+    const response = await initGame({
+      runId: setupData.runId,
+      userTeamName: setupData.userTeam,
+      offensePolicyName: setupData.offensePolicyName,
+      defensePolicyName: setupData.defensePolicyName,
+      unifiedPolicyName: setupData.unifiedPolicyName ?? null,
+      opponentUnifiedPolicyName: setupData.opponentUnifiedPolicyName ?? null,
+    });
     
     // Restore phi shaping parameters if we had them
     if (savedPhiParams && response.status === 'success') {

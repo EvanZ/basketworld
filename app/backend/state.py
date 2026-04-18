@@ -14,6 +14,13 @@ from basketworld.utils.play_names import (
 )
 from basketworld.utils.wrappers import SetObservationWrapper
 from app.backend.env_access import env_view, get_env_attr
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    get_policy_metadata,
+    prepare_policy_for_role,
+    unwrap_policy_module,
+)
 
 
 class GameState:
@@ -37,6 +44,10 @@ class GameState:
         self.unified_policy_key: str | None = None
         # Opponent unified policy (if different from unified)
         self.opponent_unified_policy_key: str | None = None
+        self.unified_policy_backend: str | None = None
+        self.defense_policy_backend: str | None = None
+        self.unified_policy_capabilities: dict | None = None
+        self.defense_policy_capabilities: dict | None = None
         # Self-play / replay tracking
         self.self_play_active: bool = False
         self.replay_seed: int | None = None
@@ -422,7 +433,6 @@ def get_full_game_state(
     from app.backend.selector_runtime import selector_ranked_intent_preferences
     from basketworld.utils.intent_policy_sensitivity import (
         clear_policy_runtime_intent_override,
-        sync_policy_runtime_intent_override_from_env,
     )
 
     # Use FastAPI's jsonable_encoder for numpy-safe encoding
@@ -523,7 +533,11 @@ def get_full_game_state(
     attention_payload = None
     if obs_tokens is not None and game_state.unified_policy is not None:
         try:
-            policy_obj = getattr(game_state.unified_policy, "policy", None)
+            unified_caps = get_policy_capabilities(game_state.unified_policy) or {}
+            if not unified_caps.get("attention", True):
+                policy_obj = None
+            else:
+                policy_obj = unwrap_policy_module(game_state.unified_policy)
             extractor = getattr(policy_obj, "features_extractor", None)
             if (
                 extractor is not None
@@ -575,7 +589,7 @@ def get_full_game_state(
                 device = next(extractor.parameters()).device
                 try:
                     with torch.no_grad():
-                        sync_policy_runtime_intent_override_from_env(
+                        prepare_policy_for_role(
                             game_state.unified_policy,
                             game_state.env,
                             observer_is_offense=observer_is_offense,
@@ -849,10 +863,23 @@ def get_full_game_state(
             else "noop"
         ),
         "pass_logit_bias": float(
-            getattr(game_state.unified_policy.policy, "pass_logit_bias", 0.0)
+            getattr(unwrap_policy_module(game_state.unified_policy), "pass_logit_bias", 0.0)
             if game_state.unified_policy
-            and hasattr(game_state.unified_policy, "policy")
             else 0.0
+        ),
+        "model_backend": get_policy_backend_kind(getattr(game_state, "unified_policy", None)),
+        "model_capabilities": copy.deepcopy(
+            get_policy_capabilities(getattr(game_state, "unified_policy", None))
+        ),
+        "model_metadata": copy.deepcopy(
+            get_policy_metadata(getattr(game_state, "unified_policy", None))
+        ),
+        "opponent_model_backend": get_policy_backend_kind(getattr(game_state, "defense_policy", None)),
+        "opponent_model_capabilities": copy.deepcopy(
+            get_policy_capabilities(getattr(game_state, "defense_policy", None))
+        ),
+        "opponent_model_metadata": copy.deepcopy(
+            get_policy_metadata(getattr(game_state, "defense_policy", None))
         ),
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),

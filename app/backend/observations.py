@@ -1,23 +1,24 @@
 import copy
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 import gymnasium as gym
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
-from stable_baselines3 import PPO
 
 from basketworld.utils.action_resolution import (
     IllegalActionStrategy,
-    get_policy_action_probabilities,
     resolve_illegal_actions,
-)
-from basketworld.utils.intent_policy_sensitivity import (
-    sync_policy_runtime_intent_override_from_env,
 )
 from basketworld.utils.wrappers import SetObservationWrapper
 
 from .env_access import env_view
+from .inference_adapters import (
+    get_policy_capabilities,
+    policy_action_probabilities,
+    prepare_policy_for_role,
+    unwrap_policy_module,
+)
 from .state import GameState, _role_flag_value_for_team, game_state
 
 _predict_failure_count = 0
@@ -101,11 +102,11 @@ def _clone_obs_with_role_flag(obs: Dict, role_flag_value: float) -> Dict:
     return cloned
 
 
-def _ensure_set_obs(policy: PPO | None, env, obs: dict | None) -> dict | None:
+def _ensure_set_obs(policy, env, obs: dict | None) -> dict | None:
     if policy is None or env is None or obs is None:
         return obs
     try:
-        policy_obj = getattr(policy, "policy", None)
+        policy_obj = unwrap_policy_module(policy)
         obs_space = getattr(policy_obj, "observation_space", None)
         if not isinstance(obs_space, gym.spaces.Dict):
             return obs
@@ -123,7 +124,7 @@ def _ensure_set_obs(policy: PPO | None, env, obs: dict | None) -> dict | None:
 
 
 def validate_policy_observation_schema(
-    policy: PPO | None,
+    policy,
     env,
     obs: dict | None,
     policy_label: str = "policy",
@@ -134,7 +135,7 @@ def validate_policy_observation_schema(
     """
     if policy is None:
         return obs
-    policy_obj = getattr(policy, "policy", None)
+    policy_obj = unwrap_policy_module(policy)
     if policy_obj is None:
         return obs
     obs_space = getattr(policy_obj, "observation_space", None)
@@ -238,7 +239,7 @@ def rebuild_observation_from_env(
 
 
 def _predict_actions_for_team(
-    policy: PPO,
+    policy,
     base_obs: Dict,
     env,
     team: Team,
@@ -268,13 +269,14 @@ def _predict_actions_for_team(
     )
     conditioned_obs = _clone_obs_with_role_flag(base_obs, role_flag_value)
     conditioned_obs = _apply_intent_fields_for_role(conditioned_obs, env, role_flag_value)
+    observer_is_offense = bool(float(role_flag_value) > 0.0)
 
     raw_actions = None
     try:
-        sync_policy_runtime_intent_override_from_env(
+        prepare_policy_for_role(
             policy,
             env,
-            observer_is_offense=bool(float(role_flag_value) > 0.0),
+            observer_is_offense=observer_is_offense,
         )
         raw_actions, _ = policy.predict(conditioned_obs, deterministic=deterministic)
     except Exception as err:
@@ -303,7 +305,7 @@ def _predict_actions_for_team(
         # Fallback: truncate/pad to team size
         team_pred_actions = raw_actions[: len(team_ids)]
 
-    probs = get_policy_action_probabilities(policy, conditioned_obs)
+    probs = policy_action_probabilities(policy, conditioned_obs)
     if probs is not None:
         probs = [np.asarray(p, dtype=np.float32) for p in probs]
         if len(probs) == num_players:
@@ -354,7 +356,7 @@ def _predict_actions_for_team(
 
 
 def _predict_policy_actions(
-    policy: PPO,
+    policy: Any,
     base_obs: Dict,
     env,
     deterministic: bool,
@@ -473,7 +475,11 @@ def _compute_state_values_from_obs(obs_dict: dict | None):
         return None
 
     value_policy = game_state.unified_policy
-    if not hasattr(value_policy, "policy"):
+    capabilities = get_policy_capabilities(value_policy) or {}
+    if not capabilities.get("state_values", True):
+        return None
+    policy_module = unwrap_policy_module(value_policy)
+    if policy_module is None:
         return None
 
     try:
@@ -483,18 +489,22 @@ def _compute_state_values_from_obs(obs_dict: dict | None):
         if offense_obs is None or defense_obs is None:
             return None
 
-        sync_policy_runtime_intent_override_from_env(
-            value_policy, game_state.env, observer_is_offense=True
+        prepare_policy_for_role(
+            value_policy,
+            game_state.env,
+            observer_is_offense=True,
         )
-        offense_tensor, _ = value_policy.policy.obs_to_tensor(offense_obs)
-        sync_policy_runtime_intent_override_from_env(
-            value_policy, game_state.env, observer_is_offense=False
+        offense_tensor, _ = policy_module.obs_to_tensor(offense_obs)
+        prepare_policy_for_role(
+            value_policy,
+            game_state.env,
+            observer_is_offense=False,
         )
-        defense_tensor, _ = value_policy.policy.obs_to_tensor(defense_obs)
+        defense_tensor, _ = policy_module.obs_to_tensor(defense_obs)
 
         with torch.no_grad():
-            offense_value = float(value_policy.policy.predict_values(offense_tensor).item())
-            defense_value = float(value_policy.policy.predict_values(defense_tensor).item())
+            offense_value = float(policy_module.predict_values(offense_tensor).item())
+            defense_value = float(policy_module.predict_values(defense_tensor).item())
 
         return {"offensive_value": offense_value, "defensive_value": defense_value}
     except Exception as err:
@@ -512,6 +522,12 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
         return action_values
 
     value_policy = state.unified_policy
+    capabilities = get_policy_capabilities(value_policy) or {}
+    if not capabilities.get("q_values", True):
+        return action_values
+    policy_module = unwrap_policy_module(value_policy)
+    if policy_module is None:
+        return action_values
     gamma = value_policy.gamma
     possible_actions = [action.name for action in ActionType]
     state_env_read = env_view(state.env)
@@ -595,14 +611,14 @@ def _compute_q_values_for_player(player_id: int, state: GameState) -> dict:
             conditioned_next_obs, temp_env, role_flag_value
         )
 
-        sync_policy_runtime_intent_override_from_env(
+        prepare_policy_for_role(
             value_policy,
             temp_env,
             observer_is_offense=bool(float(role_flag_value) > 0.0),
         )
-        next_obs_tensor, _ = value_policy.policy.obs_to_tensor(conditioned_next_obs)
+        next_obs_tensor, _ = policy_module.obs_to_tensor(conditioned_next_obs)
         with torch.no_grad():
-            next_value = value_policy.policy.predict_values(next_obs_tensor)
+            next_value = policy_module.predict_values(next_obs_tensor)
 
         team_reward = reward[player_id]
         q_value = team_reward + gamma * next_value.item()

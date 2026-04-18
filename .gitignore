@@ -1,5 +1,6 @@
 # env
 env/
+!/basketworld_jax/env/
 
 # .env
 .env
@@ -52,6 +53,8 @@ models/
 mlruns/
 mlartifacts/
 .opponent_cache/
+checkpoints/phase_a_dev/*
+!basketworld_jax/models
 
 # data
 data/
@@ -61,6 +64,7 @@ analytics/intent_*
 benchmarks/results/
 benchmarks/jax_phase_a_train_scaffold.json
 *.csv
+basketworld_jax/results/
 
 
 # temp

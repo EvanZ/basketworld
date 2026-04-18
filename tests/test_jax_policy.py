@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from benchmarks.jax_phase_a_policy import (
-    PhaseAActorCriticSpec,
+from basketworld_jax.models.actor_critic import (
+    ActorCriticSpec,
     apply_action_mask,
-    init_phase_a_actor_critic_params,
+    init_actor_critic_params,
     run_actor_critic,
 )
 
@@ -15,14 +15,14 @@ def test_actor_critic_forward_shapes():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")
 
-    spec = PhaseAActorCriticSpec(
+    spec = ActorCriticSpec(
         flat_obs_dim=5,
         training_player_count=2,
         action_dim_per_player=3,
         total_action_dim=6,
         hidden_dims=(8,),
     )
-    params = init_phase_a_actor_critic_params(jax, jnp, spec, seed=0)
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
     flat_obs = jnp.ones((4, 5), dtype=jnp.float32)
     action_mask = jnp.ones((4, 2, 3), dtype=jnp.int8)
     out = run_actor_critic(
@@ -46,7 +46,7 @@ def test_apply_action_mask_respects_legality_and_noop_fallback():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")
 
-    spec = PhaseAActorCriticSpec(
+    spec = ActorCriticSpec(
         flat_obs_dim=3,
         training_player_count=2,
         action_dim_per_player=3,

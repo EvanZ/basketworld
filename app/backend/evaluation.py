@@ -4,7 +4,7 @@ import queue
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import basketworld
@@ -12,19 +12,18 @@ from basketworld.envs.basketworld_env_v2 import Team
 from fastapi import HTTPException
 from basketworld.utils.action_resolution import (
     IllegalActionStrategy,
-    get_policy_action_probabilities,
     resolve_illegal_actions,
-)
-from basketworld.utils.intent_policy_sensitivity import (
-    sync_policy_runtime_intent_override_from_env,
 )
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
-from stable_baselines3 import PPO
-from basketworld.utils.policy_loading import load_ppo_for_inference
 
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.env_access import env_view, get_env_attr
+from app.backend.inference_adapters import (
+    load_inference_policy,
+    policy_action_probabilities,
+    prepare_policy_for_role,
+)
 from app.backend.observations import (
     _ensure_set_obs,
     _predict_policy_actions,
@@ -88,7 +87,6 @@ def _init_evaluation_worker(
     from basketworld.envs.basketworld_env_v2 import Team as _Team
     from basketworld.utils.action_resolution import (
         IllegalActionStrategy as _IllegalActionStrategy,
-        get_policy_action_probabilities as _get_policy_action_probabilities,
         resolve_illegal_actions as _resolve_illegal_actions,
     )
 
@@ -111,13 +109,13 @@ def _init_evaluation_worker(
         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
         "SetAttentionExtractor": SetAttentionExtractor,
     }
-    unified_policy = load_ppo_for_inference(
+    unified_policy = load_inference_policy(
         unified_policy_path,
         device="cpu",
         custom_objects=custom_objects,
     )
     opponent_policy = (
-        load_ppo_for_inference(
+        load_inference_policy(
             opponent_policy_path,
             device="cpu",
             custom_objects=custom_objects,
@@ -128,14 +126,12 @@ def _init_evaluation_worker(
 
     pass_mode = str(optional_params.get("pass_mode", "directional"))
     for policy_obj in (unified_policy, opponent_policy):
-        policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
-        if policy is None:
+        if policy_obj is None:
             continue
-        if hasattr(policy, "set_pass_mode"):
-            try:
-                policy.set_pass_mode(pass_mode)
-            except Exception:
-                pass
+        try:
+            policy_obj.set_pass_mode(pass_mode)
+        except Exception:
+            pass
 
     user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
 
@@ -151,7 +147,6 @@ def _init_evaluation_worker(
         "np": _np,
         "Team": _Team,
         "IllegalActionStrategy": _IllegalActionStrategy,
-        "get_policy_action_probabilities": _get_policy_action_probabilities,
         "resolve_illegal_actions": _resolve_illegal_actions,
         "progress_queue": progress_queue,
     }
@@ -234,7 +229,6 @@ def _worker_predict_actions_for_team(
     """Predict actions for a team in worker context."""
     _np = _worker_state["np"]
     _Team = _worker_state["Team"]
-    _get_policy_action_probabilities = _worker_state["get_policy_action_probabilities"]
     _resolve_illegal_actions = _worker_state["resolve_illegal_actions"]
 
     actions_by_player: dict[int, int] = {}
@@ -252,7 +246,7 @@ def _worker_predict_actions_for_team(
     conditioned_obs = _worker_clone_obs_with_role_flag(base_obs, role_flag_value)
 
     try:
-        sync_policy_runtime_intent_override_from_env(
+        prepare_policy_for_role(
             policy,
             env,
             observer_is_offense=bool(float(role_flag_value) > 0.0),
@@ -280,7 +274,7 @@ def _worker_predict_actions_for_team(
     else:
         team_pred_actions = raw_actions[: len(team_ids)]
 
-    probs = _get_policy_action_probabilities(policy, conditioned_obs)
+    probs = policy_action_probabilities(policy, conditioned_obs)
     if probs is not None:
         probs = [_np.asarray(p, dtype=_np.float32) for p in probs]
         if len(probs) == int(get_env_attr(env, "n_players", len(probs)) or len(probs)):
@@ -1170,8 +1164,8 @@ def _run_sequential_evaluation(
     opponent_deterministic: bool,
     env,
     training_params: dict | None,
-    unified_policy: PPO,
-    opponent_policy: PPO | None,
+    unified_policy: Any,
+    opponent_policy: Any | None,
     user_team: Team,
     role_flag_offense: float,
     role_flag_defense: float,
@@ -1649,13 +1643,13 @@ def run_evaluation(
             "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
             "SetAttentionExtractor": SetAttentionExtractor,
         }
-        unified_policy = load_ppo_for_inference(
+        unified_policy = load_inference_policy(
             unified_policy_path,
             device="cpu",
             custom_objects=custom_objects,
         )
         opponent_policy = (
-            load_ppo_for_inference(
+            load_inference_policy(
                 opponent_policy_path,
                 device="cpu",
                 custom_objects=custom_objects,
@@ -1665,14 +1659,12 @@ def run_evaluation(
         )
         pass_mode = str(optional_params.get("pass_mode", "directional"))
         for policy_obj in (unified_policy, opponent_policy):
-            policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
-            if policy is None:
+            if policy_obj is None:
                 continue
-            if hasattr(policy, "set_pass_mode"):
-                try:
-                    policy.set_pass_mode(pass_mode)
-                except Exception:
-                    pass
+            try:
+                policy_obj.set_pass_mode(pass_mode)
+            except Exception:
+                pass
         user_team = Team.OFFENSE if user_team_name == "OFFENSE" else Team.DEFENSE
 
         return _run_sequential_evaluation(

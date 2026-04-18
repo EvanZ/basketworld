@@ -1,23 +1,25 @@
-from basketworld_jax.models.phase_a_actor_critic import (
+from basketworld_jax.models.actor_critic import (
+    ActorCriticSpec,
     MASKED_LOGIT_FLOOR,
     NOOP_ACTION_INDEX,
-    PhaseAActorCriticSpec,
     actor_critic_forward,
     apply_action_mask,
-    build_phase_a_actor_critic_spec,
-    init_phase_a_actor_critic_params,
+    build_actor_critic_module,
+    build_actor_critic_spec,
+    init_actor_critic_params,
     run_actor_critic,
     sample_actions,
 )
 
 __all__ = [
+    "ActorCriticSpec",
     "MASKED_LOGIT_FLOOR",
     "NOOP_ACTION_INDEX",
-    "PhaseAActorCriticSpec",
     "actor_critic_forward",
     "apply_action_mask",
-    "build_phase_a_actor_critic_spec",
-    "init_phase_a_actor_critic_params",
+    "build_actor_critic_module",
+    "build_actor_critic_spec",
+    "init_actor_critic_params",
     "run_actor_critic",
     "sample_actions",
 ]

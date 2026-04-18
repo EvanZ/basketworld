@@ -58,7 +58,15 @@ async function parsePlayableJsonResponse(response) {
   return payload;
 }
 
-export async function initGame(runId, userTeamName, offensePolicyName = null, defensePolicyName = null, unifiedPolicyName = null, opponentUnifiedPolicyName = null) {
+export async function initGame(options = {}) {
+    const {
+        runId,
+        userTeamName,
+        offensePolicyName = null,
+        defensePolicyName = null,
+        unifiedPolicyName = null,
+        opponentUnifiedPolicyName = null,
+    } = options || {};
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
         method: 'POST',
         headers: {
