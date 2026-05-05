@@ -18,6 +18,7 @@ from app.backend.inference_adapters import (
     get_policy_backend_kind,
     get_policy_capabilities,
     get_policy_metadata,
+    policy_observation_vector,
     prepare_policy_for_role,
     unwrap_policy_module,
 )
@@ -700,6 +701,23 @@ def get_full_game_state(
     counterfactual_snapshot = get_counterfactual_snapshot_summary()
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
     play_name_map = get_current_play_name_map(int(getattr(env, "num_intents", 0) or 0))
+    obs_vector = game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else []
+    if get_policy_backend_kind(game_state.unified_policy) == "jax":
+        try:
+            role_flag_arr = np.asarray(
+                game_state.obs.get("role_flag", [1.0]) if game_state.obs else [1.0],
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0) if role_flag_arr.size else True
+            jax_obs = policy_observation_vector(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+            if jax_obs is not None:
+                obs_vector = np.asarray(jax_obs, dtype=np.float32).reshape(-1).tolist()
+        except Exception:
+            obs_vector = obs_vector
 
     state = {
         "players_per_side": int(env.players_per_side or 3),
@@ -730,7 +748,7 @@ def get_full_game_state(
         "counterfactual_snapshot_captured_at": counterfactual_snapshot["captured_at"],
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
-        "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],
+        "obs": obs_vector,
         "obs_tokens": (
             {**obs_tokens, "attention": attention_payload} if obs_tokens is not None else None
         ),

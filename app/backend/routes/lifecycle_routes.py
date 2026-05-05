@@ -76,6 +76,89 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     return env_kwargs, wrapper_kwargs
 
 
+def _str_to_bool(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
+
+
+_JAX_MLFLOW_ENV_PARAM_CASTS = {
+    "training_team": str,
+    "players": int,
+    "court_rows": int,
+    "court_cols": int,
+    "shot_clock": int,
+    "min_shot_clock": int,
+    "layup_pct": float,
+    "three_pt_pct": float,
+    "dunk_pct": float,
+    "layup_std": float,
+    "three_pt_std": float,
+    "dunk_std": float,
+    "three_point_distance": float,
+    "three_point_short_distance": float,
+    "three_pt_extra_hex_decay": float,
+    "shot_pressure_enabled": _str_to_bool,
+    "shot_pressure_max": float,
+    "shot_pressure_lambda": float,
+    "shot_pressure_arc_degrees": float,
+    "defender_pressure_distance": int,
+    "defender_pressure_turnover_chance": float,
+    "defender_pressure_decay_lambda": float,
+    "base_steal_rate": float,
+    "steal_perp_decay": float,
+    "steal_distance_factor": float,
+    "steal_position_weight_min": float,
+    "spawn_distance": int,
+    "max_spawn_distance": int,
+    "defender_spawn_distance": int,
+    "defender_guard_distance": int,
+    "assist_window": int,
+    "mask_occupied_moves": _str_to_bool,
+    "enable_pass_gating": _str_to_bool,
+    "pass_mode": str,
+    "use_set_obs": _str_to_bool,
+    "illegal_defense_enabled": _str_to_bool,
+    "offensive_three_seconds": _str_to_bool,
+    "include_hoop_vector": _str_to_bool,
+    "enable_phi_shaping": _str_to_bool,
+    "phi_aggregation_mode": str,
+    "phi_use_ball_handler_only": _str_to_bool,
+    "pass_reward": float,
+    "potential_assist_pct": float,
+    "full_assist_bonus_pct": float,
+}
+
+
+def _coerce_jax_mlflow_env_param(raw_value, cast):
+    if raw_value is None:
+        return None
+    raw_str = str(raw_value).strip()
+    if raw_str == "" or raw_str.lower() in {"none", "null"}:
+        return None
+    if cast is int:
+        return int(float(raw_str))
+    return cast(raw_value)
+
+
+def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -> dict:
+    merged = dict(optional_params or {})
+    for key, cast in _JAX_MLFLOW_ENV_PARAM_CASTS.items():
+        names = (f"jax/env/{key}",)
+        if key == "offensive_three_seconds":
+            names = (f"jax/env/{key}", "jax/env/offensive_three_seconds_enabled")
+        for name in names:
+            if name not in mlflow_params:
+                continue
+            value = _coerce_jax_mlflow_env_param(mlflow_params.get(name), cast)
+            if key == "training_team" and isinstance(value, str):
+                merged[key] = Team.DEFENSE if value.strip().lower() == "defense" else Team.OFFENSE
+            elif key == "offensive_three_seconds":
+                merged["offensive_three_seconds_enabled"] = bool(value)
+            else:
+                merged[key] = value
+            break
+    return merged
+
+
 def _load_start_template_library_for_run(
     mlflow_client: mlflow.tracking.MlflowClient, run_id: str
 ) -> dict | None:
@@ -90,19 +173,23 @@ def _load_start_template_library_for_run(
 def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, dict | None]:
     metadata = get_policy_metadata(policy_obj) or {}
     frozen_config = dict(metadata.get("frozen_config", {}) or {})
-    if not frozen_config:
+    env_config = dict(metadata.get("env_config", {}) or {})
+    config = env_config or frozen_config
+    if not config:
         raise HTTPException(
             status_code=400,
-            detail="JAX Phase A checkpoint is missing frozen_config metadata.",
+            detail="JAX checkpoint is missing env_config/frozen_config metadata.",
         )
-    training_team = frozen_config.get("training_team")
+    training_team = config.get("training_team")
     if isinstance(training_team, str):
-        frozen_config["training_team"] = (
+        config["training_team"] = (
             Team.DEFENSE if training_team.strip().lower() == "defense" else Team.OFFENSE
         )
+    if "offensive_three_seconds" in config and "offensive_three_seconds_enabled" not in config:
+        config["offensive_three_seconds_enabled"] = bool(config.pop("offensive_three_seconds"))
     trainer_config = dict(metadata.get("trainer_config", {}) or {})
     required_params: dict = {}
-    optional_params = dict(frozen_config)
+    optional_params = dict(config)
     phi_params = {}
     return required_params, optional_params, trainer_config, phi_params
 
@@ -238,13 +325,20 @@ async def init_game(request: InitGameRequest):
             else None
         )
 
-        if get_policy_backend_kind(game_state.unified_policy) == "jax_phase_a":
+        if get_policy_backend_kind(game_state.unified_policy) == "jax":
             (
                 required_params,
                 optional_params,
                 mlflow_training_params,
                 mlflow_phi_params,
             ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
+            policy_metadata = get_policy_metadata(game_state.unified_policy) or {}
+            if not dict(policy_metadata.get("env_config", {}) or {}):
+                try:
+                    run_params = dict(mlflow_client.get_run(run_id).data.params or {})
+                    optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
+                except Exception as e:
+                    print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
             start_template_library = None
         else:
             try:

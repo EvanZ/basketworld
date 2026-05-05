@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from basketworld_jax.checkpoints import load_checkpoint
+from basketworld_jax.models import ActorCriticSpec
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
+    _log_mlflow_params,
     build_trainer_config,
     parse_args,
     run_train_scaffold,
@@ -18,6 +20,36 @@ def test_trainer_parser_defaults_match_frozen_scope():
 
     for key, expected in TRAIN_FROZEN_VALUES.items():
         assert getattr(args, key) == expected
+
+
+def test_jax_trainer_uses_grouped_opponent_sampling_flag_name():
+    args = parse_args(["--grouped-opponent-sampling"])
+
+    assert args.grouped_opponent_sampling is True
+    with pytest.raises(SystemExit):
+        parse_args(["--per-env-opponent-sampling"])
+
+
+def test_jax_trainer_allows_skill_distribution_overrides():
+    args = parse_args(
+        [
+            "--layup-pct",
+            "0.55",
+            "--three-pt-pct",
+            "0.37",
+            "--dunk-pct",
+            "0.6",
+            "--layup-std",
+            "0.05",
+            "--three-pt-std",
+            "0.05",
+            "--dunk-std",
+            "0.3",
+        ]
+    )
+
+    validate_train_args(args)
+    assert args.dunk_pct == 0.6
 
 
 def test_build_trainer_config_uses_training_args():
@@ -54,6 +86,49 @@ def test_build_trainer_config_uses_training_args():
     assert config.learning_rate == 0.001
 
 
+def test_mlflow_params_include_jax_env_skill_stds():
+    class Recorder:
+        def __init__(self):
+            self.params = None
+
+        def log_params(self, params):
+            self.params = dict(params)
+
+    args = parse_args(
+        [
+            "--layup-std",
+            "0.05",
+            "--three-pt-std",
+            "0.05",
+            "--dunk-std",
+            "0.3",
+            "--dunk-pct",
+            "0.6",
+        ]
+    )
+    validate_train_args(args)
+    recorder = Recorder()
+    _log_mlflow_params(
+        recorder,
+        args,
+        build_trainer_config(args),
+        ActorCriticSpec(
+            flat_obs_dim=91,
+            training_player_count=3,
+            action_dim_per_player=14,
+            total_action_dim=42,
+            hidden_dims=(128, 128),
+        ),
+    )
+
+    assert recorder.params["jax/env/layup_std"] == 0.05
+    assert recorder.params["jax/env/three_pt_std"] == 0.05
+    assert recorder.params["jax/env/dunk_std"] == 0.3
+    assert recorder.params["jax/env/dunk_pct"] == 0.6
+    assert recorder.params["jax/env/layup_pct"] == args.layup_pct
+    assert recorder.params["jax/env/pass_mode"] == args.pass_mode
+
+
 def test_train_scaffold_emits_rollout_trajectory_shapes():
     pytest.importorskip("jax")
 
@@ -87,6 +162,8 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     assert spec["trajectory_assists_shape"] == [4, 4]
     assert spec["trajectory_turnovers_shape"] == [4, 4]
     assert spec["trajectory_terminal_episode_steps_shape"] == [4, 4]
+    assert spec["trajectory_offense_score_delta_shape"] == [4, 4]
+    assert spec["trajectory_defense_score_delta_shape"] == [4, 4]
     assert spec["bootstrap_values_shape"] == [4]
     assert spec["ppo_batch_flat_obs_shape"] == [16, 91]
     assert spec["ppo_batch_action_mask_shape"] == [16, 3, 14]
@@ -127,16 +204,36 @@ def test_train_loop_emits_history_and_eval_dumps():
     result = run_training_loop(args)
 
     assert result["status"] == "train_loop"
+    assert set(result["training_player_ids"]) == {"offense", "defense"}
     assert len(result["train_history"]) == 2
     assert len(result["eval_trajectories"]) == 2
     assert result["final_metrics"]["update_index"] == 2
     assert "mean_reward" in result["final_metrics"]
+    assert "offense_mean_reward" in result["final_metrics"]
+    assert "defense_mean_reward" in result["final_metrics"]
+    assert "offense_learner_mean_reward" in result["final_metrics"]
+    assert "defense_learner_mean_reward" in result["final_metrics"]
+    assert "offense_opponent_mean_reward" in result["final_metrics"]
+    assert "defense_opponent_mean_reward" in result["final_metrics"]
+    assert "offense_learner_points_per_completed_episode" in result["final_metrics"]
+    assert "defense_opponent_points_per_completed_episode" in result["final_metrics"]
+    assert result["final_metrics"]["offense_opponent_mean_reward"] == pytest.approx(
+        -result["final_metrics"]["offense_learner_mean_reward"]
+    )
+    assert result["final_metrics"]["defense_opponent_mean_reward"] == pytest.approx(
+        -result["final_metrics"]["defense_learner_mean_reward"]
+    )
+    assert result["final_metrics"]["steps_per_update"] == 32
+    assert result["final_metrics"]["approx_kl"] > 0.0
+    assert result["final_metrics"]["mean_abs_log_ratio"] > 0.0
+    assert result["final_metrics"]["max_abs_log_ratio"] > 0.0
     assert "completed_episodes" in result["final_metrics"]
     assert "mean_completed_episode_length" in result["final_metrics"]
     assert "mean_pass_attempts_per_completed_episode" in result["final_metrics"]
     assert "mean_assists_per_completed_episode" in result["final_metrics"]
     assert "mean_turnovers_per_completed_episode" in result["final_metrics"]
     first_eval = result["eval_trajectories"][0]
+    assert first_eval["training_role"] in {"offense", "defense"}
     assert first_eval["trajectory_length"] == 4
     assert first_eval["positions"].shape == (4, 6, 2)
     assert first_eval["full_actions"].shape == (4, 6)
@@ -172,6 +269,14 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
             str(checkpoint_dir),
             "--checkpoint-every-updates",
             "1",
+            "--layup-std",
+            "0.05",
+            "--three-pt-std",
+            "0.05",
+            "--dunk-std",
+            "0.3",
+            "--dunk-pct",
+            "0.6",
             "--no-progress",
         ]
     )
@@ -187,6 +292,12 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     payload = load_checkpoint(latest_checkpoint)
     assert payload["update_index"] == 1
     assert "train_history" not in payload
+    assert payload["env_config"]["layup_std"] == 0.05
+    assert payload["env_config"]["three_pt_std"] == 0.05
+    assert payload["env_config"]["dunk_std"] == 0.3
+    assert payload["env_config"]["dunk_pct"] == 0.6
+    assert set(payload["current_state"]) == {"offense", "defense"}
+    assert set(payload["eval_initial_state"]) == {"offense", "defense"}
 
     resumed_args = parse_args(
         [
@@ -211,6 +322,14 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
             "1",
             "--resume-checkpoint",
             str(latest_checkpoint),
+            "--layup-std",
+            "0.05",
+            "--three-pt-std",
+            "0.05",
+            "--dunk-std",
+            "0.3",
+            "--dunk-pct",
+            "0.6",
             "--no-progress",
         ]
     )
@@ -220,3 +339,158 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert resumed_result["resumed_from_checkpoint"] == str(latest_checkpoint)
     assert resumed_result["final_metrics"]["update_index"] == 2
     assert len(resumed_result["train_history"]) == 1
+
+
+def test_train_loop_accepts_frozen_opponent_checkpoint(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "opponent_ckpts"
+    checkpoint_args = parse_args(
+        [
+            "--run-train-loop",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "3",
+            "--eval-horizon",
+            "4",
+            "--max-eval-dumps",
+            "2",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(checkpoint_args)
+    first_result = run_training_loop(checkpoint_args)
+    opponent_checkpoint = checkpoint_dir / "latest"
+    assert first_result["latest_checkpoint_path"] == str(opponent_checkpoint)
+
+    train_args = parse_args(
+        [
+            "--run-train-loop",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "1",
+            "--eval-horizon",
+            "4",
+            "--max-eval-dumps",
+            "2",
+            "--frozen-opponent-checkpoint",
+            str(opponent_checkpoint),
+            "--no-progress",
+        ]
+    )
+    validate_train_args(train_args)
+    result = run_training_loop(train_args)
+
+    assert result["active_opponent"]["source"] in {"checkpoint", "local_checkpoint"}
+    assert result["active_opponent"].get("checkpoint_path", str(opponent_checkpoint)) == str(opponent_checkpoint)
+    assert result["opponent_pool_size"] >= 1
+    assert result["final_metrics"]["update_index"] == 1
+    assert "offense_mean_reward" in result["final_metrics"]
+    assert "defense_mean_reward" in result["final_metrics"]
+
+
+def test_train_loop_samples_newly_saved_opponents_from_pool(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "pool_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "2",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "3",
+            "--eval-horizon",
+            "4",
+            "--max-eval-dumps",
+            "2",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    assert result["opponent_pool_size"] == 2
+    assert result["active_opponent"]["candidate_kind"] == "self_checkpoint"
+    assert result["active_opponent"]["source"] == "local_checkpoint"
+    assert result["final_metrics"]["opponent_source"] == "local_checkpoint"
+    assert result["final_metrics"]["opponent_update_index"] == 1
+
+
+def test_train_loop_groups_sampled_opponents_when_per_env_enabled(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "grouped_pool_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "3",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "3",
+            "--eval-horizon",
+            "4",
+            "--max-eval-dumps",
+            "2",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--grouped-opponent-sampling",
+            "--opponent-group-count",
+            "2",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    assert result["opponent_pool_size"] == 3
+    assert result["active_opponent"]["source"] == "grouped_pool"
+    assert result["active_opponent"]["group_count"] == 2
+    assert len(result["active_opponent"]["groups"]) == 2
+    assert len(result["eval_trajectories"]) == 2
+    assert result["final_metrics"]["opponent_source"] == "grouped_pool"
+    assert result["final_metrics"]["opponent_group_count"] == 2

@@ -298,14 +298,41 @@ Purpose:
 
 Primary tasks:
 
+- mixed offense/defense training with one shared policy
+- frozen opponent checkpoint inference inside the compiled rollout
+- opponent pool sampling from MLflow checkpoints
+- per-env opponent sampling once single-opponent sampling is stable
 - JAX-native self-play logic
 - on-device opponent action selection
 - on-device action assembly
-- JAX-native opponent pool / sampling logic where needed
 
 This is where the old experiments matter most:
 
 - the speedup only survives if the self-play and action-selection path stay mostly on device
+
+Recommended order:
+
+1. Train both roles first, still against legal-random opponents.
+2. Add a single frozen opponent checkpoint to the compiled rollout.
+3. Add checkpoint-pool sampling from MLflow artifacts.
+4. Add per-env opponent sampling only after the single-opponent path is correct.
+
+Rationale:
+
+- the current production SB3 path uses one unified policy and trains mixed offense/defense envs simultaneously
+- frozen opponent sampling is only meaningful once a JAX checkpoint can act as both offense and defense
+- per-env opponent sampling is the closest production behavior, but it adds stacked/vmapped opponent params and should come after the simpler frozen-opponent path
+
+Current status:
+
+- mixed offense/defense training is implemented with one shared actor-critic
+- frozen opponent action selection stays inside the compiled JAX rollout/eval path
+- local checkpoints and MLflow `run_id` checkpoints can bootstrap the opponent pool
+- newly saved checkpoints are added to the opponent candidate pool during training
+- the trainer resamples frozen opponents from the checkpoint pool at checkpoint boundaries using the existing `opponent_pool_size`, `opponent_pool_beta`, and `opponent_pool_exploration` knobs
+- grouped opponent sampling is implemented behind the JAX-specific `--grouped-opponent-sampling` flag
+- in the JAX path, `--opponent-group-count` controls how many sampled checkpoint opponents split the rollout batch; this keeps the production-style opponent diversity while preserving batched JAX forwards
+- fully vmapped per-row opponent params remains optional benchmark work, not the preferred default
 
 Exit criteria:
 

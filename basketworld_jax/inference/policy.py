@@ -47,12 +47,29 @@ class JAXInferenceModel:
             "policy_spec": dict(payload.get("policy_spec", {})),
             "trainer_config": dict(payload.get("trainer_config", {})),
             "frozen_config": dict(payload.get("frozen_config", {})),
+            "env_config": dict(payload.get("env_config", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }
         self._prepared_env = None
         self._prepared_observer_is_offense = True
         self._sample_key = self.jax.random.PRNGKey(0)
         self._static_cache: dict[tuple[int, bool], Any] = {}
+        self._last_team_outputs: dict[str, Any] | None = None
+        self._masked_runner = self._build_masked_runner()
+
+    def _build_masked_runner(self):
+        @self.jax.jit
+        def _runner(params, flat_obs, team_action_mask):
+            forward_out = actor_critic_forward(params, flat_obs, self.spec, self.jnp)
+            return apply_action_mask(
+                forward_out["flat_policy_logits"],
+                team_action_mask,
+                self.spec,
+                self.jax,
+                self.jnp,
+            )
+
+        return _runner
 
     def _resolve_base_env(self, env):
         return getattr(env, "unwrapped", env)
@@ -75,10 +92,36 @@ class JAXInferenceModel:
         self._static_cache[cache_key] = static
         return static
 
-    def _state_from_env(self, env):
-        base_env = self._resolve_base_env(env)
-        snapshot = snapshot_state_from_env(base_env)
+    def _state_from_snapshot(self, snapshot):
         return stack_state_snapshots([snapshot], self.jnp)
+
+    def _snapshot_cache_key(self, env, observer_is_offense: bool, snapshot: dict[str, Any]):
+        base_env = self._resolve_base_env(env)
+        array_keys = (
+            "positions",
+            "offense_lane_steps",
+            "defense_lane_steps",
+            "layup_pct",
+            "three_pt_pct",
+            "dunk_pct",
+        )
+        scalar_keys = (
+            "ball_holder",
+            "shot_clock",
+            "step_count",
+            "episode_ended",
+            "pressure_exposure",
+            "cached_phi",
+            "offense_score",
+            "defense_score",
+            "assist_active",
+            "assist_passer",
+            "assist_recipient",
+            "assist_expires_at",
+        )
+        arrays = tuple(np.asarray(snapshot[key]).tobytes() for key in array_keys)
+        scalars = tuple(snapshot[key] for key in scalar_keys)
+        return (id(base_env), bool(observer_is_offense), arrays, scalars)
 
     def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
         self._prepared_env = env
@@ -86,21 +129,31 @@ class JAXInferenceModel:
         self._build_static_for_role(env, observer_is_offense)
 
     def _team_outputs(self, env, observer_is_offense: bool):
+        base_env = self._resolve_base_env(env)
+        snapshot = snapshot_state_from_env(base_env)
+        cache_key = self._snapshot_cache_key(env, observer_is_offense, snapshot)
+        if self._last_team_outputs is not None and self._last_team_outputs.get("key") == cache_key:
+            return self._last_team_outputs["masked_out"]
+
         static = self._build_static_for_role(env, observer_is_offense)
-        state = self._state_from_env(env)
+        state = self._state_from_snapshot(snapshot)
         flat_obs = build_flat_observation_batch(static, state, self.jnp)
         full_action_mask = build_action_masks_batch(static, state, self.jnp)
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
         team_action_mask = self.jnp.take(full_action_mask, team_ids, axis=1)
-        forward_out = actor_critic_forward(self.params, flat_obs, self.spec, self.jnp)
-        masked_out = apply_action_mask(
-            forward_out["flat_policy_logits"],
-            team_action_mask,
-            self.spec,
-            self.jax,
-            self.jnp,
-        )
+        masked_out = self._masked_runner(self.params, flat_obs, team_action_mask)
+        self._last_team_outputs = {
+            "key": cache_key,
+            "masked_out": masked_out,
+        }
         return masked_out
+
+    def observation_vector(self, env, *, observer_is_offense: bool):
+        base_env = self._resolve_base_env(env)
+        static = self._build_static_for_role(env, observer_is_offense)
+        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        flat_obs = build_flat_observation_batch(static, state, self.jnp)
+        return np.asarray(self.jax.device_get(flat_obs[0]), dtype=np.float32)
 
     def predict(self, obs=None, deterministic: bool = False):
         if self._prepared_env is None:

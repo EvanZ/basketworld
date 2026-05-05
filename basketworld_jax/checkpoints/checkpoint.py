@@ -80,6 +80,8 @@ def build_checkpoint_payload(
     base_key,
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
+    opponent_info: dict[str, Any] | None = None,
+    env_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "checkpoint_version": CHECKPOINT_VERSION,
@@ -88,6 +90,7 @@ def build_checkpoint_payload(
         "trainer_config": dict(trainer_config),
         "policy_spec": dict(policy_spec),
         "frozen_config": dict(frozen_config),
+        "env_config": dict(env_config) if env_config is not None else None,
         "state": {
             "params": _tree_to_numpy(params),
             "opt_state": _tree_to_numpy(opt_state),
@@ -97,11 +100,12 @@ def build_checkpoint_payload(
         },
         "eval_trajectories": list(eval_trajectories),
         "last_metrics": None if last_metrics is None else dict(last_metrics),
+        "opponent_info": None if opponent_info is None else dict(opponent_info),
     }
 
 
 def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+    metadata = {
         "checkpoint_version": int(payload["checkpoint_version"]),
         "saved_at": str(payload["saved_at"]),
         "update_index": int(payload["update_index"]),
@@ -110,11 +114,15 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "frozen_config": _to_jsonable(dict(payload["frozen_config"])),
         "eval_trajectories": _to_jsonable(payload["eval_trajectories"]),
         "last_metrics": _to_jsonable(payload["last_metrics"]),
+        "opponent_info": _to_jsonable(payload.get("opponent_info")),
     }
+    if payload.get("env_config") is not None:
+        metadata["env_config"] = _to_jsonable(dict(payload["env_config"]))
+    return metadata
 
 
 def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "checkpoint_version": int(metadata["checkpoint_version"]),
         "saved_at": metadata["saved_at"],
         "update_index": int(metadata["update_index"]),
@@ -128,7 +136,11 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         "base_key": state["base_key"],
         "eval_trajectories": _from_jsonable(metadata["eval_trajectories"]),
         "last_metrics": _from_jsonable(metadata["last_metrics"]),
+        "opponent_info": _from_jsonable(metadata.get("opponent_info")),
     }
+    if "env_config" in metadata:
+        payload["env_config"] = _from_jsonable(metadata["env_config"])
+    return payload
 
 
 def _state_dir(path: str | Path) -> Path:

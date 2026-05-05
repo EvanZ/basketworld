@@ -104,7 +104,7 @@ def get_unified_policy_path(client, run_id, policy_name: str | None):
         raise HTTPException(status_code=404, detail="No unified policy artifacts found.")
 
     run_tags = _get_run_tags(client, run_id)
-    latest_jax_artifact = str(run_tags.get("jax_phase_a_latest_checkpoint_artifact", "")).strip()
+    latest_jax_artifact = str(run_tags.get("jax_latest_checkpoint_artifact", "")).strip()
 
     if policy_name and any(p.endswith(policy_name) for p in choices):
         chosen_artifact = next(p for p in choices if p.endswith(policy_name))

@@ -5035,6 +5035,12 @@ const obsMeta = computed(() => {
   const turnoverStart = offset;
   offset += nOffense;
   const stealStart = offset;
+  offset += nOffense;
+  const roleFlagIdx = offset;
+  offset += 1;
+  const offenseSkillDeltaStart = offset;
+  const offenseSkillDeltaLen = nOffense * 3;
+  offset += offenseSkillDeltaLen;
   return {
     nPlayers,
     shotClockIdx,
@@ -5056,6 +5062,9 @@ const obsMeta = computed(() => {
     expectedPointsLen,
     turnoverStart,
     stealStart,
+    roleFlagIdx,
+    offenseSkillDeltaStart,
+    offenseSkillDeltaLen,
     nOffense,
     teammatePairCount,
   };
@@ -5392,6 +5401,30 @@ const stealRisks = computed(() => {
     meta.stealStart + meta.nOffense,
   );
 });
+
+const roleFlagObsValue = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return 0;
+  return Number(obs[meta.roleFlagIdx] || 0);
+});
+
+const offenseSkillDeltas = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.offenseSkillDeltaLen === 0) return [];
+  return obs.slice(
+    meta.offenseSkillDeltaStart,
+    meta.offenseSkillDeltaStart + meta.offenseSkillDeltaLen,
+  );
+});
+
+function offenseSkillDeltaLabel(idx) {
+  const skillNames = ['layup', '3pt', 'dunk'];
+  const playerIdx = Math.floor(idx / 3);
+  const skillIdx = idx % 3;
+  return `O${formatOffenseId(playerIdx)} ${skillNames[skillIdx] || 'skill'} delta`;
+}
 </script>
 
 <template>
@@ -8311,6 +8344,32 @@ const stealRisks = computed(() => {
                 <td class="value-mono">{{ risk.toFixed(4) }}</td>
                 <td v-if="risk > 0" class="notes highlight">⚠️ Risk</td>
                 <td v-else class="notes">Safe</td>
+              </tr>
+
+              <!-- Role Flag -->
+              <tr class="group-role-flag">
+                <td class="group-label">Role Flag</td>
+                <td>Observer role</td>
+                <td class="value-mono">{{ roleFlagObsValue.toFixed(4) }}</td>
+                <td class="notes">{{ roleFlagObsValue > 0 ? 'Offense policy view' : 'Defense policy view' }}</td>
+              </tr>
+
+              <!-- Offense Skill Deltas -->
+              <tr
+                v-for="(delta, idx) in offenseSkillDeltas"
+                :key="`skill-delta-${idx}`"
+                class="group-skill-deltas"
+              >
+                <td
+                  v-if="idx === 0"
+                  :rowspan="offenseSkillDeltas.length"
+                  class="group-label"
+                >
+                  Offense Skill Deltas
+                </td>
+                <td>{{ offenseSkillDeltaLabel(idx) }}</td>
+                <td class="value-mono">{{ delta.toFixed(4) }}</td>
+                <td class="notes">Sampled player skill minus configured mean</td>
               </tr>
             </tbody>
           </table>

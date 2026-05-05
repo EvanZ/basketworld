@@ -55,6 +55,9 @@ class InferencePolicyAdapter:
     def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
         return None
 
+    def observation_vector(self, env, *, observer_is_offense: bool):
+        return None
+
     def set_pass_mode(self, mode_value: str) -> None:
         policy = getattr(self.raw_model, "policy", None)
         if policy is None or not hasattr(policy, "set_pass_mode"):
@@ -94,7 +97,7 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
     def __init__(self, raw_model: Any) -> None:
         super().__init__(
             raw_model,
-            backend_kind="jax_phase_a",
+            backend_kind="jax",
             capabilities=InferenceCapabilities(
                 player_controls=True,
                 self_play=True,
@@ -118,6 +121,12 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
 
     def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
         self.raw_model.prepare_for_role(
+            env,
+            observer_is_offense=bool(observer_is_offense),
+        )
+
+    def observation_vector(self, env, *, observer_is_offense: bool):
+        return self.raw_model.observation_vector(
             env,
             observer_is_offense=bool(observer_is_offense),
         )
@@ -188,6 +197,17 @@ def policy_action_probabilities(policy_obj: Any, obs):
         return policy_obj.action_probabilities(obs)
     raw_model = unwrap_inference_model(policy_obj)
     return get_policy_action_probabilities(raw_model, obs)
+
+
+def policy_observation_vector(policy_obj: Any, env, *, observer_is_offense: bool):
+    if policy_obj is None:
+        return None
+    if hasattr(policy_obj, "observation_vector"):
+        return policy_obj.observation_vector(
+            env,
+            observer_is_offense=bool(observer_is_offense),
+        )
+    return None
 
 
 def get_policy_backend_kind(policy_obj: Any) -> str | None:

@@ -36,6 +36,7 @@ from app.backend.rollout_runtime import (
     predict_joint_policy_actions,
 )
 from app.backend.state import game_state
+from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
 
 
 # Worker-local storage (each process has its own copy)
@@ -1635,6 +1636,27 @@ def run_evaluation(
     num_workers: int | None = None,
     progress_callback=None,
 ):
+    if can_run_native_jax_evaluation(
+        unified_policy_path=unified_policy_path,
+        opponent_policy_path=opponent_policy_path,
+        custom_setup=custom_setup,
+        randomize_offense_permutation=randomize_offense_permutation,
+    ):
+        print("[Evaluation] Using JAX-native compiled evaluation fast path")
+        return run_native_jax_evaluation(
+            num_episodes=num_episodes,
+            player_deterministic=player_deterministic,
+            opponent_deterministic=opponent_deterministic,
+            required_params=required_params,
+            optional_params=optional_params,
+            unified_policy_path=unified_policy_path,
+            opponent_policy_path=opponent_policy_path,
+            user_team_name=user_team_name,
+            role_flag_offense=role_flag_offense,
+            role_flag_defense=role_flag_defense,
+            progress_callback=progress_callback,
+        )
+
     if num_workers is None or num_workers <= 1:
         env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
         custom_objects = {

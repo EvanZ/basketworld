@@ -65,7 +65,7 @@ def test_get_unified_policy_path_prefers_tagged_latest_jax_checkpoint():
                 "models/update_0000200",
             ],
         },
-        tags={"jax_phase_a_latest_checkpoint_artifact": "models/update_0000100"},
+        tags={"jax_latest_checkpoint_artifact": "models/update_0000100"},
     )
 
     local_path = get_unified_policy_path(client, "run-1", None)

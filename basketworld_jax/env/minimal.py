@@ -16,6 +16,16 @@ PASS_ACTION_START = ActionType.PASS_E.value
 PASS_ACTION_END = ActionType.PASS_SE.value + 1
 ACTION_COUNT = len(ActionType)
 SQRT3 = float(np.sqrt(3.0))
+TURNOVER_REASON_NONE = 0
+TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
+TURNOVER_REASON_INTERCEPTED = 2
+TURNOVER_REASON_DEFENDER_PRESSURE = 3
+TURNOVER_REASON_MOVE_OUT_OF_BOUNDS = 4
+TURNOVER_REASON_SHOT_CLOCK = 5
+SHOT_TYPE_NONE = 0
+SHOT_TYPE_DUNK = 1
+SHOT_TYPE_TWO = 2
+SHOT_TYPE_THREE = 3
 
 
 class KernelStatic(NamedTuple):
@@ -111,10 +121,25 @@ class StepBatchOutput(NamedTuple):
     rewards: Any
     done: Any
     pass_attempt: Any
+    pass_passer: Any
+    pass_receiver: Any
     completed_pass: Any
     assist: Any
     turnover: Any
     terminal_episode_steps: Any
+    shot_attempt: Any
+    shot_success: Any
+    shot_shooter: Any
+    shot_value: Any
+    shot_expected_points: Any
+    shot_distance: Any
+    shot_type: Any
+    shot_q: Any
+    shot_r: Any
+    potential_assist: Any
+    assist_passer: Any
+    turnover_player: Any
+    turnover_reason: Any
 
 
 def _player_skill_arrays(env) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -813,9 +838,9 @@ def build_offense_skill_deltas_batch(static: KernelStatic, state: KernelState, j
     return stacked.reshape(stacked.shape[0], -1).astype(jnp.float32)
 
 
-def build_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
+def build_flat_observation_batch_with_role_flag(static: KernelStatic, state: KernelState, role_flag_value, jnp):
     batch_size = state.positions.shape[0]
-    role_flag = jnp.full((batch_size, 1), static.training_role_flag, dtype=jnp.float32)
+    role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
     return jnp.concatenate(
         [
             build_observation_vector_batch(static, state, jnp),
@@ -824,6 +849,15 @@ def build_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
         ],
         axis=1,
     ).astype(jnp.float32)
+
+
+def build_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
+    return build_flat_observation_batch_with_role_flag(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+    )
 
 
 def build_aggregated_reward_batch(static: KernelStatic, rewards, jnp):
@@ -922,13 +956,21 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
         applied = single_move | collision_move
         final_positions = jnp.where(applied[:, None], jnp.broadcast_to(dest, final_positions.shape), final_positions)
 
-    return final_positions, ball_holder, turnover_any
+    turnover_player = jnp.where(
+        turnover_any,
+        turnover_player,
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    return final_positions, ball_holder, turnover_any, turnover_player
 
 
 def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key, jax, jnp):
     zero_rewards = jnp.zeros((state.positions.shape[0],), dtype=jnp.float32)
     zero_flag = jnp.asarray(0, dtype=jnp.int8)
     zero_steps = jnp.asarray(0, dtype=jnp.int32)
+    zero_float = jnp.asarray(0.0, dtype=jnp.float32)
+    no_player = jnp.asarray(-1, dtype=jnp.int32)
+    no_reason = jnp.asarray(TURNOVER_REASON_NONE, dtype=jnp.int32)
 
     def _already_done(_):
         return StepBatchOutput(
@@ -936,10 +978,25 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             rewards=zero_rewards,
             done=jnp.asarray(True),
             pass_attempt=zero_flag,
+            pass_passer=no_player,
+            pass_receiver=no_player,
             completed_pass=zero_flag,
             assist=zero_flag,
             turnover=zero_flag,
             terminal_episode_steps=zero_steps,
+            shot_attempt=zero_flag,
+            shot_success=zero_flag,
+            shot_shooter=no_player,
+            shot_value=zero_float,
+            shot_expected_points=zero_float,
+            shot_distance=zero_float,
+            shot_type=jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
+            shot_q=zero_steps,
+            shot_r=zero_steps,
+            potential_assist=zero_flag,
+            assist_passer=no_player,
+            turnover_player=no_player,
+            turnover_reason=no_reason,
         )
 
     def _run_active(_):
@@ -962,6 +1019,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         pressure_holder = static.defense_ids[pressure_def_idx]
 
         def _pressure_done(_):
+            pressure_turnover_player = jnp.clip(next_state.ball_holder, 0, next_state.positions.shape[0] - 1)
             pressure_state = _replace_state(
                 next_state,
                 ball_holder=pressure_holder,
@@ -972,10 +1030,25 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rewards=zero_rewards,
                 done=jnp.asarray(True),
                 pass_attempt=zero_flag,
+                pass_passer=no_player,
+                pass_receiver=no_player,
                 completed_pass=zero_flag,
                 assist=zero_flag,
                 turnover=jnp.asarray(1, dtype=jnp.int8),
                 terminal_episode_steps=pressure_state.step_count.astype(jnp.int32),
+                shot_attempt=zero_flag,
+                shot_success=zero_flag,
+                shot_shooter=no_player,
+                shot_value=zero_float,
+                shot_expected_points=zero_float,
+                shot_distance=zero_float,
+                shot_type=jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
+                shot_q=zero_steps,
+                shot_r=zero_steps,
+                potential_assist=zero_flag,
+                assist_passer=no_player,
+                turnover_player=jnp.where(next_state.ball_holder >= 0, pressure_turnover_player, no_player),
+                turnover_reason=jnp.asarray(TURNOVER_REASON_DEFENDER_PRESSURE, dtype=jnp.int32),
             )
 
         def _normal_step(_):
@@ -1008,6 +1081,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             shot_probabilities = shot_profile["probability"][0]
             shot_values = shot_profile["shot_value"][0]
             shot_ep_all = shot_profile["expected_points"][0]
+            shot_distances = shot_profile["distance"][0]
+            shot_is_three = shot_profile["is_three"][0]
 
             def _do_shot(_):
                 draw = jax.random.uniform(shot_key)
@@ -1023,8 +1098,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     success,
                     shot_values[safe_holder],
                     shot_ep_all[safe_holder],
+                    shot_distances[safe_holder].astype(jnp.float32),
                     jnp.asarray(False),
                     jnp.asarray(False),
+                    no_reason,
+                    no_player,
                 )
 
             def _do_pass(_):
@@ -1045,6 +1123,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     jnp.asarray(-1, dtype=jnp.int32),
                     shot_clock_state.step_count + static.assist_window.astype(jnp.int32),
                 )
+                turnover_reason = jnp.where(
+                    receiver < 0,
+                    jnp.asarray(TURNOVER_REASON_PASS_OUT_OF_BOUNDS, dtype=jnp.int32),
+                    jnp.asarray(TURNOVER_REASON_INTERCEPTED, dtype=jnp.int32),
+                )
                 return (
                     new_holder,
                     new_assist_active,
@@ -1055,8 +1138,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     jnp.asarray(False),
                     jnp.asarray(0.0, dtype=jnp.float32),
                     jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
                     theft,
                     ~theft,
+                    turnover_reason,
+                    receiver.astype(jnp.int32),
                 )
 
             (
@@ -1069,8 +1155,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 shot_success,
                 shot_value,
                 shot_expected_points,
+                shot_distance,
                 turnover_from_action,
                 pass_success,
+                action_turnover_reason,
+                pass_receiver,
             ) = jax.lax.cond(
                 is_shot,
                 _do_shot,
@@ -1087,8 +1176,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                         jnp.asarray(False),
                         jnp.asarray(0.0, dtype=jnp.float32),
                         jnp.asarray(0.0, dtype=jnp.float32),
+                        jnp.asarray(0.0, dtype=jnp.float32),
                         jnp.asarray(False),
                         jnp.asarray(False),
+                        no_reason,
+                        no_player,
                     ),
                     operand=None,
                 ),
@@ -1096,9 +1188,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
 
             movement_skipped = shot_active | turnover_from_action
-            positions_after, ball_holder_after, movement_turnover = jax.lax.cond(
+            positions_after, ball_holder_after, movement_turnover, movement_turnover_player = jax.lax.cond(
                 movement_skipped,
-                lambda _: (positions_after, ball_holder_after, jnp.asarray(False)),
+                lambda _: (positions_after, ball_holder_after, jnp.asarray(False), no_player),
                 lambda _: _resolve_movement_single(
                     static,
                     _replace_state(shot_clock_state, positions=positions_after, ball_holder=ball_holder_after),
@@ -1182,16 +1274,58 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             turnover_event = (
                 turnover_from_action | movement_turnover | shot_clock_turnover
             ).astype(jnp.int8)
+            turnover_player = jnp.where(
+                turnover_from_action,
+                safe_holder,
+                jnp.where(
+                    movement_turnover,
+                    movement_turnover_player,
+                    jnp.where(shot_clock_turnover, safe_holder, no_player),
+                ),
+            )
+            turnover_reason = jnp.where(
+                turnover_from_action,
+                action_turnover_reason,
+                jnp.where(
+                    movement_turnover,
+                    jnp.asarray(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS, dtype=jnp.int32),
+                    jnp.where(
+                        shot_clock_turnover,
+                        jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
+                        no_reason,
+                    ),
+                ),
+            )
+            turnover_player = jnp.where(turnover_event.astype(jnp.bool_), turnover_player, no_player)
+            turnover_reason = jnp.where(turnover_event.astype(jnp.bool_), turnover_reason, no_reason)
             done = done | shot_clock_turnover
             final_state = _replace_state(
                 final_state,
                 episode_ended=done.astype(final_state.episode_ended.dtype),
             )
+            shot_position = shot_clock_state.positions[shot_shooter]
+            shot_type = jnp.where(
+                shot_active,
+                jnp.where(
+                    shot_distance <= 0.0,
+                    jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
+                    jnp.where(
+                        shot_is_three[safe_holder].astype(jnp.bool_),
+                        jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
+                        jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
+                    ),
+                ),
+                jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
+            )
+            potential_assist_event = (assist_valid & shot_active).astype(jnp.int8)
+            event_assist_passer = jnp.where(potential_assist_event.astype(jnp.bool_), assist_passer, no_player)
             return StepBatchOutput(
                 state=final_state,
                 rewards=rewards,
                 done=done,
                 pass_attempt=pass_attempt,
+                pass_passer=jnp.where(is_pass, safe_holder.astype(jnp.int32), no_player),
+                pass_receiver=jnp.where(is_pass, pass_receiver.astype(jnp.int32), no_player),
                 completed_pass=pass_success.astype(jnp.int8),
                 assist=assist_event,
                 turnover=turnover_event,
@@ -1200,6 +1334,19 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     final_state.step_count.astype(jnp.int32),
                     jnp.asarray(0, dtype=jnp.int32),
                 ),
+                shot_attempt=shot_active.astype(jnp.int8),
+                shot_success=shot_success.astype(jnp.int8),
+                shot_shooter=jnp.where(shot_active, shot_shooter.astype(jnp.int32), no_player),
+                shot_value=jnp.where(shot_active, shot_value, zero_float),
+                shot_expected_points=jnp.where(shot_active, shot_expected_points, zero_float),
+                shot_distance=jnp.where(shot_active, shot_distance, zero_float),
+                shot_type=shot_type,
+                shot_q=jnp.where(shot_active, shot_position[0], zero_steps),
+                shot_r=jnp.where(shot_active, shot_position[1], zero_steps),
+                potential_assist=potential_assist_event,
+                assist_passer=event_assist_passer,
+                turnover_player=turnover_player,
+                turnover_reason=turnover_reason,
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)

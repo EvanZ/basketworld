@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Sequence
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,8 @@ class TrajectoryBatch(NamedTuple):
     assists: Any
     turnovers: Any
     terminal_episode_steps: Any
+    offense_score_delta: Any
+    defense_score_delta: Any
 
 
 class RolloutOutput(NamedTuple):
@@ -126,4 +128,15 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         old_values=rollout.trajectory.values.reshape(-1),
         advantages=normalized_advantages.reshape(-1),
         returns=returns.reshape(-1),
+    )
+
+
+def concatenate_ppo_batches(batches: Sequence[PPOBatch], jnp) -> PPOBatch:
+    if not batches:
+        raise ValueError("At least one PPO batch is required.")
+    return PPOBatch(
+        *(
+            jnp.concatenate([getattr(batch, field) for batch in batches], axis=0)
+            for field in PPOBatch._fields
+        )
     )

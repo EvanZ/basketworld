@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter_ns
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -10,6 +10,7 @@ from basketworld_jax.env import (
     build_action_masks_batch,
     build_aggregated_reward_batch,
     build_flat_observation_batch,
+    build_flat_observation_batch_with_role_flag,
     replace_done_states,
     reset_batch_minimal,
     resolve_team_player_ids,
@@ -35,6 +36,46 @@ from basketworld_jax.train.types import (
 def training_player_ids_from_static(static) -> np.ndarray:
     mask = np.asarray(static.training_player_mask, dtype=np.float32)
     return np.flatnonzero(mask > 0.5).astype(np.int32)
+
+
+def _concatenate_namedtuple_batch(items, jnp, *, axis: int):
+    if not items:
+        raise ValueError("At least one item is required.")
+    return type(items[0])(
+        *(
+            jnp.concatenate([getattr(item, field) for item in items], axis=axis)
+            for field in items[0]._fields
+        )
+    )
+
+
+def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> RolloutOutput:
+    if not rollouts:
+        raise ValueError("At least one rollout output is required.")
+    return RolloutOutput(
+        trajectory=_concatenate_namedtuple_batch(
+            [rollout.trajectory for rollout in rollouts],
+            jnp,
+            axis=1,
+        ),
+        final_state=_concatenate_namedtuple_batch(
+            [rollout.final_state for rollout in rollouts],
+            jnp,
+            axis=0,
+        ),
+        bootstrap_values=jnp.concatenate(
+            [rollout.bootstrap_values for rollout in rollouts],
+            axis=0,
+        ),
+        final_flat_obs=jnp.concatenate(
+            [rollout.final_flat_obs for rollout in rollouts],
+            axis=0,
+        ),
+        final_action_mask=jnp.concatenate(
+            [rollout.final_action_mask for rollout in rollouts],
+            axis=0,
+        ),
+    )
 
 
 def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
@@ -116,6 +157,8 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
+                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
             )
             return (next_state, key), transition
 
@@ -137,6 +180,244 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         )
 
     return jax.jit(_runner, static_argnums=(4,))
+
+
+def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
+    def _runner(static, initial_state, params, opponent_params, rollout_key, horizon: int):
+        training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            flat_obs = build_flat_observation_batch(static, state, jnp)
+            opponent_flat_obs = build_flat_observation_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            training_action_mask = full_action_mask[:, training_ids, :]
+            opponent_action_mask = full_action_mask[:, opponent_ids, :]
+
+            policy_out = run_actor_critic(
+                params,
+                flat_obs,
+                training_action_mask,
+                spec,
+                policy_key,
+                jax,
+                jnp,
+            )
+            opponent_out = run_actor_critic(
+                opponent_params,
+                opponent_flat_obs,
+                opponent_action_mask,
+                spec,
+                opponent_key,
+                jax,
+                jnp,
+            )
+            full_actions = assemble_full_actions_jax(
+                policy_out["sampled_actions"],
+                opponent_out["sampled_actions"],
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
+            aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
+            transition = TrajectoryBatch(
+                flat_obs=flat_obs,
+                action_mask=training_action_mask,
+                actions=policy_out["sampled_actions"],
+                full_actions=full_actions,
+                selected_log_probs=policy_out["selected_log_probs"],
+                values=policy_out["values"],
+                rewards=aggregated_reward,
+                dones=env_out.done.astype(jnp.int8),
+                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
+                completed_passes=env_out.completed_pass.astype(jnp.int8),
+                assists=env_out.assist.astype(jnp.int8),
+                turnovers=env_out.turnover.astype(jnp.int8),
+                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
+                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
+            )
+            return (next_state, key), transition
+
+        (final_state, _), trajectory = jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+        final_flat_obs = build_flat_observation_batch(static, final_state, jnp)
+        final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
+        bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
+        return RolloutOutput(
+            trajectory=trajectory,
+            final_state=final_state,
+            bootstrap_values=bootstrap_values,
+            final_flat_obs=final_flat_obs,
+            final_action_mask=final_action_mask,
+        )
+
+    return jax.jit(_runner, static_argnums=(5,))
+
+
+def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        opponent_params_by_group,
+        rollout_key,
+        horizon: int,
+        opponent_group_count: int,
+    ):
+        training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+        group_count = int(opponent_group_count)
+        batch_size = int(initial_state.positions.shape[0])
+        group_size = batch_size // group_count
+
+        def _sample_grouped_opponent_actions(opponent_flat_obs, opponent_action_mask, key):
+            grouped_obs = opponent_flat_obs.reshape(
+                group_count,
+                group_size,
+                int(opponent_flat_obs.shape[-1]),
+            )
+            grouped_mask = opponent_action_mask.reshape(
+                group_count,
+                group_size,
+                int(opponent_action_mask.shape[-2]),
+                int(opponent_action_mask.shape[-1]),
+            )
+            group_keys = jax.random.split(key, group_count)
+
+            def _run_group(group_params, group_obs, group_mask, group_key):
+                group_out = run_actor_critic(
+                    group_params,
+                    group_obs,
+                    group_mask,
+                    spec,
+                    group_key,
+                    jax,
+                    jnp,
+                )
+                return group_out["sampled_actions"]
+
+            grouped_actions = jax.vmap(_run_group)(
+                opponent_params_by_group,
+                grouped_obs,
+                grouped_mask,
+                group_keys,
+            )
+            return grouped_actions.reshape(
+                batch_size,
+                int(spec.training_player_count),
+            )
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            flat_obs = build_flat_observation_batch(static, state, jnp)
+            opponent_flat_obs = build_flat_observation_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            training_action_mask = full_action_mask[:, training_ids, :]
+            opponent_action_mask = full_action_mask[:, opponent_ids, :]
+
+            policy_out = run_actor_critic(
+                params,
+                flat_obs,
+                training_action_mask,
+                spec,
+                policy_key,
+                jax,
+                jnp,
+            )
+            opponent_actions = _sample_grouped_opponent_actions(
+                opponent_flat_obs,
+                opponent_action_mask,
+                opponent_key,
+            )
+            full_actions = assemble_full_actions_jax(
+                policy_out["sampled_actions"],
+                opponent_actions,
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
+            aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
+            transition = TrajectoryBatch(
+                flat_obs=flat_obs,
+                action_mask=training_action_mask,
+                actions=policy_out["sampled_actions"],
+                full_actions=full_actions,
+                selected_log_probs=policy_out["selected_log_probs"],
+                values=policy_out["values"],
+                rewards=aggregated_reward,
+                dones=env_out.done.astype(jnp.int8),
+                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
+                completed_passes=env_out.completed_pass.astype(jnp.int8),
+                assists=env_out.assist.astype(jnp.int8),
+                turnovers=env_out.turnover.astype(jnp.int8),
+                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
+                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
+            )
+            return (next_state, key), transition
+
+        (final_state, _), trajectory = jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+        final_flat_obs = build_flat_observation_batch(static, final_state, jnp)
+        final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
+        bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
+        return RolloutOutput(
+            trajectory=trajectory,
+            final_state=final_state,
+            bootstrap_values=bootstrap_values,
+            final_flat_obs=final_flat_obs,
+            final_action_mask=final_action_mask,
+        )
+
+    return jax.jit(_runner, static_argnums=(5, 6))
 
 
 def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
@@ -215,6 +496,218 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
     return jax.jit(_runner, static_argnums=(4,))
 
 
+def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
+    def _runner(static, initial_state, params, opponent_params, rollout_key, horizon: int):
+        training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, opponent_key, env_key = jax.random.split(key, 3)
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            training_action_mask = full_action_mask[:, training_ids, :]
+            opponent_action_mask = full_action_mask[:, opponent_ids, :]
+
+            forward_out = actor_critic_forward(
+                params,
+                build_flat_observation_batch(static, state, jnp),
+                spec,
+                jnp,
+            )
+            masked_out = apply_action_mask(
+                forward_out["flat_policy_logits"],
+                training_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            opponent_out = run_actor_critic(
+                opponent_params,
+                build_flat_observation_batch_with_role_flag(
+                    static,
+                    state,
+                    -static.training_role_flag,
+                    jnp,
+                ),
+                opponent_action_mask,
+                spec,
+                opponent_key,
+                jax,
+                jnp,
+            )
+            full_actions = assemble_full_actions_jax(
+                masked_out["deterministic_actions"],
+                opponent_out["sampled_actions"],
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            trace = EvalTrace(
+                positions=state.positions,
+                ball_holder=state.ball_holder,
+                shot_clock=state.shot_clock,
+                full_actions=full_actions,
+                rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
+                dones=env_out.done.astype(jnp.int8),
+                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
+                completed_passes=env_out.completed_pass.astype(jnp.int8),
+                assists=env_out.assist.astype(jnp.int8),
+                turnovers=env_out.turnover.astype(jnp.int8),
+                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
+                offense_score=env_out.state.offense_score,
+                defense_score=env_out.state.defense_score,
+            )
+            return (env_out.state, key), trace
+
+        (final_state, _), trace = jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+        return final_state, trace
+
+    return jax.jit(_runner, static_argnums=(5,))
+
+
+def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        opponent_params_by_group,
+        rollout_key,
+        horizon: int,
+        opponent_group_count: int,
+    ):
+        training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+        group_count = int(opponent_group_count)
+        batch_size = int(initial_state.positions.shape[0])
+        group_size = batch_size // group_count
+
+        def _sample_grouped_opponent_actions(opponent_flat_obs, opponent_action_mask, key):
+            grouped_obs = opponent_flat_obs.reshape(
+                group_count,
+                group_size,
+                int(opponent_flat_obs.shape[-1]),
+            )
+            grouped_mask = opponent_action_mask.reshape(
+                group_count,
+                group_size,
+                int(opponent_action_mask.shape[-2]),
+                int(opponent_action_mask.shape[-1]),
+            )
+            group_keys = jax.random.split(key, group_count)
+
+            def _run_group(group_params, group_obs, group_mask, group_key):
+                group_out = run_actor_critic(
+                    group_params,
+                    group_obs,
+                    group_mask,
+                    spec,
+                    group_key,
+                    jax,
+                    jnp,
+                )
+                return group_out["sampled_actions"]
+
+            grouped_actions = jax.vmap(_run_group)(
+                opponent_params_by_group,
+                grouped_obs,
+                grouped_mask,
+                group_keys,
+            )
+            return grouped_actions.reshape(
+                batch_size,
+                int(spec.training_player_count),
+            )
+
+        def _scan_step(carry, _):
+            state, key = carry
+            key, opponent_key, env_key = jax.random.split(key, 3)
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            training_action_mask = full_action_mask[:, training_ids, :]
+            opponent_action_mask = full_action_mask[:, opponent_ids, :]
+
+            forward_out = actor_critic_forward(
+                params,
+                build_flat_observation_batch(static, state, jnp),
+                spec,
+                jnp,
+            )
+            masked_out = apply_action_mask(
+                forward_out["flat_policy_logits"],
+                training_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            opponent_actions = _sample_grouped_opponent_actions(
+                build_flat_observation_batch_with_role_flag(
+                    static,
+                    state,
+                    -static.training_role_flag,
+                    jnp,
+                ),
+                opponent_action_mask,
+                opponent_key,
+            )
+            full_actions = assemble_full_actions_jax(
+                masked_out["deterministic_actions"],
+                opponent_actions,
+                training_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            trace = EvalTrace(
+                positions=state.positions,
+                ball_holder=state.ball_holder,
+                shot_clock=state.shot_clock,
+                full_actions=full_actions,
+                rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
+                dones=env_out.done.astype(jnp.int8),
+                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
+                completed_passes=env_out.completed_pass.astype(jnp.int8),
+                assists=env_out.assist.astype(jnp.int8),
+                turnovers=env_out.turnover.astype(jnp.int8),
+                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
+                offense_score=env_out.state.offense_score,
+                defense_score=env_out.state.defense_score,
+            )
+            return (env_out.state, key), trace
+
+        (final_state, _), trace = jax.lax.scan(
+            _scan_step,
+            (initial_state, rollout_key),
+            xs=None,
+            length=int(horizon),
+        )
+        return final_state, trace
+
+    return jax.jit(_runner, static_argnums=(5, 6))
+
+
 def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_config: TrainerConfig):
     import optax
 
@@ -254,8 +747,10 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         )
         value_loss = jnp.mean(jnp.square(forward_out["values"] - batch.returns))
         entropy_bonus = jnp.mean(jnp.mean(masked_out["entropy"], axis=-1))
-        approx_kl = jnp.mean(batch.old_selected_log_probs - new_selected_log_probs)
+        approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
         clip_fraction = jnp.mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32))
+        mean_abs_log_ratio = jnp.mean(jnp.abs(log_ratio))
+        max_abs_log_ratio = jnp.max(jnp.abs(log_ratio))
         total_loss = policy_loss + (value_coef * value_loss) - (entropy_coef * entropy_bonus)
         metrics = {
             "total_loss": total_loss,
@@ -264,11 +759,13 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "entropy_bonus": entropy_bonus,
             "approx_kl": approx_kl,
             "clip_fraction": clip_fraction,
+            "mean_abs_log_ratio": mean_abs_log_ratio,
+            "max_abs_log_ratio": max_abs_log_ratio,
         }
         return total_loss, metrics
 
     def _single_epoch(params, opt_state, batch):
-        (loss, metrics), grads = jax.value_and_grad(_loss_fn, has_aux=True)(params, batch)
+        (_, _), grads = jax.value_and_grad(_loss_fn, has_aux=True)(params, batch)
         grad_norm = global_norm(grads, optax)
         new_params, new_opt_state = optimizer_update(
             params,
@@ -277,10 +774,11 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             transform=transform,
             optax=optax,
         )
+        post_update_loss, metrics = _loss_fn(new_params, batch)
         metrics = {
             **metrics,
             "grad_norm": grad_norm,
-            "total_loss": loss,
+            "total_loss": post_update_loss,
         }
         return new_params, new_opt_state, metrics
 
@@ -379,7 +877,7 @@ def summarize_episode_events(
     assists_arr = np.asarray(assists, dtype=np.float32)
     turnovers_arr = np.asarray(turnovers, dtype=np.float32)
 
-    completed_episodes = int(done_arr.sum())
+    completed_episodes = int((terminal_steps_arr > 0).sum())
     completed_episode_steps = int(terminal_steps_arr.sum())
     denom = float(completed_episodes) if completed_episodes > 0 else 0.0
 

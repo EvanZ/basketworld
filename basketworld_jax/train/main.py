@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from copy import copy
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -46,15 +48,21 @@ from basketworld_jax.train.cli import (
 from basketworld_jax.train.types import (
     TrainerConfig,
     build_ppo_batch,
+    concatenate_ppo_batches,
 )
 from basketworld_jax.train.runtime import (
     benchmark_compiled_rollout,
     benchmark_update_runner,
     block_until_ready_tree,
     build_compiled_eval_runner,
+    build_compiled_frozen_opponent_eval_runner,
+    build_compiled_frozen_opponent_rollout_runner,
+    build_compiled_grouped_opponent_eval_runner,
+    build_compiled_grouped_opponent_rollout_runner,
     build_compiled_rollout_runner,
     build_jitted_actor_critic_runner,
     build_jitted_ppo_update_runner,
+    concatenate_rollout_outputs,
     serialize_eval_trace,
     summarize_episode_events,
     summarize_training_step,
@@ -62,10 +70,82 @@ from basketworld_jax.train.runtime import (
 )
 
 
+TRAINING_ROLES = ("offense", "defense")
+JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
+    {
+        "layup_pct",
+        "three_pt_pct",
+        "dunk_pct",
+    }
+)
+JAX_ENV_MLFLOW_PARAM_KEYS = (
+    "training_team",
+    "players",
+    "court_rows",
+    "court_cols",
+    "shot_clock",
+    "min_shot_clock",
+    "layup_pct",
+    "three_pt_pct",
+    "dunk_pct",
+    "layup_std",
+    "three_pt_std",
+    "dunk_std",
+    "three_point_distance",
+    "three_point_short_distance",
+    "three_pt_extra_hex_decay",
+    "shot_pressure_enabled",
+    "shot_pressure_max",
+    "shot_pressure_lambda",
+    "shot_pressure_arc_degrees",
+    "defender_pressure_distance",
+    "defender_pressure_turnover_chance",
+    "defender_pressure_decay_lambda",
+    "base_steal_rate",
+    "steal_perp_decay",
+    "steal_distance_factor",
+    "steal_position_weight_min",
+    "spawn_distance",
+    "max_spawn_distance",
+    "defender_spawn_distance",
+    "defender_guard_distance",
+    "assist_window",
+    "mask_occupied_moves",
+    "enable_pass_gating",
+    "pass_mode",
+    "use_set_obs",
+    "illegal_defense_enabled",
+    "offensive_three_seconds",
+    "include_hoop_vector",
+    "enable_phi_shaping",
+    "phi_aggregation_mode",
+    "phi_use_ball_handler_only",
+    "pass_reward",
+    "potential_assist_pct",
+    "full_assist_bonus_pct",
+)
+
+
+def _reject_legacy_opponent_flag(argv: list[str]) -> None:
+    if "--per-env-opponent-sampling" in argv:
+        raise SystemExit(
+            "Use --grouped-opponent-sampling for JAX grouped opponent sampling."
+        )
+
+
+def _suppress_legacy_opponent_help(parser) -> None:
+    action = parser._option_string_actions.get("--per-env-opponent-sampling")
+    if action is not None:
+        action.help = argparse.SUPPRESS
+
+
 def parse_args(argv=None):
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    _reject_legacy_opponent_flag(argv_list)
     parser = build_parser(
         "JAX trainer: reduced actor-critic + compiled rollout path."
     )
+    _suppress_legacy_opponent_help(parser)
     parser.set_defaults(**TRAIN_FROZEN_VALUES)
     parser.add_argument(
         "--kernel-batch-size",
@@ -189,7 +269,47 @@ def parse_args(argv=None):
         default="",
         help="Resume train-loop state from a saved JAX checkpoint.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--frozen-opponent-checkpoint",
+        type=str,
+        default="",
+        help="Optional local JAX checkpoint directory to use as the frozen opponent.",
+    )
+    parser.add_argument(
+        "--frozen-opponent-run-id",
+        type=str,
+        default="",
+        help="Optional MLflow run id whose latest JAX checkpoint should be used as the frozen opponent.",
+    )
+    parser.add_argument(
+        "--frozen-opponent-artifact",
+        type=str,
+        default="",
+        help="Optional MLflow artifact path/name for --frozen-opponent-run-id. Defaults to the tagged/latest JAX checkpoint.",
+    )
+    parser.add_argument(
+        "--disable-opponent-pool",
+        action="store_true",
+        help="Keep a provided frozen opponent fixed instead of resampling from saved JAX checkpoints.",
+    )
+    parser.add_argument(
+        "--grouped-opponent-sampling",
+        action="store_true",
+        help=(
+            "Sample multiple frozen opponent checkpoints per JAX rollout batch "
+            "and assign contiguous env-row groups to each opponent."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-group-count",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of sampled opponent checkpoint groups per JAX batch "
+            "when --grouped-opponent-sampling is enabled."
+        ),
+    )
+    return parser.parse_args(argv_list)
 
 
 def _values_match(actual: Any, expected: Any) -> bool:
@@ -201,14 +321,24 @@ def _values_match(actual: Any, expected: Any) -> bool:
 def validate_train_args(args) -> None:
     mismatches: list[str] = []
     for key, expected in TRAIN_FROZEN_VALUES.items():
+        if key in JAX_ALLOWED_ENV_OVERRIDE_KEYS:
+            continue
         actual = getattr(args, key)
         if not _values_match(actual, expected):
             mismatches.append(f"{key}={actual!r} expected {expected!r}")
     if mismatches:
         raise SystemExit(
-            "JAX trainer uses a frozen reduced config. Unsupported overrides: "
+            "JAX trainer uses a frozen reduced structural config. Unsupported overrides: "
             + ", ".join(mismatches)
         )
+
+
+def _jax_env_config_from_args(args) -> dict[str, Any]:
+    return {
+        key: to_builtin(getattr(args, key))
+        for key in JAX_ENV_MLFLOW_PARAM_KEYS
+        if hasattr(args, key)
+    }
 
 
 def build_trainer_config(args) -> TrainerConfig:
@@ -224,6 +354,16 @@ def build_trainer_config(args) -> TrainerConfig:
         learning_rate=float(args.learning_rate),
         policy_update_epochs=int(args.policy_update_epochs),
     )
+
+
+def _uses_grouped_opponent_sampling(args) -> bool:
+    return bool(getattr(args, "grouped_opponent_sampling", False))
+
+
+def _args_for_training_role(args, role: str):
+    role_args = copy(args)
+    role_args.training_team = str(role)
+    return role_args
 
 
 def _remaining_eval_count(*, start_update: int, num_updates: int, eval_every_updates: int) -> int:
@@ -311,6 +451,8 @@ def _validate_resume_checkpoint_payload(
     }
     if dict(payload.get("frozen_config", {})) != expected_frozen:
         raise SystemExit("Resume checkpoint frozen_config does not match the current JAX run.")
+    if "env_config" in payload and dict(payload.get("env_config", {})) != _jax_env_config_from_args(args):
+        raise SystemExit("Resume checkpoint env_config does not match the current JAX run.")
 
 
 def _save_training_checkpoint(
@@ -327,6 +469,7 @@ def _save_training_checkpoint(
     base_key,
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
+    opponent_info: dict[str, Any] | None,
 ) -> tuple[str | None, str]:
     payload = build_checkpoint_payload(
         update_index=int(update_index),
@@ -336,6 +479,7 @@ def _save_training_checkpoint(
             key: to_builtin(getattr(args, key))
             for key in TRAIN_FROZEN_VALUES
         },
+        env_config=_jax_env_config_from_args(args),
         params=params,
         opt_state=opt_state,
         current_state=current_state,
@@ -343,6 +487,7 @@ def _save_training_checkpoint(
         base_key=base_key,
         eval_trajectories=eval_trajectories,
         last_metrics=last_metrics,
+        opponent_info=opponent_info,
     )
     if checkpoint_dir is None:
         raise ValueError("checkpoint_dir must not be None when saving a persistent local checkpoint.")
@@ -371,32 +516,286 @@ def _maybe_start_mlflow_run(args, *, mode: str):
     return mlflow, context
 
 
+def _is_jax_checkpoint_artifact(path: str) -> bool:
+    name = Path(path).name
+    return (
+        name == "latest"
+        or name == "phase_a_latest"
+        or name.startswith("update_")
+        or name.startswith("phase_a_update_")
+    )
+
+
+def _checkpoint_artifact_sort_key(path: str) -> tuple[int, int, str]:
+    name = Path(path).name
+    if name == "latest" or name == "phase_a_latest":
+        return (1, 10**12, path)
+    for prefix in ("update_", "phase_a_update_"):
+        if name.startswith(prefix):
+            try:
+                return (1, int(name.removeprefix(prefix)), path)
+            except ValueError:
+                break
+    return (2, 0, path)
+
+
+def _resolve_mlflow_checkpoint_artifact(client, run_id: str, artifact_hint: str | None) -> str:
+    artifacts = client.list_artifacts(run_id, "models")
+    choices = [item.path for item in artifacts if _is_jax_checkpoint_artifact(str(item.path))]
+    if not choices:
+        raise SystemExit(f"No JAX checkpoint artifacts found under models/ for MLflow run {run_id!r}.")
+
+    hint = str(artifact_hint or "").strip()
+    if hint:
+        for choice in choices:
+            if choice == hint or choice.endswith(hint):
+                return choice
+        raise SystemExit(f"JAX checkpoint artifact {hint!r} was not found in MLflow run {run_id!r}.")
+
+    tags = dict(getattr(getattr(client.get_run(run_id), "data", None), "tags", {}) or {})
+    tagged = str(tags.get("jax_latest_checkpoint_artifact", "")).strip()
+    if tagged and tagged in choices:
+        return tagged
+
+    return sorted(choices, key=_checkpoint_artifact_sort_key)[-1]
+
+
+def _load_frozen_opponent_payload(args) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    checkpoint_path = str(getattr(args, "frozen_opponent_checkpoint", "") or "").strip()
+    run_id = str(getattr(args, "frozen_opponent_run_id", "") or "").strip()
+    artifact_hint = str(getattr(args, "frozen_opponent_artifact", "") or "").strip()
+
+    if checkpoint_path and run_id:
+        raise SystemExit("Use either --frozen-opponent-checkpoint or --frozen-opponent-run-id, not both.")
+    if artifact_hint and not run_id:
+        raise SystemExit("--frozen-opponent-artifact requires --frozen-opponent-run-id.")
+    if checkpoint_path:
+        payload = load_checkpoint(checkpoint_path)
+        return payload, {
+            "source": "checkpoint",
+            "checkpoint_path": str(Path(checkpoint_path)),
+            "update_index": int(payload.get("update_index", 0)),
+        }
+    if not run_id:
+        return None, None
+
+    import mlflow
+
+    setup_mlflow(verbose=False)
+    client = mlflow.tracking.MlflowClient()
+    artifact_path = _resolve_mlflow_checkpoint_artifact(client, run_id, artifact_hint)
+    with TemporaryDirectory(prefix="basketworld_jax_opponent_") as tmpdir:
+        local_path = client.download_artifacts(run_id, artifact_path, tmpdir)
+        payload = load_checkpoint(local_path)
+    return payload, {
+        "source": "mlflow",
+        "run_id": run_id,
+        "artifact_path": artifact_path,
+        "update_index": int(payload.get("update_index", 0)),
+    }
+
+
+def _add_opponent_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    params,
+    info: dict[str, Any],
+) -> None:
+    candidates.append(
+        {
+            "params": params,
+            "info": dict(info),
+        }
+    )
+
+
+def _sample_geometric_candidate_index(count: int, beta: float, rng: np.random.Generator) -> int:
+    if count <= 1:
+        return 0
+    beta = float(beta)
+    if beta >= 1.0:
+        return count - 1
+    beta = max(beta, 0.0)
+    weights = np.asarray(
+        [
+            (1.0 - beta) * (beta ** (count - idx))
+            for idx in range(1, count + 1)
+        ],
+        dtype=np.float64,
+    )
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        return count - 1
+    probs = weights / total
+    return int(rng.choice(np.arange(count), p=probs))
+
+
+def _sample_opponent_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    pool_size: int,
+    beta: float,
+    exploration: float,
+    rng: np.random.Generator,
+) -> dict[str, Any] | None:
+    idx = _sample_opponent_candidate_index(
+        candidates,
+        pool_size=pool_size,
+        beta=beta,
+        exploration=exploration,
+        rng=rng,
+    )
+    if idx is None:
+        return None
+    return candidates[idx]
+
+
+def _sample_opponent_candidate_index(
+    candidates: list[dict[str, Any]],
+    *,
+    pool_size: int,
+    beta: float,
+    exploration: float,
+    rng: np.random.Generator,
+) -> int | None:
+    if not candidates:
+        return None
+    recent_count = max(1, min(int(pool_size), len(candidates)))
+    recent_start = len(candidates) - recent_count
+    exploration = float(np.clip(float(exploration), 0.0, 1.0))
+    if recent_start > 0 and float(rng.random()) < exploration:
+        return int(rng.integers(0, len(candidates)))
+    chosen_idx = _sample_geometric_candidate_index(recent_count, float(beta), rng)
+    return int(recent_start + chosen_idx)
+
+
+def _select_opponent_from_pool(
+    candidates: list[dict[str, Any]],
+    *,
+    args,
+    rng: np.random.Generator,
+):
+    chosen = _sample_opponent_candidate(
+        candidates,
+        pool_size=int(getattr(args, "opponent_pool_size", 10)),
+        beta=float(getattr(args, "opponent_pool_beta", 0.7)),
+        exploration=float(getattr(args, "opponent_pool_exploration", 0.0)),
+        rng=rng,
+    )
+    if chosen is None:
+        return None, None
+    return chosen["params"], dict(chosen["info"])
+
+
+def _effective_opponent_group_count(args, *, candidate_count: int) -> int:
+    requested = max(1, int(getattr(args, "opponent_group_count", 8)))
+    batch_size = max(1, int(getattr(args, "kernel_batch_size")))
+    max_groups = max(1, min(requested, int(candidate_count), batch_size))
+    for group_count in range(max_groups, 0, -1):
+        if batch_size % group_count == 0:
+            return int(group_count)
+    return 1
+
+
+def _stack_opponent_params(params_by_group: list[Any], *, jax, jnp):
+    return jax.tree_util.tree_map(
+        lambda *leaves: jnp.stack(leaves, axis=0),
+        *params_by_group,
+    )
+
+
+def _select_grouped_opponents_from_pool(
+    candidates: list[dict[str, Any]],
+    *,
+    args,
+    rng: np.random.Generator,
+    jax,
+    jnp,
+):
+    if not candidates:
+        return None, None
+    group_count = _effective_opponent_group_count(args, candidate_count=len(candidates))
+    chosen_indices = [
+        _sample_opponent_candidate_index(
+            candidates,
+            pool_size=int(getattr(args, "opponent_pool_size", 10)),
+            beta=float(getattr(args, "opponent_pool_beta", 0.7)),
+            exploration=float(getattr(args, "opponent_pool_exploration", 0.0)),
+            rng=rng,
+        )
+        for _ in range(group_count)
+    ]
+    chosen_indices = [int(idx) for idx in chosen_indices if idx is not None]
+    if not chosen_indices:
+        return None, None
+    chosen_candidates = [candidates[idx] for idx in chosen_indices]
+    grouped_params = _stack_opponent_params(
+        [candidate["params"] for candidate in chosen_candidates],
+        jax=jax,
+        jnp=jnp,
+    )
+    groups = []
+    update_indices = []
+    for group_idx, candidate in zip(chosen_indices, chosen_candidates, strict=True):
+        info = dict(candidate["info"])
+        update_index = int(info.get("update_index", 0))
+        update_indices.append(update_index)
+        groups.append(
+            {
+                "candidate_index": int(group_idx),
+                "source": str(info.get("source", "unknown")),
+                "candidate_kind": str(info.get("candidate_kind", "unknown")),
+                "update_index": update_index,
+            }
+        )
+    return grouped_params, {
+        "source": "grouped_pool",
+        "group_count": int(len(chosen_candidates)),
+        "batch_group_size": int(int(getattr(args, "kernel_batch_size")) // len(chosen_candidates)),
+        "candidate_count": int(len(candidates)),
+        "unique_update_count": int(len(set(update_indices))),
+        "latest_update_index": int(max(update_indices)) if update_indices else 0,
+        "groups": groups,
+    }
+
+
 def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorCriticSpec) -> None:
     params = {
-            "jax_phase_a/script": "basketworld_jax/train/main.py",
-        "jax_phase_a/mode": "train_loop" if bool(args.run_train_loop) else "scaffold",
-        "jax_phase_a/kernel_batch_size": int(args.kernel_batch_size),
-        "jax_phase_a/rollout_horizon": int(args.rollout_horizon),
-        "jax_phase_a/num_updates": int(args.num_updates),
-        "jax_phase_a/policy_update_epochs": int(args.policy_update_epochs),
-        "jax_phase_a/log_every_updates": int(args.log_every_updates),
-        "jax_phase_a/eval_every_updates": int(args.eval_every_updates),
-        "jax_phase_a/eval_horizon": int(args.eval_horizon),
-        "jax_phase_a/learning_rate": float(trainer_config.learning_rate),
-        "jax_phase_a/gamma": float(trainer_config.gamma),
-        "jax_phase_a/gae_lambda": float(trainer_config.gae_lambda),
-        "jax_phase_a/ppo_clip_range": float(trainer_config.ppo_clip_range),
-        "jax_phase_a/value_coef": float(trainer_config.value_coef),
-        "jax_phase_a/entropy_coef": float(trainer_config.entropy_coef),
-        "jax_phase_a/policy_hidden_dims": ",".join(str(v) for v in spec.hidden_dims),
-        "jax_phase_a/flat_obs_dim": int(spec.flat_obs_dim),
-        "jax_phase_a/training_player_count": int(spec.training_player_count),
-        "jax_phase_a/action_dim_per_player": int(spec.action_dim_per_player),
-        "jax_phase_a/pass_mode": str(getattr(args, "pass_mode")),
-        "jax_phase_a/use_set_obs": bool(getattr(args, "use_set_obs")),
-        "jax_phase_a/training_team": str(getattr(args, "training_team")),
-        "jax_phase_a/checkpoint_every_updates": int(args.checkpoint_every_updates),
+        "jax/script": "basketworld_jax/train/main.py",
+        "jax/mode": "train_loop" if bool(args.run_train_loop) else "scaffold",
+        "jax/kernel_batch_size": int(args.kernel_batch_size),
+        "jax/rollout_horizon": int(args.rollout_horizon),
+        "jax/num_updates": int(args.num_updates),
+        "jax/policy_update_epochs": int(args.policy_update_epochs),
+        "jax/log_every_updates": int(args.log_every_updates),
+        "jax/eval_every_updates": int(args.eval_every_updates),
+        "jax/eval_horizon": int(args.eval_horizon),
+        "jax/learning_rate": float(trainer_config.learning_rate),
+        "jax/gamma": float(trainer_config.gamma),
+        "jax/gae_lambda": float(trainer_config.gae_lambda),
+        "jax/ppo_clip_range": float(trainer_config.ppo_clip_range),
+        "jax/value_coef": float(trainer_config.value_coef),
+        "jax/entropy_coef": float(trainer_config.entropy_coef),
+        "jax/policy_hidden_dims": ",".join(str(v) for v in spec.hidden_dims),
+        "jax/flat_obs_dim": int(spec.flat_obs_dim),
+        "jax/training_player_count": int(spec.training_player_count),
+        "jax/action_dim_per_player": int(spec.action_dim_per_player),
+        "jax/pass_mode": str(getattr(args, "pass_mode")),
+        "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
+        "jax/training_team": str(getattr(args, "training_team")),
+        "jax/checkpoint_every_updates": int(args.checkpoint_every_updates),
+        "jax/frozen_opponent_checkpoint": str(getattr(args, "frozen_opponent_checkpoint", "") or ""),
+        "jax/frozen_opponent_run_id": str(getattr(args, "frozen_opponent_run_id", "") or ""),
+        "jax/frozen_opponent_artifact": str(getattr(args, "frozen_opponent_artifact", "") or ""),
+        "jax/opponent_pool_enabled": not bool(getattr(args, "disable_opponent_pool", False)),
+        "jax/opponent_pool_size": int(getattr(args, "opponent_pool_size", 10)),
+        "jax/opponent_pool_beta": float(getattr(args, "opponent_pool_beta", 0.7)),
+        "jax/opponent_pool_exploration": float(getattr(args, "opponent_pool_exploration", 0.0)),
+        "jax/grouped_opponent_sampling": _uses_grouped_opponent_sampling(args),
+        "jax/opponent_group_count": int(getattr(args, "opponent_group_count", 8)),
     }
+    for key, value in _jax_env_config_from_args(args).items():
+        params[f"jax/env/{key}"] = value
     mlflow.log_params(params)
 
 
@@ -415,10 +814,10 @@ def _log_mlflow_checkpoint_artifacts(
     checkpoint_dir = Path(numbered_checkpoint_path)
     artifact_path = f"models/{checkpoint_dir.name}"
     mlflow.log_artifacts(str(checkpoint_dir), artifact_path=artifact_path)
-    mlflow.set_tag("model_backend", "jax_phase_a")
-    mlflow.set_tag("jax_phase_a_checkpoint_format", "orbax_phase_a_v2")
-    mlflow.set_tag("jax_phase_a_latest_checkpoint_artifact", artifact_path)
-    mlflow.set_tag("jax_phase_a_latest_checkpoint_update", str(int(update_index)))
+    mlflow.set_tag("model_backend", "jax")
+    mlflow.set_tag("jax_checkpoint_format", "orbax_v2")
+    mlflow.set_tag("jax_latest_checkpoint_artifact", artifact_path)
+    mlflow.set_tag("jax_latest_checkpoint_update", str(int(update_index)))
     return artifact_path
 
 
@@ -435,6 +834,70 @@ def _format_summary_value(value: Any) -> str:
             return f"{float(value):.4f}"
         return f"{float(value):.6f}"
     return str(value)
+
+
+def _safe_metric_ratio(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if float(denominator) > 0.0 else 0.0
+
+
+def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
+    rewards = np.asarray(rollout.trajectory.rewards, dtype=np.float32)
+    dones = np.asarray(rollout.trajectory.dones, dtype=np.float32)
+    terminal_steps = np.asarray(rollout.trajectory.terminal_episode_steps, dtype=np.int32)
+    offense_score_delta = np.asarray(rollout.trajectory.offense_score_delta, dtype=np.float32)
+    defense_score_delta = np.asarray(rollout.trajectory.defense_score_delta, dtype=np.float32)
+
+    completed_episodes = int((terminal_steps > 0).sum())
+    learner_reward_total = float(rewards.sum())
+    learner_reward_mean = float(rewards.mean())
+    opponent_reward_total = -learner_reward_total
+    opponent_reward_mean = -learner_reward_mean
+    offense_points_total = float(offense_score_delta.sum())
+    defense_points_total = float(defense_score_delta.sum())
+    if role == "offense":
+        learner_points_total = offense_points_total
+        opponent_points_total = defense_points_total
+    else:
+        learner_points_total = defense_points_total
+        opponent_points_total = offense_points_total
+
+    return {
+        f"{role}_mean_reward": learner_reward_mean,
+        f"{role}_learner_mean_reward": learner_reward_mean,
+        f"{role}_opponent_mean_reward": opponent_reward_mean,
+        f"{role}_learner_reward_total": learner_reward_total,
+        f"{role}_opponent_reward_total": opponent_reward_total,
+        f"{role}_learner_reward_per_completed_episode": _safe_metric_ratio(
+            learner_reward_total,
+            completed_episodes,
+        ),
+        f"{role}_opponent_reward_per_completed_episode": _safe_metric_ratio(
+            opponent_reward_total,
+            completed_episodes,
+        ),
+        f"{role}_done_rate": float(dones.mean()),
+        f"{role}_completed_episodes": int(completed_episodes),
+        f"{role}_offense_points_total": offense_points_total,
+        f"{role}_defense_points_total": defense_points_total,
+        f"{role}_offense_points_per_completed_episode": _safe_metric_ratio(
+            offense_points_total,
+            completed_episodes,
+        ),
+        f"{role}_defense_points_per_completed_episode": _safe_metric_ratio(
+            defense_points_total,
+            completed_episodes,
+        ),
+        f"{role}_learner_points_total": learner_points_total,
+        f"{role}_opponent_points_total": opponent_points_total,
+        f"{role}_learner_points_per_completed_episode": _safe_metric_ratio(
+            learner_points_total,
+            completed_episodes,
+        ),
+        f"{role}_opponent_points_per_completed_episode": _safe_metric_ratio(
+            opponent_points_total,
+            completed_episodes,
+        ),
+    }
 
 
 def _print_checkpoint_summary(
@@ -458,14 +921,26 @@ def _print_checkpoint_summary(
         ("mean_turnovers_per_completed_episode", metrics.get("mean_turnovers_per_completed_episode")),
         ("approx_kl", metrics.get("approx_kl")),
         ("clip_fraction", metrics.get("clip_fraction")),
+        ("mean_abs_log_ratio", metrics.get("mean_abs_log_ratio")),
+        ("max_abs_log_ratio", metrics.get("max_abs_log_ratio")),
         ("entropy_bonus", metrics.get("entropy_bonus")),
         ("policy_loss", metrics.get("policy_loss")),
         ("value_loss", metrics.get("value_loss")),
         ("total_loss", metrics.get("total_loss")),
         ("grad_norm", metrics.get("grad_norm")),
         ("mean_reward", metrics.get("mean_reward")),
+        ("offense_learner_mean_reward", metrics.get("offense_learner_mean_reward")),
+        ("defense_learner_mean_reward", metrics.get("defense_learner_mean_reward")),
+        ("offense_opponent_mean_reward", metrics.get("offense_opponent_mean_reward")),
+        ("defense_opponent_mean_reward", metrics.get("defense_opponent_mean_reward")),
+        ("offense_learner_points_per_completed_episode", metrics.get("offense_learner_points_per_completed_episode")),
+        ("defense_opponent_points_per_completed_episode", metrics.get("defense_opponent_points_per_completed_episode")),
         ("mean_return", metrics.get("mean_return")),
         ("done_rate", metrics.get("done_rate")),
+        ("opponent_update_index", metrics.get("opponent_update_index")),
+        ("opponent_source", metrics.get("opponent_source")),
+        ("opponent_group_count", metrics.get("opponent_group_count")),
+        ("opponent_unique_update_count", metrics.get("opponent_unique_update_count")),
         ("checkpoint_path", latest_checkpoint_path),
         ("checkpoint_artifact", latest_checkpoint_artifact_path),
     ]
@@ -480,18 +955,35 @@ def _print_checkpoint_summary(
 def run_training_loop(args) -> dict[str, Any]:
     validate_train_args(args)
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
-    static, _ = sample_state_batch(args, xp=jnp)
+    role_args = {
+        role: _args_for_training_role(args, role)
+        for role in TRAINING_ROLES
+    }
+    statics = {
+        role: sample_state_batch(role_args[role], xp=jnp)[0]
+        for role in TRAINING_ROLES
+    }
+    static = statics["offense"]
     base_key = jax.random.PRNGKey(int(args.policy_seed))
     reset_seed_key, eval_reset_seed_key, base_key = jax.random.split(base_key, 3)
-    initial_reset_keys = jax.random.split(reset_seed_key, int(args.kernel_batch_size))
-    current_state = reset_batch_minimal(static, initial_reset_keys, jax, jnp)
-    eval_reset_keys = jax.random.split(eval_reset_seed_key, int(args.kernel_batch_size))
-    eval_initial_state = reset_batch_minimal(static, eval_reset_keys, jax, jnp)
+    role_reset_keys = jax.random.split(reset_seed_key, len(TRAINING_ROLES))
+    role_eval_reset_keys = jax.random.split(eval_reset_seed_key, len(TRAINING_ROLES))
+    current_states = {}
+    eval_initial_states = {}
+    for role, reset_key, eval_key in zip(TRAINING_ROLES, role_reset_keys, role_eval_reset_keys, strict=True):
+        initial_reset_keys = jax.random.split(reset_key, int(args.kernel_batch_size))
+        current_states[role] = reset_batch_minimal(statics[role], initial_reset_keys, jax, jnp)
+        eval_reset_keys = jax.random.split(eval_key, int(args.kernel_batch_size))
+        eval_initial_states[role] = reset_batch_minimal(statics[role], eval_reset_keys, jax, jnp)
 
-    training_player_ids = training_player_ids_from_static(static)
+    training_player_ids_by_role = {
+        role: training_player_ids_from_static(statics[role])
+        for role in TRAINING_ROLES
+    }
+    training_player_ids = training_player_ids_by_role["offense"]
     training_player_ids_jnp = jnp.asarray(training_player_ids, dtype=jnp.int32)
-    flat_obs = build_flat_observation_batch(static, current_state, jnp)
-    action_masks = build_action_masks_batch(static, current_state, jnp)[:, training_player_ids_jnp, :]
+    flat_obs = build_flat_observation_batch(static, current_states["offense"], jnp)
+    action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
     action_masks_np = np.asarray(jax.device_get(action_masks), dtype=np.int8)
     spec = build_actor_critic_spec(
@@ -502,11 +994,48 @@ def run_training_loop(args) -> dict[str, Any]:
     trainer_config = build_trainer_config(args)
     rollout_runner = build_compiled_rollout_runner(jax, jnp, spec)
     eval_runner = build_compiled_eval_runner(jax, jnp, spec)
+    frozen_rollout_runner = build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec)
+    frozen_eval_runner = build_compiled_frozen_opponent_eval_runner(jax, jnp, spec)
+    grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec)
+    grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
     update_runner, optimizer_transform = build_jitted_ppo_update_runner(jax, jnp, spec, trainer_config)
     checkpoint_dir = str(args.checkpoint_dir).strip()
     resume_checkpoint = str(args.resume_checkpoint).strip()
     latest_checkpoint_path: str | None = None
     latest_checkpoint_artifact_path: str | None = None
+    frozen_opponent_payload, frozen_opponent_info = _load_frozen_opponent_payload(args)
+    opponent_params = None
+    grouped_opponent_params = None
+    active_opponent_info = None
+    opponent_candidates: list[dict[str, Any]] = []
+    opponent_rng = np.random.default_rng(int(args.policy_seed) + 90_001)
+    opponent_pool_enabled = not bool(getattr(args, "disable_opponent_pool", False))
+    grouped_opponent_sampling_enabled = (
+        opponent_pool_enabled
+        and _uses_grouped_opponent_sampling(args)
+    )
+    if frozen_opponent_payload is not None:
+        if dict(frozen_opponent_payload.get("policy_spec", {})) != asdict(spec):
+            raise SystemExit("Frozen opponent policy_spec does not match the current JAX trainer policy_spec.")
+        opponent_params = jax.device_put(frozen_opponent_payload["params"])
+        active_opponent_info = dict(frozen_opponent_info or {})
+        _add_opponent_candidate(
+            opponent_candidates,
+            params=opponent_params,
+            info={
+                **active_opponent_info,
+                "candidate_kind": "bootstrap",
+            },
+        )
+        if grouped_opponent_sampling_enabled:
+            grouped_opponent_params, active_opponent_info = _select_grouped_opponents_from_pool(
+                opponent_candidates,
+                args=args,
+                rng=opponent_rng,
+                jax=jax,
+                jnp=jnp,
+            )
+            opponent_params = None
 
     initial_params = init_actor_critic_params(
         jax,
@@ -533,12 +1062,22 @@ def run_training_loop(args) -> dict[str, Any]:
         opt_state = jax.device_put(
             _restore_like_template(checkpoint_payload["opt_state"], initial_opt_state)
         )
-        current_state = jax.device_put(
-            _restore_like_template(checkpoint_payload["current_state"], current_state)
-        )
-        eval_initial_state = jax.device_put(
-            _restore_like_template(checkpoint_payload["eval_initial_state"], eval_initial_state)
-        )
+        restored_current_state = checkpoint_payload["current_state"]
+        restored_eval_initial_state = checkpoint_payload["eval_initial_state"]
+        if not isinstance(restored_current_state, dict) or not isinstance(restored_eval_initial_state, dict):
+            raise SystemExit("Resume checkpoint does not contain mixed-role JAX train state.")
+        current_states = {
+            role: jax.device_put(
+                _restore_like_template(restored_current_state[role], current_states[role])
+            )
+            for role in TRAINING_ROLES
+        }
+        eval_initial_states = {
+            role: jax.device_put(
+                _restore_like_template(restored_eval_initial_state[role], eval_initial_states[role])
+            )
+            for role in TRAINING_ROLES
+        }
         base_key = jax.device_put(checkpoint_payload["base_key"])
         train_history = []
         eval_trajectories = list(checkpoint_payload.get("eval_trajectories", []))
@@ -570,24 +1109,57 @@ def run_training_loop(args) -> dict[str, Any]:
         )
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
-            base_key, rollout_key = jax.random.split(base_key)
+            base_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 1)
             rollout_start_ns = perf_counter_ns()
-            rollout_out = rollout_runner(
-                static,
-                current_state,
-                params,
-                rollout_key,
-                int(args.rollout_horizon),
-            )
-            block_until_ready_tree(rollout_out)
+            role_rollouts = {}
+            for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
+                if grouped_opponent_params is not None:
+                    role_rollouts[role] = grouped_rollout_runner(
+                        statics[role],
+                        current_states[role],
+                        params,
+                        grouped_opponent_params,
+                        rollout_key,
+                        int(args.rollout_horizon),
+                        int(active_opponent_info["group_count"]),
+                    )
+                elif opponent_params is None:
+                    role_rollouts[role] = rollout_runner(
+                        statics[role],
+                        current_states[role],
+                        params,
+                        rollout_key,
+                        int(args.rollout_horizon),
+                    )
+                else:
+                    role_rollouts[role] = frozen_rollout_runner(
+                        statics[role],
+                        current_states[role],
+                        params,
+                        opponent_params,
+                        rollout_key,
+                        int(args.rollout_horizon),
+                    )
+            block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
 
-            ppo_batch = build_ppo_batch(rollout_out, trainer_config, jax, jnp)
+            role_ppo_batches = [
+                build_ppo_batch(role_rollouts[role], trainer_config, jax, jnp)
+                for role in TRAINING_ROLES
+            ]
+            ppo_batch = concatenate_ppo_batches(role_ppo_batches, jnp)
+            rollout_out = concatenate_rollout_outputs(
+                [role_rollouts[role] for role in TRAINING_ROLES],
+                jnp,
+            )
             update_start_ns = perf_counter_ns()
             params, opt_state, update_metrics = update_runner(params, opt_state, ppo_batch)
             block_until_ready_tree((params, opt_state, update_metrics))
             update_elapsed_ns = perf_counter_ns() - update_start_ns
-            current_state = rollout_out.final_state
+            current_states = {
+                role: role_rollouts[role].final_state
+                for role in TRAINING_ROLES
+            }
 
             last_metrics = summarize_training_step(
                 rollout_out,
@@ -598,10 +1170,29 @@ def run_training_loop(args) -> dict[str, Any]:
                 },
                 rollout_elapsed_ns,
                 update_elapsed_ns,
-                batch_size=int(args.kernel_batch_size),
+                batch_size=int(args.kernel_batch_size) * len(TRAINING_ROLES),
                 horizon=int(args.rollout_horizon),
                 update_index=update_idx,
             )
+            for role in TRAINING_ROLES:
+                last_metrics.update(_summarize_role_rollout_metrics(role, role_rollouts[role]))
+            if active_opponent_info is not None:
+                last_metrics["opponent_update_index"] = int(
+                    active_opponent_info.get(
+                        "latest_update_index",
+                        active_opponent_info.get("update_index", 0),
+                    )
+                )
+                last_metrics["opponent_source"] = str(active_opponent_info.get("source", "unknown"))
+                last_metrics["opponent_group_count"] = int(active_opponent_info.get("group_count", 1))
+                last_metrics["opponent_unique_update_count"] = int(
+                    active_opponent_info.get("unique_update_count", 1)
+                )
+            else:
+                last_metrics["opponent_update_index"] = -1
+                last_metrics["opponent_source"] = "legal_random"
+                last_metrics["opponent_group_count"] = 0
+                last_metrics["opponent_unique_update_count"] = 0
 
             should_log_history = (
                 update_idx == 1
@@ -615,7 +1206,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         mlflow,
                         last_metrics,
                         step=update_idx,
-                        prefix="jax_phase_a/train",
+                        prefix="jax/train",
                     )
 
             progress.update(1)
@@ -633,50 +1224,79 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             if should_eval:
                 eval_key = jax.random.PRNGKey(int(args.policy_seed) + 1_000_000 + update_idx)
-                final_eval_state, eval_trace = eval_runner(
-                    static,
-                    eval_initial_state,
-                    params,
-                    eval_key,
-                    int(args.eval_horizon),
-                )
-                block_until_ready_tree((final_eval_state, eval_trace))
+                role_eval_keys = jax.random.split(eval_key, len(TRAINING_ROLES))
+                eval_outputs = {}
+                for role, role_eval_key in zip(TRAINING_ROLES, role_eval_keys, strict=True):
+                    if grouped_opponent_params is not None:
+                        eval_outputs[role] = grouped_eval_runner(
+                            statics[role],
+                            eval_initial_states[role],
+                            params,
+                            grouped_opponent_params,
+                            role_eval_key,
+                            int(args.eval_horizon),
+                            int(active_opponent_info["group_count"]),
+                        )
+                    elif opponent_params is None:
+                        eval_outputs[role] = eval_runner(
+                            statics[role],
+                            eval_initial_states[role],
+                            params,
+                            role_eval_key,
+                            int(args.eval_horizon),
+                        )
+                    else:
+                        eval_outputs[role] = frozen_eval_runner(
+                            statics[role],
+                            eval_initial_states[role],
+                            params,
+                            opponent_params,
+                            role_eval_key,
+                            int(args.eval_horizon),
+                        )
+                block_until_ready_tree(eval_outputs)
                 if len(eval_trajectories) < int(args.max_eval_dumps):
                     env_index = min(max(0, int(args.eval_trajectory_env_index)), int(args.kernel_batch_size) - 1)
-                    eval_trajectories.append(
-                        serialize_eval_trace(
+                    for role in TRAINING_ROLES:
+                        if len(eval_trajectories) >= int(args.max_eval_dumps):
+                            break
+                        final_eval_state, eval_trace = eval_outputs[role]
+                        serialized = serialize_eval_trace(
                             eval_trace,
                             final_eval_state,
                             env_index=env_index,
                             update_index=update_idx,
                         )
-                    )
+                        serialized["training_role"] = role
+                        eval_trajectories.append(serialized)
                 if mlflow is not None:
-                    eval_episode_metrics = summarize_episode_events(
-                        eval_trace.dones,
-                        eval_trace.terminal_episode_steps,
-                        eval_trace.pass_attempts,
-                        eval_trace.completed_passes,
-                        eval_trace.assists,
-                        eval_trace.turnovers,
-                    )
-                    eval_metrics = {
-                        "update_index": update_idx,
-                        "mean_final_offense_score": float(np.asarray(final_eval_state.offense_score).mean()),
-                        "mean_final_defense_score": float(np.asarray(final_eval_state.defense_score).mean()),
-                        "mean_final_score_margin": float(
-                            np.asarray(final_eval_state.offense_score - final_eval_state.defense_score).mean()
-                        ),
-                        "mean_done_rate": float(np.asarray(eval_trace.dones).mean()),
-                        "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
-                    }
-                    eval_metrics.update(eval_episode_metrics)
-                    _log_mlflow_metrics(
-                        mlflow,
-                        eval_metrics,
-                        step=update_idx,
-                        prefix="jax_phase_a/eval",
-                    )
+                    for role in TRAINING_ROLES:
+                        final_eval_state, eval_trace = eval_outputs[role]
+                        eval_episode_metrics = summarize_episode_events(
+                            eval_trace.dones,
+                            eval_trace.terminal_episode_steps,
+                            eval_trace.pass_attempts,
+                            eval_trace.completed_passes,
+                            eval_trace.assists,
+                            eval_trace.turnovers,
+                        )
+                        eval_metrics = {
+                            "update_index": update_idx,
+                            "mean_final_offense_score": float(np.asarray(final_eval_state.offense_score).mean()),
+                            "mean_final_defense_score": float(np.asarray(final_eval_state.defense_score).mean()),
+                            "mean_final_score_margin": float(
+                                np.asarray(final_eval_state.offense_score - final_eval_state.defense_score).mean()
+                            ),
+                            "mean_done_rate": float(np.asarray(eval_trace.dones).mean()),
+                            "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
+                        }
+                        eval_metrics.update(eval_episode_metrics)
+                        _log_mlflow_metrics(
+                            mlflow,
+                            eval_metrics,
+                            step=update_idx,
+                            prefix=f"jax/eval_{role}",
+                        )
                 progress.update(1)
                 progress.set_postfix_str(f"eval:{update_idx}", refresh=False)
 
@@ -689,6 +1309,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
             )
             if should_checkpoint:
+                saved_candidate_info = None
                 if checkpoint_dir:
                     latest_checkpoint_path, numbered_checkpoint_path = _save_training_checkpoint(
                         checkpoint_dir=checkpoint_dir,
@@ -698,17 +1319,30 @@ def run_training_loop(args) -> dict[str, Any]:
                         args=args,
                         params=params,
                         opt_state=opt_state,
-                        current_state=current_state,
-                        eval_initial_state=eval_initial_state,
+                        current_state=current_states,
+                        eval_initial_state=eval_initial_states,
                         base_key=base_key,
                         eval_trajectories=eval_trajectories,
                         last_metrics=last_metrics,
+                        opponent_info=active_opponent_info,
                     )
+                    saved_candidate_info = {
+                        "source": "local_checkpoint",
+                        "checkpoint_path": str(numbered_checkpoint_path),
+                        "latest_checkpoint_path": str(latest_checkpoint_path),
+                        "update_index": int(update_idx),
+                    }
                     if mlflow is not None:
                         latest_checkpoint_artifact_path = _log_mlflow_checkpoint_artifacts(
                             mlflow,
                             numbered_checkpoint_path=numbered_checkpoint_path,
                             update_index=update_idx,
+                        )
+                        saved_candidate_info.update(
+                            {
+                                "source": "mlflow",
+                                "artifact_path": latest_checkpoint_artifact_path,
+                            }
                         )
                 elif mlflow is not None:
                     with TemporaryDirectory(prefix="basketworld_jax_ckpt_") as staging_dir:
@@ -720,18 +1354,49 @@ def run_training_loop(args) -> dict[str, Any]:
                             args=args,
                             params=params,
                             opt_state=opt_state,
-                            current_state=current_state,
-                            eval_initial_state=eval_initial_state,
+                            current_state=current_states,
+                            eval_initial_state=eval_initial_states,
                             base_key=base_key,
                             eval_trajectories=eval_trajectories,
                             last_metrics=last_metrics,
+                            opponent_info=active_opponent_info,
                         )
                         latest_checkpoint_artifact_path = _log_mlflow_checkpoint_artifacts(
                             mlflow,
                             numbered_checkpoint_path=numbered_checkpoint_path,
                             update_index=update_idx,
                         )
+                        saved_candidate_info = {
+                            "source": "mlflow",
+                            "artifact_path": latest_checkpoint_artifact_path,
+                            "update_index": int(update_idx),
+                        }
                     latest_checkpoint_path = None
+                if opponent_pool_enabled and saved_candidate_info is not None:
+                    _add_opponent_candidate(
+                        opponent_candidates,
+                        params=params,
+                        info={
+                            **saved_candidate_info,
+                            "candidate_kind": "self_checkpoint",
+                        },
+                    )
+                    if grouped_opponent_sampling_enabled:
+                        grouped_opponent_params, active_opponent_info = _select_grouped_opponents_from_pool(
+                            opponent_candidates,
+                            args=args,
+                            rng=opponent_rng,
+                            jax=jax,
+                            jnp=jnp,
+                        )
+                        opponent_params = None
+                    else:
+                        opponent_params, active_opponent_info = _select_opponent_from_pool(
+                            opponent_candidates,
+                            args=args,
+                            rng=opponent_rng,
+                        )
+                        grouped_opponent_params = None
                 _print_checkpoint_summary(
                     update_index=update_idx,
                     last_metrics=last_metrics,
@@ -750,22 +1415,21 @@ def run_training_loop(args) -> dict[str, Any]:
                 key: to_builtin(getattr(args, key))
                 for key in TRAIN_FROZEN_VALUES
             },
+            "env_config": _jax_env_config_from_args(args),
             "policy_spec": asdict(spec),
-            "training_player_ids": [int(v) for v in training_player_ids.tolist()],
+            "training_player_ids": {
+                role: [int(v) for v in ids.tolist()]
+                for role, ids in training_player_ids_by_role.items()
+            },
             "train_history": train_history,
             "eval_trajectories": eval_trajectories,
             "final_metrics": last_metrics,
             "latest_checkpoint_path": latest_checkpoint_path,
             "latest_checkpoint_artifact_path": latest_checkpoint_artifact_path,
+            "active_opponent": active_opponent_info,
+            "opponent_pool_size": len(opponent_candidates),
             "next_step": "run a longer learnability check and inspect eval trajectories for behavior changes",
         }
-        if mlflow is not None and last_metrics is not None:
-            _log_mlflow_metrics(
-                mlflow,
-                last_metrics,
-                step=int(args.num_updates),
-                prefix="jax_phase_a/final",
-            )
         return result
 
 
@@ -884,6 +1548,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
             key: to_builtin(getattr(args, key))
             for key in TRAIN_FROZEN_VALUES
         },
+        "env_config": _jax_env_config_from_args(args),
         "policy_spec": asdict(spec),
         "steps_per_update": int(args.kernel_batch_size) * int(args.rollout_horizon),
         "actor_critic_forward_states_per_sec": float(total_states / total_seconds),
@@ -923,6 +1588,12 @@ def run_train_scaffold(args) -> dict[str, Any]:
                 "trajectory_turnovers_shape": list(np.asarray(rollout_out.trajectory.turnovers).shape),
                 "trajectory_terminal_episode_steps_shape": list(
                     np.asarray(rollout_out.trajectory.terminal_episode_steps).shape
+                ),
+                "trajectory_offense_score_delta_shape": list(
+                    np.asarray(rollout_out.trajectory.offense_score_delta).shape
+                ),
+                "trajectory_defense_score_delta_shape": list(
+                    np.asarray(rollout_out.trajectory.defense_score_delta).shape
                 ),
                 "bootstrap_values_shape": list(np.asarray(rollout_out.bootstrap_values).shape),
                 "ppo_batch_flat_obs_shape": list(np.asarray(ppo_batch.flat_obs).shape),
