@@ -72,6 +72,7 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
         user_team_name="OFFENSE",
         role_flag_offense=1.0,
         role_flag_defense=-1.0,
+        eval_seed=123,
     )
 
     assert len(result["results"]) == 3
@@ -97,6 +98,7 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
         assert key in player_zero
 
     diagnostics = result["eval_diagnostics"]
+    assert diagnostics["jax_native_summary"]["eval_seed"] == 123
     for key in (
         "action_mix",
         "reward_breakdown",

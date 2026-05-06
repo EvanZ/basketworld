@@ -1792,6 +1792,45 @@ def _sample_unique_indices_from_mask(mask, count: int, key, jax, jnp):
     return indices.astype(jnp.int32)
 
 
+def _defender_spawn_candidate_mask(static: KernelStatic, offense_cell_idx, taken_mask, jnp):
+    offense_dist = static.basket_distance_by_cell[offense_cell_idx].astype(jnp.float32)
+    dist_to_offense = static.cell_distance_matrix[:, offense_cell_idx].astype(jnp.float32)
+    non_basket_available = static.non_basket_cell_mask.astype(jnp.bool_) & (~taken_mask)
+    within_max = jnp.where(
+        static.max_spawn_distance_enabled.astype(jnp.bool_),
+        static.basket_distance_by_cell.astype(jnp.float32) <= static.max_spawn_distance,
+        jnp.ones_like(static.basket_distance_by_cell, dtype=jnp.bool_),
+    )
+    strict_mask = (
+        non_basket_available
+        & within_max
+        & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
+        & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+        & (jnp.abs(dist_to_offense - static.defender_spawn_distance) <= 1.0)
+    )
+    closer_mask = (
+        non_basket_available
+        & within_max
+        & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
+        & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+    )
+    ranged_mask = (
+        non_basket_available
+        & within_max
+        & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
+    )
+    fallback_mask = non_basket_available
+    return jnp.where(
+        jnp.sum(strict_mask.astype(jnp.int32)) >= 2,
+        strict_mask,
+        jnp.where(
+            jnp.any(closer_mask),
+            closer_mask,
+            jnp.where(jnp.any(ranged_mask), ranged_mask, fallback_mask),
+        ),
+    )
+
+
 def _sample_clamped_probabilities(mean, std, shape, key, jax, jnp):
     std_scalar = jnp.asarray(std, dtype=jnp.float32)
     mean_scalar = jnp.asarray(mean, dtype=jnp.float32)
@@ -1825,41 +1864,12 @@ def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
     for idx in range(offense_count):
         offense_slot = offense_match_order[idx]
         offense_cell_idx = offense_cell_indices[offense_slot]
-        offense_dist = static.basket_distance_by_cell[offense_cell_idx].astype(jnp.float32)
         dist_to_offense = static.cell_distance_matrix[:, offense_cell_idx].astype(jnp.float32)
-        non_basket_available = static.non_basket_cell_mask.astype(jnp.bool_) & (~taken_mask)
-        within_max = jnp.where(
-            static.max_spawn_distance_enabled.astype(jnp.bool_),
-            static.basket_distance_by_cell.astype(jnp.float32) <= static.max_spawn_distance,
-            jnp.ones_like(static.basket_distance_by_cell, dtype=jnp.bool_),
-        )
-        strict_mask = (
-            non_basket_available
-            & within_max
-            & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
-            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
-            & (jnp.abs(dist_to_offense - static.defender_spawn_distance) <= 1.0)
-        )
-        closer_mask = (
-            non_basket_available
-            & within_max
-            & (static.basket_distance_by_cell.astype(jnp.float32) < offense_dist)
-            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
-        )
-        ranged_mask = (
-            non_basket_available
-            & within_max
-            & (static.basket_distance_by_cell.astype(jnp.float32) >= static.defense_min_spawn_distance)
-        )
-        fallback_mask = non_basket_available
-        candidate_mask = jnp.where(
-            jnp.any(strict_mask),
-            strict_mask,
-            jnp.where(
-                jnp.any(closer_mask),
-                closer_mask,
-                jnp.where(jnp.any(ranged_mask), ranged_mask, fallback_mask),
-            ),
+        candidate_mask = _defender_spawn_candidate_mask(
+            static,
+            offense_cell_idx,
+            taken_mask,
+            jnp,
         )
         masked_distance = jnp.where(candidate_mask, dist_to_offense, jnp.full((cell_count,), jnp.inf, dtype=jnp.float32))
         min_distance = jnp.min(masked_distance)

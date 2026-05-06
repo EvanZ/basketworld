@@ -447,6 +447,129 @@ Exit criteria:
 - no dependency on current Torch/SB3 rollout plumbing
 - self-play training works end to end in the JAX path
 
+## Intent / Learnable Plays Parity
+
+Purpose:
+
+- restore the production learnable-play architecture without reintroducing ordinal intent features into the low-level policy input
+- keep intent/play identity nominal, policy-side, and compatible with compiled JAX rollout/update paths
+
+Design stance:
+
+- do not add `intent_index_norm` as a normal global feature
+- keep intent/runtime state in JAX environment state and run metadata
+- condition the low-level attention policy through learned embeddings, matching the current production direction
+- implement the selector only after the low-level policy can demonstrably respond to different play IDs
+
+Milestone 1: low-level JAX intent runtime state
+
+- add offense intent fields to `KernelState`:
+  - `intent_index`
+  - `intent_active`
+  - `intent_age`
+  - `intent_commitment_remaining`
+- add matching defense intent fields if we keep offense/defense parity from the start
+- add static config fields for:
+  - `num_intents`
+  - `intent_commitment_steps`
+  - `intent_null_prob`
+  - `defense_intent_null_prob`
+  - `intent_visible_to_defense_prob`
+  - intent enable flags
+- sample intent state during JAX reset
+- advance/expire intent state during JAX step
+- expose intent state in training/eval metrics and checkpoint metadata
+
+Exit criteria:
+
+- JAX reset/step carries active intent state deterministically under a fixed PRNG seed
+- raw `shot_clock`, scoring, rollout, and action semantics remain unchanged
+- native eval can report active intent usage and episode-level play IDs
+
+Milestone 2: low-level attention policy embedding conditioning
+
+- add intent embedding config to `ActorCriticSpec`:
+  - `intent_embedding_enabled`
+  - `intent_embedding_dim`
+  - `num_intents`
+- add offense and defense intent embedding tables in the Flax attention model
+- project the selected role-specific embedding into token embedding space
+- add the gated intent delta to each player token before self-attention:
+  - `token_i = token_mlp(player_i, globals) + gate * W_role * e_z`
+- pass intent context into the actor-critic forward path without treating `z` as an ordered scalar feature
+
+Exit criteria:
+
+- same state with different active `intent_index` can produce different logits
+- inactive intent gate produces the same logits as no intent conditioning
+- checkpoint metadata fully records intent conditioning config
+- the Attention tab can show current intent state for debugging
+
+Milestone 3: manual / sampled play conditioning smoke tests
+
+- train with uniformly sampled active intents
+- run native eval grouped by `intent_index`
+- log per-intent behavior summaries:
+  - usage count
+  - points per completed episode
+  - pass attempts
+  - assists
+  - turnovers
+  - shot profile
+- verify that conditioning does not collapse to identical behavior across all play IDs
+
+Exit criteria:
+
+- model behavior changes measurably by active play ID
+- speed remains acceptable with intent embeddings enabled
+- UI can load and inspect an intent-conditioned JAX checkpoint
+
+Milestone 4: selector head and segment runtime
+
+- add a selector head on top of the attention/CLS representation
+- define JAX-native segment boundary logic for when a new play can be chosen
+- generate selector observations with current low-level intent neutralized
+- sample or argmax a play ID and apply it to JAX runtime state
+- log selector entropy, usage, and chosen-play distribution
+
+Exit criteria:
+
+- JAX runtime can choose and apply plays without Python-side rollout intervention
+- selector decisions are reproducible under fixed seeds
+- low-level policy receives selector-chosen play IDs through the same embedding conditioning path
+
+Milestone 5: selector training objective
+
+- implement selector PPO-style training over completed segments
+- add selector value prediction
+- add selector entropy regularization
+- add usage regularization toward non-collapsed play usage
+- keep selector update inside the JAX/Optax training path
+
+Exit criteria:
+
+- selector learns non-trivial play usage
+- selector metrics are logged to MLflow
+- selector does not destabilize low-level PPO training
+
+Milestone 6: discriminator / diversity bonus parity
+
+- evaluate whether the current discriminator/DIAYN-style bonus still justifies its complexity
+- if retained, implement a JAX-native or clearly isolated host-side discriminator path
+- add reward-bonus logging and holdout classification metrics
+- avoid blocking core learnable-play parity on this item
+
+Exit criteria:
+
+- either a working diversity bonus is restored, or the JAX migration explicitly decides to omit it
+- any retained discriminator path has clear speed and learning-quality justification
+
+Recommended first implementation slice:
+
+- implement Milestone 1 and Milestone 2 only
+- add tests proving intent state propagation and embedding-conditioned logits
+- do not start selector/discriminator work until low-level conditioning is correct
+
 ## Advanced Feature Parity
 
 Purpose:
@@ -458,8 +581,7 @@ Candidates:
 - dual critic / dual policy
 - templates / curricula
 - phi shaping
-- intent learning
-- selector / discriminator path
+- intent learning and selector/discriminator path, tracked explicitly in the `Intent / Learnable Plays Parity` section
 - evaluation and analytics hooks
 
 Important constraint:

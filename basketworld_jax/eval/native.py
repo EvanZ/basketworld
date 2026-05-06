@@ -507,6 +507,7 @@ def run_native_jax_evaluation(
     user_team_name: str,
     role_flag_offense: float,
     role_flag_defense: float,
+    eval_seed: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     jax, jnp = ensure_jax_available("basketworld_jax/eval/native.py")
@@ -574,7 +575,9 @@ def run_native_jax_evaluation(
 
     start = perf_counter()
     completed_episodes = 0
-    key = jax.random.PRNGKey(int(unified_payload.get("update_index", 0)) + 17)
+    if eval_seed is None:
+        eval_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+    key = jax.random.PRNGKey(int(eval_seed))
     while completed_episodes < int(num_episodes):
         take = min(batch_size, int(num_episodes) - completed_episodes)
         key, reset_key, eval_key = jax.random.split(key, 3)
@@ -786,6 +789,7 @@ def run_native_jax_evaluation(
         "backend": "jax",
         "mode": "native_compiled",
         "num_episodes": int(num_episodes),
+        "eval_seed": int(eval_seed),
         "batch_size": int(batch_size),
         "horizon": int(horizon),
         "elapsed_sec": float(elapsed),
