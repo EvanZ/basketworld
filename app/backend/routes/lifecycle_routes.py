@@ -87,6 +87,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "court_cols": int,
     "shot_clock": int,
     "min_shot_clock": int,
+    "allow_dunks": _str_to_bool,
     "layup_pct": float,
     "three_pt_pct": float,
     "dunk_pct": float,
@@ -187,6 +188,11 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
         )
     if "offensive_three_seconds" in config and "offensive_three_seconds_enabled" not in config:
         config["offensive_three_seconds_enabled"] = bool(config.pop("offensive_three_seconds"))
+    if "allow_dunks" not in config:
+        # Historical JAX checkpoints were trained with the trainer default
+        # allow_dunks=True but did not persist that key. Preserve JAX behavior
+        # instead of falling back to the base env constructor default False.
+        config["allow_dunks"] = True
     trainer_config = dict(metadata.get("trainer_config", {}) or {})
     required_params: dict = {}
     optional_params = dict(config)

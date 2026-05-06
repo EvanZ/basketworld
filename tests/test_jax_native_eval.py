@@ -99,6 +99,10 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
 
     diagnostics = result["eval_diagnostics"]
     assert diagnostics["jax_native_summary"]["eval_seed"] == 123
+    assert diagnostics["jax_native_summary"]["allow_dunks"] is True
+    assert "shot_dunk_share" in diagnostics["jax_native_summary"]
+    assert "shot_two_share" in diagnostics["jax_native_summary"]
+    assert "shot_three_share" in diagnostics["jax_native_summary"]
     for key in (
         "action_mix",
         "reward_breakdown",

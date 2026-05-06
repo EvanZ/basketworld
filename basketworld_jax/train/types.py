@@ -32,6 +32,21 @@ class TrajectoryBatch(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    shot_attempts: Any
+    shot_makes: Any
+    shot_dunks: Any
+    shot_twos: Any
+    shot_threes: Any
+    learner_shot_attempts: Any
+    learner_shot_makes: Any
+    learner_shot_dunks: Any
+    learner_shot_twos: Any
+    learner_shot_threes: Any
+    opponent_shot_attempts: Any
+    opponent_shot_makes: Any
+    opponent_shot_dunks: Any
+    opponent_shot_twos: Any
+    opponent_shot_threes: Any
     offensive_three_seconds: Any
     defensive_lane_violations: Any
     terminal_episode_steps: Any
@@ -68,6 +83,21 @@ class EvalTrace(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    shot_attempts: Any
+    shot_makes: Any
+    shot_dunks: Any
+    shot_twos: Any
+    shot_threes: Any
+    learner_shot_attempts: Any
+    learner_shot_makes: Any
+    learner_shot_dunks: Any
+    learner_shot_twos: Any
+    learner_shot_threes: Any
+    opponent_shot_attempts: Any
+    opponent_shot_makes: Any
+    opponent_shot_dunks: Any
+    opponent_shot_twos: Any
+    opponent_shot_threes: Any
     offensive_three_seconds: Any
     defensive_lane_violations: Any
     terminal_episode_steps: Any

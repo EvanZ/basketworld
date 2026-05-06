@@ -69,6 +69,7 @@ from basketworld_jax.train.runtime import (
     concatenate_rollout_outputs,
     serialize_eval_trace,
     summarize_episode_events,
+    summarize_shot_type_metrics,
     summarize_training_step,
     training_player_ids_from_static,
 )
@@ -77,6 +78,7 @@ from basketworld_jax.train.runtime import (
 TRAINING_ROLES = ("offense", "defense")
 JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
     {
+        "allow_dunks",
         "layup_pct",
         "three_pt_pct",
         "dunk_pct",
@@ -91,6 +93,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "court_cols",
     "shot_clock",
     "min_shot_clock",
+    "allow_dunks",
     "layup_pct",
     "three_pt_pct",
     "dunk_pct",
@@ -1019,7 +1022,7 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
         learner_points_total = defense_points_total
         opponent_points_total = offense_points_total
 
-    return {
+    metrics = {
         f"{role}_mean_reward": learner_reward_mean,
         f"{role}_learner_mean_reward": learner_reward_mean,
         f"{role}_opponent_mean_reward": opponent_reward_mean,
@@ -1056,6 +1059,37 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             completed_episodes,
         ),
     }
+    metrics.update(
+        summarize_shot_type_metrics(
+            f"{role}_all",
+            shot_attempts=rollout.trajectory.shot_attempts,
+            shot_makes=rollout.trajectory.shot_makes,
+            shot_dunks=rollout.trajectory.shot_dunks,
+            shot_twos=rollout.trajectory.shot_twos,
+            shot_threes=rollout.trajectory.shot_threes,
+        )
+    )
+    metrics.update(
+        summarize_shot_type_metrics(
+            f"{role}_learner",
+            shot_attempts=rollout.trajectory.learner_shot_attempts,
+            shot_makes=rollout.trajectory.learner_shot_makes,
+            shot_dunks=rollout.trajectory.learner_shot_dunks,
+            shot_twos=rollout.trajectory.learner_shot_twos,
+            shot_threes=rollout.trajectory.learner_shot_threes,
+        )
+    )
+    metrics.update(
+        summarize_shot_type_metrics(
+            f"{role}_opponent",
+            shot_attempts=rollout.trajectory.opponent_shot_attempts,
+            shot_makes=rollout.trajectory.opponent_shot_makes,
+            shot_dunks=rollout.trajectory.opponent_shot_dunks,
+            shot_twos=rollout.trajectory.opponent_shot_twos,
+            shot_threes=rollout.trajectory.opponent_shot_threes,
+        )
+    )
+    return metrics
 
 
 def _print_checkpoint_summary(
@@ -1087,6 +1121,12 @@ def _print_checkpoint_summary(
         ("mean_completed_passes_per_completed_episode", metrics.get("mean_completed_passes_per_completed_episode")),
         ("mean_assists_per_completed_episode", metrics.get("mean_assists_per_completed_episode")),
         ("mean_turnovers_per_completed_episode", metrics.get("mean_turnovers_per_completed_episode")),
+        ("learner_shot_dunk_share", metrics.get("learner_shot_dunk_share")),
+        ("learner_shot_two_share", metrics.get("learner_shot_two_share")),
+        ("learner_shot_three_share", metrics.get("learner_shot_three_share")),
+        ("opponent_shot_dunk_share", metrics.get("opponent_shot_dunk_share")),
+        ("opponent_shot_two_share", metrics.get("opponent_shot_two_share")),
+        ("opponent_shot_three_share", metrics.get("opponent_shot_three_share")),
         ("total_offensive_three_seconds", metrics.get("total_offensive_three_seconds")),
         ("total_defensive_lane_violations", metrics.get("total_defensive_lane_violations")),
         ("approx_kl", metrics.get("approx_kl")),
@@ -1471,6 +1511,36 @@ def run_training_loop(args) -> dict[str, Any]:
                             "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
                         }
                         eval_metrics.update(eval_episode_metrics)
+                        eval_metrics.update(
+                            summarize_shot_type_metrics(
+                                "all",
+                                shot_attempts=eval_trace.shot_attempts,
+                                shot_makes=eval_trace.shot_makes,
+                                shot_dunks=eval_trace.shot_dunks,
+                                shot_twos=eval_trace.shot_twos,
+                                shot_threes=eval_trace.shot_threes,
+                            )
+                        )
+                        eval_metrics.update(
+                            summarize_shot_type_metrics(
+                                "learner",
+                                shot_attempts=eval_trace.learner_shot_attempts,
+                                shot_makes=eval_trace.learner_shot_makes,
+                                shot_dunks=eval_trace.learner_shot_dunks,
+                                shot_twos=eval_trace.learner_shot_twos,
+                                shot_threes=eval_trace.learner_shot_threes,
+                            )
+                        )
+                        eval_metrics.update(
+                            summarize_shot_type_metrics(
+                                "opponent",
+                                shot_attempts=eval_trace.opponent_shot_attempts,
+                                shot_makes=eval_trace.opponent_shot_makes,
+                                shot_dunks=eval_trace.opponent_shot_dunks,
+                                shot_twos=eval_trace.opponent_shot_twos,
+                                shot_threes=eval_trace.opponent_shot_threes,
+                            )
+                        )
                         _log_mlflow_metrics(
                             mlflow,
                             eval_metrics,

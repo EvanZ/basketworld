@@ -58,6 +58,7 @@ TRAIN_FROZEN_VALUES: dict[str, Any] = {
     "pass_mode": "pointer_targeted",
     "use_set_obs": False,
     "training_team": "offense",
+    "allow_dunks": True,
     "enable_phi_shaping": False,
     "illegal_defense_enabled": False,
     "offensive_three_seconds": False,

@@ -785,11 +785,30 @@ def run_native_jax_evaluation(
             progress_callback(completed_episodes, int(num_episodes))
 
     elapsed = max(perf_counter() - start, 1.0e-12)
+    shot_type_attempts = {
+        shot_type: int(
+            sum(
+                int((stats.get("shot_types") or {}).get(shot_type, [0, 0])[0])
+                for stats in per_player_stats.values()
+            )
+        )
+        for shot_type in ("dunk", "two", "three")
+    }
+    total_shot_attempts = int(sum(shot_type_attempts.values()))
+    shot_type_shares = {
+        shot_type: (
+            float(count / total_shot_attempts)
+            if total_shot_attempts > 0
+            else 0.0
+        )
+        for shot_type, count in shot_type_attempts.items()
+    }
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
         "num_episodes": int(num_episodes),
         "eval_seed": int(eval_seed),
+        "allow_dunks": bool(getattr(env, "allow_dunks", False)),
         "batch_size": int(batch_size),
         "horizon": int(horizon),
         "elapsed_sec": float(elapsed),
@@ -809,6 +828,13 @@ def run_native_jax_evaluation(
         "turnovers_per_episode": _mean(all_turnovers),
         "total_offense_points": _sum(all_offense_points),
         "total_defense_points": _sum(all_defense_points),
+        "total_shot_attempts": int(total_shot_attempts),
+        "total_shot_dunk_attempts": int(shot_type_attempts["dunk"]),
+        "total_shot_two_attempts": int(shot_type_attempts["two"]),
+        "total_shot_three_attempts": int(shot_type_attempts["three"]),
+        "shot_dunk_share": float(shot_type_shares["dunk"]),
+        "shot_two_share": float(shot_type_shares["two"]),
+        "shot_three_share": float(shot_type_shares["three"]),
     }
     return {
         "results": results,

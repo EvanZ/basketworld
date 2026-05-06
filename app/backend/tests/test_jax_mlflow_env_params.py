@@ -22,12 +22,14 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/layup_std": "0.05",
         "jax/env/three_pt_std": "0.05",
         "jax/env/dunk_std": "0.3",
+        "jax/env/allow_dunks": "true",
         "jax/env/training_team": "offense",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
 
     assert merged["training_team"] == Team.OFFENSE
+    assert merged["allow_dunks"] is True
     assert merged["layup_pct"] == 0.55
     assert merged["three_pt_pct"] == 0.37
     assert merged["dunk_pct"] == 0.6
@@ -57,6 +59,7 @@ def test_jax_local_env_config_prefers_checkpoint_env_config():
 
     assert required == {}
     assert optional["training_team"] == Team.OFFENSE
+    assert optional["allow_dunks"] is True
     assert optional["layup_std"] == 0.05
     assert optional["three_pt_std"] == 0.05
     assert optional["dunk_std"] == 0.3

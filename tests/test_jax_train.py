@@ -167,6 +167,7 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/env/layup_std"] == 0.05
     assert recorder.params["jax/env/three_pt_std"] == 0.05
     assert recorder.params["jax/env/dunk_std"] == 0.3
+    assert recorder.params["jax/env/allow_dunks"] is True
     assert recorder.params["jax/env/dunk_pct"] == 0.6
     assert recorder.params["jax/env/layup_pct"] == args.layup_pct
     assert recorder.params["jax/env/pass_mode"] == args.pass_mode
@@ -410,7 +411,14 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert payload["env_config"]["layup_std"] == 0.05
     assert payload["env_config"]["three_pt_std"] == 0.05
     assert payload["env_config"]["dunk_std"] == 0.3
+    assert payload["env_config"]["allow_dunks"] is True
     assert payload["env_config"]["dunk_pct"] == 0.6
+    assert "learner_shot_dunk_share" in payload["last_metrics"]
+    assert "learner_shot_two_share" in payload["last_metrics"]
+    assert "learner_shot_three_share" in payload["last_metrics"]
+    assert "opponent_shot_dunk_share" in payload["last_metrics"]
+    assert "opponent_shot_two_share" in payload["last_metrics"]
+    assert "opponent_shot_three_share" in payload["last_metrics"]
     assert set(payload["current_state"]) == {"offense", "defense"}
     assert set(payload["eval_initial_state"]) == {"offense", "defense"}
 

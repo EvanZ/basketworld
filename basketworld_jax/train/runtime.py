@@ -6,6 +6,9 @@ from typing import Any, Sequence
 import numpy as np
 
 from basketworld_jax.env import (
+    SHOT_TYPE_DUNK,
+    SHOT_TYPE_THREE,
+    SHOT_TYPE_TWO,
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_aggregated_reward_batch,
@@ -94,6 +97,36 @@ def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
     return _runner
 
 
+def _build_shot_type_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
+    shot_attempt = env_out.shot_attempt.astype(jnp.int8)
+    shot_attempt_bool = shot_attempt.astype(jnp.bool_)
+    shot_make = env_out.shot_success.astype(jnp.int8)
+    shot_dunk = (shot_attempt_bool & (env_out.shot_type == SHOT_TYPE_DUNK)).astype(jnp.int8)
+    shot_three = (shot_attempt_bool & (env_out.shot_type == SHOT_TYPE_THREE)).astype(jnp.int8)
+    shot_two = (shot_attempt_bool & (env_out.shot_type == SHOT_TYPE_TWO)).astype(jnp.int8)
+
+    safe_shooter = jnp.clip(env_out.shot_shooter, 0, int(static.role_encoding.shape[0]) - 1)
+    learner_shot = shot_attempt_bool & (static.training_player_mask[safe_shooter] > 0.5)
+    opponent_shot = shot_attempt_bool & (~learner_shot)
+    return {
+        "shot_attempts": shot_attempt,
+        "shot_makes": shot_make,
+        "shot_dunks": shot_dunk,
+        "shot_twos": shot_two,
+        "shot_threes": shot_three,
+        "learner_shot_attempts": learner_shot.astype(jnp.int8),
+        "learner_shot_makes": (learner_shot & shot_make.astype(jnp.bool_)).astype(jnp.int8),
+        "learner_shot_dunks": (learner_shot & shot_dunk.astype(jnp.bool_)).astype(jnp.int8),
+        "learner_shot_twos": (learner_shot & shot_two.astype(jnp.bool_)).astype(jnp.int8),
+        "learner_shot_threes": (learner_shot & shot_three.astype(jnp.bool_)).astype(jnp.int8),
+        "opponent_shot_attempts": opponent_shot.astype(jnp.int8),
+        "opponent_shot_makes": (opponent_shot & shot_make.astype(jnp.bool_)).astype(jnp.int8),
+        "opponent_shot_dunks": (opponent_shot & shot_dunk.astype(jnp.bool_)).astype(jnp.int8),
+        "opponent_shot_twos": (opponent_shot & shot_two.astype(jnp.bool_)).astype(jnp.int8),
+        "opponent_shot_threes": (opponent_shot & shot_three.astype(jnp.bool_)).astype(jnp.int8),
+    }
+
+
 def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
     def _runner(static, initial_state, params, rollout_key, horizon: int):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
@@ -148,6 +181,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
             next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
                 action_mask=training_action_mask,
@@ -161,6 +195,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -258,6 +293,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
             next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
                 action_mask=training_action_mask,
@@ -271,6 +307,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -412,6 +449,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
             next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
                 action_mask=training_action_mask,
@@ -425,6 +463,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -511,6 +550,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jax,
                 jnp,
             )
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -522,6 +562,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -603,6 +644,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jax,
                 jnp,
             )
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -614,6 +656,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -739,6 +782,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 jax,
                 jnp,
             )
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -750,6 +794,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                **shot_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -1060,6 +1105,38 @@ def summarize_episode_events(
     }
 
 
+def summarize_shot_type_metrics(
+    prefix: str,
+    *,
+    shot_attempts,
+    shot_makes,
+    shot_dunks,
+    shot_twos,
+    shot_threes,
+) -> dict[str, float]:
+    attempts = float(np.asarray(shot_attempts, dtype=np.float32).sum())
+    makes = float(np.asarray(shot_makes, dtype=np.float32).sum())
+    dunks = float(np.asarray(shot_dunks, dtype=np.float32).sum())
+    twos = float(np.asarray(shot_twos, dtype=np.float32).sum())
+    threes = float(np.asarray(shot_threes, dtype=np.float32).sum())
+    safe_attempts = attempts if attempts > 0.0 else 0.0
+
+    def _rate(value: float) -> float:
+        return float(value / safe_attempts) if safe_attempts > 0.0 else 0.0
+
+    return {
+        f"{prefix}_shot_attempts": attempts,
+        f"{prefix}_shot_makes": makes,
+        f"{prefix}_shot_make_rate": _rate(makes),
+        f"{prefix}_shot_dunk_attempts": dunks,
+        f"{prefix}_shot_two_attempts": twos,
+        f"{prefix}_shot_three_attempts": threes,
+        f"{prefix}_shot_dunk_share": _rate(dunks),
+        f"{prefix}_shot_two_share": _rate(twos),
+        f"{prefix}_shot_three_share": _rate(threes),
+    }
+
+
 def summarize_training_step(
     rollout_out: RolloutOutput,
     ppo_batch: PPOBatch,
@@ -1130,6 +1207,36 @@ def summarize_training_step(
         "total_defensive_lane_violations": defensive_lane_violation_total,
     }
     summary.update(episode_metrics)
+    summary.update(
+        summarize_shot_type_metrics(
+            "all",
+            shot_attempts=rollout_out.trajectory.shot_attempts,
+            shot_makes=rollout_out.trajectory.shot_makes,
+            shot_dunks=rollout_out.trajectory.shot_dunks,
+            shot_twos=rollout_out.trajectory.shot_twos,
+            shot_threes=rollout_out.trajectory.shot_threes,
+        )
+    )
+    summary.update(
+        summarize_shot_type_metrics(
+            "learner",
+            shot_attempts=rollout_out.trajectory.learner_shot_attempts,
+            shot_makes=rollout_out.trajectory.learner_shot_makes,
+            shot_dunks=rollout_out.trajectory.learner_shot_dunks,
+            shot_twos=rollout_out.trajectory.learner_shot_twos,
+            shot_threes=rollout_out.trajectory.learner_shot_threes,
+        )
+    )
+    summary.update(
+        summarize_shot_type_metrics(
+            "opponent",
+            shot_attempts=rollout_out.trajectory.opponent_shot_attempts,
+            shot_makes=rollout_out.trajectory.opponent_shot_makes,
+            shot_dunks=rollout_out.trajectory.opponent_shot_dunks,
+            shot_twos=rollout_out.trajectory.opponent_shot_twos,
+            shot_threes=rollout_out.trajectory.opponent_shot_threes,
+        )
+    )
     summary.update({key: float(value) for key, value in update_metrics.items()})
     return summary
 
@@ -1151,6 +1258,11 @@ def serialize_eval_trace(
     completed_passes = np.asarray(trace.completed_passes)
     assists = np.asarray(trace.assists)
     turnovers = np.asarray(trace.turnovers)
+    shot_attempts = np.asarray(trace.shot_attempts)
+    shot_makes = np.asarray(trace.shot_makes)
+    shot_dunks = np.asarray(trace.shot_dunks)
+    shot_twos = np.asarray(trace.shot_twos)
+    shot_threes = np.asarray(trace.shot_threes)
     offensive_three_seconds = np.asarray(trace.offensive_three_seconds)
     defensive_lane_violations = np.asarray(trace.defensive_lane_violations)
     terminal_episode_steps = np.asarray(trace.terminal_episode_steps)
@@ -1172,6 +1284,11 @@ def serialize_eval_trace(
         "completed_passes": completed_passes[:, env_index].astype(np.int8),
         "assists": assists[:, env_index].astype(np.int8),
         "turnovers": turnovers[:, env_index].astype(np.int8),
+        "shot_attempts": shot_attempts[:, env_index].astype(np.int8),
+        "shot_makes": shot_makes[:, env_index].astype(np.int8),
+        "shot_dunks": shot_dunks[:, env_index].astype(np.int8),
+        "shot_twos": shot_twos[:, env_index].astype(np.int8),
+        "shot_threes": shot_threes[:, env_index].astype(np.int8),
         "offensive_three_seconds": offensive_three_seconds[:, env_index].astype(np.int8),
         "defensive_lane_violations": defensive_lane_violations[:, env_index].astype(np.int8),
         "terminal_episode_steps": terminal_episode_steps[:, env_index].astype(np.int32),
