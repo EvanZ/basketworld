@@ -18,6 +18,8 @@ from app.backend.inference_adapters import (
     get_policy_backend_kind,
     get_policy_capabilities,
     get_policy_metadata,
+    policy_attention_payload,
+    policy_observation_tokens,
     policy_observation_vector,
     prepare_policy_for_role,
     unwrap_policy_module,
@@ -531,8 +533,49 @@ def get_full_game_state(
         except Exception:
             obs_tokens = obs_tokens
 
+    if get_policy_backend_kind(game_state.unified_policy) == "jax":
+        try:
+            obs_like = game_state.obs if isinstance(game_state.obs, dict) else {}
+            role_flag_arr = np.asarray(
+                obs_like.get("role_flag", [1.0]),
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0) if role_flag_arr.size else True
+            jax_tokens = policy_observation_tokens(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+            if jax_tokens is not None:
+                obs_tokens = {
+                    key: (
+                        value.tolist()
+                        if hasattr(value, "tolist")
+                        else value
+                    )
+                    for key, value in dict(jax_tokens).items()
+                }
+        except Exception:
+            obs_tokens = obs_tokens
+
     attention_payload = None
     if obs_tokens is not None and game_state.unified_policy is not None:
+        try:
+            obs_like = game_state.obs if isinstance(game_state.obs, dict) else {}
+            role_flag_arr = np.asarray(
+                obs_like.get("role_flag", [1.0]),
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0)
+            attention_payload = policy_attention_payload(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+        except Exception:
+            attention_payload = None
+
+    if attention_payload is None and obs_tokens is not None and game_state.unified_policy is not None:
         try:
             unified_caps = get_policy_capabilities(game_state.unified_policy) or {}
             if not unified_caps.get("attention", True):

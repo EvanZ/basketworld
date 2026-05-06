@@ -27,8 +27,12 @@ from basketworld_jax.checkpoints import (
 )
 from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.env import (
+    PASS_ACTION_END,
+    PASS_ACTION_START,
+    TOKEN_OBS_GLOBAL_DIM,
+    TOKEN_OBS_PLAYER_DIM,
     build_action_masks_batch,
-    build_flat_observation_batch,
+    build_policy_observation_batch,
     reset_batch_minimal,
     sample_state_batch,
 )
@@ -76,6 +80,8 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "layup_pct",
         "three_pt_pct",
         "dunk_pct",
+        "illegal_defense_enabled",
+        "offensive_three_seconds",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -116,6 +122,10 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "use_set_obs",
     "illegal_defense_enabled",
     "offensive_three_seconds",
+    "three_second_lane_width",
+    "three_second_lane_height",
+    "three_second_max_steps",
+    "violation_reward",
     "include_hoop_vector",
     "enable_phi_shaping",
     "phi_aggregation_mode",
@@ -179,6 +189,65 @@ def parse_args(argv=None):
         help="Hidden layer widths for the reduced flat actor-critic.",
     )
     parser.add_argument(
+        "--policy-model",
+        choices=("mlp", "attention"),
+        default="mlp",
+        help="JAX policy architecture. 'attention' uses packed player tokens plus globals.",
+    )
+    parser.add_argument(
+        "--action-head-mode",
+        choices=("flat", "pointer_targeted"),
+        default="flat",
+        help=(
+            "JAX action distribution head. 'pointer_targeted' factorizes pass "
+            "selection into action type plus teammate target slot."
+        ),
+    )
+    parser.add_argument(
+        "--attention-embed-dim",
+        type=int,
+        default=64,
+        help="Token embedding dimension for --policy-model attention.",
+    )
+    parser.add_argument(
+        "--attention-num-heads",
+        type=int,
+        default=4,
+        help="Number of self-attention heads for --policy-model attention.",
+    )
+    parser.add_argument(
+        "--attention-token-mlp-dim",
+        type=int,
+        default=64,
+        help="Hidden width of the shared token MLP for --policy-model attention.",
+    )
+    parser.add_argument(
+        "--attention-cls-tokens",
+        type=int,
+        default=2,
+        help="Number of learned CLS tokens for --policy-model attention.",
+    )
+    parser.add_argument(
+        "--attention-pi-head-hidden-dims",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Post-attention policy head MLP hidden widths. Empty means direct linear head.",
+    )
+    parser.add_argument(
+        "--attention-vf-head-hidden-dims",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Post-attention value head MLP hidden widths. Empty means direct linear head.",
+    )
+    parser.add_argument(
+        "--attention-head-activation",
+        choices=("tanh", "relu", "gelu", "silu", "swish"),
+        default="tanh",
+        help="Activation used between post-attention PI/VF head MLP layers.",
+    )
+    parser.add_argument(
         "--policy-seed",
         type=int,
         default=0,
@@ -202,7 +271,16 @@ def parse_args(argv=None):
         "--policy-update-epochs",
         type=int,
         default=1,
-        help="Number of full-batch PPO update epochs per rollout.",
+        help="Number of PPO update epochs per rollout.",
+    )
+    parser.add_argument(
+        "--ppo-minibatches",
+        type=int,
+        default=1,
+        help=(
+            "Number of shuffled PPO minibatches per update epoch. "
+            "Set 1 to keep full-batch update behavior."
+        ),
     )
     parser.add_argument(
         "--run-train-loop",
@@ -309,7 +387,12 @@ def parse_args(argv=None):
             "when --grouped-opponent-sampling is enabled."
         ),
     )
-    return parser.parse_args(argv_list)
+    args = parser.parse_args(argv_list)
+    if bool(getattr(args, "use_set_obs", False)):
+        args.policy_model = "attention"
+    if str(args.policy_model) == "attention":
+        args.use_set_obs = True
+    return args
 
 
 def _values_match(actual: Any, expected: Any) -> bool:
@@ -323,6 +406,8 @@ def validate_train_args(args) -> None:
     for key, expected in TRAIN_FROZEN_VALUES.items():
         if key in JAX_ALLOWED_ENV_OVERRIDE_KEYS:
             continue
+        if key == "use_set_obs" and str(getattr(args, "policy_model", "mlp")) == "attention":
+            continue
         actual = getattr(args, key)
         if not _values_match(actual, expected):
             mismatches.append(f"{key}={actual!r} expected {expected!r}")
@@ -330,6 +415,20 @@ def validate_train_args(args) -> None:
         raise SystemExit(
             "JAX trainer uses a frozen reduced structural config. Unsupported overrides: "
             + ", ".join(mismatches)
+        )
+    ppo_minibatches = int(getattr(args, "ppo_minibatches", 1))
+    if ppo_minibatches < 1:
+        raise SystemExit("--ppo-minibatches must be >= 1.")
+    role_multiplier = len(TRAINING_ROLES) if bool(getattr(args, "run_train_loop", False)) else 1
+    ppo_sample_count = (
+        int(getattr(args, "kernel_batch_size"))
+        * int(getattr(args, "rollout_horizon"))
+        * role_multiplier
+    )
+    if ppo_sample_count % ppo_minibatches != 0:
+        raise SystemExit(
+            "--ppo-minibatches must evenly divide the PPO batch size. "
+            f"ppo_batch_size={ppo_sample_count}, ppo_minibatches={ppo_minibatches}."
         )
 
 
@@ -353,7 +452,47 @@ def build_trainer_config(args) -> TrainerConfig:
         entropy_coef=float(args.ent_coef),
         learning_rate=float(args.learning_rate),
         policy_update_epochs=int(args.policy_update_epochs),
+        ppo_minibatches=int(args.ppo_minibatches),
     )
+
+
+def _policy_model_type(args) -> str:
+    return str(getattr(args, "policy_model", "mlp")).lower()
+
+
+def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: np.ndarray) -> ActorCriticSpec:
+    model_type = _policy_model_type(args)
+    return build_actor_critic_spec(
+        flat_obs_np,
+        action_masks_np,
+        hidden_dims=args.policy_hidden_dims,
+        model_type=model_type,
+        token_player_count=(
+            int(static.role_encoding.shape[0])
+            if model_type == "attention"
+            else 0
+        ),
+        token_dim=TOKEN_OBS_PLAYER_DIM if model_type == "attention" else 0,
+        global_dim=TOKEN_OBS_GLOBAL_DIM if model_type == "attention" else 0,
+        attention_embed_dim=int(getattr(args, "attention_embed_dim", 64)),
+        attention_num_heads=int(getattr(args, "attention_num_heads", 4)),
+        attention_token_mlp_dim=int(getattr(args, "attention_token_mlp_dim", 64)),
+        attention_num_cls_tokens=int(getattr(args, "attention_cls_tokens", 2)),
+        attention_pi_head_hidden_dims=tuple(
+            int(v) for v in getattr(args, "attention_pi_head_hidden_dims", [])
+        ),
+        attention_vf_head_hidden_dims=tuple(
+            int(v) for v in getattr(args, "attention_vf_head_hidden_dims", [])
+        ),
+        attention_head_activation=str(getattr(args, "attention_head_activation", "tanh")),
+        action_head_mode=str(getattr(args, "action_head_mode", "flat")),
+        pass_action_start=int(PASS_ACTION_START),
+        pass_action_end=int(PASS_ACTION_END),
+    )
+
+
+def _normalize_policy_spec_dict(raw_spec: dict[str, Any]) -> dict[str, Any]:
+    return asdict(ActorCriticSpec(**dict(raw_spec)))
 
 
 def _uses_grouped_opponent_sampling(args) -> bool:
@@ -442,7 +581,7 @@ def _validate_resume_checkpoint_payload(
             raise SystemExit(f"Resume checkpoint trainer_config mismatch for {key!r}.")
 
     expected_policy_spec = asdict(spec)
-    if dict(payload.get("policy_spec", {})) != expected_policy_spec:
+    if _normalize_policy_spec_dict(payload.get("policy_spec", {})) != expected_policy_spec:
         raise SystemExit("Resume checkpoint policy_spec does not match the current JAX run.")
 
     expected_frozen = {
@@ -767,6 +906,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rollout_horizon": int(args.rollout_horizon),
         "jax/num_updates": int(args.num_updates),
         "jax/policy_update_epochs": int(args.policy_update_epochs),
+        "jax/ppo_minibatches": int(args.ppo_minibatches),
         "jax/log_every_updates": int(args.log_every_updates),
         "jax/eval_every_updates": int(args.eval_every_updates),
         "jax/eval_horizon": int(args.eval_horizon),
@@ -776,10 +916,28 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/ppo_clip_range": float(trainer_config.ppo_clip_range),
         "jax/value_coef": float(trainer_config.value_coef),
         "jax/entropy_coef": float(trainer_config.entropy_coef),
+        "jax/policy_model": str(spec.model_type),
+        "jax/action_head_mode": str(spec.action_head_mode),
         "jax/policy_hidden_dims": ",".join(str(v) for v in spec.hidden_dims),
         "jax/flat_obs_dim": int(spec.flat_obs_dim),
         "jax/training_player_count": int(spec.training_player_count),
         "jax/action_dim_per_player": int(spec.action_dim_per_player),
+        "jax/token_player_count": int(spec.token_player_count),
+        "jax/token_dim": int(spec.token_dim),
+        "jax/global_dim": int(spec.global_dim),
+        "jax/attention_embed_dim": int(spec.attention_embed_dim),
+        "jax/attention_num_heads": int(spec.attention_num_heads),
+        "jax/attention_token_mlp_dim": int(spec.attention_token_mlp_dim),
+        "jax/attention_cls_tokens": int(spec.attention_num_cls_tokens),
+        "jax/attention_pi_head_hidden_dims": ",".join(
+            str(v) for v in spec.attention_pi_head_hidden_dims
+        ),
+        "jax/attention_vf_head_hidden_dims": ",".join(
+            str(v) for v in spec.attention_vf_head_hidden_dims
+        ),
+        "jax/attention_head_activation": str(spec.attention_head_activation),
+        "jax/pass_action_start": int(spec.pass_action_start),
+        "jax/pass_action_end": int(spec.pass_action_end),
         "jax/pass_mode": str(getattr(args, "pass_mode")),
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
@@ -913,12 +1071,24 @@ def _print_checkpoint_summary(
         ("steps_per_update", metrics.get("steps_per_update")),
         ("end_to_end_steps_per_sec", metrics.get("end_to_end_steps_per_sec")),
         ("rollout_states_per_sec", metrics.get("rollout_states_per_sec")),
+        ("ppo_update_rollout_samples_per_sec", metrics.get("ppo_update_rollout_samples_per_sec")),
+        ("ppo_update_optimizer_samples_per_sec", metrics.get("ppo_update_optimizer_samples_per_sec")),
+        ("end_to_end_latency_ms", metrics.get("end_to_end_latency_ms")),
+        ("rollout_latency_ms", metrics.get("rollout_latency_ms")),
+        ("update_latency_ms", metrics.get("update_latency_ms")),
+        ("rollout_time_pct", metrics.get("rollout_time_pct")),
+        ("ppo_update_time_pct", metrics.get("ppo_update_time_pct")),
+        ("ppo_update_epochs", metrics.get("ppo_update_epochs")),
+        ("ppo_update_minibatches", metrics.get("ppo_update_minibatches")),
+        ("ppo_update_minibatch_size", metrics.get("ppo_update_minibatch_size")),
         ("completed_episodes", metrics.get("completed_episodes")),
         ("mean_completed_episode_length", metrics.get("mean_completed_episode_length")),
         ("mean_pass_attempts_per_completed_episode", metrics.get("mean_pass_attempts_per_completed_episode")),
         ("mean_completed_passes_per_completed_episode", metrics.get("mean_completed_passes_per_completed_episode")),
         ("mean_assists_per_completed_episode", metrics.get("mean_assists_per_completed_episode")),
         ("mean_turnovers_per_completed_episode", metrics.get("mean_turnovers_per_completed_episode")),
+        ("total_offensive_three_seconds", metrics.get("total_offensive_three_seconds")),
+        ("total_defensive_lane_violations", metrics.get("total_defensive_lane_violations")),
         ("approx_kl", metrics.get("approx_kl")),
         ("clip_fraction", metrics.get("clip_fraction")),
         ("mean_abs_log_ratio", metrics.get("mean_abs_log_ratio")),
@@ -982,15 +1152,16 @@ def run_training_loop(args) -> dict[str, Any]:
     }
     training_player_ids = training_player_ids_by_role["offense"]
     training_player_ids_jnp = jnp.asarray(training_player_ids, dtype=jnp.int32)
-    flat_obs = build_flat_observation_batch(static, current_states["offense"], jnp)
+    flat_obs = build_policy_observation_batch(
+        static,
+        current_states["offense"],
+        jnp,
+        model_type=_policy_model_type(args),
+    )
     action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
     action_masks_np = np.asarray(jax.device_get(action_masks), dtype=np.int8)
-    spec = build_actor_critic_spec(
-        flat_obs_np,
-        action_masks_np,
-        hidden_dims=args.policy_hidden_dims,
-    )
+    spec = _build_policy_spec(args, static, flat_obs_np, action_masks_np)
     trainer_config = build_trainer_config(args)
     rollout_runner = build_compiled_rollout_runner(jax, jnp, spec)
     eval_runner = build_compiled_eval_runner(jax, jnp, spec)
@@ -1015,7 +1186,7 @@ def run_training_loop(args) -> dict[str, Any]:
         and _uses_grouped_opponent_sampling(args)
     )
     if frozen_opponent_payload is not None:
-        if dict(frozen_opponent_payload.get("policy_spec", {})) != asdict(spec):
+        if _normalize_policy_spec_dict(frozen_opponent_payload.get("policy_spec", {})) != asdict(spec):
             raise SystemExit("Frozen opponent policy_spec does not match the current JAX trainer policy_spec.")
         opponent_params = jax.device_put(frozen_opponent_payload["params"])
         active_opponent_info = dict(frozen_opponent_info or {})
@@ -1109,7 +1280,7 @@ def run_training_loop(args) -> dict[str, Any]:
         )
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
-            base_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 1)
+            base_key, update_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 2)
             rollout_start_ns = perf_counter_ns()
             role_rollouts = {}
             for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
@@ -1153,7 +1324,12 @@ def run_training_loop(args) -> dict[str, Any]:
                 jnp,
             )
             update_start_ns = perf_counter_ns()
-            params, opt_state, update_metrics = update_runner(params, opt_state, ppo_batch)
+            params, opt_state, update_metrics = update_runner(
+                params,
+                opt_state,
+                ppo_batch,
+                update_key,
+            )
             block_until_ready_tree((params, opt_state, update_metrics))
             update_elapsed_ns = perf_counter_ns() - update_start_ns
             current_states = {
@@ -1173,6 +1349,8 @@ def run_training_loop(args) -> dict[str, Any]:
                 batch_size=int(args.kernel_batch_size) * len(TRAINING_ROLES),
                 horizon=int(args.rollout_horizon),
                 update_index=update_idx,
+                policy_update_epochs=int(args.policy_update_epochs),
+                ppo_minibatches=int(args.ppo_minibatches),
             )
             for role in TRAINING_ROLES:
                 last_metrics.update(_summarize_role_rollout_metrics(role, role_rollouts[role]))
@@ -1214,6 +1392,8 @@ def run_training_loop(args) -> dict[str, Any]:
                 (
                     f"train:{update_idx}"
                     f" sps:{float(last_metrics['end_to_end_steps_per_sec']):.0f}"
+                    f" rollout:{float(last_metrics['rollout_time_pct']):.0f}%"
+                    f" update:{float(last_metrics['ppo_update_time_pct']):.0f}%"
                 ),
                 refresh=False,
             )
@@ -1440,15 +1620,16 @@ def run_train_scaffold(args) -> dict[str, Any]:
     training_player_ids = training_player_ids_from_static(static)
     training_player_ids_jnp = jnp.asarray(training_player_ids, dtype=jnp.int32)
 
-    flat_obs = build_flat_observation_batch(static, state, jnp)
+    flat_obs = build_policy_observation_batch(
+        static,
+        state,
+        jnp,
+        model_type=_policy_model_type(args),
+    )
     action_masks = build_action_masks_batch(static, state, jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
     action_masks_np = np.asarray(jax.device_get(action_masks), dtype=np.int8)
-    spec = build_actor_critic_spec(
-        flat_obs_np,
-        action_masks_np,
-        hidden_dims=args.policy_hidden_dims,
-    )
+    spec = _build_policy_spec(args, static, flat_obs_np, action_masks_np)
     params = init_actor_critic_params(
         jax,
         jnp,
@@ -1518,6 +1699,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
     total_states = int(args.kernel_batch_size) * int(args.benchmark_iters)
     total_seconds = max(timed_ns / 1e9, 1e-12)
     ppo_batch = build_ppo_batch(rollout_out, trainer_config, jax, jnp)
+    update_key = jax.random.PRNGKey(int(args.policy_seed) + 202)
     if int(args.warmup_iters) > 0:
         _, _, _ = benchmark_update_runner(
             jax,
@@ -1525,6 +1707,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
             params,
             opt_state,
             ppo_batch,
+            update_key,
             iterations=int(args.warmup_iters),
             progress=progress,
         )
@@ -1534,6 +1717,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
         params,
         opt_state,
         ppo_batch,
+        jax.random.fold_in(update_key, 50_000),
         iterations=int(args.benchmark_iters),
         progress=progress,
     )
@@ -1586,6 +1770,12 @@ def run_train_scaffold(args) -> dict[str, Any]:
                 "trajectory_completed_passes_shape": list(np.asarray(rollout_out.trajectory.completed_passes).shape),
                 "trajectory_assists_shape": list(np.asarray(rollout_out.trajectory.assists).shape),
                 "trajectory_turnovers_shape": list(np.asarray(rollout_out.trajectory.turnovers).shape),
+                "trajectory_offensive_three_seconds_shape": list(
+                    np.asarray(rollout_out.trajectory.offensive_three_seconds).shape
+                ),
+                "trajectory_defensive_lane_violations_shape": list(
+                    np.asarray(rollout_out.trajectory.defensive_lane_violations).shape
+                ),
                 "trajectory_terminal_episode_steps_shape": list(
                     np.asarray(rollout_out.trajectory.terminal_episode_steps).shape
                 ),

@@ -16,6 +16,7 @@ class TrainerConfig:
     entropy_coef: float
     learning_rate: float
     policy_update_epochs: int
+    ppo_minibatches: int = 1
 
 
 class TrajectoryBatch(NamedTuple):
@@ -31,6 +32,8 @@ class TrajectoryBatch(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    offensive_three_seconds: Any
+    defensive_lane_violations: Any
     terminal_episode_steps: Any
     offense_score_delta: Any
     defense_score_delta: Any
@@ -65,6 +68,8 @@ class EvalTrace(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    offensive_three_seconds: Any
+    defensive_lane_violations: Any
     terminal_episode_steps: Any
     offense_score: Any
     defense_score: Any

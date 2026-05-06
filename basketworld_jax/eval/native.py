@@ -19,12 +19,13 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
+    TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
     TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
     TURNOVER_REASON_SHOT_CLOCK,
     assemble_full_actions_jax,
     build_action_masks_batch,
-    build_flat_observation_batch_with_role_flag,
     build_kernel_static_from_env,
+    build_policy_observation_batch_with_role_flag,
     reset_batch_minimal,
     step_batch_minimal,
 )
@@ -96,17 +97,19 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             full_action_mask = build_action_masks_batch(static, state, jnp)
             offense_mask = full_action_mask[:, offense_ids, :]
             defense_mask = full_action_mask[:, defense_ids, :]
-            offense_obs = build_flat_observation_batch_with_role_flag(
+            offense_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
                 role_flag_offense,
                 jnp,
+                model_type=spec.model_type,
             )
-            defense_obs = build_flat_observation_batch_with_role_flag(
+            defense_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
                 role_flag_defense,
                 jnp,
+                model_type=spec.model_type,
             )
             offense_actions = _team_actions(
                 offense_params,
@@ -163,6 +166,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "assist_passer": env_out.assist_passer.astype(jnp.int32),
                 "turnover_player": env_out.turnover_player.astype(jnp.int32),
                 "turnover_reason": env_out.turnover_reason.astype(jnp.int32),
+                "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
+                "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
+                "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
             }
             return (env_out.state, key), trace
 
@@ -338,6 +344,7 @@ def _turnover_reason_label(code: int) -> str:
         int(TURNOVER_REASON_DEFENDER_PRESSURE): "defender_pressure",
         int(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS): "move_out_of_bounds",
         int(TURNOVER_REASON_SHOT_CLOCK): "shot_clock_violation",
+        int(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS): "offensive_three_seconds",
     }
     return labels.get(int(code), "unknown")
 
@@ -543,6 +550,7 @@ def run_native_jax_evaluation(
     user_team_ids_set = set(user_team_ids)
     offense_sign = 1.0 if user_team == Team.OFFENSE else -1.0
     pass_reward = float(getattr(env, "pass_reward", 0.0) or 0.0)
+    violation_reward = float(getattr(env, "violation_reward", 0.0) or 0.0)
     potential_assist_pct = float(getattr(env, "potential_assist_pct", 0.0) or 0.0)
     full_assist_bonus_pct = float(getattr(env, "full_assist_bonus_pct", 0.0) or 0.0)
     shot_clock_steps = int(getattr(env, "shot_clock_steps", horizon))
@@ -596,6 +604,7 @@ def run_native_jax_evaluation(
             episode_player_stats = _init_player_stats(n_players)
             shots_payload: dict[str, dict[str, Any]] = {}
             turnovers_payload: list[dict[str, Any]] = []
+            defensive_lane_violations_payload: list[dict[str, Any]] = []
             episode_shots: dict[str, list[int]] = {}
             eval_diagnostics["intent_inactive_count"] = int(eval_diagnostics.get("intent_inactive_count", 0)) + 1
 
@@ -700,20 +709,33 @@ def run_native_jax_evaluation(
                                 "reason": reason,
                             }
                         )
+                if int(trace["defensive_lane_violation"][t, idx]):
+                    defender_id = int(trace["defensive_lane_violation_player"][t, idx])
+                    defensive_lane_violations_payload.append(
+                        {
+                            "player_id": defender_id,
+                            "reason": "illegal_defense",
+                        }
+                    )
 
             completed_passes = float(np.asarray(trace["completed_passes"])[:active_steps, idx].sum())
+            defensive_lane_violations = float(
+                np.asarray(trace["defensive_lane_violation"])[:active_steps, idx].sum()
+            )
             shot_expected_points = np.asarray(trace["shot_expected_points"])[:active_steps, idx]
             potential_flags = np.asarray(trace["potential_assist"])[:active_steps, idx].astype(bool)
             assist_flags = np.asarray(trace["assists"])[:active_steps, idx].astype(bool)
             expected_amt = offense_sign * float(shot_expected_points.sum())
             pass_amt = offense_sign * pass_reward * completed_passes
+            violation_amt = offense_sign * violation_reward * defensive_lane_violations
             potential_amt = offense_sign * potential_assist_pct * float(shot_expected_points[potential_flags].sum())
             full_amt = offense_sign * full_assist_bonus_pct * float(shot_expected_points[assist_flags].sum())
-            known_reward = expected_amt + pass_amt + potential_amt + full_amt
+            known_reward = expected_amt + pass_amt + violation_amt + potential_amt + full_amt
             reward_breakdown = eval_diagnostics["reward_breakdown"]
             reward_breakdown["total_reward"] += user_reward
             reward_breakdown["expected_points"] += expected_amt
             reward_breakdown["pass_reward"] += pass_amt
+            reward_breakdown["violation_reward"] += violation_amt
             reward_breakdown["assist_potential"] += potential_amt
             reward_breakdown["assist_full_bonus"] += full_amt
             reward_breakdown["unexplained"] += user_reward - known_reward
@@ -738,7 +760,7 @@ def run_native_jax_evaluation(
                     "outcome_info": {
                         "shots": shots_payload,
                         "turnovers": turnovers_payload,
-                        "defensive_lane_violations": [],
+                        "defensive_lane_violations": defensive_lane_violations_payload,
                         "shot_clock": shot_clock_steps,
                         "three_point_distance": three_point_distance,
                     },

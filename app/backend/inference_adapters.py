@@ -58,6 +58,12 @@ class InferencePolicyAdapter:
     def observation_vector(self, env, *, observer_is_offense: bool):
         return None
 
+    def observation_tokens(self, env, *, observer_is_offense: bool):
+        return None
+
+    def attention_payload(self, env, *, observer_is_offense: bool):
+        return None
+
     def set_pass_mode(self, mode_value: str) -> None:
         policy = getattr(self.raw_model, "policy", None)
         if policy is None or not hasattr(policy, "set_pass_mode"):
@@ -95,6 +101,7 @@ class SB3PPOInferenceAdapter(InferencePolicyAdapter):
 
 class JAXInferenceAdapter(InferencePolicyAdapter):
     def __init__(self, raw_model: Any) -> None:
+        supports_attention = _jax_model_uses_attention(raw_model)
         super().__init__(
             raw_model,
             backend_kind="jax",
@@ -105,7 +112,7 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
                 eval=True,
                 playbook=False,
                 mcts=False,
-                attention=False,
+                attention=supports_attention,
                 env_training_tabs=False,
                 state_values=False,
                 q_values=False,
@@ -130,6 +137,34 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
             env,
             observer_is_offense=bool(observer_is_offense),
         )
+
+    def observation_tokens(self, env, *, observer_is_offense: bool):
+        token_fn = getattr(self.raw_model, "observation_tokens", None)
+        if not callable(token_fn):
+            return None
+        return token_fn(env, observer_is_offense=bool(observer_is_offense))
+
+    def attention_payload(self, env, *, observer_is_offense: bool):
+        if not _jax_model_uses_attention(self.raw_model):
+            return None
+        payload_fn = getattr(self.raw_model, "attention_payload", None)
+        if not callable(payload_fn):
+            return None
+        return payload_fn(env, observer_is_offense=bool(observer_is_offense))
+
+
+def _jax_model_uses_attention(raw_model: Any) -> bool:
+    spec_obj = getattr(raw_model, "spec", None)
+    spec_model_type = getattr(spec_obj, "model_type", None)
+    if spec_model_type is not None:
+        return str(spec_model_type).lower() == "attention"
+    metadata = getattr(raw_model, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    policy_spec = metadata.get("policy_spec")
+    if not isinstance(policy_spec, dict):
+        return False
+    return str(policy_spec.get("model_type", "")).lower() == "attention"
 
 
 def load_sb3_policy_adapter(
@@ -207,6 +242,32 @@ def policy_observation_vector(policy_obj: Any, env, *, observer_is_offense: bool
             env,
             observer_is_offense=bool(observer_is_offense),
         )
+    return None
+
+
+def policy_observation_tokens(policy_obj: Any, env, *, observer_is_offense: bool):
+    if policy_obj is None:
+        return None
+    token_fn = getattr(policy_obj, "observation_tokens", None)
+    if callable(token_fn):
+        return token_fn(env, observer_is_offense=bool(observer_is_offense))
+    raw_model = unwrap_inference_model(policy_obj)
+    token_fn = getattr(raw_model, "observation_tokens", None)
+    if callable(token_fn):
+        return token_fn(env, observer_is_offense=bool(observer_is_offense))
+    return None
+
+
+def policy_attention_payload(policy_obj: Any, env, *, observer_is_offense: bool):
+    if policy_obj is None:
+        return None
+    payload_fn = getattr(policy_obj, "attention_payload", None)
+    if callable(payload_fn):
+        return payload_fn(env, observer_is_offense=bool(observer_is_offense))
+    raw_model = unwrap_inference_model(policy_obj)
+    payload_fn = getattr(raw_model, "attention_payload", None)
+    if callable(payload_fn):
+        return payload_fn(env, observer_is_offense=bool(observer_is_offense))
     return None
 
 

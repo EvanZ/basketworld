@@ -16,12 +16,16 @@ PASS_ACTION_START = ActionType.PASS_E.value
 PASS_ACTION_END = ActionType.PASS_SE.value + 1
 ACTION_COUNT = len(ActionType)
 SQRT3 = float(np.sqrt(3.0))
+TOKEN_OBS_PLAYER_DIM = 15
+TOKEN_OBS_GLOBAL_DIM = 4
+TOKEN_OBS_ROLE_FLAG_DIM = 1
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
 TURNOVER_REASON_INTERCEPTED = 2
 TURNOVER_REASON_DEFENDER_PRESSURE = 3
 TURNOVER_REASON_MOVE_OUT_OF_BOUNDS = 4
 TURNOVER_REASON_SHOT_CLOCK = 5
+TURNOVER_REASON_OFFENSIVE_THREE_SECONDS = 6
 SHOT_TYPE_NONE = 0
 SHOT_TYPE_DUNK = 1
 SHOT_TYPE_TWO = 2
@@ -140,6 +144,9 @@ class StepBatchOutput(NamedTuple):
     assist_passer: Any
     turnover_player: Any
     turnover_reason: Any
+    offensive_three_seconds: Any
+    defensive_lane_violation: Any
+    defensive_lane_violation_player: Any
 
 
 def _player_skill_arrays(env) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -758,7 +765,8 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
     ).astype(jnp.float32)
 
     pressure_exposure = state.pressure_exposure[:, None]
-    shot_clock = state.shot_clock.astype(jnp.float32)[:, None]
+    shot_clock_den = jnp.maximum(static.shot_clock_max.astype(jnp.float32), 1.0)
+    shot_clock = (state.shot_clock.astype(jnp.float32) / shot_clock_den)[:, None]
     role_encoding = jnp.broadcast_to(static.role_encoding[None, :], (batch_size, n_players))
 
     passer_pos = _safe_ball_holder_positions(state, jnp).astype(jnp.float32)
@@ -860,6 +868,200 @@ def build_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
     )
 
 
+def _scatter_offense_features(static: KernelStatic, offense_values, n_players: int, jnp):
+    batch_size = offense_values.shape[0]
+    out = jnp.zeros((batch_size, int(n_players)), dtype=jnp.float32)
+    return out.at[:, static.offense_ids].set(offense_values.astype(jnp.float32))
+
+
+def _nearest_masked_distance(distance_matrix, valid_mask, jnp):
+    masked = jnp.where(
+        valid_mask,
+        distance_matrix,
+        jnp.full(distance_matrix.shape, jnp.inf, dtype=jnp.float32),
+    )
+    nearest = jnp.min(masked, axis=-1)
+    return jnp.where(jnp.isfinite(nearest), nearest, jnp.zeros_like(nearest))
+
+
+def build_token_observation_components_batch(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+):
+    """Build set-observation components matching the production token layout."""
+    batch_size, n_players, _ = state.positions.shape
+    norm_den = static.court_norm_den
+    positions_norm = state.positions.astype(jnp.float32) / norm_den
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    role_encoding = jnp.broadcast_to(static.role_encoding[None, :], (batch_size, n_players))
+    is_offense = role_encoding > 0.0
+    has_ball = (
+        (state.ball_holder[:, None] == player_ids[None, :]) & (state.ball_holder[:, None] >= 0)
+    ).astype(jnp.float32)
+
+    skill_gate = is_offense.astype(jnp.float32)
+    layup = state.layup_pct.astype(jnp.float32) * skill_gate
+    three = state.three_pt_pct.astype(jnp.float32) * skill_gate
+    dunk = state.dunk_pct.astype(jnp.float32) * skill_gate
+
+    max_lane_steps = jnp.maximum(static.three_second_max_steps, jnp.asarray(1.0, dtype=jnp.float32))
+    lane_steps = jnp.where(
+        is_offense,
+        state.offense_lane_steps,
+        state.defense_lane_steps,
+    ).astype(jnp.float32)
+    lane_steps_norm = jnp.clip(lane_steps / max_lane_steps, 0.0, 1.0)
+
+    shot_profile = build_shot_profile_batch(static, state, jnp)
+    expected_points = jnp.where(
+        is_offense,
+        shot_profile["expected_points"].astype(jnp.float32),
+        jnp.zeros((batch_size, n_players), dtype=jnp.float32),
+    )
+    offense_expected_points = jnp.take(expected_points, static.offense_ids, axis=1)
+    best_offense_slot = jnp.argmax(offense_expected_points, axis=1)
+    best_ep_player = static.offense_ids[best_offense_slot]
+    best_ep_pos = jnp.take_along_axis(
+        state.positions,
+        best_ep_player[:, None, None],
+        axis=1,
+    )[:, 0, :]
+
+    turnover_probs = _scatter_offense_features(
+        static,
+        build_turnover_probabilities_batch(static, state, jnp),
+        n_players,
+        jnp,
+    )
+    steal_risks = _scatter_offense_features(
+        static,
+        build_pass_steal_probabilities_batch(static, state, jnp),
+        n_players,
+        jnp,
+    )
+
+    ball_pos = _safe_ball_holder_positions(state, jnp)
+    dist_to_ball = _hex_distance(state.positions, ball_pos[:, None, :], jnp).astype(jnp.float32) / norm_den
+    dist_to_ball = jnp.where(state.ball_holder[:, None] >= 0, dist_to_ball, jnp.zeros_like(dist_to_ball))
+    dist_to_best_ep = _hex_distance(state.positions, best_ep_pos[:, None, :], jnp).astype(jnp.float32) / norm_den
+
+    all_distances = _hex_distance(
+        state.positions[:, :, None, :],
+        state.positions[:, None, :, :],
+        jnp,
+    ).astype(jnp.float32)
+    opponent_mask = static.opponent_mask.astype(jnp.bool_)[None, :, :]
+    same_team_mask = (static.role_encoding[:, None] == static.role_encoding[None, :])[None, :, :]
+    not_self_mask = ~jnp.eye(n_players, dtype=jnp.bool_)[None, :, :]
+    dist_to_nearest_opp = _nearest_masked_distance(all_distances, opponent_mask, jnp) / norm_den
+    dist_to_nearest_team = _nearest_masked_distance(all_distances, same_team_mask & not_self_mask, jnp) / norm_den
+
+    players = jnp.stack(
+        [
+            positions_norm[..., 0],
+            positions_norm[..., 1],
+            role_encoding,
+            has_ball,
+            layup,
+            three,
+            dunk,
+            lane_steps_norm,
+            expected_points,
+            turnover_probs,
+            steal_risks,
+            dist_to_ball,
+            dist_to_best_ep,
+            dist_to_nearest_opp,
+            dist_to_nearest_team,
+        ],
+        axis=-1,
+    ).astype(jnp.float32)
+    globals_vec = jnp.stack(
+        [
+            state.shot_clock.astype(jnp.float32)
+            / jnp.maximum(static.shot_clock_max.astype(jnp.float32), 1.0),
+            state.pressure_exposure.astype(jnp.float32),
+            jnp.full((batch_size,), static.basket_position[0].astype(jnp.float32) / norm_den, dtype=jnp.float32),
+            jnp.full((batch_size,), static.basket_position[1].astype(jnp.float32) / norm_den, dtype=jnp.float32),
+        ],
+        axis=-1,
+    ).astype(jnp.float32)
+    role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
+    return players, globals_vec, role_flag
+
+
+def build_token_observation_batch_with_role_flag(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+):
+    players, globals_vec, role_flag = build_token_observation_components_batch(
+        static,
+        state,
+        role_flag_value,
+        jnp,
+    )
+    return jnp.concatenate(
+        [
+            players.reshape(players.shape[0], -1),
+            globals_vec,
+            role_flag,
+        ],
+        axis=1,
+    ).astype(jnp.float32)
+
+
+def build_token_observation_batch(static: KernelStatic, state: KernelState, jnp):
+    return build_token_observation_batch_with_role_flag(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+    )
+
+
+def build_policy_observation_batch_with_role_flag(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+    *,
+    model_type: str,
+):
+    if str(model_type) == "attention":
+        return build_token_observation_batch_with_role_flag(
+            static,
+            state,
+            role_flag_value,
+            jnp,
+        )
+    return build_flat_observation_batch_with_role_flag(
+        static,
+        state,
+        role_flag_value,
+        jnp,
+    )
+
+
+def build_policy_observation_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+    *,
+    model_type: str,
+):
+    return build_policy_observation_batch_with_role_flag(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+        model_type=model_type,
+    )
+
+
 def build_aggregated_reward_batch(static: KernelStatic, rewards, jnp):
     scaled = rewards.astype(jnp.float32) * static.training_player_mask[None, :]
     return jnp.sum(scaled, axis=1) * static.task_reward_scale
@@ -906,6 +1108,99 @@ def _pressure_turnover_probs_single(static: KernelStatic, state: KernelState, jn
         -static.defender_pressure_decay_lambda * jnp.maximum(0.0, distances - 1.0)
     )
     return jnp.where(valid, per_defender, 0.0), total_prob
+
+
+def _positions_in_lane(static: KernelStatic, positions, lane_mask, jnp):
+    cell_indices, found = _lookup_cell_indices(static.cell_coords, positions, jnp)
+    return found & lane_mask[cell_indices].astype(jnp.bool_)
+
+
+def _defender_guarding_offense_mask(static: KernelStatic, positions, jnp):
+    defense_positions = positions[static.defense_ids]
+    offense_positions = positions[static.offense_ids]
+    distances = _hex_distance(
+        defense_positions[:, None, :],
+        offense_positions[None, :, :],
+        jnp,
+    ).astype(jnp.float32)
+    guarding = jnp.any(distances <= static.defender_guard_distance, axis=1)
+    return jnp.where(static.defender_guard_distance > 0.0, guarding, jnp.zeros_like(guarding))
+
+
+def _apply_offensive_three_seconds_single(static: KernelStatic, state: KernelState, actions, jnp):
+    n_players = state.positions.shape[0]
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    enabled = static.offensive_three_seconds_enabled.astype(jnp.bool_)
+    in_lane = _positions_in_lane(static, state.positions, static.offensive_lane_by_cell, jnp)
+    offense_mask = static.role_encoding > 0.0
+    updated_steps = jnp.where(
+        offense_mask & in_lane,
+        state.offense_lane_steps + 1.0,
+        jnp.zeros_like(state.offense_lane_steps),
+    )
+    updated_steps = jnp.where(enabled, updated_steps, state.offense_lane_steps)
+
+    has_ball = player_ids == state.ball_holder
+    threshold = static.three_second_max_steps
+    non_holder_violation = offense_mask & in_lane & (~has_ball) & (updated_steps >= threshold)
+    holder_violation = (
+        offense_mask
+        & in_lane
+        & has_ball
+        & (updated_steps > threshold)
+        & (actions != ActionType.SHOOT.value)
+    )
+    violation_mask = enabled & (non_holder_violation | holder_violation)
+    has_violation = jnp.any(violation_mask)
+    violating_player = jnp.argmax(violation_mask.astype(jnp.int32)).astype(jnp.int32)
+    turnover_from = jnp.where(
+        state.ball_holder >= 0,
+        state.ball_holder,
+        violating_player,
+    )
+    new_holder = jnp.where(
+        has_violation,
+        _turnover_to_defense_single(static, state.positions, turnover_from, jnp),
+        state.ball_holder,
+    )
+    next_state = _replace_state(
+        state,
+        ball_holder=new_holder,
+        offense_lane_steps=updated_steps,
+    )
+    return next_state, has_violation, jnp.where(has_violation, violating_player, jnp.asarray(-1, dtype=jnp.int32))
+
+
+def _apply_defensive_lane_rule_single(static: KernelStatic, state: KernelState, *, shot_active, jnp):
+    enabled = static.illegal_defense_enabled.astype(jnp.bool_) & (~shot_active)
+    n_players = state.positions.shape[0]
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    defense_mask = static.role_encoding < 0.0
+    in_lane = _positions_in_lane(static, state.positions, static.defensive_lane_by_cell, jnp)
+    guarding_by_defender = _defender_guarding_offense_mask(static, state.positions, jnp)
+    guarding = jnp.zeros((n_players,), dtype=jnp.bool_)
+    guarding = guarding.at[static.defense_ids].set(guarding_by_defender)
+    should_increment = defense_mask & in_lane & (~guarding)
+    updated_steps = jnp.where(
+        should_increment,
+        state.defense_lane_steps + 1.0,
+        jnp.zeros_like(state.defense_lane_steps),
+    )
+    updated_steps = jnp.where(enabled, updated_steps, state.defense_lane_steps)
+    violation_mask = enabled & should_increment & (updated_steps > static.three_second_max_steps)
+    has_violation = jnp.any(violation_mask)
+    violating_player = jnp.argmax(violation_mask.astype(jnp.int32)).astype(jnp.int32)
+    updated_steps = jnp.where(
+        has_violation & (player_ids == violating_player),
+        jnp.zeros_like(updated_steps),
+        updated_steps,
+    )
+    next_state = _replace_state(
+        state,
+        defense_lane_steps=updated_steps,
+        offense_score=state.offense_score + has_violation.astype(jnp.float32),
+    )
+    return next_state, has_violation, jnp.where(has_violation, violating_player, jnp.asarray(-1, dtype=jnp.int32))
 
 
 def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, key, jax, jnp):
@@ -997,6 +1292,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             assist_passer=no_player,
             turnover_player=no_player,
             turnover_reason=no_reason,
+            offensive_three_seconds=zero_flag,
+            defensive_lane_violation=zero_flag,
+            defensive_lane_violation_player=no_player,
         )
 
     def _run_active(_):
@@ -1049,6 +1347,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=no_player,
                 turnover_player=jnp.where(next_state.ball_holder >= 0, pressure_turnover_player, no_player),
                 turnover_reason=jnp.asarray(TURNOVER_REASON_DEFENDER_PRESSURE, dtype=jnp.int32),
+                offensive_three_seconds=zero_flag,
+                defensive_lane_violation=zero_flag,
+                defensive_lane_violation_player=no_player,
             )
 
         def _normal_step(_):
@@ -1270,9 +1571,48 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 ),
             )
 
+            (
+                final_state,
+                offensive_three_seconds_turnover,
+                offensive_three_seconds_player,
+            ) = jax.lax.cond(
+                shot_active | turnover_from_action,
+                lambda _: (
+                    final_state,
+                    jnp.asarray(False),
+                    no_player,
+                ),
+                lambda _: _apply_offensive_three_seconds_single(
+                    static,
+                    final_state,
+                    actions,
+                    jnp,
+                ),
+                operand=None,
+            )
+            (
+                final_state,
+                defensive_lane_violation,
+                defensive_lane_violation_player,
+            ) = _apply_defensive_lane_rule_single(
+                static,
+                final_state,
+                shot_active=shot_active,
+                jnp=jnp,
+            )
+            per_team_violation = static.violation_reward / static.offense_ids.shape[0]
+            rewards = rewards + (
+                jnp.where(offense_mask, per_team_violation, -per_team_violation)
+                * defensive_lane_violation.astype(jnp.float32)
+            )
+
             shot_clock_turnover = final_state.shot_clock <= 0
+            done = done | offensive_three_seconds_turnover | defensive_lane_violation
             turnover_event = (
-                turnover_from_action | movement_turnover | shot_clock_turnover
+                turnover_from_action
+                | movement_turnover
+                | offensive_three_seconds_turnover
+                | shot_clock_turnover
             ).astype(jnp.int8)
             turnover_player = jnp.where(
                 turnover_from_action,
@@ -1280,7 +1620,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 jnp.where(
                     movement_turnover,
                     movement_turnover_player,
-                    jnp.where(shot_clock_turnover, safe_holder, no_player),
+                    jnp.where(
+                        offensive_three_seconds_turnover,
+                        offensive_three_seconds_player,
+                        jnp.where(shot_clock_turnover, safe_holder, no_player),
+                    ),
                 ),
             )
             turnover_reason = jnp.where(
@@ -1290,9 +1634,13 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     movement_turnover,
                     jnp.asarray(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS, dtype=jnp.int32),
                     jnp.where(
-                        shot_clock_turnover,
-                        jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
-                        no_reason,
+                        offensive_three_seconds_turnover,
+                        jnp.asarray(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS, dtype=jnp.int32),
+                        jnp.where(
+                            shot_clock_turnover,
+                            jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
+                            no_reason,
+                        ),
                     ),
                 ),
             )
@@ -1347,6 +1695,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=event_assist_passer,
                 turnover_player=turnover_player,
                 turnover_reason=turnover_reason,
+                offensive_three_seconds=offensive_three_seconds_turnover.astype(jnp.int8),
+                defensive_lane_violation=defensive_lane_violation.astype(jnp.int8),
+                defensive_lane_violation_player=defensive_lane_violation_player,
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)

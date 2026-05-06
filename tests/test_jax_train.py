@@ -52,6 +52,46 @@ def test_jax_trainer_allows_skill_distribution_overrides():
     assert args.dunk_pct == 0.6
 
 
+def test_jax_trainer_allows_lane_rule_overrides():
+    args = parse_args(
+        [
+            "--illegal-defense-enabled",
+            "true",
+            "--offensive-three-seconds",
+            "true",
+        ]
+    )
+
+    validate_train_args(args)
+    assert args.illegal_defense_enabled is True
+    assert args.offensive_three_seconds is True
+
+
+def test_jax_trainer_attention_model_enables_set_obs():
+    args = parse_args(["--policy-model", "attention"])
+
+    validate_train_args(args)
+    assert args.policy_model == "attention"
+    assert args.use_set_obs is True
+
+
+def test_jax_trainer_validates_ppo_minibatches_divide_batch_size():
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--ppo-minibatches",
+            "3",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="ppo_batch_size=32"):
+        validate_train_args(args)
+
+
 def test_build_trainer_config_uses_training_args():
     args = parse_args(
         [
@@ -71,6 +111,8 @@ def test_build_trainer_config_uses_training_args():
             "0.02",
             "--learning-rate",
             "0.001",
+            "--ppo-minibatches",
+            "16",
         ]
     )
     validate_train_args(args)
@@ -84,6 +126,7 @@ def test_build_trainer_config_uses_training_args():
     assert config.value_coef == 0.7
     assert config.entropy_coef == 0.02
     assert config.learning_rate == 0.001
+    assert config.ppo_minibatches == 16
 
 
 def test_mlflow_params_include_jax_env_skill_stds():
@@ -161,6 +204,8 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     assert spec["trajectory_completed_passes_shape"] == [4, 4]
     assert spec["trajectory_assists_shape"] == [4, 4]
     assert spec["trajectory_turnovers_shape"] == [4, 4]
+    assert spec["trajectory_offensive_three_seconds_shape"] == [4, 4]
+    assert spec["trajectory_defensive_lane_violations_shape"] == [4, 4]
     assert spec["trajectory_terminal_episode_steps_shape"] == [4, 4]
     assert spec["trajectory_offense_score_delta_shape"] == [4, 4]
     assert spec["trajectory_defense_score_delta_shape"] == [4, 4]
@@ -173,6 +218,59 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     assert spec["ppo_batch_returns_shape"] == [16]
     assert result["ppo_update_updates_per_sec"] > 0.0
     assert "total_loss" in result["ppo_update_final_metrics"]
+
+
+def test_train_scaffold_supports_attention_policy_model():
+    pytest.importorskip("jax")
+
+    args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--action-head-mode",
+            "pointer_targeted",
+            "--attention-embed-dim",
+            "16",
+            "--attention-num-heads",
+            "4",
+            "--attention-token-mlp-dim",
+            "12",
+            "--attention-pi-head-hidden-dims",
+            "8",
+            "8",
+            "--attention-vf-head-hidden-dims",
+            "8",
+            "8",
+            "--attention-head-activation",
+            "relu",
+            "--kernel-batch-size",
+            "2",
+            "--warmup-iters",
+            "0",
+            "--benchmark-iters",
+            "1",
+            "--rollout-horizon",
+            "2",
+            "--ppo-minibatches",
+            "2",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_train_scaffold(args)
+
+    assert result["policy_spec"]["model_type"] == "attention"
+    assert result["policy_spec"]["action_head_mode"] == "pointer_targeted"
+    assert result["policy_spec"]["token_player_count"] == 6
+    assert result["policy_spec"]["token_dim"] == 15
+    assert result["policy_spec"]["global_dim"] == 4
+    assert result["policy_spec"]["attention_pi_head_hidden_dims"] == (8, 8)
+    assert result["policy_spec"]["attention_vf_head_hidden_dims"] == (8, 8)
+    assert result["policy_spec"]["attention_head_activation"] == "relu"
+    assert result["trainer_config"]["ppo_minibatches"] == 2
+    assert result["trajectory_spec"]["flat_obs_shape"] == [2, 95]
+    assert result["trajectory_spec"]["trajectory_flat_obs_shape"] == [2, 2, 95]
+    assert result["ppo_update_final_metrics"]["total_loss"] != 0.0
 
 
 def test_train_loop_emits_history_and_eval_dumps():
@@ -189,6 +287,8 @@ def test_train_loop_emits_history_and_eval_dumps():
             "2",
             "--policy-update-epochs",
             "1",
+            "--ppo-minibatches",
+            "2",
             "--log-every-updates",
             "1",
             "--eval-every-updates",
@@ -204,6 +304,7 @@ def test_train_loop_emits_history_and_eval_dumps():
     result = run_training_loop(args)
 
     assert result["status"] == "train_loop"
+    assert result["trainer_config"]["ppo_minibatches"] == 2
     assert set(result["training_player_ids"]) == {"offense", "defense"}
     assert len(result["train_history"]) == 2
     assert len(result["eval_trajectories"]) == 2
@@ -224,6 +325,16 @@ def test_train_loop_emits_history_and_eval_dumps():
         -result["final_metrics"]["defense_learner_mean_reward"]
     )
     assert result["final_metrics"]["steps_per_update"] == 32
+    assert result["final_metrics"]["ppo_batch_size"] == 32
+    assert result["final_metrics"]["ppo_update_epochs"] == 1
+    assert result["final_metrics"]["ppo_update_minibatches"] == 2
+    assert result["final_metrics"]["ppo_update_minibatch_size"] == 16
+    assert result["final_metrics"]["rollout_time_pct"] > 0.0
+    assert result["final_metrics"]["ppo_update_time_pct"] > 0.0
+    assert result["final_metrics"]["rollout_time_pct"] + result["final_metrics"]["ppo_update_time_pct"] == pytest.approx(
+        100.0
+    )
+    assert result["final_metrics"]["ppo_update_optimizer_samples_per_sec"] > 0.0
     assert result["final_metrics"]["approx_kl"] > 0.0
     assert result["final_metrics"]["mean_abs_log_ratio"] > 0.0
     assert result["final_metrics"]["max_abs_log_ratio"] > 0.0
@@ -232,6 +343,8 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert "mean_pass_attempts_per_completed_episode" in result["final_metrics"]
     assert "mean_assists_per_completed_episode" in result["final_metrics"]
     assert "mean_turnovers_per_completed_episode" in result["final_metrics"]
+    assert "total_offensive_three_seconds" in result["final_metrics"]
+    assert "total_defensive_lane_violations" in result["final_metrics"]
     first_eval = result["eval_trajectories"][0]
     assert first_eval["training_role"] in {"offense", "defense"}
     assert first_eval["trajectory_length"] == 4
@@ -241,6 +354,8 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert first_eval["completed_passes"].shape == (4,)
     assert first_eval["assists"].shape == (4,)
     assert first_eval["turnovers"].shape == (4,)
+    assert first_eval["offensive_three_seconds"].shape == (4,)
+    assert first_eval["defensive_lane_violations"].shape == (4,)
     assert first_eval["terminal_episode_steps"].shape == (4,)
 
 

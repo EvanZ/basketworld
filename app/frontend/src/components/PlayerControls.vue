@@ -2841,7 +2841,9 @@ function isDevTabVisible(tabId) {
   if (tabId === 'advisor') return caps.mcts !== false;
   if (tabId === 'playbook') return caps.playbook !== false;
   if (tabId === 'attention') return caps.attention !== false;
-  if (tabId === 'environment' || tabId === 'training') return caps.env_training_tabs !== false;
+  if (tabId === 'environment' || tabId === 'training' || tabId === 'phi') {
+    return caps.env_training_tabs !== false;
+  }
   if (tabId === 'observation') return caps.observation_panel !== false;
   if (tabId === 'eval') return caps.eval !== false;
   if (tabId === 'jax') return isJaxModel.value;

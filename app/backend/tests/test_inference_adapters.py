@@ -5,10 +5,13 @@ from pathlib import Path
 import app.backend.inference_adapters as adapters
 from app.backend.inference_adapters import (
     InferencePolicyAdapter,
+    JAXInferenceAdapter,
     SB3PPOInferenceAdapter,
     get_policy_backend_kind,
     get_policy_capabilities,
     get_policy_metadata,
+    policy_observation_tokens,
+    policy_attention_payload,
     policy_action_probabilities,
     prepare_policy_for_role,
     unwrap_inference_model,
@@ -32,6 +35,31 @@ class _FakeRawModel:
     def predict(self, obs, deterministic: bool = False):
         self.predict_calls.append((obs, bool(deterministic)))
         return [1, 2, 3], None
+
+
+class _FakeJAXRawModel:
+    def __init__(self, model_type: str):
+        self.metadata = {"policy_spec": {"model_type": model_type}}
+        self.attention_payload_calls = []
+
+    def predict(self, obs, deterministic: bool = False):
+        return [0], None
+
+    def action_probabilities(self, obs):
+        return [[1.0]]
+
+    def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
+        return None
+
+    def observation_vector(self, env, *, observer_is_offense: bool):
+        return [0.0]
+
+    def observation_tokens(self, env, *, observer_is_offense: bool):
+        return {"globals": [0.5], "globals_labels": ["shot_clock_norm"]}
+
+    def attention_payload(self, env, *, observer_is_offense: bool):
+        self.attention_payload_calls.append((env, bool(observer_is_offense)))
+        return {"weights_avg": [[1.0]], "weights_heads": [[[1.0]]], "labels": ["T0"], "heads": 1}
 
 
 class _FakeCustomAdapter(InferencePolicyAdapter):
@@ -75,6 +103,32 @@ def test_adapter_unwrap_and_capabilities_helpers():
     assert capabilities is not None
     assert capabilities["player_controls"] is True
     assert capabilities["attention"] is True
+
+
+def test_jax_adapter_enables_attention_only_for_attention_checkpoints():
+    env = object()
+    attention_raw = _FakeJAXRawModel("attention")
+    attention_adapter = JAXInferenceAdapter(attention_raw)
+    mlp_adapter = JAXInferenceAdapter(_FakeJAXRawModel("mlp"))
+
+    assert get_policy_capabilities(attention_adapter)["attention"] is True
+    assert get_policy_capabilities(mlp_adapter)["attention"] is False
+    assert policy_attention_payload(
+        attention_adapter,
+        env,
+        observer_is_offense=False,
+    ) == {"weights_avg": [[1.0]], "weights_heads": [[[1.0]]], "labels": ["T0"], "heads": 1}
+    assert policy_observation_tokens(
+        attention_adapter,
+        env,
+        observer_is_offense=False,
+    ) == {"globals": [0.5], "globals_labels": ["shot_clock_norm"]}
+    assert attention_raw.attention_payload_calls == [(env, False)]
+    assert policy_attention_payload(
+        mlp_adapter,
+        env,
+        observer_is_offense=True,
+    ) is None
 
 
 def test_helper_dispatch_uses_adapter_surface():

@@ -9,8 +9,8 @@ from basketworld_jax.env import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_aggregated_reward_batch,
-    build_flat_observation_batch,
-    build_flat_observation_batch_with_role_flag,
+    build_policy_observation_batch,
+    build_policy_observation_batch_with_role_flag,
     replace_done_states,
     reset_batch_minimal,
     resolve_team_player_ids,
@@ -102,7 +102,12 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         def _scan_step(carry, _):
             state, key = carry
             key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
-            flat_obs = build_flat_observation_batch(static, state, jnp)
+            flat_obs = build_policy_observation_batch(
+                static,
+                state,
+                jnp,
+                model_type=spec.model_type,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -156,6 +161,8 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
                 defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
@@ -168,7 +175,12 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             xs=None,
             length=int(horizon),
         )
-        final_flat_obs = build_flat_observation_batch(static, final_state, jnp)
+        final_flat_obs = build_policy_observation_batch(
+            static,
+            final_state,
+            jnp,
+            model_type=spec.model_type,
+        )
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
         return RolloutOutput(
@@ -190,12 +202,18 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         def _scan_step(carry, _):
             state, key = carry
             key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
-            flat_obs = build_flat_observation_batch(static, state, jnp)
-            opponent_flat_obs = build_flat_observation_batch_with_role_flag(
+            flat_obs = build_policy_observation_batch(
+                static,
+                state,
+                jnp,
+                model_type=spec.model_type,
+            )
+            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
                 -static.training_role_flag,
                 jnp,
+                model_type=spec.model_type,
             )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
@@ -253,6 +271,8 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
                 defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
@@ -265,7 +285,12 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             xs=None,
             length=int(horizon),
         )
-        final_flat_obs = build_flat_observation_batch(static, final_state, jnp)
+        final_flat_obs = build_policy_observation_batch(
+            static,
+            final_state,
+            jnp,
+            model_type=spec.model_type,
+        )
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
         return RolloutOutput(
@@ -335,12 +360,18 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         def _scan_step(carry, _):
             state, key = carry
             key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
-            flat_obs = build_flat_observation_batch(static, state, jnp)
-            opponent_flat_obs = build_flat_observation_batch_with_role_flag(
+            flat_obs = build_policy_observation_batch(
+                static,
+                state,
+                jnp,
+                model_type=spec.model_type,
+            )
+            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
                 -static.training_role_flag,
                 jnp,
+                model_type=spec.model_type,
             )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
@@ -394,6 +425,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
                 defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
@@ -406,7 +439,12 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             xs=None,
             length=int(horizon),
         )
-        final_flat_obs = build_flat_observation_batch(static, final_state, jnp)
+        final_flat_obs = build_policy_observation_batch(
+            static,
+            final_state,
+            jnp,
+            model_type=spec.model_type,
+        )
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
         return RolloutOutput(
@@ -434,7 +472,12 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
 
             forward_out = actor_critic_forward(
                 params,
-                build_flat_observation_batch(static, state, jnp),
+                build_policy_observation_batch(
+                    static,
+                    state,
+                    jnp,
+                    model_type=spec.model_type,
+                ),
                 spec,
                 jnp,
             )
@@ -479,6 +522,8 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
@@ -510,7 +555,12 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
 
             forward_out = actor_critic_forward(
                 params,
-                build_flat_observation_batch(static, state, jnp),
+                build_policy_observation_batch(
+                    static,
+                    state,
+                    jnp,
+                    model_type=spec.model_type,
+                ),
                 spec,
                 jnp,
             )
@@ -523,11 +573,12 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
             )
             opponent_out = run_actor_critic(
                 opponent_params,
-                build_flat_observation_batch_with_role_flag(
+                build_policy_observation_batch_with_role_flag(
                     static,
                     state,
                     -static.training_role_flag,
                     jnp,
+                    model_type=spec.model_type,
                 ),
                 opponent_action_mask,
                 spec,
@@ -563,6 +614,8 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
@@ -642,7 +695,12 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
 
             forward_out = actor_critic_forward(
                 params,
-                build_flat_observation_batch(static, state, jnp),
+                build_policy_observation_batch(
+                    static,
+                    state,
+                    jnp,
+                    model_type=spec.model_type,
+                ),
                 spec,
                 jnp,
             )
@@ -654,11 +712,12 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 jnp,
             )
             opponent_actions = _sample_grouped_opponent_actions(
-                build_flat_observation_batch_with_role_flag(
+                build_policy_observation_batch_with_role_flag(
                     static,
                     state,
                     -static.training_role_flag,
                     jnp,
+                    model_type=spec.model_type,
                 ),
                 opponent_action_mask,
                 opponent_key,
@@ -691,6 +750,8 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
+                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
@@ -715,6 +776,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
     value_coef = jnp.asarray(trainer_config.value_coef, dtype=jnp.float32)
     entropy_coef = jnp.asarray(trainer_config.entropy_coef, dtype=jnp.float32)
     epochs = int(trainer_config.policy_update_epochs)
+    configured_minibatches = max(1, int(getattr(trainer_config, "ppo_minibatches", 1)))
     transform = build_adam_transform(
         optax,
         learning_rate=float(trainer_config.learning_rate),
@@ -782,8 +844,23 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         }
         return new_params, new_opt_state, metrics
 
-    @jax.jit
-    def _runner(params, opt_state, batch):
+    def _mean_metrics(metric_steps):
+        return {
+            name: jnp.mean(values)
+            for name, values in metric_steps.items()
+        }
+
+    def _take_minibatch(batch: PPOBatch, indices):
+        return PPOBatch(
+            *(
+                jnp.take(getattr(batch, field), indices, axis=0)
+                for field in PPOBatch._fields
+            )
+        )
+
+    def _full_batch_runner(params, opt_state, batch, update_key):
+        del update_key
+
         def _epoch_step(carry, _):
             epoch_params, epoch_opt_state = carry
             next_params, next_opt_state, metrics = _single_epoch(epoch_params, epoch_opt_state, batch)
@@ -797,6 +874,77 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         )
         final_metrics = {name: values[-1] for name, values in metrics.items()}
         return next_params, next_opt_state, final_metrics
+
+    def _build_minibatch_runner(batch_size: int, minibatches: int):
+        if minibatches <= 1:
+            return _full_batch_runner
+        if minibatches > batch_size:
+            raise ValueError(
+                "PPO minibatch count must not exceed the compiled PPO batch size: "
+                f"batch_size={batch_size}, ppo_minibatches={minibatches}."
+            )
+        if batch_size % minibatches != 0:
+            raise ValueError(
+                "PPO minibatch count must evenly divide the compiled PPO batch size: "
+                f"batch_size={batch_size}, ppo_minibatches={minibatches}."
+            )
+        minibatch_count = int(minibatches)
+        minibatch_size = batch_size // minibatch_count
+
+        def _minibatch_runner(params, opt_state, batch, update_key):
+            def _epoch_step(carry, epoch_index):
+                epoch_params, epoch_opt_state, epoch_key = carry
+                epoch_key = jax.random.fold_in(epoch_key, epoch_index)
+                permutation = jax.random.permutation(
+                    epoch_key,
+                    jnp.arange(batch_size, dtype=jnp.int32),
+                )
+                minibatch_indices = permutation.reshape(minibatch_count, minibatch_size)
+
+                def _minibatch_step(mini_carry, indices):
+                    mini_params, mini_opt_state = mini_carry
+                    minibatch = _take_minibatch(batch, indices)
+                    next_params, next_opt_state, metrics = _single_epoch(
+                        mini_params,
+                        mini_opt_state,
+                        minibatch,
+                    )
+                    return (next_params, next_opt_state), metrics
+
+                (next_params, next_opt_state), minibatch_metrics = jax.lax.scan(
+                    _minibatch_step,
+                    (epoch_params, epoch_opt_state),
+                    minibatch_indices,
+                )
+                return (next_params, next_opt_state, epoch_key), _mean_metrics(minibatch_metrics)
+
+            (next_params, next_opt_state, _), epoch_metrics = jax.lax.scan(
+                _epoch_step,
+                (params, opt_state, update_key),
+                jnp.arange(epochs, dtype=jnp.int32),
+            )
+            final_metrics = {name: values[-1] for name, values in epoch_metrics.items()}
+            return next_params, next_opt_state, final_metrics
+
+        return _minibatch_runner
+
+    compiled_batch_size: int | None = None
+    compiled_runner = None
+
+    def _runner(params, opt_state, batch, update_key):
+        nonlocal compiled_batch_size, compiled_runner
+        batch_size = int(batch.flat_obs.shape[0])
+        if compiled_batch_size is None:
+            compiled_batch_size = batch_size
+            compiled_runner = jax.jit(
+                _build_minibatch_runner(batch_size, configured_minibatches)
+            )
+        elif compiled_batch_size != batch_size:
+            raise ValueError(
+                "PPO update runner was called with a different batch size than it was compiled for: "
+                f"expected {compiled_batch_size}, got {batch_size}."
+            )
+        return compiled_runner(params, opt_state, batch, update_key)
 
     return _runner, transform
 
@@ -837,14 +985,20 @@ def benchmark_compiled_rollout(jax, runner, static, state, params, rollout_key, 
     }, final_out
 
 
-def benchmark_update_runner(jax, runner, params, opt_state, batch, *, iterations: int, progress=None):
+def benchmark_update_runner(jax, runner, params, opt_state, batch, update_key, *, iterations: int, progress=None):
     timed_ns = 0
     final_params = params
     final_opt_state = opt_state
     final_metrics = None
-    for _ in range(int(iterations)):
+    for idx in range(int(iterations)):
+        iter_key = jax.random.fold_in(update_key, idx)
         start_ns = perf_counter_ns()
-        final_params, final_opt_state, final_metrics = runner(final_params, final_opt_state, batch)
+        final_params, final_opt_state, final_metrics = runner(
+            final_params,
+            final_opt_state,
+            batch,
+            iter_key,
+        )
         block_until_ready_tree((final_params, final_opt_state, final_metrics))
         timed_ns += perf_counter_ns() - start_ns
         if progress is not None:
@@ -916,16 +1070,26 @@ def summarize_training_step(
     batch_size: int,
     horizon: int,
     update_index: int,
+    policy_update_epochs: int = 1,
+    ppo_minibatches: int = 1,
 ) -> dict[str, Any]:
     total_states = int(batch_size) * int(horizon)
+    ppo_batch_size = int(ppo_batch.flat_obs.shape[0])
     rollout_sec = max(rollout_elapsed_ns / 1e9, 1e-12)
     update_sec = max(update_elapsed_ns / 1e9, 1e-12)
     end_to_end_sec = max((rollout_elapsed_ns + update_elapsed_ns) / 1e9, 1e-12)
+    rollout_time_fraction = float(rollout_sec / end_to_end_sec)
+    update_time_fraction = float(update_sec / end_to_end_sec)
+    optimizer_sample_count = int(ppo_batch_size * max(1, int(policy_update_epochs)))
+    minibatch_count = max(1, int(ppo_minibatches))
+    minibatch_size = int(ppo_batch_size // minibatch_count) if ppo_batch_size % minibatch_count == 0 else 0
     reward_mean = float(np.asarray(rollout_out.trajectory.rewards).mean())
     done_rate = float(np.asarray(rollout_out.trajectory.dones).mean())
     advantage_std = float(np.asarray(ppo_batch.advantages).std())
     return_mean = float(np.asarray(ppo_batch.returns).mean())
     value_mean = float(np.asarray(rollout_out.trajectory.values).mean())
+    offensive_three_seconds_total = int(np.asarray(rollout_out.trajectory.offensive_three_seconds).sum())
+    defensive_lane_violation_total = int(np.asarray(rollout_out.trajectory.defensive_lane_violations).sum())
     episode_metrics = summarize_episode_events(
         rollout_out.trajectory.dones,
         rollout_out.trajectory.terminal_episode_steps,
@@ -937,16 +1101,33 @@ def summarize_training_step(
     summary = {
         "update_index": int(update_index),
         "steps_per_update": int(total_states),
+        "ppo_batch_size": int(ppo_batch_size),
+        "ppo_update_epochs": int(max(1, int(policy_update_epochs))),
+        "ppo_update_minibatches": int(minibatch_count),
+        "ppo_update_minibatch_size": int(minibatch_size),
+        "ppo_update_optimizer_samples": int(optimizer_sample_count),
+        "end_to_end_latency_ms": float((rollout_elapsed_ns + update_elapsed_ns) / 1e6),
+        "rollout_elapsed_sec": float(rollout_sec),
+        "ppo_update_elapsed_sec": float(update_sec),
+        "end_to_end_elapsed_sec": float(end_to_end_sec),
+        "rollout_time_fraction": rollout_time_fraction,
+        "ppo_update_time_fraction": update_time_fraction,
+        "rollout_time_pct": float(100.0 * rollout_time_fraction),
+        "ppo_update_time_pct": float(100.0 * update_time_fraction),
         "rollout_states_per_sec": float(total_states / rollout_sec),
         "end_to_end_steps_per_sec": float(total_states / end_to_end_sec),
         "rollout_latency_ms": float(rollout_elapsed_ns / 1e6),
         "update_steps_per_sec": float(1.0 / update_sec),
         "update_latency_ms": float(update_elapsed_ns / 1e6),
+        "ppo_update_rollout_samples_per_sec": float(ppo_batch_size / update_sec),
+        "ppo_update_optimizer_samples_per_sec": float(optimizer_sample_count / update_sec),
         "mean_reward": reward_mean,
         "done_rate": done_rate,
         "mean_return": return_mean,
         "mean_value": value_mean,
         "advantage_std": advantage_std,
+        "total_offensive_three_seconds": offensive_three_seconds_total,
+        "total_defensive_lane_violations": defensive_lane_violation_total,
     }
     summary.update(episode_metrics)
     summary.update({key: float(value) for key, value in update_metrics.items()})
@@ -970,6 +1151,8 @@ def serialize_eval_trace(
     completed_passes = np.asarray(trace.completed_passes)
     assists = np.asarray(trace.assists)
     turnovers = np.asarray(trace.turnovers)
+    offensive_three_seconds = np.asarray(trace.offensive_three_seconds)
+    defensive_lane_violations = np.asarray(trace.defensive_lane_violations)
     terminal_episode_steps = np.asarray(trace.terminal_episode_steps)
     offense_score = np.asarray(trace.offense_score)
     defense_score = np.asarray(trace.defense_score)
@@ -989,6 +1172,8 @@ def serialize_eval_trace(
         "completed_passes": completed_passes[:, env_index].astype(np.int8),
         "assists": assists[:, env_index].astype(np.int8),
         "turnovers": turnovers[:, env_index].astype(np.int8),
+        "offensive_three_seconds": offensive_three_seconds[:, env_index].astype(np.int8),
+        "defensive_lane_violations": defensive_lane_violations[:, env_index].astype(np.int8),
         "terminal_episode_steps": terminal_episode_steps[:, env_index].astype(np.int32),
         "offense_score": offense_score[:, env_index].astype(np.float32),
         "defense_score": defense_score[:, env_index].astype(np.float32),

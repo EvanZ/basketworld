@@ -10,7 +10,8 @@ from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     build_action_masks_batch,
     build_kernel_static_from_env,
-    build_flat_observation_batch,
+    build_policy_observation_batch,
+    build_token_observation_components_batch,
     snapshot_state_from_env,
     stack_state_snapshots,
 )
@@ -61,13 +62,17 @@ class JAXInferenceModel:
         @self.jax.jit
         def _runner(params, flat_obs, team_action_mask):
             forward_out = actor_critic_forward(params, flat_obs, self.spec, self.jnp)
-            return apply_action_mask(
+            masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
                 team_action_mask,
                 self.spec,
                 self.jax,
                 self.jnp,
             )
+            return {
+                **masked_out,
+                "attention_weights": forward_out["attention_weights"],
+            }
 
         return _runner
 
@@ -137,7 +142,12 @@ class JAXInferenceModel:
 
         static = self._build_static_for_role(env, observer_is_offense)
         state = self._state_from_snapshot(snapshot)
-        flat_obs = build_flat_observation_batch(static, state, self.jnp)
+        flat_obs = build_policy_observation_batch(
+            static,
+            state,
+            self.jnp,
+            model_type=self.spec.model_type,
+        )
         full_action_mask = build_action_masks_batch(static, state, self.jnp)
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
         team_action_mask = self.jnp.take(full_action_mask, team_ids, axis=1)
@@ -152,8 +162,36 @@ class JAXInferenceModel:
         base_env = self._resolve_base_env(env)
         static = self._build_static_for_role(env, observer_is_offense)
         state = self._state_from_snapshot(snapshot_state_from_env(base_env))
-        flat_obs = build_flat_observation_batch(static, state, self.jnp)
+        flat_obs = build_policy_observation_batch(
+            static,
+            state,
+            self.jnp,
+            model_type=self.spec.model_type,
+        )
         return np.asarray(self.jax.device_get(flat_obs[0]), dtype=np.float32)
+
+    def observation_tokens(self, env, *, observer_is_offense: bool):
+        if str(self.spec.model_type) != "attention":
+            return None
+        base_env = self._resolve_base_env(env)
+        static = self._build_static_for_role(env, observer_is_offense)
+        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        players, globals_vec, _ = build_token_observation_components_batch(
+            static,
+            state,
+            static.training_role_flag,
+            self.jnp,
+        )
+        return {
+            "players": np.asarray(self.jax.device_get(players[0]), dtype=np.float32),
+            "globals": np.asarray(self.jax.device_get(globals_vec[0]), dtype=np.float32),
+            "globals_labels": [
+                "shot_clock_norm",
+                "pressure_exposure",
+                "hoop_q_norm",
+                "hoop_r_norm",
+            ],
+        }
 
     def predict(self, obs=None, deterministic: bool = False):
         if self._prepared_env is None:
@@ -184,6 +222,57 @@ class JAXInferenceModel:
         )
         probs = np.asarray(self.jax.device_get(masked_out["probs"][0]), dtype=np.float32)
         return [probs[idx] for idx in range(probs.shape[0])]
+
+    def attention_payload(self, env, *, observer_is_offense: bool):
+        if str(self.spec.model_type) != "attention":
+            return None
+        masked_out = self._team_outputs(env, bool(observer_is_offense))
+        weights_device = masked_out.get("attention_weights")
+        if weights_device is None:
+            return None
+        weights = np.asarray(self.jax.device_get(weights_device[0]), dtype=np.float32)
+        if weights.ndim != 3 or weights.shape[0] <= 0 or weights.shape[1] <= 0:
+            return None
+
+        base_env = self._resolve_base_env(env)
+        offense_ids = set(int(pid) for pid in getattr(base_env, "offense_ids", []) or [])
+        defense_ids = set(int(pid) for pid in getattr(base_env, "defense_ids", []) or [])
+        labels: list[str] = []
+        for pid in range(int(self.spec.token_player_count)):
+            if pid in offense_ids:
+                labels.append(f"O{pid}")
+            elif pid in defense_ids:
+                labels.append(f"D{pid}")
+            else:
+                labels.append(f"P{pid}")
+
+        cls_labels: list[str] = []
+        cls_count = int(self.spec.attention_num_cls_tokens)
+        if cls_count >= 1:
+            cls_labels.append("CLS_OFF")
+        if cls_count >= 2:
+            cls_labels.append("CLS_DEF")
+        for idx in range(2, cls_count):
+            cls_labels.append(f"CLS_{idx + 1}")
+        labels.extend(cls_labels)
+
+        token_count = int(weights.shape[-1])
+        if len(labels) != token_count:
+            labels = [f"T{idx}" for idx in range(token_count)]
+            cls_labels = []
+
+        return {
+            "weights_avg": weights.mean(axis=0).tolist(),
+            "weights_heads": weights.tolist(),
+            "labels": labels,
+            "heads": int(weights.shape[0]),
+            "runtime_intent_index": 0,
+            "runtime_intent_active": False,
+            "runtime_intent_visible": True,
+            "runtime_intent_gate": False,
+            "observer_role": "offense" if bool(observer_is_offense) else "defense",
+            "cls_labels": cls_labels,
+        }
 
 
 def load_inference_model(path: str | Path) -> JAXInferenceModel:

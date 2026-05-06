@@ -274,7 +274,7 @@ Purpose:
 
 Primary tasks:
 
-- port the flat MLP policy/value network to Flax if not already done
+- keep the flat MLP policy/value network available as a stable baseline
 - add set-observation support
 - add a Flax set-attention encoder
 - add pointer-targeted action head support under the JAX-native sampling path
@@ -289,6 +289,114 @@ Exit criteria:
 - pointer-targeted action semantics work on device
 
 This is the point where the reduced stack starts to resemble the current model class more closely.
+
+Current status:
+
+- the trainer now supports `--policy-model attention` alongside the default `--policy-model mlp`
+- attention mode uses packed JAX-native set observations: player tokens plus global features plus role flag
+- the token layout mirrors the production set-observation wrapper: 15 per-player features and 4 global features
+- the Flax actor-critic now has a shared token MLP, learned CLS tokens, self-attention, role-selected player action heads, and role-selected value heads
+- attention mode now supports configurable post-attention PI/VF token-head MLPs through `--attention-pi-head-hidden-dims`, `--attention-vf-head-hidden-dims`, and `--attention-head-activation`
+- the checkpointed dev launch is set to the production-style parity cost: 64-dim attention, 4 heads, 2 CLS tokens, 4x64 ReLU PI head, and 4x64 ReLU VF head
+- rollout, PPO update, checkpointing, inference loading, and native eval route through the checkpoint `policy_spec["model_type"]`
+- attention mode now supports a JAX-native pointer-targeted action head through `--action-head-mode pointer_targeted`
+- the pointer-targeted head factorizes pass decisions into non-pass action type vs `PASS`, then learned teammate slot logits, while still emitting the existing final action ids for rollout, PPO, eval, and UI compatibility
+
+## Environment Parity
+
+Purpose:
+
+- restore production-relevant rules while keeping the JAX rollout loop compiled
+
+Current status:
+
+- JAX reset/step now supports active offensive three-seconds counters and turnovers
+- JAX reset/step now supports active illegal-defense lane counters, guard-distance reset behavior, defensive lane violations, technical point assignment, and violation rewards
+- lane config is now logged with JAX run metadata:
+  - `illegal_defense_enabled`
+  - `offensive_three_seconds`
+  - `three_second_lane_width`
+  - `three_second_lane_height`
+  - `three_second_max_steps`
+  - `violation_reward`
+- the checkpointed dev launch now enables both lane-rule families for more honest parity/performance measurement
+
+Remaining environment parity gaps:
+
+- start-template resets/curricula
+- phi shaping
+- advanced intent/template hooks
+- richer Python-env `action_results` diagnostics
+
+## GPU Viability Test
+
+Purpose:
+
+- determine whether attention training is viable when the PPO update runs on GPU instead of CPU
+
+Current finding:
+
+- attention rollout is not the main bottleneck
+- attention PPO update/backprop over the full rollout batch is the dominant CPU cost
+- with the current full-batch PPO update, each update can contain roughly `2 * kernel_batch_size * rollout_horizon` samples
+- for `kernel_batch_size=4096` and `rollout_horizon=128`, that is `1,048,576` samples before multiplying by `policy_update_epochs`
+
+Expected GPU behavior:
+
+- no JAX code change should be required for a single-GPU test if CUDA-enabled JAX is installed
+- JAX should choose the GPU backend automatically when the GPU is visible and the installed `jaxlib` supports CUDA
+- the test should verify `jax.default_backend()` and `jax.devices()` before training
+- the important comparison metrics are:
+  - `rollout_latency_ms`
+  - `update_latency_ms`
+  - `end_to_end_steps_per_sec`
+- a successful GPU test should show `update_latency_ms` dropping materially for attention runs
+
+Setup notes:
+
+- install a CUDA-enabled JAX wheel in the training environment, for example `jax[cuda13]` or `jax[cuda12]`
+- use `nvidia-smi` to verify the EC2 GPU and driver
+- use a single GPU first; the current trainer is not designed to automatically shard one run across multiple GPUs
+
+Decision rule:
+
+- if GPU reduces attention update latency enough to restore acceptable end-to-end throughput, continue with attention parity work
+- if GPU does not materially improve the update bottleneck, revisit PPO minibatching, smaller attention dimensions, or delayed attention adoption
+
+## PPO Minibatching
+
+Purpose:
+
+- reduce the cost and memory pressure of attention PPO updates without changing rollout semantics
+
+Current implementation:
+
+- the trainer now supports `--ppo-minibatches`
+- `--ppo-minibatches 1` preserves the original full-batch PPO update
+- values greater than 1 shuffle the PPO batch with a JAX PRNG key and scan over minibatches inside the compiled update path
+- minibatch count must evenly divide the compiled PPO batch size
+- the effective PPO batch size is:
+  - train loop: `2 * kernel_batch_size * rollout_horizon`
+  - scaffold: `kernel_batch_size * rollout_horizon`
+
+Why this matters:
+
+- full-batch PPO was acceptable for the MLP policy
+- attention made the full-batch backward pass the dominant CPU cost
+- standard PPO usually trains from shuffled minibatches rather than one giant full-batch gradient
+
+Suggested starting points:
+
+- CPU attention smoke runs: `--ppo-minibatches 16`
+- larger batches per minibatch: `8`
+- smaller batches per minibatch: `32` or `64`
+- keep `--policy-update-epochs 1` initially while measuring speed and learning behavior
+
+Decision rule:
+
+- if minibatching preserves or improves throughput and learning signal, keep it as the default for attention runs
+- if minibatching slows CPU but improves GPU utilization, keep it as a GPU-oriented option
+- if learning quality requires multiple epochs, tune minibatch count before increasing full-batch update cost again
 
 ## Self-Play Parity
 
