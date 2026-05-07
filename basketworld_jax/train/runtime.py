@@ -12,6 +12,8 @@ from basketworld_jax.env import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_aggregated_reward_batch,
+    build_policy_intent_context_batch,
+    build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch,
     build_policy_observation_batch_with_role_flag,
     replace_done_states,
@@ -83,7 +85,7 @@ def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> Rollo
 
 def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
     @jax.jit
-    def _runner(params, flat_obs, action_mask, sample_key):
+    def _runner(params, flat_obs, action_mask, intent_context, sample_key):
         return run_actor_critic(
             params,
             flat_obs,
@@ -92,6 +94,7 @@ def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
             sample_key,
             jax,
             jnp,
+            intent_context=intent_context,
         )
 
     return _runner
@@ -127,6 +130,26 @@ def _build_shot_type_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     }
 
 
+def _build_intent_transition_metrics(state) -> dict[str, Any]:
+    return {
+        "intent_index": state.intent_index.astype(state.intent_index.dtype),
+        "intent_active": state.intent_active.astype(state.intent_active.dtype),
+        "intent_age": state.intent_age.astype(state.intent_age.dtype),
+        "intent_commitment_remaining": state.intent_commitment_remaining.astype(
+            state.intent_commitment_remaining.dtype
+        ),
+        "intent_visible_to_defense": state.intent_visible_to_defense.astype(
+            state.intent_visible_to_defense.dtype
+        ),
+        "defense_intent_index": state.defense_intent_index.astype(state.defense_intent_index.dtype),
+        "defense_intent_active": state.defense_intent_active.astype(state.defense_intent_active.dtype),
+        "defense_intent_age": state.defense_intent_age.astype(state.defense_intent_age.dtype),
+        "defense_intent_commitment_remaining": state.defense_intent_commitment_remaining.astype(
+            state.defense_intent_commitment_remaining.dtype
+        ),
+    }
+
+
 def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
     def _runner(static, initial_state, params, rollout_key, horizon: int):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
@@ -141,6 +164,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 model_type=spec.model_type,
             )
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -153,6 +177,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
             )
             opponent_actions = sample_uniform_legal_actions_jax(
                 opponent_action_mask,
@@ -184,6 +209,8 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
+                policy_intent_index=policy_intent_context["intent_index"],
+                policy_intent_gate=policy_intent_context["intent_gate"],
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
@@ -196,6 +223,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -216,8 +244,15 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             jnp,
             model_type=spec.model_type,
         )
+        final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
+        bootstrap_values = actor_critic_forward(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+            intent_context=final_intent_context,
+        )["values"]
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
@@ -250,6 +285,13 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
                 model_type=spec.model_type,
             )
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -262,6 +304,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
             )
             opponent_out = run_actor_critic(
                 opponent_params,
@@ -271,6 +314,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 opponent_key,
                 jax,
                 jnp,
+                intent_context=opponent_intent_context,
             )
             full_actions = assemble_full_actions_jax(
                 policy_out["sampled_actions"],
@@ -296,6 +340,8 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
+                policy_intent_index=policy_intent_context["intent_index"],
+                policy_intent_gate=policy_intent_context["intent_gate"],
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
@@ -308,6 +354,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -328,8 +375,15 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             jnp,
             model_type=spec.model_type,
         )
+        final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
+        bootstrap_values = actor_critic_forward(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+            intent_context=final_intent_context,
+        )["values"]
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
@@ -357,7 +411,12 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         batch_size = int(initial_state.positions.shape[0])
         group_size = batch_size // group_count
 
-        def _sample_grouped_opponent_actions(opponent_flat_obs, opponent_action_mask, key):
+        def _sample_grouped_opponent_actions(
+            opponent_flat_obs,
+            opponent_action_mask,
+            opponent_intent_context,
+            key,
+        ):
             grouped_obs = opponent_flat_obs.reshape(
                 group_count,
                 group_size,
@@ -369,9 +428,13 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 int(opponent_action_mask.shape[-2]),
                 int(opponent_action_mask.shape[-1]),
             )
+            grouped_intent_context = {
+                name: value.reshape(group_count, group_size)
+                for name, value in opponent_intent_context.items()
+            }
             group_keys = jax.random.split(key, group_count)
 
-            def _run_group(group_params, group_obs, group_mask, group_key):
+            def _run_group(group_params, group_obs, group_mask, group_intent_context, group_key):
                 group_out = run_actor_critic(
                     group_params,
                     group_obs,
@@ -380,6 +443,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     group_key,
                     jax,
                     jnp,
+                    intent_context=group_intent_context,
                 )
                 return group_out["sampled_actions"]
 
@@ -387,6 +451,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 opponent_params_by_group,
                 grouped_obs,
                 grouped_mask,
+                grouped_intent_context,
                 group_keys,
             )
             return grouped_actions.reshape(
@@ -410,6 +475,13 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 jnp,
                 model_type=spec.model_type,
             )
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -422,10 +494,12 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
             )
             opponent_actions = _sample_grouped_opponent_actions(
                 opponent_flat_obs,
                 opponent_action_mask,
+                opponent_intent_context,
                 opponent_key,
             )
             full_actions = assemble_full_actions_jax(
@@ -452,6 +526,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             transition = TrajectoryBatch(
                 flat_obs=flat_obs,
+                policy_intent_index=policy_intent_context["intent_index"],
+                policy_intent_gate=policy_intent_context["intent_gate"],
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
@@ -464,6 +540,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -484,8 +561,15 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             jnp,
             model_type=spec.model_type,
         )
+        final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(params, final_flat_obs, spec, jnp)["values"]
+        bootstrap_values = actor_critic_forward(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+            intent_context=final_intent_context,
+        )["values"]
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
@@ -508,6 +592,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
 
             forward_out = actor_critic_forward(
                 params,
@@ -519,6 +604,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 ),
                 spec,
                 jnp,
+                intent_context=policy_intent_context,
             )
             masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
@@ -563,6 +649,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -593,6 +680,13 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
 
             forward_out = actor_critic_forward(
                 params,
@@ -604,6 +698,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 ),
                 spec,
                 jnp,
+                intent_context=policy_intent_context,
             )
             masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
@@ -626,6 +721,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 opponent_key,
                 jax,
                 jnp,
+                intent_context=opponent_intent_context,
             )
             full_actions = assemble_full_actions_jax(
                 masked_out["deterministic_actions"],
@@ -657,6 +753,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -692,7 +789,12 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
         batch_size = int(initial_state.positions.shape[0])
         group_size = batch_size // group_count
 
-        def _sample_grouped_opponent_actions(opponent_flat_obs, opponent_action_mask, key):
+        def _sample_grouped_opponent_actions(
+            opponent_flat_obs,
+            opponent_action_mask,
+            opponent_intent_context,
+            key,
+        ):
             grouped_obs = opponent_flat_obs.reshape(
                 group_count,
                 group_size,
@@ -704,9 +806,13 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 int(opponent_action_mask.shape[-2]),
                 int(opponent_action_mask.shape[-1]),
             )
+            grouped_intent_context = {
+                name: value.reshape(group_count, group_size)
+                for name, value in opponent_intent_context.items()
+            }
             group_keys = jax.random.split(key, group_count)
 
-            def _run_group(group_params, group_obs, group_mask, group_key):
+            def _run_group(group_params, group_obs, group_mask, group_intent_context, group_key):
                 group_out = run_actor_critic(
                     group_params,
                     group_obs,
@@ -715,6 +821,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     group_key,
                     jax,
                     jnp,
+                    intent_context=group_intent_context,
                 )
                 return group_out["sampled_actions"]
 
@@ -722,6 +829,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 opponent_params_by_group,
                 grouped_obs,
                 grouped_mask,
+                grouped_intent_context,
                 group_keys,
             )
             return grouped_actions.reshape(
@@ -735,6 +843,13 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
+            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+            )
 
             forward_out = actor_critic_forward(
                 params,
@@ -746,6 +861,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 ),
                 spec,
                 jnp,
+                intent_context=policy_intent_context,
             )
             masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
@@ -763,6 +879,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     model_type=spec.model_type,
                 ),
                 opponent_action_mask,
+                opponent_intent_context,
                 opponent_key,
             )
             full_actions = assemble_full_actions_jax(
@@ -795,6 +912,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
@@ -828,7 +946,16 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
     )
 
     def _loss_fn(params, batch: PPOBatch):
-        forward_out = actor_critic_forward(params, batch.flat_obs, spec, jnp)
+        forward_out = actor_critic_forward(
+            params,
+            batch.flat_obs,
+            spec,
+            jnp,
+            intent_context={
+                "intent_index": batch.policy_intent_index,
+                "intent_gate": batch.policy_intent_gate,
+            },
+        )
         masked_out = apply_action_mask(
             forward_out["flat_policy_logits"],
             batch.action_mask,
@@ -1137,6 +1264,48 @@ def summarize_shot_type_metrics(
     }
 
 
+def summarize_intent_metrics(
+    prefix: str,
+    *,
+    intent_index,
+    intent_active,
+    intent_age,
+    intent_commitment_remaining,
+    intent_visible_to_defense=None,
+) -> dict[str, float]:
+    index_arr = np.asarray(intent_index, dtype=np.int32)
+    active_arr = np.asarray(intent_active, dtype=np.float32)
+    age_arr = np.asarray(intent_age, dtype=np.float32)
+    remaining_arr = np.asarray(intent_commitment_remaining, dtype=np.float32)
+    active_count = float(active_arr.sum())
+    total_count = float(active_arr.size)
+    active_bool = active_arr > 0.5
+    metrics = {
+        f"{prefix}_intent_active_rate": float(active_count / total_count) if total_count > 0.0 else 0.0,
+        f"{prefix}_intent_active_count": active_count,
+        f"{prefix}_intent_mean_age": float(age_arr[active_bool].mean()) if np.any(active_bool) else 0.0,
+        f"{prefix}_intent_mean_commitment_remaining": (
+            float(remaining_arr[active_bool].mean()) if np.any(active_bool) else 0.0
+        ),
+        f"{prefix}_intent_mean_index": (
+            float(index_arr[active_bool].mean()) if np.any(active_bool) else 0.0
+        ),
+    }
+    if intent_visible_to_defense is not None:
+        visible_arr = np.asarray(intent_visible_to_defense, dtype=np.float32)
+        metrics[f"{prefix}_intent_visible_to_defense_rate"] = (
+            float(visible_arr.mean()) if visible_arr.size else 0.0
+        )
+    if np.any(active_bool):
+        active_indices, counts = np.unique(index_arr[active_bool], return_counts=True)
+        for raw_index, raw_count in zip(active_indices, counts, strict=True):
+            idx = int(raw_index)
+            count = float(raw_count)
+            metrics[f"{prefix}_intent_usage_count/{idx}"] = count
+            metrics[f"{prefix}_intent_usage_share/{idx}"] = float(count / active_count) if active_count > 0.0 else 0.0
+    return metrics
+
+
 def summarize_training_step(
     rollout_out: RolloutOutput,
     ppo_batch: PPOBatch,
@@ -1237,6 +1406,25 @@ def summarize_training_step(
             shot_threes=rollout_out.trajectory.opponent_shot_threes,
         )
     )
+    summary.update(
+        summarize_intent_metrics(
+            "offense",
+            intent_index=rollout_out.trajectory.intent_index,
+            intent_active=rollout_out.trajectory.intent_active,
+            intent_age=rollout_out.trajectory.intent_age,
+            intent_commitment_remaining=rollout_out.trajectory.intent_commitment_remaining,
+            intent_visible_to_defense=rollout_out.trajectory.intent_visible_to_defense,
+        )
+    )
+    summary.update(
+        summarize_intent_metrics(
+            "defense",
+            intent_index=rollout_out.trajectory.defense_intent_index,
+            intent_active=rollout_out.trajectory.defense_intent_active,
+            intent_age=rollout_out.trajectory.defense_intent_age,
+            intent_commitment_remaining=rollout_out.trajectory.defense_intent_commitment_remaining,
+        )
+    )
     summary.update({key: float(value) for key, value in update_metrics.items()})
     return summary
 
@@ -1263,6 +1451,15 @@ def serialize_eval_trace(
     shot_dunks = np.asarray(trace.shot_dunks)
     shot_twos = np.asarray(trace.shot_twos)
     shot_threes = np.asarray(trace.shot_threes)
+    intent_index = np.asarray(trace.intent_index)
+    intent_active = np.asarray(trace.intent_active)
+    intent_age = np.asarray(trace.intent_age)
+    intent_commitment_remaining = np.asarray(trace.intent_commitment_remaining)
+    intent_visible_to_defense = np.asarray(trace.intent_visible_to_defense)
+    defense_intent_index = np.asarray(trace.defense_intent_index)
+    defense_intent_active = np.asarray(trace.defense_intent_active)
+    defense_intent_age = np.asarray(trace.defense_intent_age)
+    defense_intent_commitment_remaining = np.asarray(trace.defense_intent_commitment_remaining)
     offensive_three_seconds = np.asarray(trace.offensive_three_seconds)
     defensive_lane_violations = np.asarray(trace.defensive_lane_violations)
     terminal_episode_steps = np.asarray(trace.terminal_episode_steps)
@@ -1289,6 +1486,15 @@ def serialize_eval_trace(
         "shot_dunks": shot_dunks[:, env_index].astype(np.int8),
         "shot_twos": shot_twos[:, env_index].astype(np.int8),
         "shot_threes": shot_threes[:, env_index].astype(np.int8),
+        "intent_index": intent_index[:, env_index].astype(np.int32),
+        "intent_active": intent_active[:, env_index].astype(np.int8),
+        "intent_age": intent_age[:, env_index].astype(np.int32),
+        "intent_commitment_remaining": intent_commitment_remaining[:, env_index].astype(np.int32),
+        "intent_visible_to_defense": intent_visible_to_defense[:, env_index].astype(np.int8),
+        "defense_intent_index": defense_intent_index[:, env_index].astype(np.int32),
+        "defense_intent_active": defense_intent_active[:, env_index].astype(np.int8),
+        "defense_intent_age": defense_intent_age[:, env_index].astype(np.int32),
+        "defense_intent_commitment_remaining": defense_intent_commitment_remaining[:, env_index].astype(np.int32),
         "offensive_three_seconds": offensive_three_seconds[:, env_index].astype(np.int8),
         "defensive_lane_violations": defensive_lane_violations[:, env_index].astype(np.int8),
         "terminal_episode_steps": terminal_episode_steps[:, env_index].astype(np.int32),

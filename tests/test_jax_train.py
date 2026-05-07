@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
 from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.models import ActorCriticSpec
@@ -67,12 +68,116 @@ def test_jax_trainer_allows_lane_rule_overrides():
     assert args.offensive_three_seconds is True
 
 
+def test_jax_trainer_allows_intent_runtime_overrides():
+    args = parse_args(
+        [
+            "--enable-intent-learning",
+            "true",
+            "--enable-defense-intent-learning",
+            "true",
+            "--num-intents",
+            "6",
+            "--intent-commitment-steps",
+            "5",
+            "--intent-null-prob",
+            "0.1",
+            "--defense-intent-null-prob",
+            "0.2",
+            "--intent-visible-to-defense-prob",
+            "0.3",
+        ]
+    )
+
+    validate_train_args(args)
+    assert args.enable_intent_learning is True
+    assert args.enable_defense_intent_learning is True
+    assert args.num_intents == 6
+    assert args.intent_commitment_steps == 5
+    assert args.intent_null_prob == 0.1
+    assert args.defense_intent_null_prob == 0.2
+    assert args.intent_visible_to_defense_prob == 0.3
+
+
 def test_jax_trainer_attention_model_enables_set_obs():
     args = parse_args(["--policy-model", "attention"])
 
     validate_train_args(args)
     assert args.policy_model == "attention"
     assert args.use_set_obs is True
+
+
+def test_jax_trainer_validates_intent_embedding_runtime_requirements():
+    valid_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+            "--enable-intent-learning",
+            "true",
+        ]
+    )
+    validate_train_args(valid_args)
+
+    invalid_args = parse_args(["--intent-embedding-enabled"])
+    with pytest.raises(SystemExit, match="requires --policy-model attention"):
+        validate_train_args(invalid_args)
+
+    no_runtime_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+        ]
+    )
+    with pytest.raises(SystemExit, match="requires --enable-intent-learning"):
+        validate_train_args(no_runtime_args)
+
+
+def test_jax_trainer_validates_intent_diversity_requirements():
+    scaffold_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+            "--enable-intent-learning",
+            "true",
+            "--intent-diversity-enabled",
+            "true",
+        ]
+    )
+    with pytest.raises(SystemExit, match="supported only with --run-train-loop"):
+        validate_train_args(scaffold_args)
+
+    missing_embedding_args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--enable-intent-learning",
+            "true",
+            "--intent-diversity-enabled",
+            "true",
+        ]
+    )
+    with pytest.raises(SystemExit, match="requires --intent-embedding-enabled"):
+        validate_train_args(missing_embedding_args)
+
+    gru_args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+            "--enable-intent-learning",
+            "true",
+            "--intent-diversity-enabled",
+            "true",
+            "--intent-disc-encoder-type",
+            "gru",
+        ]
+    )
+    with pytest.raises(SystemExit, match="mlp_mean or set_step"):
+        validate_train_args(gru_args)
 
 
 def test_jax_trainer_validates_ppo_minibatches_divide_batch_size():
@@ -147,6 +252,20 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "0.3",
             "--dunk-pct",
             "0.6",
+            "--enable-intent-learning",
+            "true",
+            "--enable-defense-intent-learning",
+            "true",
+            "--num-intents",
+            "6",
+            "--intent-commitment-steps",
+            "5",
+            "--intent-null-prob",
+            "0.1",
+            "--defense-intent-null-prob",
+            "0.2",
+            "--intent-visible-to-defense-prob",
+            "0.3",
         ]
     )
     validate_train_args(args)
@@ -171,6 +290,16 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/env/dunk_pct"] == 0.6
     assert recorder.params["jax/env/layup_pct"] == args.layup_pct
     assert recorder.params["jax/env/pass_mode"] == args.pass_mode
+    assert recorder.params["jax/env/enable_intent_learning"] is True
+    assert recorder.params["jax/env/enable_defense_intent_learning"] is True
+    assert recorder.params["jax/env/num_intents"] == 6
+    assert recorder.params["jax/env/intent_commitment_steps"] == 5
+    assert recorder.params["jax/env/intent_null_prob"] == 0.1
+    assert recorder.params["jax/env/defense_intent_null_prob"] == 0.2
+    assert recorder.params["jax/env/intent_visible_to_defense_prob"] == 0.3
+    assert recorder.params["jax/intent_embedding_enabled"] is False
+    assert recorder.params["jax/intent_embedding_dim"] == 16
+    assert recorder.params["jax/num_intents"] == 8
 
 
 def test_train_scaffold_emits_rollout_trajectory_shapes():
@@ -194,6 +323,8 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
 
     spec = result["trajectory_spec"]
     assert spec["trajectory_flat_obs_shape"] == [4, 4, 91]
+    assert spec["trajectory_policy_intent_index_shape"] == [4, 4]
+    assert spec["trajectory_policy_intent_gate_shape"] == [4, 4]
     assert spec["trajectory_action_mask_shape"] == [4, 4, 3, 14]
     assert spec["trajectory_actions_shape"] == [4, 4, 3]
     assert spec["trajectory_full_actions_shape"] == [4, 4, 6]
@@ -212,6 +343,8 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     assert spec["trajectory_defense_score_delta_shape"] == [4, 4]
     assert spec["bootstrap_values_shape"] == [4]
     assert spec["ppo_batch_flat_obs_shape"] == [16, 91]
+    assert spec["ppo_batch_policy_intent_index_shape"] == [16]
+    assert spec["ppo_batch_policy_intent_gate_shape"] == [16]
     assert spec["ppo_batch_action_mask_shape"] == [16, 3, 14]
     assert spec["ppo_batch_actions_shape"] == [16, 3]
     assert spec["ppo_batch_old_log_probs_shape"] == [16, 3]
@@ -244,6 +377,13 @@ def test_train_scaffold_supports_attention_policy_model():
             "8",
             "--attention-head-activation",
             "relu",
+            "--intent-embedding-enabled",
+            "--intent-embedding-dim",
+            "6",
+            "--enable-intent-learning",
+            "true",
+            "--enable-defense-intent-learning",
+            "true",
             "--kernel-batch-size",
             "2",
             "--warmup-iters",
@@ -268,6 +408,8 @@ def test_train_scaffold_supports_attention_policy_model():
     assert result["policy_spec"]["attention_pi_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_vf_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_head_activation"] == "relu"
+    assert result["policy_spec"]["intent_embedding_enabled"] is True
+    assert result["policy_spec"]["intent_embedding_dim"] == 6
     assert result["trainer_config"]["ppo_minibatches"] == 2
     assert result["trajectory_spec"]["flat_obs_shape"] == [2, 95]
     assert result["trajectory_spec"]["trajectory_flat_obs_shape"] == [2, 2, 95]
@@ -413,6 +555,11 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert payload["env_config"]["dunk_std"] == 0.3
     assert payload["env_config"]["allow_dunks"] is True
     assert payload["env_config"]["dunk_pct"] == 0.6
+    assert payload["play_name_metadata"]["backend"] == "jax"
+    assert payload["play_name_metadata"]["pool_version"] >= 1
+    assert payload["play_name_metadata"]["model_codename"]
+    assert payload["play_name_metadata"]["num_intents"] == int(first_args.num_intents)
+    assert len(payload["play_name_map"]) == int(first_args.num_intents)
     assert "learner_shot_dunk_share" in payload["last_metrics"]
     assert "learner_shot_two_share" in payload["last_metrics"]
     assert "learner_shot_three_share" in payload["last_metrics"]
@@ -617,3 +764,191 @@ def test_train_loop_groups_sampled_opponents_when_per_env_enabled(tmp_path):
     assert len(result["eval_trajectories"]) == 2
     assert result["final_metrics"]["opponent_source"] == "grouped_pool"
     assert result["final_metrics"]["opponent_group_count"] == 2
+
+
+def test_train_loop_runs_offense_intent_discriminator_and_sample_dump(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "intent_disc_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--action-head-mode",
+            "pointer_targeted",
+            "--attention-embed-dim",
+            "16",
+            "--attention-num-heads",
+            "4",
+            "--attention-token-mlp-dim",
+            "12",
+            "--intent-embedding-enabled",
+            "--intent-embedding-dim",
+            "4",
+            "--enable-intent-learning",
+            "true",
+            "--num-intents",
+            "4",
+            "--intent-null-prob",
+            "0.0",
+            "--intent-diversity-enabled",
+            "true",
+            "--intent-diversity-warmup-updates",
+            "0",
+            "--intent-diversity-ramp-updates",
+            "1",
+            "--intent-diversity-beta-target",
+            "0.01",
+            "--intent-disc-hidden-dim",
+            "16",
+            "--intent-disc-batch-size",
+            "8",
+            "--intent-disc-updates-per-rollout",
+            "1",
+            "--intent-disc-eval-holdout-fraction",
+            "0.5",
+            "--intent-disc-encoder-type",
+            "set_step",
+            "--intent-disc-include-shot-clock",
+            "false",
+            "--intent-disc-include-pressure-exposure",
+            "false",
+            "--kernel-batch-size",
+            "2",
+            "--rollout-horizon",
+            "2",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--disc-eval-batch-output",
+            "true",
+            "--intent-sample-dump-size",
+            "3",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    metrics = result["final_metrics"]
+    assert metrics["intent_disc_active_count"] > 0.0
+    assert metrics["intent_disc_loss"] > 0.0
+    assert metrics["intent_disc_top1_acc_trainbatch"] >= 0.0
+    assert metrics["intent_disc_top1_acc_holdout"] >= 0.0
+    assert metrics["intent_disc_auc_ovr_macro_trainbatch"] >= 0.0
+    assert metrics["intent_disc_auc_ovr_macro_holdout"] >= 0.0
+    assert metrics["intent_disc_trainbatch_size"] > 0.0
+    assert metrics["intent_disc_holdout_size"] > 0.0
+    assert 0.0 <= metrics["intent_disc_holdout_fraction_realized"] <= 1.0
+    assert "intent_disc_label_prob_by_intent/0" in metrics
+    assert "intent_disc_pred_prob_by_intent/0" in metrics
+    assert metrics["intent_bonus_beta"] == pytest.approx(0.01)
+    assert metrics["intent_bonus_active_sample_count"] > 0
+    assert result["intent_discriminator_config"]["num_intents"] == 4
+    assert result["intent_discriminator_config"]["encoder_type"] == "set_step"
+    assert result["intent_discriminator_config"]["eval_holdout_fraction"] == pytest.approx(0.5)
+    assert result["intent_discriminator_config"]["include_shot_clock"] is False
+    assert result["intent_discriminator_config"]["include_pressure_exposure"] is False
+    assert len(result["intent_sample_artifacts"]) == 1
+    sample_path = result["intent_sample_artifacts"][0]
+    payload = load_checkpoint(checkpoint_dir / "latest")
+    assert "intent_discriminator_state" in payload
+    assert payload["play_name_metadata"]["backend"] == "jax"
+    assert payload["play_name_metadata"]["num_intents"] == 4
+    assert set(payload["play_name_map"]) == {"0", "1", "2", "3"}
+    assert result["play_name_map"] == payload["play_name_map"]
+    with np.load(sample_path) as sample:
+        assert sample["features"].shape[0] <= 3
+        assert sample["embedding"].shape[0] == sample["features"].shape[0]
+        assert sample["intent_index"].shape[0] == sample["features"].shape[0]
+        assert sample["players"].shape[0] == sample["features"].shape[0]
+        assert sample["globals"].shape[1] == 4
+        assert np.all(sample["globals"][:, 0] == 0.0)
+        assert np.all(sample["globals"][:, 1] == 0.0)
+
+
+def test_train_loop_skips_intent_discriminator_during_warmup(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "intent_disc_warmup_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--action-head-mode",
+            "pointer_targeted",
+            "--attention-embed-dim",
+            "16",
+            "--attention-num-heads",
+            "4",
+            "--attention-token-mlp-dim",
+            "12",
+            "--intent-embedding-enabled",
+            "--intent-embedding-dim",
+            "4",
+            "--enable-intent-learning",
+            "true",
+            "--num-intents",
+            "4",
+            "--intent-null-prob",
+            "0.0",
+            "--intent-diversity-enabled",
+            "true",
+            "--intent-diversity-warmup-updates",
+            "10",
+            "--intent-diversity-ramp-updates",
+            "1",
+            "--intent-diversity-beta-target",
+            "0.01",
+            "--intent-disc-hidden-dim",
+            "16",
+            "--intent-disc-batch-size",
+            "8",
+            "--intent-disc-updates-per-rollout",
+            "1",
+            "--intent-disc-encoder-type",
+            "set_step",
+            "--kernel-batch-size",
+            "2",
+            "--rollout-horizon",
+            "2",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--disc-eval-batch-output",
+            "true",
+            "--intent-sample-dump-size",
+            "3",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    metrics = result["final_metrics"]
+    assert metrics["intent_bonus_beta"] == pytest.approx(0.0)
+    assert metrics["intent_disc_skipped_warmup"] == pytest.approx(1.0)
+    assert "intent_disc_loss" not in metrics
+    assert "intent_disc_top1_acc_trainbatch" not in metrics
+    assert "intent_bonus_active_sample_count" not in metrics
+    assert result["intent_sample_artifacts"] == []

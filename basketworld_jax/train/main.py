@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from copy import copy
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -19,6 +20,11 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
 from basketworld.utils.mlflow_config import setup_mlflow
+from basketworld.utils.play_names import (
+    PLAY_NAME_POOL_VERSION,
+    build_model_codename,
+    build_play_name_artifact_payload,
+)
 from basketworld_jax.checkpoints import (
     build_checkpoint_paths,
     build_checkpoint_payload,
@@ -32,6 +38,7 @@ from basketworld_jax.env import (
     TOKEN_OBS_GLOBAL_DIM,
     TOKEN_OBS_PLAYER_DIM,
     build_action_masks_batch,
+    build_policy_intent_context_batch,
     build_policy_observation_batch,
     reset_batch_minimal,
     sample_state_batch,
@@ -40,6 +47,18 @@ from basketworld_jax.models import (
     ActorCriticSpec,
     build_actor_critic_spec,
     init_actor_critic_params,
+)
+from basketworld_jax.intent import (
+    apply_intent_bonus_to_rollout,
+    build_intent_discriminator_spec,
+    build_intent_discriminator_update_runner,
+    build_intent_sample_dump,
+    build_intent_step_features_from_rollout,
+    compute_intent_beta,
+    compute_normalized_intent_bonus,
+    init_bonus_stats,
+    init_intent_discriminator_params,
+    update_bonus_stats,
 )
 from basketworld_jax.optim import init_optimizer_state
 from basketworld_jax.train.cli import (
@@ -69,6 +88,7 @@ from basketworld_jax.train.runtime import (
     concatenate_rollout_outputs,
     serialize_eval_trace,
     summarize_episode_events,
+    summarize_intent_metrics,
     summarize_shot_type_metrics,
     summarize_training_step,
     training_player_ids_from_static,
@@ -84,6 +104,14 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "dunk_pct",
         "illegal_defense_enabled",
         "offensive_three_seconds",
+        "enable_intent_learning",
+        "enable_defense_intent_learning",
+        "intent_diversity_enabled",
+        "num_intents",
+        "intent_commitment_steps",
+        "intent_null_prob",
+        "defense_intent_null_prob",
+        "intent_visible_to_defense_prob",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -136,6 +164,13 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "pass_reward",
     "potential_assist_pct",
     "full_assist_bonus_pct",
+    "enable_intent_learning",
+    "enable_defense_intent_learning",
+    "num_intents",
+    "intent_commitment_steps",
+    "intent_null_prob",
+    "defense_intent_null_prob",
+    "intent_visible_to_defense_prob",
 )
 
 
@@ -249,6 +284,48 @@ def parse_args(argv=None):
         choices=("tanh", "relu", "gelu", "silu", "swish"),
         default="tanh",
         help="Activation used between post-attention PI/VF head MLP layers.",
+    )
+    parser.add_argument(
+        "--intent-embedding-enabled",
+        action="store_true",
+        help=(
+            "Condition the JAX attention policy on the active runtime intent ID. "
+            "Requires an intent runtime to be enabled."
+        ),
+    )
+    parser.add_argument(
+        "--intent-embedding-dim",
+        type=int,
+        default=16,
+        help="Embedding dimension for runtime intent conditioning in the JAX attention policy.",
+    )
+    parser.add_argument(
+        "--intent-sample-dump-size",
+        type=int,
+        default=2048,
+        help=(
+            "Maximum active-offense intent samples to include in each JAX "
+            "discriminator sample dump when --disc-eval-batch-output is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--intent-diversity-warmup-updates",
+        type=int,
+        default=None,
+        help=(
+            "JAX-only update-count warmup for intent diversity. When set, the "
+            "discriminator and diversity bonus are skipped until this PPO update."
+        ),
+    )
+    parser.add_argument(
+        "--intent-diversity-ramp-updates",
+        type=int,
+        default=None,
+        help=(
+            "JAX-only update-count ramp from zero diversity beta to target after "
+            "--intent-diversity-warmup-updates. Defaults to one update when "
+            "warmup updates are set and this is omitted."
+        ),
     )
     parser.add_argument(
         "--policy-seed",
@@ -433,6 +510,65 @@ def validate_train_args(args) -> None:
             "--ppo-minibatches must evenly divide the PPO batch size. "
             f"ppo_batch_size={ppo_sample_count}, ppo_minibatches={ppo_minibatches}."
         )
+    if int(getattr(args, "num_intents", 8)) < 1:
+        raise SystemExit("--num-intents must be >= 1.")
+    if int(getattr(args, "intent_commitment_steps", 4)) < 1:
+        raise SystemExit("--intent-commitment-steps must be >= 1.")
+    for key in (
+        "intent_null_prob",
+        "defense_intent_null_prob",
+        "intent_visible_to_defense_prob",
+    ):
+        value = float(getattr(args, key, 0.0))
+        if value < 0.0 or value > 1.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be in [0, 1].")
+    if bool(getattr(args, "intent_embedding_enabled", False)):
+        if str(getattr(args, "policy_model", "mlp")) != "attention":
+            raise SystemExit("--intent-embedding-enabled requires --policy-model attention.")
+        if not (
+            bool(getattr(args, "enable_intent_learning", False))
+            or bool(getattr(args, "enable_defense_intent_learning", False))
+        ):
+            raise SystemExit(
+                "--intent-embedding-enabled requires --enable-intent-learning or "
+                "--enable-defense-intent-learning."
+            )
+    if int(getattr(args, "intent_embedding_dim", 16)) < 1:
+        raise SystemExit("--intent-embedding-dim must be >= 1.")
+    if int(getattr(args, "intent_sample_dump_size", 2048)) < 0:
+        raise SystemExit("--intent-sample-dump-size must be >= 0.")
+    if bool(getattr(args, "intent_diversity_enabled", False)):
+        if not bool(getattr(args, "run_train_loop", False)):
+            raise SystemExit("--intent-diversity-enabled is supported only with --run-train-loop.")
+        if not bool(getattr(args, "enable_intent_learning", False)):
+            raise SystemExit("--intent-diversity-enabled requires --enable-intent-learning.")
+        if not bool(getattr(args, "intent_embedding_enabled", False)):
+            raise SystemExit("--intent-diversity-enabled requires --intent-embedding-enabled.")
+        encoder_type = str(getattr(args, "intent_disc_encoder_type", "mlp_mean"))
+        if encoder_type not in {"mlp_mean", "set_step"}:
+            raise SystemExit("JAX intent discriminator supports --intent-disc-encoder-type mlp_mean or set_step.")
+        if encoder_type == "set_step":
+            if str(getattr(args, "policy_model", "mlp")) != "attention":
+                raise SystemExit("--intent-disc-encoder-type set_step requires --policy-model attention.")
+            hidden_dim = int(getattr(args, "intent_disc_hidden_dim", 128))
+            num_heads = int(getattr(args, "attention_num_heads", 4))
+            if hidden_dim % num_heads != 0:
+                raise SystemExit("--intent-disc-hidden-dim must be divisible by --attention-num-heads for set_step.")
+        if not bool(getattr(args, "intent_disc_current_policy_only", True)):
+            raise SystemExit("JAX intent discriminator currently requires --intent-disc-current-policy-only true.")
+        if int(getattr(args, "intent_disc_batch_size", 256)) < 1:
+            raise SystemExit("--intent-disc-batch-size must be >= 1.")
+        if int(getattr(args, "intent_disc_updates_per_rollout", 2)) < 1:
+            raise SystemExit("--intent-disc-updates-per-rollout must be >= 1.")
+        holdout_fraction = float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25))
+        if holdout_fraction < 0.0 or holdout_fraction > 1.0:
+            raise SystemExit("--intent-disc-eval-holdout-fraction must be in [0, 1].")
+        if getattr(args, "intent_diversity_warmup_updates", None) is not None:
+            if int(getattr(args, "intent_diversity_warmup_updates")) < 0:
+                raise SystemExit("--intent-diversity-warmup-updates must be >= 0.")
+        if getattr(args, "intent_diversity_ramp_updates", None) is not None:
+            if int(getattr(args, "intent_diversity_ramp_updates")) < 0:
+                raise SystemExit("--intent-diversity-ramp-updates must be >= 0.")
 
 
 def _jax_env_config_from_args(args) -> dict[str, Any]:
@@ -491,6 +627,9 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
         action_head_mode=str(getattr(args, "action_head_mode", "flat")),
         pass_action_start=int(PASS_ACTION_START),
         pass_action_end=int(PASS_ACTION_END),
+        intent_embedding_enabled=bool(getattr(args, "intent_embedding_enabled", False)),
+        intent_embedding_dim=int(getattr(args, "intent_embedding_dim", 16)),
+        num_intents=int(getattr(args, "num_intents", 8)),
     )
 
 
@@ -530,16 +669,26 @@ def _restore_like_template(restored, template):
         if isinstance(restored, dict):
             return type(template)(
                 **{
-                    field: _restore_like_template(restored[field], getattr(template, field))
+                    field: _restore_like_template(
+                        restored.get(field, getattr(template, field)),
+                        getattr(template, field),
+                    )
                     for field in template._fields
                 }
             )
         if isinstance(restored, (tuple, list)):
+            restored_by_field = {
+                field: item
+                for item, field in zip(restored, template._fields, strict=False)
+            }
             return type(template)(
-                *[
-                    _restore_like_template(item, getattr(template, field))
-                    for item, field in zip(restored, template._fields, strict=False)
-                ]
+                **{
+                    field: _restore_like_template(
+                        restored_by_field.get(field, getattr(template, field)),
+                        getattr(template, field),
+                    )
+                    for field in template._fields
+                }
             )
         return restored
     if isinstance(template, tuple):
@@ -595,6 +744,9 @@ def _validate_resume_checkpoint_payload(
         raise SystemExit("Resume checkpoint frozen_config does not match the current JAX run.")
     if "env_config" in payload and dict(payload.get("env_config", {})) != _jax_env_config_from_args(args):
         raise SystemExit("Resume checkpoint env_config does not match the current JAX run.")
+    if bool(getattr(args, "intent_diversity_enabled", False)):
+        if "intent_discriminator_state" not in payload:
+            raise SystemExit("Resume checkpoint does not contain JAX intent discriminator state.")
 
 
 def _save_training_checkpoint(
@@ -612,6 +764,8 @@ def _save_training_checkpoint(
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
     opponent_info: dict[str, Any] | None,
+    intent_discriminator_state: dict[str, Any] | None = None,
+    play_name_metadata: dict[str, Any] | None = None,
 ) -> tuple[str | None, str]:
     payload = build_checkpoint_payload(
         update_index=int(update_index),
@@ -630,6 +784,8 @@ def _save_training_checkpoint(
         eval_trajectories=eval_trajectories,
         last_metrics=last_metrics,
         opponent_info=opponent_info,
+        intent_discriminator_state=intent_discriminator_state,
+        play_name_metadata=play_name_metadata,
     )
     if checkpoint_dir is None:
         raise ValueError("checkpoint_dir must not be None when saving a persistent local checkpoint.")
@@ -656,6 +812,56 @@ def _maybe_start_mlflow_run(args, *, mode: str):
         run_name = f"jax-train-{mode}-{timestamp}"
     context = mlflow.start_run(run_name=run_name)
     return mlflow, context
+
+
+def _training_play_name_seed_key(args, mlflow, checkpoint_dir: str | None) -> str:
+    if mlflow is not None:
+        active_run = mlflow.active_run()
+        run_id = str(getattr(getattr(active_run, "info", None), "run_id", "") or "").strip()
+        if run_id:
+            return run_id
+    for value in (
+        getattr(args, "mlflow_run_name", None),
+        checkpoint_dir,
+        getattr(args, "output_json", None),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "jax-train"
+
+
+def _build_training_play_name_metadata(
+    *,
+    args,
+    mlflow,
+    checkpoint_dir: str | None,
+) -> dict[str, Any]:
+    seed_key = _training_play_name_seed_key(args, mlflow, checkpoint_dir)
+    payload = build_play_name_artifact_payload(
+        seed_key,
+        int(getattr(args, "num_intents", 0) or 0),
+    )
+    payload["model_codename"] = build_model_codename(seed_key)
+    payload["backend"] = "jax"
+    return payload
+
+
+def _log_mlflow_play_name_metadata(mlflow, play_name_metadata: dict[str, Any]) -> None:
+    try:
+        mlflow.log_param("jax/play_name_pool_version", int(PLAY_NAME_POOL_VERSION))
+        model_codename = str(play_name_metadata.get("model_codename", "")).strip()
+        if model_codename:
+            mlflow.set_tag("model_codename", model_codename)
+        with TemporaryDirectory(prefix="basketworld_jax_play_names_") as tmpdir:
+            path = Path(tmpdir) / "play_names.json"
+            path.write_text(
+                json.dumps(play_name_metadata, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            mlflow.log_artifact(str(path), artifact_path="metadata")
+    except Exception as exc:
+        print(f"[play_names] Failed to log JAX play name mapping artifact: {exc}")
 
 
 def _is_jax_checkpoint_artifact(path: str) -> bool:
@@ -941,6 +1147,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/attention_head_activation": str(spec.attention_head_activation),
         "jax/pass_action_start": int(spec.pass_action_start),
         "jax/pass_action_end": int(spec.pass_action_end),
+        "jax/intent_embedding_enabled": bool(spec.intent_embedding_enabled),
+        "jax/intent_embedding_dim": int(spec.intent_embedding_dim),
+        "jax/num_intents": int(spec.num_intents),
         "jax/pass_mode": str(getattr(args, "pass_mode")),
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
@@ -954,6 +1163,29 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/opponent_pool_exploration": float(getattr(args, "opponent_pool_exploration", 0.0)),
         "jax/grouped_opponent_sampling": _uses_grouped_opponent_sampling(args),
         "jax/opponent_group_count": int(getattr(args, "opponent_group_count", 8)),
+        "jax/intent_diversity_enabled": bool(getattr(args, "intent_diversity_enabled", False)),
+        "jax/intent_diversity_beta_target": float(getattr(args, "intent_diversity_beta_target", 0.05)),
+        "jax/intent_diversity_warmup_updates": (
+            -1
+            if getattr(args, "intent_diversity_warmup_updates", None) is None
+            else int(getattr(args, "intent_diversity_warmup_updates"))
+        ),
+        "jax/intent_diversity_ramp_updates": (
+            -1
+            if getattr(args, "intent_diversity_ramp_updates", None) is None
+            else int(getattr(args, "intent_diversity_ramp_updates"))
+        ),
+        "jax/intent_diversity_warmup_steps": int(getattr(args, "intent_diversity_warmup_steps", 1_000_000)),
+        "jax/intent_diversity_ramp_steps": int(getattr(args, "intent_diversity_ramp_steps", 1_000_000)),
+        "jax/intent_diversity_clip": float(getattr(args, "intent_diversity_clip", 2.0)),
+        "jax/intent_disc_lr": float(getattr(args, "intent_disc_lr", 3e-4)),
+        "jax/intent_disc_batch_size": int(getattr(args, "intent_disc_batch_size", 256)),
+        "jax/intent_disc_updates_per_rollout": int(getattr(args, "intent_disc_updates_per_rollout", 2)),
+        "jax/intent_disc_hidden_dim": int(getattr(args, "intent_disc_hidden_dim", 128)),
+        "jax/intent_disc_encoder_type": str(getattr(args, "intent_disc_encoder_type", "mlp_mean")),
+        "jax/intent_disc_eval_holdout_fraction": float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25)),
+        "jax/intent_sample_dump_size": int(getattr(args, "intent_sample_dump_size", 2048)),
+        "jax/disc_eval_batch_output": bool(getattr(args, "disc_eval_batch_output", False)),
     }
     for key, value in _jax_env_config_from_args(args).items():
         params[f"jax/env/{key}"] = value
@@ -980,6 +1212,37 @@ def _log_mlflow_checkpoint_artifacts(
     mlflow.set_tag("jax_latest_checkpoint_artifact", artifact_path)
     mlflow.set_tag("jax_latest_checkpoint_update", str(int(update_index)))
     return artifact_path
+
+
+def _log_mlflow_intent_sample_artifact(
+    mlflow,
+    *,
+    sample_payload: dict[str, np.ndarray],
+    update_index: int,
+) -> str | None:
+    if not sample_payload:
+        return None
+    with TemporaryDirectory(prefix="basketworld_jax_intent_samples_") as tmpdir:
+        path = Path(tmpdir) / f"intent_samples_update_{int(update_index):07d}.npz"
+        np.savez_compressed(path, **sample_payload)
+        artifact_path = f"intent_samples/update_{int(update_index):07d}"
+        mlflow.log_artifact(str(path), artifact_path=artifact_path)
+        return f"{artifact_path}/{path.name}"
+
+
+def _save_local_intent_sample_artifact(
+    *,
+    checkpoint_dir: str,
+    sample_payload: dict[str, np.ndarray],
+    update_index: int,
+) -> str | None:
+    if not sample_payload:
+        return None
+    root = Path(checkpoint_dir) / "intent_samples"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"intent_samples_update_{int(update_index):07d}.npz"
+    np.savez_compressed(path, **sample_payload)
+    return str(path)
 
 
 def _format_summary_value(value: Any) -> str:
@@ -1089,6 +1352,25 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             shot_threes=rollout.trajectory.opponent_shot_threes,
         )
     )
+    metrics.update(
+        summarize_intent_metrics(
+            f"{role}_offense",
+            intent_index=rollout.trajectory.intent_index,
+            intent_active=rollout.trajectory.intent_active,
+            intent_age=rollout.trajectory.intent_age,
+            intent_commitment_remaining=rollout.trajectory.intent_commitment_remaining,
+            intent_visible_to_defense=rollout.trajectory.intent_visible_to_defense,
+        )
+    )
+    metrics.update(
+        summarize_intent_metrics(
+            f"{role}_defense",
+            intent_index=rollout.trajectory.defense_intent_index,
+            intent_active=rollout.trajectory.defense_intent_active,
+            intent_age=rollout.trajectory.defense_intent_age,
+            intent_commitment_remaining=rollout.trajectory.defense_intent_commitment_remaining,
+        )
+    )
     return metrics
 
 
@@ -1127,6 +1409,8 @@ def _print_checkpoint_summary(
         ("opponent_shot_dunk_share", metrics.get("opponent_shot_dunk_share")),
         ("opponent_shot_two_share", metrics.get("opponent_shot_two_share")),
         ("opponent_shot_three_share", metrics.get("opponent_shot_three_share")),
+        ("offense_intent_active_rate", metrics.get("offense_intent_active_rate")),
+        ("defense_intent_active_rate", metrics.get("defense_intent_active_rate")),
         ("total_offensive_three_seconds", metrics.get("total_offensive_three_seconds")),
         ("total_defensive_lane_violations", metrics.get("total_defensive_lane_violations")),
         ("approx_kl", metrics.get("approx_kl")),
@@ -1151,6 +1435,15 @@ def _print_checkpoint_summary(
         ("opponent_source", metrics.get("opponent_source")),
         ("opponent_group_count", metrics.get("opponent_group_count")),
         ("opponent_unique_update_count", metrics.get("opponent_unique_update_count")),
+        ("intent_disc_active_count", metrics.get("intent_disc_active_count")),
+        ("intent_disc_loss", metrics.get("intent_disc_loss")),
+        ("intent_disc_top1_acc_trainbatch", metrics.get("intent_disc_top1_acc_trainbatch")),
+        ("intent_disc_top1_acc_holdout", metrics.get("intent_disc_top1_acc_holdout")),
+        ("intent_disc_auc_ovr_macro_trainbatch", metrics.get("intent_disc_auc_ovr_macro_trainbatch")),
+        ("intent_disc_auc_ovr_macro_holdout", metrics.get("intent_disc_auc_ovr_macro_holdout")),
+        ("intent_bonus_beta", metrics.get("intent_bonus_beta")),
+        ("intent_bonus_raw_mean", metrics.get("intent_bonus_raw_mean")),
+        ("intent_bonus_shaping_per_step_mean", metrics.get("intent_bonus_shaping_per_step_mean")),
         ("checkpoint_path", latest_checkpoint_path),
         ("checkpoint_artifact", latest_checkpoint_artifact_path),
     ]
@@ -1210,6 +1503,25 @@ def run_training_loop(args) -> dict[str, Any]:
     grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec)
     grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
     update_runner, optimizer_transform = build_jitted_ppo_update_runner(jax, jnp, spec, trainer_config)
+    intent_disc_enabled = bool(getattr(args, "intent_diversity_enabled", False))
+    intent_disc_spec = build_intent_discriminator_spec(args, spec) if intent_disc_enabled else None
+    if intent_disc_spec is not None:
+        intent_disc_runner, intent_disc_transform = build_intent_discriminator_update_runner(
+            jax,
+            jnp,
+            intent_disc_spec,
+        )
+        initial_intent_disc_params = init_intent_discriminator_params(
+            jax,
+            jnp,
+            intent_disc_spec,
+            seed=int(args.policy_seed) + 7_001,
+        )
+        initial_intent_disc_opt_state = intent_disc_transform.init(initial_intent_disc_params)
+    else:
+        intent_disc_runner = None
+        initial_intent_disc_params = None
+        initial_intent_disc_opt_state = None
     checkpoint_dir = str(args.checkpoint_dir).strip()
     resume_checkpoint = str(args.resume_checkpoint).strip()
     latest_checkpoint_path: str | None = None
@@ -1219,6 +1531,7 @@ def run_training_loop(args) -> dict[str, Any]:
     grouped_opponent_params = None
     active_opponent_info = None
     opponent_candidates: list[dict[str, Any]] = []
+    intent_sample_artifacts: list[str] = []
     opponent_rng = np.random.default_rng(int(args.policy_seed) + 90_001)
     opponent_pool_enabled = not bool(getattr(args, "disable_opponent_pool", False))
     grouped_opponent_sampling_enabled = (
@@ -1273,6 +1586,24 @@ def run_training_loop(args) -> dict[str, Any]:
         opt_state = jax.device_put(
             _restore_like_template(checkpoint_payload["opt_state"], initial_opt_state)
         )
+        if intent_disc_enabled:
+            restored_disc = dict(checkpoint_payload.get("intent_discriminator_state", {}) or {})
+            if restored_disc.get("params") is not None and restored_disc.get("opt_state") is not None:
+                intent_disc_params = jax.device_put(
+                    _restore_like_template(restored_disc["params"], initial_intent_disc_params)
+                )
+                intent_disc_opt_state = jax.device_put(
+                    _restore_like_template(restored_disc["opt_state"], initial_intent_disc_opt_state)
+                )
+                intent_bonus_stats = dict(restored_disc.get("bonus_stats", {}) or init_bonus_stats())
+            else:
+                intent_disc_params = initial_intent_disc_params
+                intent_disc_opt_state = initial_intent_disc_opt_state
+                intent_bonus_stats = init_bonus_stats()
+        else:
+            intent_disc_params = None
+            intent_disc_opt_state = None
+            intent_bonus_stats = init_bonus_stats()
         restored_current_state = checkpoint_payload["current_state"]
         restored_eval_initial_state = checkpoint_payload["eval_initial_state"]
         if not isinstance(restored_current_state, dict) or not isinstance(restored_eval_initial_state, dict):
@@ -1297,6 +1628,9 @@ def run_training_loop(args) -> dict[str, Any]:
         completed_updates = 0
         params = initial_params
         opt_state = initial_opt_state
+        intent_disc_params = initial_intent_disc_params
+        intent_disc_opt_state = initial_intent_disc_opt_state
+        intent_bonus_stats = init_bonus_stats()
         train_history = []
         eval_trajectories = []
         last_metrics = None
@@ -1304,8 +1638,14 @@ def run_training_loop(args) -> dict[str, Any]:
     mlflow, mlflow_context = _maybe_start_mlflow_run(args, mode="train")
 
     with mlflow_context:
+        play_name_metadata = _build_training_play_name_metadata(
+            args=args,
+            mlflow=mlflow,
+            checkpoint_dir=checkpoint_dir,
+        )
         if mlflow is not None:
             _log_mlflow_params(mlflow, args, trainer_config, spec)
+            _log_mlflow_play_name_metadata(mlflow, play_name_metadata)
 
         expected_evals = _remaining_eval_count(
             start_update=completed_updates,
@@ -1354,6 +1694,97 @@ def run_training_loop(args) -> dict[str, Any]:
             block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
 
+            intent_disc_metrics: dict[str, Any] = {}
+            latest_intent_sample_payload = None
+            if intent_disc_enabled and intent_disc_spec is not None and intent_disc_runner is not None:
+                global_step = int(update_idx) * int(args.kernel_batch_size) * int(args.rollout_horizon) * len(TRAINING_ROLES)
+                intent_beta = compute_intent_beta(
+                    global_step=global_step,
+                    spec=intent_disc_spec,
+                    update_index=update_idx,
+                )
+                intent_disc_metrics = {
+                    "intent_bonus_beta": float(intent_beta),
+                    "intent_disc_skipped_warmup": 1.0 if float(intent_beta) <= 0.0 else 0.0,
+                }
+                if float(intent_beta) > 0.0:
+                    intent_features, intent_labels, intent_active_mask = build_intent_step_features_from_rollout(
+                        role_rollouts["offense"],
+                        intent_disc_spec,
+                        jnp,
+                    )
+                    params_key, update_key = jax.random.split(update_key)
+                    intent_disc_params, intent_disc_opt_state, raw_disc_metrics, raw_intent_bonus = intent_disc_runner(
+                        intent_disc_params,
+                        intent_disc_opt_state,
+                        intent_features,
+                        intent_labels,
+                        intent_active_mask,
+                        params_key,
+                    )
+                    block_until_ready_tree(
+                        (intent_disc_params, intent_disc_opt_state, raw_disc_metrics, raw_intent_bonus)
+                    )
+                    raw_bonus_np = np.asarray(jax.device_get(raw_intent_bonus), dtype=np.float32)
+                    active_mask_np = np.asarray(jax.device_get(intent_active_mask), dtype=bool)
+                    active_raw_bonus = raw_bonus_np[active_mask_np]
+                    intent_bonus_stats = update_bonus_stats(intent_bonus_stats, active_raw_bonus)
+                    intent_bonus = compute_normalized_intent_bonus(
+                        raw_intent_bonus,
+                        intent_active_mask,
+                        intent_bonus_stats,
+                        beta=intent_beta,
+                        clip=float(intent_disc_spec.bonus_clip),
+                        jnp=jnp,
+                    )
+                    role_rollouts["offense"] = apply_intent_bonus_to_rollout(
+                        role_rollouts["offense"],
+                        intent_bonus,
+                        jnp,
+                    )
+                    norm_bonus_np = np.asarray(jax.device_get(intent_bonus), dtype=np.float32)
+                    active_norm_bonus = norm_bonus_np[active_mask_np]
+                    intent_disc_metrics.update(
+                        {
+                            key: float(np.asarray(value))
+                            for key, value in raw_disc_metrics.items()
+                        }
+                    )
+                    intent_disc_metrics.update(
+                        {
+                            "intent_bonus_stats_count": float(intent_bonus_stats["count"]),
+                            "intent_bonus_stats_mean": float(intent_bonus_stats["mean"]),
+                            "intent_bonus_stats_std": float(np.sqrt(max(float(intent_bonus_stats["var"]), 1.0e-12))),
+                            "intent_bonus_raw_mean": (
+                                float(np.mean(active_raw_bonus)) if active_raw_bonus.size else 0.0
+                            ),
+                            "intent_bonus_raw_std": (
+                                float(np.std(active_raw_bonus)) if active_raw_bonus.size else 0.0
+                            ),
+                            "intent_bonus_shaping_per_step_mean": (
+                                float(np.mean(active_norm_bonus)) if active_norm_bonus.size else 0.0
+                            ),
+                            "intent_bonus_shaping_per_step_std": (
+                                float(np.std(active_norm_bonus)) if active_norm_bonus.size else 0.0
+                            ),
+                            "intent_bonus_active_sample_count": int(active_mask_np.sum()),
+                        }
+                    )
+                    if bool(getattr(args, "disc_eval_batch_output", False)):
+                        latest_intent_sample_payload = build_intent_sample_dump(
+                            params=intent_disc_params,
+                            features=intent_features,
+                            labels=intent_labels,
+                            active_mask=intent_active_mask,
+                            bonus=intent_bonus,
+                            rollout=role_rollouts["offense"],
+                            spec=intent_disc_spec,
+                            jax=jax,
+                            jnp=jnp,
+                            update_index=update_idx,
+                            max_samples=int(getattr(args, "intent_sample_dump_size", 2048)),
+                        )
+
             role_ppo_batches = [
                 build_ppo_batch(role_rollouts[role], trainer_config, jax, jnp)
                 for role in TRAINING_ROLES
@@ -1394,6 +1825,8 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             for role in TRAINING_ROLES:
                 last_metrics.update(_summarize_role_rollout_metrics(role, role_rollouts[role]))
+            if intent_disc_metrics:
+                last_metrics.update(intent_disc_metrics)
             if active_opponent_info is not None:
                 last_metrics["opponent_update_index"] = int(
                     active_opponent_info.get(
@@ -1541,6 +1974,25 @@ def run_training_loop(args) -> dict[str, Any]:
                                 shot_threes=eval_trace.opponent_shot_threes,
                             )
                         )
+                        eval_metrics.update(
+                            summarize_intent_metrics(
+                                "offense",
+                                intent_index=eval_trace.intent_index,
+                                intent_active=eval_trace.intent_active,
+                                intent_age=eval_trace.intent_age,
+                                intent_commitment_remaining=eval_trace.intent_commitment_remaining,
+                                intent_visible_to_defense=eval_trace.intent_visible_to_defense,
+                            )
+                        )
+                        eval_metrics.update(
+                            summarize_intent_metrics(
+                                "defense",
+                                intent_index=eval_trace.defense_intent_index,
+                                intent_active=eval_trace.defense_intent_active,
+                                intent_age=eval_trace.defense_intent_age,
+                                intent_commitment_remaining=eval_trace.defense_intent_commitment_remaining,
+                            )
+                        )
                         _log_mlflow_metrics(
                             mlflow,
                             eval_metrics,
@@ -1560,6 +2012,15 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             if should_checkpoint:
                 saved_candidate_info = None
+                intent_discriminator_state = None
+                if intent_disc_enabled and intent_disc_spec is not None:
+                    intent_discriminator_state = {
+                        "enabled": True,
+                        "config": intent_disc_spec.asdict(),
+                        "params": intent_disc_params,
+                        "opt_state": intent_disc_opt_state,
+                        "bonus_stats": dict(intent_bonus_stats),
+                    }
                 if checkpoint_dir:
                     latest_checkpoint_path, numbered_checkpoint_path = _save_training_checkpoint(
                         checkpoint_dir=checkpoint_dir,
@@ -1575,6 +2036,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         eval_trajectories=eval_trajectories,
                         last_metrics=last_metrics,
                         opponent_info=active_opponent_info,
+                        intent_discriminator_state=intent_discriminator_state,
+                        play_name_metadata=play_name_metadata,
                     )
                     saved_candidate_info = {
                         "source": "local_checkpoint",
@@ -1588,12 +2051,28 @@ def run_training_loop(args) -> dict[str, Any]:
                             numbered_checkpoint_path=numbered_checkpoint_path,
                             update_index=update_idx,
                         )
+                        if latest_intent_sample_payload is not None:
+                            artifact = _log_mlflow_intent_sample_artifact(
+                                mlflow,
+                                sample_payload=latest_intent_sample_payload,
+                                update_index=update_idx,
+                            )
+                            if artifact is not None:
+                                intent_sample_artifacts.append(artifact)
                         saved_candidate_info.update(
                             {
                                 "source": "mlflow",
                                 "artifact_path": latest_checkpoint_artifact_path,
                             }
                         )
+                    elif latest_intent_sample_payload is not None:
+                        artifact = _save_local_intent_sample_artifact(
+                            checkpoint_dir=checkpoint_dir,
+                            sample_payload=latest_intent_sample_payload,
+                            update_index=update_idx,
+                        )
+                        if artifact is not None:
+                            intent_sample_artifacts.append(artifact)
                 elif mlflow is not None:
                     with TemporaryDirectory(prefix="basketworld_jax_ckpt_") as staging_dir:
                         latest_checkpoint_path, numbered_checkpoint_path = _save_training_checkpoint(
@@ -1610,12 +2089,22 @@ def run_training_loop(args) -> dict[str, Any]:
                             eval_trajectories=eval_trajectories,
                             last_metrics=last_metrics,
                             opponent_info=active_opponent_info,
+                            intent_discriminator_state=intent_discriminator_state,
+                            play_name_metadata=play_name_metadata,
                         )
                         latest_checkpoint_artifact_path = _log_mlflow_checkpoint_artifacts(
                             mlflow,
                             numbered_checkpoint_path=numbered_checkpoint_path,
                             update_index=update_idx,
                         )
+                        if latest_intent_sample_payload is not None:
+                            artifact = _log_mlflow_intent_sample_artifact(
+                                mlflow,
+                                sample_payload=latest_intent_sample_payload,
+                                update_index=update_idx,
+                            )
+                            if artifact is not None:
+                                intent_sample_artifacts.append(artifact)
                         saved_candidate_info = {
                             "source": "mlflow",
                             "artifact_path": latest_checkpoint_artifact_path,
@@ -1676,6 +2165,16 @@ def run_training_loop(args) -> dict[str, Any]:
             "final_metrics": last_metrics,
             "latest_checkpoint_path": latest_checkpoint_path,
             "latest_checkpoint_artifact_path": latest_checkpoint_artifact_path,
+            "intent_discriminator_config": (
+                intent_disc_spec.asdict() if intent_disc_spec is not None else None
+            ),
+            "play_name_metadata": play_name_metadata,
+            "play_name_map": {
+                str(int(item["intent_index"])): str(item["play_name"])
+                for item in play_name_metadata.get("play_names", [])
+                if isinstance(item, dict)
+            },
+            "intent_sample_artifacts": intent_sample_artifacts,
             "active_opponent": active_opponent_info,
             "opponent_pool_size": len(opponent_candidates),
             "next_step": "run a longer learnability check and inspect eval trajectories for behavior changes",
@@ -1696,6 +2195,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
         jnp,
         model_type=_policy_model_type(args),
     )
+    policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
     action_masks = build_action_masks_batch(static, state, jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
     action_masks_np = np.asarray(jax.device_get(action_masks), dtype=np.int8)
@@ -1724,7 +2224,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
     final_out = None
     for idx in range(int(args.warmup_iters)):
         sample_key = jax.random.fold_in(sample_key, idx)
-        final_out = runner(params, flat_obs, action_masks, sample_key)
+        final_out = runner(params, flat_obs, action_masks, policy_intent_context, sample_key)
         jax.block_until_ready(final_out["values"])
         progress.update(1)
         progress.set_postfix_str("forward_warmup", refresh=False)
@@ -1733,7 +2233,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
     for idx in range(int(args.benchmark_iters)):
         sample_key = jax.random.fold_in(sample_key, idx + 10_000)
         start_ns = perf_counter_ns()
-        final_out = runner(params, flat_obs, action_masks, sample_key)
+        final_out = runner(params, flat_obs, action_masks, policy_intent_context, sample_key)
         jax.block_until_ready(final_out["values"])
         timed_ns += perf_counter_ns() - start_ns
         progress.update(1)
@@ -1829,6 +2329,12 @@ def run_train_scaffold(args) -> dict[str, Any]:
                 "log_prob_shape": [int(args.kernel_batch_size), int(spec.training_player_count)],
                 "rollout_horizon": int(args.rollout_horizon),
                 "trajectory_flat_obs_shape": list(np.asarray(rollout_out.trajectory.flat_obs).shape),
+                "trajectory_policy_intent_index_shape": list(
+                    np.asarray(rollout_out.trajectory.policy_intent_index).shape
+                ),
+                "trajectory_policy_intent_gate_shape": list(
+                    np.asarray(rollout_out.trajectory.policy_intent_gate).shape
+                ),
                 "trajectory_action_mask_shape": list(np.asarray(rollout_out.trajectory.action_mask).shape),
                 "trajectory_actions_shape": list(np.asarray(rollout_out.trajectory.actions).shape),
                 "trajectory_full_actions_shape": list(np.asarray(rollout_out.trajectory.full_actions).shape),
@@ -1857,6 +2363,8 @@ def run_train_scaffold(args) -> dict[str, Any]:
                 ),
                 "bootstrap_values_shape": list(np.asarray(rollout_out.bootstrap_values).shape),
                 "ppo_batch_flat_obs_shape": list(np.asarray(ppo_batch.flat_obs).shape),
+                "ppo_batch_policy_intent_index_shape": list(np.asarray(ppo_batch.policy_intent_index).shape),
+                "ppo_batch_policy_intent_gate_shape": list(np.asarray(ppo_batch.policy_intent_gate).shape),
                 "ppo_batch_action_mask_shape": list(np.asarray(ppo_batch.action_mask).shape),
             "ppo_batch_actions_shape": list(np.asarray(ppo_batch.actions).shape),
             "ppo_batch_old_log_probs_shape": list(np.asarray(ppo_batch.old_selected_log_probs).shape),

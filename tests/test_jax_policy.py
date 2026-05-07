@@ -96,6 +96,109 @@ def test_attention_actor_critic_forward_shapes():
     )
 
 
+def test_attention_intent_embedding_conditions_policy_when_active():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    spec = ActorCriticSpec(
+        flat_obs_dim=95,
+        training_player_count=3,
+        action_dim_per_player=14,
+        total_action_dim=42,
+        hidden_dims=(8,),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=15,
+        global_dim=4,
+        attention_embed_dim=16,
+        attention_num_heads=4,
+        attention_token_mlp_dim=12,
+        attention_num_cls_tokens=2,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=4,
+        num_intents=5,
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
+    flat_obs = jnp.ones((3, 95), dtype=jnp.float32)
+    flat_obs = flat_obs.at[:, -1].set(1.0)
+
+    out_a = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context={
+            "intent_index": jnp.full((3,), 1, dtype=jnp.int32),
+            "intent_gate": jnp.ones((3,), dtype=jnp.float32),
+        },
+    )
+    out_b = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context={
+            "intent_index": jnp.full((3,), 2, dtype=jnp.int32),
+            "intent_gate": jnp.ones((3,), dtype=jnp.float32),
+        },
+    )
+
+    assert not np.allclose(
+        np.asarray(out_a["flat_policy_logits"]),
+        np.asarray(out_b["flat_policy_logits"]),
+    )
+
+
+def test_attention_intent_embedding_zero_gate_matches_no_context():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    spec = ActorCriticSpec(
+        flat_obs_dim=95,
+        training_player_count=3,
+        action_dim_per_player=14,
+        total_action_dim=42,
+        hidden_dims=(8,),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=15,
+        global_dim=4,
+        attention_embed_dim=16,
+        attention_num_heads=4,
+        attention_token_mlp_dim=12,
+        attention_num_cls_tokens=2,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=4,
+        num_intents=5,
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
+    flat_obs = jnp.ones((3, 95), dtype=jnp.float32)
+    flat_obs = flat_obs.at[:, -1].set(1.0)
+
+    no_context = actor_critic_forward(params, flat_obs, spec, jnp)
+    zero_gate = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context={
+            "intent_index": jnp.full((3,), 4, dtype=jnp.int32),
+            "intent_gate": jnp.zeros((3,), dtype=jnp.float32),
+        },
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(no_context["flat_policy_logits"]),
+        np.asarray(zero_gate["flat_policy_logits"]),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(no_context["values"]),
+        np.asarray(zero_gate["values"]),
+        atol=1e-6,
+    )
+
+
 def test_pointer_targeted_action_head_produces_final_action_distribution():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")

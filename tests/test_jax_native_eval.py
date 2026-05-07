@@ -103,6 +103,10 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
     assert "shot_dunk_share" in diagnostics["jax_native_summary"]
     assert "shot_two_share" in diagnostics["jax_native_summary"]
     assert "shot_three_share" in diagnostics["jax_native_summary"]
+    assert diagnostics["jax_native_summary"]["intent_active_episodes"] == 0
+    assert diagnostics["jax_native_summary"]["intent_inactive_episodes"] == 3
+    assert diagnostics["jax_native_summary"]["defense_intent_active_episodes"] == 0
+    assert diagnostics["jax_native_summary"]["defense_intent_inactive_episodes"] == 3
     for key in (
         "action_mix",
         "reward_breakdown",
@@ -114,6 +118,11 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
         assert key in diagnostics
 
     for episode in result["results"]:
+        assert episode["intent_index"] is None
+        assert episode["intent_active"] is False
+        assert episode["intent_visible_to_defense"] is False
+        assert episode["defense_intent_index"] is None
+        assert episode["defense_intent_active"] is False
         outcome_info = episode["outcome_info"]
         assert set(outcome_info) >= {
             "shots",

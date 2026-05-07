@@ -25,6 +25,7 @@ from basketworld_jax.env.minimal import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_kernel_static_from_env,
+    build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch_with_role_flag,
     reset_batch_minimal,
     step_batch_minimal,
@@ -74,8 +75,14 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
         offense_ids = static.offense_ids.astype(jnp.int32)
         defense_ids = static.defense_ids.astype(jnp.int32)
 
-        def _team_actions(params, flat_obs, action_mask, key, deterministic: bool):
-            forward_out = actor_critic_forward(params, flat_obs, spec, jnp)
+        def _team_actions(params, flat_obs, action_mask, intent_context, key, deterministic: bool):
+            forward_out = actor_critic_forward(
+                params,
+                flat_obs,
+                spec,
+                jnp,
+                intent_context=intent_context,
+            )
             masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
                 action_mask,
@@ -111,10 +118,23 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 model_type=spec.model_type,
             )
+            offense_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                role_flag_offense,
+                jnp,
+            )
+            defense_intent_context = build_policy_intent_context_batch_with_role_flag(
+                static,
+                state,
+                role_flag_defense,
+                jnp,
+            )
             offense_actions = _team_actions(
                 offense_params,
                 offense_obs,
                 offense_mask,
+                offense_intent_context,
                 offense_key,
                 offense_deterministic,
             )
@@ -122,6 +142,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 defense_params,
                 defense_obs,
                 defense_mask,
+                defense_intent_context,
                 defense_key,
                 defense_deterministic,
             )
@@ -169,6 +190,15 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
                 "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
                 "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
+                "intent_index": state.intent_index.astype(jnp.int32),
+                "intent_active": state.intent_active.astype(jnp.int8),
+                "intent_age": state.intent_age.astype(jnp.int32),
+                "intent_commitment_remaining": state.intent_commitment_remaining.astype(jnp.int32),
+                "intent_visible_to_defense": state.intent_visible_to_defense.astype(jnp.int8),
+                "defense_intent_index": state.defense_intent_index.astype(jnp.int32),
+                "defense_intent_active": state.defense_intent_active.astype(jnp.int8),
+                "defense_intent_age": state.defense_intent_age.astype(jnp.int32),
+                "defense_intent_commitment_remaining": state.defense_intent_commitment_remaining.astype(jnp.int32),
             }
             return (env_out.state, key), trace
 
@@ -252,6 +282,8 @@ def _init_eval_diagnostics() -> dict[str, Any]:
     return {
         "intent_selection_counts": {},
         "intent_inactive_count": 0,
+        "defense_intent_selection_counts": {},
+        "defense_intent_inactive_count": 0,
         "turnover_reasons": {},
         "assist_links": {},
         "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
@@ -609,7 +641,32 @@ def run_native_jax_evaluation(
             turnovers_payload: list[dict[str, Any]] = []
             defensive_lane_violations_payload: list[dict[str, Any]] = []
             episode_shots: dict[str, list[int]] = {}
-            eval_diagnostics["intent_inactive_count"] = int(eval_diagnostics.get("intent_inactive_count", 0)) + 1
+            episode_intent_active = bool(int(trace["intent_active"][0, idx])) if int(horizon) > 0 else False
+            episode_intent_index = int(trace["intent_index"][0, idx]) if episode_intent_active else None
+            episode_intent_key = str(episode_intent_index) if episode_intent_active else "none"
+            episode_intent_visible_to_defense = (
+                bool(int(trace["intent_visible_to_defense"][0, idx])) if int(horizon) > 0 else False
+            )
+            if episode_intent_active:
+                intent_counts = eval_diagnostics.setdefault("intent_selection_counts", {})
+                intent_counts[episode_intent_key] = int(intent_counts.get(episode_intent_key, 0)) + 1
+            else:
+                eval_diagnostics["intent_inactive_count"] = int(eval_diagnostics.get("intent_inactive_count", 0)) + 1
+
+            episode_defense_intent_active = (
+                bool(int(trace["defense_intent_active"][0, idx])) if int(horizon) > 0 else False
+            )
+            episode_defense_intent_index = (
+                int(trace["defense_intent_index"][0, idx]) if episode_defense_intent_active else None
+            )
+            if episode_defense_intent_active:
+                defense_counts = eval_diagnostics.setdefault("defense_intent_selection_counts", {})
+                defense_key = str(episode_defense_intent_index)
+                defense_counts[defense_key] = int(defense_counts.get(defense_key, 0)) + 1
+            else:
+                eval_diagnostics["defense_intent_inactive_count"] = (
+                    int(eval_diagnostics.get("defense_intent_inactive_count", 0)) + 1
+                )
 
             for pid in per_player_stats:
                 per_player_stats[pid]["episodes"] += 1
@@ -743,8 +800,8 @@ def run_native_jax_evaluation(
             reward_breakdown["assist_full_bonus"] += full_amt
             reward_breakdown["unexplained"] += user_reward - known_reward
 
-            per_intent_stats["none"] = _accumulate_team_stats_from_players(
-                per_intent_stats.get("none"),
+            per_intent_stats[episode_intent_key] = _accumulate_team_stats_from_players(
+                per_intent_stats.get(episode_intent_key),
                 episode_player_stats,
                 user_team_ids,
                 episodes=1,
@@ -754,7 +811,11 @@ def run_native_jax_evaluation(
             results.append(
                 {
                     "episode": int(episode_num),
-                    "intent_index": None,
+                    "intent_index": episode_intent_index,
+                    "intent_active": episode_intent_active,
+                    "intent_visible_to_defense": episode_intent_visible_to_defense,
+                    "defense_intent_index": episode_defense_intent_index,
+                    "defense_intent_active": episode_defense_intent_active,
                     "steps": step_count,
                     "episode_rewards": {
                         "offense": offense_reward,
@@ -803,6 +864,12 @@ def run_native_jax_evaluation(
         )
         for shot_type, count in shot_type_attempts.items()
     }
+    intent_active_episodes = int(sum(int(v) for v in eval_diagnostics["intent_selection_counts"].values()))
+    intent_inactive_episodes = int(eval_diagnostics.get("intent_inactive_count", 0))
+    defense_intent_active_episodes = int(
+        sum(int(v) for v in eval_diagnostics["defense_intent_selection_counts"].values())
+    )
+    defense_intent_inactive_episodes = int(eval_diagnostics.get("defense_intent_inactive_count", 0))
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -835,6 +902,14 @@ def run_native_jax_evaluation(
         "shot_dunk_share": float(shot_type_shares["dunk"]),
         "shot_two_share": float(shot_type_shares["two"]),
         "shot_three_share": float(shot_type_shares["three"]),
+        "intent_active_episodes": int(intent_active_episodes),
+        "intent_inactive_episodes": int(intent_inactive_episodes),
+        "intent_active_rate": float(intent_active_episodes / int(num_episodes)) if int(num_episodes) else 0.0,
+        "defense_intent_active_episodes": int(defense_intent_active_episodes),
+        "defense_intent_inactive_episodes": int(defense_intent_inactive_episodes),
+        "defense_intent_active_rate": (
+            float(defense_intent_active_episodes / int(num_episodes)) if int(num_episodes) else 0.0
+        ),
     }
     return {
         "results": results,

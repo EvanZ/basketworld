@@ -35,6 +35,9 @@ class ActorCriticSpec:
     action_head_mode: str = ACTION_HEAD_MODE_FLAT
     pass_action_start: int = PASS_ACTION_START
     pass_action_end: int = PASS_ACTION_END
+    intent_embedding_enabled: bool = False
+    intent_embedding_dim: int = 16
+    num_intents: int = 8
 
 
 def build_actor_critic_spec(
@@ -56,6 +59,9 @@ def build_actor_critic_spec(
     action_head_mode: str = ACTION_HEAD_MODE_FLAT,
     pass_action_start: int = PASS_ACTION_START,
     pass_action_end: int = PASS_ACTION_END,
+    intent_embedding_enabled: bool = False,
+    intent_embedding_dim: int = 16,
+    num_intents: int = 8,
 ) -> ActorCriticSpec:
     if flat_obs_batch.ndim != 2:
         raise ValueError(
@@ -76,6 +82,17 @@ def build_actor_critic_spec(
         raise ValueError(f"Unsupported JAX action head mode {action_head_mode!r}.")
     if normalized_action_head_mode == ACTION_HEAD_MODE_POINTER_TARGETED and normalized_model_type != "attention":
         raise ValueError("Pointer-targeted JAX action head currently requires --policy-model attention.")
+    intent_embedding_enabled = bool(intent_embedding_enabled)
+    intent_embedding_dim = int(intent_embedding_dim)
+    num_intents = int(num_intents)
+    if intent_embedding_enabled and normalized_model_type != "attention":
+        raise ValueError("JAX intent embeddings require --policy-model attention.")
+    if intent_embedding_enabled and intent_embedding_dim <= 0:
+        raise ValueError("--intent-embedding-dim must be >= 1.")
+    if num_intents <= 0:
+        raise ValueError("--num-intents must be >= 1.")
+    if not intent_embedding_enabled:
+        num_intents = 8
     pass_action_start = int(pass_action_start)
     pass_action_end = int(pass_action_end)
     if not (0 <= pass_action_start < pass_action_end <= action_dim_per_player):
@@ -118,6 +135,9 @@ def build_actor_critic_spec(
         action_head_mode=normalized_action_head_mode,
         pass_action_start=int(pass_action_start),
         pass_action_end=int(pass_action_end),
+        intent_embedding_enabled=bool(intent_embedding_enabled),
+        intent_embedding_dim=int(intent_embedding_dim),
+        num_intents=int(num_intents),
     )
 
 
@@ -183,7 +203,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
     class ActorCriticModule(nn.Module):
         @nn.compact
         def _mlp_forward(self, flat_obs):
-            hidden = flat_obs.astype(np.float32)
+            hidden = flat_obs.astype(jnp.float32)
             for hidden_dim in spec.hidden_dims:
                 hidden = nn.Dense(
                     int(hidden_dim),
@@ -255,6 +275,56 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             globals_vec = flat_obs[:, global_start:global_end]
             role_flag = flat_obs[:, global_end : global_end + 1]
             return players.astype(jnp.float32), globals_vec.astype(jnp.float32), role_flag.astype(jnp.float32)
+
+        @nn.compact
+        def _apply_intent_conditioning(self, token_hidden, role_flag, intent_context):
+            if not bool(spec.intent_embedding_enabled):
+                return token_hidden
+
+            batch_size = token_hidden.shape[0]
+            if intent_context is None:
+                intent_index = jnp.zeros((batch_size,), dtype=jnp.int32)
+                intent_gate = jnp.zeros((batch_size,), dtype=jnp.float32)
+            else:
+                intent_index = jnp.asarray(
+                    intent_context.get("intent_index", jnp.zeros((batch_size,), dtype=jnp.int32)),
+                    dtype=jnp.int32,
+                ).reshape((batch_size,))
+                intent_gate = jnp.asarray(
+                    intent_context.get(
+                        "intent_gate",
+                        intent_context.get("intent_active", jnp.zeros((batch_size,), dtype=jnp.float32)),
+                    ),
+                    dtype=jnp.float32,
+                ).reshape((batch_size,))
+
+            safe_index = jnp.clip(intent_index, 0, int(spec.num_intents) - 1)
+            offense_embeddings = self.param(
+                "offense_intent_embedding",
+                nn.initializers.normal(stddev=0.02),
+                (int(spec.num_intents), int(spec.intent_embedding_dim)),
+            )
+            defense_embeddings = self.param(
+                "defense_intent_embedding",
+                nn.initializers.normal(stddev=0.02),
+                (int(spec.num_intents), int(spec.intent_embedding_dim)),
+            )
+            offense_delta = nn.Dense(
+                int(spec.attention_embed_dim),
+                use_bias=False,
+                kernel_init=kernel_init,
+                name="offense_intent_projection",
+            )(offense_embeddings[safe_index])
+            defense_delta = nn.Dense(
+                int(spec.attention_embed_dim),
+                use_bias=False,
+                kernel_init=kernel_init,
+                name="defense_intent_projection",
+            )(defense_embeddings[safe_index])
+            is_offense = role_flag[:, 0:1] > 0.0
+            delta = jnp.where(is_offense, offense_delta, defense_delta)
+            gate = jnp.clip(intent_gate, 0.0, 1.0)
+            return token_hidden + (gate[:, None, None] * delta[:, None, :])
 
         def _select_training_player_tokens(self, player_tokens, role_flag):
             if int(spec.token_player_count) == int(spec.training_player_count):
@@ -382,7 +452,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             return jnp.where(has_valid, slot_logits, fallback)
 
         @nn.compact
-        def _attention_forward(self, flat_obs):
+        def _attention_forward(self, flat_obs, intent_context=None):
             players, globals_vec, role_flag = self._unpack_token_observation(flat_obs)
             globals_expanded = jnp.broadcast_to(
                 globals_vec[:, None, :],
@@ -402,6 +472,11 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 bias_init=bias_init,
                 name="token_mlp_1",
             )(token_hidden)
+            token_hidden = self._apply_intent_conditioning(
+                token_hidden,
+                role_flag,
+                intent_context,
+            )
 
             cls_count = max(0, int(spec.attention_num_cls_tokens))
             if cls_count > 0:
@@ -529,9 +604,9 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 "values": values,
             }
 
-        def __call__(self, flat_obs):
+        def __call__(self, flat_obs, intent_context=None):
             if str(spec.model_type) == "attention":
-                return self._attention_forward(flat_obs)
+                return self._attention_forward(flat_obs, intent_context)
             return self._mlp_forward(flat_obs)
 
     return ActorCriticModule()
@@ -546,9 +621,13 @@ def init_actor_critic_params(jax, jnp, spec: ActorCriticSpec, *, seed: int):
     return unfreeze(variables["params"])
 
 
-def actor_critic_forward(params, flat_obs, spec: ActorCriticSpec, jnp):
+def actor_critic_forward(params, flat_obs, spec: ActorCriticSpec, jnp, *, intent_context=None):
     module = build_actor_critic_module(spec)
-    return module.apply({"params": params}, flat_obs.astype(jnp.float32))
+    return module.apply(
+        {"params": params},
+        flat_obs.astype(jnp.float32),
+        intent_context,
+    )
 
 
 def apply_action_mask(flat_policy_logits, action_mask, spec: ActorCriticSpec, jax, jnp):
@@ -596,8 +675,24 @@ def sample_actions(masked_logits, sample_key, jax, jnp):
     return sampled_actions, selected_log_probs
 
 
-def run_actor_critic(params, flat_obs, action_mask, spec: ActorCriticSpec, sample_key, jax, jnp):
-    forward_out = actor_critic_forward(params, flat_obs, spec, jnp)
+def run_actor_critic(
+    params,
+    flat_obs,
+    action_mask,
+    spec: ActorCriticSpec,
+    sample_key,
+    jax,
+    jnp,
+    *,
+    intent_context=None,
+):
+    forward_out = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context=intent_context,
+    )
     mask_out = apply_action_mask(
         forward_out["flat_policy_logits"],
         action_mask,

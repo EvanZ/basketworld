@@ -143,6 +143,36 @@ def test_counterfactual_snapshot_restores_state_and_rng(isolated_game_state):
     ]
 
 
+def test_play_name_map_prefers_policy_metadata(isolated_game_state):
+    env = HexagonBasketballEnv(
+        players=3,
+        enable_intent_learning=True,
+        num_intents=3,
+        training_team=Team.OFFENSE,
+    )
+    isolated_game_state.env = env
+    isolated_game_state.unified_policy = type(
+        "PolicyWithMetadata",
+        (),
+        {
+            "metadata": {
+                "play_name_map": {
+                    "0": "Atlas Cut",
+                    "1": "Cinder Flare",
+                    "2": "Nova Screen",
+                    "9": "Ignored Extra",
+                }
+            }
+        },
+    )()
+
+    assert backend_state.get_current_play_name_map(3) == {
+        "0": "Atlas Cut",
+        "1": "Cinder Flare",
+        "2": "Nova Screen",
+    }
+
+
 def test_counterfactual_snapshot_routes_capture_and_restore(isolated_game_state):
     _init_live_game(isolated_game_state)
     baseline_positions = [tuple(pos) for pos in isolated_game_state.env.positions]

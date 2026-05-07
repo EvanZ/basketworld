@@ -82,8 +82,10 @@ def build_checkpoint_payload(
     last_metrics: dict[str, Any] | None,
     opponent_info: dict[str, Any] | None = None,
     env_config: dict[str, Any] | None = None,
+    intent_discriminator_state: dict[str, Any] | None = None,
+    play_name_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "update_index": int(update_index),
@@ -102,6 +104,17 @@ def build_checkpoint_payload(
         "last_metrics": None if last_metrics is None else dict(last_metrics),
         "opponent_info": None if opponent_info is None else dict(opponent_info),
     }
+    if intent_discriminator_state is not None:
+        payload["intent_discriminator_state"] = dict(intent_discriminator_state)
+        payload["state"]["intent_discriminator_params"] = _tree_to_numpy(
+            intent_discriminator_state.get("params")
+        )
+        payload["state"]["intent_discriminator_opt_state"] = _tree_to_numpy(
+            intent_discriminator_state.get("opt_state")
+        )
+    if play_name_metadata is not None:
+        payload["play_name_metadata"] = dict(play_name_metadata)
+    return payload
 
 
 def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -118,6 +131,33 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if payload.get("env_config") is not None:
         metadata["env_config"] = _to_jsonable(dict(payload["env_config"]))
+    if payload.get("intent_discriminator_state") is not None:
+        state = dict(payload["intent_discriminator_state"])
+        metadata["intent_discriminator_state"] = _to_jsonable(
+            {
+                "config": dict(state.get("config", {}) or {}),
+                "bonus_stats": dict(state.get("bonus_stats", {}) or {}),
+                "enabled": bool(state.get("enabled", False)),
+            }
+        )
+    if payload.get("play_name_metadata") is not None:
+        play_name_metadata = dict(payload["play_name_metadata"] or {})
+        metadata["play_name_metadata"] = _to_jsonable(play_name_metadata)
+        play_name_map = {}
+        for item in play_name_metadata.get("play_names", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                intent_index = int(item.get("intent_index"))
+            except Exception:
+                continue
+            play_name = str(item.get("play_name", "")).strip()
+            if play_name:
+                play_name_map[str(intent_index)] = play_name
+        metadata["play_name_map"] = play_name_map
+        model_codename = str(play_name_metadata.get("model_codename", "")).strip()
+        if model_codename:
+            metadata["model_codename"] = model_codename
     return metadata
 
 
@@ -140,6 +180,19 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
     }
     if "env_config" in metadata:
         payload["env_config"] = _from_jsonable(metadata["env_config"])
+    if "intent_discriminator_state" in metadata:
+        disc_meta = _from_jsonable(metadata["intent_discriminator_state"])
+        payload["intent_discriminator_state"] = {
+            **dict(disc_meta or {}),
+            "params": state.get("intent_discriminator_params"),
+            "opt_state": state.get("intent_discriminator_opt_state"),
+        }
+    if "play_name_metadata" in metadata:
+        payload["play_name_metadata"] = _from_jsonable(metadata["play_name_metadata"])
+    if "play_name_map" in metadata:
+        payload["play_name_map"] = _from_jsonable(metadata["play_name_map"])
+    if "model_codename" in metadata:
+        payload["model_codename"] = metadata["model_codename"]
     return payload
 
 

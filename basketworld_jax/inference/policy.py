@@ -10,6 +10,7 @@ from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     build_action_masks_batch,
     build_kernel_static_from_env,
+    build_policy_intent_context_batch,
     build_policy_observation_batch,
     build_token_observation_components_batch,
     snapshot_state_from_env,
@@ -51,6 +52,9 @@ class JAXInferenceModel:
             "env_config": dict(payload.get("env_config", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }
+        for key in ("play_name_metadata", "play_name_map", "model_codename"):
+            if key in payload:
+                self.metadata[key] = payload[key]
         self._prepared_env = None
         self._prepared_observer_is_offense = True
         self._sample_key = self.jax.random.PRNGKey(0)
@@ -60,8 +64,14 @@ class JAXInferenceModel:
 
     def _build_masked_runner(self):
         @self.jax.jit
-        def _runner(params, flat_obs, team_action_mask):
-            forward_out = actor_critic_forward(params, flat_obs, self.spec, self.jnp)
+        def _runner(params, flat_obs, team_action_mask, intent_context):
+            forward_out = actor_critic_forward(
+                params,
+                flat_obs,
+                self.spec,
+                self.jnp,
+                intent_context=intent_context,
+            )
             masked_out = apply_action_mask(
                 forward_out["flat_policy_logits"],
                 team_action_mask,
@@ -123,6 +133,15 @@ class JAXInferenceModel:
             "assist_passer",
             "assist_recipient",
             "assist_expires_at",
+            "intent_index",
+            "intent_active",
+            "intent_age",
+            "intent_commitment_remaining",
+            "intent_visible_to_defense",
+            "defense_intent_index",
+            "defense_intent_active",
+            "defense_intent_age",
+            "defense_intent_commitment_remaining",
         )
         arrays = tuple(np.asarray(snapshot[key]).tobytes() for key in array_keys)
         scalars = tuple(snapshot[key] for key in scalar_keys)
@@ -151,7 +170,13 @@ class JAXInferenceModel:
         full_action_mask = build_action_masks_batch(static, state, self.jnp)
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
         team_action_mask = self.jnp.take(full_action_mask, team_ids, axis=1)
-        masked_out = self._masked_runner(self.params, flat_obs, team_action_mask)
+        intent_context = build_policy_intent_context_batch(static, state, self.jnp)
+        masked_out = self._masked_runner(
+            self.params,
+            flat_obs,
+            team_action_mask,
+            intent_context,
+        )
         self._last_team_outputs = {
             "key": cache_key,
             "masked_out": masked_out,
@@ -235,6 +260,11 @@ class JAXInferenceModel:
             return None
 
         base_env = self._resolve_base_env(env)
+        static = self._build_static_for_role(env, observer_is_offense)
+        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        intent_context = build_policy_intent_context_batch(static, state, self.jnp)
+        intent_index = np.asarray(self.jax.device_get(intent_context["intent_index"]), dtype=np.int32)
+        intent_gate = np.asarray(self.jax.device_get(intent_context["intent_gate"]), dtype=np.float32)
         offense_ids = set(int(pid) for pid in getattr(base_env, "offense_ids", []) or [])
         defense_ids = set(int(pid) for pid in getattr(base_env, "defense_ids", []) or [])
         labels: list[str] = []
@@ -266,10 +296,10 @@ class JAXInferenceModel:
             "weights_heads": weights.tolist(),
             "labels": labels,
             "heads": int(weights.shape[0]),
-            "runtime_intent_index": 0,
-            "runtime_intent_active": False,
-            "runtime_intent_visible": True,
-            "runtime_intent_gate": False,
+            "runtime_intent_index": int(intent_index[0]) if intent_index.size else 0,
+            "runtime_intent_active": bool(intent_gate[0] > 0.5) if intent_gate.size else False,
+            "runtime_intent_visible": bool(intent_gate[0] > 0.5) if intent_gate.size else False,
+            "runtime_intent_gate": bool(intent_gate[0] > 0.5) if intent_gate.size else False,
             "observer_role": "offense" if bool(observer_is_offense) else "defense",
             "cls_labels": cls_labels,
         }

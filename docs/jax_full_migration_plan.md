@@ -459,9 +459,12 @@ Design stance:
 - do not add `intent_index_norm` as a normal global feature
 - keep intent/runtime state in JAX environment state and run metadata
 - condition the low-level attention policy through learned embeddings, matching the current production direction
+- learnable plays require a discriminator/diversity objective; sampled intent IDs and embeddings alone are not sufficient
 - implement the selector only after the low-level policy can demonstrably respond to different play IDs
 
 Milestone 1: low-level JAX intent runtime state
+
+Status: implemented.
 
 - add offense intent fields to `KernelState`:
   - `intent_index`
@@ -486,7 +489,19 @@ Exit criteria:
 - raw `shot_clock`, scoring, rollout, and action semantics remain unchanged
 - native eval can report active intent usage and episode-level play IDs
 
+Implementation notes:
+
+- JAX reset now samples offense and defense intent state from static config with deterministic PRNG behavior.
+- JAX step advances and expires active intent commitments without changing action or scoring semantics.
+- Null/inactive intents carry `commitment_remaining=0`; active intents start at `intent_commitment_steps`.
+- Train/eval metrics now include offense and defense intent active rates, ages, remaining commitment, and per-ID usage shares.
+- Checkpoint/MLflow env metadata now persists the intent runtime config.
+- Native JAX eval now emits episode-level offense and defense intent IDs and active/inactive summary counts.
+- Intent state is runtime/diagnostic only in Milestone 1; Milestone 2 now consumes the role-selected intent in the policy path.
+
 Milestone 2: low-level attention policy embedding conditioning
+
+Status: implemented.
 
 - add intent embedding config to `ActorCriticSpec`:
   - `intent_embedding_enabled`
@@ -503,12 +518,85 @@ Exit criteria:
 - same state with different active `intent_index` can produce different logits
 - inactive intent gate produces the same logits as no intent conditioning
 - checkpoint metadata fully records intent conditioning config
+- checkpoint/MLflow metadata persists the same deterministic play-code-name mapping used by SB3
 - the Attention tab can show current intent state for debugging
 
-Milestone 3: manual / sampled play conditioning smoke tests
+Implementation notes:
+
+- `ActorCriticSpec` now records `intent_embedding_enabled`, `intent_embedding_dim`, and `num_intents`.
+- The Flax attention policy has separate offense and defense intent embedding tables plus role-specific projections into token embedding space.
+- Runtime policy context is passed separately from observations as `intent_index` and `intent_gate`; the PPO rollout batch stores both fields and feeds them back through the update loss.
+- The JAX rollout, frozen-opponent, grouped-opponent, native eval, and web inference paths all pass role-selected intent context into actor-critic forward calls.
+- Inactive/zero intent gate is tested to match no-context logits, while active different intent IDs are tested to change logits.
+- MLflow/checkpoint policy metadata records the intent embedding config, and the Attention tab payload now reports the live JAX runtime intent gate/index.
+- JAX training now logs `metadata/play_names.json`, tags `model_codename`, and stores `play_name_map` in checkpoint metadata so the UI and analytics can use the same code names as the SB3 path.
+
+Milestone 3: discriminator / diversity objective
+
+Status: current-policy offense discriminator path is implemented with both `set_step` and `mlp_mean`; `set_step` is the intended parity path.
+
+- add a JAX-native discriminator that predicts active `intent_index` from behavior traces
+- match the current SB3 production architecture:
+  - collect only active offense intent behavior by default
+  - keep a `current_policy_only`-style filter so frozen-opponent offense episodes do not train the discriminator unless explicitly enabled
+  - compute the DIAYN-style bonus as `log q(z | trajectory) + log(num_intents)`
+  - normalize the raw bonus with running mean/std
+  - clip the normalized bonus
+  - scale it with a scheduled beta
+  - inject the bonus into rollout rewards before PPO advantage/return computation
+- define the behavior window used by the discriminator:
+  - player-token trajectory summaries
+  - action/pass/shot features
+  - role-aware offense and defense features if defense intents are enabled
+- train the discriminator with Optax alongside PPO without feeding ordinal intent features into the low-level policy
+- add a DIAYN-style intrinsic reward or auxiliary bonus based on discriminator confidence/log-prob
+- keep reward scaling explicit and logged so this cannot silently dominate basketball rewards
+- log discriminator trainbatch and holdout top-1 accuracy, macro OVR AUC, entropy, intrinsic reward mean, and per-intent classification stats
+- save capped active-offense rollout samples for offline t-SNE/UMAP analysis:
+  - `intent_index`
+  - behavior feature vector used by the discriminator
+  - discriminator embedding / penultimate layer output
+  - action/pass/shot/outcome summary fields
+  - update index and current-policy-vs-frozen provenance
+  - default to opt-in or capped dumps so artifacts stay bounded
+- support the production-relevant discriminator path in JAX:
+  - set-step discriminator over `players`, `globals`, and `role_flag`
+  - mean-pooled MLP fallback for simpler smoke tests
+  - GRU/sequence discriminator is intentionally not planned for JAX
+- preserve optional auxiliary heads as follow-up parity:
+  - shot-end prior
+  - shot-quality prior
+
+Exit criteria:
+
+- discriminator can predict intent above chance on held-out rollout windows
+- intrinsic reward is nonzero and bounded by configured scale
+- per-intent behavior begins to separate under uniform sampled intents
+- discriminator/update cost is measurable and acceptable
+
+Implementation notes:
+
+- JAX train loop now supports `--intent-diversity-enabled` with offense-only, current-policy-only discriminator training.
+- The JAX discriminator supports `--intent-disc-encoder-type set_step`, which consumes the attention policy's tokenized player observations plus global context and role flag.
+- The mean-pooled `mlp_mean` discriminator remains available as a flat-feature smoke/debug path built from observations, selected actions, pass/shot/turnover events, and score deltas.
+- `--intent-disc-include-shot-clock false` and `--intent-disc-include-pressure-exposure false` zero those globals for the set-step discriminator while leaving the policy observation unchanged.
+- JAX supports update-count diversity scheduling with `--intent-diversity-warmup-updates` and `--intent-diversity-ramp-updates`, which is preferred over step-count scheduling for JAX runs.
+- While scheduled beta is zero, JAX skips discriminator training, bonus computation, and discriminator sample dumps to match SB3 warmup behavior.
+- The low-level PPO reward path now injects normalized/clipped DIAYN-style bonus into active offense intent steps before GAE.
+- Metrics include discriminator loss/entropy, trainbatch and holdout top-1 accuracy, trainbatch and holdout macro OVR AUC, trainbatch/holdout sizes, label/predicted intent distributions, active sample count, raw bonus stats, normalized bonus stats, beta, and bonus normalizer state.
+- Checkpoints now persist discriminator params, optimizer state, config, and bonus normalizer stats.
+- `--disc-eval-batch-output true` plus `--intent-sample-dump-size N` saves capped `.npz` active-offense samples for t-SNE/UMAP:
+  - local checkpoints save under `intent_samples/`
+  - MLflow runs log under `intent_samples/update_*`
+- The set-step sample dump includes `features`, `players`, `globals`, `role_flag`, discriminator `embedding`, intent labels, actions, and pass/shot/outcome summary fields.
+- `analytics/jax_intent_sample_embed.py` resolves the same deterministic play labels and writes them into plots, CSVs, and summaries.
+- GRU/sequence discriminator support is not a JAX migration goal because the production-relevant path is the set-step discriminator.
+
+Milestone 4: manual / sampled play conditioning smoke tests
 
 - train with uniformly sampled active intents
 - run native eval grouped by `intent_index`
+- display per-intent eval rows and shot-chart filters with play code names instead of raw `z=N` labels
 - log per-intent behavior summaries:
   - usage count
   - points per completed episode
@@ -524,12 +612,18 @@ Exit criteria:
 - speed remains acceptable with intent embeddings enabled
 - UI can load and inspect an intent-conditioned JAX checkpoint
 
-Milestone 4: selector head and segment runtime
+Milestone 5: selector head and segment runtime
 
 - add a selector head on top of the attention/CLS representation
+- keep selector observation neutralized with respect to current intent, matching SB3
+- apply selected intent through runtime state/override, not by mutating normal observation features
 - define JAX-native segment boundary logic for when a new play can be chosen
+  - episode start
+  - commitment timeout
+  - optional completed-pass boundary after `intent_selector_min_play_steps`
 - generate selector observations with current low-level intent neutralized
 - sample or argmax a play ID and apply it to JAX runtime state
+- add selector alpha schedule and epsilon-to-uniform exploration schedule
 - log selector entropy, usage, and chosen-play distribution
 
 Exit criteria:
@@ -538,12 +632,14 @@ Exit criteria:
 - selector decisions are reproducible under fixed seeds
 - low-level policy receives selector-chosen play IDs through the same embedding conditioning path
 
-Milestone 5: selector training objective
+Milestone 6: selector training objective
 
 - implement selector PPO-style training over completed segments
 - add selector value prediction
 - add selector entropy regularization
 - add usage regularization toward non-collapsed play usage
+- train on segment returns, including optional bootstrap value at segment boundaries
+- log selector return, advantage, KL, clip fraction, usage-by-intent, top-1-by-intent, and per-segment usage
 - keep selector update inside the JAX/Optax training path
 
 Exit criteria:
@@ -552,23 +648,11 @@ Exit criteria:
 - selector metrics are logged to MLflow
 - selector does not destabilize low-level PPO training
 
-Milestone 6: discriminator / diversity bonus parity
-
-- evaluate whether the current discriminator/DIAYN-style bonus still justifies its complexity
-- if retained, implement a JAX-native or clearly isolated host-side discriminator path
-- add reward-bonus logging and holdout classification metrics
-- avoid blocking core learnable-play parity on this item
-
-Exit criteria:
-
-- either a working diversity bonus is restored, or the JAX migration explicitly decides to omit it
-- any retained discriminator path has clear speed and learning-quality justification
-
 Recommended first implementation slice:
 
-- implement Milestone 1 and Milestone 2 only
-- add tests proving intent state propagation and embedding-conditioned logits
-- do not start selector/discriminator work until low-level conditioning is correct
+- implement Milestone 1, Milestone 2, and Milestone 3 before selector work
+- add tests proving intent state propagation, embedding-conditioned logits, and discriminator learning on synthetic/separable traces
+- do not start selector work until low-level conditioning plus discriminator-driven diversity is working
 
 ## Advanced Feature Parity
 

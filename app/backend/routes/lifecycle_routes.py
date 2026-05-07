@@ -126,6 +126,13 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "pass_reward": float,
     "potential_assist_pct": float,
     "full_assist_bonus_pct": float,
+    "enable_intent_learning": _str_to_bool,
+    "enable_defense_intent_learning": _str_to_bool,
+    "num_intents": int,
+    "intent_commitment_steps": int,
+    "intent_null_prob": float,
+    "defense_intent_null_prob": float,
+    "intent_visible_to_defense_prob": float,
 }
 
 

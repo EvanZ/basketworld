@@ -21,6 +21,8 @@ class TrainerConfig:
 
 class TrajectoryBatch(NamedTuple):
     flat_obs: Any
+    policy_intent_index: Any
+    policy_intent_gate: Any
     action_mask: Any
     actions: Any
     full_actions: Any
@@ -47,6 +49,15 @@ class TrajectoryBatch(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    intent_index: Any
+    intent_active: Any
+    intent_age: Any
+    intent_commitment_remaining: Any
+    intent_visible_to_defense: Any
+    defense_intent_index: Any
+    defense_intent_active: Any
+    defense_intent_age: Any
+    defense_intent_commitment_remaining: Any
     offensive_three_seconds: Any
     defensive_lane_violations: Any
     terminal_episode_steps: Any
@@ -64,6 +75,8 @@ class RolloutOutput(NamedTuple):
 
 class PPOBatch(NamedTuple):
     flat_obs: Any
+    policy_intent_index: Any
+    policy_intent_gate: Any
     action_mask: Any
     actions: Any
     old_selected_log_probs: Any
@@ -98,6 +111,15 @@ class EvalTrace(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    intent_index: Any
+    intent_active: Any
+    intent_age: Any
+    intent_commitment_remaining: Any
+    intent_visible_to_defense: Any
+    defense_intent_index: Any
+    defense_intent_active: Any
+    defense_intent_age: Any
+    defense_intent_commitment_remaining: Any
     offensive_three_seconds: Any
     defensive_lane_violations: Any
     terminal_episode_steps: Any
@@ -147,6 +169,8 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
             -1,
             int(rollout.trajectory.flat_obs.shape[-1]),
         ),
+        policy_intent_index=rollout.trajectory.policy_intent_index.reshape(-1),
+        policy_intent_gate=rollout.trajectory.policy_intent_gate.reshape(-1),
         action_mask=rollout.trajectory.action_mask.reshape(
             -1,
             int(rollout.trajectory.action_mask.shape[-2]),

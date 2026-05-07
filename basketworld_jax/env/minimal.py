@@ -97,6 +97,13 @@ class KernelStatic(NamedTuple):
     training_player_mask: Any
     training_role_flag: Any
     task_reward_scale: Any
+    enable_intent_learning: Any
+    enable_defense_intent_learning: Any
+    num_intents: Any
+    intent_commitment_steps: Any
+    intent_null_prob: Any
+    defense_intent_null_prob: Any
+    intent_visible_to_defense_prob: Any
 
 
 class KernelState(NamedTuple):
@@ -115,6 +122,15 @@ class KernelState(NamedTuple):
     assist_passer: Any
     assist_recipient: Any
     assist_expires_at: Any
+    intent_index: Any
+    intent_active: Any
+    intent_age: Any
+    intent_commitment_remaining: Any
+    intent_visible_to_defense: Any
+    defense_intent_index: Any
+    defense_intent_active: Any
+    defense_intent_age: Any
+    defense_intent_commitment_remaining: Any
     layup_pct: Any
     three_pt_pct: Any
     dunk_pct: Any
@@ -197,6 +213,17 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "assist_passer": int(assist_candidate.get("passer_id", -1)) if assist_candidate is not None else -1,
         "assist_recipient": int(assist_candidate.get("recipient_id", -1)) if assist_candidate is not None else -1,
         "assist_expires_at": int(assist_candidate.get("expires_at_step", -1)) if assist_candidate is not None else -1,
+        "intent_index": int(getattr(env, "intent_index", 0)),
+        "intent_active": 1 if bool(getattr(env, "intent_active", False)) else 0,
+        "intent_age": int(getattr(env, "intent_age", 0)),
+        "intent_commitment_remaining": int(getattr(env, "intent_commitment_remaining", 0)),
+        "intent_visible_to_defense": 1 if bool(getattr(env, "_intent_visible_to_defense", False)) else 0,
+        "defense_intent_index": int(getattr(env, "defense_intent_index", 0)),
+        "defense_intent_active": 1 if bool(getattr(env, "defense_intent_active", False)) else 0,
+        "defense_intent_age": int(getattr(env, "defense_intent_age", 0)),
+        "defense_intent_commitment_remaining": int(
+            getattr(env, "defense_intent_commitment_remaining", 0)
+        ),
         "layup_pct": layup,
         "three_pt_pct": three,
         "dunk_pct": dunk,
@@ -272,6 +299,48 @@ def stack_state_snapshots(
         ),
         assist_expires_at=xp.asarray(
             np.asarray([int(item["assist_expires_at"]) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        intent_index=xp.asarray(
+            np.asarray([int(item.get("intent_index", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        intent_active=xp.asarray(
+            np.asarray([int(item.get("intent_active", 0)) for item in snapshots], dtype=np.int8),
+            dtype=xp.int8,
+        ),
+        intent_age=xp.asarray(
+            np.asarray([int(item.get("intent_age", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        intent_commitment_remaining=xp.asarray(
+            np.asarray(
+                [int(item.get("intent_commitment_remaining", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        intent_visible_to_defense=xp.asarray(
+            np.asarray([int(item.get("intent_visible_to_defense", 0)) for item in snapshots], dtype=np.int8),
+            dtype=xp.int8,
+        ),
+        defense_intent_index=xp.asarray(
+            np.asarray([int(item.get("defense_intent_index", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        defense_intent_active=xp.asarray(
+            np.asarray([int(item.get("defense_intent_active", 0)) for item in snapshots], dtype=np.int8),
+            dtype=xp.int8,
+        ),
+        defense_intent_age=xp.asarray(
+            np.asarray([int(item.get("defense_intent_age", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        defense_intent_commitment_remaining=xp.asarray(
+            np.asarray(
+                [int(item.get("defense_intent_commitment_remaining", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
             dtype=xp.int32,
         ),
         layup_pct=xp.asarray(
@@ -428,6 +497,31 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         training_player_mask=xp.asarray(training_player_mask, dtype=xp.float32),
         training_role_flag=xp.asarray(float(training_role_flag), dtype=xp.float32),
         task_reward_scale=xp.asarray(float(getattr(env, "task_reward_scale", 1.0)), dtype=xp.float32),
+        enable_intent_learning=xp.asarray(
+            1 if bool(getattr(env, "enable_intent_learning", False)) else 0,
+            dtype=xp.int8,
+        ),
+        enable_defense_intent_learning=xp.asarray(
+            1 if bool(getattr(env, "enable_defense_intent_learning", False)) else 0,
+            dtype=xp.int8,
+        ),
+        num_intents=xp.asarray(max(1, int(getattr(env, "num_intents", 8))), dtype=xp.int32),
+        intent_commitment_steps=xp.asarray(
+            max(1, int(getattr(env, "intent_commitment_steps", 4))),
+            dtype=xp.int32,
+        ),
+        intent_null_prob=xp.asarray(
+            float(np.clip(float(getattr(env, "intent_null_prob", 0.2)), 0.0, 1.0)),
+            dtype=xp.float32,
+        ),
+        defense_intent_null_prob=xp.asarray(
+            float(np.clip(float(getattr(env, "defense_intent_null_prob", 1.0)), 0.0, 1.0)),
+            dtype=xp.float32,
+        ),
+        intent_visible_to_defense_prob=xp.asarray(
+            float(np.clip(float(getattr(env, "intent_visible_to_defense_prob", 0.0)), 0.0, 1.0)),
+            dtype=xp.float32,
+        ),
     )
 
 
@@ -470,6 +564,63 @@ def _single_state_to_batched(state: KernelState, jnp) -> KernelState:
 
 def _replace_state(state: KernelState, **updates) -> KernelState:
     return state._replace(**updates)
+
+
+def _advance_role_intent_single(static: KernelStatic, enabled, index, active, age, remaining, jnp):
+    enabled_bool = enabled.astype(jnp.bool_)
+    active_bool = active.astype(jnp.bool_)
+    should_expire = enabled_bool & active_bool & (remaining <= 0)
+    should_advance = enabled_bool & active_bool & (remaining > 0)
+    next_active = jnp.where(should_expire, jnp.asarray(0, dtype=jnp.int8), active)
+    next_age = jnp.where(should_advance, age + 1, age)
+    next_remaining = jnp.where(
+        should_expire,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.where(should_advance, jnp.maximum(0, remaining - 1), remaining),
+    )
+    disabled = ~enabled_bool
+    return {
+        "index": jnp.where(disabled, jnp.asarray(0, dtype=jnp.int32), index),
+        "active": jnp.where(disabled, jnp.asarray(0, dtype=jnp.int8), next_active),
+        "age": jnp.where(disabled, jnp.asarray(0, dtype=jnp.int32), next_age),
+        "commitment_remaining": jnp.where(
+            disabled,
+            jnp.asarray(0, dtype=jnp.int32),
+            next_remaining,
+        ),
+    }
+
+
+def advance_intent_clock_single(static: KernelStatic, state: KernelState, jnp) -> KernelState:
+    offense = _advance_role_intent_single(
+        static,
+        static.enable_intent_learning,
+        state.intent_index,
+        state.intent_active,
+        state.intent_age,
+        state.intent_commitment_remaining,
+        jnp,
+    )
+    defense = _advance_role_intent_single(
+        static,
+        static.enable_defense_intent_learning,
+        state.defense_intent_index,
+        state.defense_intent_active,
+        state.defense_intent_age,
+        state.defense_intent_commitment_remaining,
+        jnp,
+    )
+    return _replace_state(
+        state,
+        intent_index=offense["index"],
+        intent_active=offense["active"],
+        intent_age=offense["age"],
+        intent_commitment_remaining=offense["commitment_remaining"],
+        defense_intent_index=defense["index"],
+        defense_intent_active=defense["active"],
+        defense_intent_age=defense["age"],
+        defense_intent_commitment_remaining=defense["commitment_remaining"],
+    )
 
 
 def _team_mask_for_holder(static: KernelStatic, ball_holder, jnp):
@@ -1062,6 +1213,45 @@ def build_policy_observation_batch(
     )
 
 
+def build_policy_intent_context_batch_with_role_flag(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+) -> dict[str, Any]:
+    """Return the runtime intent context consumed by intent-conditioned policies."""
+    batch_size = state.positions.shape[0]
+    role_flag = jnp.full((batch_size,), role_flag_value, dtype=jnp.float32)
+    is_offense = role_flag > 0.0
+    offense_gate = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & state.intent_active.astype(jnp.bool_)
+    )
+    defense_gate = (
+        static.enable_defense_intent_learning.astype(jnp.bool_)
+        & state.defense_intent_active.astype(jnp.bool_)
+    )
+    intent_index = jnp.where(is_offense, state.intent_index, state.defense_intent_index)
+    intent_gate = jnp.where(is_offense, offense_gate, defense_gate)
+    return {
+        "intent_index": intent_index.astype(jnp.int32),
+        "intent_gate": intent_gate.astype(jnp.float32),
+    }
+
+
+def build_policy_intent_context_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+) -> dict[str, Any]:
+    return build_policy_intent_context_batch_with_role_flag(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+    )
+
+
 def build_aggregated_reward_batch(static: KernelStatic, rewards, jnp):
     scaled = rewards.astype(jnp.float32) * static.training_player_mask[None, :]
     return jnp.sum(scaled, axis=1) * static.task_reward_scale
@@ -1304,6 +1494,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             step_count=state.step_count + 1,
             episode_ended=jnp.asarray(0, dtype=state.episode_ended.dtype),
         )
+        next_state = advance_intent_clock_single(static, next_state, jnp)
 
         pressure_probs, total_pressure_prob = _pressure_turnover_probs_single(static, next_state, jnp)
         next_state = _replace_state(
@@ -1884,10 +2075,43 @@ def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
     return positions
 
 
+def _sample_role_intent_single(static: KernelStatic, enabled, null_prob, key, jax, jnp):
+    draw_key, index_key = jax.random.split(key)
+    enabled_bool = enabled.astype(jnp.bool_)
+    active = enabled_bool & (jax.random.uniform(draw_key) >= null_prob)
+    sampled_index = jax.random.randint(
+        index_key,
+        shape=(),
+        minval=0,
+        maxval=jnp.maximum(static.num_intents, jnp.asarray(1, dtype=jnp.int32)),
+        dtype=jnp.int32,
+    )
+    return {
+        "index": jnp.where(active, sampled_index, jnp.asarray(0, dtype=jnp.int32)),
+        "active": active.astype(jnp.int8),
+        "age": jnp.asarray(0, dtype=jnp.int32),
+        "commitment_remaining": jnp.where(
+            active,
+            static.intent_commitment_steps.astype(jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+    }
+
+
 def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
-    shot_clock_key, layup_key, three_key, dunk_key, positions_key, holder_key = jax.random.split(key, 6)
+    (
+        shot_clock_key,
+        layup_key,
+        three_key,
+        dunk_key,
+        positions_key,
+        holder_key,
+        offense_intent_key,
+        defense_intent_key,
+        intent_visible_key,
+    ) = jax.random.split(key, 9)
 
     shot_clock = jax.random.randint(
         shot_clock_key,
@@ -1930,6 +2154,26 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     positions = _sample_reset_positions_single(static, positions_key, jax, jnp)
     holder_offset = jax.random.randint(holder_key, shape=(), minval=0, maxval=offense_count, dtype=jnp.int32)
     ball_holder = static.offense_ids[holder_offset]
+    offense_intent = _sample_role_intent_single(
+        static,
+        static.enable_intent_learning,
+        static.intent_null_prob,
+        offense_intent_key,
+        jax,
+        jnp,
+    )
+    defense_intent = _sample_role_intent_single(
+        static,
+        static.enable_defense_intent_learning,
+        static.defense_intent_null_prob,
+        defense_intent_key,
+        jax,
+        jnp,
+    )
+    intent_visible_to_defense = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & (jax.random.uniform(intent_visible_key) < static.intent_visible_to_defense_prob)
+    )
     return KernelState(
         positions=positions,
         ball_holder=ball_holder,
@@ -1946,6 +2190,15 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         assist_passer=jnp.asarray(-1, dtype=jnp.int32),
         assist_recipient=jnp.asarray(-1, dtype=jnp.int32),
         assist_expires_at=jnp.asarray(-1, dtype=jnp.int32),
+        intent_index=offense_intent["index"],
+        intent_active=offense_intent["active"],
+        intent_age=offense_intent["age"],
+        intent_commitment_remaining=offense_intent["commitment_remaining"],
+        intent_visible_to_defense=intent_visible_to_defense.astype(jnp.int8),
+        defense_intent_index=defense_intent["index"],
+        defense_intent_active=defense_intent["active"],
+        defense_intent_age=defense_intent["age"],
+        defense_intent_commitment_remaining=defense_intent["commitment_remaining"],
         layup_pct=layup_pct,
         three_pt_pct=three_pt_pct,
         dunk_pct=dunk_pct,

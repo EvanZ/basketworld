@@ -282,6 +282,50 @@ def _build_counterfactual_snapshot_metadata() -> dict:
     }
 
 
+def _coerce_play_name_map(raw_map, *, num_intents: int | None = None) -> dict[str, str]:
+    if not isinstance(raw_map, dict):
+        return {}
+    out: dict[str, str] = {}
+    limit = None if num_intents is None else max(0, int(num_intents))
+    for raw_idx, raw_name in raw_map.items():
+        try:
+            idx = int(raw_idx)
+        except Exception:
+            continue
+        if idx < 0 or (limit is not None and idx >= limit):
+            continue
+        name = str(raw_name or "").strip()
+        if name:
+            out[str(idx)] = name
+    return out
+
+
+def _play_name_map_from_metadata(metadata: dict | None, *, num_intents: int | None = None) -> dict[str, str]:
+    if not isinstance(metadata, dict):
+        return {}
+    direct = _coerce_play_name_map(metadata.get("play_name_map"), num_intents=num_intents)
+    if direct:
+        return direct
+    play_meta = metadata.get("play_name_metadata")
+    if not isinstance(play_meta, dict):
+        return {}
+    mapped: dict[str, str] = {}
+    limit = None if num_intents is None else max(0, int(num_intents))
+    for item in play_meta.get("play_names", []) or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("intent_index"))
+        except Exception:
+            continue
+        if idx < 0 or (limit is not None and idx >= limit):
+            continue
+        name = str(item.get("play_name", "")).strip()
+        if name:
+            mapped[str(idx)] = name
+    return mapped
+
+
 def get_current_play_name_map(num_intents: int | None = None) -> dict[str, str]:
     env_obj = env_view(game_state.env) if game_state.env else None
     count = int(
@@ -294,6 +338,17 @@ def get_current_play_name_map(num_intents: int | None = None) -> dict[str, str]:
     )
     if count <= 0:
         return {}
+    for policy_obj in (
+        getattr(game_state, "unified_policy", None),
+        getattr(game_state, "offense_policy", None),
+        getattr(game_state, "defense_policy", None),
+    ):
+        mapping = _play_name_map_from_metadata(
+            get_policy_metadata(policy_obj),
+            num_intents=count,
+        )
+        if mapping:
+            return mapping
     seed_key = play_name_seed_key(
         run_id=getattr(game_state, "run_id", None),
         unified_policy_key=getattr(game_state, "unified_policy_key", None),
