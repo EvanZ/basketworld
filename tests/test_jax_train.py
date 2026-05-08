@@ -7,7 +7,9 @@ from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.models import ActorCriticSpec
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
+    _entropy_coef_for_update,
     _log_mlflow_params,
+    _task_reward_scale_for_update,
     build_trainer_config,
     parse_args,
     run_train_scaffold,
@@ -133,6 +135,46 @@ def test_jax_trainer_validates_intent_embedding_runtime_requirements():
         validate_train_args(no_runtime_args)
 
 
+def test_jax_trainer_validates_intent_selector_requirements():
+    valid_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+            "--enable-intent-learning",
+            "true",
+            "--intent-selector-enabled",
+            "true",
+        ]
+    )
+    validate_train_args(valid_args)
+
+    missing_attention_args = parse_args(
+        [
+            "--intent-selector-enabled",
+            "true",
+            "--enable-intent-learning",
+            "true",
+            "--intent-embedding-enabled",
+        ]
+    )
+    with pytest.raises(SystemExit, match="requires --policy-model attention"):
+        validate_train_args(missing_attention_args)
+
+    missing_embedding_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--enable-intent-learning",
+            "true",
+            "--intent-selector-enabled",
+            "true",
+        ]
+    )
+    with pytest.raises(SystemExit, match="requires --intent-embedding-enabled"):
+        validate_train_args(missing_embedding_args)
+
+
 def test_jax_trainer_validates_intent_diversity_requirements():
     scaffold_args = parse_args(
         [
@@ -234,6 +276,74 @@ def test_build_trainer_config_uses_training_args():
     assert config.ppo_minibatches == 16
 
 
+def test_jax_task_reward_scale_prefers_update_schedule():
+    args = parse_args(
+        [
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--task-reward-scale-start",
+            "0.1",
+            "--task-reward-scale-end",
+            "1.0",
+            "--task-reward-scale-warmup-steps",
+            "999999",
+            "--task-reward-scale-ramp-steps",
+            "999999",
+            "--task-reward-scale-warmup-updates",
+            "2",
+            "--task-reward-scale-ramp-updates",
+            "4",
+        ]
+    )
+    validate_train_args(args)
+
+    assert _task_reward_scale_for_update(args, 1) == pytest.approx(0.1)
+    assert _task_reward_scale_for_update(args, 2) == pytest.approx(0.1)
+    assert _task_reward_scale_for_update(args, 4) == pytest.approx(0.55)
+    assert _task_reward_scale_for_update(args, 6) == pytest.approx(1.0)
+
+
+def test_jax_entropy_coef_supports_linear_and_exp_schedules():
+    linear_args = parse_args(
+        [
+            "--num-updates",
+            "6",
+            "--ent-coef",
+            "0.01",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.002",
+            "--ent-schedule",
+            "linear",
+        ]
+    )
+    validate_train_args(linear_args)
+    assert _entropy_coef_for_update(linear_args, 1) == pytest.approx(0.02)
+    assert _entropy_coef_for_update(linear_args, 6) == pytest.approx(0.002)
+
+    exp_args = parse_args(
+        [
+            "--num-updates",
+            "3",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.002",
+            "--ent-schedule",
+            "exp",
+        ]
+    )
+    validate_train_args(exp_args)
+    assert _entropy_coef_for_update(exp_args, 1) == pytest.approx(0.02)
+    assert _entropy_coef_for_update(exp_args, 2) == pytest.approx(
+        float(np.sqrt(0.02 * 0.002))
+    )
+    assert _entropy_coef_for_update(exp_args, 3) == pytest.approx(0.002)
+
+
 def test_mlflow_params_include_jax_env_skill_stds():
     class Recorder:
         def __init__(self):
@@ -252,6 +362,12 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "0.3",
             "--dunk-pct",
             "0.6",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.003",
+            "--ent-schedule",
+            "exp",
             "--enable-intent-learning",
             "true",
             "--enable-defense-intent-learning",
@@ -266,6 +382,14 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "0.2",
             "--intent-visible-to-defense-prob",
             "0.3",
+            "--task-reward-scale-start",
+            "0.1",
+            "--task-reward-scale-end",
+            "1.0",
+            "--task-reward-scale-warmup-updates",
+            "50",
+            "--task-reward-scale-ramp-updates",
+            "300",
         ]
     )
     validate_train_args(args)
@@ -300,6 +424,13 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/intent_embedding_enabled"] is False
     assert recorder.params["jax/intent_embedding_dim"] == 16
     assert recorder.params["jax/num_intents"] == 8
+    assert recorder.params["jax/task_reward_scale_start"] == 0.1
+    assert recorder.params["jax/task_reward_scale_end"] == 1.0
+    assert recorder.params["jax/task_reward_scale_warmup_updates"] == 50
+    assert recorder.params["jax/task_reward_scale_ramp_updates"] == 300
+    assert recorder.params["jax/ent_coef_start"] == 0.02
+    assert recorder.params["jax/ent_coef_end"] == 0.003
+    assert recorder.params["jax/ent_schedule"] == "exp"
 
 
 def test_train_scaffold_emits_rollout_trajectory_shapes():
@@ -500,6 +631,90 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert first_eval["offensive_three_seconds"].shape == (4,)
     assert first_eval["defensive_lane_violations"].shape == (4,)
     assert first_eval["terminal_episode_steps"].shape == (4,)
+
+
+def test_train_loop_runs_intent_selector_segment_start_metrics():
+    pytest.importorskip("jax")
+
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--attention-embed-dim",
+            "16",
+            "--attention-num-heads",
+            "4",
+            "--attention-token-mlp-dim",
+            "12",
+            "--intent-embedding-enabled",
+            "--intent-embedding-dim",
+            "4",
+            "--enable-intent-learning",
+            "true",
+            "--num-intents",
+            "4",
+            "--intent-commitment-steps",
+            "2",
+            "--intent-null-prob",
+            "0.0",
+            "--intent-selector-enabled",
+            "true",
+            "--intent-selector-hidden-dim",
+            "8",
+            "--intent-selector-alpha-start",
+            "1.0",
+            "--intent-selector-alpha-end",
+            "1.0",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.02",
+            "--task-reward-scale-start",
+            "0.25",
+            "--task-reward-scale-end",
+            "0.25",
+            "--intent-selector-multiselect-enabled",
+            "true",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "5",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--ppo-minibatches",
+            "2",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    metrics = result["final_metrics"]
+    assert result["policy_spec"]["intent_selector_enabled"] is True
+    assert result["policy_spec"]["intent_selector_hidden_dim"] == 8
+    assert metrics["selector_alpha"] == pytest.approx(1.0)
+    assert metrics["selector_eps"] == pytest.approx(0.0)
+    assert metrics["entropy_coef"] == pytest.approx(0.02)
+    assert metrics["task_reward_scale"] == pytest.approx(0.25)
+    assert metrics["task_reward_scale_is_scheduled"] == pytest.approx(1.0)
+    assert metrics["selector_used_count"] > 0
+    assert metrics["selector_usage_rate"] > 0.0
+    assert metrics["selector_applied_count"] >= metrics["selector_used_count"]
+    assert metrics["selector_boundary_commitment_timeout_count"] > 0
+    assert metrics["selector_entropy"] > 0.0
+    assert metrics["selector_train_sample_count"] > 0.0
+    assert "selector_train_loss" in metrics
+    assert "selector_train_approx_kl" in metrics
+    assert "selector_train_clip_fraction" in metrics
+    assert "selector_train_usage_by_intent/0" in metrics
+    assert "selector_usage_by_intent/0" in metrics
 
 
 def test_train_loop_checkpoint_resume_round_trip(tmp_path):

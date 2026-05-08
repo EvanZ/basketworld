@@ -20,6 +20,7 @@ from basketworld_jax.env import (
     reset_batch_minimal,
     resolve_team_player_ids,
     sample_uniform_legal_actions_jax,
+    set_offense_intent_state_batch,
     step_batch_minimal,
 )
 from basketworld_jax.models import (
@@ -33,6 +34,7 @@ from basketworld_jax.train.types import (
     EvalTrace,
     PPOBatch,
     RolloutOutput,
+    SelectorBatch,
     TrajectoryBatch,
     TrainerConfig,
 )
@@ -70,6 +72,10 @@ def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> Rollo
         ),
         bootstrap_values=jnp.concatenate(
             [rollout.bootstrap_values for rollout in rollouts],
+            axis=0,
+        ),
+        final_selector_values=jnp.concatenate(
+            [rollout.final_selector_values for rollout in rollouts],
             axis=0,
         ),
         final_flat_obs=jnp.concatenate(
@@ -150,22 +156,202 @@ def _build_intent_transition_metrics(state) -> dict[str, Any]:
     }
 
 
+def _zero_selector_transition_metrics(state, jnp) -> dict[str, Any]:
+    batch_shape = state.intent_index.shape
+    return {
+        "selector_used": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_applied": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_fallback_used": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_boundary_episode_start": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_boundary_commitment_timeout": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_boundary_completed_pass": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_intent_index": jnp.full(batch_shape, -1, dtype=jnp.int32),
+        "selector_old_log_prob": jnp.zeros(batch_shape, dtype=jnp.float32),
+        "selector_value": jnp.zeros(batch_shape, dtype=jnp.float32),
+        "selector_entropy": jnp.zeros(batch_shape, dtype=jnp.float32),
+        "selector_max_prob": jnp.zeros(batch_shape, dtype=jnp.float32),
+    }
+
+
+def _where_state(mask, selected_state, fallback_state, jnp):
+    replaced = []
+    for selected_value, fallback_value in zip(selected_state, fallback_state):
+        if getattr(selected_value, "ndim", 0) <= 1:
+            replaced.append(jnp.where(mask, selected_value, fallback_value))
+        else:
+            expand_shape = (mask.shape[0],) + (1,) * (selected_value.ndim - 1)
+            replaced.append(jnp.where(mask.reshape(expand_shape), selected_value, fallback_value))
+    return type(fallback_state)(*replaced)
+
+
+def _maybe_apply_selector_segment_start(
+    static,
+    state,
+    params,
+    flat_obs,
+    selector_key,
+    selector_alpha,
+    selector_eps,
+    selector_multiselect_enabled,
+    completed_pass_boundary,
+    selector_min_play_steps,
+    jax,
+    jnp,
+    spec: ActorCriticSpec,
+):
+    metrics = _zero_selector_transition_metrics(state, jnp)
+    if not bool(spec.intent_selector_enabled):
+        return state, metrics
+
+    alpha = jnp.clip(jnp.asarray(selector_alpha, dtype=jnp.float32), 0.0, 1.0)
+    multiselect_enabled = jnp.asarray(selector_multiselect_enabled).astype(jnp.bool_)
+    should_run = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & (static.training_role_flag > 0.0)
+        & ((alpha > 0.0) | multiselect_enabled)
+    )
+
+    def _disabled(_):
+        return state, metrics
+
+    def _enabled(_):
+        batch_size = int(state.intent_index.shape[0])
+        neutral_context = {
+            "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
+            "intent_gate": jnp.zeros((batch_size,), dtype=jnp.float32),
+        }
+        selector_out = actor_critic_forward(
+            params,
+            flat_obs,
+            spec,
+            jnp,
+            intent_context=neutral_context,
+        )
+        logits = selector_out["selector_logits"]
+        raw_probs = jax.nn.softmax(logits, axis=-1)
+        eps = jnp.clip(jnp.asarray(selector_eps, dtype=jnp.float32), 0.0, 1.0)
+        uniform = jnp.full_like(raw_probs, 1.0 / float(max(1, int(spec.num_intents))))
+        probs = ((1.0 - eps) * raw_probs) + (eps * uniform)
+        log_probs = jnp.log(jnp.maximum(probs, 1.0e-8))
+        sample_key, alpha_key, fallback_key = jax.random.split(selector_key, 3)
+        sampled_intent = jax.random.categorical(sample_key, log_probs, axis=-1).astype(jnp.int32)
+        fallback_intent = jax.random.randint(
+            fallback_key,
+            shape=(batch_size,),
+            minval=0,
+            maxval=int(spec.num_intents),
+            dtype=jnp.int32,
+        )
+        sampled_log_prob = jnp.take_along_axis(
+            log_probs,
+            sampled_intent[:, None],
+            axis=-1,
+        )[:, 0]
+        entropy = -jnp.sum(probs * log_probs, axis=-1)
+        max_prob = jnp.max(probs, axis=-1)
+        alpha_used = jax.random.uniform(alpha_key, shape=(batch_size,)) < alpha
+        active = state.intent_active.astype(jnp.bool_)
+        episode_start = active & (state.intent_age == 0)
+        commitment_timeout = (
+            multiselect_enabled
+            & active
+            & (state.intent_age > 0)
+            & (state.intent_commitment_remaining <= 0)
+        )
+        completed_pass = (
+            multiselect_enabled
+            & active
+            & jnp.asarray(completed_pass_boundary).astype(jnp.bool_)
+            & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
+        )
+        eligible = episode_start | commitment_timeout | completed_pass
+        used = eligible & alpha_used
+        fallback_used = (commitment_timeout | completed_pass) & (~alpha_used)
+        applied = used | fallback_used
+        chosen_intent = jnp.where(used, sampled_intent, fallback_intent)
+        selected_state = set_offense_intent_state_batch(
+            static,
+            state,
+            chosen_intent,
+            jnp.ones((batch_size,), dtype=jnp.int8),
+            jnp,
+        )
+        next_state = _where_state(applied, selected_state, state, jnp)
+        return next_state, {
+            "selector_used": used.astype(jnp.int8),
+            "selector_applied": applied.astype(jnp.int8),
+            "selector_fallback_used": fallback_used.astype(jnp.int8),
+            "selector_boundary_episode_start": (applied & episode_start).astype(jnp.int8),
+            "selector_boundary_commitment_timeout": (applied & commitment_timeout).astype(jnp.int8),
+            "selector_boundary_completed_pass": (applied & completed_pass & (~commitment_timeout)).astype(jnp.int8),
+            "selector_intent_index": jnp.where(used, sampled_intent, jnp.asarray(-1, dtype=jnp.int32)),
+            "selector_old_log_prob": jnp.where(used, sampled_log_prob, jnp.asarray(0.0, dtype=jnp.float32)),
+            "selector_value": jnp.where(used, selector_out["selector_values"], jnp.asarray(0.0, dtype=jnp.float32)),
+            "selector_entropy": jnp.where(used, entropy, jnp.asarray(0.0, dtype=jnp.float32)),
+            "selector_max_prob": jnp.where(used, max_prob, jnp.asarray(0.0, dtype=jnp.float32)),
+        }
+
+    return jax.lax.cond(should_run, _enabled, _disabled, operand=None)
+
+
+def _compute_final_selector_values(params, flat_obs, spec: ActorCriticSpec, jnp):
+    if not bool(spec.intent_selector_enabled):
+        return jnp.zeros((flat_obs.shape[0],), dtype=jnp.float32)
+    batch_size = int(flat_obs.shape[0])
+    neutral_context = {
+        "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
+        "intent_gate": jnp.zeros((batch_size,), dtype=jnp.float32),
+    }
+    return actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context=neutral_context,
+    )["selector_values"]
+
+
 def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
-    def _runner(static, initial_state, params, rollout_key, horizon: int):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        rollout_key,
+        horizon: int,
+        selector_alpha=0.0,
+        selector_eps=0.0,
+        selector_multiselect_enabled=False,
+        selector_min_play_steps=3,
+    ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
 
         def _scan_step(carry, _):
-            state, key = carry
-            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            state, key, completed_pass_boundary = carry
+            key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
                 jnp,
                 model_type=spec.model_type,
             )
-            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
-            full_action_mask = build_action_masks_batch(static, state, jnp)
+            policy_state, selector_metrics = _maybe_apply_selector_segment_start(
+                static,
+                state,
+                params,
+                flat_obs,
+                selector_key,
+                selector_alpha,
+                selector_eps,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
+            full_action_mask = build_action_masks_batch(static, policy_state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
 
@@ -196,7 +382,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
             env_out = step_batch_minimal(
                 static,
-                state,
+                policy_state,
                 full_actions,
                 env_keys,
                 jax,
@@ -223,18 +409,27 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
-                **_build_intent_transition_metrics(state),
+                **_build_intent_transition_metrics(policy_state),
+                **selector_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
+                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
             )
-            return (next_state, key), transition
+            next_completed_pass_boundary = (
+                env_out.completed_pass.astype(jnp.bool_)
+                & (~env_out.done.astype(jnp.bool_))
+            )
+            return (next_state, key, next_completed_pass_boundary), transition
 
-        (final_state, _), trajectory = jax.lax.scan(
+        initial_completed_pass_boundary = jnp.zeros(
+            (int(initial_state.positions.shape[0]),),
+            dtype=jnp.bool_,
+        )
+        (final_state, _, _), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (initial_state, rollout_key, initial_completed_pass_boundary),
             xs=None,
             length=int(horizon),
         )
@@ -246,17 +441,25 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(
+        final_forward = actor_critic_forward(
             params,
             final_flat_obs,
             spec,
             jnp,
             intent_context=final_intent_context,
-        )["values"]
+        )
+        bootstrap_values = final_forward["values"]
+        final_selector_values = _compute_final_selector_values(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+        )
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
             bootstrap_values=bootstrap_values,
+            final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
         )
@@ -265,34 +468,60 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
 
 
 def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
-    def _runner(static, initial_state, params, opponent_params, rollout_key, horizon: int):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        opponent_params,
+        rollout_key,
+        horizon: int,
+        selector_alpha=0.0,
+        selector_eps=0.0,
+        selector_multiselect_enabled=False,
+        selector_min_play_steps=3,
+    ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
 
         def _scan_step(carry, _):
-            state, key = carry
-            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            state, key, completed_pass_boundary = carry
+            key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
                 jnp,
                 model_type=spec.model_type,
             )
-            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
+            policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
                 state,
+                params,
+                flat_obs,
+                selector_key,
+                selector_alpha,
+                selector_eps,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                policy_state,
                 -static.training_role_flag,
                 jnp,
                 model_type=spec.model_type,
             )
-            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
-                state,
+                policy_state,
                 -static.training_role_flag,
                 jnp,
             )
-            full_action_mask = build_action_masks_batch(static, state, jnp)
+            full_action_mask = build_action_masks_batch(static, policy_state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
 
@@ -327,7 +556,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
             env_out = step_batch_minimal(
                 static,
-                state,
+                policy_state,
                 full_actions,
                 env_keys,
                 jax,
@@ -354,18 +583,27 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
-                **_build_intent_transition_metrics(state),
+                **_build_intent_transition_metrics(policy_state),
+                **selector_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
+                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
             )
-            return (next_state, key), transition
+            next_completed_pass_boundary = (
+                env_out.completed_pass.astype(jnp.bool_)
+                & (~env_out.done.astype(jnp.bool_))
+            )
+            return (next_state, key, next_completed_pass_boundary), transition
 
-        (final_state, _), trajectory = jax.lax.scan(
+        initial_completed_pass_boundary = jnp.zeros(
+            (int(initial_state.positions.shape[0]),),
+            dtype=jnp.bool_,
+        )
+        (final_state, _, _), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (initial_state, rollout_key, initial_completed_pass_boundary),
             xs=None,
             length=int(horizon),
         )
@@ -377,17 +615,25 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(
+        final_forward = actor_critic_forward(
             params,
             final_flat_obs,
             spec,
             jnp,
             intent_context=final_intent_context,
-        )["values"]
+        )
+        bootstrap_values = final_forward["values"]
+        final_selector_values = _compute_final_selector_values(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+        )
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
             bootstrap_values=bootstrap_values,
+            final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
         )
@@ -404,6 +650,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         rollout_key,
         horizon: int,
         opponent_group_count: int,
+        selector_alpha=0.0,
+        selector_eps=0.0,
+        selector_multiselect_enabled=False,
+        selector_min_play_steps=3,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
@@ -460,29 +710,44 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             )
 
         def _scan_step(carry, _):
-            state, key = carry
-            key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 5)
+            state, key, completed_pass_boundary = carry
+            key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
                 jnp,
                 model_type=spec.model_type,
             )
-            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
+            policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
                 state,
+                params,
+                flat_obs,
+                selector_key,
+                selector_alpha,
+                selector_eps,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            opponent_flat_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                policy_state,
                 -static.training_role_flag,
                 jnp,
                 model_type=spec.model_type,
             )
-            policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
+            policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
-                state,
+                policy_state,
                 -static.training_role_flag,
                 jnp,
             )
-            full_action_mask = build_action_masks_batch(static, state, jnp)
+            full_action_mask = build_action_masks_batch(static, policy_state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
 
@@ -513,7 +778,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
             env_out = step_batch_minimal(
                 static,
-                state,
+                policy_state,
                 full_actions,
                 env_keys,
                 jax,
@@ -540,18 +805,27 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
-                **_build_intent_transition_metrics(state),
+                **_build_intent_transition_metrics(policy_state),
+                **selector_metrics,
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
                 terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - state.defense_score).astype(jnp.float32),
+                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
             )
-            return (next_state, key), transition
+            next_completed_pass_boundary = (
+                env_out.completed_pass.astype(jnp.bool_)
+                & (~env_out.done.astype(jnp.bool_))
+            )
+            return (next_state, key, next_completed_pass_boundary), transition
 
-        (final_state, _), trajectory = jax.lax.scan(
+        initial_completed_pass_boundary = jnp.zeros(
+            (int(initial_state.positions.shape[0]),),
+            dtype=jnp.bool_,
+        )
+        (final_state, _, _), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (initial_state, rollout_key, initial_completed_pass_boundary),
             xs=None,
             length=int(horizon),
         )
@@ -563,17 +837,25 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
-        bootstrap_values = actor_critic_forward(
+        final_forward = actor_critic_forward(
             params,
             final_flat_obs,
             spec,
             jnp,
             intent_context=final_intent_context,
-        )["values"]
+        )
+        bootstrap_values = final_forward["values"]
+        final_selector_values = _compute_final_selector_values(
+            params,
+            final_flat_obs,
+            spec,
+            jnp,
+        )
         return RolloutOutput(
             trajectory=trajectory,
             final_state=final_state,
             bootstrap_values=bootstrap_values,
+            final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
         )
@@ -937,7 +1219,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
 
     clip_range = jnp.asarray(trainer_config.ppo_clip_range, dtype=jnp.float32)
     value_coef = jnp.asarray(trainer_config.value_coef, dtype=jnp.float32)
-    entropy_coef = jnp.asarray(trainer_config.entropy_coef, dtype=jnp.float32)
+    default_entropy_coef = jnp.asarray(trainer_config.entropy_coef, dtype=jnp.float32)
     epochs = int(trainer_config.policy_update_epochs)
     configured_minibatches = max(1, int(getattr(trainer_config, "ppo_minibatches", 1)))
     transform = build_adam_transform(
@@ -945,7 +1227,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         learning_rate=float(trainer_config.learning_rate),
     )
 
-    def _loss_fn(params, batch: PPOBatch):
+    def _loss_fn(params, batch: PPOBatch, entropy_coef):
         forward_out = actor_critic_forward(
             params,
             batch.flat_obs,
@@ -991,6 +1273,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "policy_loss": policy_loss,
             "value_loss": value_loss,
             "entropy_bonus": entropy_bonus,
+            "entropy_coef": entropy_coef,
             "approx_kl": approx_kl,
             "clip_fraction": clip_fraction,
             "mean_abs_log_ratio": mean_abs_log_ratio,
@@ -998,8 +1281,12 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         }
         return total_loss, metrics
 
-    def _single_epoch(params, opt_state, batch):
-        (_, _), grads = jax.value_and_grad(_loss_fn, has_aux=True)(params, batch)
+    def _single_epoch(params, opt_state, batch, entropy_coef):
+        (_, _), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
+            params,
+            batch,
+            entropy_coef,
+        )
         grad_norm = global_norm(grads, optax)
         new_params, new_opt_state = optimizer_update(
             params,
@@ -1008,7 +1295,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             transform=transform,
             optax=optax,
         )
-        post_update_loss, metrics = _loss_fn(new_params, batch)
+        post_update_loss, metrics = _loss_fn(new_params, batch, entropy_coef)
         metrics = {
             **metrics,
             "grad_norm": grad_norm,
@@ -1030,12 +1317,17 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             )
         )
 
-    def _full_batch_runner(params, opt_state, batch, update_key):
+    def _full_batch_runner(params, opt_state, batch, update_key, entropy_coef):
         del update_key
 
         def _epoch_step(carry, _):
             epoch_params, epoch_opt_state = carry
-            next_params, next_opt_state, metrics = _single_epoch(epoch_params, epoch_opt_state, batch)
+            next_params, next_opt_state, metrics = _single_epoch(
+                epoch_params,
+                epoch_opt_state,
+                batch,
+                entropy_coef,
+            )
             return (next_params, next_opt_state), metrics
 
         (next_params, next_opt_state), metrics = jax.lax.scan(
@@ -1063,7 +1355,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         minibatch_count = int(minibatches)
         minibatch_size = batch_size // minibatch_count
 
-        def _minibatch_runner(params, opt_state, batch, update_key):
+        def _minibatch_runner(params, opt_state, batch, update_key, entropy_coef):
             def _epoch_step(carry, epoch_index):
                 epoch_params, epoch_opt_state, epoch_key = carry
                 epoch_key = jax.random.fold_in(epoch_key, epoch_index)
@@ -1080,6 +1372,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
                         mini_params,
                         mini_opt_state,
                         minibatch,
+                        entropy_coef,
                     )
                     return (next_params, next_opt_state), metrics
 
@@ -1103,9 +1396,14 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
     compiled_batch_size: int | None = None
     compiled_runner = None
 
-    def _runner(params, opt_state, batch, update_key):
+    def _runner(params, opt_state, batch, update_key, entropy_coef=None):
         nonlocal compiled_batch_size, compiled_runner
         batch_size = int(batch.flat_obs.shape[0])
+        entropy_coef_t = (
+            default_entropy_coef
+            if entropy_coef is None
+            else jnp.asarray(float(entropy_coef), dtype=jnp.float32)
+        )
         if compiled_batch_size is None:
             compiled_batch_size = batch_size
             compiled_runner = jax.jit(
@@ -1116,7 +1414,138 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
                 "PPO update runner was called with a different batch size than it was compiled for: "
                 f"expected {compiled_batch_size}, got {batch_size}."
             )
-        return compiled_runner(params, opt_state, batch, update_key)
+        return compiled_runner(params, opt_state, batch, update_key, entropy_coef_t)
+
+    return _runner, transform
+
+
+def build_jitted_selector_update_runner(
+    jax,
+    jnp,
+    spec: ActorCriticSpec,
+    trainer_config: TrainerConfig,
+    *,
+    selector_value_coef: float,
+    selector_entropy_coef: float,
+    selector_usage_reg_coef: float,
+):
+    import optax
+
+    clip_range = jnp.asarray(trainer_config.ppo_clip_range, dtype=jnp.float32)
+    value_coef = jnp.asarray(selector_value_coef, dtype=jnp.float32)
+    entropy_coef = jnp.asarray(selector_entropy_coef, dtype=jnp.float32)
+    usage_reg_coef = jnp.asarray(selector_usage_reg_coef, dtype=jnp.float32)
+    transform = build_adam_transform(
+        optax,
+        learning_rate=float(trainer_config.learning_rate),
+    )
+
+    def _masked_mean(values, mask):
+        return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+    def _loss_fn(params, batch: SelectorBatch, selector_eps):
+        batch_size = int(batch.flat_obs.shape[0])
+        neutral_context = {
+            "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
+            "intent_gate": jnp.zeros((batch_size,), dtype=jnp.float32),
+        }
+        forward_out = actor_critic_forward(
+            params,
+            batch.flat_obs,
+            spec,
+            jnp,
+            intent_context=neutral_context,
+        )
+        raw_probs = jax.nn.softmax(forward_out["selector_logits"], axis=-1)
+        eps = jnp.clip(jnp.asarray(selector_eps, dtype=jnp.float32), 0.0, 1.0)
+        uniform = jnp.full_like(raw_probs, 1.0 / float(max(1, int(spec.num_intents))))
+        probs = ((1.0 - eps) * raw_probs) + (eps * uniform)
+        log_probs = jnp.log(jnp.maximum(probs, 1.0e-8))
+        safe_intents = jnp.clip(batch.chosen_intents, 0, int(spec.num_intents) - 1)
+        new_log_probs = jnp.take_along_axis(
+            log_probs,
+            safe_intents[:, None],
+            axis=-1,
+        )[:, 0]
+        mask = batch.active_mask.astype(jnp.float32)
+        log_ratio = new_log_probs - batch.old_log_probs
+        ratio = jnp.exp(log_ratio)
+        clipped_ratio = jnp.clip(ratio, 1.0 - clip_range, 1.0 + clip_range)
+        policy_loss = -_masked_mean(
+            jnp.minimum(ratio * batch.advantages, clipped_ratio * batch.advantages),
+            mask,
+        )
+        values = forward_out["selector_values"]
+        value_loss = _masked_mean(jnp.square(values - batch.returns), mask)
+        entropy = _masked_mean(-jnp.sum(probs * log_probs, axis=-1), mask)
+        sample_count = jnp.maximum(jnp.sum(mask), 1.0)
+        mean_raw_probs = jnp.sum(raw_probs * mask[:, None], axis=0) / sample_count
+        uniform_prob = jnp.asarray(1.0 / float(max(1, int(spec.num_intents))), dtype=jnp.float32)
+        usage_kl_uniform = jnp.sum(
+            mean_raw_probs
+            * (jnp.log(jnp.maximum(mean_raw_probs, 1.0e-8)) - jnp.log(uniform_prob))
+        )
+        approx_kl = _masked_mean((ratio - 1.0) - log_ratio, mask)
+        clip_fraction = _masked_mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32), mask)
+        total_loss = (
+            policy_loss
+            + (value_coef * value_loss)
+            - (entropy_coef * entropy)
+            + (usage_reg_coef * usage_kl_uniform)
+        )
+        metrics = {
+            "selector_train_loss": total_loss,
+            "selector_train_policy_loss": policy_loss,
+            "selector_train_value_loss": value_loss,
+            "selector_train_entropy": entropy,
+            "selector_train_usage_kl_uniform": usage_kl_uniform,
+            "selector_train_approx_kl": approx_kl,
+            "selector_train_clip_fraction": clip_fraction,
+            "selector_train_sample_count": jnp.sum(mask),
+            "selector_train_return_mean": _masked_mean(batch.returns, mask),
+            "selector_train_advantage_mean": _masked_mean(batch.advantages, mask),
+            "selector_train_value_mean": _masked_mean(values, mask),
+        }
+        for intent_idx in range(int(spec.num_intents)):
+            metrics[f"selector_train_usage_by_intent/{intent_idx}"] = _masked_mean(
+                (safe_intents == int(intent_idx)).astype(jnp.float32),
+                mask,
+            )
+            metrics[f"selector_train_prob_by_intent/{intent_idx}"] = mean_raw_probs[int(intent_idx)]
+        return total_loss, metrics
+
+    @jax.jit
+    def _runner(params, opt_state, batch: SelectorBatch, update_key, selector_eps):
+        del update_key
+        (_, loss_metrics), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
+            params,
+            batch,
+            selector_eps,
+        )
+        grad_norm = global_norm(grads, optax)
+        sample_count = loss_metrics["selector_train_sample_count"]
+        effective_grads = jax.tree_util.tree_map(
+            lambda grad: jnp.where(sample_count > 0.0, grad, jnp.zeros_like(grad)),
+            grads,
+        )
+        new_params, new_opt_state = optimizer_update(
+            params,
+            effective_grads,
+            opt_state,
+            transform=transform,
+            optax=optax,
+        )
+        post_update_loss, metrics = _loss_fn(new_params, batch, selector_eps)
+        metrics = {
+            **metrics,
+            "selector_train_loss": post_update_loss,
+            "selector_train_grad_norm": jnp.where(
+                sample_count > 0.0,
+                grad_norm,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+        }
+        return new_params, new_opt_state, metrics
 
     return _runner, transform
 

@@ -6,6 +6,11 @@ from typing import Any, NamedTuple, Sequence
 import numpy as np
 
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.start_templates import (
+    _mirror_anchor,
+    _project_anchor_to_valid_cell,
+    resolve_start_template,
+)
 from basketworld_jax.train.cli import resolve_training_team
 from train.env_factory import setup_environment
 
@@ -48,6 +53,15 @@ class KernelStatic(NamedTuple):
     opponent_mask: Any
     pointer_pass_slot_mask: Any
     pointer_pass_target_ids: Any
+    start_template_enabled: Any
+    start_template_prob: Any
+    start_template_positions: Any
+    start_template_ball_holders: Any
+    start_template_shot_clocks: Any
+    start_template_weights: Any
+    start_template_entry_anchors: Any
+    start_template_entry_jitter_radii: Any
+    start_template_entry_has_ball: Any
     court_norm_den: Any
     offensive_lane_by_cell: Any
     defensive_lane_by_cell: Any
@@ -358,6 +372,139 @@ def stack_state_snapshots(
     )
 
 
+def _compiled_start_template_arrays(env) -> dict[str, np.ndarray | float | bool]:
+    n_players = int(env.n_players)
+    fallback_holder = int(env.offense_ids[0]) if len(env.offense_ids) else 0
+    fallback = {
+        "enabled": False,
+        "prob": 0.0,
+        "positions": np.zeros((1, n_players, 2), dtype=np.int32),
+        "ball_holders": np.full((1,), fallback_holder, dtype=np.int32),
+        "shot_clocks": np.full((1,), -1, dtype=np.int32),
+        "weights": np.ones((1,), dtype=np.float32),
+        "entry_anchors": np.zeros((1, n_players, 2), dtype=np.int32),
+        "entry_jitter_radii": np.zeros((1, n_players), dtype=np.int32),
+        "entry_has_ball": np.zeros((1, n_players), dtype=np.int8),
+    }
+
+    enabled = bool(getattr(env, "start_template_enabled", False))
+    library = getattr(env, "start_template_library", None)
+    prob = float(np.clip(float(getattr(env, "start_template_prob", 0.0)), 0.0, 1.0))
+    if not enabled or library is None or prob <= 0.0:
+        return fallback
+
+    jitter_scale = float(getattr(env, "start_template_jitter_scale", 1.0))
+    mirror_prob = float(np.clip(float(getattr(env, "start_template_mirror_prob", 0.0)), 0.0, 1.0))
+    strict = bool(getattr(env, "start_template_strict", False))
+    positions: list[np.ndarray] = []
+    ball_holders: list[int] = []
+    shot_clocks: list[int] = []
+    weights: list[float] = []
+    entry_anchors: list[np.ndarray] = []
+    entry_jitter_radii: list[np.ndarray] = []
+    entry_has_ball: list[np.ndarray] = []
+    valid_cells = list(
+        getattr(env, "_valid_axial", ())
+        or getattr(env, "_cell_index", {}).keys()
+    )
+
+    for template in list(library.get("templates", []) or []):
+        template_weight = max(0.0, float(template.get("weight", 1.0)))
+        if template_weight <= 0.0:
+            continue
+        mirrorable = bool(template.get("mirrorable", False))
+        variants: list[tuple[bool, float]]
+        if mirrorable and mirror_prob > 0.0:
+            variants = [(False, template_weight * (1.0 - mirror_prob))]
+            variants.append((True, template_weight * mirror_prob))
+        else:
+            variants = [(False, template_weight)]
+
+        for mirror, variant_weight in variants:
+            if variant_weight <= 0.0:
+                continue
+            try:
+                resolved = resolve_start_template(
+                    env,
+                    template,
+                    jitter_scale=jitter_scale,
+                    mirror=mirror,
+                )
+            except Exception:
+                if strict:
+                    raise
+                continue
+            variant_anchors: list[tuple[int, int]] = []
+            variant_jitter: list[int] = []
+            variant_has_ball: list[int] = []
+            try:
+                for team_name in ("offense", "defense"):
+                    for entry in list(template.get(team_name, []) or []):
+                        anchor = _project_anchor_to_valid_cell(
+                            env,
+                            (int(entry["anchor"][0]), int(entry["anchor"][1])),
+                            valid_cells=valid_cells,
+                        )
+                        if mirror and bool(template.get("mirrorable", False)):
+                            anchor = _project_anchor_to_valid_cell(
+                                env,
+                                _mirror_anchor(env, anchor),
+                                valid_cells=valid_cells,
+                            )
+                        variant_anchors.append((int(anchor[0]), int(anchor[1])))
+                        variant_jitter.append(
+                            max(
+                                0,
+                                int(
+                                    round(
+                                        float(entry.get("jitter_radius", 0))
+                                        * max(0.0, jitter_scale)
+                                    )
+                                ),
+                            )
+                        )
+                        variant_has_ball.append(1 if bool(entry.get("has_ball", False)) else 0)
+            except Exception:
+                if strict:
+                    raise
+                continue
+            if len(variant_anchors) != n_players:
+                if strict:
+                    raise ValueError(
+                        f"start template '{template.get('id', '')}' has {len(variant_anchors)} entries, expected {n_players}"
+                    )
+                continue
+            positions.append(
+                np.asarray(resolved["initial_positions"], dtype=np.int32).reshape(n_players, 2)
+            )
+            ball_holders.append(int(resolved.get("ball_holder", -1)))
+            shot_clocks.append(int(resolved.get("shot_clock", -1)))
+            weights.append(float(variant_weight))
+            entry_anchors.append(np.asarray(variant_anchors, dtype=np.int32).reshape(n_players, 2))
+            entry_jitter_radii.append(np.asarray(variant_jitter, dtype=np.int32).reshape(n_players))
+            entry_has_ball.append(np.asarray(variant_has_ball, dtype=np.int8).reshape(n_players))
+
+    if not positions:
+        if strict:
+            raise ValueError("start-template library did not produce any valid JAX reset candidates")
+        return fallback
+
+    weight_array = np.asarray(weights, dtype=np.float32)
+    if float(np.sum(weight_array)) <= 0.0:
+        weight_array = np.ones_like(weight_array, dtype=np.float32)
+    return {
+        "enabled": True,
+        "prob": prob,
+        "positions": np.stack(positions, axis=0).astype(np.int32, copy=False),
+        "ball_holders": np.asarray(ball_holders, dtype=np.int32),
+        "shot_clocks": np.asarray(shot_clocks, dtype=np.int32),
+        "weights": weight_array,
+        "entry_anchors": np.stack(entry_anchors, axis=0).astype(np.int32, copy=False),
+        "entry_jitter_radii": np.stack(entry_jitter_radii, axis=0).astype(np.int32, copy=False),
+        "entry_has_ball": np.stack(entry_has_ball, axis=0).astype(np.int8, copy=False),
+    }
+
+
 def build_kernel_static_from_env(env, xp) -> KernelStatic:
     cells = sorted(env._move_mask_by_cell.keys())
     basket_position = np.asarray(env.basket_position, dtype=np.int32)
@@ -425,6 +572,7 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         teammates = sorted(int(pid) for pid in teammates)[:6]
         pass_slot_mask[passer_id, : len(teammates)] = 1
         pass_target_ids[passer_id, : len(teammates)] = np.asarray(teammates, dtype=np.int32)
+    start_templates = _compiled_start_template_arrays(env)
 
     return KernelStatic(
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
@@ -442,6 +590,15 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         opponent_mask=xp.asarray(opponent_mask, dtype=xp.int8),
         pointer_pass_slot_mask=xp.asarray(pass_slot_mask, dtype=xp.int8),
         pointer_pass_target_ids=xp.asarray(pass_target_ids, dtype=xp.int32),
+        start_template_enabled=xp.asarray(1 if bool(start_templates["enabled"]) else 0, dtype=xp.int8),
+        start_template_prob=xp.asarray(float(start_templates["prob"]), dtype=xp.float32),
+        start_template_positions=xp.asarray(start_templates["positions"], dtype=xp.int32),
+        start_template_ball_holders=xp.asarray(start_templates["ball_holders"], dtype=xp.int32),
+        start_template_shot_clocks=xp.asarray(start_templates["shot_clocks"], dtype=xp.int32),
+        start_template_weights=xp.asarray(start_templates["weights"], dtype=xp.float32),
+        start_template_entry_anchors=xp.asarray(start_templates["entry_anchors"], dtype=xp.int32),
+        start_template_entry_jitter_radii=xp.asarray(start_templates["entry_jitter_radii"], dtype=xp.int32),
+        start_template_entry_has_ball=xp.asarray(start_templates["entry_has_ball"], dtype=xp.int8),
         court_norm_den=xp.asarray(
             float(max(env.court_width, env.court_height)) if env.normalize_obs else 1.0,
             dtype=xp.float32,
@@ -1970,6 +2127,34 @@ def replace_done_states(next_state: KernelState, reset_state: KernelState, done,
     return KernelState(*replaced)
 
 
+def set_offense_intent_state_batch(
+    static: KernelStatic,
+    state: KernelState,
+    intent_index,
+    intent_active,
+    jnp,
+) -> KernelState:
+    """Batch equivalent of the Python env's set_offense_intent_state helper."""
+    enabled = static.enable_intent_learning.astype(jnp.bool_)
+    active = enabled & jnp.asarray(intent_active).astype(jnp.bool_)
+    safe_index = jnp.clip(
+        jnp.asarray(intent_index, dtype=jnp.int32),
+        0,
+        static.num_intents.astype(jnp.int32) - 1,
+    )
+    return _replace_state(
+        state,
+        intent_index=jnp.where(active, safe_index, jnp.asarray(0, dtype=jnp.int32)),
+        intent_active=active.astype(jnp.int8),
+        intent_age=jnp.zeros_like(state.intent_age, dtype=jnp.int32),
+        intent_commitment_remaining=jnp.where(
+            active,
+            static.intent_commitment_steps.astype(jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+    )
+
+
 def _sample_index_from_mask(mask, key, jax, jnp):
     mask_bool = mask.astype(jnp.bool_)
     logits = jnp.where(mask_bool, jnp.zeros(mask_bool.shape, dtype=jnp.float32), -jnp.inf)
@@ -2075,6 +2260,75 @@ def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
     return positions
 
 
+def _sample_start_template_positions_single(static: KernelStatic, template_index, key, jax, jnp):
+    """Resolve one sampled template variant on-device.
+
+    Template rows are stored as offense entries followed by defense entries.
+    Each reset re-samples team slot assignment and each entry's jittered cell.
+    """
+    n_players = int(static.role_encoding.shape[0])
+    offense_count = int(static.offense_ids.shape[0])
+    cell_count = int(static.cell_coords.shape[0])
+    entry_count = int(static.start_template_entry_anchors.shape[1])
+    offense_perm_key, defense_perm_key, placement_key = jax.random.split(key, 3)
+
+    offense_assignment = jax.random.permutation(offense_perm_key, static.offense_ids)
+    defense_assignment = jax.random.permutation(defense_perm_key, static.defense_ids)
+    entry_player_ids = jnp.concatenate(
+        [
+            offense_assignment,
+            defense_assignment,
+        ],
+        axis=0,
+    ).astype(jnp.int32)
+    anchors = static.start_template_entry_anchors[template_index]
+    radii = static.start_template_entry_jitter_radii[template_index].astype(jnp.int32)
+    has_ball = static.start_template_entry_has_ball[template_index].astype(jnp.bool_)
+    order = jnp.argsort((radii * (n_players + 1)) + entry_player_ids)
+    placement_keys = jax.random.split(placement_key, entry_count)
+
+    positions = jnp.zeros((n_players, 2), dtype=jnp.int32)
+    taken_mask = jnp.zeros((cell_count,), dtype=jnp.bool_)
+    base_cell_available = jnp.where(
+        static.allow_dunks.astype(jnp.bool_),
+        jnp.ones((cell_count,), dtype=jnp.bool_),
+        static.non_basket_cell_mask.astype(jnp.bool_),
+    )
+
+    for slot in range(entry_count):
+        entry_idx = order[slot]
+        anchor = anchors[entry_idx]
+        radius = radii[entry_idx]
+        player_id = entry_player_ids[entry_idx]
+        available_mask = base_cell_available & (~taken_mask)
+        distances = _hex_distance(static.cell_coords, anchor, jnp).astype(jnp.int32)
+        in_radius_mask = available_mask & (distances <= radius)
+        masked_distance = jnp.where(
+            available_mask,
+            distances,
+            jnp.full((cell_count,), 1_000_000, dtype=jnp.int32),
+        )
+        nearest_distance = jnp.min(masked_distance)
+        nearest_mask = available_mask & (distances == nearest_distance)
+        candidate_mask = jnp.where(jnp.any(in_radius_mask), in_radius_mask, nearest_mask)
+        chosen_cell_idx = _sample_index_from_mask(
+            candidate_mask,
+            placement_keys[slot],
+            jax,
+            jnp,
+        )
+        positions = positions.at[player_id].set(static.cell_coords[chosen_cell_idx])
+        taken_mask = taken_mask.at[chosen_cell_idx].set(True)
+
+    ball_entry_idx = jnp.argmax(has_ball.astype(jnp.int32)).astype(jnp.int32)
+    ball_holder = jnp.where(
+        jnp.any(has_ball),
+        entry_player_ids[ball_entry_idx],
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    return positions, ball_holder
+
+
 def _sample_role_intent_single(static: KernelStatic, enabled, null_prob, key, jax, jnp):
     draw_key, index_key = jax.random.split(key)
     enabled_bool = enabled.astype(jnp.bool_)
@@ -2107,11 +2361,12 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         three_key,
         dunk_key,
         positions_key,
+        template_key,
         holder_key,
         offense_intent_key,
         defense_intent_key,
         intent_visible_key,
-    ) = jax.random.split(key, 9)
+    ) = jax.random.split(key, 10)
 
     shot_clock = jax.random.randint(
         shot_clock_key,
@@ -2154,6 +2409,41 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     positions = _sample_reset_positions_single(static, positions_key, jax, jnp)
     holder_offset = jax.random.randint(holder_key, shape=(), minval=0, maxval=offense_count, dtype=jnp.int32)
     ball_holder = static.offense_ids[holder_offset]
+    template_draw_key, template_index_key, template_resolve_key = jax.random.split(template_key, 3)
+    template_weights = jnp.maximum(static.start_template_weights.astype(jnp.float32), 0.0)
+    template_weight_sum = jnp.sum(template_weights)
+    template_count = static.start_template_weights.shape[0]
+    safe_template_weights = jnp.where(
+        template_weight_sum > 0.0,
+        template_weights / template_weight_sum,
+        jnp.ones_like(template_weights, dtype=jnp.float32) / float(template_count),
+    )
+    template_cdf = jnp.cumsum(safe_template_weights)
+    template_draw = jax.random.uniform(template_index_key)
+    template_index = jnp.argmax((template_draw <= template_cdf).astype(jnp.int32)).astype(jnp.int32)
+    use_template = (
+        static.start_template_enabled.astype(jnp.bool_)
+        & (jax.random.uniform(template_draw_key) < static.start_template_prob)
+    )
+    template_positions, template_ball_holder = _sample_start_template_positions_single(
+        static,
+        template_index,
+        template_resolve_key,
+        jax,
+        jnp,
+    )
+    template_shot_clock = static.start_template_shot_clocks[template_index]
+    positions = jnp.where(use_template, template_positions, positions)
+    ball_holder = jnp.where(
+        use_template & (template_ball_holder >= 0),
+        template_ball_holder,
+        ball_holder,
+    )
+    shot_clock = jnp.where(
+        use_template & (template_shot_clock >= 0),
+        template_shot_clock,
+        shot_clock,
+    )
     offense_intent = _sample_role_intent_single(
         static,
         static.enable_intent_learning,

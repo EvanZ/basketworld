@@ -89,10 +89,65 @@ def test_attention_actor_critic_forward_shapes():
     assert out["action_type_logits"].shape == (4, 3, 9)
     assert out["pass_target_logits"].shape == (4, 3, 6)
     assert out["attention_weights"].shape == (4, 4, 8, 8)
+    assert out["selector_logits"].shape == (4, 8)
+    assert out["selector_values"].shape == (4,)
     np.testing.assert_allclose(
         np.asarray(out["attention_weights"]).sum(axis=-1),
         np.ones((4, 4, 8), dtype=np.float32),
         atol=1e-5,
+    )
+
+
+def test_attention_intent_selector_head_starts_uniform_and_zero_value():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    spec = ActorCriticSpec(
+        flat_obs_dim=95,
+        training_player_count=3,
+        action_dim_per_player=14,
+        total_action_dim=42,
+        hidden_dims=(8,),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=15,
+        global_dim=4,
+        attention_embed_dim=16,
+        attention_num_heads=4,
+        attention_token_mlp_dim=12,
+        attention_num_cls_tokens=2,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=4,
+        num_intents=5,
+        intent_selector_enabled=True,
+        intent_selector_hidden_dim=7,
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
+    flat_obs = jnp.ones((3, 95), dtype=jnp.float32)
+    flat_obs = flat_obs.at[:, -1].set(1.0)
+
+    out = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        intent_context={
+            "intent_index": jnp.zeros((3,), dtype=jnp.int32),
+            "intent_gate": jnp.zeros((3,), dtype=jnp.float32),
+        },
+    )
+
+    assert out["selector_logits"].shape == (3, 5)
+    assert out["selector_values"].shape == (3,)
+    np.testing.assert_allclose(
+        np.asarray(out["selector_logits"]),
+        np.zeros((3, 5), dtype=np.float32),
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        np.asarray(out["selector_values"]),
+        np.zeros((3,), dtype=np.float32),
+        atol=1e-7,
     )
 
 

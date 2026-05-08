@@ -38,6 +38,8 @@ class ActorCriticSpec:
     intent_embedding_enabled: bool = False
     intent_embedding_dim: int = 16
     num_intents: int = 8
+    intent_selector_enabled: bool = False
+    intent_selector_hidden_dim: int = 64
 
 
 def build_actor_critic_spec(
@@ -62,6 +64,8 @@ def build_actor_critic_spec(
     intent_embedding_enabled: bool = False,
     intent_embedding_dim: int = 16,
     num_intents: int = 8,
+    intent_selector_enabled: bool = False,
+    intent_selector_hidden_dim: int = 64,
 ) -> ActorCriticSpec:
     if flat_obs_batch.ndim != 2:
         raise ValueError(
@@ -85,13 +89,19 @@ def build_actor_critic_spec(
     intent_embedding_enabled = bool(intent_embedding_enabled)
     intent_embedding_dim = int(intent_embedding_dim)
     num_intents = int(num_intents)
+    intent_selector_enabled = bool(intent_selector_enabled)
+    intent_selector_hidden_dim = int(intent_selector_hidden_dim)
     if intent_embedding_enabled and normalized_model_type != "attention":
         raise ValueError("JAX intent embeddings require --policy-model attention.")
+    if intent_selector_enabled and normalized_model_type != "attention":
+        raise ValueError("JAX intent selector requires --policy-model attention.")
     if intent_embedding_enabled and intent_embedding_dim <= 0:
         raise ValueError("--intent-embedding-dim must be >= 1.")
+    if intent_selector_enabled and intent_selector_hidden_dim <= 0:
+        raise ValueError("--intent-selector-hidden-dim must be >= 1.")
     if num_intents <= 0:
         raise ValueError("--num-intents must be >= 1.")
-    if not intent_embedding_enabled:
+    if not intent_embedding_enabled and not intent_selector_enabled:
         num_intents = 8
     pass_action_start = int(pass_action_start)
     pass_action_end = int(pass_action_end)
@@ -138,6 +148,8 @@ def build_actor_critic_spec(
         intent_embedding_enabled=bool(intent_embedding_enabled),
         intent_embedding_dim=int(intent_embedding_dim),
         num_intents=int(num_intents),
+        intent_selector_enabled=bool(intent_selector_enabled),
+        intent_selector_hidden_dim=int(intent_selector_hidden_dim),
     )
 
 
@@ -194,6 +206,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
 
     kernel_init = _flax_dense_kernel_init(nn)
     bias_init = _flax_dense_bias_init(nn)
+    zero_init = nn.initializers.zeros_init()
     non_pass_indices = _non_pass_action_indices(spec)
     pass_indices = _pass_action_indices(spec)
     pointer_type_dim = _pointer_action_type_dim(spec)
@@ -232,6 +245,11 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                     dtype=jnp.float32,
                 ),
                 "values": values,
+                "selector_logits": jnp.zeros(
+                    (flat_obs.shape[0], int(spec.num_intents)),
+                    dtype=jnp.float32,
+                ),
+                "selector_values": jnp.zeros((flat_obs.shape[0],), dtype=jnp.float32),
             }
 
         @nn.compact
@@ -379,6 +397,16 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 else:
                     out = nn.tanh(out)
             return out
+
+        def _head_activation(self, hidden):
+            activation = str(spec.attention_head_activation).lower()
+            if activation == "relu":
+                return nn.relu(hidden)
+            if activation == "gelu":
+                return nn.gelu(hidden)
+            if activation in {"silu", "swish"}:
+                return nn.silu(hidden)
+            return nn.tanh(hidden)
 
         def _compose_pointer_flat_logits(self, action_type_logits, pass_target_logits):
             type_log_probs = jax.nn.log_softmax(action_type_logits, axis=-1)
@@ -566,13 +594,16 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             if cls_count >= 2:
                 offense_value_input = attended[:, int(spec.token_player_count), :]
                 defense_value_input = attended[:, int(spec.token_player_count) + 1, :]
+                selector_input = offense_value_input
             elif cls_count == 1:
                 offense_value_input = attended[:, int(spec.token_player_count), :]
                 defense_value_input = offense_value_input
+                selector_input = offense_value_input
             else:
                 pooled = jnp.mean(player_tokens, axis=1)
                 offense_value_input = pooled
                 defense_value_input = pooled
+                selector_input = pooled
 
             value_inputs = jnp.stack([offense_value_input, defense_value_input], axis=1)
             value_latents = self._attention_head_mlp(
@@ -595,6 +626,39 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 name="value_head_defense",
             )(defense_value_input)[..., 0]
             values = jnp.where(role_flag[:, 0] > 0.0, values_offense, values_defense)
+            if bool(spec.intent_selector_enabled):
+                selector_hidden = nn.Dense(
+                    int(spec.intent_selector_hidden_dim),
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    name="intent_selector_head_0",
+                )(selector_input)
+                selector_hidden = self._head_activation(selector_hidden)
+                selector_logits = nn.Dense(
+                    int(spec.num_intents),
+                    kernel_init=zero_init,
+                    bias_init=zero_init,
+                    name="intent_selector_head_out",
+                )(selector_hidden)
+                selector_value_hidden = nn.Dense(
+                    int(spec.intent_selector_hidden_dim),
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    name="intent_selector_value_head_0",
+                )(selector_input)
+                selector_value_hidden = self._head_activation(selector_value_hidden)
+                selector_values = nn.Dense(
+                    1,
+                    kernel_init=zero_init,
+                    bias_init=zero_init,
+                    name="intent_selector_value_head_out",
+                )(selector_value_hidden)[..., 0]
+            else:
+                selector_logits = jnp.zeros(
+                    (flat_obs.shape[0], int(spec.num_intents)),
+                    dtype=jnp.float32,
+                )
+                selector_values = jnp.zeros((flat_obs.shape[0],), dtype=jnp.float32)
             return {
                 "hidden": attended.reshape(attended.shape[0], -1),
                 "flat_policy_logits": flat_policy_logits,
@@ -602,6 +666,8 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 "pass_target_logits": pass_target_logits,
                 "attention_weights": attention_weights,
                 "values": values,
+                "selector_logits": selector_logits,
+                "selector_values": selector_values,
             }
 
         def __call__(self, flat_obs, intent_context=None):

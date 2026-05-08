@@ -193,7 +193,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -524,6 +524,19 @@ function handlePolicySelection(type, event) {
   emit('policy-swap-requested', { target: 'opponent', policyName: value });
 }
 
+function formatCheckpointLabel(policyName) {
+  const name = String(policyName || '').trim();
+  if (!name) return 'Unknown checkpoint';
+  const updateMatch = name.match(/(?:phase_a_)?update_(\d+)/);
+  if (updateMatch) {
+    return `Update ${Number(updateMatch[1]).toLocaleString()} (${name})`;
+  }
+  if (name === 'latest' || name === 'phase_a_latest') {
+    return `Latest (${name})`;
+  }
+  return name;
+}
+
 // Offense skill overrides (Environment tab)
 const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
 const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
@@ -830,6 +843,10 @@ const defaultEvalConfig = () => ({
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
+  startTemplateMode: 'checkpoint',
+  startTemplateProb: 1.0,
+  startTemplateJitterScale: 0.0,
+  startTemplateMirrorProb: 0.0,
 });
 const defaultTemplateConfig = () => ({
   positions: [],
@@ -939,6 +956,22 @@ const selectedEditableTemplate = computed(() => {
     : [];
   return idx >= 0 ? templates[idx] || null : null;
 });
+const editableTemplateThumbnailModels = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      if (!id) return null;
+      const model = buildStartTemplatePreviewModel(
+        template,
+        false,
+      );
+      return model ? { id, label: id, model } : null;
+    })
+    .filter(Boolean);
+});
 
 const hasEditableTemplateLibrary = computed(() => editableTemplateOptions.value.length > 0);
 const templateLibraryJsonExport = computed(() => JSON.stringify(templateLibraryDraft.value, null, 2));
@@ -993,9 +1026,7 @@ watch(
 );
 
 const startTemplateOptions = computed(() => {
-  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
-    ? props.gameState.start_template_library.templates
-    : [];
+  const templates = startTemplateDefinitions.value;
   return templates
     .map((template) => {
       const id = String(template?.id || '').trim();
@@ -1004,26 +1035,67 @@ const startTemplateOptions = computed(() => {
     .filter(Boolean);
 });
 const hasLoadedStartTemplates = computed(() => startTemplateOptions.value.length > 0);
-const selectedStartTemplateDefinition = computed(() => {
-  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+const startTemplateDefinitions = computed(() => (
+  Array.isArray(props.gameState?.start_template_library?.templates)
     ? props.gameState.start_template_library.templates
-    : [];
+    : []
+));
+const START_TEMPLATE_SELECTION_STORAGE_KEY = 'basketworld.start_template.selection';
+function loadStoredStartTemplateSelection() {
+  if (typeof window === 'undefined') {
+    return { id: '', mirrored: false };
+  }
+  try {
+    const raw = window.sessionStorage.getItem(START_TEMPLATE_SELECTION_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return {
+      id: String(parsed?.id || '').trim(),
+      mirrored: Boolean(parsed?.mirrored),
+    };
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load start-template selection', err);
+    return { id: '', mirrored: false };
+  }
+}
+function persistStartTemplateSelection() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(
+      START_TEMPLATE_SELECTION_STORAGE_KEY,
+      JSON.stringify({
+        id: String(selectedStartTemplateId.value || '').trim(),
+        mirrored: Boolean(selectedStartTemplateMirrored.value),
+      }),
+    );
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist start-template selection', err);
+  }
+}
+const storedStartTemplateSelection = loadStoredStartTemplateSelection();
+const selectedStartTemplateDefinition = computed(() => {
+  const templates = startTemplateDefinitions.value;
   const wantedId = String(selectedStartTemplateId.value || '').trim();
   return templates.find((template) => String(template?.id || '').trim() === wantedId) || null;
 });
-const selectedStartTemplateId = ref('');
-const selectedStartTemplateMirrored = ref(false);
+const selectedStartTemplateId = ref(storedStartTemplateSelection.id);
+const selectedStartTemplateMirrored = ref(storedStartTemplateSelection.mirrored);
 const startTemplateActionStatus = ref('');
 const startTemplateActionError = ref('');
 
 watch(
   startTemplateOptions,
   (options) => {
+    if (!options.length) return;
     const values = new Set(options.map((opt) => opt.value));
     if (!values.has(selectedStartTemplateId.value)) {
       selectedStartTemplateId.value = options[0]?.value || '';
     }
   },
+  { immediate: true }
+);
+watch(
+  [selectedStartTemplateId, selectedStartTemplateMirrored],
+  persistStartTemplateSelection,
   { immediate: true }
 );
 
@@ -1087,8 +1159,7 @@ function previewAxialToCartesian(anchor) {
   };
 }
 
-const startTemplatePreviewModel = computed(() => {
-  const template = selectedStartTemplateDefinition.value;
+function buildStartTemplatePreviewModel(template, mirroredInput = false) {
   const courtWidth = Number(props.gameState?.court_width || 0);
   const courtHeight = Number(props.gameState?.court_height || 0);
   if (!template || courtWidth <= 0 || courtHeight <= 0) return null;
@@ -1119,7 +1190,7 @@ const startTemplatePreviewModel = computed(() => {
   const originX = frame.x + (frame.width - usedWidth) / 2 - minX * scale;
   const originY = frame.y + (frame.height - usedHeight) / 2 - minY * scale;
 
-  const mirrored = Boolean(selectedStartTemplateMirrored.value && template?.mirrorable);
+  const mirrored = Boolean(mirroredInput && template?.mirrorable);
   const entries = [];
   for (const teamName of ['offense', 'defense']) {
     const teamEntries = Array.isArray(template?.[teamName]) ? template[teamName] : [];
@@ -1169,7 +1240,33 @@ const startTemplatePreviewModel = computed(() => {
     court,
     entries,
   };
-});
+}
+
+const startTemplatePreviewModel = computed(() => (
+  buildStartTemplatePreviewModel(
+    selectedStartTemplateDefinition.value,
+    selectedStartTemplateMirrored.value,
+  )
+));
+
+const startTemplateThumbnailModels = computed(() => (
+  startTemplateDefinitions.value
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      if (!id) return null;
+      const model = buildStartTemplatePreviewModel(
+        template,
+        selectedStartTemplateMirrored.value,
+      );
+      return model ? { id, label: id, model } : null;
+    })
+    .filter(Boolean)
+));
+
+function selectStartTemplate(id) {
+  selectedStartTemplateId.value = String(id || '').trim();
+  clearStartTemplateFeedback();
+}
 
 async function handleApplyStartTemplateToBoard() {
   clearStartTemplateFeedback();
@@ -1189,6 +1286,16 @@ async function handleApplyStartTemplateToBoard() {
     console.error('[PlayerControls] Failed to apply start template to board', err);
     startTemplateActionError.value = err?.message || 'Failed to load template onto board.';
   }
+}
+
+function handleStartSelfPlayFromTemplate() {
+  clearStartTemplateFeedback();
+  if (!selectedStartTemplateId.value) return;
+  emit('template-self-play', {
+    templateId: selectedStartTemplateId.value,
+    mirrored: selectedStartTemplateMirrored.value,
+    seed: stableStartTemplateSeed(selectedStartTemplateId.value),
+  });
 }
 
 const evalConfigSafe = computed(() => {
@@ -2036,6 +2143,19 @@ function setEvalIntentSelectionMode(mode) {
   emitEvalConfigUpdate({ intentSelectionMode: normalized });
 }
 
+function setEvalStartTemplateMode(mode) {
+  const normalized = ['checkpoint', 'enabled', 'disabled'].includes(String(mode))
+    ? String(mode)
+    : 'checkpoint';
+  emitEvalConfigUpdate({ startTemplateMode: normalized });
+}
+
+function setEvalStartTemplateNumber(key, value, { min = 0, max = 1 } = {}) {
+  const numeric = Number(value);
+  const safe = Number.isFinite(numeric) ? Math.max(min, Math.min(max, numeric)) : min;
+  emitEvalConfigUpdate({ [key]: safe });
+}
+
 function updateEvalSkill(idx, key, value) {
   const offenseCount = props.gameState?.offense_ids?.length || 0;
   const base = evalConfigSafe.value.skills || {};
@@ -2194,23 +2314,27 @@ async function resetPassLogitBiasDefault() {
   await applyPassLogitBiasOverride();
 }
 
-async function applyIntentStateOverride() {
+function normalizeIntentStatePayload(source = {}) {
+  return {
+    active: Boolean(source.active),
+    intent_index: Math.max(
+      0,
+      Math.min(intentIndexMax.value, Number(source.intent_index) || 0),
+    ),
+    intent_age: Math.max(
+      0,
+      Math.min(intentAgeMax.value, Number(source.intent_age) || 0),
+    ),
+  };
+}
+
+async function commitIntentState(payload) {
   if (!props.gameState || intentControlsDisabled.value) return;
   intentStateUpdating.value = true;
   intentStateError.value = null;
   try {
-    const payload = {
-      active: Boolean(intentStateInput.value.active),
-      intent_index: Math.max(
-        0,
-        Math.min(intentIndexMax.value, Number(intentStateInput.value.intent_index) || 0),
-      ),
-      intent_age: Math.max(
-        0,
-        Math.min(intentAgeMax.value, Number(intentStateInput.value.intent_age) || 0),
-      ),
-    };
-    const res = await setIntentState(payload);
+    const normalizedPayload = normalizeIntentStatePayload(payload);
+    const res = await setIntentState(normalizedPayload);
     if (res?.status === 'success' && res.state) {
       emit('state-updated', res.state);
     } else {
@@ -2222,6 +2346,23 @@ async function applyIntentStateOverride() {
   } finally {
     intentStateUpdating.value = false;
   }
+}
+
+async function applyIntentStateOverride() {
+  await commitIntentState(intentStateInput.value);
+}
+
+async function activateIntentPreference(item) {
+  if (!props.gameState || intentControlsDisabled.value) return;
+  const intentIndex = Number(item?.intent_index);
+  if (!Number.isFinite(intentIndex)) return;
+  const payload = normalizeIntentStatePayload({
+    active: true,
+    intent_index: intentIndex,
+    intent_age: 0,
+  });
+  intentStateInput.value = payload;
+  await commitIntentState(payload);
 }
 
 function resetIntentStateInputs() {
@@ -2835,11 +2976,55 @@ const jaxModelMetadata = computed(() => {
 const jaxFrozenConfigText = computed(() => prettyJson(jaxModelMetadata.value?.frozen_config || null));
 const jaxTrainerConfigText = computed(() => prettyJson(jaxModelMetadata.value?.trainer_config || null));
 const jaxPolicySpecText = computed(() => prettyJson(jaxModelMetadata.value?.policy_spec || null));
+const playDiagnosticsEnabled = computed(() => {
+  const caps = modelCapabilities.value || {};
+  const hasIntentConfig = Boolean(
+    props.gameState?.enable_intent_learning
+    || Number(props.gameState?.num_intents || 0) > 0
+  );
+  return caps.play_metadata !== false && hasIntentConfig;
+});
+const selectorDistributionCapabilityEnabled = computed(() =>
+  (modelCapabilities.value || {}).selector_distribution !== false
+);
+const livePlaySummary = computed(() => {
+  const state = props.gameState || {};
+  const active = Boolean(state.intent_active_current);
+  const intentIndex = Number(state.intent_index_current ?? 0);
+  return {
+    active,
+    playLabel: active
+      ? formatPlayLabel(intentIndex, state.play_name_map, state.current_play_name)
+      : 'No active play',
+    age: state.intent_age ?? 'N/A',
+    commitmentRemaining: state.intent_commitment_remaining ?? 'N/A',
+    selectorSegmentIndex: state.selector_segment_index_current ?? 'N/A',
+    boundaryReason: state.selector_last_boundary_reason || 'N/A',
+    visibleToDefense: Boolean(state.intent_visible_to_defense_current),
+    defensePlayLabel: state.defense_intent_active_current
+      ? formatPlayLabel(
+        Number(state.defense_intent_index_current ?? 0),
+        state.play_name_map,
+        state.current_defense_play_name,
+      )
+      : 'No active defense play',
+  };
+});
+const selectorIntentUnavailableReason = computed(() => {
+  if (!selectorEnabled.value) return 'Selector is not enabled for this checkpoint.';
+  if (!selectorDistributionCapabilityEnabled.value) {
+    return 'Loaded model does not expose selector distribution diagnostics.';
+  }
+  if (!props.gameState?.intent_active_current) {
+    return 'No active offense play is present in the current state.';
+  }
+  return 'Selector preferences are unavailable for the current state.';
+});
 
 function isDevTabVisible(tabId) {
   const caps = modelCapabilities.value || {};
   if (tabId === 'advisor') return caps.mcts !== false;
-  if (tabId === 'playbook') return caps.playbook !== false;
+  if (tabId === 'playbook') return caps.playbook !== false && caps.playbook_preview !== false;
   if (tabId === 'attention') return caps.attention !== false;
   if (tabId === 'environment' || tabId === 'training' || tabId === 'phi') {
     return caps.env_training_tabs !== false;
@@ -6014,6 +6199,225 @@ function offenseSkillDeltaLabel(idx) {
         <h4>Policy Probabilities ({{ policyTeamLabel }})</h4>
         <p class="entropy-note">Legal-action probabilities for the current state, filtered to the selected team.</p>
 
+        <div v-if="isJaxModel" class="param-category selector-intent-card">
+          <h5>JAX Checkpoint</h5>
+          <p class="entropy-note">
+            Load a different checkpoint artifact from the current MLflow run without resetting the board. Opponent can mirror the player checkpoint or use its own selected checkpoint.
+          </p>
+          <div class="eval-row">
+            <label>Player</label>
+            <select
+              :value="userPolicySelection || ''"
+              :disabled="policiesLoading || props.isPolicySwapping || props.isEvaluating || props.isReplaying"
+              @change="handlePolicySelection('user', $event)"
+            >
+              <option v-if="availablePolicies.length === 0 && !userPolicySelection" disabled value="">
+                No checkpoints available
+              </option>
+              <option
+                v-for="policy in availablePolicies"
+                :key="`jax-player-checkpoint-${policy}`"
+                :value="policy"
+              >
+                {{ formatCheckpointLabel(policy) }}
+              </option>
+              <option
+                v-if="userPolicySelection && !availablePolicies.includes(userPolicySelection)"
+                :value="userPolicySelection"
+              >
+                {{ formatCheckpointLabel(userPolicySelection) }} (current)
+              </option>
+            </select>
+
+            <label>Opponent</label>
+            <select
+              :value="opponentPolicySelection || ''"
+              :disabled="policiesLoading || props.isPolicySwapping || props.isEvaluating || props.isReplaying"
+              @change="handlePolicySelection('opponent', $event)"
+            >
+              <option value="">Mirror player checkpoint</option>
+              <option
+                v-for="policy in availablePolicies"
+                :key="`jax-opponent-checkpoint-${policy}`"
+                :value="policy"
+              >
+                {{ formatCheckpointLabel(policy) }}
+              </option>
+              <option
+                v-if="opponentPolicySelection && opponentPolicySelection !== '' && !availablePolicies.includes(opponentPolicySelection)"
+                :value="opponentPolicySelection"
+              >
+                {{ formatCheckpointLabel(opponentPolicySelection) }} (current)
+              </option>
+            </select>
+
+            <button
+              class="ghost-btn"
+              @click="$emit('refresh-policies')"
+              :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
+              title="Refresh checkpoint list from MLflow"
+            >
+              <span v-if="policiesLoading">Loading...</span>
+              <span v-else>Refresh checkpoints</span>
+            </button>
+          </div>
+          <div class="status-note">
+            Current player: {{ formatCheckpointLabel(userPolicySelection) }}
+            <span v-if="opponentPolicySelection">
+              · opponent: {{ formatCheckpointLabel(opponentPolicySelection) }}
+            </span>
+            <span v-else>
+              · opponent mirrors player
+            </span>
+          </div>
+          <div v-if="policyLoadError" class="policy-status error">
+            {{ policyLoadError }}
+          </div>
+        </div>
+
+        <div v-if="playDiagnosticsEnabled" class="param-category selector-intent-card">
+          <h5>Live Play State</h5>
+          <div class="parameters-grid">
+            <div class="param-item" data-tooltip="Current offense play conditioning applied to the low-level policy.">
+              <span class="param-name">Offense play:</span>
+              <span class="param-value">{{ livePlaySummary.playLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether an offense play is currently active.">
+              <span class="param-name">Active:</span>
+              <span class="param-value">{{ livePlaySummary.active ? 'Yes' : 'No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of environment steps elapsed under the current offense play.">
+              <span class="param-name">Age:</span>
+              <span class="param-value">{{ livePlaySummary.age }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Remaining commitment steps before selector reselection is eligible.">
+              <span class="param-name">Commitment remaining:</span>
+              <span class="param-value">{{ livePlaySummary.commitmentRemaining }}</span>
+            </div>
+            <div class="param-item" data-tooltip="App-side selector segment counter for this possession.">
+              <span class="param-name">Selector segment:</span>
+              <span class="param-value">{{ livePlaySummary.selectorSegmentIndex }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Most recent selector boundary that advanced the segment.">
+              <span class="param-name">Last boundary:</span>
+              <span class="param-value">{{ livePlaySummary.boundaryReason }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the current offense play is visible to the defensive policy view.">
+              <span class="param-name">Defense-visible:</span>
+              <span class="param-value">{{ livePlaySummary.visibleToDefense ? 'Yes' : 'No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current defense intent state, if defense intent learning is enabled.">
+              <span class="param-name">Defense play:</span>
+              <span class="param-value">{{ livePlaySummary.defensePlayLabel }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="param-category selector-intent-card">
+          <h5>Start Template</h5>
+          <p class="entropy-note">
+            Use the loaded template library as a playable setup. Loading a library alone does not change the board until you apply or start from a template.
+          </p>
+          <div v-if="hasLoadedStartTemplates" class="start-template-thumbnail-grid">
+            <button
+              v-for="thumb in startTemplateThumbnailModels"
+              :key="`policy-template-thumb-${thumb.id}`"
+              type="button"
+              class="start-template-thumbnail-btn"
+              :class="{ active: selectedStartTemplateId === thumb.id }"
+              :title="`Select ${thumb.label}${thumb.model.mirrored ? ' (mirrored)' : ''}`"
+              @click="selectStartTemplate(thumb.id)"
+            >
+              <svg
+                class="start-template-thumbnail-svg"
+                :viewBox="`0 0 ${thumb.model.viewBox.width} ${thumb.model.viewBox.height}`"
+                aria-hidden="true"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="thumb.model.court.x"
+                  :y="thumb.model.court.y"
+                  :width="thumb.model.court.width"
+                  :height="thumb.model.court.height"
+                  rx="4"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="thumb.model.court.backboardX"
+                  :y1="thumb.model.court.laneY"
+                  :x2="thumb.model.court.backboardX"
+                  :y2="thumb.model.court.laneY + thumb.model.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="thumb.model.court.hoopX"
+                  :cy="thumb.model.court.hoopY"
+                  :r="thumb.model.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="thumb.model.court.laneX"
+                  :y="thumb.model.court.laneY"
+                  :width="thumb.model.court.laneWidth"
+                  :height="thumb.model.court.laneHeight"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${thumb.model.court.arcLineX} ${thumb.model.court.arcTopY}
+                       A ${thumb.model.court.arcRadius} ${thumb.model.court.arcRadius} 0 0 1 ${thumb.model.court.arcLineX} ${thumb.model.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in thumb.model.entries"
+                  :key="`policy-thumb-${thumb.id}-${entry.key}`"
+                  :x="entry.x"
+                  :y="entry.y"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                  :class="['start-template-preview-marker', 'thumbnail-marker', `team-${entry.team}`]"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <span class="start-template-thumbnail-label">{{ thumb.label }}</span>
+            </button>
+          </div>
+          <div v-if="hasLoadedStartTemplates" class="eval-row">
+            <label>Template</label>
+            <select v-model="selectedStartTemplateId" :disabled="props.isEvaluating || props.isReplaying">
+              <option v-for="opt in startTemplateOptions" :key="`policy-template-${opt.value}`" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <label class="inline-label">
+              <input type="checkbox" v-model="selectedStartTemplateMirrored" :disabled="props.isEvaluating || props.isReplaying" />
+              Mirror
+            </label>
+            <button
+              class="ghost-btn"
+              @click="handleApplyStartTemplateToBoard"
+              :disabled="props.isEvaluating || props.isReplaying || !selectedStartTemplateId"
+            >
+              Apply to board
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleStartSelfPlayFromTemplate"
+              :disabled="props.isEvaluating || props.isReplaying || !props.aiMode || props.gameState?.done || !selectedStartTemplateId"
+            >
+              Start self-play from template
+            </button>
+          </div>
+          <div v-else class="policy-status">
+            No start-template library is loaded. Load one in the Template tab first.
+          </div>
+          <div v-if="startTemplateActionStatus" class="status-note">
+            {{ startTemplateActionStatus }}
+          </div>
+          <div v-if="startTemplateActionError" class="policy-status error">
+            {{ startTemplateActionError }}
+          </div>
+        </div>
+
         <div v-if="hasSelectorIntentPreferences" class="param-category selector-intent-card">
           <h5>Intent Preferences</h5>
           <div class="eval-row selector-plot-row">
@@ -6058,6 +6462,7 @@ function offenseSkillDeltaLabel(idx) {
           </p>
           <p class="entropy-note">
             Raw = selector softmax. Mixed = selector-branch probabilities after epsilon floor. Deployed = final runtime distribution after alpha mixes the selector branch with uniform fallback.
+            Click a play row to make it the active play for the current possession.
           </p>
           <div class="entropy-table-wrapper">
             <table class="entropy-table">
@@ -6076,8 +6481,18 @@ function offenseSkillDeltaLabel(idx) {
                   v-for="(item, idx) in selectorIntentPreferences.items"
                   :key="`selector-intent-${item.intent_index}`"
                   class="selector-intent-row"
-                  :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
+                  :class="{
+                    'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex),
+                    'selector-intent-row-disabled': intentControlsDisabled,
+                  }"
                   :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, getSelectorIntentPlotProb(item) * 100)).toFixed(2)}%` }"
+                  :tabindex="intentControlsDisabled ? -1 : 0"
+                  role="button"
+                  :aria-disabled="intentControlsDisabled ? 'true' : 'false'"
+                  :aria-label="`Activate ${formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name)}`"
+                  @click="activateIntentPreference(item)"
+                  @keydown.enter.prevent="activateIntentPreference(item)"
+                  @keydown.space.prevent="activateIntentPreference(item)"
                 >
                   <td>{{ idx + 1 }}</td>
                   <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
@@ -6089,6 +6504,15 @@ function offenseSkillDeltaLabel(idx) {
               </tbody>
             </table>
           </div>
+          <div class="policy-status error" v-if="intentStateError">
+            {{ intentStateError }}
+          </div>
+        </div>
+        <div
+          v-else-if="selectorEnabled"
+          class="policy-status"
+        >
+          {{ selectorIntentUnavailableReason }}
         </div>
 
         <div v-if="!policyProbabilities || !hasPolicyData" class="no-data">
@@ -6544,17 +6968,69 @@ function offenseSkillDeltaLabel(idx) {
             <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
           </div>
           <div
-            v-if="editableTemplateOptions.length"
-            class="template-library-chip-list"
+            v-if="editableTemplateThumbnailModels.length"
+            class="start-template-thumbnail-grid template-editor-thumbnail-grid"
           >
             <button
-              v-for="opt in editableTemplateOptions"
-              :key="`template-chip-${opt.value}`"
-              class="template-chip-btn"
-              :class="{ active: selectedEditableTemplateId === opt.value }"
-              @click="selectedEditableTemplateId = opt.value"
+              v-for="thumb in editableTemplateThumbnailModels"
+              :key="`editable-template-thumb-${thumb.id}`"
+              type="button"
+              class="start-template-thumbnail-btn"
+              :class="{ active: selectedEditableTemplateId === thumb.id }"
+              :title="`Edit ${thumb.label}`"
+              @click="selectedEditableTemplateId = thumb.id"
             >
-              {{ opt.label }}
+              <svg
+                class="start-template-thumbnail-svg"
+                :viewBox="`0 0 ${thumb.model.viewBox.width} ${thumb.model.viewBox.height}`"
+                aria-hidden="true"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="thumb.model.court.x"
+                  :y="thumb.model.court.y"
+                  :width="thumb.model.court.width"
+                  :height="thumb.model.court.height"
+                  rx="4"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="thumb.model.court.backboardX"
+                  :y1="thumb.model.court.laneY"
+                  :x2="thumb.model.court.backboardX"
+                  :y2="thumb.model.court.laneY + thumb.model.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="thumb.model.court.hoopX"
+                  :cy="thumb.model.court.hoopY"
+                  :r="thumb.model.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="thumb.model.court.laneX"
+                  :y="thumb.model.court.laneY"
+                  :width="thumb.model.court.laneWidth"
+                  :height="thumb.model.court.laneHeight"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${thumb.model.court.arcLineX} ${thumb.model.court.arcTopY}
+                       A ${thumb.model.court.arcRadius} ${thumb.model.court.arcRadius} 0 0 1 ${thumb.model.court.arcLineX} ${thumb.model.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in thumb.model.entries"
+                  :key="`editable-thumb-${thumb.id}-${entry.key}`"
+                  :x="entry.x"
+                  :y="entry.y"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                  :class="['start-template-preview-marker', 'thumbnail-marker', `team-${entry.team}`]"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <span class="start-template-thumbnail-label">{{ thumb.label }}</span>
             </button>
           </div>
         </div>
@@ -6806,6 +7282,85 @@ function offenseSkillDeltaLabel(idx) {
         <span v-if="!selectorEnabled" class="status-note">
           Selector is not enabled for this checkpoint.
         </span>
+      </div>
+
+      <div class="eval-row">
+        <label>Start templates</label>
+        <select
+          :value="evalConfigSafe.startTemplateMode"
+          :disabled="props.isEvaluating"
+          @change="setEvalStartTemplateMode($event.target.value)"
+        >
+          <option value="checkpoint">Checkpoint/default behavior</option>
+          <option value="enabled" :disabled="!hasLoadedStartTemplates">Use loaded template library</option>
+          <option value="disabled">Disable templates for eval</option>
+        </select>
+        <span v-if="hasLoadedStartTemplates" class="status-note">
+          {{ startTemplateOptions.length }} templates loaded from {{ templateLibrarySourceLabel }}.
+        </span>
+        <span v-else class="status-note">
+          No template library loaded.
+        </span>
+      </div>
+
+      <div v-if="evalConfigSafe.startTemplateMode === 'enabled'" class="eval-row">
+        <label>Template eval params</label>
+        <label class="inline-label compact-field">
+          prob
+          <span
+            class="template-help"
+            data-tooltip="Probability that each eval episode starts from a sampled template. 1.0 means every episode uses the loaded template library; 0.0 falls back to the normal spawn generator."
+            title="Probability that each eval episode starts from a sampled template."
+            aria-label="Template probability help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            :value="evalConfigSafe.startTemplateProb"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateProb', $event.target.value, { min: 0, max: 1 })"
+          />
+        </label>
+        <label class="inline-label compact-field">
+          jitter
+          <span
+            class="template-help"
+            data-tooltip="Global multiplier for each template anchor's jitter radius. 0 keeps exact template positions; higher values randomize positions around each anchor."
+            title="Global multiplier for template position jitter."
+            aria-label="Template jitter help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            :value="evalConfigSafe.startTemplateJitterScale"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateJitterScale', $event.target.value, { min: 0, max: 10 })"
+          />
+        </label>
+        <label class="inline-label compact-field">
+          mirror
+          <span
+            class="template-help"
+            data-tooltip="Probability of left-right mirroring for mirrorable templates. 0 never mirrors; 1 always mirrors when the selected template permits mirroring."
+            title="Probability of mirroring mirrorable templates."
+            aria-label="Template mirror help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            :value="evalConfigSafe.startTemplateMirrorProb"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateMirrorProb', $event.target.value, { min: 0, max: 1 })"
+          />
+        </label>
       </div>
 
       <div v-if="evalModeIsCustom" class="eval-custom">
@@ -8964,6 +9519,7 @@ function offenseSkillDeltaLabel(idx) {
   background-image: linear-gradient(90deg, rgba(56, 189, 248, 0.24), rgba(56, 189, 248, 0.24));
   background-repeat: no-repeat;
   background-size: var(--selector-prob-width) 100%;
+  cursor: pointer;
   transition: background-size 160ms ease-out;
 }
 
@@ -8978,6 +9534,20 @@ function offenseSkillDeltaLabel(idx) {
 .probability-bar-row:hover td,
 .selector-intent-row:hover td {
   background: rgba(148, 163, 184, 0.06);
+}
+
+.selector-intent-row:focus-visible td {
+  outline: 1px solid rgba(56, 189, 248, 0.75);
+  outline-offset: -2px;
+}
+
+.selector-intent-row-disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.selector-intent-row-disabled:hover td {
+  background: transparent;
 }
 
 .current-intent-row {
@@ -9343,6 +9913,63 @@ function offenseSkillDeltaLabel(idx) {
 
 .start-template-preview-marker.team-defense {
   fill: rgba(226, 232, 240, 0.82);
+}
+
+.start-template-thumbnail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+  margin: 0.85rem 0 1rem;
+}
+
+.template-editor-thumbnail-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.start-template-thumbnail-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: stretch;
+  padding: 0.55rem;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--app-text);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+
+.start-template-thumbnail-btn:hover {
+  border-color: rgba(56, 189, 248, 0.58);
+  background: rgba(15, 23, 42, 0.78);
+  transform: translateY(-1px);
+}
+
+.start-template-thumbnail-btn.active {
+  border-color: var(--app-accent);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35), 0 10px 24px rgba(8, 47, 73, 0.22);
+}
+
+.start-template-thumbnail-svg {
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+  border-radius: 9px;
+}
+
+.start-template-preview-marker.thumbnail-marker {
+  font-size: 19px;
+}
+
+.start-template-thumbnail-label {
+  overflow: hidden;
+  color: var(--app-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .param-category h5 {
@@ -9869,6 +10496,9 @@ function offenseSkillDeltaLabel(idx) {
   align-items: center;
   gap: 0.35rem;
 }
+.eval-tab .compact-field input {
+  width: 5.5rem;
+}
 .playbook-controls .eval-row {
   display: flex;
   gap: 0.75rem;
@@ -10124,9 +10754,15 @@ function offenseSkillDeltaLabel(idx) {
   transition: opacity 0.2s ease, visibility 0.2s ease;
 }
 .template-help[data-tooltip]:hover::before,
-.template-help[data-tooltip]:hover::after {
+.template-help[data-tooltip]:hover::after,
+.template-help[data-tooltip]:focus::before,
+.template-help[data-tooltip]:focus::after {
   opacity: 1;
   visibility: visible;
+}
+.template-help:focus {
+  outline: 2px solid rgba(56, 189, 248, 0.65);
+  outline-offset: 2px;
 }
 .template-library-chip-list {
   display: flex;

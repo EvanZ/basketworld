@@ -50,6 +50,7 @@ class JAXInferenceModel:
             "trainer_config": dict(payload.get("trainer_config", {})),
             "frozen_config": dict(payload.get("frozen_config", {})),
             "env_config": dict(payload.get("env_config", {}) or {}),
+            "last_metrics": dict(payload.get("last_metrics", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }
         for key in ("play_name_metadata", "play_name_map", "model_codename"):
@@ -61,6 +62,7 @@ class JAXInferenceModel:
         self._static_cache: dict[tuple[int, bool], Any] = {}
         self._last_team_outputs: dict[str, Any] | None = None
         self._masked_runner = self._build_masked_runner()
+        self._selector_runner = self._build_selector_runner()
 
     def _build_masked_runner(self):
         @self.jax.jit
@@ -82,6 +84,29 @@ class JAXInferenceModel:
             return {
                 **masked_out,
                 "attention_weights": forward_out["attention_weights"],
+                "values": forward_out["values"],
+            }
+
+        return _runner
+
+    def _build_selector_runner(self):
+        @self.jax.jit
+        def _runner(params, flat_obs):
+            batch_size = flat_obs.shape[0]
+            neutral_context = {
+                "intent_index": self.jnp.zeros((batch_size,), dtype=self.jnp.int32),
+                "intent_gate": self.jnp.zeros((batch_size,), dtype=self.jnp.float32),
+            }
+            forward_out = actor_critic_forward(
+                params,
+                flat_obs,
+                self.spec,
+                self.jnp,
+                intent_context=neutral_context,
+            )
+            return {
+                "selector_logits": forward_out["selector_logits"],
+                "selector_values": forward_out["selector_values"],
             }
 
         return _runner
@@ -247,6 +272,39 @@ class JAXInferenceModel:
         )
         probs = np.asarray(self.jax.device_get(masked_out["probs"][0]), dtype=np.float32)
         return [probs[idx] for idx in range(probs.shape[0])]
+
+    def state_value(self, env, *, observer_is_offense: bool) -> float:
+        masked_out = self._team_outputs(env, bool(observer_is_offense))
+        values = np.asarray(self.jax.device_get(masked_out["values"]), dtype=np.float32).reshape(-1)
+        if values.size == 0:
+            return 0.0
+        return float(values[0])
+
+    def has_intent_selector(self) -> bool:
+        return bool(getattr(self.spec, "intent_selector_enabled", False))
+
+    def get_intent_selector_outputs(self, obs=None):
+        if not self.has_intent_selector() or self._prepared_env is None:
+            return None, None
+        base_env = self._resolve_base_env(self._prepared_env)
+        static = self._build_static_for_role(base_env, observer_is_offense=True)
+        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        flat_obs = build_policy_observation_batch(
+            static,
+            state,
+            self.jnp,
+            model_type=self.spec.model_type,
+        )
+        selector_out = self._selector_runner(self.params, flat_obs)
+        logits = np.asarray(
+            self.jax.device_get(selector_out["selector_logits"][0]),
+            dtype=np.float32,
+        )
+        values = np.asarray(
+            self.jax.device_get(selector_out["selector_values"][0:1]),
+            dtype=np.float32,
+        )
+        return logits, values
 
     def attention_payload(self, env, *, observer_is_offense: bool):
         if str(self.spec.model_type) != "attention":

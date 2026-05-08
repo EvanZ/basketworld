@@ -20,6 +20,20 @@ from .observations import (
 )
 
 
+def _selector_policy_object(policy_model: Any) -> Any | None:
+    policy_obj = getattr(policy_model, "policy", None)
+    if policy_obj is not None and (
+        hasattr(policy_obj, "has_intent_selector")
+        or hasattr(policy_obj, "get_intent_selector_outputs")
+    ):
+        return policy_obj
+    if hasattr(policy_model, "has_intent_selector") or hasattr(
+        policy_model, "get_intent_selector_outputs"
+    ):
+        return policy_model
+    return None
+
+
 def selector_runtime_enabled(training_params: dict | None, policy_model: Any) -> bool:
     if not isinstance(training_params, dict):
         return False
@@ -27,7 +41,7 @@ def selector_runtime_enabled(training_params: dict | None, policy_model: Any) ->
         return False
     if str(training_params.get("intent_selector_mode", "callback")).lower() != "integrated":
         return False
-    policy_obj = getattr(policy_model, "policy", None)
+    policy_obj = _selector_policy_object(policy_model)
     if policy_obj is None or not hasattr(policy_obj, "has_intent_selector"):
         return False
     try:
@@ -141,6 +155,18 @@ def selector_apply_eps_floor(
     return mixed / mixed.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
+def _writable_float32_tensor(value: Any) -> torch.Tensor:
+    """Convert model outputs to Torch through a writable copy.
+
+    JAX-backed inference can return read-only NumPy views. Passing those
+    directly to torch.as_tensor emits a warning because Torch tensors are
+    writable by default, even though this runtime only reads the values.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(dtype=torch.float32).clone()
+    return torch.from_numpy(np.asarray(value, dtype=np.float32).copy())
+
+
 def build_offense_selector_observation(
     policy_model: Any,
     env: Any,
@@ -193,9 +219,12 @@ def selector_sample_intent(
 
     try:
         with torch.no_grad():
-            logits, values = policy_model.policy.get_intent_selector_outputs(selector_obs)
-            logits_t = torch.as_tensor(logits, dtype=torch.float32).reshape(1, -1)
-            values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+            policy_obj = _selector_policy_object(policy_model)
+            if policy_obj is None:
+                raise RuntimeError("Policy does not expose intent selector outputs.")
+            logits, values = policy_obj.get_intent_selector_outputs(selector_obs)
+            logits_t = _writable_float32_tensor(logits).reshape(1, -1)
+            values_t = _writable_float32_tensor(values).reshape(-1)
             raw_probs_t = torch.softmax(logits_t, dim=-1)
             mixed_probs_t = selector_apply_eps_floor(raw_probs_t, selector_eps)
     except Exception:
@@ -293,13 +322,19 @@ def selector_ranked_intent_preferences(
     )
     if selector_obs is None:
         return None
-    policy_obj = getattr(offense_policy, "policy", None)
+    prepare_fn = getattr(offense_policy, "prepare_for_role", None)
+    if callable(prepare_fn):
+        try:
+            prepare_fn(env, observer_is_offense=True)
+        except Exception:
+            return None
+    policy_obj = _selector_policy_object(offense_policy)
     if policy_obj is None or not hasattr(policy_obj, "get_intent_selector_outputs"):
         return None
     try:
         with torch.no_grad():
             logits, values = policy_obj.get_intent_selector_outputs(selector_obs)
-            logits_t = torch.as_tensor(logits, dtype=torch.float32).reshape(1, -1)
+            logits_t = _writable_float32_tensor(logits).reshape(1, -1)
             raw_probs_t = torch.softmax(logits_t, dim=-1)
             alpha_current = float(selector_alpha_current(training_params, offense_policy))
             eps_current = float(selector_eps_current(training_params, offense_policy))
@@ -336,7 +371,7 @@ def selector_ranked_intent_preferences(
             )
         value_estimate = None
         if values is not None:
-            values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+            values_t = _writable_float32_tensor(values).reshape(-1)
             if values_t.numel() > 0:
                 value_estimate = float(values_t[0].item())
         return {
@@ -389,6 +424,12 @@ def apply_rollout_segment_start(
     )
     if selector_obs is None:
         return {"applied": False, "obs": base_obs, "used_selector": False, "intent_index": None}
+    prepare_fn = getattr(offense_policy, "prepare_for_role", None)
+    if callable(prepare_fn):
+        try:
+            prepare_fn(env, observer_is_offense=True)
+        except Exception:
+            return {"applied": False, "obs": base_obs, "used_selector": False, "intent_index": None}
     result = selector_sample_intent(
         training_params,
         offense_policy,

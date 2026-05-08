@@ -350,9 +350,18 @@ export async function renderGifFromPngs(frames, durations, stepDurationMs) {
     return response.blob();
 }
 
-export async function startSelfPlay() {
+export async function startSelfPlay(options = null) {
+    const payload = options && typeof options === 'object'
+        ? {
+            template_id: options.templateId || null,
+            template_mirrored: options.mirrored ?? null,
+            template_seed: options.seed ?? null,
+        }
+        : {};
     const response = await fetch(`${API_BASE_URL}/api/start_self_play`, {
-        method: 'POST'
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
     });
     if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to start self-play' }));
@@ -421,7 +430,9 @@ export async function runEvaluation(
   customSetup = null,
   randomizeOffensePermutation = false,
   intentSelectionMode = 'learned_sample',
+  startTemplateOptions = null,
 ) {
+  const templateOptions = startTemplateOptions || {};
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -432,6 +443,10 @@ export async function runEvaluation(
       custom_setup: customSetup || null,
       randomize_offense_permutation: Boolean(randomizeOffensePermutation),
       intent_selection_mode: String(intentSelectionMode || 'learned_sample'),
+      start_template_mode: String(templateOptions.mode || 'checkpoint'),
+      start_template_prob: templateOptions.prob ?? null,
+      start_template_jitter_scale: templateOptions.jitterScale ?? null,
+      start_template_mirror_prob: templateOptions.mirrorProb ?? null,
     }),
   });
   if (!response.ok) {

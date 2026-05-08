@@ -27,6 +27,11 @@ class InferenceCapabilities:
     env_training_tabs: bool = True
     state_values: bool = True
     q_values: bool = True
+    play_metadata: bool = True
+    selector_distribution: bool = True
+    per_intent_eval: bool = True
+    play_shot_charts: bool = True
+    manual_intent_override: bool = True
 
 
 class InferencePolicyAdapter:
@@ -102,6 +107,9 @@ class SB3PPOInferenceAdapter(InferencePolicyAdapter):
 class JAXInferenceAdapter(InferencePolicyAdapter):
     def __init__(self, raw_model: Any) -> None:
         supports_attention = _jax_model_uses_attention(raw_model)
+        metadata = dict(getattr(raw_model, "metadata", {}) or {})
+        supports_play_metadata = _jax_model_uses_intents(raw_model, metadata)
+        supports_selector_distribution = _jax_model_uses_selector(raw_model, metadata)
         super().__init__(
             raw_model,
             backend_kind="jax",
@@ -114,10 +122,15 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
                 mcts=False,
                 attention=supports_attention,
                 env_training_tabs=False,
-                state_values=False,
+                state_values=True,
                 q_values=False,
+                play_metadata=supports_play_metadata,
+                selector_distribution=supports_selector_distribution,
+                per_intent_eval=supports_play_metadata,
+                play_shot_charts=supports_play_metadata,
+                manual_intent_override=supports_play_metadata,
             ),
-            metadata=dict(getattr(raw_model, "metadata", {}) or {}),
+            metadata=metadata,
         )
 
     def predict(self, obs, deterministic: bool = False):
@@ -152,6 +165,27 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
             return None
         return payload_fn(env, observer_is_offense=bool(observer_is_offense))
 
+    def state_value(self, env, *, observer_is_offense: bool) -> float | None:
+        value_fn = getattr(self.raw_model, "state_value", None)
+        if not callable(value_fn):
+            return None
+        return value_fn(env, observer_is_offense=bool(observer_is_offense))
+
+    def has_intent_selector(self) -> bool:
+        selector_fn = getattr(self.raw_model, "has_intent_selector", None)
+        if callable(selector_fn):
+            try:
+                return bool(selector_fn())
+            except Exception:
+                return False
+        return _jax_model_uses_selector(self.raw_model, self.metadata)
+
+    def get_intent_selector_outputs(self, obs=None):
+        output_fn = getattr(self.raw_model, "get_intent_selector_outputs", None)
+        if not callable(output_fn):
+            return None, None
+        return output_fn(obs)
+
 
 def _jax_model_uses_attention(raw_model: Any) -> bool:
     spec_obj = getattr(raw_model, "spec", None)
@@ -165,6 +199,65 @@ def _jax_model_uses_attention(raw_model: Any) -> bool:
     if not isinstance(policy_spec, dict):
         return False
     return str(policy_spec.get("model_type", "")).lower() == "attention"
+
+
+def _jax_policy_spec_dict(raw_model: Any, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    spec_obj = getattr(raw_model, "spec", None)
+    if spec_obj is not None:
+        keys = (
+            "model_type",
+            "num_intents",
+            "intent_embedding_enabled",
+            "intent_selector_enabled",
+        )
+        return {
+            key: getattr(spec_obj, key)
+            for key in keys
+            if hasattr(spec_obj, key)
+        }
+    if isinstance(metadata, dict):
+        policy_spec = metadata.get("policy_spec")
+        if isinstance(policy_spec, dict):
+            return dict(policy_spec)
+    raw_metadata = getattr(raw_model, "metadata", None)
+    if isinstance(raw_metadata, dict):
+        policy_spec = raw_metadata.get("policy_spec")
+        if isinstance(policy_spec, dict):
+            return dict(policy_spec)
+    return {}
+
+
+def _jax_model_uses_intents(raw_model: Any, metadata: dict[str, Any] | None = None) -> bool:
+    metadata = metadata if isinstance(metadata, dict) else getattr(raw_model, "metadata", None)
+    policy_spec = _jax_policy_spec_dict(raw_model, metadata)
+    env_config = (
+        dict(metadata.get("env_config", {}) or {})
+        if isinstance(metadata, dict)
+        else {}
+    )
+    play_name_map = metadata.get("play_name_map") if isinstance(metadata, dict) else None
+    try:
+        num_intents = int(
+            policy_spec.get("num_intents")
+            or env_config.get("num_intents")
+            or 0
+        )
+    except Exception:
+        num_intents = 0
+    return bool(
+        num_intents > 0
+        and (
+            bool(policy_spec.get("intent_embedding_enabled", False))
+            or bool(policy_spec.get("intent_selector_enabled", False))
+            or bool(env_config.get("enable_intent_learning", False))
+            or bool(play_name_map)
+        )
+    )
+
+
+def _jax_model_uses_selector(raw_model: Any, metadata: dict[str, Any] | None = None) -> bool:
+    policy_spec = _jax_policy_spec_dict(raw_model, metadata)
+    return bool(policy_spec.get("intent_selector_enabled", False))
 
 
 def load_sb3_policy_adapter(

@@ -266,6 +266,88 @@ Current backend status:
 
 Dev App Integration is now considered complete for the current reduced JAX stack.
 
+Important correction:
+
+- the current dev app uses JAX checkpoint inference, but it still steps the Python `HexagonBasketballEnv`
+- this means interactive self-play and visual testing are not yet running on the exact JAX-native transition system used during training
+- that bridge was useful for early checkpoint loading and UI debugging, but it is now a parity risk
+- achieving honest deployment parity requires a JAX-native UI/runtime stepping path
+
+## JAX-Native Dev Runtime Parity
+
+Purpose:
+
+- make the dev app step the same JAX environment state/transition logic used by JAX training and native eval
+- remove the current Python-env bridge for JAX checkpoints during interactive play, self-play, template resets, and visual debugging
+- ensure visual testing is evaluating the model in the environment it was trained on
+
+Priority:
+
+- this is the next top-priority implementation slice before adding more advanced feature parity
+- further UI parity work should assume this runtime path exists, or explicitly state when it is still using the Python bridge
+
+Current risk:
+
+- JAX inference currently snapshots a live Python `HexagonBasketballEnv` and runs the JAX actor-critic against that snapshot
+- actions are then applied through `game_state.env.step(...)`, which is the Python production env transition path
+- if the Python env and `basketworld_jax.env.minimal` diverge in reset logic, rule handling, reward calculation, action masks, intent/template handling, or terminal semantics, the UI can make a checkpoint look better or worse than it is under the actual training environment
+
+Target architecture:
+
+- introduce a JAX dev-runtime session object for JAX checkpoints
+- store canonical JAX `KernelState` plus static env config in backend session state
+- run reset/step through `basketworld_jax.env` functions, not through `HexagonBasketballEnv.step`
+- run policy inference from the same JAX state/static pair, avoiding Python-env snapshot reconstruction
+- serialize JAX state into the existing frontend game-state payload shape so `GameBoard`, Policy, Eval, Stats, Attention, and template controls can continue to work
+- keep the Python env path only for SB3 checkpoints and for temporary fallback diagnostics
+
+Implementation milestones:
+
+1. Add a backend runtime abstraction.
+   - define a small interface for `reset`, `step`, `render_state_payload`, `policy_outputs`, `state_values`, `attention_payload`, and `selector_preferences`
+   - implement adapters for the existing Python env runtime and the new JAX runtime
+   - route JAX checkpoints to the JAX runtime based on `model_backend == "jax"`
+
+2. Build a JAX game-state serializer.
+   - convert `KernelState` and static config into the existing frontend fields:
+     `positions`, `ball_holder`, `shot_clock`, `offense_ids`, `defense_ids`, `scores`, `done`, `action_mask`, skills, lane counters, intent/play metadata, template metadata, and policy metadata
+   - preserve raw display units such as shot-clock seconds while keeping normalized values only in observations/tokens
+   - include `last_action_results` parity fields needed by the board, moves table, stats, and eval diagnostics
+
+3. Add JAX-native interactive step.
+   - accept the same UI action override payloads
+   - combine manual/user actions with JAX policy actions in JAX-native action format
+   - support deterministic/stochastic policy choices, pointer-targeted passing, selector state, and frozen/opponent policy inference
+   - update replay buffers, rewards, episode states, and frontend response payloads without calling the Python env
+
+4. Add JAX-native reset and template reset.
+   - support normal reset, New Game reset, self-play reset, selected start template, jitter, and mirror
+   - preserve selected start-template UI state across reset
+   - ensure eval-time template behavior and interactive template behavior use the same JAX resolver
+
+5. Port visual diagnostics that currently depend on Python env helpers.
+   - shot probability and shot type
+   - pass steal probabilities / pointer target metadata
+   - lane violation counters and rewards
+   - value-function overlay
+   - attention/token payloads
+   - selector/intent preference payloads
+
+6. Add parity tests.
+   - golden reset snapshots for Python bridge vs JAX serializer where semantics intentionally overlap
+   - action-mask parity for supported JAX rules
+   - one-step transition tests for shoot, pass, turnover, lane violations, and terminal states
+   - template reset determinism tests
+   - backend route tests proving JAX checkpoints do not call `HexagonBasketballEnv.step`
+
+Exit criteria:
+
+- loading a JAX checkpoint in the dev app creates a JAX runtime session, not a Python env session
+- `New Game`, self-play, manual controls, templates, value overlay, attention, selector preferences, and replay state all work through JAX-native reset/step
+- the frontend payload remains stable enough that the board and existing tabs do not need a full rewrite
+- route tests prove that JAX interactive stepping does not use the SB3/Python-env transition path
+- any remaining fallback to Python env is explicit, logged, and disabled by default for JAX checkpoints
+
 ## Representation Parity
 
 Purpose:
@@ -582,6 +664,8 @@ Implementation notes:
 - `--intent-disc-include-shot-clock false` and `--intent-disc-include-pressure-exposure false` zero those globals for the set-step discriminator while leaving the policy observation unchanged.
 - JAX supports update-count diversity scheduling with `--intent-diversity-warmup-updates` and `--intent-diversity-ramp-updates`, which is preferred over step-count scheduling for JAX runs.
 - While scheduled beta is zero, JAX skips discriminator training, bonus computation, and discriminator sample dumps to match SB3 warmup behavior.
+- JAX now supports SB3-style task reward scaling for DIAYN-first curricula. `--task-reward-scale-start/end` down-weight normal basketball reward before the discriminator bonus is added, and JAX-preferred `--task-reward-scale-warmup-updates` / `--task-reward-scale-ramp-updates` take precedence over the legacy step-count schedule.
+- JAX low-level PPO now supports SB3-style entropy coefficient schedules through `--ent-coef-start`, `--ent-coef-end`, and `--ent-schedule linear|exp`. The scheduled value is logged as `jax/train/entropy_coef`.
 - The low-level PPO reward path now injects normalized/clipped DIAYN-style bonus into active offense intent steps before GAE.
 - Metrics include discriminator loss/entropy, trainbatch and holdout top-1 accuracy, trainbatch and holdout macro OVR AUC, trainbatch/holdout sizes, label/predicted intent distributions, active sample count, raw bonus stats, normalized bonus stats, beta, and bonus normalizer state.
 - Checkpoints now persist discriminator params, optimizer state, config, and bonus normalizer stats.
@@ -614,6 +698,8 @@ Exit criteria:
 
 Milestone 5: selector head and segment runtime
 
+Status: selector-runtime parity slice is implemented for current-policy offense rollouts.
+
 - add a selector head on top of the attention/CLS representation
 - keep selector observation neutralized with respect to current intent, matching SB3
 - apply selected intent through runtime state/override, not by mutating normal observation features
@@ -632,7 +718,26 @@ Exit criteria:
 - selector decisions are reproducible under fixed seeds
 - low-level policy receives selector-chosen play IDs through the same embedding conditioning path
 
+Implementation notes:
+
+- The Flax attention actor-critic now has production-style selector logits and selector-value heads on the offense CLS context.
+- Selector final logits and value heads are zero-initialized, matching the SB3 convention of starting near uniform with zero value bias.
+- Compiled JAX rollouts can now neutralize low-level intent context, run selector inference, sample a play with epsilon-to-uniform mixing, and apply the selected offense intent through `KernelState`.
+- Selector application now happens at eligible offense segment starts where active offense intent age is zero and, when `--intent-selector-multiselect-enabled true`, at commitment-timeout boundaries where the active offense intent has exhausted `intent_commitment_steps`.
+- Selector application also supports completed-pass reselection once the current play has reached `--intent-selector-min-play-steps`; the completed-pass event is carried to the next compiled scan step so reselection occurs before the next policy action is sampled.
+- Commitment-timeout and completed-pass boundaries mirror the SB3 integrated selector behavior:
+  - if the learned selector branch is active under alpha, record a selector sample and apply the selected play
+  - if alpha does not select the learned branch, apply an unrecorded uniform fallback play so the expired segment does not continue indefinitely
+- The train loop supports update-count selector alpha/epsilon schedules through:
+  - `--intent-selector-alpha-warmup-updates`
+  - `--intent-selector-alpha-ramp-updates`
+  - `--intent-selector-eps-warmup-updates`
+  - `--intent-selector-eps-ramp-updates`
+- MLflow/train metrics now include selector alpha, epsilon, usage count/rate, applied count/rate, uniform fallback count/rate, commitment-timeout and completed-pass boundary counts, entropy, max probability, selected log-prob/value means, and per-intent usage shares.
+
 Milestone 6: selector training objective
+
+Status: selector PPO objective and rollout-cadence accounting are implemented for current-policy offense selector samples.
 
 - implement selector PPO-style training over completed segments
 - add selector value prediction
@@ -647,6 +752,179 @@ Exit criteria:
 - selector learns non-trivial play usage
 - selector metrics are logged to MLflow
 - selector does not destabilize low-level PPO training
+
+Implementation notes:
+
+- The JAX train loop now builds selector batches from offense rollout selector-start records.
+- Selector returns now use segment-aware discounted rewards: a selector sample bootstraps from the next selector value when another selector segment starts before episode termination, and unfinished rollout-window segments bootstrap from the final selector value.
+- Selector advantages are normalized over actually-used selector samples and computed against the stored selector value from rollout time.
+- The selector update runs after the low-level PPO update, uses the same Optax optimizer state as the actor-critic, and applies:
+  - clipped PPO selector policy loss
+  - selector value loss
+  - selector entropy bonus
+  - KL-to-uniform usage regularization
+- The selector loss uses neutralized low-level intent context, preserving the SB3 architecture where the selector does not observe the currently active low-level play.
+- The selector objective respects the active alpha/epsilon schedules:
+  - if alpha is zero, no selector samples are generated and no selector gradient is applied
+  - epsilon-to-uniform is mixed into selector probabilities for both rollout sampling and selector PPO log-prob computation
+- MLflow/train metrics now include selector train loss, policy loss, value loss, entropy, usage KL, approximate KL, clip fraction, gradient norm, sample count, return/advantage/value means, and per-intent usage/probability.
+- When `--intent-selector-train-every-rollouts > 1`, selector batches are accumulated across skipped rollout updates and trained together on the scheduled selector update rather than discarded.
+- `--intent-selector-max-samples-per-update` is applied to the accumulated selector batch by masking excess active selector samples while preserving the compiled batch shape.
+- Remaining optional selector cleanup is per-segment bucket diagnostics for deeper selector debugging.
+
+## Play-Aware Dev UI Parity
+
+Purpose:
+
+- make the dev app useful for visually debugging learned JAX plays, not just loading and stepping the model
+- preserve the useful SB3 play diagnostics while using JAX-native metadata, eval, and selector outputs
+- keep unsupported SB3-only panels explicitly gated instead of showing stale controls
+
+Current implemented hooks:
+
+- the backend state payload exposes `play_name_map`, current offense/defense play IDs, play names, intent ages, commitment remaining, selector boundary diagnostics, and model metadata
+- the Policy tab can show selector intent preferences with play names, raw selector probabilities, epsilon-mixed probabilities, deployed alpha/epsilon probabilities, entropy, KL-to-uniform, logits, and the current play row
+- the Eval tab can choose selector intent selection mode: learned sample, argmax, or uniform random
+- native JAX eval returns per-intent aggregate stats and intent start counts
+- the Stats panel shows per-intent eval rows with play labels
+- the board shot-chart dropdown can switch from team/player charts to per-play charts after eval
+- the Attention tab shows the runtime intent index/gate/visibility context for the current tokenized observation
+
+Milestone UI-1: explicit play capability contract
+
+Status: first slice implemented for JAX play metadata and selector distribution gating.
+
+- add or audit backend capability flags for:
+  - play names / intent metadata
+  - selector distribution in current state
+  - per-intent eval stats
+  - play-conditioned shot chart filtering
+  - playbook / counterfactual play preview
+  - manual intent override
+- make JAX UI gates derive from capability flags plus metadata, not from assumptions about model names or training params
+- show a clear disabled reason when a play-aware panel cannot run for the loaded checkpoint
+
+Exit criteria:
+
+- a JAX checkpoint without selector/discriminator metadata does not show misleading play controls
+- a selector-enabled JAX checkpoint enables only the supported play diagnostics
+
+Implementation notes:
+
+- Inference capabilities now include play-aware flags for metadata, selector distribution, per-intent eval, play shot charts, and manual intent override.
+- JAX inference derives those flags from checkpoint `policy_spec`, `env_config`, and play-name metadata.
+- JAX selector checkpoints expose generic selector outputs so the existing backend selector preference payload can populate the Policy tab without SB3-specific `.policy` assumptions.
+
+Milestone UI-2: Policy tab parity and cleanup
+
+Status: live-play header implemented; selector distribution table now works through the generic selector interface.
+
+- keep the existing selector intent distribution table as the primary play distribution view
+- add a compact live play header:
+  - current play code name
+  - active/inactive state
+  - age and commitment remaining
+  - selector segment index
+  - last selector boundary reason
+  - offense visibility to defense
+- clearly separate selector distribution `p(z | s)` from low-level action distributions `pi(a | s, z)`
+- show a no-data state that distinguishes "selector not present" from "policy probabilities were not requested"
+
+Exit criteria:
+
+- while running self-play, the Policy tab tells us both which play is active and what play the selector would choose from the current state
+- play labels match MLflow/checkpoint `play_name_map`
+
+Implementation notes:
+
+- The Policy tab now shows current offense play, active flag, age, commitment remaining, selector segment, last boundary, defense visibility, and defense play.
+- If selector training is enabled but the current state cannot produce selector preferences, the Policy tab now shows an explicit reason instead of silently hiding the section.
+
+Milestone UI-3: Eval tab play controls
+
+- keep learned sample, argmax, and uniform random selector modes
+- add explicit eval modes for play diagnostics:
+  - force one selected play for all eval episodes
+  - sweep all plays with equal episode counts
+  - sweep a user-provided subset of plays
+  - optionally include a no-intent/null bucket if the checkpoint supports null intents
+- route these modes through the JAX-native eval fast path where possible
+- surface the eval seed and actual sampled/forced play counts in the response
+
+Exit criteria:
+
+- we can run a 10K-episode eval that produces fair per-play comparisons without manually changing runtime state
+- repeated evals are reproducible only when the same seed/mode is used
+
+Milestone UI-4: Stats, shot charts, and assist-flow by play
+
+- keep the existing per-intent aggregate table and board shot-chart dropdown
+- extend per-play eval stats to include the same debugging views as team/player eval:
+  - shot chart
+  - shot type mix
+  - pass attempts and completions
+  - assists and potential assists
+  - turnovers by reason
+  - lane violations
+  - PPP and reward/episode
+- add play filtering for assist/Sankey diagnostics, not only shot charts
+- ensure copied Markdown stats include per-play summaries with code names
+
+Exit criteria:
+
+- the Eval/Stats workflow can answer "what does play X do?" without leaving the UI
+- per-play filters use the same labels as Policy and MLflow artifacts
+
+Milestone UI-5: Playbook / counterfactual parity decision
+
+- decide whether the Playbook tab should remain enabled for JAX checkpoints
+- if enabled, ensure it uses JAX-compatible policy inference, play override, and selector boundary semantics
+- if not enabled, replace it with a narrower JAX play preview panel that runs fixed-play rollouts from the current state or captured snapshot
+- keep trajectory overlays grouped by play code name
+
+Exit criteria:
+
+- play-conditioned counterfactual rollouts no longer depend on SB3-only assumptions
+- the UI clearly distinguishes statistical eval from current-state play previews
+
+Milestone UI-6: Tests and fixtures
+
+- add backend tests for the JAX state payload play fields and selector intent preference payload
+- add eval-route tests for forced/sweep play modes and per-play stats
+- add frontend fixture coverage for:
+  - selector-enabled JAX checkpoint
+  - intent-conditioned but selector-disabled JAX checkpoint
+  - legacy/SB3 checkpoint
+- run frontend build after UI changes
+
+Exit criteria:
+
+- play-aware UI behavior is stable across JAX, SB3, and unsupported checkpoints
+
+## Starting Templates Parity
+
+Purpose:
+
+- restore the SB3-style reset/start-template system after the current selector run proves stable
+- reduce spawn-distribution artifacts and make visual/eval comparisons more controlled
+
+Primary tasks:
+
+- inspect the current SB3 start-template and jitter implementation: done
+- add JAX-native template metadata to env static/config state: done
+- implement compiled reset sampling from template IDs: done
+- expose template config in MLflow/checkpoint metadata: done for train metadata/artifacts
+- support eval-time use of a session-loaded template library even when the checkpoint was not trained with templates: done
+- support Policy-tab playable template controls and self-play starts from selected templates: done
+- implement deterministic PRNG jitter/mirror sampling per reset rather than pre-resolved candidate variants: done
+- expose start-template metadata in the dev app JAX metadata panel
+- add eval/train launch options for fixed template, sampled templates, and zero-jitter diagnostic runs: sampled-template train launch enabled for the active JAX diagnostic config
+
+Exit criteria:
+
+- JAX train/eval can run from the same family of start templates as the SB3 path: done for train, eval, and Policy-tab self-play
+- fixed-template eval is deterministic under a fixed seed and sampled-template eval varies under different seeds
+- start-template choices are visible in logs/artifacts so shot charts and behavior can be compared honestly
 
 Recommended first implementation slice:
 

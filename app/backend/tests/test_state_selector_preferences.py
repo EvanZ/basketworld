@@ -27,6 +27,23 @@ class _DummyModel:
         self.num_timesteps = int(num_timesteps)
 
 
+class _DummyGenericSelectorModel:
+    def __init__(self, logits: list[float], *, num_timesteps: int = 10):
+        self._logits = np.asarray(logits, dtype=np.float32)
+        self._value = np.asarray([0.5], dtype=np.float32)
+        self.num_timesteps = int(num_timesteps)
+        self.prepare_calls = []
+
+    def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
+        self.prepare_calls.append((env, bool(observer_is_offense)))
+
+    def has_intent_selector(self) -> bool:
+        return True
+
+    def get_intent_selector_outputs(self, obs):
+        return self._logits, self._value
+
+
 def test_get_full_game_state_includes_selector_intent_preferences():
     original_state = backend_state.game_state.__dict__.copy()
     try:
@@ -73,6 +90,52 @@ def test_get_full_game_state_includes_selector_intent_preferences():
         assert [int(item["intent_index"]) for item in ranked[:4]] == [2, 3, 6, 7]
         probs = [float(item["prob"]) for item in ranked]
         assert probs == sorted(probs, reverse=True)
+    finally:
+        backend_state.game_state.__dict__.clear()
+        backend_state.game_state.__dict__.update(original_state)
+
+
+def test_get_full_game_state_includes_generic_selector_intent_preferences():
+    original_state = backend_state.game_state.__dict__.copy()
+    try:
+        env = HexagonBasketballEnv(
+            players=3,
+            render_mode=None,
+            enable_intent_learning=True,
+            intent_null_prob=0.0,
+            training_team=Team.OFFENSE,
+        )
+        obs, _ = env.reset(seed=123)
+        env.intent_active = True
+        env.intent_index = 1
+        model = _DummyGenericSelectorModel([0.1, 2.0, 0.0, -0.5])
+        backend_state.game_state.env = env
+        backend_state.game_state.obs = obs
+        backend_state.game_state.user_team = Team.OFFENSE
+        backend_state.game_state.unified_policy = model
+        backend_state.game_state.defense_policy = None
+        backend_state.game_state.reward_history = []
+        backend_state.game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+        backend_state.game_state.shot_log = []
+        backend_state.game_state.phi_log = []
+        backend_state.game_state.actions_log = []
+        backend_state.game_state.episode_states = []
+        backend_state.game_state.mlflow_training_params = {
+            "intent_selector_enabled": True,
+            "intent_selector_mode": "integrated",
+            "intent_selector_alpha_start": 1.0,
+            "intent_selector_alpha_end": 1.0,
+            "intent_selector_alpha_warmup_steps": 0,
+            "intent_selector_alpha_ramp_steps": 0,
+        }
+
+        state = backend_state.get_full_game_state(include_policy_probs=True)
+
+        prefs = state.get("selector_intent_preferences")
+        assert prefs is not None
+        assert int(prefs["current_intent_index"]) == 1
+        assert int(prefs["intent_probs"][0]["intent_index"]) == 1
+        assert model.prepare_calls and model.prepare_calls[-1] == (env, True)
     finally:
         backend_state.game_state.__dict__.clear()
         backend_state.game_state.__dict__.update(original_state)

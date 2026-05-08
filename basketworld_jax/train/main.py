@@ -71,7 +71,10 @@ from basketworld_jax.train.cli import (
 from basketworld_jax.train.types import (
     TrainerConfig,
     build_ppo_batch,
+    build_selector_batch,
+    concatenate_selector_batches,
     concatenate_ppo_batches,
+    limit_selector_batch_samples,
 )
 from basketworld_jax.train.runtime import (
     benchmark_compiled_rollout,
@@ -85,6 +88,7 @@ from basketworld_jax.train.runtime import (
     build_compiled_rollout_runner,
     build_jitted_actor_critic_runner,
     build_jitted_ppo_update_runner,
+    build_jitted_selector_update_runner,
     concatenate_rollout_outputs,
     serialize_eval_trace,
     summarize_episode_events,
@@ -96,6 +100,11 @@ from basketworld_jax.train.runtime import (
 
 
 TRAINING_ROLES = ("offense", "defense")
+TRAIN_LOOP_SUMMARY_ARTIFACT_DIR = "results"
+TRAIN_LOOP_SUMMARY_ARTIFACT_NAME = "train_loop_summary.json"
+TRAIN_LOOP_SUMMARY_ARTIFACT_PATH = (
+    f"{TRAIN_LOOP_SUMMARY_ARTIFACT_DIR}/{TRAIN_LOOP_SUMMARY_ARTIFACT_NAME}"
+)
 JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
     {
         "allow_dunks",
@@ -107,11 +116,34 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "enable_intent_learning",
         "enable_defense_intent_learning",
         "intent_diversity_enabled",
+        "intent_selector_enabled",
+        "intent_selector_hidden_dim",
+        "intent_selector_alpha_start",
+        "intent_selector_alpha_end",
+        "intent_selector_alpha_warmup_steps",
+        "intent_selector_alpha_ramp_steps",
+        "intent_selector_eps_start",
+        "intent_selector_eps_end",
+        "intent_selector_eps_warmup_steps",
+        "intent_selector_eps_ramp_steps",
+        "intent_selector_entropy_coef",
+        "intent_selector_usage_reg_coef",
+        "intent_selector_value_coef",
+        "intent_selector_train_every_rollouts",
+        "intent_selector_max_samples_per_update",
+        "intent_selector_multiselect_enabled",
+        "intent_selector_min_play_steps",
         "num_intents",
         "intent_commitment_steps",
         "intent_null_prob",
         "defense_intent_null_prob",
         "intent_visible_to_defense_prob",
+        "start_template_enabled",
+        "start_template_library",
+        "start_template_prob",
+        "start_template_jitter_scale",
+        "start_template_mirror_prob",
+        "start_template_strict",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -164,6 +196,12 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "pass_reward",
     "potential_assist_pct",
     "full_assist_bonus_pct",
+    "start_template_enabled",
+    "start_template_library",
+    "start_template_prob",
+    "start_template_jitter_scale",
+    "start_template_mirror_prob",
+    "start_template_strict",
     "enable_intent_learning",
     "enable_defense_intent_learning",
     "num_intents",
@@ -326,6 +364,48 @@ def parse_args(argv=None):
             "--intent-diversity-warmup-updates. Defaults to one update when "
             "warmup updates are set and this is omitted."
         ),
+    )
+    parser.add_argument(
+        "--task-reward-scale-warmup-updates",
+        type=int,
+        default=None,
+        help=(
+            "JAX-only update-count warmup for task reward scaling. When set, "
+            "this takes precedence over --task-reward-scale-warmup-steps."
+        ),
+    )
+    parser.add_argument(
+        "--task-reward-scale-ramp-updates",
+        type=int,
+        default=None,
+        help=(
+            "JAX-only update-count ramp for task reward scaling. When set, "
+            "this takes precedence over --task-reward-scale-ramp-steps."
+        ),
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-warmup-updates",
+        type=int,
+        default=0,
+        help="PPO updates to wait before ramping selector alpha.",
+    )
+    parser.add_argument(
+        "--intent-selector-alpha-ramp-updates",
+        type=int,
+        default=1,
+        help="PPO updates over which selector alpha ramps from start to end.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-warmup-updates",
+        type=int,
+        default=0,
+        help="PPO updates to wait before ramping selector epsilon floor.",
+    )
+    parser.add_argument(
+        "--intent-selector-eps-ramp-updates",
+        type=int,
+        default=1,
+        help="PPO updates over which selector epsilon ramps from start to end.",
     )
     parser.add_argument(
         "--policy-seed",
@@ -535,6 +615,54 @@ def validate_train_args(args) -> None:
             )
     if int(getattr(args, "intent_embedding_dim", 16)) < 1:
         raise SystemExit("--intent-embedding-dim must be >= 1.")
+    for key in ("ent_coef", "ent_coef_start", "ent_coef_end"):
+        value = getattr(args, key, None)
+        if value is not None and float(value) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    ent_schedule = str(getattr(args, "ent_schedule", "linear")).lower()
+    if ent_schedule not in {"linear", "exp"}:
+        raise SystemExit("--ent-schedule must be one of: linear, exp.")
+    for key in ("task_reward_scale_start", "task_reward_scale_end"):
+        value = getattr(args, key, None)
+        if value is not None and float(value) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    for key in ("task_reward_scale_warmup_updates", "task_reward_scale_ramp_updates"):
+        value = getattr(args, key, None)
+        if value is not None and int(value) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    if bool(getattr(args, "intent_selector_enabled", False)):
+        if str(getattr(args, "policy_model", "mlp")) != "attention":
+            raise SystemExit("--intent-selector-enabled requires --policy-model attention.")
+        if not bool(getattr(args, "enable_intent_learning", False)):
+            raise SystemExit("--intent-selector-enabled requires --enable-intent-learning.")
+        if not bool(getattr(args, "intent_embedding_enabled", False)):
+            raise SystemExit("--intent-selector-enabled requires --intent-embedding-enabled.")
+    if int(getattr(args, "intent_selector_hidden_dim", 64)) < 1:
+        raise SystemExit("--intent-selector-hidden-dim must be >= 1.")
+    for key in (
+        "intent_selector_alpha_start",
+        "intent_selector_alpha_end",
+        "intent_selector_eps_start",
+        "intent_selector_eps_end",
+    ):
+        value = float(getattr(args, key, 0.0))
+        if value < 0.0 or value > 1.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be in [0, 1].")
+    for key in (
+        "intent_selector_alpha_warmup_updates",
+        "intent_selector_alpha_ramp_updates",
+        "intent_selector_eps_warmup_updates",
+        "intent_selector_eps_ramp_updates",
+        "intent_selector_train_every_rollouts",
+        "intent_selector_max_samples_per_update",
+        "intent_selector_min_play_steps",
+    ):
+        if int(getattr(args, key, 0)) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    if int(getattr(args, "intent_selector_train_every_rollouts", 1)) < 1:
+        raise SystemExit("--intent-selector-train-every-rollouts must be >= 1.")
+    if int(getattr(args, "intent_selector_min_play_steps", 3)) < 1:
+        raise SystemExit("--intent-selector-min-play-steps must be >= 1.")
     if int(getattr(args, "intent_sample_dump_size", 2048)) < 0:
         raise SystemExit("--intent-sample-dump-size must be >= 0.")
     if bool(getattr(args, "intent_diversity_enabled", False)):
@@ -630,6 +758,8 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
         intent_embedding_enabled=bool(getattr(args, "intent_embedding_enabled", False)),
         intent_embedding_dim=int(getattr(args, "intent_embedding_dim", 16)),
         num_intents=int(getattr(args, "num_intents", 8)),
+        intent_selector_enabled=bool(getattr(args, "intent_selector_enabled", False)),
+        intent_selector_hidden_dim=int(getattr(args, "intent_selector_hidden_dim", 64)),
     )
 
 
@@ -823,7 +953,6 @@ def _training_play_name_seed_key(args, mlflow, checkpoint_dir: str | None) -> st
     for value in (
         getattr(args, "mlflow_run_name", None),
         checkpoint_dir,
-        getattr(args, "output_json", None),
     ):
         text = str(value or "").strip()
         if text:
@@ -862,6 +991,39 @@ def _log_mlflow_play_name_metadata(mlflow, play_name_metadata: dict[str, Any]) -
             mlflow.log_artifact(str(path), artifact_path="metadata")
     except Exception as exc:
         print(f"[play_names] Failed to log JAX play name mapping artifact: {exc}")
+
+
+def _log_mlflow_start_template_library(mlflow, args) -> None:
+    if not bool(getattr(args, "start_template_enabled", False)):
+        return
+    source_path = getattr(args, "start_template_library", None)
+    if not source_path:
+        return
+    try:
+        from basketworld.utils.start_templates import load_start_template_library
+
+        library = load_start_template_library(
+            source_path,
+            players_per_side=int(getattr(args, "players", 3) or 3),
+        )
+        with TemporaryDirectory(prefix="basketworld_jax_start_templates_") as tmpdir:
+            artifact_name = "start_template_library.json"
+            artifact_path = Path(tmpdir) / artifact_name
+            artifact_path.write_text(
+                json.dumps(library, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            mlflow.log_artifact(str(artifact_path), artifact_path="metadata")
+        mlflow.log_param(
+            "start_template_library_artifact_path",
+            f"metadata/{artifact_name}",
+        )
+        mlflow.log_param(
+            "start_template_library_template_count",
+            int(len(library.get("templates", []) or [])),
+        )
+    except Exception as exc:
+        print(f"[start_templates] Failed to log JAX template library artifact: {exc}")
 
 
 def _is_jax_checkpoint_artifact(path: str) -> bool:
@@ -1125,6 +1287,17 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/ppo_clip_range": float(trainer_config.ppo_clip_range),
         "jax/value_coef": float(trainer_config.value_coef),
         "jax/entropy_coef": float(trainer_config.entropy_coef),
+        "jax/ent_coef_start": (
+            ""
+            if getattr(args, "ent_coef_start", None) is None
+            else float(getattr(args, "ent_coef_start"))
+        ),
+        "jax/ent_coef_end": (
+            ""
+            if getattr(args, "ent_coef_end", None) is None
+            else float(getattr(args, "ent_coef_end"))
+        ),
+        "jax/ent_schedule": str(getattr(args, "ent_schedule", "linear")),
         "jax/policy_model": str(spec.model_type),
         "jax/action_head_mode": str(spec.action_head_mode),
         "jax/policy_hidden_dims": ",".join(str(v) for v in spec.hidden_dims),
@@ -1150,6 +1323,59 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/intent_embedding_enabled": bool(spec.intent_embedding_enabled),
         "jax/intent_embedding_dim": int(spec.intent_embedding_dim),
         "jax/num_intents": int(spec.num_intents),
+        "jax/intent_selector_enabled": bool(spec.intent_selector_enabled),
+        "jax/intent_selector_hidden_dim": int(spec.intent_selector_hidden_dim),
+        "jax/intent_selector_alpha_start": float(getattr(args, "intent_selector_alpha_start", 0.0)),
+        "jax/intent_selector_alpha_end": float(getattr(args, "intent_selector_alpha_end", 1.0)),
+        "jax/intent_selector_alpha_warmup_updates": int(
+            getattr(args, "intent_selector_alpha_warmup_updates", 0)
+        ),
+        "jax/intent_selector_alpha_ramp_updates": int(
+            getattr(args, "intent_selector_alpha_ramp_updates", 1)
+        ),
+        "jax/intent_selector_eps_start": float(getattr(args, "intent_selector_eps_start", 0.0)),
+        "jax/intent_selector_eps_end": float(getattr(args, "intent_selector_eps_end", 0.0)),
+        "jax/intent_selector_eps_warmup_updates": int(
+            getattr(args, "intent_selector_eps_warmup_updates", 0)
+        ),
+        "jax/intent_selector_eps_ramp_updates": int(
+            getattr(args, "intent_selector_eps_ramp_updates", 1)
+        ),
+        "jax/intent_selector_entropy_coef": float(getattr(args, "intent_selector_entropy_coef", 0.01)),
+        "jax/intent_selector_usage_reg_coef": float(getattr(args, "intent_selector_usage_reg_coef", 0.01)),
+        "jax/intent_selector_value_coef": float(getattr(args, "intent_selector_value_coef", 0.5)),
+        "jax/intent_selector_train_every_rollouts": int(
+            getattr(args, "intent_selector_train_every_rollouts", 1)
+        ),
+        "jax/intent_selector_max_samples_per_update": int(
+            getattr(args, "intent_selector_max_samples_per_update", 0)
+        ),
+        "jax/intent_selector_multiselect_enabled": bool(
+            getattr(args, "intent_selector_multiselect_enabled", False)
+        ),
+        "jax/intent_selector_min_play_steps": int(getattr(args, "intent_selector_min_play_steps", 3)),
+        "jax/task_reward_scale_start": (
+            ""
+            if getattr(args, "task_reward_scale_start", None) is None
+            else float(getattr(args, "task_reward_scale_start"))
+        ),
+        "jax/task_reward_scale_end": (
+            ""
+            if getattr(args, "task_reward_scale_end", None) is None
+            else float(getattr(args, "task_reward_scale_end"))
+        ),
+        "jax/task_reward_scale_warmup_updates": (
+            -1
+            if getattr(args, "task_reward_scale_warmup_updates", None) is None
+            else int(getattr(args, "task_reward_scale_warmup_updates"))
+        ),
+        "jax/task_reward_scale_ramp_updates": (
+            -1
+            if getattr(args, "task_reward_scale_ramp_updates", None) is None
+            else int(getattr(args, "task_reward_scale_ramp_updates"))
+        ),
+        "jax/task_reward_scale_warmup_steps": int(getattr(args, "task_reward_scale_warmup_steps", 0)),
+        "jax/task_reward_scale_ramp_steps": int(getattr(args, "task_reward_scale_ramp_steps", 1)),
         "jax/pass_mode": str(getattr(args, "pass_mode")),
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
@@ -1230,6 +1456,15 @@ def _log_mlflow_intent_sample_artifact(
         return f"{artifact_path}/{path.name}"
 
 
+def _log_mlflow_train_loop_summary(mlflow, result: dict[str, Any]) -> str:
+    with TemporaryDirectory(prefix="basketworld_jax_train_summary_") as tmpdir:
+        path = Path(tmpdir) / TRAIN_LOOP_SUMMARY_ARTIFACT_NAME
+        write_json(path, result)
+        mlflow.log_artifact(str(path), artifact_path=TRAIN_LOOP_SUMMARY_ARTIFACT_DIR)
+    mlflow.set_tag("jax_train_loop_summary_artifact", TRAIN_LOOP_SUMMARY_ARTIFACT_PATH)
+    return TRAIN_LOOP_SUMMARY_ARTIFACT_PATH
+
+
 def _save_local_intent_sample_artifact(
     *,
     checkpoint_dir: str,
@@ -1262,6 +1497,203 @@ def _format_summary_value(value: Any) -> str:
 
 def _safe_metric_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if float(denominator) > 0.0 else 0.0
+
+
+def _linear_update_schedule(
+    update_index: int,
+    *,
+    start: float,
+    end: float,
+    warmup_updates: int,
+    ramp_updates: int,
+) -> float:
+    if int(update_index) < int(warmup_updates):
+        return float(start)
+    if int(ramp_updates) <= 0:
+        return float(end)
+    progress = min(
+        1.0,
+        max(0.0, (int(update_index) - int(warmup_updates)) / float(int(ramp_updates))),
+    )
+    return float(start) + ((float(end) - float(start)) * float(progress))
+
+
+def _linear_position_schedule(
+    position: int,
+    *,
+    start: float,
+    end: float,
+    warmup: int,
+    ramp: int,
+) -> float:
+    if int(position) < int(warmup):
+        return float(start)
+    if int(ramp) <= 0:
+        return float(end)
+    progress = min(
+        1.0,
+        max(0.0, (int(position) - int(warmup)) / float(int(ramp))),
+    )
+    return float(start) + ((float(end) - float(start)) * float(progress))
+
+
+def _entropy_coef_for_update(args, update_index: int) -> float:
+    start_raw = getattr(args, "ent_coef_start", None)
+    end_raw = getattr(args, "ent_coef_end", None)
+    if start_raw is None and end_raw is None:
+        return float(getattr(args, "ent_coef", 0.0))
+    start = float(getattr(args, "ent_coef", 0.0) if start_raw is None else start_raw)
+    end = float(start if end_raw is None else end_raw)
+    total_updates = max(1, int(getattr(args, "num_updates", 1)) - 1)
+    progress = min(
+        1.0,
+        max(0.0, (int(update_index) - 1) / float(total_updates)),
+    )
+    schedule = str(getattr(args, "ent_schedule", "linear")).lower()
+    if schedule == "exp":
+        start_pos = max(float(start), 1.0e-12)
+        end_pos = max(float(end), 1.0e-12)
+        ratio = start_pos / end_pos
+        return float(end_pos * (ratio ** (1.0 - progress)))
+    return float(start + ((end - start) * progress))
+
+
+def _task_reward_scale_for_update(args, update_index: int) -> float:
+    start_raw = getattr(args, "task_reward_scale_start", None)
+    end_raw = getattr(args, "task_reward_scale_end", None)
+    if start_raw is None and end_raw is None:
+        return 1.0
+    start = 1.0 if start_raw is None else float(start_raw)
+    end = start if end_raw is None else float(end_raw)
+    warmup_updates = getattr(args, "task_reward_scale_warmup_updates", None)
+    ramp_updates = getattr(args, "task_reward_scale_ramp_updates", None)
+    if warmup_updates is not None or ramp_updates is not None:
+        return _linear_position_schedule(
+            int(update_index),
+            start=start,
+            end=end,
+            warmup=int(0 if warmup_updates is None else warmup_updates),
+            ramp=int(1 if ramp_updates is None else ramp_updates),
+        )
+
+    steps_per_update = (
+        int(getattr(args, "kernel_batch_size"))
+        * int(getattr(args, "rollout_horizon"))
+        * len(TRAINING_ROLES)
+    )
+    completed_steps = max(0, int(update_index) - 1) * int(steps_per_update)
+    return _linear_position_schedule(
+        completed_steps,
+        start=start,
+        end=end,
+        warmup=int(getattr(args, "task_reward_scale_warmup_steps", 0)),
+        ramp=int(getattr(args, "task_reward_scale_ramp_steps", 1)),
+    )
+
+
+def _apply_task_reward_scale_to_rollout(rollout, scale: float, jnp):
+    scale_t = jnp.asarray(float(scale), dtype=jnp.float32)
+    return rollout._replace(
+        trajectory=rollout.trajectory._replace(
+            rewards=rollout.trajectory.rewards * scale_t,
+        )
+    )
+
+
+def _selector_schedules_for_update(args, update_index: int) -> tuple[float, float]:
+    if not bool(getattr(args, "intent_selector_enabled", False)):
+        return 0.0, 0.0
+    alpha = _linear_update_schedule(
+        update_index,
+        start=float(getattr(args, "intent_selector_alpha_start", 0.0)),
+        end=float(getattr(args, "intent_selector_alpha_end", 1.0)),
+        warmup_updates=int(getattr(args, "intent_selector_alpha_warmup_updates", 0)),
+        ramp_updates=int(getattr(args, "intent_selector_alpha_ramp_updates", 1)),
+    )
+    eps = _linear_update_schedule(
+        update_index,
+        start=float(getattr(args, "intent_selector_eps_start", 0.0)),
+        end=float(getattr(args, "intent_selector_eps_end", 0.0)),
+        warmup_updates=int(getattr(args, "intent_selector_eps_warmup_updates", 0)),
+        ramp_updates=int(getattr(args, "intent_selector_eps_ramp_updates", 1)),
+    )
+    return alpha, eps
+
+
+def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: float) -> dict[str, Any]:
+    selector_used = np.asarray(rollout.trajectory.selector_used, dtype=bool)
+    selector_applied = np.asarray(rollout.trajectory.selector_applied, dtype=bool)
+    selector_fallback_used = np.asarray(rollout.trajectory.selector_fallback_used, dtype=bool)
+    selector_boundary_episode_start = np.asarray(
+        rollout.trajectory.selector_boundary_episode_start,
+        dtype=bool,
+    )
+    selector_boundary_commitment_timeout = np.asarray(
+        rollout.trajectory.selector_boundary_commitment_timeout,
+        dtype=bool,
+    )
+    selector_boundary_completed_pass = np.asarray(
+        rollout.trajectory.selector_boundary_completed_pass,
+        dtype=bool,
+    )
+    selector_intent_index = np.asarray(rollout.trajectory.selector_intent_index, dtype=np.int32)
+    selector_entropy = np.asarray(rollout.trajectory.selector_entropy, dtype=np.float32)
+    selector_max_prob = np.asarray(rollout.trajectory.selector_max_prob, dtype=np.float32)
+    selector_value = np.asarray(rollout.trajectory.selector_value, dtype=np.float32)
+    selector_log_prob = np.asarray(rollout.trajectory.selector_old_log_prob, dtype=np.float32)
+    used_count = int(selector_used.sum())
+    total_steps = int(selector_used.size)
+    metrics: dict[str, Any] = {
+        "selector_alpha": float(alpha),
+        "selector_eps": float(eps),
+        "selector_used_count": int(used_count),
+        "selector_usage_rate": _safe_metric_ratio(used_count, total_steps),
+        "selector_applied_count": int(selector_applied.sum()),
+        "selector_applied_rate": _safe_metric_ratio(int(selector_applied.sum()), total_steps),
+        "selector_fallback_count": int(selector_fallback_used.sum()),
+        "selector_fallback_rate": _safe_metric_ratio(int(selector_fallback_used.sum()), total_steps),
+        "selector_boundary_episode_start_count": int(selector_boundary_episode_start.sum()),
+        "selector_boundary_commitment_timeout_count": int(selector_boundary_commitment_timeout.sum()),
+        "selector_boundary_commitment_timeout_rate": _safe_metric_ratio(
+            int(selector_boundary_commitment_timeout.sum()),
+            int(selector_applied.sum()),
+        ),
+        "selector_boundary_completed_pass_count": int(selector_boundary_completed_pass.sum()),
+        "selector_boundary_completed_pass_rate": _safe_metric_ratio(
+            int(selector_boundary_completed_pass.sum()),
+            int(selector_applied.sum()),
+        ),
+    }
+    if used_count > 0:
+        used_entropy = selector_entropy[selector_used]
+        used_max_prob = selector_max_prob[selector_used]
+        used_value = selector_value[selector_used]
+        used_log_prob = selector_log_prob[selector_used]
+        metrics.update(
+            {
+                "selector_entropy": float(np.mean(used_entropy)),
+                "selector_max_prob": float(np.mean(used_max_prob)),
+                "selector_value_mean": float(np.mean(used_value)),
+                "selector_old_log_prob_mean": float(np.mean(used_log_prob)),
+            }
+        )
+        selected = selector_intent_index[selector_used]
+        for intent_idx in range(int(num_intents)):
+            metrics[f"selector_usage_by_intent/{intent_idx}"] = float(
+                np.mean(selected == int(intent_idx))
+            )
+    else:
+        metrics.update(
+            {
+                "selector_entropy": 0.0,
+                "selector_max_prob": 0.0,
+                "selector_value_mean": 0.0,
+                "selector_old_log_prob_mean": 0.0,
+            }
+        )
+        for intent_idx in range(int(num_intents)):
+            metrics[f"selector_usage_by_intent/{intent_idx}"] = 0.0
+    return metrics
 
 
 def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
@@ -1417,6 +1849,7 @@ def _print_checkpoint_summary(
         ("clip_fraction", metrics.get("clip_fraction")),
         ("mean_abs_log_ratio", metrics.get("mean_abs_log_ratio")),
         ("max_abs_log_ratio", metrics.get("max_abs_log_ratio")),
+        ("entropy_coef", metrics.get("entropy_coef")),
         ("entropy_bonus", metrics.get("entropy_bonus")),
         ("policy_loss", metrics.get("policy_loss")),
         ("value_loss", metrics.get("value_loss")),
@@ -1435,6 +1868,7 @@ def _print_checkpoint_summary(
         ("opponent_source", metrics.get("opponent_source")),
         ("opponent_group_count", metrics.get("opponent_group_count")),
         ("opponent_unique_update_count", metrics.get("opponent_unique_update_count")),
+        ("task_reward_scale", metrics.get("task_reward_scale")),
         ("intent_disc_active_count", metrics.get("intent_disc_active_count")),
         ("intent_disc_loss", metrics.get("intent_disc_loss")),
         ("intent_disc_top1_acc_trainbatch", metrics.get("intent_disc_top1_acc_trainbatch")),
@@ -1444,6 +1878,22 @@ def _print_checkpoint_summary(
         ("intent_bonus_beta", metrics.get("intent_bonus_beta")),
         ("intent_bonus_raw_mean", metrics.get("intent_bonus_raw_mean")),
         ("intent_bonus_shaping_per_step_mean", metrics.get("intent_bonus_shaping_per_step_mean")),
+        ("selector_alpha", metrics.get("selector_alpha")),
+        ("selector_eps", metrics.get("selector_eps")),
+        ("selector_used_count", metrics.get("selector_used_count")),
+        ("selector_usage_rate", metrics.get("selector_usage_rate")),
+        ("selector_applied_count", metrics.get("selector_applied_count")),
+        ("selector_fallback_count", metrics.get("selector_fallback_count")),
+        ("selector_boundary_commitment_timeout_count", metrics.get("selector_boundary_commitment_timeout_count")),
+        ("selector_boundary_completed_pass_count", metrics.get("selector_boundary_completed_pass_count")),
+        ("selector_entropy", metrics.get("selector_entropy")),
+        ("selector_max_prob", metrics.get("selector_max_prob")),
+        ("selector_train_sample_count", metrics.get("selector_train_sample_count")),
+        ("selector_train_pending_rollout_count", metrics.get("selector_train_pending_rollout_count")),
+        ("selector_train_loss", metrics.get("selector_train_loss")),
+        ("selector_train_approx_kl", metrics.get("selector_train_approx_kl")),
+        ("selector_train_clip_fraction", metrics.get("selector_train_clip_fraction")),
+        ("selector_train_grad_norm", metrics.get("selector_train_grad_norm")),
         ("checkpoint_path", latest_checkpoint_path),
         ("checkpoint_artifact", latest_checkpoint_artifact_path),
     ]
@@ -1503,6 +1953,18 @@ def run_training_loop(args) -> dict[str, Any]:
     grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec)
     grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
     update_runner, optimizer_transform = build_jitted_ppo_update_runner(jax, jnp, spec, trainer_config)
+    if bool(getattr(args, "intent_selector_enabled", False)):
+        selector_update_runner, _ = build_jitted_selector_update_runner(
+            jax,
+            jnp,
+            spec,
+            trainer_config,
+            selector_value_coef=float(getattr(args, "intent_selector_value_coef", 0.5)),
+            selector_entropy_coef=float(getattr(args, "intent_selector_entropy_coef", 0.01)),
+            selector_usage_reg_coef=float(getattr(args, "intent_selector_usage_reg_coef", 0.01)),
+        )
+    else:
+        selector_update_runner = None
     intent_disc_enabled = bool(getattr(args, "intent_diversity_enabled", False))
     intent_disc_spec = build_intent_discriminator_spec(args, spec) if intent_disc_enabled else None
     if intent_disc_spec is not None:
@@ -1646,6 +2108,7 @@ def run_training_loop(args) -> dict[str, Any]:
         if mlflow is not None:
             _log_mlflow_params(mlflow, args, trainer_config, spec)
             _log_mlflow_play_name_metadata(mlflow, play_name_metadata)
+            _log_mlflow_start_template_library(mlflow, args)
 
         expected_evals = _remaining_eval_count(
             start_update=completed_updates,
@@ -1658,9 +2121,17 @@ def run_training_loop(args) -> dict[str, Any]:
             disable=bool(args.no_progress),
             unit="event",
         )
+        pending_selector_batches = []
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
             base_key, update_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 2)
+            entropy_coef = _entropy_coef_for_update(args, update_idx)
+            task_reward_scale = _task_reward_scale_for_update(args, update_idx)
+            selector_alpha, selector_eps = _selector_schedules_for_update(args, update_idx)
+            selector_multiselect_enabled = bool(
+                getattr(args, "intent_selector_multiselect_enabled", False)
+            )
+            selector_min_play_steps = int(getattr(args, "intent_selector_min_play_steps", 3))
             rollout_start_ns = perf_counter_ns()
             role_rollouts = {}
             for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
@@ -1673,6 +2144,10 @@ def run_training_loop(args) -> dict[str, Any]:
                         rollout_key,
                         int(args.rollout_horizon),
                         int(active_opponent_info["group_count"]),
+                        selector_alpha,
+                        selector_eps,
+                        selector_multiselect_enabled,
+                        selector_min_play_steps,
                     )
                 elif opponent_params is None:
                     role_rollouts[role] = rollout_runner(
@@ -1681,6 +2156,10 @@ def run_training_loop(args) -> dict[str, Any]:
                         params,
                         rollout_key,
                         int(args.rollout_horizon),
+                        selector_alpha,
+                        selector_eps,
+                        selector_multiselect_enabled,
+                        selector_min_play_steps,
                     )
                 else:
                     role_rollouts[role] = frozen_rollout_runner(
@@ -1690,9 +2169,31 @@ def run_training_loop(args) -> dict[str, Any]:
                         opponent_params,
                         rollout_key,
                         int(args.rollout_horizon),
+                        selector_alpha,
+                        selector_eps,
+                        selector_multiselect_enabled,
+                        selector_min_play_steps,
                     )
             block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
+            role_rollouts = {
+                role: _apply_task_reward_scale_to_rollout(
+                    rollout,
+                    task_reward_scale,
+                    jnp,
+                )
+                for role, rollout in role_rollouts.items()
+            }
+
+            if bool(getattr(args, "intent_selector_enabled", False)):
+                pending_selector_batches.append(
+                    build_selector_batch(
+                        role_rollouts["offense"],
+                        trainer_config,
+                        jax,
+                        jnp,
+                    )
+                )
 
             intent_disc_metrics: dict[str, Any] = {}
             latest_intent_sample_payload = None
@@ -1795,13 +2296,49 @@ def run_training_loop(args) -> dict[str, Any]:
                 jnp,
             )
             update_start_ns = perf_counter_ns()
+            update_key, ppo_update_key, selector_update_key = jax.random.split(update_key, 3)
             params, opt_state, update_metrics = update_runner(
                 params,
                 opt_state,
                 ppo_batch,
-                update_key,
+                ppo_update_key,
+                entropy_coef,
             )
-            block_until_ready_tree((params, opt_state, update_metrics))
+            selector_update_metrics: dict[str, Any] = {}
+            if (
+                selector_update_runner is not None
+                and update_idx % int(getattr(args, "intent_selector_train_every_rollouts", 1)) == 0
+                and pending_selector_batches
+            ):
+                selector_train_batch = concatenate_selector_batches(pending_selector_batches, jnp)
+                selector_train_batch = limit_selector_batch_samples(
+                    selector_train_batch,
+                    jnp,
+                    max_samples=int(getattr(args, "intent_selector_max_samples_per_update", 0)),
+                )
+                params, opt_state, raw_selector_metrics = selector_update_runner(
+                    params,
+                    opt_state,
+                    selector_train_batch,
+                    selector_update_key,
+                    selector_eps,
+                )
+                selector_update_metrics = {
+                    key: float(np.asarray(value))
+                    for key, value in raw_selector_metrics.items()
+                }
+                selector_update_metrics["selector_train_skipped_cadence"] = 0.0
+                selector_update_metrics["selector_train_pending_rollout_count"] = float(
+                    len(pending_selector_batches)
+                )
+                pending_selector_batches.clear()
+            elif bool(getattr(args, "intent_selector_enabled", False)):
+                selector_update_metrics = {
+                    "selector_train_skipped_cadence": 1.0,
+                    "selector_train_sample_count": 0.0,
+                    "selector_train_pending_rollout_count": float(len(pending_selector_batches)),
+                }
+            block_until_ready_tree((params, opt_state, update_metrics, selector_update_metrics))
             update_elapsed_ns = perf_counter_ns() - update_start_ns
             current_states = {
                 role: role_rollouts[role].final_state
@@ -1825,6 +2362,21 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             for role in TRAINING_ROLES:
                 last_metrics.update(_summarize_role_rollout_metrics(role, role_rollouts[role]))
+            if bool(getattr(args, "intent_selector_enabled", False)):
+                last_metrics.update(
+                    summarize_selector_metrics(
+                        role_rollouts["offense"],
+                        num_intents=int(args.num_intents),
+                        alpha=selector_alpha,
+                        eps=selector_eps,
+                    )
+                )
+                last_metrics.update(selector_update_metrics)
+            last_metrics["task_reward_scale"] = float(task_reward_scale)
+            last_metrics["task_reward_scale_is_scheduled"] = float(
+                getattr(args, "task_reward_scale_start", None) is not None
+                or getattr(args, "task_reward_scale_end", None) is not None
+            )
             if intent_disc_metrics:
                 last_metrics.update(intent_disc_metrics)
             if active_opponent_info is not None:
@@ -2177,8 +2729,11 @@ def run_training_loop(args) -> dict[str, Any]:
             "intent_sample_artifacts": intent_sample_artifacts,
             "active_opponent": active_opponent_info,
             "opponent_pool_size": len(opponent_candidates),
+            "summary_artifact_path": TRAIN_LOOP_SUMMARY_ARTIFACT_PATH if mlflow is not None else None,
             "next_step": "run a longer learnability check and inspect eval trajectories for behavior changes",
         }
+        if mlflow is not None:
+            _log_mlflow_train_loop_summary(mlflow, result)
         return result
 
 
@@ -2430,10 +2985,6 @@ def main(argv=None):
             f" mean_update_latency_ms={result['ppo_update_mean_latency_ms']:.4f}"
         )
         print(f"trajectory_spec: {result['trajectory_spec']}")
-
-    if args.output_json:
-        write_json(args.output_json, result)
-        print(f"wrote_json: {args.output_json}")
 
 
 if __name__ == "__main__":

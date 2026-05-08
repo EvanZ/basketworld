@@ -478,6 +478,21 @@ def _compute_state_values_from_obs(obs_dict: dict | None):
     capabilities = get_policy_capabilities(value_policy) or {}
     if not capabilities.get("state_values", True):
         return None
+    value_fn = getattr(value_policy, "state_value", None)
+    if callable(value_fn) and game_state.env is not None:
+        try:
+            return {
+                "offensive_value": float(
+                    value_fn(game_state.env, observer_is_offense=True)
+                ),
+                "defensive_value": float(
+                    value_fn(game_state.env, observer_is_offense=False)
+                ),
+            }
+        except Exception as err:
+            print(f"[STATE_VALUES] Failed to compute adapter state values: {err}")
+            return None
+
     policy_module = unwrap_policy_module(value_policy)
     if policy_module is None:
         return None

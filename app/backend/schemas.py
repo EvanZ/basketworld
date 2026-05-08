@@ -109,6 +109,10 @@ class EvaluationRequest(BaseModel):
     custom_setup: CustomEvalSetup | None = None
     randomize_offense_permutation: bool = False
     intent_selection_mode: Literal["learned_sample", "best_intent", "uniform_random"] = "learned_sample"
+    start_template_mode: Literal["checkpoint", "enabled", "disabled"] = "checkpoint"
+    start_template_prob: float | None = None
+    start_template_jitter_scale: float | None = None
+    start_template_mirror_prob: float | None = None
 
 
 class SaveEpisodeRequest(BaseModel):
@@ -139,6 +143,12 @@ class SetIntentStateRequest(BaseModel):
     active: bool
     intent_index: int
     intent_age: int
+
+
+class StartSelfPlayRequest(BaseModel):
+    template_id: str | None = None
+    template_mirrored: bool | None = None
+    template_seed: int | None = None
 
 
 class ReplayCounterfactualRequest(BaseModel):

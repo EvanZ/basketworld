@@ -329,6 +329,10 @@ const defaultEvalConfig = () => ({
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
+  startTemplateMode: 'checkpoint',
+  startTemplateProb: 1.0,
+  startTemplateJitterScale: 0.0,
+  startTemplateMirrorProb: 0.0,
 });
 const defaultTemplateAuthoringConfig = () => ({
   positions: [],
@@ -1228,13 +1232,21 @@ function handleSelfPlayButton() {
   handleSelfPlay(preselected);
 }
 
+function handleTemplateSelfPlay(options = {}) {
+  if (templateSandboxMode.value || activeControlsTab.value === 'eval') {
+    console.log('[App] Template self-play disabled in sandbox/eval modes');
+    return;
+  }
+  handleSelfPlay(null, options || {});
+}
+
 // New function for self-play mode (runs full episode)
-async function handleSelfPlay(preselected = null) {
+async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   if (!gameState.value || !aiMode.value) return;
   const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
   // Start deterministic self-play on backend: snapshot seed and initial state
   try {
-    const res = await startSelfPlay();
+    const res = await startSelfPlay(startTemplateOptions);
     if (res && res.status === 'success' && res.state) {
       // Reset UI to backend's reset state so trajectories align
       gameState.value = res.state;
@@ -1740,6 +1752,12 @@ async function handleEvaluation() {
       customSetup,
       !!evalConfig.value.randomizeOffensePermutation,
       evalConfig.value.intentSelectionMode || 'learned_sample',
+      {
+        mode: evalConfig.value.startTemplateMode || 'checkpoint',
+        prob: Number(evalConfig.value.startTemplateProb ?? 1.0),
+        jitterScale: Number(evalConfig.value.startTemplateJitterScale ?? 0.0),
+        mirrorProb: Number(evalConfig.value.startTemplateMirrorProb ?? 0.0),
+      },
     );
     
   if (response.status === 'success' && Array.isArray(response.results)) {
@@ -2531,6 +2549,7 @@ onBeforeUnmount(() => {
           @eval-config-changed="handleEvalConfigChanged"
           @template-config-changed="handleTemplateConfigChanged"
           @eval-run="handleEvalRunRequested"
+          @template-self-play="handleTemplateSelfPlay"
           @active-tab-changed="handleActiveTabChanged"
           @stats-reset="handleStatsReset"
           ref="controlsRef"

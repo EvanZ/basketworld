@@ -18,6 +18,7 @@ from basketworld.utils.mlflow_params import (
 )
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.start_templates import resolve_start_template
 from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.inference_adapters import (
@@ -50,6 +51,7 @@ from app.backend.schemas import (
     InitGameRequest,
     ListPoliciesRequest,
     MCTSAdviseRequest,
+    StartSelfPlayRequest,
     TemplateBootstrapRequest,
 )
 from app.backend.state import (
@@ -126,6 +128,11 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "pass_reward": float,
     "potential_assist_pct": float,
     "full_assist_bonus_pct": float,
+    "start_template_enabled": _str_to_bool,
+    "start_template_prob": float,
+    "start_template_jitter_scale": float,
+    "start_template_mirror_prob": float,
+    "start_template_strict": _str_to_bool,
     "enable_intent_learning": _str_to_bool,
     "enable_defense_intent_learning": _str_to_bool,
     "num_intents": int,
@@ -178,6 +185,38 @@ def _load_start_template_library_for_run(
         return None
 
 
+_SESSION_START_TEMPLATE_SOURCES = {"local_file", "file_upload", "session_editor"}
+
+
+def _resolve_start_template_library_for_init(
+    *,
+    mlflow_client: mlflow.tracking.MlflowClient,
+    run_id: str,
+    mlflow_training_params: dict,
+    previous_library: dict | None,
+    previous_source: str | None,
+    previous_path: str | None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Prefer a run artifact, but keep manually loaded session templates across New Game."""
+    run_library = _load_start_template_library_for_run(mlflow_client, run_id)
+    if run_library is not None:
+        return (
+            run_library,
+            "mlflow_artifact",
+            str(
+                mlflow_training_params.get(
+                    "start_template_library_artifact_path",
+                    "metadata/start_template_library.json",
+                )
+            ),
+        )
+
+    source = str(previous_source or "").strip()
+    if previous_library is not None and source in _SESSION_START_TEMPLATE_SOURCES:
+        return copy.deepcopy(previous_library), source, previous_path
+    return None, None, None
+
+
 def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, dict | None]:
     metadata = get_policy_metadata(policy_obj) or {}
     frozen_config = dict(metadata.get("frozen_config", {}) or {})
@@ -201,6 +240,24 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
         # instead of falling back to the base env constructor default False.
         config["allow_dunks"] = True
     trainer_config = dict(metadata.get("trainer_config", {}) or {})
+    policy_spec = dict(metadata.get("policy_spec", {}) or {})
+    last_metrics = dict(metadata.get("last_metrics", {}) or {})
+    if bool(policy_spec.get("intent_selector_enabled", False)):
+        trainer_config.setdefault("intent_selector_enabled", True)
+        trainer_config.setdefault("intent_selector_mode", "integrated")
+        current_alpha = float(last_metrics.get("selector_alpha", 1.0) or 0.0)
+        current_eps = float(last_metrics.get("selector_eps", 0.0) or 0.0)
+        trainer_config.setdefault("intent_selector_alpha_start", current_alpha)
+        trainer_config.setdefault("intent_selector_alpha_end", current_alpha)
+        trainer_config.setdefault("intent_selector_alpha_warmup_steps", 0)
+        trainer_config.setdefault("intent_selector_alpha_ramp_steps", 0)
+        trainer_config.setdefault("intent_selector_eps_start", current_eps)
+        trainer_config.setdefault("intent_selector_eps_end", current_eps)
+        trainer_config.setdefault("intent_selector_eps_warmup_steps", 0)
+        trainer_config.setdefault("intent_selector_eps_ramp_steps", 0)
+        trainer_config.setdefault("intent_selector_value_coef", 0.5)
+        trainer_config.setdefault("intent_selector_multiselect_enabled", True)
+        trainer_config.setdefault("intent_selector_min_play_steps", 3)
     required_params: dict = {}
     optional_params = dict(config)
     phi_params = {}
@@ -230,6 +287,90 @@ def _apply_app_segment_start(*, allow_uniform_fallback: bool) -> bool:
     if result.get("obs") is not None:
         game_state.obs = result["obs"]
     return bool(result.get("used_selector", False))
+
+
+def _resolve_self_play_start_template(
+    request: StartSelfPlayRequest,
+) -> tuple[list[tuple[int, int]], int | None, int | None, dict | None]:
+    template_id = str(getattr(request, "template_id", "") or "").strip()
+    if not template_id:
+        return [], None, None, None
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    library = getattr(game_state, "mlflow_start_template_library", None)
+    if not library or not isinstance(library, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="No start-template library is loaded for this UI session.",
+        )
+
+    template = next(
+        (
+            dict(item)
+            for item in list(library.get("templates") or [])
+            if str(item.get("id", "")).strip() == template_id
+        ),
+        None,
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail=f"Unknown start template: {template_id}")
+
+    env = getattr(game_state.env, "unwrapped", game_state.env)
+    original_rng = getattr(env, "_rng", None)
+    seed = getattr(request, "template_seed", None)
+    if seed is not None:
+        setattr(env, "_rng", np.random.default_rng(int(seed)))
+    elif original_rng is None:
+        setattr(env, "_rng", np.random.default_rng())
+    rng = getattr(env, "_rng")
+
+    mirrored_requested = getattr(request, "template_mirrored", None)
+    if mirrored_requested is None:
+        training_params = getattr(game_state, "mlflow_training_params", None) or {}
+        try:
+            mirror_prob = float(training_params.get("start_template_mirror_prob", 0.5))
+        except Exception:
+            mirror_prob = 0.5
+        mirrored = bool(template.get("mirrorable", False) and float(rng.random()) < mirror_prob)
+    else:
+        mirrored = bool(mirrored_requested) and bool(template.get("mirrorable", False))
+
+    training_params = getattr(game_state, "mlflow_training_params", None) or {}
+    try:
+        jitter_scale = float(training_params.get("start_template_jitter_scale", 1.0))
+    except Exception:
+        jitter_scale = 1.0
+
+    try:
+        resolved = resolve_start_template(
+            env,
+            template,
+            jitter_scale=jitter_scale,
+            mirror=mirrored,
+        )
+    finally:
+        if seed is not None:
+            setattr(env, "_rng", original_rng)
+
+    positions = [
+        (int(pos[0]), int(pos[1]))
+        for pos in list(resolved.get("initial_positions") or [])
+    ]
+    if not positions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Start template {template_id} did not resolve any positions.",
+        )
+    return (
+        positions,
+        int(resolved["ball_holder"]) if resolved.get("ball_holder") is not None else None,
+        int(resolved["shot_clock"]) if resolved.get("shot_clock") is not None else None,
+        {
+            "template_id": str(resolved.get("template_id") or template_id),
+            "mirrored": bool(resolved.get("mirrored", mirrored)),
+            "source": getattr(game_state, "start_template_library_source", None),
+        },
+    )
 
 
 def _initialize_app_selector_runtime_for_episode() -> None:
@@ -305,6 +446,11 @@ async def init_game(request: InitGameRequest):
     opponent_unified_policy_name = request.opponent_unified_policy_name
     if not run_id:
         raise HTTPException(status_code=400, detail="init_game requires run_id.")
+    previous_start_template_library = copy.deepcopy(
+        getattr(game_state, "mlflow_start_template_library", None)
+    )
+    previous_start_template_source = getattr(game_state, "start_template_library_source", None)
+    previous_start_template_path = getattr(game_state, "start_template_library_path", None)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         required_params: dict
@@ -312,6 +458,8 @@ async def init_game(request: InitGameRequest):
         mlflow_phi_params: dict
         mlflow_training_params: dict
         start_template_library: dict | None
+        start_template_library_source: str | None = None
+        start_template_library_path: str | None = None
 
         try:
             unified_path = get_unified_policy_path(mlflow_client, run_id, unified_policy_name)
@@ -352,7 +500,29 @@ async def init_game(request: InitGameRequest):
                     optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
                 except Exception as e:
                     print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
-            start_template_library = None
+            (
+                start_template_library,
+                start_template_library_source,
+                start_template_library_path,
+            ) = _resolve_start_template_library_for_init(
+                mlflow_client=mlflow_client,
+                run_id=run_id,
+                mlflow_training_params=mlflow_training_params,
+                previous_library=previous_start_template_library,
+                previous_source=previous_start_template_source,
+                previous_path=previous_start_template_path,
+            )
+            if start_template_library is not None:
+                optional_params["start_template_library"] = start_template_library
+                if start_template_library_source == "mlflow_artifact":
+                    mlflow_training_params.setdefault(
+                        "start_template_library_artifact_path",
+                        start_template_library_path or "metadata/start_template_library.json",
+                    )
+            else:
+                # Checkpoint metadata stores the source path for reproducibility,
+                # but the live Python env expects the resolved library dict.
+                optional_params.pop("start_template_library", None)
         else:
             try:
                 required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
@@ -364,8 +534,17 @@ async def init_game(request: InitGameRequest):
                     raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
                 raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
 
-            start_template_library = _load_start_template_library_for_run(
-                mlflow_client, run_id
+            (
+                start_template_library,
+                start_template_library_source,
+                start_template_library_path,
+            ) = _resolve_start_template_library_for_init(
+                mlflow_client=mlflow_client,
+                run_id=run_id,
+                mlflow_training_params=mlflow_training_params,
+                previous_library=previous_start_template_library,
+                previous_source=previous_start_template_source,
+                previous_path=previous_start_template_path,
             )
 
         # Extract role_flag encoding for backward compatibility (not passed to env)
@@ -547,13 +726,8 @@ async def init_game(request: InitGameRequest):
     game_state.mlflow_training_params = mlflow_training_params
     game_state.mlflow_start_template_library = copy.deepcopy(start_template_library)
     if start_template_library is not None:
-        game_state.start_template_library_source = "mlflow_artifact"
-        game_state.start_template_library_path = str(
-            mlflow_training_params.get(
-                "start_template_library_artifact_path",
-                "metadata/start_template_library.json",
-            )
-        )
+        game_state.start_template_library_source = start_template_library_source
+        game_state.start_template_library_path = start_template_library_path
     else:
         game_state.start_template_library_source = None
         game_state.start_template_library_path = None
@@ -696,7 +870,7 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     initial_state = get_full_game_state(
         include_policy_probs=False,
         include_action_values=False,
-        include_state_values=False,
+        include_state_values=True,
     )
     game_state.episode_states.append(initial_state)
 
@@ -1244,10 +1418,11 @@ def mcts_advise(request: MCTSAdviseRequest):
 
 
 @router.post("/api/start_self_play")
-def start_self_play():
+def start_self_play(request: StartSelfPlayRequest | None = None):
     """Prepare deterministic self-play by resetting with current initial conditions and a fixed seed."""
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
+    request = request or StartSelfPlayRequest()
 
     env_read = env_view(game_state.env)
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
@@ -1256,6 +1431,16 @@ def start_self_play():
         int(env_read.ball_holder) if env_read.ball_holder is not None else None
     )
     init_shot_clock = int(env_read.shot_clock or 24)
+    template_metadata = None
+    template_positions, template_ball_holder, template_shot_clock, template_metadata = (
+        _resolve_self_play_start_template(request)
+    )
+    if template_positions:
+        init_positions = template_positions
+        if template_ball_holder is not None:
+            init_ball_holder = int(template_ball_holder)
+        if template_shot_clock is not None:
+            init_shot_clock = int(template_shot_clock)
     preserved_intent_state = None
     if bool(getattr(base_env, "intent_active", False)):
         preserved_intent_state = {
@@ -1346,6 +1531,7 @@ def start_self_play():
         "status": "success",
         "state": get_ui_game_state(),
         "seed": episode_seed,
+        "start_template": template_metadata,
     }
 
 

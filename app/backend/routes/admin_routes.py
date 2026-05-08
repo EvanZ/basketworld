@@ -31,6 +31,11 @@ from app.backend.rollout_runtime import (
     predict_joint_policy_actions,
 )
 from app.backend.env_access import env_view
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    load_inference_policy,
+)
 from app.backend.schemas import (
     ActionRequest,
     ApplyStartTemplateRequest,
@@ -2043,7 +2048,7 @@ def set_defender_pressure_params(req: SetPressureParamsRequest):
 
 @router.post("/api/swap_policies")
 def swap_policies(req: SwapPoliciesRequest):
-    """Swap the active PPO policies without resetting the environment."""
+    """Swap the active inference policies without resetting the environment."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     if not game_state.run_id:
@@ -2064,22 +2069,39 @@ def swap_policies(req: SwapPoliciesRequest):
     }
 
     def _apply_pass_mode(policy_obj) -> None:
-        policy = getattr(policy_obj, "policy", None)
-        if policy is None:
+        if policy_obj is None:
             return
         mode_value = str(getattr(game_state.env, "pass_mode", "directional"))
-        if hasattr(policy, "set_pass_mode"):
+        if hasattr(policy_obj, "set_pass_mode"):
             try:
-                policy.set_pass_mode(mode_value)
+                policy_obj.set_pass_mode(mode_value)
             except Exception:
                 pass
+            return
+        policy = getattr(policy_obj, "policy", None)
+        if policy is None or not hasattr(policy, "set_pass_mode"):
+            return
+        try:
+            policy.set_pass_mode(mode_value)
+        except Exception:
+            pass
+
+    def _refresh_policy_metadata() -> None:
+        game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
+        game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
+        game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
+        game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
 
     policies_changed = False
 
     if requested_user_policy is not None and requested_user_policy != game_state.unified_policy_key:
         try:
             user_path = get_unified_policy_path(client, game_state.run_id, requested_user_policy)
-            game_state.unified_policy = PPO.load(user_path, custom_objects=custom_objects)
+            game_state.unified_policy = load_inference_policy(
+                user_path,
+                device="cpu",
+                custom_objects=custom_objects,
+            )
             _apply_pass_mode(game_state.unified_policy)
             game_state.unified_policy_key = os.path.basename(user_path)
             game_state.unified_policy_path = user_path
@@ -2102,11 +2124,17 @@ def swap_policies(req: SwapPoliciesRequest):
                 game_state.defense_policy = None
                 game_state.opponent_unified_policy_key = None
                 game_state.opponent_policy_path = None
+                game_state.defense_policy_backend = None
+                game_state.defense_policy_capabilities = None
                 policies_changed = True
         elif requested_opponent_policy != game_state.opponent_unified_policy_key:
             try:
                 opp_path = get_unified_policy_path(client, game_state.run_id, requested_opponent_policy)
-                game_state.defense_policy = PPO.load(opp_path, custom_objects=custom_objects)
+                game_state.defense_policy = load_inference_policy(
+                    opp_path,
+                    device="cpu",
+                    custom_objects=custom_objects,
+                )
                 _apply_pass_mode(game_state.defense_policy)
                 game_state.opponent_unified_policy_key = os.path.basename(opp_path)
                 game_state.opponent_policy_path = opp_path
@@ -2129,6 +2157,7 @@ def swap_policies(req: SwapPoliciesRequest):
             "state": get_ui_game_state(),
         }
 
+    _refresh_policy_metadata()
     updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state

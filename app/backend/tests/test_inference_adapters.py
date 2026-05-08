@@ -38,8 +38,13 @@ class _FakeRawModel:
 
 
 class _FakeJAXRawModel:
-    def __init__(self, model_type: str):
-        self.metadata = {"policy_spec": {"model_type": model_type}}
+    def __init__(self, model_type: str, policy_spec: dict | None = None):
+        self.metadata = {
+            "policy_spec": {
+                "model_type": model_type,
+                **dict(policy_spec or {}),
+            }
+        }
         self.attention_payload_calls = []
 
     def predict(self, obs, deterministic: bool = False):
@@ -60,6 +65,9 @@ class _FakeJAXRawModel:
     def attention_payload(self, env, *, observer_is_offense: bool):
         self.attention_payload_calls.append((env, bool(observer_is_offense)))
         return {"weights_avg": [[1.0]], "weights_heads": [[[1.0]]], "labels": ["T0"], "heads": 1}
+
+    def state_value(self, env, *, observer_is_offense: bool):
+        return 0.75 if observer_is_offense else -0.25
 
 
 class _FakeCustomAdapter(InferencePolicyAdapter):
@@ -113,6 +121,9 @@ def test_jax_adapter_enables_attention_only_for_attention_checkpoints():
 
     assert get_policy_capabilities(attention_adapter)["attention"] is True
     assert get_policy_capabilities(mlp_adapter)["attention"] is False
+    assert get_policy_capabilities(attention_adapter)["state_values"] is True
+    assert attention_adapter.state_value(env, observer_is_offense=True) == 0.75
+    assert attention_adapter.state_value(env, observer_is_offense=False) == -0.25
     assert policy_attention_payload(
         attention_adapter,
         env,
@@ -129,6 +140,27 @@ def test_jax_adapter_enables_attention_only_for_attention_checkpoints():
         env,
         observer_is_offense=True,
     ) is None
+
+
+def test_jax_adapter_exposes_play_capabilities_from_policy_spec():
+    raw = _FakeJAXRawModel(
+        "attention",
+        {
+            "num_intents": 4,
+            "intent_embedding_enabled": True,
+            "intent_selector_enabled": True,
+        },
+    )
+    raw.metadata["env_config"] = {"enable_intent_learning": True, "num_intents": 4}
+    raw.metadata["play_name_map"] = {"0": "cut", "1": "flare"}
+
+    capabilities = get_policy_capabilities(JAXInferenceAdapter(raw))
+
+    assert capabilities["play_metadata"] is True
+    assert capabilities["selector_distribution"] is True
+    assert capabilities["per_intent_eval"] is True
+    assert capabilities["play_shot_charts"] is True
+    assert capabilities["manual_intent_override"] is True
 
 
 def test_helper_dispatch_uses_adapter_surface():
