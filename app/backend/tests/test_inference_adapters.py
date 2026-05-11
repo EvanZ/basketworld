@@ -161,6 +161,7 @@ def test_jax_adapter_exposes_play_capabilities_from_policy_spec():
     assert capabilities["per_intent_eval"] is True
     assert capabilities["play_shot_charts"] is True
     assert capabilities["manual_intent_override"] is True
+    assert capabilities["playbook"] is True
 
 
 def test_helper_dispatch_uses_adapter_surface():

@@ -184,3 +184,48 @@ def test_sequential_evaluation_best_intent_mode_bypasses_alpha_mixing(monkeypatc
     )
 
     assert captured_initial_intents == [chosen_intent]
+
+
+def test_run_evaluation_forwards_selector_settings_to_native_jax(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        backend_evaluation,
+        "can_run_native_jax_evaluation",
+        lambda **kwargs: True,
+    )
+
+    def _fake_native_eval(**kwargs):
+        captured.update(kwargs)
+        return {"results": [], "shot_accumulator": {}, "eval_diagnostics": {}}
+
+    monkeypatch.setattr(
+        backend_evaluation,
+        "run_native_jax_evaluation",
+        _fake_native_eval,
+    )
+
+    training_params = {
+        "intent_selector_enabled": True,
+        "intent_selector_mode": "integrated",
+        "intent_selector_multiselect_enabled": True,
+        "intent_selector_min_play_steps": 7,
+    }
+
+    backend_evaluation.run_evaluation(
+        num_episodes=3,
+        player_deterministic=True,
+        opponent_deterministic=True,
+        required_params={},
+        optional_params={},
+        training_params=training_params,
+        unified_policy_path="/tmp/jax-checkpoint",
+        opponent_policy_path=None,
+        user_team_name="OFFENSE",
+        role_flag_offense=1.0,
+        role_flag_defense=-1.0,
+        intent_selection_mode="best_intent",
+    )
+
+    assert captured["training_params"] is training_params
+    assert captured["intent_selection_mode"] == "best_intent"

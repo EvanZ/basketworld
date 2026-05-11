@@ -121,6 +121,10 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "use_set_obs": _str_to_bool,
     "illegal_defense_enabled": _str_to_bool,
     "offensive_three_seconds": _str_to_bool,
+    "three_second_lane_width": int,
+    "three_second_lane_height": int,
+    "three_second_max_steps": int,
+    "violation_reward": float,
     "include_hoop_vector": _str_to_bool,
     "enable_phi_shaping": _str_to_bool,
     "phi_aggregation_mode": str,
@@ -129,6 +133,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "potential_assist_pct": float,
     "full_assist_bonus_pct": float,
     "start_template_enabled": _str_to_bool,
+    "start_template_library": str,
     "start_template_prob": float,
     "start_template_jitter_scale": float,
     "start_template_mirror_prob": float,
@@ -172,6 +177,147 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
                 merged[key] = value
             break
     return merged
+
+
+def _coerce_jax_mlflow_training_value(raw_value):
+    if raw_value is None:
+        return None
+    raw_str = str(raw_value).strip()
+    if raw_str == "":
+        return raw_value
+    raw_lower = raw_str.lower()
+    if raw_lower in {"none", "null"}:
+        return None
+    if raw_lower in {"true", "false"}:
+        return raw_lower == "true"
+    try:
+        if all(token not in raw_str for token in (".", "e", "E")):
+            return int(raw_str)
+    except Exception:
+        pass
+    try:
+        return float(raw_str)
+    except Exception:
+        return raw_value
+
+
+def _jax_param_is_missing(value) -> bool:
+    return value is None or value == ""
+
+
+def _jax_setdefault_param(params: dict, key: str, value) -> None:
+    if _jax_param_is_missing(value):
+        return
+    if key not in params or _jax_param_is_missing(params.get(key)):
+        params[key] = value
+
+
+def _jax_int_param(params: dict, key: str, default: int | None = None) -> int | None:
+    value = params.get(key, default)
+    if _jax_param_is_missing(value):
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _populate_jax_training_ui_aliases(training_params: dict) -> dict:
+    """Populate SB3-style UI aliases from JAX-native MLflow/trainer params."""
+    merged = dict(training_params or {})
+
+    kernel_batch_size = _jax_int_param(merged, "kernel_batch_size")
+    rollout_horizon = _jax_int_param(merged, "rollout_horizon")
+    ppo_minibatches = max(1, _jax_int_param(merged, "ppo_minibatches", 1) or 1)
+    role_multiplier = 2 if str(merged.get("mode", "train_loop")).lower() == "train_loop" else 1
+    steps_per_update = None
+    if kernel_batch_size is not None and rollout_horizon is not None:
+        steps_per_update = int(kernel_batch_size * rollout_horizon * role_multiplier)
+        _jax_setdefault_param(merged, "num_envs", kernel_batch_size)
+        _jax_setdefault_param(merged, "n_steps", rollout_horizon)
+        _jax_setdefault_param(merged, "steps_per_update", steps_per_update)
+        _jax_setdefault_param(merged, "ppo_batch_size", steps_per_update)
+        minibatch_size = (
+            steps_per_update // ppo_minibatches
+            if steps_per_update % ppo_minibatches == 0
+            else steps_per_update
+        )
+        _jax_setdefault_param(merged, "batch_size", minibatch_size)
+
+    alias_pairs = {
+        "n_epochs": "policy_update_epochs",
+        "clip_range": "ppo_clip_range",
+        "vf_coef": "value_coef",
+        "ent_coef": "entropy_coef",
+    }
+    for ui_key, jax_key in alias_pairs.items():
+        _jax_setdefault_param(merged, ui_key, merged.get(jax_key))
+
+    has_model_config = any(
+        not _jax_param_is_missing(merged.get(key))
+        for key in (
+            "policy_model",
+            "model_type",
+            "attention_embed_dim",
+            "policy_hidden_dims",
+        )
+    )
+
+    if "policy_class" not in merged and has_model_config:
+        model = str(merged.get("policy_model", "") or merged.get("model_type", "") or "").strip()
+        if not model:
+            model = "attention" if merged.get("attention_embed_dim") else "mlp"
+        merged["policy_class"] = f"JAX {model} actor-critic"
+
+    if has_model_config:
+        _jax_setdefault_param(merged, "use_dual_critic", bool(merged.get("use_dual_critic", False)))
+    if "net_arch_used" not in merged and has_model_config:
+        if merged.get("attention_embed_dim"):
+            pi = merged.get("attention_pi_head_hidden_dims")
+            vf = merged.get("attention_vf_head_hidden_dims")
+            parts = [
+                f"attention embed={merged.get('attention_embed_dim')}",
+                f"heads={merged.get('attention_num_heads', 'N/A')}",
+                f"token_mlp={merged.get('attention_token_mlp_dim', 'N/A')}",
+            ]
+            if pi:
+                parts.append(f"pi=[{pi}]")
+            if vf:
+                parts.append(f"vf=[{vf}]")
+            merged["net_arch_used"] = ", ".join(parts)
+        elif merged.get("policy_hidden_dims"):
+            merged["net_arch_used"] = str(merged.get("policy_hidden_dims"))
+
+    if steps_per_update is not None:
+        for prefix in (
+            "intent_selector_alpha",
+            "intent_selector_eps",
+            "task_reward_scale",
+            "intent_diversity",
+        ):
+            for phase in ("warmup", "ramp"):
+                update_key = f"{prefix}_{phase}_updates"
+                steps_key = f"{prefix}_{phase}_steps"
+                updates = _jax_int_param(merged, update_key)
+                if updates is None or updates < 0:
+                    continue
+                _jax_setdefault_param(merged, steps_key, int(updates * steps_per_update))
+    return merged
+
+
+def _overlay_jax_mlflow_training_params(training_params: dict, mlflow_params: dict) -> dict:
+    """Expose JAX MLflow params as normal unprefixed training params for the UI/runtime."""
+    merged = dict(training_params or {})
+    for raw_key, raw_value in dict(mlflow_params or {}).items():
+        if not str(raw_key).startswith("jax/"):
+            continue
+        key = str(raw_key)[len("jax/") :]
+        if not key or key.startswith("env/"):
+            continue
+        merged[key] = _coerce_jax_mlflow_training_value(raw_value)
+    if bool(merged.get("intent_selector_enabled", False)):
+        merged.setdefault("intent_selector_mode", "integrated")
+    return _populate_jax_training_ui_aliases(merged)
 
 
 def _load_start_template_library_for_run(
@@ -258,6 +404,7 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
         trainer_config.setdefault("intent_selector_value_coef", 0.5)
         trainer_config.setdefault("intent_selector_multiselect_enabled", True)
         trainer_config.setdefault("intent_selector_min_play_steps", 3)
+    trainer_config = _populate_jax_training_ui_aliases(trainer_config)
     required_params: dict = {}
     optional_params = dict(config)
     phi_params = {}
@@ -494,9 +641,17 @@ async def init_game(request: InitGameRequest):
                 mlflow_phi_params,
             ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
             policy_metadata = get_policy_metadata(game_state.unified_policy) or {}
+            run_params = {}
+            try:
+                run_params = dict(mlflow_client.get_run(run_id).data.params or {})
+                mlflow_training_params = _overlay_jax_mlflow_training_params(
+                    mlflow_training_params,
+                    run_params,
+                )
+            except Exception as e:
+                print(f"[init_game] Warning: failed to apply JAX MLflow training params: {e}")
             if not dict(policy_metadata.get("env_config", {}) or {}):
                 try:
-                    run_params = dict(mlflow_client.get_run(run_id).data.params or {})
                     optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
                 except Exception as e:
                     print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
@@ -571,13 +726,35 @@ async def init_game(request: InitGameRequest):
 
         env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(optional_params)
         use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
-        game_state.env = basketworld.HexagonBasketballEnv(
-            **required_params,
-            **env_optional_params,
-            render_mode="rgb_array",
-        )
-        if use_set_obs:
-            game_state.env = SetObservationWrapper(game_state.env)
+        resolved_user_team = Team[request.user_team_name.upper()]
+        game_state.user_team = resolved_user_team
+
+        if game_state.unified_policy_backend == "jax":
+            from app.backend.jax_dev_runtime import JaxDevRuntime
+
+            game_state.jax_runtime = JaxDevRuntime(
+                required_params=required_params,
+                env_params=env_optional_params,
+                unified_policy=game_state.unified_policy,
+                opponent_policy=game_state.defense_policy,
+                user_team=resolved_user_team,
+                role_flag_offense=game_state.role_flag_offense,
+                role_flag_defense=game_state.role_flag_defense,
+            )
+            game_state.jax_runtime.reset()
+            game_state.env = game_state.jax_runtime.display_env
+            game_state.obs = game_state.jax_runtime.observation_dict(
+                observer_is_offense=resolved_user_team != Team.DEFENSE
+            )
+        else:
+            game_state.jax_runtime = None
+            game_state.env = basketworld.HexagonBasketballEnv(
+                **required_params,
+                **env_optional_params,
+                render_mode="rgb_array",
+            )
+            if use_set_obs:
+                game_state.env = SetObservationWrapper(game_state.env)
 
         def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
             if policy_obj is None:
@@ -599,7 +776,8 @@ async def init_game(request: InitGameRequest):
         _apply_policy_pass_mode(game_state.unified_policy, current_pass_mode)
         _apply_policy_pass_mode(game_state.defense_policy, current_pass_mode)
 
-        game_state.obs, _ = game_state.env.reset()
+        if game_state.jax_runtime is None:
+            game_state.obs, _ = game_state.env.reset()
         try:
             game_state.obs = validate_policy_observation_schema(
                 game_state.unified_policy,
@@ -636,7 +814,7 @@ async def init_game(request: InitGameRequest):
 
         _capture_turn_start_snapshot()
 
-        game_state.user_team = Team[request.user_team_name.upper()]
+        game_state.user_team = resolved_user_team
         game_state.run_id = run_id
         game_state.run_name = run_name or run_id
         game_state.mlflow_phi_shaping_params = mlflow_phi_params
@@ -649,7 +827,11 @@ async def init_game(request: InitGameRequest):
         game_state.episode_states = []
         game_state.phi_log = []
         game_state.playable_session = None
-        _initialize_app_selector_runtime_for_episode()
+        if game_state.jax_runtime is None:
+            _initialize_app_selector_runtime_for_episode()
+        else:
+            game_state.selector_segment_index = 0
+            game_state.selector_last_boundary_reason = None
 
         try:
             frame = game_state.env.render()
@@ -823,6 +1005,7 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
         "render_mode": "rgb_array",
     }
 
+    game_state.jax_runtime = None
     game_state.env = basketworld.HexagonBasketballEnv(**env_kwargs)
     game_state.obs, _ = game_state.env.reset()
     game_state.prev_obs = None
@@ -939,6 +1122,17 @@ def _normalize_action_overrides(raw_actions, n_players: int) -> tuple[dict[int, 
 @router.post("/api/step")
 def step(request: ActionRequest):
     """Takes a single step in the environment (restored full behavior from pre-refactor)."""
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.step(request, game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"JAX runtime step failed: {err}")
+
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
@@ -1420,9 +1614,20 @@ def mcts_advise(request: MCTSAdviseRequest):
 @router.post("/api/start_self_play")
 def start_self_play(request: StartSelfPlayRequest | None = None):
     """Prepare deterministic self-play by resetting with current initial conditions and a fixed seed."""
+    request = request or StartSelfPlayRequest()
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.start_self_play(request, game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"JAX runtime self-play reset failed: {err}")
+
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
-    request = request or StartSelfPlayRequest()
 
     env_read = env_view(game_state.env)
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
@@ -1538,6 +1743,17 @@ def start_self_play(request: StartSelfPlayRequest | None = None):
 @router.post("/api/reset_turn_state")
 def reset_turn_state():
     """Restore positions/ball holder/shot clock to the start-of-turn snapshot."""
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.reset_turn_state(game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to reset JAX turn: {err}")
+
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     if not game_state.turn_start_positions:

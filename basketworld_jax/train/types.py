@@ -17,9 +17,11 @@ class TrainerConfig:
     learning_rate: float
     policy_update_epochs: int
     ppo_minibatches: int = 1
+    single_episode_rollouts: bool = False
 
 
 class TrajectoryBatch(NamedTuple):
+    active_mask: Any
     flat_obs: Any
     policy_intent_index: Any
     policy_intent_gate: Any
@@ -34,6 +36,14 @@ class TrajectoryBatch(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    learner_turnovers: Any
+    opponent_turnovers: Any
+    turnover_pass_out_of_bounds: Any
+    turnover_intercepted: Any
+    turnover_defender_pressure: Any
+    turnover_move_out_of_bounds: Any
+    turnover_shot_clock: Any
+    turnover_offensive_three_seconds: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -95,6 +105,7 @@ class PPOBatch(NamedTuple):
     old_values: Any
     advantages: Any
     returns: Any
+    active_mask: Any
 
 
 class SelectorBatch(NamedTuple):
@@ -182,10 +193,18 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         jax=jax,
         jnp=jnp,
     )
+    active_mask = rollout.trajectory.active_mask.astype(jnp.float32)
     flat_advantages = advantages.reshape(-1)
-    adv_mean = jnp.mean(flat_advantages)
-    adv_std = jnp.std(flat_advantages)
-    normalized_advantages = (advantages - adv_mean) / jnp.maximum(adv_std, 1.0e-8)
+    flat_active_mask = active_mask.reshape(-1).astype(jnp.float32)
+    active_count = jnp.maximum(jnp.sum(flat_active_mask), 1.0)
+    adv_mean = jnp.sum(flat_advantages * flat_active_mask) / active_count
+    adv_var = jnp.sum(jnp.square(flat_advantages - adv_mean) * flat_active_mask) / active_count
+    normalized_advantages = (advantages - adv_mean) / jnp.sqrt(jnp.maximum(adv_var, 1.0e-8))
+    normalized_advantages = jnp.where(
+        active_mask.astype(jnp.bool_),
+        normalized_advantages,
+        jnp.zeros_like(normalized_advantages),
+    )
     return PPOBatch(
         flat_obs=rollout.trajectory.flat_obs.reshape(
             -1,
@@ -209,6 +228,7 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         old_values=rollout.trajectory.values.reshape(-1),
         advantages=normalized_advantages.reshape(-1),
         returns=returns.reshape(-1),
+        active_mask=flat_active_mask,
     )
 
 
@@ -277,7 +297,10 @@ def build_selector_batch(
         jax=jax,
         jnp=jnp,
     )
-    flat_mask = rollout.trajectory.selector_used.reshape(-1).astype(jnp.bool_)
+    flat_mask = (
+        rollout.trajectory.selector_used.reshape(-1).astype(jnp.bool_)
+        & (rollout.trajectory.active_mask.reshape(-1).astype(jnp.float32) > 0.5)
+    )
     max_samples = int(max_samples_per_update)
     if max_samples > 0:
         flat_order = jnp.cumsum(flat_mask.astype(jnp.int32))
@@ -334,15 +357,22 @@ def limit_selector_batch_samples(batch: SelectorBatch, jnp, *, max_samples: int)
     if max_count <= 0:
         return batch
     active_mask = batch.active_mask.astype(jnp.bool_)
-    active_order = jnp.cumsum(active_mask.astype(jnp.int32))
-    limited_mask = active_mask & (active_order <= max_count)
-    limited_mask_f = limited_mask.astype(jnp.float32)
+    active_count = jnp.sum(active_mask.astype(jnp.int32))
+    valid_count = jnp.minimum(active_count, jnp.asarray(max_count, dtype=jnp.int32))
+    indices = jnp.nonzero(active_mask, size=max_count, fill_value=0)[0]
+    valid_rows = jnp.arange(max_count, dtype=jnp.int32) < valid_count
+
+    def _take_active(field):
+        selected = jnp.take(field, indices, axis=0)
+        mask_shape = (max_count,) + (1,) * max(0, int(selected.ndim) - 1)
+        return jnp.where(valid_rows.reshape(mask_shape), selected, jnp.zeros_like(selected))
+
     return SelectorBatch(
-        flat_obs=batch.flat_obs,
-        chosen_intents=batch.chosen_intents,
-        old_log_probs=batch.old_log_probs,
-        old_values=batch.old_values,
-        advantages=jnp.where(limited_mask, batch.advantages, jnp.zeros_like(batch.advantages)),
-        returns=batch.returns,
-        active_mask=limited_mask_f,
+        flat_obs=_take_active(batch.flat_obs),
+        chosen_intents=_take_active(batch.chosen_intents).astype(jnp.int32),
+        old_log_probs=_take_active(batch.old_log_probs).astype(jnp.float32),
+        old_values=_take_active(batch.old_values).astype(jnp.float32),
+        advantages=_take_active(batch.advantages).astype(jnp.float32),
+        returns=_take_active(batch.returns).astype(jnp.float32),
+        active_mask=valid_rows.astype(jnp.float32),
     )

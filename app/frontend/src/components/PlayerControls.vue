@@ -4,6 +4,7 @@ import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import {
   applyStartTemplate,
+  cancelPlaybookAnalysis,
   getActionValues,
   getPlaybookProgress,
   getRewards,
@@ -340,11 +341,7 @@ const selectorAlphaSummary = computed(() => {
 });
 const selectorScheduleSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.intent_selector_alpha_warmup_steps;
-  const ramp = selectorTrainingParams.value?.intent_selector_alpha_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'intent_selector_alpha');
 });
 const selectorEpsSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -358,11 +355,7 @@ const selectorEpsSummary = computed(() => {
 });
 const selectorEpsScheduleSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.intent_selector_eps_warmup_steps;
-  const ramp = selectorTrainingParams.value?.intent_selector_eps_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'intent_selector_eps');
 });
 const selectorMultiselectEnabled = computed(() =>
   Boolean(selectorTrainingParams.value?.intent_selector_multiselect_enabled)
@@ -391,11 +384,7 @@ const taskRewardScaleSummary = computed(() => {
 const taskRewardScheduleSummary = computed(() => {
   const start = selectorTrainingParams.value?.task_reward_scale_start;
   if (start === null || start === undefined) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.task_reward_scale_warmup_steps;
-  const ramp = selectorTrainingParams.value?.task_reward_scale_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'task_reward_scale');
 });
 const selectorHeadContextLabel = computed(() => {
   const policyClass = String(selectorTrainingParams.value?.policy_class || '');
@@ -558,6 +547,8 @@ const intentStateError = ref(null);
 const counterfactualSnapshotUpdating = ref(false);
 const counterfactualSnapshotError = ref(null);
 const playbookIntentInput = ref('');
+const PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT = 24;
+const PLAYBOOK_MAX_ROLLOUTS_PER_INTENT = 512;
 const playbookNumRollouts = ref(24);
 const playbookMaxSteps = ref(8);
 const playbookRunToEnd = ref(false);
@@ -2660,12 +2651,14 @@ async function handleRunPlaybookAnalysis() {
 
   playbookRunning.value = true;
   playbookError.value = null;
-  const totalRollouts = playbookSelectedIntentIndices.value.length * Number(playbookNumRollouts.value || 16);
+  const rolloutsPerIntent = playbookRolloutsPerIntent.value;
+  playbookNumRollouts.value = rolloutsPerIntent;
+  const totalRollouts = playbookSelectedIntentIndices.value.length * rolloutsPerIntent;
   startPlaybookProgressPolling(totalRollouts);
   try {
     const res = await runPlaybookAnalysis({
       intent_indices: playbookSelectedIntentIndices.value,
-      num_rollouts: Number(playbookNumRollouts.value || 16),
+      num_rollouts: rolloutsPerIntent,
       max_steps: Number(playbookMaxSteps.value || 8),
       run_to_end: Boolean(playbookRunToEnd.value),
       use_snapshot: Boolean(playbookUseSnapshot.value),
@@ -2684,6 +2677,13 @@ async function handleRunPlaybookAnalysis() {
         status: 'completed',
         error: null,
       };
+    } else if (res?.status === 'cancelled') {
+      playbookProgress.value = {
+        ...playbookProgress.value,
+        running: false,
+        status: 'cancelled',
+        error: null,
+      };
     } else {
       throw new Error(res?.detail || 'Failed to generate playbook analysis');
     }
@@ -2699,6 +2699,23 @@ async function handleRunPlaybookAnalysis() {
   } finally {
     stopPlaybookProgressPolling();
     playbookRunning.value = false;
+  }
+}
+
+async function handleCancelPlaybookAnalysis() {
+  if (!playbookRunning.value) return;
+  playbookError.value = null;
+  try {
+    const res = await cancelPlaybookAnalysis();
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      ...(res?.progress || {}),
+      status: res?.progress?.status || 'cancel_requested',
+      error: null,
+    };
+  } catch (err) {
+    console.error('[PlayerControls] Failed to cancel playbook analysis', err);
+    playbookError.value = err?.message || 'Failed to cancel playbook analysis';
   }
 }
 
@@ -2926,7 +2943,6 @@ const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'moves', label: 'Moves' },
   { id: 'eval', label: 'Eval' },
   { id: 'training', label: 'Training' },
-  { id: 'jax', label: 'JAX' },
   { id: 'phi', label: 'Phi Shaping' },
   { id: 'observation', label: 'Observation' },
   { id: 'attention', label: 'Attention' },
@@ -2973,9 +2989,168 @@ const jaxModelMetadata = computed(() => {
   const raw = props.gameState?.model_metadata;
   return raw && typeof raw === 'object' ? raw : null;
 });
-const jaxFrozenConfigText = computed(() => prettyJson(jaxModelMetadata.value?.frozen_config || null));
+const jaxEnvConfig = computed(() => {
+  const meta = jaxModelMetadata.value || {};
+  const env = meta.env_config || meta.frozen_config || {};
+  return env && typeof env === 'object' ? env : {};
+});
+const jaxTrainerConfig = computed(() => {
+  const raw = jaxModelMetadata.value?.trainer_config;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const jaxPolicySpec = computed(() => {
+  const raw = jaxModelMetadata.value?.policy_spec;
+  return raw && typeof raw === 'object' ? raw : {};
+});
 const jaxTrainerConfigText = computed(() => prettyJson(jaxModelMetadata.value?.trainer_config || null));
 const jaxPolicySpecText = computed(() => prettyJson(jaxModelMetadata.value?.policy_spec || null));
+function firstPresent(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return 'N/A';
+}
+function formatConfigValue(value, fallback = 'N/A') {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'number' && !Number.isFinite(value)) return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toLocaleString() : String(value);
+}
+function formatScheduleWindow(params, prefix) {
+  const warmupUpdates = params?.[`${prefix}_warmup_updates`];
+  const rampUpdates = params?.[`${prefix}_ramp_updates`];
+  if (warmupUpdates !== null && warmupUpdates !== undefined && warmupUpdates !== '') {
+    return `warmup ${formatConfigValue(warmupUpdates, '0')} updates, ramp ${formatConfigValue(rampUpdates, '0')} updates`;
+  }
+  const warmupSteps = params?.[`${prefix}_warmup_steps`];
+  const rampSteps = params?.[`${prefix}_ramp_steps`];
+  return `warmup ${formatConfigValue(warmupSteps, '0')} steps, ramp ${formatConfigValue(rampSteps, '0')} steps`;
+}
+const jaxRuntimeRows = computed(() => {
+  if (!isJaxModel.value) return [];
+  const spec = jaxPolicySpec.value || {};
+  const metadata = jaxModelMetadata.value || {};
+  const rows = [
+    {
+      label: 'Backend',
+      value: props.gameState?.model_backend || 'jax',
+      tooltip: 'Inference/training backend for the currently loaded model.',
+    },
+    {
+      label: 'Checkpoint',
+      value: metadata.checkpoint_path || 'N/A',
+      tooltip: 'MLflow checkpoint artifact currently loaded into the dev runtime.',
+    },
+    {
+      label: 'Saved update',
+      value: metadata.update_index ?? 'N/A',
+      tooltip: 'Training update index stored in the loaded checkpoint metadata.',
+    },
+    {
+      label: 'Saved at',
+      value: metadata.saved_at || 'N/A',
+      tooltip: 'Checkpoint save timestamp from checkpoint metadata.',
+    },
+    {
+      label: 'Model type',
+      value: spec.model_type || 'N/A',
+      tooltip: 'JAX policy representation: attention or MLP.',
+    },
+    {
+      label: 'Hidden dim',
+      value: firstPresent(spec.hidden_dim, spec.attention_embed_dim),
+      tooltip: 'Main hidden/embedding width for the JAX policy network.',
+    },
+    {
+      label: 'Attention layers',
+      value: firstPresent(spec.attention_num_layers),
+      tooltip: 'Number of attention blocks when this is an attention checkpoint.',
+    },
+    {
+      label: 'Attention heads',
+      value: firstPresent(spec.attention_num_heads),
+      tooltip: 'Number of attention heads when this is an attention checkpoint.',
+    },
+  ];
+  if (paramCounts.value?.total !== undefined) {
+    rows.push({
+      label: 'Params',
+      value: formatParamCount(paramCounts.value.total),
+      tooltip: 'Total trainable parameter count exposed by backend metadata.',
+    });
+  }
+  return rows;
+});
+const jaxTrainingLoopRows = computed(() => {
+  if (!isJaxModel.value) return [];
+  const training = selectorTrainingParams.value || {};
+  const trainer = jaxTrainerConfig.value || {};
+  const batchSize = firstPresent(training.kernel_batch_size, trainer.kernel_batch_size);
+  const horizon = firstPresent(training.rollout_horizon, trainer.rollout_horizon);
+  const explicitStepsPerUpdate = firstPresent(
+    training.steps_per_update,
+    trainer.steps_per_update,
+    training.ppo_batch_size,
+    trainer.ppo_batch_size
+  );
+  const roleMultiplier = String(firstPresent(training.mode, trainer.mode, 'train_loop')).toLowerCase() === 'train_loop' ? 2 : 1;
+  const numericStepsPerUpdate = Number(batchSize) * Number(horizon) * roleMultiplier;
+  const stepsPerUpdate = explicitStepsPerUpdate !== 'N/A'
+    ? formatConfigValue(explicitStepsPerUpdate)
+    : formatConfigValue(numericStepsPerUpdate);
+  return [
+    {
+      label: 'Batch envs',
+      value: batchSize,
+      tooltip: 'Number of parallel JAX environment states stepped in one compiled rollout.',
+    },
+    {
+      label: 'Rollout horizon',
+      value: horizon,
+      tooltip: 'Compiled rollout length per PPO update.',
+    },
+    {
+      label: 'Steps/update',
+      value: stepsPerUpdate,
+      tooltip: 'Environment steps collected per PPO update. In train-loop mode this includes both offense and defense role rollouts.',
+    },
+    {
+      label: 'Updates',
+      value: firstPresent(training.num_updates, trainer.num_updates),
+      tooltip: 'Total PPO update count configured for the run.',
+    },
+    {
+      label: 'Update epochs',
+      value: firstPresent(training.policy_update_epochs, trainer.policy_update_epochs),
+      tooltip: 'Number of PPO passes through each collected rollout batch.',
+    },
+    {
+      label: 'Minibatches',
+      value: firstPresent(training.ppo_minibatches, trainer.ppo_minibatches),
+      tooltip: 'Number of minibatches each PPO update is split into.',
+    },
+    {
+      label: 'Learning rate',
+      value: firstPresent(training.learning_rate, trainer.learning_rate),
+      tooltip: 'Optax optimizer learning rate.',
+    },
+    {
+      label: 'Clip range',
+      value: firstPresent(training.ppo_clip_range, trainer.ppo_clip_range),
+      tooltip: 'PPO ratio clipping range.',
+    },
+    {
+      label: 'Value coef',
+      value: firstPresent(training.value_coef, trainer.value_coef),
+      tooltip: 'Weight applied to value-function loss.',
+    },
+    {
+      label: 'Entropy coef',
+      value: firstPresent(training.entropy_coef, trainer.entropy_coef, training.ent_coef),
+      tooltip: 'Weight applied to low-level action entropy.',
+    },
+  ];
+});
 const playDiagnosticsEnabled = computed(() => {
   const caps = modelCapabilities.value || {};
   const hasIntentConfig = Boolean(
@@ -2987,6 +3162,53 @@ const playDiagnosticsEnabled = computed(() => {
 const selectorDistributionCapabilityEnabled = computed(() =>
   (modelCapabilities.value || {}).selector_distribution !== false
 );
+function formatDebugNumber(value, digits = 3) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : 'N/A';
+}
+function formatDebugProb(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `${(num * 100).toFixed(1)}%` : 'N/A';
+}
+const selectorDebug = computed(() => {
+  const raw = props.gameState?.selector_debug;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const liveSelectorDebugSummary = computed(() => {
+  const debug = selectorDebug.value || {};
+  const transition = debug.last_transition && typeof debug.last_transition === 'object'
+    ? debug.last_transition
+    : null;
+  const currentProbs = debug.current_play_probabilities && typeof debug.current_play_probabilities === 'object'
+    ? debug.current_play_probabilities
+    : null;
+  return {
+    runtimeEnabled: debug.runtime_enabled === true ? 'Yes' : debug.runtime_enabled === false ? 'No' : 'N/A',
+    modelSelectorEnabled: debug.model_selector_enabled === true ? 'Yes' : debug.model_selector_enabled === false ? 'No' : 'N/A',
+    trainingSelectorEnabled: debug.training_selector_enabled === true ? 'Yes' : debug.training_selector_enabled === false ? 'No' : 'N/A',
+    multiselectEnabled: debug.multiselect_enabled === true ? 'Yes' : debug.multiselect_enabled === false ? 'No' : 'N/A',
+    alpha: formatDebugNumber(debug.alpha_current),
+    eps: formatDebugNumber(debug.eps_current),
+    trainingAlpha: formatDebugNumber(debug.training_alpha_current),
+    trainingEps: formatDebugNumber(debug.training_eps_current),
+    forceLearnedRuntime: debug.force_learned_runtime === true ? 'Yes' : debug.force_learned_runtime === false ? 'No' : 'N/A',
+    minPlaySteps: debug.min_play_steps ?? 'N/A',
+    commitmentSteps: debug.commitment_steps ?? 'N/A',
+    eligibleBoundary: debug.eligible_boundary_reason || 'None',
+    lastCompletedPassBoundary: debug.last_completed_pass_boundary === true ? 'Yes' : 'No',
+    lastTransitionSource: debug.last_transition_source || 'N/A',
+    lastTransitionPreviousIntent: transition?.previous_intent_index ?? 'N/A',
+    lastTransitionIntent: transition?.intent_index ?? 'N/A',
+    lastTransitionChanged: transition?.changed_intent === true ? 'Yes' : transition?.changed_intent === false ? 'No' : 'N/A',
+    lastTransitionUsedSelector: transition?.used_selector === true ? 'Yes' : transition?.used_selector === false ? 'No' : 'N/A',
+    lastTransitionAlpha: formatDebugNumber(transition?.alpha),
+    lastTransitionEps: formatDebugNumber(transition?.eps),
+    currentRawProb: formatDebugProb(currentProbs?.raw_prob),
+    currentMixedProb: formatDebugProb(currentProbs?.mixed_prob),
+    currentDeployedProb: formatDebugProb(currentProbs?.deployed_prob),
+    currentDeployedRank: currentProbs?.rank_deployed ?? debug.current_play_rank_deployed ?? 'N/A',
+  };
+});
 const livePlaySummary = computed(() => {
   const state = props.gameState || {};
   const active = Boolean(state.intent_active_current);
@@ -3026,12 +3248,14 @@ function isDevTabVisible(tabId) {
   if (tabId === 'advisor') return caps.mcts !== false;
   if (tabId === 'playbook') return caps.playbook !== false && caps.playbook_preview !== false;
   if (tabId === 'attention') return caps.attention !== false;
-  if (tabId === 'environment' || tabId === 'training' || tabId === 'phi') {
+  if (tabId === 'environment' || tabId === 'training') {
+    return isJaxModel.value || caps.env_training_tabs !== false;
+  }
+  if (tabId === 'phi') {
     return caps.env_training_tabs !== false;
   }
   if (tabId === 'observation') return caps.observation_panel !== false;
   if (tabId === 'eval') return caps.eval !== false;
-  if (tabId === 'jax') return isJaxModel.value;
   return true;
 }
 
@@ -4191,6 +4415,15 @@ const playbookSelectedIntentIndices = computed(() => {
   }
   return out;
 });
+const playbookMaxRolloutsPerIntent = computed(() => PLAYBOOK_MAX_ROLLOUTS_PER_INTENT);
+const playbookRolloutsPerIntent = computed(() => {
+  const raw = Number(playbookNumRollouts.value || PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT);
+  const rounded = Number.isFinite(raw) ? Math.round(raw) : PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT;
+  return Math.max(1, Math.min(playbookMaxRolloutsPerIntent.value, rounded));
+});
+const playbookTotalRollouts = computed(() =>
+  playbookSelectedIntentIndices.value.length * playbookRolloutsPerIntent.value
+);
 
 // Shot probability display is handled on the board
 
@@ -6302,6 +6535,94 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">Last boundary:</span>
               <span class="param-value">{{ livePlaySummary.boundaryReason }}</span>
             </div>
+            <div class="param-item" data-tooltip="Boundary that would trigger if the next model-driven step started from the currently displayed state.">
+              <span class="param-name">Eligible boundary:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.eligibleBoundary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether JAX runtime selector logic is active for this loaded checkpoint and current team.">
+              <span class="param-name">Selector runtime:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.runtimeEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the loaded model exposes an intent selector head.">
+              <span class="param-name">Model selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.modelSelectorEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether selector training/runtime was enabled in the MLflow training params for this run.">
+              <span class="param-name">Training selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingSelectorEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the selector can reselect after timeout or completed-pass boundaries.">
+              <span class="param-name">Multiselect:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.multiselectEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether interactive JAX runtime bypasses training alpha fallback and samples from the learned selector distribution whenever possible.">
+              <span class="param-name">Force learned runtime:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.forceLearnedRuntime }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Effective runtime selector alpha. In dev UI this should normally be 1.0 so selection uses the learned selector instead of training-time uniform fallback.">
+              <span class="param-name">Runtime alpha:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.alpha }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current selector epsilon floor mixed into learned probabilities before alpha fallback.">
+              <span class="param-name">Runtime eps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.eps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Training alpha loaded from MLflow/checkpoint metadata before the dev-runtime override.">
+              <span class="param-name">Training alpha:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingAlpha }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Training epsilon loaded from MLflow/checkpoint metadata before the dev-runtime override.">
+              <span class="param-name">Training eps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingEps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Minimum current-play age before a completed pass can trigger reselection.">
+              <span class="param-name">Min play steps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.minPlaySteps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Commitment length used when a new selector play is applied.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.commitmentSteps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Source of the last selector transition: learned_selector means sampled from learned selector distribution; uniform_fallback means alpha fallback chose uniformly.">
+              <span class="param-name">Last source:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionSource }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent index selected by the last selector transition.">
+              <span class="param-name">Last selected z:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionIntent }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent index that was active immediately before the last selector transition.">
+              <span class="param-name">Previous z:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionPreviousIntent }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the last selector transition changed the active play index. No means the selector resampled the same play.">
+              <span class="param-name">Changed play:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionChanged }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the last transition used the learned selector rather than uniform fallback.">
+              <span class="param-name">Used selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionUsedSelector }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Deployed probability assigned to the current play by the selector distribution.">
+              <span class="param-name">Current deployed prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentDeployedProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Raw learned selector probability for the current play before epsilon and alpha mixing.">
+              <span class="param-name">Current raw prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentRawProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Mixed selector probability for the current play after epsilon but before alpha fallback.">
+              <span class="param-name">Current mixed prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentMixedProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Rank of the current play by deployed selector probability; 1 is most likely.">
+              <span class="param-name">Current deployed rank:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentDeployedRank }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the previous executed step completed a pass and is eligible to trigger a pass-boundary reselection subject to min play steps.">
+              <span class="param-name">Completed-pass boundary:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastCompletedPassBoundary }}</span>
+            </div>
             <div class="param-item" data-tooltip="Whether the current offense play is visible to the defensive policy view.">
               <span class="param-name">Defense-visible:</span>
               <span class="param-value">{{ livePlaySummary.visibleToDefense ? 'Yes' : 'No' }}</span>
@@ -6580,14 +6901,21 @@ function offenseSkillDeltaLabel(idx) {
           </div>
 
           <div class="eval-row">
-            <label>Rollouts</label>
+            <label>Rollouts / play</label>
             <input
               type="number"
               min="1"
-              max="512"
+              :max="playbookMaxRolloutsPerIntent"
               v-model.number="playbookNumRollouts"
               :disabled="playbookControlsDisabled"
             />
+            <span class="status-note">
+              Total: {{ playbookTotalRollouts.toLocaleString() }} rollouts
+              ({{ playbookRolloutsPerIntent.toLocaleString() }} per play × {{ playbookSelectedIntentIndices.length }} plays)
+            </span>
+            <span class="status-note" v-if="isJaxModel">
+              JAX Playbook uses a batched compiled path for checkpoint-backed models.
+            </span>
             <label>Horizon</label>
             <input
               type="number"
@@ -6611,6 +6939,14 @@ function offenseSkillDeltaLabel(idx) {
             >
               {{ playbookRunning ? 'Generating…' : 'Generate' }}
             </button>
+            <button
+              v-if="playbookRunning"
+              class="eval-run-btn secondary"
+              @click="handleCancelPlaybookAnalysis"
+              type="button"
+            >
+              Cancel
+            </button>
           </div>
 
           <div v-if="playbookRunning" class="eval-progress-wrap">
@@ -6628,7 +6964,7 @@ function offenseSkillDeltaLabel(idx) {
               />
             </div>
             <span class="eval-status">
-              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || (playbookSelectedIntentIndices.length * Number(playbookNumRollouts || 0)) }}
+              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || playbookTotalRollouts }}
             </span>
             <span class="eval-status" v-if="playbookProgressSafe.total > 0">({{ playbookProgressPercent }})</span>
           </div>
@@ -7434,6 +7770,18 @@ function offenseSkillDeltaLabel(idx) {
         </div>
         <div v-else>
         <div class="parameters-grid">
+          <div v-if="isJaxModel" class="param-category">
+            <h5>Model Runtime</h5>
+            <div
+              v-for="row in jaxRuntimeRows"
+              :key="`jax-runtime-${row.label}`"
+              class="param-item"
+              :data-tooltip="row.tooltip"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+          </div>
           <div v-if="hasLoadedStartTemplates" class="param-category">
             <h5>Start Templates</h5>
             <div class="eval-row">
@@ -8085,6 +8433,18 @@ function offenseSkillDeltaLabel(idx) {
             </div>
           </div>
 
+          <div v-if="isJaxModel" class="param-category">
+            <h5>Advanced JAX Metadata</h5>
+            <details class="jax-metadata-details">
+              <summary>Environment config</summary>
+              <pre class="jax-config-pre">{{ prettyJson(jaxEnvConfig) }}</pre>
+            </details>
+            <details class="jax-metadata-details">
+              <summary>Policy spec</summary>
+              <pre class="jax-config-pre">{{ jaxPolicySpecText }}</pre>
+            </details>
+          </div>
+
           <div class="param-category">
             <h5>Counterfactual Snapshot</h5>
             <div class="param-item" data-tooltip="Whether a branch point snapshot is currently stored for restoring the exact current state later.">
@@ -8298,6 +8658,22 @@ function offenseSkillDeltaLabel(idx) {
           No training parameters available
         </div>
         <div v-else class="parameters-grid">
+          <div v-if="isJaxModel" class="param-category">
+            <h5>JAX PPO Loop</h5>
+            <div
+              v-for="row in jaxTrainingLoopRows"
+              :key="`jax-training-loop-${row.label}`"
+              class="param-item"
+              :data-tooltip="row.tooltip"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+            <details class="jax-metadata-details">
+              <summary>Trainer config</summary>
+              <pre class="jax-config-pre">{{ jaxTrainerConfigText }}</pre>
+            </details>
+          </div>
           <div class="param-category">
             <h5>PPO Core</h5>
             <div class="param-item" data-tooltip="Step size for gradient descent. Lower = slower but more stable training.">
@@ -8686,52 +9062,6 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">Opponent pool exploration:</span>
               <span class="param-value">{{ props.gameState.training_params.opponent_pool_exploration || 'N/A' }}</span>
             </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- JAX Tab -->
-    <div v-if="activeTab === 'jax'" class="tab-content">
-      <div class="parameters-section">
-        <h4>JAX Model Metadata</h4>
-        <div v-if="!props.gameState || !isJaxModel" class="no-data">
-          No JAX model loaded.
-        </div>
-        <div v-else class="parameters-grid">
-          <div class="param-category">
-            <h5>Runtime</h5>
-            <div class="param-item">
-              <span class="param-name">Backend:</span>
-              <span class="param-value">{{ props.gameState.model_backend || 'N/A' }}</span>
-            </div>
-            <div class="param-item">
-              <span class="param-name">Checkpoint:</span>
-              <span class="param-value">{{ jaxModelMetadata?.checkpoint_path || 'N/A' }}</span>
-            </div>
-            <div class="param-item">
-              <span class="param-name">Saved at:</span>
-              <span class="param-value">{{ jaxModelMetadata?.saved_at || 'N/A' }}</span>
-            </div>
-            <div class="param-item">
-              <span class="param-name">Update:</span>
-              <span class="param-value">{{ jaxModelMetadata?.update_index ?? 'N/A' }}</span>
-            </div>
-          </div>
-
-          <div class="param-category">
-            <h5>Frozen Env Config</h5>
-            <pre class="jax-config-pre">{{ jaxFrozenConfigText }}</pre>
-          </div>
-
-          <div class="param-category">
-            <h5>Trainer Config</h5>
-            <pre class="jax-config-pre">{{ jaxTrainerConfigText }}</pre>
-          </div>
-
-          <div class="param-category">
-            <h5>Policy Spec</h5>
-            <pre class="jax-config-pre">{{ jaxPolicySpecText }}</pre>
           </div>
         </div>
       </div>

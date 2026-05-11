@@ -617,6 +617,18 @@ export async function getPlaybookProgress() {
   return response.json();
 }
 
+export async function cancelPlaybookAnalysis() {
+  const response = await fetch(`${API_BASE_URL}/api/cancel_playbook_analysis`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to cancel playbook analysis');
+  }
+  return response.json();
+}
+
 export async function resetTurnState() {
   const response = await fetch(`${API_BASE_URL}/api/reset_turn_state`, {
     method: 'POST',

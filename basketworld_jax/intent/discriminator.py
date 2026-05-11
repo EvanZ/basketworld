@@ -24,6 +24,7 @@ class IntentDiscriminatorSpec:
     ramp_steps: int
     bonus_clip: float
     eval_holdout_fraction: float
+    dropout: float
     max_obs_dim: int
     action_dim_per_player: int
     training_player_count: int
@@ -78,6 +79,7 @@ def build_intent_discriminator_spec(args, policy_spec) -> IntentDiscriminatorSpe
         ramp_steps=int(getattr(args, "intent_diversity_ramp_steps", 1_000_000)),
         bonus_clip=float(getattr(args, "intent_diversity_clip", 2.0)),
         eval_holdout_fraction=float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25)),
+        dropout=float(min(max(0.0, getattr(args, "intent_disc_dropout", 0.1)), 0.99)),
         max_obs_dim=int(obs_dim),
         action_dim_per_player=int(policy_spec.action_dim_per_player),
         training_player_count=int(policy_spec.training_player_count),
@@ -97,7 +99,9 @@ def build_intent_discriminator_module(spec: IntentDiscriminatorSpec):
 
     class IntentDiscriminatorModule(nn.Module):
         @nn.compact
-        def _set_step_forward(self, features):
+        def _set_step_forward(self, features, *, train: bool = False):
+            dropout_rate = float(min(max(0.0, spec.dropout), 0.99))
+            deterministic = (not bool(train)) or dropout_rate <= 0.0
             players = features["players"].astype(jnp.float32)
             globals_vec = features["globals"].astype(jnp.float32)
             role_flag = features["role_flag"].astype(jnp.float32)
@@ -114,6 +118,10 @@ def build_intent_discriminator_module(spec: IntentDiscriminatorSpec):
             tokens = jnp.concatenate([players, globals_expanded, role_expanded], axis=-1)
             hidden = nn.Dense(int(spec.hidden_dim), name="set_token_mlp_0")(tokens)
             hidden = nn.relu(hidden)
+            hidden = nn.Dropout(rate=dropout_rate, name="set_token_dropout")(
+                hidden,
+                deterministic=deterministic,
+            )
             hidden = nn.Dense(int(spec.hidden_dim), name="set_token_mlp_1")(hidden)
 
             cls_count = max(0, int(spec.set_cls_tokens))
@@ -139,34 +147,55 @@ def build_intent_discriminator_module(spec: IntentDiscriminatorSpec):
             scale = jnp.asarray(head_dim, dtype=jnp.float32) ** -0.5
             scores = jnp.einsum("bthd,bshd->bhts", query, key) * scale
             weights = nn.softmax(scores, axis=-1)
+            weights = nn.Dropout(rate=dropout_rate, name="set_attention_dropout")(
+                weights,
+                deterministic=deterministic,
+            )
             attended = jnp.einsum("bhts,bshd->bthd", weights, value)
             attended = attended.reshape(hidden.shape[0], hidden.shape[1], int(spec.hidden_dim))
             projected = nn.Dense(int(spec.hidden_dim), name="set_attention_out")(attended)
             hidden = nn.LayerNorm(name="set_attention_norm")(hidden + projected)
             ff = nn.Dense(int(spec.hidden_dim), name="set_ff_0")(hidden)
             ff = nn.relu(ff)
-            ff = nn.Dense(int(spec.hidden_dim), name="set_ff_1")(ff)
+            ff = nn.Dropout(rate=dropout_rate, name="set_ff_dropout")(
+                ff,
+                deterministic=deterministic,
+            )
             hidden = nn.LayerNorm(name="set_ff_norm")(hidden + ff)
 
             if cls_count > 0:
                 embedding = jnp.mean(hidden[:, -cls_count:, :], axis=1)
             else:
                 embedding = jnp.mean(hidden, axis=1)
-            logits = nn.Dense(int(spec.num_intents), name="intent_head")(embedding)
+            head_input = nn.Dropout(rate=dropout_rate, name="intent_head_dropout")(
+                embedding,
+                deterministic=deterministic,
+            )
+            logits = nn.Dense(int(spec.num_intents), name="intent_head")(head_input)
             return {
                 "embedding": embedding,
                 "logits": logits,
             }
 
         @nn.compact
-        def __call__(self, features):
+        def __call__(self, features, *, train: bool = False):
+            dropout_rate = float(min(max(0.0, spec.dropout), 0.99))
+            deterministic = (not bool(train)) or dropout_rate <= 0.0
             if str(spec.encoder_type) == "set_step":
-                return self._set_step_forward(features)
+                return self._set_step_forward(features, train=train)
             hidden = nn.Dense(int(spec.hidden_dim), name="hidden_0")(features.astype(jnp.float32))
             hidden = nn.relu(hidden)
+            hidden = nn.Dropout(rate=dropout_rate, name="hidden_dropout")(
+                hidden,
+                deterministic=deterministic,
+            )
             embedding = nn.Dense(int(spec.hidden_dim), name="embedding")(hidden)
             embedding = nn.relu(embedding)
-            logits = nn.Dense(int(spec.num_intents), name="intent_head")(embedding)
+            head_input = nn.Dropout(rate=dropout_rate, name="intent_head_dropout")(
+                embedding,
+                deterministic=deterministic,
+            )
+            logits = nn.Dense(int(spec.num_intents), name="intent_head")(head_input)
             return {
                 "embedding": embedding,
                 "logits": logits,
@@ -214,7 +243,10 @@ def build_intent_step_features_from_rollout(rollout: RolloutOutput, spec: Intent
             globals_vec = globals_vec.at[..., 1].set(0.0)
         role_flag = flat_obs[..., global_end : global_end + 1]
         labels = trajectory.policy_intent_index.astype(jnp.int32)
-        active_mask = trajectory.policy_intent_gate.astype(jnp.float32) > 0.5
+        active_mask = (
+            (trajectory.policy_intent_gate.astype(jnp.float32) > 0.5)
+            & (trajectory.active_mask.astype(jnp.float32) > 0.5)
+        )
         return {
             "players": players,
             "globals": globals_vec,
@@ -242,7 +274,10 @@ def build_intent_step_features_from_rollout(rollout: RolloutOutput, spec: Intent
     )
     features = jnp.concatenate([obs, actions, events], axis=-1).astype(jnp.float32)
     labels = trajectory.policy_intent_index.astype(jnp.int32)
-    active_mask = trajectory.policy_intent_gate.astype(jnp.float32) > 0.5
+    active_mask = (
+        (trajectory.policy_intent_gate.astype(jnp.float32) > 0.5)
+        & (trajectory.active_mask.astype(jnp.float32) > 0.5)
+    )
     return features, labels, active_mask
 
 
@@ -282,13 +317,16 @@ def build_intent_discriminator_update_runner(jax, jnp, spec: IntentDiscriminator
             }
         return features[indices]
 
-    def _forward(params, features):
+    def _forward(params, features, *, train: bool = False, rng=None):
+        apply_kwargs = {"train": bool(train)}
+        if bool(train) and float(spec.dropout) > 0.0 and rng is not None:
+            apply_kwargs["rngs"] = {"dropout": rng}
         if str(spec.encoder_type) == "set_step":
-            return module.apply({"params": params}, features)
-        return module.apply({"params": params}, features.astype(jnp.float32))
+            return module.apply({"params": params}, features, **apply_kwargs)
+        return module.apply({"params": params}, features.astype(jnp.float32), **apply_kwargs)
 
-    def _loss_fn(params, features, labels, weights):
-        out = _forward(params, features)
+    def _loss_fn(params, features, labels, weights, rng):
+        out = _forward(params, features, train=True, rng=rng)
         logits = out["logits"]
         labels = jnp.clip(labels.astype(jnp.int32), 0, num_intents - 1)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
@@ -415,17 +453,19 @@ def build_intent_discriminator_update_runner(jax, jnp, spec: IntentDiscriminator
         def _update_step(carry, step_idx):
             step_params, step_opt_state, step_key = carry
             step_key = jax.random.fold_in(step_key, step_idx)
+            sample_key, dropout_key = jax.random.split(step_key)
             mb_features, mb_labels, mb_weights = _take_batch(
                 flat_features,
                 flat_labels,
                 train_weights,
-                step_key,
+                sample_key,
             )
             (_, train_metrics), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
                 step_params,
                 mb_features,
                 mb_labels,
                 mb_weights,
+                dropout_key,
             )
             updates, next_opt_state = transform.update(grads, step_opt_state, step_params)
             next_params = optax.apply_updates(step_params, updates)

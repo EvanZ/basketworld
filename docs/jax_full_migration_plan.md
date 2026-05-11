@@ -6,6 +6,8 @@ Replace the current rollout-critical Torch/SB3 stack with a JAX-native training 
 
 This plan assumes the reduced JAX path has already passed proof-of-value on throughput.
 
+For a study-oriented overview of the current JAX package structure and how the SB3 architecture maps to the JAX implementation, see [jax_codebase_overview.md](/home/evanzamir/basketworld/docs/jax_codebase_overview.md).
+
 ## What Has Already Been Proven
 
 The benchmark phase established:
@@ -339,6 +341,24 @@ Implementation milestones:
    - one-step transition tests for shoot, pass, turnover, lane violations, and terminal states
    - template reset determinism tests
    - backend route tests proving JAX checkpoints do not call `HexagonBasketballEnv.step`
+
+Current implementation status:
+
+- backend session state now has an explicit `jax_runtime` slot
+- JAX checkpoint initialization now creates a `JaxDevRuntime` session instead of treating the Python env as the canonical stepping runtime
+- `/api/step`, `/api/start_self_play`, `/api/reset_turn_state`, and state serialization dispatch to the JAX runtime when a JAX checkpoint is loaded
+- `JaxDevRuntime` stores canonical JAX `KernelState` plus static env config, runs reset/step through `basketworld_jax.env.minimal`, and serializes back into the existing frontend payload shape
+- the Python env is still constructed for static config/display helper compatibility, but JAX interactive stepping no longer calls `HexagonBasketballEnv.step`
+- JAX self-play now supports selector multiselect reselection at commitment-timeout and completed-pass boundaries when the checkpoint/run metadata enables it
+- the first parity tests now prove state serialization dispatch, route dispatch, and a direct JAX runtime step that fails if the Python env `step()` is called
+
+Remaining runtime hardening:
+
+- replace any remaining Python-env helper dependence with explicit JAX serializers where practical
+- harden selector parity with real-checkpoint UI smoke tests and any missing diagnostics around selector segment starts
+- harden start-template reset parity and determinism under the JAX resolver
+- add focused one-step parity tests for passes, shots, turnovers, lane violations, and terminal states
+- exercise the dev app manually with real checkpoints, including templates, value overlay, attention, selector preferences, and replay
 
 Exit criteria:
 

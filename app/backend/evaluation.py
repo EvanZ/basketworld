@@ -1649,11 +1649,13 @@ def run_evaluation(
             opponent_deterministic=opponent_deterministic,
             required_params=required_params,
             optional_params=optional_params,
+            training_params=training_params,
             unified_policy_path=unified_policy_path,
             opponent_policy_path=opponent_policy_path,
             user_team_name=user_team_name,
             role_flag_offense=role_flag_offense,
             role_flag_defense=role_flag_defense,
+            intent_selection_mode=intent_selection_mode,
             progress_callback=progress_callback,
         )
 

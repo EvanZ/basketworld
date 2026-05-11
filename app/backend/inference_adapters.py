@@ -118,7 +118,7 @@ class JAXInferenceAdapter(InferencePolicyAdapter):
                 self_play=True,
                 observation_panel=True,
                 eval=True,
-                playbook=False,
+                playbook=supports_play_metadata,
                 mcts=False,
                 attention=supports_attention,
                 env_training_tabs=False,

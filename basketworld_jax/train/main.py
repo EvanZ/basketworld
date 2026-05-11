@@ -93,6 +93,7 @@ from basketworld_jax.train.runtime import (
     serialize_eval_trace,
     summarize_episode_events,
     summarize_intent_metrics,
+    summarize_lane_violation_metrics,
     summarize_shot_type_metrics,
     summarize_training_step,
     training_player_ids_from_static,
@@ -420,6 +421,15 @@ def parse_args(argv=None):
         help="Rollout horizon per PPO update.",
     )
     parser.add_argument(
+        "--single-episode-rollouts",
+        action="store_true",
+        help=(
+            "Do not reset completed envs inside a JAX training rollout. "
+            "Post-terminal slots are masked out of PPO, making each env "
+            "contribute at most one possession per update."
+        ),
+    )
+    parser.add_argument(
         "--num-updates",
         type=int,
         default=500,
@@ -688,6 +698,9 @@ def validate_train_args(args) -> None:
             raise SystemExit("--intent-disc-batch-size must be >= 1.")
         if int(getattr(args, "intent_disc_updates_per_rollout", 2)) < 1:
             raise SystemExit("--intent-disc-updates-per-rollout must be >= 1.")
+        disc_dropout = float(getattr(args, "intent_disc_dropout", 0.1))
+        if disc_dropout < 0.0 or disc_dropout >= 1.0:
+            raise SystemExit("--intent-disc-dropout must be in [0, 1).")
         holdout_fraction = float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25))
         if holdout_fraction < 0.0 or holdout_fraction > 1.0:
             raise SystemExit("--intent-disc-eval-holdout-fraction must be in [0, 1].")
@@ -720,6 +733,7 @@ def build_trainer_config(args) -> TrainerConfig:
         learning_rate=float(args.learning_rate),
         policy_update_epochs=int(args.policy_update_epochs),
         ppo_minibatches=int(args.ppo_minibatches),
+        single_episode_rollouts=bool(getattr(args, "single_episode_rollouts", False)),
     )
 
 
@@ -1275,6 +1289,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/mode": "train_loop" if bool(args.run_train_loop) else "scaffold",
         "jax/kernel_batch_size": int(args.kernel_batch_size),
         "jax/rollout_horizon": int(args.rollout_horizon),
+        "jax/single_episode_rollouts": bool(getattr(args, "single_episode_rollouts", False)),
         "jax/num_updates": int(args.num_updates),
         "jax/policy_update_epochs": int(args.policy_update_epochs),
         "jax/ppo_minibatches": int(args.ppo_minibatches),
@@ -1409,6 +1424,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/intent_disc_updates_per_rollout": int(getattr(args, "intent_disc_updates_per_rollout", 2)),
         "jax/intent_disc_hidden_dim": int(getattr(args, "intent_disc_hidden_dim", 128)),
         "jax/intent_disc_encoder_type": str(getattr(args, "intent_disc_encoder_type", "mlp_mean")),
+        "jax/intent_disc_dropout": float(getattr(args, "intent_disc_dropout", 0.1)),
         "jax/intent_disc_eval_holdout_fraction": float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25)),
         "jax/intent_sample_dump_size": int(getattr(args, "intent_sample_dump_size", 2048)),
         "jax/disc_eval_batch_output": bool(getattr(args, "disc_eval_batch_output", False)),
@@ -1456,10 +1472,28 @@ def _log_mlflow_intent_sample_artifact(
         return f"{artifact_path}/{path.name}"
 
 
+def _build_train_loop_summary_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact MLflow run summary without per-update trace payloads."""
+    train_history = result.get("train_history")
+    eval_trajectories = result.get("eval_trajectories")
+    summary = {
+        key: value
+        for key, value in result.items()
+        if key not in {"train_history", "eval_trajectories"}
+    }
+    summary["train_history_count"] = (
+        len(train_history) if isinstance(train_history, list) else 0
+    )
+    summary["eval_trajectory_count"] = (
+        len(eval_trajectories) if isinstance(eval_trajectories, list) else 0
+    )
+    return summary
+
+
 def _log_mlflow_train_loop_summary(mlflow, result: dict[str, Any]) -> str:
     with TemporaryDirectory(prefix="basketworld_jax_train_summary_") as tmpdir:
         path = Path(tmpdir) / TRAIN_LOOP_SUMMARY_ARTIFACT_NAME
-        write_json(path, result)
+        write_json(path, _build_train_loop_summary_payload(result))
         mlflow.log_artifact(str(path), artifact_path=TRAIN_LOOP_SUMMARY_ARTIFACT_DIR)
     mlflow.set_tag("jax_train_loop_summary_artifact", TRAIN_LOOP_SUMMARY_ARTIFACT_PATH)
     return TRAIN_LOOP_SUMMARY_ARTIFACT_PATH
@@ -1702,14 +1736,26 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
     terminal_steps = np.asarray(rollout.trajectory.terminal_episode_steps, dtype=np.int32)
     offense_score_delta = np.asarray(rollout.trajectory.offense_score_delta, dtype=np.float32)
     defense_score_delta = np.asarray(rollout.trajectory.defense_score_delta, dtype=np.float32)
+    active_mask = np.asarray(rollout.trajectory.active_mask, dtype=np.float32)
+    active_bool = active_mask > 0.5
+    active_count = float(active_mask.sum())
+    total_count = int(active_mask.size)
 
-    completed_episodes = int((terminal_steps > 0).sum())
-    learner_reward_total = float(rewards.sum())
-    learner_reward_mean = float(rewards.mean())
+    def _active_sum(values: np.ndarray) -> float:
+        return float((np.asarray(values, dtype=np.float32) * active_mask).sum())
+
+    def _active_mean(values: np.ndarray) -> float:
+        if active_count <= 0.0:
+            return 0.0
+        return float((np.asarray(values, dtype=np.float32) * active_mask).sum() / active_count)
+
+    completed_episodes = int(((terminal_steps > 0) & active_bool).sum())
+    learner_reward_total = _active_sum(rewards)
+    learner_reward_mean = _active_mean(rewards)
     opponent_reward_total = -learner_reward_total
     opponent_reward_mean = -learner_reward_mean
-    offense_points_total = float(offense_score_delta.sum())
-    defense_points_total = float(defense_score_delta.sum())
+    offense_points_total = _active_sum(offense_score_delta)
+    defense_points_total = _active_sum(defense_score_delta)
     if role == "offense":
         learner_points_total = offense_points_total
         opponent_points_total = defense_points_total
@@ -1731,7 +1777,9 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             opponent_reward_total,
             completed_episodes,
         ),
-        f"{role}_done_rate": float(dones.mean()),
+        f"{role}_done_rate": _active_mean(dones),
+        f"{role}_active_step_count": int(active_count),
+        f"{role}_active_step_fraction": _safe_metric_ratio(active_count, total_count),
         f"{role}_completed_episodes": int(completed_episodes),
         f"{role}_offense_points_total": offense_points_total,
         f"{role}_defense_points_total": defense_points_total,
@@ -1817,7 +1865,10 @@ def _print_checkpoint_summary(
     rows = [
         ("update_index", int(update_index)),
         ("steps_per_update", metrics.get("steps_per_update")),
+        ("rollout_active_step_fraction", metrics.get("rollout_active_step_fraction")),
+        ("ppo_active_sample_fraction", metrics.get("ppo_active_sample_fraction")),
         ("end_to_end_steps_per_sec", metrics.get("end_to_end_steps_per_sec")),
+        ("active_end_to_end_steps_per_sec", metrics.get("active_end_to_end_steps_per_sec")),
         ("rollout_states_per_sec", metrics.get("rollout_states_per_sec")),
         ("ppo_update_rollout_samples_per_sec", metrics.get("ppo_update_rollout_samples_per_sec")),
         ("ppo_update_optimizer_samples_per_sec", metrics.get("ppo_update_optimizer_samples_per_sec")),
@@ -1835,6 +1886,15 @@ def _print_checkpoint_summary(
         ("mean_completed_passes_per_completed_episode", metrics.get("mean_completed_passes_per_completed_episode")),
         ("mean_assists_per_completed_episode", metrics.get("mean_assists_per_completed_episode")),
         ("mean_turnovers_per_completed_episode", metrics.get("mean_turnovers_per_completed_episode")),
+        ("mean_learner_turnovers_per_completed_episode", metrics.get("mean_learner_turnovers_per_completed_episode")),
+        ("mean_opponent_turnovers_per_completed_episode", metrics.get("mean_opponent_turnovers_per_completed_episode")),
+        ("mean_turnovers_reason_intercepted_per_completed_episode", metrics.get("mean_turnovers_reason_intercepted_per_completed_episode")),
+        ("mean_turnovers_reason_defender_pressure_per_completed_episode", metrics.get("mean_turnovers_reason_defender_pressure_per_completed_episode")),
+        ("mean_turnovers_reason_move_out_of_bounds_per_completed_episode", metrics.get("mean_turnovers_reason_move_out_of_bounds_per_completed_episode")),
+        ("mean_turnovers_reason_shot_clock_per_completed_episode", metrics.get("mean_turnovers_reason_shot_clock_per_completed_episode")),
+        ("mean_3_second_violations_per_completed_episode", metrics.get("mean_3_second_violations_per_completed_episode")),
+        ("three_second_violation_rate_per_step", metrics.get("three_second_violation_rate_per_step")),
+        ("mean_defensive_lane_violations_per_completed_episode", metrics.get("mean_defensive_lane_violations_per_completed_episode")),
         ("learner_shot_dunk_share", metrics.get("learner_shot_dunk_share")),
         ("learner_shot_two_share", metrics.get("learner_shot_two_share")),
         ("learner_shot_three_share", metrics.get("learner_shot_three_share")),
@@ -2124,6 +2184,7 @@ def run_training_loop(args) -> dict[str, Any]:
         pending_selector_batches = []
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
+            loop_start_ns = perf_counter_ns()
             base_key, update_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 2)
             entropy_coef = _entropy_coef_for_update(args, update_idx)
             task_reward_scale = _task_reward_scale_for_update(args, update_idx)
@@ -2132,6 +2193,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 getattr(args, "intent_selector_multiselect_enabled", False)
             )
             selector_min_play_steps = int(getattr(args, "intent_selector_min_play_steps", 3))
+            single_episode_rollout = bool(getattr(args, "single_episode_rollouts", False))
             rollout_start_ns = perf_counter_ns()
             role_rollouts = {}
             for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
@@ -2148,6 +2210,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_eps,
                         selector_multiselect_enabled,
                         selector_min_play_steps,
+                        single_episode_rollout,
                     )
                 elif opponent_params is None:
                     role_rollouts[role] = rollout_runner(
@@ -2160,6 +2223,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_eps,
                         selector_multiselect_enabled,
                         selector_min_play_steps,
+                        single_episode_rollout,
                     )
                 else:
                     role_rollouts[role] = frozen_rollout_runner(
@@ -2173,6 +2237,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_eps,
                         selector_multiselect_enabled,
                         selector_min_play_steps,
+                        single_episode_rollout,
                     )
             block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
@@ -2186,12 +2251,17 @@ def run_training_loop(args) -> dict[str, Any]:
             }
 
             if bool(getattr(args, "intent_selector_enabled", False)):
+                selector_batch = build_selector_batch(
+                    role_rollouts["offense"],
+                    trainer_config,
+                    jax,
+                    jnp,
+                )
                 pending_selector_batches.append(
-                    build_selector_batch(
-                        role_rollouts["offense"],
-                        trainer_config,
-                        jax,
+                    limit_selector_batch_samples(
+                        selector_batch,
                         jnp,
+                        max_samples=int(getattr(args, "intent_selector_max_samples_per_update", 0)),
                     )
                 )
 
@@ -2340,10 +2410,19 @@ def run_training_loop(args) -> dict[str, Any]:
                 }
             block_until_ready_tree((params, opt_state, update_metrics, selector_update_metrics))
             update_elapsed_ns = perf_counter_ns() - update_start_ns
-            current_states = {
-                role: role_rollouts[role].final_state
-                for role in TRAINING_ROLES
-            }
+            if single_episode_rollout:
+                base_key, reset_block_key = jax.random.split(base_key)
+                role_reset_keys = jax.random.split(reset_block_key, len(TRAINING_ROLES))
+                current_states = {}
+                for role, role_reset_key in zip(TRAINING_ROLES, role_reset_keys, strict=True):
+                    reset_keys = jax.random.split(role_reset_key, int(args.kernel_batch_size))
+                    current_states[role] = reset_batch_minimal(statics[role], reset_keys, jax, jnp)
+                block_until_ready_tree(current_states)
+            else:
+                current_states = {
+                    role: role_rollouts[role].final_state
+                    for role in TRAINING_ROLES
+                }
 
             last_metrics = summarize_training_step(
                 rollout_out,
@@ -2396,6 +2475,22 @@ def run_training_loop(args) -> dict[str, Any]:
                 last_metrics["opponent_source"] = "legal_random"
                 last_metrics["opponent_group_count"] = 0
                 last_metrics["opponent_unique_update_count"] = 0
+            loop_elapsed_ns = perf_counter_ns() - loop_start_ns
+            loop_elapsed_sec = max(loop_elapsed_ns / 1e9, 1e-12)
+            loop_steps = int(args.kernel_batch_size) * int(args.rollout_horizon) * len(TRAINING_ROLES)
+            last_metrics["train_loop_elapsed_sec"] = float(loop_elapsed_sec)
+            last_metrics["train_loop_latency_ms"] = float(loop_elapsed_ns / 1e6)
+            last_metrics["train_loop_steps_per_sec"] = float(loop_steps / loop_elapsed_sec)
+            last_metrics["train_loop_active_steps_per_sec"] = float(
+                float(last_metrics.get("rollout_active_step_count", 0.0)) / loop_elapsed_sec
+            )
+            last_metrics["train_loop_overhead_sec"] = float(
+                max(
+                    0.0,
+                    loop_elapsed_sec
+                    - float(last_metrics.get("end_to_end_elapsed_sec", 0.0)),
+                )
+            )
 
             should_log_history = (
                 update_idx == 1
@@ -2417,6 +2512,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 (
                     f"train:{update_idx}"
                     f" sps:{float(last_metrics['end_to_end_steps_per_sec']):.0f}"
+                    f" active:{float(last_metrics['active_end_to_end_steps_per_sec']):.0f}"
                     f" rollout:{float(last_metrics['rollout_time_pct']):.0f}%"
                     f" update:{float(last_metrics['ppo_update_time_pct']):.0f}%"
                 ),
@@ -2496,6 +2592,13 @@ def run_training_loop(args) -> dict[str, Any]:
                             "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
                         }
                         eval_metrics.update(eval_episode_metrics)
+                        eval_metrics.update(
+                            summarize_lane_violation_metrics(
+                                terminal_episode_steps=eval_trace.terminal_episode_steps,
+                                offensive_three_seconds=eval_trace.offensive_three_seconds,
+                                defensive_lane_violations=eval_trace.defensive_lane_violations,
+                            )
+                        )
                         eval_metrics.update(
                             summarize_shot_type_metrics(
                                 "all",

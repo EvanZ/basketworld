@@ -5,6 +5,7 @@ import numpy as np
 
 from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.models import ActorCriticSpec
+from basketworld_jax.train.types import SelectorBatch, limit_selector_batch_samples
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
     _entropy_coef_for_update,
@@ -237,6 +238,29 @@ def test_jax_trainer_validates_ppo_minibatches_divide_batch_size():
 
     with pytest.raises(SystemExit, match="ppo_batch_size=32"):
         validate_train_args(args)
+
+
+def test_limit_selector_batch_samples_compacts_active_rows():
+    jnp = pytest.importorskip("jax.numpy")
+    batch = SelectorBatch(
+        flat_obs=jnp.arange(20, dtype=jnp.float32).reshape(10, 2),
+        chosen_intents=jnp.arange(10, dtype=jnp.int32),
+        old_log_probs=jnp.arange(10, dtype=jnp.float32) + 0.1,
+        old_values=jnp.arange(10, dtype=jnp.float32) + 0.2,
+        advantages=jnp.arange(10, dtype=jnp.float32) + 0.3,
+        returns=jnp.arange(10, dtype=jnp.float32) + 0.4,
+        active_mask=jnp.asarray([0, 1, 0, 1, 1, 0, 1, 0, 1, 0], dtype=jnp.float32),
+    )
+
+    limited = limit_selector_batch_samples(batch, jnp, max_samples=3)
+
+    assert tuple(limited.flat_obs.shape) == (3, 2)
+    np.testing.assert_array_equal(
+        np.asarray(limited.flat_obs),
+        np.asarray(batch.flat_obs)[[1, 3, 4]],
+    )
+    np.testing.assert_array_equal(np.asarray(limited.chosen_intents), [1, 3, 4])
+    np.testing.assert_array_equal(np.asarray(limited.active_mask), [1.0, 1.0, 1.0])
 
 
 def test_build_trainer_config_uses_training_args():
@@ -618,6 +642,10 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert "mean_assists_per_completed_episode" in result["final_metrics"]
     assert "mean_turnovers_per_completed_episode" in result["final_metrics"]
     assert "total_offensive_three_seconds" in result["final_metrics"]
+    assert "total_3_second_violations" in result["final_metrics"]
+    assert "mean_3_second_violations_per_completed_episode" in result["final_metrics"]
+    assert "three_second_violation_rate_per_step" in result["final_metrics"]
+    assert "mean_defensive_lane_violations_per_completed_episode" in result["final_metrics"]
     assert "total_defensive_lane_violations" in result["final_metrics"]
     first_eval = result["eval_trajectories"][0]
     assert first_eval["training_role"] in {"offense", "defense"}
@@ -1017,6 +1045,8 @@ def test_train_loop_runs_offense_intent_discriminator_and_sample_dump(tmp_path):
             "0.01",
             "--intent-disc-hidden-dim",
             "16",
+            "--intent-disc-dropout",
+            "0.1",
             "--intent-disc-batch-size",
             "8",
             "--intent-disc-updates-per-rollout",
@@ -1071,6 +1101,7 @@ def test_train_loop_runs_offense_intent_discriminator_and_sample_dump(tmp_path):
     assert metrics["intent_bonus_active_sample_count"] > 0
     assert result["intent_discriminator_config"]["num_intents"] == 4
     assert result["intent_discriminator_config"]["encoder_type"] == "set_step"
+    assert result["intent_discriminator_config"]["dropout"] == pytest.approx(0.1)
     assert result["intent_discriminator_config"]["eval_holdout_fraction"] == pytest.approx(0.5)
     assert result["intent_discriminator_config"]["include_shot_clock"] is False
     assert result["intent_discriminator_config"]["include_pressure_exposure"] is False

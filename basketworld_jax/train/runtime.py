@@ -23,6 +23,14 @@ from basketworld_jax.env import (
     set_offense_intent_state_batch,
     step_batch_minimal,
 )
+from basketworld_jax.env.minimal import (
+    TURNOVER_REASON_DEFENDER_PRESSURE,
+    TURNOVER_REASON_INTERCEPTED,
+    TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
+    TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
+    TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
+    TURNOVER_REASON_SHOT_CLOCK,
+)
 from basketworld_jax.models import (
     ActorCriticSpec,
     actor_critic_forward,
@@ -133,6 +141,29 @@ def _build_shot_type_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
         "opponent_shot_dunks": (opponent_shot & shot_dunk.astype(jnp.bool_)).astype(jnp.int8),
         "opponent_shot_twos": (opponent_shot & shot_two.astype(jnp.bool_)).astype(jnp.int8),
         "opponent_shot_threes": (opponent_shot & shot_three.astype(jnp.bool_)).astype(jnp.int8),
+    }
+
+
+def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
+    turnover = env_out.turnover.astype(jnp.int8)
+    turnover_bool = turnover.astype(jnp.bool_)
+    safe_player = jnp.clip(env_out.turnover_player, 0, int(static.role_encoding.shape[0]) - 1)
+    valid_player = env_out.turnover_player >= 0
+    learner_turnover = turnover_bool & valid_player & (static.training_player_mask[safe_player] > 0.5)
+    opponent_turnover = turnover_bool & valid_player & (~learner_turnover)
+
+    def _reason_flag(reason: int):
+        return (turnover_bool & (env_out.turnover_reason == int(reason))).astype(jnp.int8)
+
+    return {
+        "learner_turnovers": learner_turnover.astype(jnp.int8),
+        "opponent_turnovers": opponent_turnover.astype(jnp.int8),
+        "turnover_pass_out_of_bounds": _reason_flag(TURNOVER_REASON_PASS_OUT_OF_BOUNDS),
+        "turnover_intercepted": _reason_flag(TURNOVER_REASON_INTERCEPTED),
+        "turnover_defender_pressure": _reason_flag(TURNOVER_REASON_DEFENDER_PRESSURE),
+        "turnover_move_out_of_bounds": _reason_flag(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS),
+        "turnover_shot_clock": _reason_flag(TURNOVER_REASON_SHOT_CLOCK),
+        "turnover_offensive_three_seconds": _reason_flag(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS),
     }
 
 
@@ -311,6 +342,13 @@ def _compute_final_selector_values(params, flat_obs, spec: ActorCriticSpec, jnp)
     )["selector_values"]
 
 
+def _mask_step_metrics(metrics: dict[str, Any], active_mask, jnp) -> dict[str, Any]:
+    return {
+        key: jnp.where(active_mask, value, jnp.zeros_like(value))
+        for key, value in metrics.items()
+    }
+
+
 def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
     def _runner(
         static,
@@ -322,6 +360,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         selector_eps=0.0,
         selector_multiselect_enabled=False,
         selector_min_play_steps=3,
+        single_episode_rollout=False,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
@@ -329,6 +368,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         def _scan_step(carry, _):
             state, key, completed_pass_boundary = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
+            active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
@@ -350,6 +390,8 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 spec,
             )
+            policy_state = _where_state(active_step, policy_state, state, jnp)
+            selector_metrics = _mask_step_metrics(selector_metrics, active_step, jnp)
             policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             full_action_mask = build_action_masks_batch(static, policy_state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
@@ -390,10 +432,26 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
-            next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
+            reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
+            next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            intent_metrics = _mask_step_metrics(
+                _build_intent_transition_metrics(policy_state),
+                active_step,
+                jnp,
+            )
+            masked_reward = jnp.where(active_step, aggregated_reward, jnp.zeros_like(aggregated_reward))
+            masked_done = jnp.where(
+                active_step,
+                env_out.done.astype(jnp.int8),
+                jnp.zeros_like(env_out.done.astype(jnp.int8)),
+            )
             transition = TrajectoryBatch(
+                active_mask=active_step.astype(jnp.float32),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -402,23 +460,45 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 full_actions=full_actions,
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
-                rewards=aggregated_reward,
-                dones=env_out.done.astype(jnp.int8),
-                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
-                completed_passes=env_out.completed_pass.astype(jnp.int8),
-                assists=env_out.assist.astype(jnp.int8),
-                turnovers=env_out.turnover.astype(jnp.int8),
+                rewards=masked_reward,
+                dones=masked_done,
+                pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
+                completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
+                assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
+                turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **turnover_metrics,
                 **shot_metrics,
-                **_build_intent_transition_metrics(policy_state),
+                **intent_metrics,
                 **selector_metrics,
-                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
-                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
-                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                offensive_three_seconds=jnp.where(
+                    active_step,
+                    env_out.offensive_three_seconds.astype(jnp.int8),
+                    0,
+                ),
+                defensive_lane_violations=jnp.where(
+                    active_step,
+                    env_out.defensive_lane_violation.astype(jnp.int8),
+                    0,
+                ),
+                terminal_episode_steps=jnp.where(
+                    active_step,
+                    env_out.terminal_episode_steps.astype(jnp.int32),
+                    0,
+                ),
+                offense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                    0.0,
+                ),
+                defense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                    0.0,
+                ),
             )
             next_completed_pass_boundary = (
-                env_out.completed_pass.astype(jnp.bool_)
+                active_step
+                & env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (next_state, key, next_completed_pass_boundary), transition
@@ -479,6 +559,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         selector_eps=0.0,
         selector_multiselect_enabled=False,
         selector_min_play_steps=3,
+        single_episode_rollout=False,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
@@ -486,6 +567,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         def _scan_step(carry, _):
             state, key, completed_pass_boundary = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
+            active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
@@ -507,6 +589,8 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
                 spec,
             )
+            policy_state = _where_state(active_step, policy_state, state, jnp)
+            selector_metrics = _mask_step_metrics(selector_metrics, active_step, jnp)
             opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
@@ -564,10 +648,26 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
-            next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
+            reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
+            next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            intent_metrics = _mask_step_metrics(
+                _build_intent_transition_metrics(policy_state),
+                active_step,
+                jnp,
+            )
+            masked_reward = jnp.where(active_step, aggregated_reward, jnp.zeros_like(aggregated_reward))
+            masked_done = jnp.where(
+                active_step,
+                env_out.done.astype(jnp.int8),
+                jnp.zeros_like(env_out.done.astype(jnp.int8)),
+            )
             transition = TrajectoryBatch(
+                active_mask=active_step.astype(jnp.float32),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -576,23 +676,45 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 full_actions=full_actions,
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
-                rewards=aggregated_reward,
-                dones=env_out.done.astype(jnp.int8),
-                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
-                completed_passes=env_out.completed_pass.astype(jnp.int8),
-                assists=env_out.assist.astype(jnp.int8),
-                turnovers=env_out.turnover.astype(jnp.int8),
+                rewards=masked_reward,
+                dones=masked_done,
+                pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
+                completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
+                assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
+                turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **turnover_metrics,
                 **shot_metrics,
-                **_build_intent_transition_metrics(policy_state),
+                **intent_metrics,
                 **selector_metrics,
-                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
-                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
-                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                offensive_three_seconds=jnp.where(
+                    active_step,
+                    env_out.offensive_three_seconds.astype(jnp.int8),
+                    0,
+                ),
+                defensive_lane_violations=jnp.where(
+                    active_step,
+                    env_out.defensive_lane_violation.astype(jnp.int8),
+                    0,
+                ),
+                terminal_episode_steps=jnp.where(
+                    active_step,
+                    env_out.terminal_episode_steps.astype(jnp.int32),
+                    0,
+                ),
+                offense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                    0.0,
+                ),
+                defense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                    0.0,
+                ),
             )
             next_completed_pass_boundary = (
-                env_out.completed_pass.astype(jnp.bool_)
+                active_step
+                & env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (next_state, key, next_completed_pass_boundary), transition
@@ -654,6 +776,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         selector_eps=0.0,
         selector_multiselect_enabled=False,
         selector_min_play_steps=3,
+        single_episode_rollout=False,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
@@ -712,6 +835,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         def _scan_step(carry, _):
             state, key, completed_pass_boundary = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
+            active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
                 state,
@@ -733,6 +857,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 jnp,
                 spec,
             )
+            policy_state = _where_state(active_step, policy_state, state, jnp)
+            selector_metrics = _mask_step_metrics(selector_metrics, active_step, jnp)
             opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
@@ -786,10 +912,26 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
-            next_state = replace_done_states(env_out.state, reset_state, env_out.done, jnp)
+            reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
+            next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            intent_metrics = _mask_step_metrics(
+                _build_intent_transition_metrics(policy_state),
+                active_step,
+                jnp,
+            )
+            masked_reward = jnp.where(active_step, aggregated_reward, jnp.zeros_like(aggregated_reward))
+            masked_done = jnp.where(
+                active_step,
+                env_out.done.astype(jnp.int8),
+                jnp.zeros_like(env_out.done.astype(jnp.int8)),
+            )
             transition = TrajectoryBatch(
+                active_mask=active_step.astype(jnp.float32),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -798,23 +940,45 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 full_actions=full_actions,
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
-                rewards=aggregated_reward,
-                dones=env_out.done.astype(jnp.int8),
-                pass_attempts=env_out.pass_attempt.astype(jnp.int8),
-                completed_passes=env_out.completed_pass.astype(jnp.int8),
-                assists=env_out.assist.astype(jnp.int8),
-                turnovers=env_out.turnover.astype(jnp.int8),
+                rewards=masked_reward,
+                dones=masked_done,
+                pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
+                completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
+                assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
+                turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **turnover_metrics,
                 **shot_metrics,
-                **_build_intent_transition_metrics(policy_state),
+                **intent_metrics,
                 **selector_metrics,
-                offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
-                defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
-                terminal_episode_steps=env_out.terminal_episode_steps.astype(jnp.int32),
-                offense_score_delta=(env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
-                defense_score_delta=(env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                offensive_three_seconds=jnp.where(
+                    active_step,
+                    env_out.offensive_three_seconds.astype(jnp.int8),
+                    0,
+                ),
+                defensive_lane_violations=jnp.where(
+                    active_step,
+                    env_out.defensive_lane_violation.astype(jnp.int8),
+                    0,
+                ),
+                terminal_episode_steps=jnp.where(
+                    active_step,
+                    env_out.terminal_episode_steps.astype(jnp.int32),
+                    0,
+                ),
+                offense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.offense_score - policy_state.offense_score).astype(jnp.float32),
+                    0.0,
+                ),
+                defense_score_delta=jnp.where(
+                    active_step,
+                    (env_out.state.defense_score - policy_state.defense_score).astype(jnp.float32),
+                    0.0,
+                ),
             )
             next_completed_pass_boundary = (
-                env_out.completed_pass.astype(jnp.bool_)
+                active_step
+                & env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (next_state, key, next_completed_pass_boundary), transition
@@ -1255,18 +1419,26 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         log_ratio = new_log_prob_state - old_log_prob_state
         ratio = jnp.exp(log_ratio)
         clipped_ratio = jnp.clip(ratio, 1.0 - clip_range, 1.0 + clip_range)
-        policy_loss = -jnp.mean(
+        mask = batch.active_mask.astype(jnp.float32)
+        mask_den = jnp.maximum(jnp.sum(mask), 1.0)
+
+        def _masked_mean(values):
+            return jnp.sum(values * mask) / mask_den
+
+        policy_loss = -_masked_mean(
             jnp.minimum(
                 ratio * batch.advantages,
                 clipped_ratio * batch.advantages,
             )
         )
-        value_loss = jnp.mean(jnp.square(forward_out["values"] - batch.returns))
-        entropy_bonus = jnp.mean(jnp.mean(masked_out["entropy"], axis=-1))
-        approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
-        clip_fraction = jnp.mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32))
-        mean_abs_log_ratio = jnp.mean(jnp.abs(log_ratio))
-        max_abs_log_ratio = jnp.max(jnp.abs(log_ratio))
+        value_loss = _masked_mean(jnp.square(forward_out["values"] - batch.returns))
+        entropy_bonus = _masked_mean(jnp.mean(masked_out["entropy"], axis=-1))
+        approx_kl = _masked_mean((ratio - 1.0) - log_ratio)
+        clip_fraction = _masked_mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32))
+        mean_abs_log_ratio = _masked_mean(jnp.abs(log_ratio))
+        max_abs_log_ratio = jnp.max(
+            jnp.where(mask > 0.0, jnp.abs(log_ratio), jnp.zeros_like(log_ratio))
+        )
         total_loss = policy_loss + (value_coef * value_loss) - (entropy_coef * entropy_bonus)
         metrics = {
             "total_loss": total_loss,
@@ -1278,6 +1450,8 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "clip_fraction": clip_fraction,
             "mean_abs_log_ratio": mean_abs_log_ratio,
             "max_abs_log_ratio": max_abs_log_ratio,
+            "ppo_active_sample_count": jnp.sum(mask),
+            "ppo_active_sample_fraction": jnp.mean(mask),
         }
         return total_loss, metrics
 
@@ -1693,6 +1867,83 @@ def summarize_shot_type_metrics(
     }
 
 
+def summarize_turnover_diagnostics(
+    *,
+    terminal_episode_steps,
+    learner_turnovers,
+    opponent_turnovers,
+    turnover_pass_out_of_bounds,
+    turnover_intercepted,
+    turnover_defender_pressure,
+    turnover_move_out_of_bounds,
+    turnover_shot_clock,
+    turnover_offensive_three_seconds,
+) -> dict[str, float]:
+    terminal_steps_arr = np.asarray(terminal_episode_steps, dtype=np.int32)
+    completed_episodes = int((terminal_steps_arr > 0).sum())
+    denom = float(completed_episodes) if completed_episodes > 0 else 0.0
+
+    def _total(values) -> float:
+        return float(np.asarray(values, dtype=np.float32).sum())
+
+    def _mean_per_episode(total: float) -> float:
+        return float(total / denom) if denom > 0.0 else 0.0
+
+    metrics: dict[str, float] = {}
+    role_items = {
+        "learner": _total(learner_turnovers),
+        "opponent": _total(opponent_turnovers),
+    }
+    for name, total in role_items.items():
+        metrics[f"total_{name}_turnovers"] = total
+        metrics[f"mean_{name}_turnovers_per_completed_episode"] = _mean_per_episode(total)
+
+    reason_items = {
+        "pass_out_of_bounds": _total(turnover_pass_out_of_bounds),
+        "intercepted": _total(turnover_intercepted),
+        "defender_pressure": _total(turnover_defender_pressure),
+        "move_out_of_bounds": _total(turnover_move_out_of_bounds),
+        "shot_clock": _total(turnover_shot_clock),
+        "offensive_three_seconds": _total(turnover_offensive_three_seconds),
+    }
+    for reason, total in reason_items.items():
+        metrics[f"total_turnovers_reason_{reason}"] = total
+        metrics[f"mean_turnovers_reason_{reason}_per_completed_episode"] = _mean_per_episode(total)
+    return metrics
+
+
+def summarize_lane_violation_metrics(
+    *,
+    terminal_episode_steps,
+    offensive_three_seconds,
+    defensive_lane_violations,
+) -> dict[str, float]:
+    terminal_steps_arr = np.asarray(terminal_episode_steps, dtype=np.int32)
+    completed_episodes = int((terminal_steps_arr > 0).sum())
+    denom = float(completed_episodes) if completed_episodes > 0 else 0.0
+    offensive_total = float(np.asarray(offensive_three_seconds, dtype=np.float32).sum())
+    defensive_total = float(np.asarray(defensive_lane_violations, dtype=np.float32).sum())
+    step_count = float(np.asarray(offensive_three_seconds, dtype=np.float32).size)
+
+    def _per_episode(total: float) -> float:
+        return float(total / denom) if denom > 0.0 else 0.0
+
+    def _per_step(total: float) -> float:
+        return float(total / step_count) if step_count > 0.0 else 0.0
+
+    return {
+        "total_offensive_three_seconds": offensive_total,
+        "total_3_second_violations": offensive_total,
+        "mean_offensive_three_seconds_per_completed_episode": _per_episode(offensive_total),
+        "mean_3_second_violations_per_completed_episode": _per_episode(offensive_total),
+        "offensive_three_seconds_rate_per_step": _per_step(offensive_total),
+        "three_second_violation_rate_per_step": _per_step(offensive_total),
+        "total_defensive_lane_violations": defensive_total,
+        "mean_defensive_lane_violations_per_completed_episode": _per_episode(defensive_total),
+        "defensive_lane_violation_rate_per_step": _per_step(defensive_total),
+    }
+
+
 def summarize_intent_metrics(
     prefix: str,
     *,
@@ -1758,13 +2009,26 @@ def summarize_training_step(
     optimizer_sample_count = int(ppo_batch_size * max(1, int(policy_update_epochs)))
     minibatch_count = max(1, int(ppo_minibatches))
     minibatch_size = int(ppo_batch_size // minibatch_count) if ppo_batch_size % minibatch_count == 0 else 0
-    reward_mean = float(np.asarray(rollout_out.trajectory.rewards).mean())
-    done_rate = float(np.asarray(rollout_out.trajectory.dones).mean())
-    advantage_std = float(np.asarray(ppo_batch.advantages).std())
-    return_mean = float(np.asarray(ppo_batch.returns).mean())
-    value_mean = float(np.asarray(rollout_out.trajectory.values).mean())
-    offensive_three_seconds_total = int(np.asarray(rollout_out.trajectory.offensive_three_seconds).sum())
-    defensive_lane_violation_total = int(np.asarray(rollout_out.trajectory.defensive_lane_violations).sum())
+    rollout_active = np.asarray(rollout_out.trajectory.active_mask, dtype=np.float32)
+    ppo_active = np.asarray(ppo_batch.active_mask, dtype=np.float32)
+    active_count = float(rollout_active.sum())
+    active_ppo_count = float(ppo_active.sum())
+
+    def _active_mean(values, mask) -> float:
+        denom = float(mask.sum())
+        if denom <= 0.0:
+            return 0.0
+        return float((np.asarray(values, dtype=np.float32) * mask).sum() / denom)
+
+    reward_mean = _active_mean(rollout_out.trajectory.rewards, rollout_active)
+    done_rate = _active_mean(rollout_out.trajectory.dones, rollout_active)
+    advantage_std = (
+        float(np.asarray(ppo_batch.advantages)[ppo_active.astype(bool)].std())
+        if active_ppo_count > 0.0
+        else 0.0
+    )
+    return_mean = _active_mean(ppo_batch.returns, ppo_active)
+    value_mean = _active_mean(rollout_out.trajectory.values, rollout_active)
     episode_metrics = summarize_episode_events(
         rollout_out.trajectory.dones,
         rollout_out.trajectory.terminal_episode_steps,
@@ -1777,6 +2041,10 @@ def summarize_training_step(
         "update_index": int(update_index),
         "steps_per_update": int(total_states),
         "ppo_batch_size": int(ppo_batch_size),
+        "ppo_active_sample_count": int(active_ppo_count),
+        "ppo_active_sample_fraction": float(active_ppo_count / max(1, int(ppo_batch_size))),
+        "rollout_active_step_count": int(active_count),
+        "rollout_active_step_fraction": float(active_count / max(1, int(total_states))),
         "ppo_update_epochs": int(max(1, int(policy_update_epochs))),
         "ppo_update_minibatches": int(minibatch_count),
         "ppo_update_minibatch_size": int(minibatch_size),
@@ -1791,6 +2059,8 @@ def summarize_training_step(
         "ppo_update_time_pct": float(100.0 * update_time_fraction),
         "rollout_states_per_sec": float(total_states / rollout_sec),
         "end_to_end_steps_per_sec": float(total_states / end_to_end_sec),
+        "active_rollout_steps_per_sec": float(active_count / rollout_sec),
+        "active_end_to_end_steps_per_sec": float(active_count / end_to_end_sec),
         "rollout_latency_ms": float(rollout_elapsed_ns / 1e6),
         "update_steps_per_sec": float(1.0 / update_sec),
         "update_latency_ms": float(update_elapsed_ns / 1e6),
@@ -1801,10 +2071,28 @@ def summarize_training_step(
         "mean_return": return_mean,
         "mean_value": value_mean,
         "advantage_std": advantage_std,
-        "total_offensive_three_seconds": offensive_three_seconds_total,
-        "total_defensive_lane_violations": defensive_lane_violation_total,
     }
     summary.update(episode_metrics)
+    summary.update(
+        summarize_lane_violation_metrics(
+            terminal_episode_steps=rollout_out.trajectory.terminal_episode_steps,
+            offensive_three_seconds=rollout_out.trajectory.offensive_three_seconds,
+            defensive_lane_violations=rollout_out.trajectory.defensive_lane_violations,
+        )
+    )
+    summary.update(
+        summarize_turnover_diagnostics(
+            terminal_episode_steps=rollout_out.trajectory.terminal_episode_steps,
+            learner_turnovers=rollout_out.trajectory.learner_turnovers,
+            opponent_turnovers=rollout_out.trajectory.opponent_turnovers,
+            turnover_pass_out_of_bounds=rollout_out.trajectory.turnover_pass_out_of_bounds,
+            turnover_intercepted=rollout_out.trajectory.turnover_intercepted,
+            turnover_defender_pressure=rollout_out.trajectory.turnover_defender_pressure,
+            turnover_move_out_of_bounds=rollout_out.trajectory.turnover_move_out_of_bounds,
+            turnover_shot_clock=rollout_out.trajectory.turnover_shot_clock,
+            turnover_offensive_three_seconds=rollout_out.trajectory.turnover_offensive_three_seconds,
+        )
+    )
     summary.update(
         summarize_shot_type_metrics(
             "all",

@@ -1044,6 +1044,7 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
         line_y[:, :, None],
         jnp,
     )
+    between_endpoints = (position_t > 0.0) & (position_t < 1.0)
     position_weight = static.steal_position_weight_min + ((1.0 - static.steal_position_weight_min) * position_t)
     steal_contrib = (
         static.base_steal_rate
@@ -1053,7 +1054,11 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
     )
     steal_contrib = jnp.clip(steal_contrib, 0.0, 1.0)
     steal_contrib = jnp.where(
-        valid_receivers[:, :, None] & forward_defender & (~same_as_passer) & (~same_as_receiver),
+        valid_receivers[:, :, None]
+        & forward_defender
+        & between_endpoints
+        & (~same_as_passer)
+        & (~same_as_receiver),
         steal_contrib,
         0.0,
     )

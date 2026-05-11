@@ -31,6 +31,9 @@ class GameState:
 
     def __init__(self):
         self.env = None
+        # JAX-native dev runtime. When set, JAX checkpoints should use this for
+        # interactive reset/step instead of stepping the Python env bridge.
+        self.jax_runtime = None
         self.offense_policy = None
         self.defense_policy = None
         self.unified_policy = None
@@ -117,6 +120,7 @@ class GameState:
             "finished_at": None,
             "status": "idle",
             "error": None,
+            "cancel_requested": False,
         }
 
 
@@ -185,6 +189,7 @@ def reset_playbook_progress(total: int = 0) -> None:
             "finished_at": None,
             "status": "running" if total > 0 else "idle",
             "error": None,
+            "cancel_requested": False,
         }
 
 
@@ -194,12 +199,17 @@ def update_playbook_progress(completed: int, total: int | None = None) -> None:
         next_total = current_total if total is None else int(max(0, total))
         next_completed = int(max(0, completed))
         running = next_completed < next_total if next_total > 0 else False
+        cancel_requested = bool(game_state.playbook_progress.get("cancel_requested"))
         game_state.playbook_progress.update(
             {
                 "completed": next_completed,
                 "total": next_total,
                 "running": running,
-                "status": "running" if running else ("completed" if next_total > 0 else "idle"),
+                "status": (
+                    "cancel_requested"
+                    if cancel_requested
+                    else ("running" if running else ("completed" if next_total > 0 else "idle"))
+                ),
             }
         )
         if not running and next_total > 0:
@@ -214,6 +224,38 @@ def fail_playbook_progress(error: str) -> None:
                 "status": "failed",
                 "error": str(error),
                 "finished_at": time.time(),
+                "cancel_requested": False,
+            }
+        )
+
+
+def request_playbook_cancel() -> dict:
+    with game_state._playbook_progress_lock:
+        running = bool(game_state.playbook_progress.get("running"))
+        game_state.playbook_progress.update(
+            {
+                "cancel_requested": True,
+                "status": "cancel_requested" if running else "cancelled",
+                "running": running,
+                "finished_at": None if running else time.time(),
+            }
+        )
+        return dict(game_state.playbook_progress)
+
+
+def playbook_cancel_requested() -> bool:
+    with game_state._playbook_progress_lock:
+        return bool(game_state.playbook_progress.get("cancel_requested"))
+
+
+def cancel_playbook_progress() -> None:
+    with game_state._playbook_progress_lock:
+        game_state.playbook_progress.update(
+            {
+                "running": False,
+                "status": "cancelled",
+                "finished_at": time.time(),
+                "cancel_requested": False,
             }
         )
 
@@ -380,8 +422,14 @@ def _capture_restorable_backend_state() -> dict:
     if not game_state.env or game_state.obs is None:
         raise RuntimeError("Game not initialized.")
 
+    jax_runtime = getattr(game_state, "jax_runtime", None)
     return {
         "env": copy.deepcopy(game_state.env),
+        "jax_runtime": (
+            jax_runtime.capture_snapshot()
+            if jax_runtime is not None and hasattr(jax_runtime, "capture_snapshot")
+            else None
+        ),
         "user_team": copy.deepcopy(game_state.user_team),
         "obs": copy.deepcopy(game_state.obs),
         "prev_obs": copy.deepcopy(game_state.prev_obs),
@@ -434,8 +482,13 @@ def _restore_restorable_backend_state(snapshot: dict) -> None:
         snapshot.get("selector_last_boundary_reason", None)
     )
 
-    _rebuild_cached_obs()
-    _capture_turn_start_snapshot()
+    jax_snapshot = snapshot.get("jax_runtime")
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None and jax_snapshot is not None:
+        jax_runtime.restore_snapshot(jax_snapshot, game_state=game_state)
+    else:
+        _rebuild_cached_obs()
+        _capture_turn_start_snapshot()
 
 
 def get_counterfactual_snapshot_summary() -> dict:
@@ -477,6 +530,15 @@ def get_full_game_state(
     include_state_values: bool = False,
 ):
     """Construct a JSON-friendly snapshot of the current game state."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        return jax_runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=include_policy_probs,
+            include_action_values=include_action_values,
+            include_state_values=include_state_values,
+        )
+
     if not game_state.env:
         return {}
 
