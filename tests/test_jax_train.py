@@ -3,19 +3,42 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
-from basketworld_jax.checkpoints import load_checkpoint
+from basketworld_jax.checkpoints import build_checkpoint_payload, load_checkpoint
+from basketworld_jax.intent.discriminator import (
+    IntentDiscriminatorSpec,
+    build_intent_step_features_from_rollout,
+)
 from basketworld_jax.models import ActorCriticSpec
-from basketworld_jax.train.types import SelectorBatch, limit_selector_batch_samples
+from basketworld_jax.train.types import (
+    RolloutOutput,
+    SelectorBatch,
+    TrainerConfig,
+    TrajectoryBatch,
+    build_ppo_batch,
+    limit_selector_batch_samples,
+)
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
+    _checkpoint_trainer_config_from_args,
     _entropy_coef_for_update,
+    _filter_mlflow_train_metrics,
+    _phi_beta_for_update,
     _log_mlflow_params,
+    _selector_learning_rate_for_args,
     _task_reward_scale_for_update,
     build_trainer_config,
     parse_args,
     run_train_scaffold,
     run_training_loop,
     validate_train_args,
+)
+from basketworld_jax.train.runtime import (
+    _apply_selector_update_param_scope,
+    _mask_selector_update_grads,
+    _merge_selector_update_params,
+    _selector_segment_application_masks,
+    summarize_ppo_eligible_episode_metrics,
+    summarize_reward_by_intent_metrics,
 )
 
 
@@ -24,6 +47,88 @@ def test_trainer_parser_defaults_match_frozen_scope():
 
     for key, expected in TRAIN_FROZEN_VALUES.items():
         assert getattr(args, key) == expected
+
+
+def test_checkpoint_payload_preserves_selector_optimizer_state():
+    selector_opt_state = {"count": np.asarray(3, dtype=np.int32)}
+
+    payload = build_checkpoint_payload(
+        update_index=1,
+        trainer_config={},
+        policy_spec={},
+        frozen_config={},
+        params={"w": np.asarray([1.0], dtype=np.float32)},
+        opt_state={"count": np.asarray(2, dtype=np.int32)},
+        selector_opt_state=selector_opt_state,
+        current_state={},
+        eval_initial_state={},
+        base_key=np.asarray([0, 1], dtype=np.uint32),
+        eval_trajectories=[],
+        last_metrics=None,
+    )
+
+    assert payload["state"]["selector_opt_state"]["count"] == np.asarray(3, dtype=np.int32)
+
+
+def test_checkpoint_trainer_config_persists_selector_runtime_fields():
+    args = parse_args(
+        [
+            "--enable-intent-learning",
+            "true",
+            "--num-intents",
+            "8",
+            "--intent-commitment-steps",
+            "8",
+            "--intent-selector-enabled",
+            "true",
+            "--intent-selector-mode",
+            "integrated",
+            "--intent-selector-learning-rate",
+            "0.0004",
+            "--intent-selector-alpha-start",
+            "0.25",
+            "--intent-selector-alpha-end",
+            "0.75",
+            "--intent-selector-alpha-warmup-updates",
+            "10",
+            "--intent-selector-alpha-ramp-updates",
+            "20",
+            "--intent-selector-eps-start",
+            "0.5",
+            "--intent-selector-eps-end",
+            "0.15",
+            "--intent-selector-eps-warmup-updates",
+            "30",
+            "--intent-selector-eps-ramp-updates",
+            "40",
+            "--intent-selector-multiselect-enabled",
+            "true",
+            "--intent-selector-min-play-steps",
+            "4",
+            "--ppo-completed-episodes-only",
+        ]
+    )
+    trainer_config = build_trainer_config(args)
+
+    serialized = _checkpoint_trainer_config_from_args(trainer_config, args)
+
+    assert serialized["ppo_completed_episodes_only"] is True
+    assert serialized["enable_intent_learning"] is True
+    assert serialized["num_intents"] == 8
+    assert serialized["intent_commitment_steps"] == 8
+    assert serialized["intent_selector_enabled"] is True
+    assert serialized["intent_selector_mode"] == "integrated"
+    assert serialized["intent_selector_learning_rate"] == pytest.approx(0.0004)
+    assert serialized["intent_selector_alpha_start"] == pytest.approx(0.25)
+    assert serialized["intent_selector_alpha_end"] == pytest.approx(0.75)
+    assert serialized["intent_selector_alpha_warmup_updates"] == 10
+    assert serialized["intent_selector_alpha_ramp_updates"] == 20
+    assert serialized["intent_selector_eps_start"] == pytest.approx(0.5)
+    assert serialized["intent_selector_eps_end"] == pytest.approx(0.15)
+    assert serialized["intent_selector_eps_warmup_updates"] == 30
+    assert serialized["intent_selector_eps_ramp_updates"] == 40
+    assert serialized["intent_selector_multiselect_enabled"] is True
+    assert serialized["intent_selector_min_play_steps"] == 4
 
 
 def test_jax_trainer_uses_grouped_opponent_sampling_flag_name():
@@ -69,6 +174,272 @@ def test_jax_trainer_allows_lane_rule_overrides():
     validate_train_args(args)
     assert args.illegal_defense_enabled is True
     assert args.offensive_three_seconds is True
+
+
+def test_jax_phi_beta_update_schedule():
+    args = parse_args(
+        [
+            "--enable-phi-shaping",
+            "true",
+            "--phi-beta-start",
+            "0.0",
+            "--phi-beta-end",
+            "0.15",
+            "--phi-beta-warmup-updates",
+            "2",
+            "--phi-beta-ramp-updates",
+            "4",
+        ]
+    )
+
+    validate_train_args(args)
+    assert _phi_beta_for_update(args, 1) == pytest.approx(0.0)
+    assert _phi_beta_for_update(args, 2) == pytest.approx(0.0)
+    assert _phi_beta_for_update(args, 4) == pytest.approx(0.075)
+    assert _phi_beta_for_update(args, 6) == pytest.approx(0.15)
+
+    disabled = parse_args(
+        [
+            "--enable-phi-shaping",
+            "false",
+            "--phi-beta-start",
+            "0.0",
+            "--phi-beta-end",
+            "0.15",
+        ]
+    )
+    validate_train_args(disabled)
+    assert _phi_beta_for_update(disabled, 6) == pytest.approx(0.0)
+
+
+def test_intent_discriminator_uses_training_mask_for_active_samples():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    time_steps = 3
+    batch_size = 2
+    flat_obs_dim = 8
+    player_count = 3
+    zeros = jnp.zeros((time_steps, batch_size), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "episode_start": jnp.zeros((time_steps, batch_size), dtype=jnp.float32),
+            "flat_obs": jnp.zeros((time_steps, batch_size, flat_obs_dim), dtype=jnp.float32),
+            "policy_intent_index": jnp.asarray([[0, 1], [2, 3], [1, 0]], dtype=jnp.int32),
+            "policy_intent_gate": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "action_mask": jnp.zeros((time_steps, batch_size, player_count, 5), dtype=jnp.float32),
+            "actions": jnp.zeros((time_steps, batch_size, player_count), dtype=jnp.int32),
+            "full_actions": jnp.zeros((time_steps, batch_size, player_count * 2), dtype=jnp.int32),
+            "selected_log_probs": jnp.zeros((time_steps, batch_size, player_count), dtype=jnp.float32),
+            "values": zeros,
+            "rewards": zeros,
+            "dones": zeros,
+            "terminal_episode_steps": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+        }
+    )
+    rollout = RolloutOutput(
+        trajectory=TrajectoryBatch(**trajectory_data),
+        final_state=None,
+        bootstrap_values=jnp.zeros((batch_size,), dtype=jnp.float32),
+        final_selector_values=jnp.zeros((batch_size,), dtype=jnp.float32),
+        final_flat_obs=jnp.zeros((batch_size, flat_obs_dim), dtype=jnp.float32),
+        final_action_mask=None,
+    )
+    spec = IntentDiscriminatorSpec(
+        encoder_type="mlp_mean",
+        input_dim=flat_obs_dim + player_count + 11,
+        hidden_dim=8,
+        num_intents=4,
+        learning_rate=3e-4,
+        batch_size=8,
+        updates_per_rollout=1,
+        beta_target=0.01,
+        warmup_updates=0,
+        ramp_updates=1,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=2.0,
+        eval_holdout_fraction=0.25,
+        dropout=0.0,
+        max_obs_dim=flat_obs_dim,
+        action_dim_per_player=5,
+        training_player_count=player_count,
+        token_player_count=2,
+        token_dim=3,
+        global_dim=1,
+        set_heads=1,
+        set_cls_tokens=1,
+        include_shot_clock=True,
+        include_pressure_exposure=True,
+    )
+    training_mask = jnp.asarray([[1, 0], [0, 1], [1, 1]], dtype=jnp.float32)
+
+    _, _, active_mask = build_intent_step_features_from_rollout(
+        rollout,
+        spec,
+        jnp,
+        training_mask=training_mask,
+    )
+
+    np.testing.assert_array_equal(np.asarray(active_mask), np.asarray(training_mask, dtype=bool))
+
+
+def test_completed_episode_ppo_weights_sum_episode_losses():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    time_steps = 4
+    batch_size = 1
+    flat_obs_dim = 3
+    player_count = 3
+    zeros = jnp.zeros((time_steps, batch_size), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "episode_start": jnp.asarray([[1], [0], [1], [0]], dtype=jnp.int8),
+            "flat_obs": jnp.zeros((time_steps, batch_size, flat_obs_dim), dtype=jnp.float32),
+            "policy_intent_index": jnp.zeros((time_steps, batch_size), dtype=jnp.int32),
+            "policy_intent_gate": jnp.zeros((time_steps, batch_size), dtype=jnp.float32),
+            "action_mask": jnp.zeros((time_steps, batch_size, player_count, 5), dtype=jnp.float32),
+            "actions": jnp.zeros((time_steps, batch_size, player_count), dtype=jnp.int32),
+            "full_actions": jnp.zeros((time_steps, batch_size, player_count * 2), dtype=jnp.int32),
+            "selected_log_probs": jnp.zeros((time_steps, batch_size, player_count), dtype=jnp.float32),
+            "values": zeros,
+            "rewards": jnp.asarray([[0.2], [0.3], [5.0], [5.0]], dtype=jnp.float32),
+            "dones": jnp.asarray([[0], [1], [0], [0]], dtype=jnp.int8),
+            "terminal_episode_steps": jnp.asarray([[0], [2], [0], [0]], dtype=jnp.int32),
+        }
+    )
+    rollout = RolloutOutput(
+        trajectory=TrajectoryBatch(**trajectory_data),
+        final_state=None,
+        bootstrap_values=jnp.zeros((batch_size,), dtype=jnp.float32),
+        final_selector_values=jnp.zeros((batch_size,), dtype=jnp.float32),
+        final_flat_obs=jnp.zeros((batch_size, flat_obs_dim), dtype=jnp.float32),
+        final_action_mask=None,
+    )
+    config = TrainerConfig(
+        kernel_batch_size=batch_size,
+        rollout_horizon=time_steps,
+        num_updates=1,
+        gamma=1.0,
+        gae_lambda=1.0,
+        ppo_clip_range=0.2,
+        value_coef=0.5,
+        entropy_coef=0.0,
+        learning_rate=1e-3,
+        policy_update_epochs=1,
+        ppo_minibatches=1,
+        ppo_completed_episodes_only=True,
+    )
+
+    ppo_batch = build_ppo_batch(rollout, config, jax, jnp)
+
+    np.testing.assert_array_equal(np.asarray(ppo_batch.active_mask), [1.0, 1.0, 0.0, 0.0])
+    np.testing.assert_array_equal(np.asarray(ppo_batch.loss_weights), [1.0, 1.0, 0.0, 0.0])
+    np.testing.assert_array_equal(np.asarray(ppo_batch.loss_denominator), [1.0, 1.0, 1.0, 1.0])
+
+
+def test_ppo_eligible_episode_metrics_use_training_mask():
+    jnp = pytest.importorskip("jax.numpy")
+
+    time_steps = 4
+    batch_size = 1
+    zeros = jnp.zeros((time_steps, batch_size), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "rewards": jnp.asarray([[0.2], [0.3], [5.0], [5.0]], dtype=jnp.float32),
+            "dones": jnp.asarray([[0], [1], [0], [0]], dtype=jnp.int8),
+            "pass_attempts": jnp.asarray([[1], [0], [1], [1]], dtype=jnp.float32),
+            "turnovers": jnp.asarray([[0], [1], [0], [0]], dtype=jnp.float32),
+            "learner_turnovers": jnp.asarray([[0], [1], [0], [0]], dtype=jnp.float32),
+            "shot_attempts": jnp.asarray([[0], [0], [1], [1]], dtype=jnp.float32),
+            "terminal_episode_steps": jnp.asarray([[0], [2], [0], [0]], dtype=jnp.int32),
+            "turnover_intercepted": jnp.asarray([[0], [1], [0], [0]], dtype=jnp.float32),
+        }
+    )
+    training_mask = jnp.asarray([[1], [1], [0], [0]], dtype=jnp.float32)
+
+    metrics = summarize_ppo_eligible_episode_metrics(
+        "test_ppo_eligible",
+        TrajectoryBatch(**trajectory_data),
+        training_mask,
+    )
+
+    assert metrics["test_ppo_eligible_active_step_count"] == pytest.approx(2.0)
+    assert metrics["test_ppo_eligible_completed_episodes"] == pytest.approx(1.0)
+    assert metrics["test_ppo_eligible_completed_episode_count"] == pytest.approx(1.0)
+    assert metrics["test_ppo_eligible_completed_active_step_count"] == pytest.approx(2.0)
+    assert metrics["test_ppo_eligible_reward_total"] == pytest.approx(0.5)
+    assert metrics["test_ppo_eligible_reward_per_step"] == pytest.approx(0.25)
+    assert metrics["test_ppo_eligible_reward_per_completed_episode"] == pytest.approx(0.5)
+    assert metrics["test_ppo_eligible_mean_completed_episode_length"] == pytest.approx(2.0)
+    assert metrics["test_ppo_eligible_pass_attempts_total"] == pytest.approx(1.0)
+    assert metrics["test_ppo_eligible_terminal_turnover_share"] == pytest.approx(1.0)
+    assert metrics["test_ppo_eligible_terminal_turnover_intercepted_share"] == pytest.approx(1.0)
+    assert metrics["test_ppo_eligible_shot_attempts_total"] == pytest.approx(0.0)
+
+
+def test_reward_by_intent_metrics_attribute_completed_episodes_to_start_intent():
+    jnp = pytest.importorskip("jax.numpy")
+
+    time_steps = 4
+    batch_size = 2
+    zeros = jnp.zeros((time_steps, batch_size), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "episode_start": jnp.asarray(
+                [[1, 1], [0, 0], [1, 1], [0, 0]],
+                dtype=jnp.int8,
+            ),
+            "policy_intent_index": jnp.asarray(
+                [[1, 2], [1, 2], [2, 1], [2, 1]],
+                dtype=jnp.int32,
+            ),
+            "rewards": jnp.asarray(
+                [[0.5, 1.0], [0.7, 2.0], [3.0, 4.0], [3.0, 5.0]],
+                dtype=jnp.float32,
+            ),
+            "terminal_episode_steps": jnp.asarray(
+                [[0, 0], [2, 2], [0, 0], [0, 2]],
+                dtype=jnp.int32,
+            ),
+        }
+    )
+
+    metrics = summarize_reward_by_intent_metrics(
+        "test_intent",
+        TrajectoryBatch(**trajectory_data),
+        num_intents=3,
+    )
+
+    assert metrics["test_intent_completed_episodes_by_intent/0"] == pytest.approx(0.0)
+    assert metrics["test_intent_completed_episodes_by_intent/1"] == pytest.approx(2.0)
+    assert metrics["test_intent_completed_episodes_by_intent/2"] == pytest.approx(1.0)
+    assert metrics["test_intent_reward_per_completed_episode_by_intent/1"] == pytest.approx(5.1)
+    assert metrics["test_intent_reward_per_completed_episode_by_intent/2"] == pytest.approx(3.0)
+
+    training_mask = jnp.asarray(
+        [[1, 1], [1, 1], [0, 0], [0, 0]],
+        dtype=jnp.float32,
+    )
+    ppo_metrics = summarize_reward_by_intent_metrics(
+        "test_ppo_intent",
+        TrajectoryBatch(**trajectory_data),
+        num_intents=3,
+        training_mask=training_mask,
+    )
+    assert ppo_metrics["test_ppo_intent_completed_episodes_by_intent/1"] == pytest.approx(1.0)
+    assert ppo_metrics["test_ppo_intent_completed_episodes_by_intent/2"] == pytest.approx(1.0)
+    assert ppo_metrics["test_ppo_intent_reward_per_completed_episode_by_intent/1"] == pytest.approx(1.2)
+    assert ppo_metrics["test_ppo_intent_reward_per_completed_episode_by_intent/2"] == pytest.approx(3.0)
 
 
 def test_jax_trainer_allows_intent_runtime_overrides():
@@ -176,6 +547,28 @@ def test_jax_trainer_validates_intent_selector_requirements():
         validate_train_args(missing_embedding_args)
 
 
+def test_jax_trainer_supports_selector_learning_rate_override():
+    default_args = parse_args(["--learning-rate", "0.001"])
+    default_config = build_trainer_config(default_args)
+    assert _selector_learning_rate_for_args(default_args, default_config) == pytest.approx(0.001)
+
+    override_args = parse_args(
+        [
+            "--learning-rate",
+            "0.001",
+            "--intent-selector-learning-rate",
+            "0.0003",
+        ]
+    )
+    validate_train_args(override_args)
+    override_config = build_trainer_config(override_args)
+    assert _selector_learning_rate_for_args(override_args, override_config) == pytest.approx(0.0003)
+
+    invalid_args = parse_args(["--intent-selector-learning-rate", "0"])
+    with pytest.raises(SystemExit, match="must be > 0"):
+        validate_train_args(invalid_args)
+
+
 def test_jax_trainer_validates_intent_diversity_requirements():
     scaffold_args = parse_args(
         [
@@ -261,6 +654,121 @@ def test_limit_selector_batch_samples_compacts_active_rows():
     )
     np.testing.assert_array_equal(np.asarray(limited.chosen_intents), [1, 3, 4])
     np.testing.assert_array_equal(np.asarray(limited.active_mask), [1.0, 1.0, 1.0])
+
+
+def test_selector_update_helpers_freeze_shared_policy_params():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    params = {
+        "attention_block_0": {"kernel": jnp.asarray([1.0], dtype=jnp.float32)},
+        "policy_head_offense": {"bias": jnp.asarray([2.0], dtype=jnp.float32)},
+        "intent_selector_head_0": {"kernel": jnp.asarray([3.0], dtype=jnp.float32)},
+        "intent_selector_head_out": {"bias": jnp.asarray([4.0], dtype=jnp.float32)},
+        "intent_selector_value_head_0": {"kernel": jnp.asarray([5.0], dtype=jnp.float32)},
+        "intent_selector_value_head_out": {"bias": jnp.asarray([6.0], dtype=jnp.float32)},
+    }
+    candidate_params = jax.tree_util.tree_map(lambda value: value + 10.0, params)
+
+    merged = _merge_selector_update_params(params, candidate_params, jax)
+
+    np.testing.assert_allclose(np.asarray(merged["attention_block_0"]["kernel"]), [1.0])
+    np.testing.assert_allclose(np.asarray(merged["policy_head_offense"]["bias"]), [2.0])
+    np.testing.assert_allclose(np.asarray(merged["intent_selector_head_0"]["kernel"]), [13.0])
+    np.testing.assert_allclose(np.asarray(merged["intent_selector_head_out"]["bias"]), [14.0])
+    np.testing.assert_allclose(
+        np.asarray(merged["intent_selector_value_head_0"]["kernel"]),
+        [15.0],
+    )
+    np.testing.assert_allclose(
+        np.asarray(merged["intent_selector_value_head_out"]["bias"]),
+        [16.0],
+    )
+
+    grads = jax.tree_util.tree_map(lambda value: jnp.ones_like(value), params)
+    masked_grads = _mask_selector_update_grads(grads, jnp.asarray(1.0), jax, jnp)
+
+    np.testing.assert_allclose(np.asarray(masked_grads["attention_block_0"]["kernel"]), [0.0])
+    np.testing.assert_allclose(np.asarray(masked_grads["policy_head_offense"]["bias"]), [0.0])
+    np.testing.assert_allclose(np.asarray(masked_grads["intent_selector_head_0"]["kernel"]), [1.0])
+    np.testing.assert_allclose(np.asarray(masked_grads["intent_selector_head_out"]["bias"]), [1.0])
+    np.testing.assert_allclose(
+        np.asarray(masked_grads["intent_selector_value_head_0"]["kernel"]),
+        [1.0],
+    )
+    np.testing.assert_allclose(
+        np.asarray(masked_grads["intent_selector_value_head_out"]["bias"]),
+        [1.0],
+    )
+
+    inactive_grads = _mask_selector_update_grads(grads, jnp.asarray(0.0), jax, jnp)
+    assert all(
+        np.allclose(np.asarray(leaf), 0.0)
+        for leaf in jax.tree_util.tree_leaves(inactive_grads)
+    )
+
+    active_scoped_params = _apply_selector_update_param_scope(
+        params,
+        candidate_params,
+        jnp.asarray(1.0),
+        jax,
+        jnp,
+    )
+    inactive_scoped_params = _apply_selector_update_param_scope(
+        params,
+        candidate_params,
+        jnp.asarray(0.0),
+        jax,
+        jnp,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(active_scoped_params["attention_block_0"]["kernel"]),
+        [1.0],
+    )
+    np.testing.assert_allclose(
+        np.asarray(active_scoped_params["intent_selector_head_0"]["kernel"]),
+        [13.0],
+    )
+    np.testing.assert_allclose(
+        np.asarray(inactive_scoped_params["attention_block_0"]["kernel"]),
+        [1.0],
+    )
+    np.testing.assert_allclose(
+        np.asarray(inactive_scoped_params["intent_selector_head_0"]["kernel"]),
+        [3.0],
+    )
+
+
+def test_multiselect_boundaries_do_not_apply_random_fallback_intents():
+    jnp = pytest.importorskip("jax.numpy")
+
+    class State:
+        intent_active = jnp.asarray([1, 1], dtype=jnp.int8)
+        intent_age = jnp.asarray([6, 6], dtype=jnp.int32)
+        intent_commitment_remaining = jnp.asarray([0, 2], dtype=jnp.int32)
+
+    (
+        _episode_start,
+        commitment_timeout,
+        completed_pass,
+        used,
+        applied,
+        fallback_used,
+    ) = _selector_segment_application_masks(
+        State,
+        alpha_used=jnp.asarray([False, False]),
+        multiselect_enabled=jnp.asarray(True),
+        completed_pass_boundary=jnp.asarray([False, True]),
+        selector_min_play_steps=4,
+        jnp=jnp,
+    )
+
+    np.testing.assert_array_equal(np.asarray(commitment_timeout), [True, False])
+    np.testing.assert_array_equal(np.asarray(completed_pass), [False, True])
+    np.testing.assert_array_equal(np.asarray(used), [False, False])
+    np.testing.assert_array_equal(np.asarray(applied), [False, False])
+    np.testing.assert_array_equal(np.asarray(fallback_used), [False, False])
 
 
 def test_build_trainer_config_uses_training_args():
@@ -368,6 +876,73 @@ def test_jax_entropy_coef_supports_linear_and_exp_schedules():
     assert _entropy_coef_for_update(exp_args, 3) == pytest.approx(0.002)
 
 
+def test_mlflow_metric_profile_defaults_to_core():
+    args = parse_args([])
+
+    assert args.mlflow_metric_profile == "core"
+
+
+def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
+    metrics = {
+        "learner_shot_attempts": 10,
+        "offense_all_shot_attempts": 10,
+        "offense_learner_shot_attempts": 10,
+        "defense_all_shot_makes": 4,
+        "defense_opponent_shot_makes": 4,
+        "offense_offense_points_total": 12.0,
+        "offense_learner_points_total": 12.0,
+        "defense_offense_points_total": 7.0,
+        "defense_opponent_points_total": 7.0,
+        "offense_mean_reward": 0.1,
+        "offense_learner_mean_reward": 0.1,
+        "offense_learner_shot_dunk_share": 0.3,
+        "offense_ppo_eligible_shot_attempts_total": 100,
+        "offense_ppo_eligible_shot_attempts_per_step": 0.1,
+        "offense_ppo_eligible_shot_attempts_per_completed_episode": 1.1,
+        "offense_ppo_eligible_learner_shot_attempts_per_completed_episode": 0.9,
+        "offense_ppo_eligible_terminal_shot_episodes": 10,
+        "offense_ppo_eligible_terminal_shot_share": 0.8,
+        "offense_ppo_eligible_reward_per_step": 0.09,
+        "offense_intent_usage_count/0": 42,
+        "offense_intent_usage_share/0": 0.25,
+        "intent_disc_label_count_by_intent/0": 21,
+        "intent_disc_label_prob_by_intent/0": 0.125,
+        "selector_used_count": 500,
+        "selector_usage_by_intent/0": 0.2,
+        "end_to_end_steps_per_sec": 30000.0,
+    }
+
+    filtered = _filter_mlflow_train_metrics(metrics)
+
+    assert "learner_shot_attempts" not in filtered
+    assert "offense_all_shot_attempts" not in filtered
+    assert "defense_all_shot_makes" not in filtered
+    assert "offense_offense_points_total" not in filtered
+    assert "defense_offense_points_total" not in filtered
+    assert "offense_mean_reward" not in filtered
+    assert "offense_ppo_eligible_shot_attempts_total" not in filtered
+    assert "offense_ppo_eligible_shot_attempts_per_step" not in filtered
+    assert "offense_ppo_eligible_shot_attempts_per_completed_episode" not in filtered
+    assert "offense_ppo_eligible_terminal_shot_episodes" not in filtered
+    assert "offense_intent_usage_count/0" not in filtered
+    assert "intent_disc_label_count_by_intent/0" not in filtered
+    assert "offense_learner_shot_attempts" not in filtered
+    assert "defense_opponent_shot_makes" not in filtered
+    assert "offense_learner_points_total" not in filtered
+    assert "defense_opponent_points_total" not in filtered
+    assert filtered["offense_learner_mean_reward"] == 0.1
+    assert filtered["offense_learner_shot_dunk_share"] == 0.3
+    assert filtered["offense_ppo_eligible_learner_shot_attempts_per_completed_episode"] == 0.9
+    assert filtered["offense_ppo_eligible_terminal_shot_share"] == 0.8
+    assert filtered["offense_ppo_eligible_reward_per_step"] == 0.09
+    assert filtered["offense_intent_usage_share/0"] == 0.25
+    assert filtered["intent_disc_label_prob_by_intent/0"] == 0.125
+    assert filtered["selector_used_count"] == 500
+    assert filtered["selector_usage_by_intent/0"] == 0.2
+    assert filtered["end_to_end_steps_per_sec"] == 30000.0
+    assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
+
+
 def test_mlflow_params_include_jax_env_skill_stds():
     class Recorder:
         def __init__(self):
@@ -414,6 +989,20 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "50",
             "--task-reward-scale-ramp-updates",
             "300",
+            "--enable-phi-shaping",
+            "true",
+            "--reward-shaping-gamma",
+            "0.97",
+            "--phi-beta-start",
+            "0.01",
+            "--phi-beta-end",
+            "0.15",
+            "--phi-beta-warmup-updates",
+            "50",
+            "--phi-beta-ramp-updates",
+            "200",
+            "--phi-blend-weight",
+            "0.5",
         ]
     )
     validate_train_args(args)
@@ -445,6 +1034,20 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/env/intent_null_prob"] == 0.1
     assert recorder.params["jax/env/defense_intent_null_prob"] == 0.2
     assert recorder.params["jax/env/intent_visible_to_defense_prob"] == 0.3
+    assert recorder.params["jax/env/enable_phi_shaping"] is True
+    assert recorder.params["jax/env/reward_shaping_gamma"] == 0.97
+    assert recorder.params["jax/env/phi_beta_start"] == 0.01
+    assert recorder.params["jax/env/phi_beta_end"] == 0.15
+    assert recorder.params["jax/env/phi_beta_warmup_updates"] == 50
+    assert recorder.params["jax/env/phi_beta_ramp_updates"] == 200
+    assert recorder.params["jax/env/phi_blend_weight"] == 0.5
+    assert "jax/enable_phi_shaping" not in recorder.params
+    assert "jax/reward_shaping_gamma" not in recorder.params
+    assert "jax/phi_beta_start" not in recorder.params
+    assert "jax/phi_beta_end" not in recorder.params
+    assert "jax/phi_beta_warmup_updates" not in recorder.params
+    assert "jax/phi_beta_ramp_updates" not in recorder.params
+    assert "jax/phi_blend_weight" not in recorder.params
     assert recorder.params["jax/intent_embedding_enabled"] is False
     assert recorder.params["jax/intent_embedding_dim"] == 16
     assert recorder.params["jax/num_intents"] == 8
@@ -455,6 +1058,7 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/ent_coef_start"] == 0.02
     assert recorder.params["jax/ent_coef_end"] == 0.003
     assert recorder.params["jax/ent_schedule"] == "exp"
+    assert recorder.params["jax/mlflow_metric_profile"] == "core"
 
 
 def test_train_scaffold_emits_rollout_trajectory_shapes():
@@ -616,6 +1220,16 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert "defense_opponent_mean_reward" in result["final_metrics"]
     assert "offense_learner_points_per_completed_episode" in result["final_metrics"]
     assert "defense_opponent_points_per_completed_episode" in result["final_metrics"]
+    assert "offense_ppo_eligible_completed_episodes" in result["final_metrics"]
+    assert "offense_completed_episode_count" in result["final_metrics"]
+    assert "offense_completed_active_step_count" in result["final_metrics"]
+    assert "offense_ppo_eligible_completed_episode_count" in result["final_metrics"]
+    assert "offense_ppo_eligible_completed_active_step_count" in result["final_metrics"]
+    assert "defense_ppo_eligible_completed_episodes" in result["final_metrics"]
+    assert "offense_ppo_eligible_reward_per_completed_episode" in result["final_metrics"]
+    assert "offense_ppo_eligible_reward_per_step" in result["final_metrics"]
+    assert "offense_ppo_eligible_terminal_turnover_share" in result["final_metrics"]
+    assert "offense_ppo_eligible_terminal_shot_share" in result["final_metrics"]
     assert result["final_metrics"]["offense_opponent_mean_reward"] == pytest.approx(
         -result["final_metrics"]["offense_learner_mean_reward"]
     )
@@ -637,6 +1251,36 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert result["final_metrics"]["mean_abs_log_ratio"] > 0.0
     assert result["final_metrics"]["max_abs_log_ratio"] > 0.0
     assert "completed_episodes" in result["final_metrics"]
+    assert "completed_episode_count" in result["final_metrics"]
+    assert "completed_active_step_count" in result["final_metrics"]
+    assert "active_step_count" in result["final_metrics"]
+    assert "ppo_used_active_step_count" in result["final_metrics"]
+    assert "ppo_unused_active_step_count" in result["final_metrics"]
+    assert "ppo_used_completed_episode_count" in result["final_metrics"]
+    assert "ppo_used_completed_active_step_count" in result["final_metrics"]
+    assert "ppo_unused_completed_episode_count" in result["final_metrics"]
+    assert "ppo_unused_completed_active_step_count" in result["final_metrics"]
+    assert "cumulative_active_step_count" in result["final_metrics"]
+    assert "cumulative_ppo_used_active_step_count" in result["final_metrics"]
+    assert "cumulative_ppo_unused_active_step_count" in result["final_metrics"]
+    assert "cumulative_completed_episode_count" in result["final_metrics"]
+    assert "cumulative_completed_active_step_count" in result["final_metrics"]
+    assert "cumulative_ppo_used_completed_episode_count" in result["final_metrics"]
+    assert "cumulative_ppo_used_completed_active_step_count" in result["final_metrics"]
+    assert "cumulative_ppo_unused_completed_episode_count" in result["final_metrics"]
+    assert "cumulative_ppo_unused_completed_active_step_count" in result["final_metrics"]
+    assert result["final_metrics"]["cumulative_completed_episode_count"] == pytest.approx(
+        result["final_metrics"]["cumulative_ppo_used_completed_episode_count"]
+        + result["final_metrics"]["cumulative_ppo_unused_completed_episode_count"]
+    )
+    assert result["final_metrics"]["cumulative_active_step_count"] == pytest.approx(
+        result["final_metrics"]["cumulative_ppo_used_active_step_count"]
+        + result["final_metrics"]["cumulative_ppo_unused_active_step_count"]
+    )
+    assert result["final_metrics"]["cumulative_completed_active_step_count"] == pytest.approx(
+        result["final_metrics"]["cumulative_ppo_used_completed_active_step_count"]
+        + result["final_metrics"]["cumulative_ppo_unused_completed_active_step_count"]
+    )
     assert "mean_completed_episode_length" in result["final_metrics"]
     assert "mean_pass_attempts_per_completed_episode" in result["final_metrics"]
     assert "mean_assists_per_completed_episode" in result["final_metrics"]
@@ -745,6 +1389,64 @@ def test_train_loop_runs_intent_selector_segment_start_metrics():
     assert "selector_usage_by_intent/0" in metrics
 
 
+def test_train_loop_skips_empty_selector_update_during_warmup():
+    pytest.importorskip("jax")
+
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--policy-model",
+            "attention",
+            "--attention-embed-dim",
+            "16",
+            "--attention-num-heads",
+            "4",
+            "--attention-token-mlp-dim",
+            "12",
+            "--intent-embedding-enabled",
+            "--intent-embedding-dim",
+            "4",
+            "--enable-intent-learning",
+            "true",
+            "--num-intents",
+            "4",
+            "--intent-selector-enabled",
+            "true",
+            "--intent-selector-hidden-dim",
+            "8",
+            "--intent-selector-alpha-start",
+            "0.0",
+            "--intent-selector-alpha-end",
+            "0.0",
+            "--intent-selector-train-every-rollouts",
+            "1",
+            "--kernel-batch-size",
+            "4",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--ppo-minibatches",
+            "2",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    result = run_training_loop(args)
+
+    metrics = result["final_metrics"]
+    assert metrics["selector_alpha"] == pytest.approx(0.0)
+    assert metrics["selector_train_sample_count"] == pytest.approx(0.0)
+    assert metrics["selector_train_skipped_empty"] == pytest.approx(1.0)
+    assert "selector_train_loss" not in metrics
+
+
 def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     pytest.importorskip("jax")
 
@@ -851,6 +1553,15 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
 
     assert resumed_result["resumed_from_checkpoint"] == str(latest_checkpoint)
     assert resumed_result["final_metrics"]["update_index"] == 2
+    assert resumed_result["final_metrics"]["cumulative_active_step_count"] >= (
+        first_result["final_metrics"]["cumulative_active_step_count"]
+    )
+    assert resumed_result["final_metrics"]["cumulative_completed_episode_count"] >= (
+        first_result["final_metrics"]["cumulative_completed_episode_count"]
+    )
+    assert resumed_result["final_metrics"]["cumulative_completed_active_step_count"] >= (
+        first_result["final_metrics"]["cumulative_completed_active_step_count"]
+    )
     assert len(resumed_result["train_history"]) == 1
 
 

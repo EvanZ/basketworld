@@ -502,7 +502,12 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                         )
                     except Exception:
                         continue
-            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_turnover_reasons(
+                eval_diagnostics,
+                turnovers_raw_step,
+                user_team_ids_set,
+                count_unattributed_team_turnovers=user_team == _Team.OFFENSE,
+            )
             _accumulate_reward_breakdown(
                 eval_diagnostics,
                 env,
@@ -896,8 +901,19 @@ def _accumulate_intent_selection(eval_diagnostics: dict, env) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
 
 
+def _canonical_turnover_reason(reason: object) -> str:
+    key = str(reason or "unknown")
+    if key == "shot_clock":
+        return "shot_clock_violation"
+    return key
+
+
 def _accumulate_turnover_reasons(
-    eval_diagnostics: dict, turnovers_raw_step, user_team_ids_set: set[int]
+    eval_diagnostics: dict,
+    turnovers_raw_step,
+    user_team_ids_set: set[int],
+    *,
+    count_unattributed_team_turnovers: bool = False,
 ) -> None:
     turnover_reasons = eval_diagnostics.setdefault("turnover_reasons", {})
     if not isinstance(turnovers_raw_step, (list, tuple)):
@@ -905,15 +921,17 @@ def _accumulate_turnover_reasons(
     for turnover in turnovers_raw_step:
         if not isinstance(turnover, dict):
             continue
+        reason = _canonical_turnover_reason(turnover.get("reason") or "unknown")
         pid = turnover.get("player_id")
         if pid is None:
+            if count_unattributed_team_turnovers and reason == "shot_clock_violation":
+                turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
             continue
         try:
             if int(pid) not in user_team_ids_set:
                 continue
         except Exception:
             continue
-        reason = str(turnover.get("reason") or "unknown")
         turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
 
 
@@ -1322,7 +1340,12 @@ def _run_sequential_evaluation(
                         )
                     except Exception:
                         continue
-            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_turnover_reasons(
+                eval_diagnostics,
+                turnovers_raw_step,
+                user_team_ids_set,
+                count_unattributed_team_turnovers=user_team == Team.OFFENSE,
+            )
             _accumulate_reward_breakdown(
                 eval_diagnostics,
                 env,

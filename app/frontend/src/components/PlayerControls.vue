@@ -324,10 +324,39 @@ function buildDisplaySelections(selections) {
   return displaySelections;
 }
 
-const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
-const selectorTrainingParams = computed(() => props.gameState?.training_params || {});
+function normalizeTrainingParamsForUi(params) {
+  if (!params || typeof params !== 'object') return {};
+  const normalized = { ...params };
+  for (const [rawKey, value] of Object.entries(params)) {
+    const key = String(rawKey);
+    if (key.startsWith('jax/env/')) {
+      const alias = key.slice('jax/env/'.length);
+      if (alias && normalized[alias] === undefined) normalized[alias] = value;
+      continue;
+    }
+    if (key.startsWith('jax/')) {
+      const alias = key.slice('jax/'.length);
+      if (alias && normalized[alias] === undefined) normalized[alias] = value;
+    }
+  }
+  return normalized;
+}
+
+function coerceTrainingBool(value, fallback = false) {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 't', 'on'].includes(text)) return true;
+  if (['0', 'false', 'no', 'n', 'f', 'off'].includes(text)) return false;
+  return fallback;
+}
+
+const trainingParamsForUi = computed(() => normalizeTrainingParamsForUi(props.gameState?.training_params || {}));
+const paramCounts = computed(() => trainingParamsForUi.value?.param_counts || null);
+const selectorTrainingParams = computed(() => trainingParamsForUi.value || {});
 const selectorEnabled = computed(() =>
-  Boolean(selectorTrainingParams.value?.intent_selector_enabled)
+  coerceTrainingBool(selectorTrainingParams.value?.intent_selector_enabled, false)
 );
 const selectorAlphaSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -358,7 +387,7 @@ const selectorEpsScheduleSummary = computed(() => {
   return formatScheduleWindow(selectorTrainingParams.value, 'intent_selector_eps');
 });
 const selectorMultiselectEnabled = computed(() =>
-  Boolean(selectorTrainingParams.value?.intent_selector_multiselect_enabled)
+  coerceTrainingBool(selectorTrainingParams.value?.intent_selector_multiselect_enabled, false)
 );
 const selectorMinPlayStepsSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -1296,6 +1325,51 @@ const evalConfigSafe = computed(() => {
     ...base,
     ...incoming,
     skills: { ...base.skills, ...(incoming.skills || {}) },
+  };
+});
+
+const envOptionalParamsForUi = computed(() =>
+  normalizeTrainingParamsForUi({
+    ...(props.gameState?.mlflow_env_defaults || {}),
+    ...(props.gameState?.env_optional_params || {}),
+  })
+);
+function firstDefinedValue(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return undefined;
+}
+function formatEvalTemplateNumber(value, digits = 2) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'N/A';
+}
+const evalCheckpointTemplateSettings = computed(() => {
+  const params = {
+    ...(trainingParamsForUi.value || {}),
+    ...(envOptionalParamsForUi.value || {}),
+  };
+  const enabledRaw = firstDefinedValue(
+    params.start_template_enabled,
+    params['jax/start_template_enabled'],
+    params['jax/env/start_template_enabled'],
+  );
+  const enabled = coerceTrainingBool(enabledRaw, false);
+  const prob = firstDefinedValue(params.start_template_prob, enabled ? 1.0 : 0.0);
+  const jitter = firstDefinedValue(params.start_template_jitter_scale, enabled ? 1.0 : 0.0);
+  const mirror = firstDefinedValue(params.start_template_mirror_prob, 0.0);
+  const source = firstDefinedValue(
+    params.start_template_library_artifact_path,
+    params.start_template_library,
+    props.gameState?.start_template_library_source,
+    hasLoadedStartTemplates.value ? templateLibrarySourceLabel.value : undefined,
+  );
+  return {
+    enabled,
+    prob,
+    jitter,
+    mirror,
+    source: source === undefined ? 'N/A' : String(source),
   };
 });
 const templateConfigSafe = computed(() => {
@@ -2564,6 +2638,28 @@ function getPlaybookPrimaryShooterSummary(panel) {
     .join(', ');
 }
 
+function formatPlaybookNextIntentSummary(panel) {
+  const raw = panel?.next_intent_distribution || {};
+  const playMap = playbookResult.value?.play_name_map || props.gameState?.play_name_map;
+  const entries = Object.entries(raw)
+    .map(([key, value]) => {
+      const intentIndex = Number(key);
+      const count = Number(value?.count || 0);
+      const rate = Number(value?.rate || 0);
+      if (!Number.isFinite(intentIndex) || count <= 0) return null;
+      return { intentIndex, count, rate, playName: value?.play_name };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.intentIndex - b.intentIndex;
+    });
+  if (!entries.length) return 'none';
+  return entries
+    .map((entry) => `${formatPlayLabel(entry.intentIndex, playMap, entry.playName)}: ${entry.count} (${(entry.rate * 100).toFixed(0)}%)`)
+    .join(', ');
+}
+
 function formatPlaybookOutcomeSummary(panel) {
   const raw = panel?.terminal_outcomes || {};
   const entries = Object.entries(raw)
@@ -3269,6 +3365,32 @@ const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
+const phiParamsSource = ref(null);
+const phiRewardsEnabled = computed(() => Boolean(mlflowPhiParams.value?.enable_phi_shaping));
+const phiColumnsVisible = computed(() => {
+  if (phiRewardsEnabled.value) return true;
+  return rewardHistory.value.some((row) => (
+    Object.prototype.hasOwnProperty.call(row || {}, 'mlflow_phi_r_shape')
+    || Object.prototype.hasOwnProperty.call(row || {}, 'env_phi_r_shape')
+    || Object.prototype.hasOwnProperty.call(row || {}, 'mlflow_phi_potential')
+  ));
+});
+const phiStatusLabel = computed(() => {
+  if (phiRewardsEnabled.value) return 'Enabled';
+  if (mlflowPhiParams.value) return 'Disabled in loaded params';
+  return 'No phi params loaded';
+});
+const phiSourceLabel = computed(() => {
+  if (phiParamsSource.value === 'mlflow') return 'MLflow run params';
+  if (phiParamsSource.value === 'env') return 'Live environment params';
+  return 'None';
+});
+function phiRewardForRow(row) {
+  if (!row || typeof row !== 'object') return 0;
+  if (row.mlflow_phi_r_shape !== undefined) return Number(row.mlflow_phi_r_shape) || 0;
+  if (row.env_phi_r_shape !== undefined) return Number(row.env_phi_r_shape) || 0;
+  return 0;
+}
 
 // Advisor (MCTS) state
 const advisorMaxDepth = ref(3);
@@ -3443,11 +3565,32 @@ function ensureStatsDiagnosticFields(target) {
   target.rewardBreakdown.assistFullBonus = Number(target.rewardBreakdown.assistFullBonus || 0);
   target.rewardBreakdown.phiShaping = Number(target.rewardBreakdown.phiShaping || 0);
   target.rewardBreakdown.unexplained = Number(target.rewardBreakdown.unexplained || 0);
+  if (!target.selectorDiagnostics || typeof target.selectorDiagnostics !== "object") {
+    target.selectorDiagnostics = {};
+  }
+  target.selectorDiagnostics.source = String(target.selectorDiagnostics.source || "intent_fallback");
+  target.selectorDiagnostics.enabled = Boolean(target.selectorDiagnostics.enabled);
+  target.selectorDiagnostics.mode = String(target.selectorDiagnostics.mode || "");
+  target.selectorDiagnostics.appliedEpisodeStarts = Number(target.selectorDiagnostics.appliedEpisodeStarts || 0);
+  target.selectorDiagnostics.rawProbCount = Number(target.selectorDiagnostics.rawProbCount || 0);
+  target.selectorDiagnostics.meanRawMaxProb = Number(target.selectorDiagnostics.meanRawMaxProb || 0);
+  target.selectorDiagnostics.meanRawProbs = Array.isArray(target.selectorDiagnostics.meanRawProbs)
+    ? target.selectorDiagnostics.meanRawProbs.map((v) => Number(v) || 0)
+    : [];
+  target.selectorDiagnostics.sampleCounts = target.selectorDiagnostics.sampleCounts || {};
+  target.selectorDiagnostics.argmaxCounts = target.selectorDiagnostics.argmaxCounts || {};
 }
 
 ensureStatsDiagnosticFields(statsState.value);
 
+function normalizeTurnoverReason(reason) {
+  const key = String(reason || 'unknown');
+  if (key === 'shot_clock') return 'shot_clock_violation';
+  return key;
+}
+
 function formatTurnoverReason(reason) {
+  const key = normalizeTurnoverReason(reason);
   const map = {
     intercepted: 'Intercepted',
     steal: 'Intercepted',
@@ -3457,10 +3600,11 @@ function formatTurnoverReason(reason) {
     offensive_three_seconds: 'Offensive 3-second violation',
     shot_clock_violation: 'Shot Clock',
   };
-  return map[String(reason)] || String(reason || 'unknown');
+  return map[key] || key;
 }
 
 function getTurnoverReasonTooltip(reason) {
+  const key = normalizeTurnoverReason(reason);
   const map = {
     intercepted: 'A defender intercepted a pass before it reached the target.',
     steal: 'Legacy label for an intercepted pass turnover.',
@@ -3468,9 +3612,9 @@ function getTurnoverReasonTooltip(reason) {
     pass_out_of_bounds: 'The selected pass trajectory went out of bounds.',
     move_out_of_bounds: 'The ball handler moved out of bounds.',
     offensive_three_seconds: 'An offensive player stayed in the lane longer than the 3-second limit.',
-    shot_clock_violation: 'Possession ended because the shot clock expired.',
+    shot_clock_violation: 'Possession ended because the shot clock expired. This is a team turnover and is not attributed to an individual offensive player.',
   };
-  return map[String(reason)] || 'Turnover category reported by the environment.';
+  return map[key] || 'Turnover category reported by the environment.';
 }
 
 function getActionMixTooltip(key) {
@@ -3499,7 +3643,12 @@ function getRewardBreakdownTooltip(key) {
 }
 
 const turnoverReasonRows = computed(() => {
-  const rows = Object.entries(statsState.value?.turnoverReasons || {}).map(([reason, count]) => ({
+  const counts = {};
+  for (const [reason, count] of Object.entries(statsState.value?.turnoverReasons || {})) {
+    const key = normalizeTurnoverReason(reason);
+    counts[key] = Number(counts[key] || 0) + Number(count || 0);
+  }
+  const rows = Object.entries(counts).map(([reason, count]) => ({
     reason,
     label: formatTurnoverReason(reason),
     count: Number(count || 0),
@@ -3507,6 +3656,12 @@ const turnoverReasonRows = computed(() => {
   rows.sort((a, b) => b.count - a.count);
   return rows;
 });
+
+const shotClockViolationCount = computed(() => Number(
+  statsState.value?.turnoverReasons?.shot_clock_violation || 0
+) + Number(
+  statsState.value?.turnoverReasons?.shot_clock || 0
+));
 
 const actionMixRows = computed(() => {
   const mix = statsState.value?.actionMix || {};
@@ -3546,6 +3701,33 @@ const intentSelectionRows = computed(() => {
     rows,
     inactiveCount: Number(statsState.value?.intentInactiveCount || 0),
     total: rows.reduce((acc, row) => acc + row.count, 0) + Number(statsState.value?.intentInactiveCount || 0),
+  };
+});
+
+const selectorEvalDiagnostics = computed(() => {
+  const diag = statsState.value?.selectorDiagnostics || {};
+  const meanRawProbs = Array.isArray(diag.meanRawProbs) ? diag.meanRawProbs : [];
+  const rawRows = meanRawProbs
+    .map((prob, intent) => ({
+      intent,
+      label: formatPlayLabel(intent, props.gameState?.play_name_map),
+      prob: Number(prob || 0),
+      argmaxCount: Number(diag.argmaxCounts?.[String(intent)] || 0),
+      sampleCount: Number(diag.sampleCounts?.[String(intent)] || 0),
+    }))
+    .sort((a, b) => b.prob - a.prob);
+  return {
+    source: String(diag.source || "intent_fallback"),
+    enabled: Boolean(diag.enabled),
+    specEnabled: Boolean(diag.specEnabled),
+    configEnabled: Boolean(diag.configEnabled),
+    configMode: String(diag.configMode || ""),
+    disabledReason: String(diag.disabledReason || ""),
+    mode: String(diag.mode || ""),
+    appliedEpisodeStarts: Number(diag.appliedEpisodeStarts || 0),
+    rawProbCount: Number(diag.rawProbCount || 0),
+    meanRawMaxProb: Number(diag.meanRawMaxProb || 0),
+    rawRows,
   };
 });
 
@@ -3811,7 +3993,7 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   const tovCount = turnovers.length;
   statsState.value.turnovers += Number(tovCount || 0);
   for (const turnover of turnovers) {
-    const reason = String(turnover?.reason || 'unknown');
+    const reason = normalizeTurnoverReason(turnover?.reason);
     statsState.value.turnoverReasons[reason] = Number(statsState.value.turnoverReasons[reason] || 0) + 1;
   }
   if (!statsState.value.violations) {
@@ -3939,7 +4121,7 @@ function applyEvaluationStats(
     defensiveLaneCount += Number(defLane || 0);
     const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
     offensiveThreeCount += turnovers.filter(
-      (turnover) => String(turnover?.reason || '') === 'offensive_three_seconds'
+      (turnover) => normalizeTurnoverReason(turnover?.reason) === 'offensive_three_seconds'
     ).length;
   }
 
@@ -3961,7 +4143,10 @@ function applyEvaluationStats(
   }
 
   if (evalDiagnostics && typeof evalDiagnostics === 'object') {
-    const intentRaw = evalDiagnostics.intent_selection_counts || {};
+    const selectorStartRaw = evalDiagnostics.selector?.episode_start_selection_counts || {};
+    const intentRaw = Object.keys(selectorStartRaw).length > 0
+      ? selectorStartRaw
+      : (evalDiagnostics.intent_selection_counts || {});
     next.intentSelectionCounts = {};
     for (const [intent, count] of Object.entries(intentRaw)) {
       const idx = Number(intent);
@@ -3973,8 +4158,14 @@ function applyEvaluationStats(
     const reasonsRaw = evalDiagnostics.turnover_reasons || {};
     next.turnoverReasons = {};
     for (const [reason, count] of Object.entries(reasonsRaw)) {
-      next.turnoverReasons[String(reason)] = Number(count || 0);
+      const key = normalizeTurnoverReason(reason);
+      next.turnoverReasons[key] = Number(next.turnoverReasons[key] || 0) + Number(count || 0);
     }
+    const turnoverReasonTotal = Object.values(next.turnoverReasons || {}).reduce(
+      (sum, count) => sum + Number(count || 0),
+      0
+    );
+    next.turnovers = Math.max(Number(next.turnovers || 0), turnoverReasonTotal);
 
     const mixRaw = evalDiagnostics.action_mix || {};
     next.actionMix = {
@@ -3984,6 +4175,45 @@ function applyEvaluationStats(
       pass: Number(mixRaw.pass || 0),
       other: Number(mixRaw.other || 0),
       total: Number(mixRaw.total || 0),
+    };
+
+    const selectorDiagRaw = evalDiagnostics.selector || {};
+    const nativeSummary = evalDiagnostics.jax_native_summary || {};
+    const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
+    const selectorStartSource = Object.keys(selectorStartCounts).length > 0
+      ? "selector_episode_start"
+      : "intent_fallback";
+    const meanRawProbs = Array.isArray(selectorDiagRaw.episode_start_mean_raw_probs)
+      ? selectorDiagRaw.episode_start_mean_raw_probs.map((v) => Number(v) || 0)
+      : (Array.isArray(nativeSummary.selector_episode_start_mean_raw_probs)
+        ? nativeSummary.selector_episode_start_mean_raw_probs.map((v) => Number(v) || 0)
+        : []);
+    next.selectorDiagnostics = {
+      source: selectorStartSource,
+      enabled: Boolean(nativeSummary.selector_enabled),
+      specEnabled: Boolean(nativeSummary.selector_spec_enabled),
+      configEnabled: Boolean(nativeSummary.selector_config_enabled),
+      configMode: String(nativeSummary.selector_config_mode || ""),
+      disabledReason: String(nativeSummary.selector_disabled_reason || ""),
+      mode: String(nativeSummary.selector_selection_mode || ""),
+      appliedEpisodeStarts: Number(
+        selectorDiagRaw.boundary_episode_start_count
+        ?? nativeSummary.selector_boundary_episode_start_count
+        ?? 0
+      ),
+      rawProbCount: Number(
+        selectorDiagRaw.episode_start_raw_prob_count
+        ?? nativeSummary.selector_episode_start_raw_prob_count
+        ?? 0
+      ),
+      meanRawMaxProb: Number(
+        selectorDiagRaw.episode_start_mean_raw_max_prob
+        ?? nativeSummary.selector_episode_start_mean_raw_max_prob
+        ?? 0
+      ),
+      meanRawProbs,
+      sampleCounts: { ...selectorStartCounts },
+      argmaxCounts: { ...(selectorDiagRaw.episode_start_argmax_counts || {}) },
     };
 
     const rbRaw = evalDiagnostics.reward_breakdown || {};
@@ -4024,6 +4254,7 @@ async function copyStatsMarkdown() {
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
       ['Total potential assists', String(s.dunk.potentialAssists + s.twoPt.potentialAssists + s.threePt.potentialAssists)],
       ['Total turnovers', String(s.turnovers)],
+      ['Shot clock violations', String(shotClockViolationCount.value)],
       ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
       ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
       ['Offensive 3-second violations', String(s.violations?.offensiveThreeSeconds || 0)],
@@ -5191,6 +5422,7 @@ const fetchRewards = async () => {
     episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
     rewardParams.value = data.reward_params || null;
     mlflowPhiParams.value = data.mlflow_phi_params || null;
+    phiParamsSource.value = data.phi_params_source || null;
   } catch (error) {
     console.error('Failed to fetch rewards:', error);
   }
@@ -6063,12 +6295,16 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
             <div class="param-item"><span class="param-name">Violation reward:</span><span class="param-value">{{ rewardParams.violation_reward }}</span></div>
           </div>
-          <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
-            <h5>Phi Shaping (from MLflow)</h5>
-            <div class="param-item"><span class="param-name">Beta (β):</span><span class="param-value">{{ mlflowPhiParams.phi_beta }}</span></div>
-            <div class="param-item"><span class="param-name">Gamma (γ):</span><span class="param-value">{{ mlflowPhiParams.reward_shaping_gamma }}</span></div>
-            <div class="param-item"><span class="param-name">Aggregation mode:</span><span class="param-value">{{ mlflowPhiParams.phi_aggregation_mode }}</span></div>
-            <div class="param-item" v-if="mlflowPhiParams.phi_blend_weight > 0"><span class="param-name">Blend weight:</span><span class="param-value">{{ mlflowPhiParams.phi_blend_weight.toFixed(2) }}</span></div>
+          <div class="param-category">
+            <h5>Phi Shaping</h5>
+            <div class="param-item"><span class="param-name">Status:</span><span class="param-value">{{ phiStatusLabel }}</span></div>
+            <div class="param-item"><span class="param-name">Source:</span><span class="param-value">{{ phiSourceLabel }}</span></div>
+            <template v-if="mlflowPhiParams">
+              <div class="param-item"><span class="param-name">Beta (β):</span><span class="param-value">{{ mlflowPhiParams.phi_beta }}</span></div>
+              <div class="param-item"><span class="param-name">Gamma (γ):</span><span class="param-value">{{ mlflowPhiParams.reward_shaping_gamma }}</span></div>
+              <div class="param-item"><span class="param-name">Aggregation mode:</span><span class="param-value">{{ mlflowPhiParams.phi_aggregation_mode }}</span></div>
+              <div class="param-item"><span class="param-name">Blend weight:</span><span class="param-value">{{ Number(mlflowPhiParams.phi_blend_weight || 0).toFixed(2) }}</span></div>
+            </template>
           </div>
         </div>
         <div v-else class="no-rewards">No reward parameters available.</div>
@@ -6090,7 +6326,7 @@ function offenseSkillDeltaLabel(idx) {
           <div v-if="rewardHistory.length === 0" class="no-rewards">
             No rewards recorded yet.
           </div>
-          <div v-else class="reward-table" :class="{ 'with-phi': mlflowPhiParams && mlflowPhiParams.enable_phi_shaping }">
+          <div v-else class="reward-table" :class="{ 'with-phi': phiColumnsVisible }">
             <div class="reward-header">
               <span>Turn</span>
               <span>Shot Clock</span>
@@ -6098,7 +6334,8 @@ function offenseSkillDeltaLabel(idx) {
               <span>Off. Reason</span>
               <span>Defense</span>
               <span>Def. Reason</span>
-              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">Φ</span>
+              <span v-if="phiColumnsVisible">Φ Reward</span>
+              <span v-if="phiColumnsVisible">Φ Potential</span>
             </div>
             <div 
               v-for="reward in rewardHistory" 
@@ -6116,7 +6353,13 @@ function offenseSkillDeltaLabel(idx) {
                 {{ reward.defense.toFixed(3) }}
               </span>
               <span class="reason-text">{{ reward.defense_reason }}</span>
-              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
+              <span
+                v-if="phiColumnsVisible"
+                :class="{ positive: phiRewardForRow(reward) > 0, negative: phiRewardForRow(reward) < 0 }"
+              >
+                {{ phiRewardForRow(reward).toFixed(3) }}
+              </span>
+              <span v-if="phiColumnsVisible">
                 {{ (reward.mlflow_phi_potential || 0).toFixed(3) }}
               </span>
             </div>
@@ -6213,6 +6456,7 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
             <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
+            <div class="param-item" data-tooltip="Shot clock expirations. These count as team turnovers but are not assigned to an individual offensive player."><span class="param-name">Shot clock violations:</span><span class="param-value">{{ shotClockViolationCount }}</span></div>
             <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
             <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offense kept a player in the lane beyond the 3-second limit, causing turnovers."><span class="param-name">Offensive 3-second violations:</span><span class="param-value">{{ statsState.violations?.offensiveThreeSeconds || 0 }}</span></div>
@@ -6299,6 +6543,66 @@ function offenseSkillDeltaLabel(idx) {
             <div v-if="intentSelectionRows.total === 0" class="param-item" data-tooltip="No offense intent start counts were recorded in this evaluation window.">
               <span class="param-name">(none)</span>
               <span class="param-value">0</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
+              Selector Diagnostics
+              <span
+                class="category-help"
+                title="Diagnostics for JAX learned selector sampling at eval episode starts. If source is intent_fallback, the table above is not using selector-applied starts."
+                aria-label="Selector diagnostics help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Whether native JAX eval considered the learned selector enabled for this run.">
+              <span class="param-name">Selector enabled:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.enabled ? "Yes" : "No" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Which source populated Offense Intent Starts: selector episode-start applications, or fallback reset intent counts.">
+              <span class="param-name">Start count source:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.source }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the loaded JAX checkpoint policy_spec contains a selector head.">
+              <span class="param-name">Spec selector:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.specEnabled ? "Yes" : "No" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether checkpoint/session config enables the selector after metadata resolution.">
+              <span class="param-name">Config selector:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.configEnabled ? "Yes" : "No" }}</span>
+            </div>
+            <div v-if="selectorEvalDiagnostics.disabledReason" class="param-item" data-tooltip="Why native JAX eval disabled selector application.">
+              <span class="param-name">Disabled reason:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.disabledReason }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Requested eval intent selection mode. learned_sample should use raw learned selector probabilities.">
+              <span class="param-name">Mode:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.mode || "N/A" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of episode starts where the selector actually applied a play.">
+              <span class="param-name">Applied starts:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.appliedEpisodeStarts }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many episode-start raw probability vectors were averaged below.">
+              <span class="param-name">Raw prob samples:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.rawProbCount }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Mean max raw selector probability at episode starts. About 12.5% for 8 intents means near-uniform.">
+              <span class="param-name">Mean raw max prob:</span>
+              <span class="param-value">{{ percentFromProb(selectorEvalDiagnostics.meanRawMaxProb).toFixed(1) }}%</span>
+            </div>
+            <div
+              v-for="row in selectorEvalDiagnostics.rawRows"
+              :key="`selector-raw-prob-${row.intent}`"
+              class="param-item"
+              data-tooltip="Mean raw selector probability at eval episode starts. Argmax/sample counts help distinguish a uniform model from a sampling/display issue."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ percentFromProb(row.prob).toFixed(1) }}% | argmax {{ row.argmaxCount }} | sampled {{ row.sampleCount }}</span>
+            </div>
+            <div v-if="selectorEvalDiagnostics.rawRows.length === 0" class="param-item" data-tooltip="No native selector probability diagnostics were returned. This usually means eval did not use the native JAX selector path.">
+              <span class="param-name">Raw probs:</span>
+              <span class="param-value">N/A</span>
             </div>
           </div>
           <div class="param-category">
@@ -7041,6 +7345,7 @@ function offenseSkillDeltaLabel(idx) {
                 <th>Avg First Shot Step</th>
                 <th>Avg Terminated Steps</th>
                 <th>Primary Shooter</th>
+                <th>Next Selected Plays</th>
                 <th
                   v-for="playerId in playbookOffenseColumnIds"
                   :key="`playbook-summary-head-p${playerId}`"
@@ -7065,6 +7370,7 @@ function offenseSkillDeltaLabel(idx) {
                 <td>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</td>
                 <td>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</td>
                 <td>{{ getPlaybookPrimaryShooterSummary(panel) }}</td>
+                <td>{{ formatPlaybookNextIntentSummary(panel) }}</td>
                 <td
                   v-for="playerId in playbookOffenseColumnIds"
                   :key="`playbook-summary-${panel.intent_index}-p${playerId}`"
@@ -7637,6 +7943,24 @@ function offenseSkillDeltaLabel(idx) {
         <span v-else class="status-note">
           No template library loaded.
         </span>
+      </div>
+
+      <div v-if="evalConfigSafe.startTemplateMode === 'checkpoint'" class="eval-row">
+        <label>Effective template settings</label>
+        <span class="status-note">
+          enabled: {{ evalCheckpointTemplateSettings.enabled ? 'Yes' : 'No' }}
+          · prob: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.prob, 2) }}
+          · jitter: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.jitter, 2) }}
+          · mirror: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.mirror, 2) }}
+        </span>
+      </div>
+      <div v-if="evalConfigSafe.startTemplateMode === 'checkpoint' && evalCheckpointTemplateSettings.source !== 'N/A'" class="eval-row">
+        <label>Template source</label>
+        <span class="status-note path-note">{{ evalCheckpointTemplateSettings.source }}</span>
+      </div>
+      <div v-else-if="evalConfigSafe.startTemplateMode === 'disabled'" class="eval-row">
+        <label>Effective template settings</label>
+        <span class="status-note">Templates forced off for this eval run.</span>
       </div>
 
       <div v-if="evalConfigSafe.startTemplateMode === 'enabled'" class="eval-row">
@@ -9922,7 +10246,7 @@ function offenseSkillDeltaLabel(idx) {
 }
 
 .reward-table.with-phi .reward-header {
-  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr 1fr;
 }
 
 .reward-row {
@@ -9936,7 +10260,7 @@ function offenseSkillDeltaLabel(idx) {
 }
 
 .reward-table.with-phi .reward-row {
-  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr 1fr;
 }
 
 .reward-row:last-child {

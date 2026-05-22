@@ -8,6 +8,8 @@ This plan assumes the reduced JAX path has already passed proof-of-value on thro
 
 For a study-oriented overview of the current JAX package structure and how the SB3 architecture maps to the JAX implementation, see [jax_codebase_overview.md](/home/evanzamir/basketworld/docs/jax_codebase_overview.md).
 
+For the next training-quality push around early-termination exploits, rollout masking, episode-balanced weighting, and episode-quota collection, see [jax_rollout_objective_stability_plan.md](/home/evanzamir/basketworld/docs/jax_rollout_objective_stability_plan.md).
+
 ## What Has Already Been Proven
 
 The benchmark phase established:
@@ -426,9 +428,71 @@ Current status:
 Remaining environment parity gaps:
 
 - start-template resets/curricula
-- phi shaping
 - advanced intent/template hooks
 - richer Python-env `action_results` diagnostics
+
+## Phi Shaping Parity
+
+Purpose:
+
+- restore the SB3 potential-based reward shaping signal in the compiled JAX environment
+- provide a dense shot-quality signal that can stabilize learning without replacing the terminal basketball objective
+- reduce abrupt policy swings where PPO discovers short-horizon reward hacks, such as rapidly ending possessions or collapsing into a narrow shot type
+
+Motivation:
+
+- the SB3 environment applies `phi_beta * (reward_shaping_gamma * Phi(s_next) - Phi(s_prev))`
+- `Phi(s)` is based on pressure-adjusted expected points for the current possession, typically using `team_best` with optional ball-handler blending
+- the current JAX environment carries phi-related static fields, but does not yet apply the shaping term to rewards
+- without this dense potential signal, the JAX model is relying more heavily on sparse terminal shot/turnover outcomes and discriminator/selector incentives
+
+Implementation milestones:
+
+Current status:
+
+- implemented in `basketworld_jax.env.minimal`
+- beta is scheduled by PPO update count
+- active beta and phi diagnostics are logged through the JAX training metrics path
+- launch config has a conservative first-run schedule: beta `0.0 -> 0.15` after 50 warmup updates over a 200-update ramp
+- targeted parity tests pass for the beta schedule and a phi-shaped compiled transition
+
+1. Add JAX-native potential calculation. Complete.
+   - compute pressure-adjusted expected points from the existing JAX shot-profile kernel
+   - support `team_best`, `teammates_best`, `teammates_avg`, `team_avg`, `team_worst`, and `teammates_worst`
+   - support `phi_use_ball_handler_only` and `phi_blend_weight`
+
+2. Apply potential-based shaping in `basketworld_jax.env.minimal`. Complete.
+   - use `state.cached_phi` as `Phi(s_prev)`
+   - use `Phi(s_next)=0` on terminal transitions
+   - distribute shaped reward to offense players and the negative shaped reward to defense players
+   - update `cached_phi` for the next compiled step
+
+3. Add update-based scheduling. Complete.
+   - expose `--phi-beta-warmup-updates`
+   - expose `--phi-beta-ramp-updates`
+   - schedule from `--phi-beta-start` to `--phi-beta-end`
+   - log the active `phi_beta` each update
+
+4. Add diagnostics. Complete for training metrics, needs long-run interpretation.
+   - log `phi_r_shape`, `phi_prev`, `phi_next`, and `phi_beta`
+   - keep base reward metrics and shaped reward metrics separable enough to debug whether shaping is dominating
+
+Initial recommendation:
+
+- `--enable-phi-shaping true`
+- `--phi-beta-start 0.0`
+- `--phi-beta-end 0.15`
+- `--phi-beta-warmup-updates 50`
+- `--phi-beta-ramp-updates 200`
+- `--reward-shaping-gamma 1.0`
+- `--phi-aggregation-mode team_best`
+- `--phi-blend-weight 0.5`
+
+Risks:
+
+- too much beta can encourage hovering in high-EP states instead of finishing possessions
+- if phi is introduced before the policy has basic legal behavior, it can amplify noisy early movement
+- diagnostics need to distinguish actual task reward from shaping contribution
 
 ## GPU Viability Test
 

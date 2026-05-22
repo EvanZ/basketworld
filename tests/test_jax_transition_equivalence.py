@@ -17,6 +17,12 @@ from benchmarks.jax_kernel import (
     step_batch,
     stack_state_snapshots,
 )
+from basketworld_jax.env.minimal import (
+    build_kernel_static_from_env as build_minimal_kernel_static_from_env,
+    snapshot_state_from_env as snapshot_minimal_state_from_env,
+    stack_state_snapshots as stack_minimal_state_snapshots,
+    step_batch_minimal as minimal_step_batch,
+)
 
 
 def _make_env() -> HexagonBasketballEnv:
@@ -58,6 +64,12 @@ def _make_env() -> HexagonBasketballEnv:
 def _make_kernel_inputs(env: HexagonBasketballEnv):
     static = build_kernel_static_from_env(env, xp=jnp)
     state = stack_state_snapshots([snapshot_state_from_env(env)], xp=jnp)
+    return static, state
+
+
+def _make_minimal_kernel_inputs(env: HexagonBasketballEnv):
+    static = build_minimal_kernel_static_from_env(env, xp=jnp)
+    state = stack_minimal_state_snapshots([snapshot_minimal_state_from_env(env)], xp=jnp)
     return static, state
 
 
@@ -206,6 +218,140 @@ def test_jax_step_batch_matches_env_for_deterministic_noop_step():
     assert np.asarray(build_observation_vector_batch(static, next_state, jnp))[0].tolist() == pytest.approx(
         env_obs["obs"].tolist(), abs=1e-6
     )
+
+
+def test_jax_step_batch_matches_env_for_phi_shaping_noop_step():
+    env = _make_minimal_step_env()
+    env.enable_phi_shaping = True
+    env.reward_shaping_gamma = 1.0
+    env.phi_beta = 0.25
+    env.phi_blend_weight = 0.5
+    env.phi_aggregation_mode = "team_best"
+    env.phi_use_ball_handler_only = False
+    env._cached_phi = 0.0
+    static, state = _make_minimal_kernel_inputs(env)
+    actions = np.array([[0] * env.n_players], dtype=np.int32)
+    key = jax.random.PRNGKey(0)
+
+    env._rng = _FakeRng([])
+    _, env_rewards, env_done, env_truncated, env_info = env.step(actions[0])
+    out = minimal_step_batch(static, state, jnp.asarray(actions), jnp.asarray([key]), jax, jnp)
+    next_state = out.state
+
+    assert env_truncated is False
+    assert bool(np.asarray(out.done)[0]) == bool(env_done)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert float(np.asarray(out.phi_r_shape)[0]) == pytest.approx(float(env_info["phi_r_shape"]), abs=1e-6)
+    assert float(np.asarray(out.phi_prev)[0]) == pytest.approx(float(env_info["phi_prev"]), abs=1e-6)
+    assert float(np.asarray(out.phi_next)[0]) == pytest.approx(float(env_info["phi_next"]), abs=1e-6)
+    assert float(np.asarray(out.phi_beta)[0]) == pytest.approx(float(env_info["phi_beta"]), abs=1e-6)
+    assert float(np.asarray(next_state.cached_phi)[0]) == pytest.approx(float(env_info["phi_next"]), abs=1e-6)
+
+
+def test_jax_pressure_turnover_does_not_receive_shot_expected_value_reward():
+    env = _make_minimal_step_env()
+    env.defender_pressure_turnover_chance = 1.0
+    env.defender_pressure_distance = 10
+    static, state = _make_minimal_kernel_inputs(env)
+    actions = np.array([[0] * env.n_players], dtype=np.int32)
+    key = jax.random.PRNGKey(11)
+
+    env._rng = _FakeRng([0.0])
+    _, env_rewards, env_done, env_truncated, env_info = env.step(actions[0])
+    out = minimal_step_batch(static, state, jnp.asarray(actions), jnp.asarray([key]), jax, jnp)
+
+    assert env_truncated is False
+    assert env_done is True
+    assert bool(np.asarray(out.done)[0]) is True
+    assert int(np.asarray(out.turnover)[0]) == 1
+    assert int(np.asarray(out.turnover_reason)[0]) == 3
+    assert int(np.asarray(out.shot_attempt)[0]) == 0
+    assert float(np.asarray(out.shot_expected_points)[0]) == pytest.approx(0.0)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx([0.0] * env.n_players, abs=1e-6)
+
+
+def test_jax_pressure_turnover_phi_shaping_penalizes_offense():
+    env = _make_minimal_step_env()
+    env.defender_pressure_turnover_chance = 1.0
+    env.defender_pressure_distance = 10
+    env.enable_phi_shaping = True
+    env.reward_shaping_gamma = 1.0
+    env.phi_beta = 0.25
+    env._cached_phi = 1.2
+    static, state = _make_minimal_kernel_inputs(env)
+    actions = np.array([[0] * env.n_players], dtype=np.int32)
+    key = jax.random.PRNGKey(12)
+
+    env._rng = _FakeRng([0.0])
+    _, env_rewards, env_done, env_truncated, env_info = env.step(actions[0])
+    out = minimal_step_batch(static, state, jnp.asarray(actions), jnp.asarray([key]), jax, jnp)
+
+    assert env_truncated is False
+    assert env_done is True
+    assert bool(np.asarray(out.done)[0]) is True
+    assert int(np.asarray(out.turnover)[0]) == 1
+    assert int(np.asarray(out.shot_attempt)[0]) == 0
+    assert float(np.asarray(out.shot_expected_points)[0]) == pytest.approx(0.0)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert float(np.asarray(out.phi_r_shape)[0]) == pytest.approx(float(env_info["phi_r_shape"]), abs=1e-6)
+    assert float(np.asarray(out.phi_prev)[0]) == pytest.approx(1.2, abs=1e-6)
+    assert float(np.asarray(out.phi_next)[0]) == pytest.approx(0.0, abs=1e-6)
+    assert np.all(np.asarray(out.rewards)[0, env.offense_ids] < 0.0)
+    assert np.all(np.asarray(out.rewards)[0, env.defense_ids] > 0.0)
+
+
+def test_jax_shot_clock_turnover_has_no_shot_expected_value_reward():
+    env = _make_minimal_step_env()
+    env.shot_clock = 1
+    static, state = _make_minimal_kernel_inputs(env)
+    actions = np.array([[0] * env.n_players], dtype=np.int32)
+    key = jax.random.PRNGKey(13)
+
+    env._rng = _FakeRng([])
+    _, env_rewards, env_done, env_truncated, env_info = env.step(actions[0])
+    out = minimal_step_batch(static, state, jnp.asarray(actions), jnp.asarray([key]), jax, jnp)
+
+    assert env_truncated is False
+    assert env_done is True
+    assert bool(np.asarray(out.done)[0]) is True
+    assert int(np.asarray(out.turnover)[0]) == 1
+    assert int(np.asarray(out.turnover_reason)[0]) == 5
+    assert int(np.asarray(out.turnover_player)[0]) == env.offense_ids[0]
+    assert int(np.asarray(out.shot_attempt)[0]) == 0
+    assert float(np.asarray(out.shot_expected_points)[0]) == pytest.approx(0.0)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx([0.0] * env.n_players, abs=1e-6)
+
+
+def test_jax_shot_clock_turnover_phi_shaping_penalizes_offense():
+    env = _make_minimal_step_env()
+    env.shot_clock = 1
+    env.enable_phi_shaping = True
+    env.reward_shaping_gamma = 1.0
+    env.phi_beta = 0.25
+    env._cached_phi = 1.2
+    static, state = _make_minimal_kernel_inputs(env)
+    actions = np.array([[0] * env.n_players], dtype=np.int32)
+    key = jax.random.PRNGKey(14)
+
+    env._rng = _FakeRng([])
+    _, env_rewards, env_done, env_truncated, env_info = env.step(actions[0])
+    out = minimal_step_batch(static, state, jnp.asarray(actions), jnp.asarray([key]), jax, jnp)
+
+    assert env_truncated is False
+    assert env_done is True
+    assert bool(np.asarray(out.done)[0]) is True
+    assert int(np.asarray(out.turnover)[0]) == 1
+    assert int(np.asarray(out.turnover_reason)[0]) == 5
+    assert int(np.asarray(out.shot_attempt)[0]) == 0
+    assert float(np.asarray(out.shot_expected_points)[0]) == pytest.approx(0.0)
+    assert np.asarray(out.rewards)[0].tolist() == pytest.approx(env_rewards.tolist(), abs=1e-6)
+    assert float(np.asarray(out.phi_r_shape)[0]) == pytest.approx(float(env_info["phi_r_shape"]), abs=1e-6)
+    assert float(np.asarray(out.phi_prev)[0]) == pytest.approx(1.2, abs=1e-6)
+    assert float(np.asarray(out.phi_next)[0]) == pytest.approx(0.0, abs=1e-6)
+    assert np.all(np.asarray(out.rewards)[0, env.offense_ids] < 0.0)
+    assert np.all(np.asarray(out.rewards)[0, env.defense_ids] > 0.0)
 
 
 def test_jax_step_batch_matches_env_for_pointer_pass_success():

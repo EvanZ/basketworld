@@ -62,6 +62,14 @@ def _load_checkpoint_params(path: str | Path, jax) -> tuple[dict[str, Any], Any,
 _SELECTOR_MODE_LEARNED_SAMPLE = 0
 _SELECTOR_MODE_BEST_INTENT = 1
 _SELECTOR_MODE_UNIFORM_RANDOM = 2
+_SELECTOR_METADATA_PRIORITY_KEYS = {
+    "intent_selector_enabled",
+    "intent_selector_mode",
+    "intent_selector_multiselect_enabled",
+    "intent_selector_min_play_steps",
+    "intent_selector_hidden_dim",
+    "intent_selector_value_coef",
+}
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -96,7 +104,49 @@ def _param(training_params: dict[str, Any], key: str, default: Any = None) -> An
     jax_key = f"jax/{key}"
     if jax_key in training_params:
         return training_params[jax_key]
+    jax_env_key = f"jax/env/{key}"
+    if jax_env_key in training_params:
+        return training_params[jax_env_key]
     return default
+
+
+def _selector_training_params_from_checkpoint(
+    payload: dict[str, Any],
+    training_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge session params with checkpoint metadata, preferring checkpoint selector flags.
+
+    MLflow/session extraction can populate default False values when a run is
+    incomplete or when a checkpoint is loaded outside its original run. Static
+    selector flags are architectural/runtime facts of the checkpoint, so native
+    eval should resolve them from checkpoint metadata before falling back.
+    """
+    params: dict[str, Any] = {}
+    trainer_config = payload.get("trainer_config")
+    if isinstance(trainer_config, dict):
+        params.update(trainer_config)
+    if isinstance(training_params, dict):
+        params.update(training_params)
+    if isinstance(trainer_config, dict):
+        for key in _SELECTOR_METADATA_PRIORITY_KEYS:
+            if key in trainer_config:
+                params[key] = trainer_config[key]
+    policy_spec = payload.get("policy_spec")
+    if isinstance(policy_spec, dict) and "intent_selector_enabled" in policy_spec:
+        policy_selector_enabled = _coerce_bool(
+            policy_spec.get("intent_selector_enabled"),
+            default=False,
+        )
+        if policy_selector_enabled:
+            params["intent_selector_enabled"] = True
+            selector_mode = str(params.get("intent_selector_mode") or "").strip().lower()
+            if not selector_mode or selector_mode == "callback":
+                params["intent_selector_mode"] = "integrated"
+            else:
+                params.setdefault("intent_selector_mode", "integrated")
+        else:
+            params.setdefault("intent_selector_enabled", False)
+    return params
 
 
 def _normalize_selector_mode_code(mode: str | None) -> int:
@@ -157,15 +207,24 @@ def _selector_eval_settings(
     training_params: dict[str, Any] | None,
     intent_selection_mode: str | None,
 ) -> dict[str, Any]:
-    params = dict(training_params or {})
+    params = _selector_training_params_from_checkpoint(payload, training_params)
     update_index = int(payload.get("update_index", 0) or 0)
     mode_code = _normalize_selector_mode_code(intent_selection_mode)
-    selector_enabled = bool(spec.intent_selector_enabled) and _coerce_bool(
-        _param(params, "intent_selector_enabled", bool(spec.intent_selector_enabled)),
-        bool(spec.intent_selector_enabled),
+    spec_selector_enabled = bool(spec.intent_selector_enabled)
+    config_selector_enabled = _coerce_bool(
+        _param(params, "intent_selector_enabled", spec_selector_enabled),
+        spec_selector_enabled,
     )
-    selector_mode = str(_param(params, "intent_selector_mode", "integrated") or "integrated").lower()
+    selector_enabled = spec_selector_enabled and config_selector_enabled
+    selector_mode = str(_param(params, "intent_selector_mode", "integrated") or "integrated").strip().lower()
     selector_enabled = selector_enabled and selector_mode == "integrated"
+    disabled_reason = None
+    if not spec_selector_enabled:
+        disabled_reason = "policy_spec_selector_disabled"
+    elif not config_selector_enabled:
+        disabled_reason = "config_selector_disabled"
+    elif selector_mode != "integrated":
+        disabled_reason = f"selector_mode_{selector_mode}"
     eps = _linear_eval_schedule(
         params,
         "intent_selector_eps",
@@ -182,9 +241,17 @@ def _selector_eval_settings(
     )
     return {
         "enabled": bool(selector_enabled),
+        "spec_enabled": bool(spec_selector_enabled),
+        "config_enabled": bool(config_selector_enabled),
+        "selector_mode": str(selector_mode),
+        "disabled_reason": disabled_reason,
         "mode_code": int(mode_code),
         "mode_label": _selector_mode_label(mode_code),
         "eps": float(np.clip(eps, 0.0, 1.0)),
+        # Eval "learned_sample" should sample the learned selector distribution,
+        # not the training exploration mix. Uniform behavior is explicit via
+        # intent_selection_mode="uniform_random".
+        "eval_sampling_eps": 0.0,
         "training_alpha": float(np.clip(training_alpha, 0.0, 1.0)),
         "eval_alpha": 1.0 if selector_enabled and mode_code != _SELECTOR_MODE_UNIFORM_RANDOM else 0.0,
         "multiselect_enabled": _coerce_bool(
@@ -246,6 +313,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
 
         def _zero_selector_trace(state):
             batch_shape = state.intent_index.shape
+            batch_size = int(batch_shape[0])
             return {
                 "selector_applied": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_used": jnp.zeros(batch_shape, dtype=jnp.int8),
@@ -254,6 +322,12 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "selector_boundary_commitment_timeout": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_completed_pass": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_intent_index": jnp.full(batch_shape, -1, dtype=jnp.int32),
+                "selector_raw_probs": jnp.zeros(
+                    (batch_size, int(spec.num_intents)),
+                    dtype=jnp.float32,
+                ),
+                "selector_raw_argmax": jnp.full(batch_shape, -1, dtype=jnp.int32),
+                "selector_raw_max_prob": jnp.zeros(batch_shape, dtype=jnp.float32),
             }
 
         def _where_state(mask, selected_state, fallback_state):
@@ -347,6 +421,21 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     eligible & completed_pass & (~commitment_timeout)
                 ).astype(jnp.int8),
                 "selector_intent_index": jnp.where(eligible, chosen_intent, jnp.asarray(-1, dtype=jnp.int32)),
+                "selector_raw_probs": jnp.where(
+                    eligible[:, None],
+                    raw_probs.astype(jnp.float32),
+                    jnp.zeros_like(raw_probs, dtype=jnp.float32),
+                ),
+                "selector_raw_argmax": jnp.where(
+                    eligible,
+                    jnp.argmax(raw_probs, axis=-1).astype(jnp.int32),
+                    jnp.asarray(-1, dtype=jnp.int32),
+                ),
+                "selector_raw_max_prob": jnp.where(
+                    eligible,
+                    jnp.max(raw_probs, axis=-1).astype(jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                ),
             }
 
         def _scan_step(carry, _):
@@ -565,6 +654,7 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "boundary_commitment_timeout_count": 0,
             "boundary_completed_pass_count": 0,
             "selection_counts": {},
+            "episode_start_selection_counts": {},
         },
         "turnover_reasons": {},
         "assist_links": {},
@@ -798,12 +888,14 @@ def _record_turnover_event(
     player_id: int,
     reason_code: int,
     user_team_ids_set: set[int],
+    count_for_user_team: bool | None = None,
 ) -> str:
     reason = _turnover_reason_label(int(reason_code))
     entry = stats.get(int(player_id))
     if entry is not None:
         entry["turnovers"] += 1
-    if int(player_id) in user_team_ids_set:
+    should_count = bool(count_for_user_team) if count_for_user_team is not None else int(player_id) in user_team_ids_set
+    if should_count:
         reasons = eval_diagnostics["turnover_reasons"]
         reasons[reason] = int(reasons.get(reason, 0)) + 1
     return reason
@@ -919,7 +1011,7 @@ def run_native_jax_evaluation(
             bool(offense_deterministic),
             bool(defense_deterministic),
             bool(selector_settings["enabled"]),
-            float(selector_settings["eps"]),
+            float(selector_settings["eval_sampling_eps"]),
             bool(selector_settings["multiselect_enabled"]),
             int(selector_settings["min_play_steps"]),
             int(selector_settings["mode_code"]),
@@ -938,8 +1030,16 @@ def run_native_jax_evaluation(
             turnovers_payload: list[dict[str, Any]] = []
             defensive_lane_violations_payload: list[dict[str, Any]] = []
             episode_shots: dict[str, list[int]] = {}
-            episode_intent_active = bool(int(trace["intent_active"][0, idx])) if int(horizon) > 0 else False
-            episode_intent_index = int(trace["intent_index"][0, idx]) if episode_intent_active else None
+            selector_start_applied = (
+                bool(int(trace["selector_applied"][0, idx]))
+                and bool(int(trace["selector_boundary_episode_start"][0, idx]))
+            ) if int(horizon) > 0 else False
+            if selector_start_applied:
+                episode_intent_index = int(trace["selector_intent_index"][0, idx])
+                episode_intent_active = episode_intent_index >= 0
+            else:
+                episode_intent_active = bool(int(trace["intent_active"][0, idx])) if int(horizon) > 0 else False
+                episode_intent_index = int(trace["intent_index"][0, idx]) if episode_intent_active else None
             episode_intent_key = str(episode_intent_index) if episode_intent_active else "none"
             episode_intent_visible_to_defense = (
                 bool(int(trace["intent_visible_to_defense"][0, idx])) if int(horizon) > 0 else False
@@ -982,10 +1082,41 @@ def run_native_jax_evaluation(
                 selector_diag.get("boundary_completed_pass_count", 0)
             ) + int(np.asarray(trace["selector_boundary_completed_pass"])[:active_steps, idx].sum())
             selector_counts = selector_diag.setdefault("selection_counts", {})
+            selector_start_counts = selector_diag.setdefault("episode_start_selection_counts", {})
             selector_intents = np.asarray(trace["selector_intent_index"])[:active_steps, idx]
+            selector_episode_start = np.asarray(trace["selector_boundary_episode_start"])[:active_steps, idx].astype(bool)
+            selector_episode_start_applied = selector_applied & selector_episode_start
             for selected_intent in selector_intents[selector_applied]:
                 selected_key = str(int(selected_intent))
                 selector_counts[selected_key] = int(selector_counts.get(selected_key, 0)) + 1
+            for selected_intent in selector_intents[selector_episode_start_applied]:
+                selected_key = str(int(selected_intent))
+                selector_start_counts[selected_key] = int(selector_start_counts.get(selected_key, 0)) + 1
+            if selector_episode_start_applied.any():
+                raw_probs = np.asarray(trace["selector_raw_probs"])[:active_steps, idx]
+                raw_argmax = np.asarray(trace["selector_raw_argmax"])[:active_steps, idx]
+                raw_max_prob = np.asarray(trace["selector_raw_max_prob"])[:active_steps, idx]
+                start_raw_probs = raw_probs[selector_episode_start_applied]
+                selector_diag["episode_start_raw_prob_count"] = int(
+                    selector_diag.get("episode_start_raw_prob_count", 0)
+                ) + int(start_raw_probs.shape[0])
+                prev_sums = np.asarray(
+                    selector_diag.get(
+                        "episode_start_raw_prob_sums",
+                        [0.0] * int(spec.num_intents),
+                    ),
+                    dtype=np.float64,
+                )
+                selector_diag["episode_start_raw_prob_sums"] = (
+                    prev_sums + start_raw_probs.astype(np.float64).sum(axis=0)
+                ).tolist()
+                selector_diag["episode_start_raw_max_prob_sum"] = float(
+                    selector_diag.get("episode_start_raw_max_prob_sum", 0.0)
+                ) + float(raw_max_prob[selector_episode_start_applied].sum())
+                argmax_counts = selector_diag.setdefault("episode_start_argmax_counts", {})
+                for argmax_intent in raw_argmax[selector_episode_start_applied]:
+                    argmax_key = str(int(argmax_intent))
+                    argmax_counts[argmax_key] = int(argmax_counts.get(argmax_key, 0)) + 1
 
             for pid in per_player_stats:
                 per_player_stats[pid]["episodes"] += 1
@@ -1072,22 +1203,27 @@ def run_native_jax_evaluation(
 
                 if int(trace["turnovers"][t, idx]):
                     turnover_player = int(trace["turnover_player"][t, idx])
+                    turnover_reason_code = int(trace["turnover_reason"][t, idx])
+                    count_for_user_team = turnover_player in user_team_ids_set
+                    if turnover_player < 0 and turnover_reason_code == int(TURNOVER_REASON_SHOT_CLOCK):
+                        count_for_user_team = user_team == Team.OFFENSE
+                    reason = _record_turnover_event(
+                        stats=per_player_stats,
+                        eval_diagnostics=eval_diagnostics,
+                        player_id=turnover_player,
+                        reason_code=turnover_reason_code,
+                        user_team_ids_set=user_team_ids_set,
+                        count_for_user_team=count_for_user_team,
+                    )
                     if turnover_player >= 0:
-                        reason = _record_turnover_event(
-                            stats=per_player_stats,
-                            eval_diagnostics=eval_diagnostics,
-                            player_id=turnover_player,
-                            reason_code=int(trace["turnover_reason"][t, idx]),
-                            user_team_ids_set=user_team_ids_set,
-                        )
                         if turnover_player in episode_player_stats:
                             episode_player_stats[turnover_player]["turnovers"] += 1
-                        turnovers_payload.append(
-                            {
-                                "player_id": turnover_player,
-                                "reason": reason,
-                            }
-                        )
+                    turnovers_payload.append(
+                        {
+                            "player_id": turnover_player if turnover_player >= 0 else None,
+                            "reason": reason,
+                        }
+                    )
                 if int(trace["defensive_lane_violation"][t, idx]):
                     defender_id = int(trace["defensive_lane_violation_player"][t, idx])
                     defensive_lane_violations_payload.append(
@@ -1193,6 +1329,21 @@ def run_native_jax_evaluation(
     selector_applied_count = int(selector_diag.get("applied_count", 0) or 0)
     selector_used_count = int(selector_diag.get("used_count", 0) or 0)
     selector_uniform_count = int(selector_diag.get("uniform_count", 0) or 0)
+    selector_start_raw_count = int(selector_diag.get("episode_start_raw_prob_count", 0) or 0)
+    selector_start_raw_sums = list(selector_diag.get("episode_start_raw_prob_sums") or [])
+    if selector_start_raw_count > 0 and selector_start_raw_sums:
+        selector_start_mean_raw_probs = [
+            float(value) / float(selector_start_raw_count)
+            for value in selector_start_raw_sums
+        ]
+        selector_start_mean_raw_max_prob = float(
+            selector_diag.get("episode_start_raw_max_prob_sum", 0.0) or 0.0
+        ) / float(selector_start_raw_count)
+    else:
+        selector_start_mean_raw_probs = []
+        selector_start_mean_raw_max_prob = 0.0
+    selector_diag["episode_start_mean_raw_probs"] = selector_start_mean_raw_probs
+    selector_diag["episode_start_mean_raw_max_prob"] = float(selector_start_mean_raw_max_prob)
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -1234,10 +1385,15 @@ def run_native_jax_evaluation(
             float(defense_intent_active_episodes / int(num_episodes)) if int(num_episodes) else 0.0
         ),
         "selector_enabled": bool(selector_settings["enabled"]),
+        "selector_spec_enabled": bool(selector_settings["spec_enabled"]),
+        "selector_config_enabled": bool(selector_settings["config_enabled"]),
+        "selector_config_mode": str(selector_settings["selector_mode"]),
+        "selector_disabled_reason": selector_settings["disabled_reason"],
         "selector_selection_mode": str(selector_settings["mode_label"]),
         "selector_training_alpha": float(selector_settings["training_alpha"]),
         "selector_eval_alpha": float(selector_settings["eval_alpha"]),
         "selector_eps": float(selector_settings["eps"]),
+        "selector_eval_sampling_eps": float(selector_settings["eval_sampling_eps"]),
         "selector_multiselect_enabled": bool(selector_settings["multiselect_enabled"]),
         "selector_min_play_steps": int(selector_settings["min_play_steps"]),
         "selector_applied_count": int(selector_applied_count),
@@ -1258,6 +1414,9 @@ def run_native_jax_evaluation(
         "selector_boundary_completed_pass_count": int(
             selector_diag.get("boundary_completed_pass_count", 0) or 0
         ),
+        "selector_episode_start_raw_prob_count": int(selector_start_raw_count),
+        "selector_episode_start_mean_raw_probs": selector_start_mean_raw_probs,
+        "selector_episode_start_mean_raw_max_prob": float(selector_start_mean_raw_max_prob),
     }
     return {
         "results": results,

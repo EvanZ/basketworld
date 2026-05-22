@@ -38,6 +38,15 @@ from app.backend.inference_adapters import (
     unwrap_inference_model,
 )
 
+_SELECTOR_METADATA_PRIORITY_KEYS = {
+    "intent_selector_enabled",
+    "intent_selector_mode",
+    "intent_selector_multiselect_enabled",
+    "intent_selector_min_play_steps",
+    "intent_selector_hidden_dim",
+    "intent_selector_value_coef",
+}
+
 
 def _as_int(value) -> int:
     return int(np.asarray(value).reshape(-1)[0])
@@ -269,6 +278,46 @@ class JaxDevRuntime:
             game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
             game_state.prev_obs = None
             self._capture_turn_start(game_state)
+
+    def refresh_static_from_display_env(self) -> None:
+        """Refresh immutable JAX kernel config after live display-env edits."""
+        self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self._last_policy_probs = None
+        self._last_attention_payload = None
+        if hasattr(self, "_playbook_batch_runner_cache"):
+            self._playbook_batch_runner_cache = None
+
+    def replace_policies(
+        self,
+        *,
+        unified_policy: Any,
+        opponent_policy: Any | None,
+        game_state: Any | None = None,
+    ) -> None:
+        """Replace live inference policies after a UI checkpoint swap."""
+        raw_model = unwrap_inference_model(unified_policy)
+        if raw_model is None or not hasattr(raw_model, "jax"):
+            raise TypeError("JAX dev runtime requires a loaded JAX inference model.")
+
+        self.unified_policy = unified_policy
+        self.opponent_policy = opponent_policy
+        self.raw_model = raw_model
+        self.jax = raw_model.jax
+        self.jnp = raw_model.jnp
+
+        self._last_policy_probs = None
+        self._last_attention_payload = None
+        self._last_selector_transition = None
+        if hasattr(self, "_playbook_batch_runner_cache"):
+            self._playbook_batch_runner_cache = None
+
+        if game_state is not None:
+            game_state.env = self.display_env
+            if self.state is not None:
+                game_state.obs = self.observation_dict(
+                    observer_is_offense=game_state.user_team != Team.DEFENSE
+                )
+            game_state.prev_obs = None
 
     def reset(
         self,
@@ -553,6 +602,8 @@ class JaxDevRuntime:
         self.last_step_output = out
         self.last_action_results = self._action_results_from_step(prev_state, out)
         self._last_completed_pass_boundary = bool(_as_bool(out.completed_pass[0]) and not _as_bool(out.done[0]))
+        self._last_policy_probs = None
+        self._last_attention_payload = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
         game_state.prev_obs = None
@@ -563,21 +614,50 @@ class JaxDevRuntime:
             "offense": float(np.sum(rewards[self.offense_ids])),
             "defense": float(np.sum(rewards[self.defense_ids])),
         }
+        step_idx = len(game_state.reward_history) + 1
+        ep_by_player = self.expected_points()
+        ball_handler = self.ball_holder
+        is_terminal = bool(_as_bool(out.done[0]))
+        phi_r_shape = _as_float(out.phi_r_shape[0])
+        phi_prev = _as_float(out.phi_prev[0])
+        phi_next = _as_float(out.phi_next[0])
+        phi_beta = _as_float(out.phi_beta[0])
+        team_best_ep, ball_handler_ep = self._phi_ep_summary(ep_by_player, ball_handler)
         game_state.episode_rewards["offense"] += step_rewards["offense"]
         game_state.episode_rewards["defense"] += step_rewards["defense"]
         game_state.reward_history.append(
             {
-                "step": len(game_state.reward_history) + 1,
+                "step": step_idx,
                 "offense": step_rewards["offense"],
                 "defense": step_rewards["defense"],
                 "offense_reason": self._reward_reason(),
                 "defense_reason": self._reward_reason(defense=True),
-                "phi_r_shape": 0.0,
-                "ep_by_player": self.expected_points(),
-                "ball_handler": self.ball_holder,
+                "phi_r_shape": phi_r_shape,
+                "phi_prev": phi_prev,
+                "phi_next": phi_next,
+                "phi_beta": phi_beta,
+                "ep_by_player": ep_by_player,
+                "ball_handler": int(ball_handler) if ball_handler is not None else -1,
                 "offense_ids": self.offense_ids,
-                "is_terminal": bool(_as_bool(out.done[0])),
+                "is_terminal": is_terminal,
                 "shot_clock": self.shot_clock,
+            }
+        )
+        game_state.phi_log.append(
+            {
+                "step": step_idx,
+                "phi_prev": phi_prev,
+                "phi_next": phi_next,
+                "phi_beta": phi_beta,
+                "phi_r_shape": phi_r_shape,
+                "ball_handler": int(ball_handler) if ball_handler is not None else -1,
+                "offense_ids": self.offense_ids,
+                "defense_ids": self.defense_ids,
+                "shot_clock": self.shot_clock,
+                "is_terminal": is_terminal,
+                "ep_by_player": ep_by_player,
+                "team_best_ep": team_best_ep,
+                "ball_handler_ep": ball_handler_ep,
             }
         )
         self._append_shot_log_if_needed(game_state)
@@ -644,7 +724,9 @@ class JaxDevRuntime:
         game_state.reward_history = []
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
         game_state.episode_states = []
+        game_state.phi_log = []
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        self._append_initial_phi_log(game_state)
         self._capture_turn_start(game_state)
         state_payload = self.get_full_game_state(
             game_state,
@@ -728,6 +810,21 @@ class JaxDevRuntime:
             2,
         )
         ball_holder = getattr(env, "ball_holder", None)
+        offense_ids = np.asarray(self.offense_ids, dtype=np.int32)
+
+        def _skill_state(field_name: str, env_attr: str):
+            current = np.asarray(_field0(self.state, field_name), dtype=np.float32).copy()
+            raw_values = getattr(env, env_attr, None)
+            if raw_values is None:
+                return self.jnp.asarray(current[None, ...], dtype=self.jnp.float32)
+            values = np.asarray(raw_values, dtype=np.float32).reshape(-1)
+            if values.size != offense_ids.size:
+                raise RuntimeError(
+                    f"{env_attr} must contain {offense_ids.size} values, got {values.size}."
+                )
+            current[offense_ids] = values
+            return self.jnp.asarray(current[None, ...], dtype=self.jnp.float32)
+
         updates = {
             "positions": self.jnp.asarray(positions[None, ...], dtype=self.jnp.int32),
             "ball_holder": self.jnp.asarray(
@@ -738,6 +835,9 @@ class JaxDevRuntime:
                 [int(getattr(env, "shot_clock", self.shot_clock))],
                 dtype=self.jnp.int32,
             ),
+            "layup_pct": _skill_state("layup_pct", "offense_layup_pct_by_player"),
+            "three_pt_pct": _skill_state("three_pt_pct", "offense_three_pt_pct_by_player"),
+            "dunk_pct": _skill_state("dunk_pct", "offense_dunk_pct_by_player"),
         }
         self.state = self.state._replace(**updates)
         self._last_policy_probs = None
@@ -834,6 +934,46 @@ class JaxDevRuntime:
             for v in np.asarray(self.jax.device_get(profile["expected_points"][0]), dtype=np.float32).tolist()
         ]
 
+    def _phi_ep_summary(
+        self,
+        ep_by_player: list[float],
+        ball_handler: int | None,
+    ) -> tuple[float, float]:
+        offense_ids = self.offense_ids
+        team_eps = [
+            float(ep_by_player[int(pid)])
+            for pid in offense_ids
+            if 0 <= int(pid) < len(ep_by_player)
+        ]
+        team_best_ep = max(team_eps) if team_eps else 0.0
+        if ball_handler is not None and 0 <= int(ball_handler) < len(ep_by_player):
+            ball_handler_ep = float(ep_by_player[int(ball_handler)])
+        else:
+            ball_handler_ep = 0.0
+        return float(team_best_ep), float(ball_handler_ep)
+
+    def _append_initial_phi_log(self, game_state: Any) -> None:
+        ep_by_player = self.expected_points()
+        ball_handler = self.ball_holder
+        team_best_ep, ball_handler_ep = self._phi_ep_summary(ep_by_player, ball_handler)
+        game_state.phi_log.append(
+            {
+                "step": 0,
+                "phi_prev": 0.0,
+                "phi_next": float(_as_float(_field0(self.state, "cached_phi"))),
+                "phi_beta": float(np.asarray(self.static.phi_beta).reshape(-1)[0]),
+                "phi_r_shape": 0.0,
+                "ball_handler": int(ball_handler) if ball_handler is not None else -1,
+                "offense_ids": self.offense_ids,
+                "defense_ids": self.defense_ids,
+                "shot_clock": self.shot_clock,
+                "is_terminal": False,
+                "ep_by_player": ep_by_player,
+                "team_best_ep": team_best_ep,
+                "ball_handler_ep": ball_handler_ep,
+            }
+        )
+
     def pass_steal_probabilities(self) -> dict[int, float]:
         if self.ball_holder is None:
             return {}
@@ -917,7 +1057,7 @@ class JaxDevRuntime:
                 TURNOVER_REASON_DEFENDER_PRESSURE: "defender_pressure",
                 TURNOVER_REASON_MOVE_OUT_OF_BOUNDS: "move_out_of_bounds",
                 TURNOVER_REASON_OFFENSIVE_THREE_SECONDS: "offensive_three_seconds",
-                TURNOVER_REASON_SHOT_CLOCK: "shot_clock",
+                TURNOVER_REASON_SHOT_CLOCK: "shot_clock_violation",
                 TURNOVER_REASON_INTERCEPTED: "steal",
             }
             results["turnovers"].append(
@@ -1037,8 +1177,30 @@ class JaxDevRuntime:
         }
 
     def _selector_training_params(self, game_state: Any) -> dict[str, Any]:
-        params = getattr(game_state, "mlflow_training_params", None)
-        return params if isinstance(params, dict) else {}
+        params: dict[str, Any] = {}
+        game_params = getattr(game_state, "mlflow_training_params", None)
+        if isinstance(game_params, dict):
+            params.update(game_params)
+
+        metadata = get_policy_metadata(self.unified_policy) or get_policy_metadata(self.raw_model) or {}
+        trainer_config = metadata.get("trainer_config")
+        if isinstance(trainer_config, dict):
+            for key, value in trainer_config.items():
+                params.setdefault(str(key), value)
+            # Static selector architecture/runtime flags should come from the
+            # loaded checkpoint. MLflow training-param extraction may populate
+            # default False values for older/incomplete runs.
+            for key in _SELECTOR_METADATA_PRIORITY_KEYS:
+                if key in trainer_config:
+                    params[key] = trainer_config[key]
+
+        policy_spec = metadata.get("policy_spec")
+        if isinstance(policy_spec, dict) and "intent_selector_enabled" in policy_spec:
+            params.setdefault(
+                "intent_selector_enabled",
+                bool(policy_spec.get("intent_selector_enabled")),
+            )
+        return params
 
     def _selector_runtime_enabled(self, game_state: Any) -> bool:
         if not bool(getattr(self.raw_model.spec, "intent_selector_enabled", False)):

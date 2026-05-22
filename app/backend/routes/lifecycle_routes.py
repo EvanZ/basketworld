@@ -127,6 +127,13 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "violation_reward": float,
     "include_hoop_vector": _str_to_bool,
     "enable_phi_shaping": _str_to_bool,
+    "reward_shaping_gamma": float,
+    "phi_beta": float,
+    "phi_beta_start": float,
+    "phi_beta_end": float,
+    "phi_beta_warmup_updates": int,
+    "phi_beta_ramp_updates": int,
+    "phi_blend_weight": float,
     "phi_aggregation_mode": str,
     "phi_use_ball_handler_only": _str_to_bool,
     "pass_reward": float,
@@ -176,6 +183,36 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
             else:
                 merged[key] = value
             break
+    return _normalize_jax_phi_runtime_env_params(merged)
+
+
+def _normalize_jax_phi_runtime_env_params(
+    config: dict,
+    *,
+    current_phi_beta: float | None = None,
+) -> dict:
+    """Map JAX phi schedule metadata into the env's runtime phi fields.
+
+    The trainer persists phi schedule knobs (`phi_beta_start/end`) for
+    reproducibility, but the live env/runtime expects the active field
+    `phi_beta`. For checkpoints, prefer the checkpoint's recorded current beta;
+    otherwise fall back to the target end beta and then start beta.
+    """
+    merged = dict(config or {})
+    if "phi_beta" not in merged or merged.get("phi_beta") in ("", None):
+        beta_value = current_phi_beta
+        if beta_value is None:
+            for beta_key in ("phi_beta_end", "phi_beta_start"):
+                raw = merged.get(beta_key)
+                if raw in ("", None):
+                    continue
+                try:
+                    beta_value = float(raw)
+                    break
+                except Exception:
+                    continue
+        if beta_value is not None:
+            merged["phi_beta"] = float(beta_value)
     return merged
 
 
@@ -315,6 +352,28 @@ def _overlay_jax_mlflow_training_params(training_params: dict, mlflow_params: di
         if not key or key.startswith("env/"):
             continue
         merged[key] = _coerce_jax_mlflow_training_value(raw_value)
+    for raw_key, raw_value in dict(mlflow_params or {}).items():
+        if not str(raw_key).startswith("jax/env/"):
+            continue
+        key = str(raw_key)[len("jax/env/") :]
+        if key in {
+            "enable_phi_shaping",
+            "reward_shaping_gamma",
+            "phi_beta_start",
+            "phi_beta_end",
+            "phi_beta_warmup_updates",
+            "phi_beta_ramp_updates",
+            "phi_blend_weight",
+            "phi_aggregation_mode",
+            "phi_use_ball_handler_only",
+            "start_template_enabled",
+            "start_template_library",
+            "start_template_prob",
+            "start_template_jitter_scale",
+            "start_template_mirror_prob",
+            "start_template_strict",
+        }:
+            merged[key] = _coerce_jax_mlflow_training_value(raw_value)
     if bool(merged.get("intent_selector_enabled", False)):
         merged.setdefault("intent_selector_mode", "integrated")
     return _populate_jax_training_ui_aliases(merged)
@@ -388,6 +447,19 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
     trainer_config = dict(metadata.get("trainer_config", {}) or {})
     policy_spec = dict(metadata.get("policy_spec", {}) or {})
     last_metrics = dict(metadata.get("last_metrics", {}) or {})
+    current_phi_beta = None
+    for beta_metric in ("phi_beta", "phi_beta_mean", "offense_phi_beta_mean"):
+        if beta_metric not in last_metrics:
+            continue
+        try:
+            current_phi_beta = float(last_metrics[beta_metric])
+            break
+        except Exception:
+            continue
+    config = _normalize_jax_phi_runtime_env_params(
+        config,
+        current_phi_beta=current_phi_beta,
+    )
     if bool(policy_spec.get("intent_selector_enabled", False)):
         trainer_config.setdefault("intent_selector_enabled", True)
         trainer_config.setdefault("intent_selector_mode", "integrated")
@@ -407,7 +479,14 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
     trainer_config = _populate_jax_training_ui_aliases(trainer_config)
     required_params: dict = {}
     optional_params = dict(config)
-    phi_params = {}
+    phi_params = {
+        "enable_phi_shaping": bool(config.get("enable_phi_shaping", False)),
+        "phi_beta": float(config.get("phi_beta", 0.0) or 0.0),
+        "reward_shaping_gamma": float(config.get("reward_shaping_gamma", 1.0) or 1.0),
+        "phi_aggregation_mode": str(config.get("phi_aggregation_mode", "team_best")),
+        "phi_use_ball_handler_only": bool(config.get("phi_use_ball_handler_only", False)),
+        "phi_blend_weight": float(config.get("phi_blend_weight", 0.0) or 0.0),
+    }
     return required_params, optional_params, trainer_config, phi_params
 
 
@@ -648,13 +727,13 @@ async def init_game(request: InitGameRequest):
                     mlflow_training_params,
                     run_params,
                 )
+                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
             except Exception as e:
                 print(f"[init_game] Warning: failed to apply JAX MLflow training params: {e}")
-            if not dict(policy_metadata.get("env_config", {}) or {}):
-                try:
-                    optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
-                except Exception as e:
-                    print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
+            try:
+                optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
+            except Exception as e:
+                print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
             (
                 start_template_library,
                 start_template_library_source,

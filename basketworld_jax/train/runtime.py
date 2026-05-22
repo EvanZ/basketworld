@@ -48,6 +48,68 @@ from basketworld_jax.train.types import (
 )
 
 
+_SELECTOR_UPDATE_PARAM_NAMES = frozenset(
+    {
+        "intent_selector_head_0",
+        "intent_selector_head_out",
+        "intent_selector_value_head_0",
+        "intent_selector_value_head_out",
+    }
+)
+
+
+def _tree_path_key_names(path) -> tuple[str, ...]:
+    names = []
+    for item in path:
+        key = getattr(item, "key", item)
+        names.append(str(key))
+    return tuple(names)
+
+
+def _is_selector_update_param_path(path) -> bool:
+    return any(name in _SELECTOR_UPDATE_PARAM_NAMES for name in _tree_path_key_names(path))
+
+
+def _selector_tree_map(jax, selector_fn, fallback_fn, tree, *rest):
+    def _map(path, value, *others):
+        if _is_selector_update_param_path(path):
+            return selector_fn(value, *others)
+        return fallback_fn(value, *others)
+
+    return jax.tree_util.tree_map_with_path(_map, tree, *rest)
+
+
+def _mask_selector_update_grads(grads, sample_count, jax, jnp):
+    def _keep_selector_grad(grad):
+        return jnp.where(sample_count > 0.0, grad, jnp.zeros_like(grad))
+
+    return _selector_tree_map(
+        jax,
+        _keep_selector_grad,
+        lambda grad: jnp.zeros_like(grad),
+        grads,
+    )
+
+
+def _merge_selector_update_params(original_params, candidate_params, jax):
+    return _selector_tree_map(
+        jax,
+        lambda original, candidate: candidate,
+        lambda original, candidate: original,
+        original_params,
+        candidate_params,
+    )
+
+
+def _apply_selector_update_param_scope(original_params, candidate_params, sample_count, jax, jnp):
+    selector_only_params = _merge_selector_update_params(original_params, candidate_params, jax)
+    return jax.tree_util.tree_map(
+        lambda original, candidate: jnp.where(sample_count > 0.0, candidate, original),
+        original_params,
+        selector_only_params,
+    )
+
+
 def training_player_ids_from_static(static) -> np.ndarray:
     mask = np.asarray(static.training_player_mask, dtype=np.float32)
     return np.flatnonzero(mask > 0.5).astype(np.int32)
@@ -215,6 +277,39 @@ def _where_state(mask, selected_state, fallback_state, jnp):
     return type(fallback_state)(*replaced)
 
 
+def _selector_segment_application_masks(
+    state,
+    *,
+    alpha_used,
+    multiselect_enabled,
+    completed_pass_boundary,
+    selector_min_play_steps,
+    jnp,
+):
+    active = state.intent_active.astype(jnp.bool_)
+    episode_start = active & (state.intent_age == 0)
+    commitment_timeout = (
+        multiselect_enabled
+        & active
+        & (state.intent_age > 0)
+        & (state.intent_commitment_remaining <= 0)
+    )
+    completed_pass = (
+        multiselect_enabled
+        & active
+        & jnp.asarray(completed_pass_boundary).astype(jnp.bool_)
+        & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
+    )
+    eligible = episode_start | commitment_timeout | completed_pass
+    used = eligible & alpha_used
+    # Exploration already happens through epsilon-mixed selector probabilities. A random
+    # segment fallback makes multiselect active during warmup and mostly random when
+    # selector alpha is below 1.0, which is not the intended learned-selector behavior.
+    fallback_used = jnp.zeros_like(used, dtype=jnp.bool_)
+    applied = used
+    return episode_start, commitment_timeout, completed_pass, used, applied, fallback_used
+
+
 def _maybe_apply_selector_segment_start(
     static,
     state,
@@ -239,7 +334,7 @@ def _maybe_apply_selector_segment_start(
     should_run = (
         static.enable_intent_learning.astype(jnp.bool_)
         & (static.training_role_flag > 0.0)
-        & ((alpha > 0.0) | multiselect_enabled)
+        & (alpha > 0.0)
     )
 
     def _disabled(_):
@@ -264,15 +359,8 @@ def _maybe_apply_selector_segment_start(
         uniform = jnp.full_like(raw_probs, 1.0 / float(max(1, int(spec.num_intents))))
         probs = ((1.0 - eps) * raw_probs) + (eps * uniform)
         log_probs = jnp.log(jnp.maximum(probs, 1.0e-8))
-        sample_key, alpha_key, fallback_key = jax.random.split(selector_key, 3)
+        sample_key, alpha_key = jax.random.split(selector_key, 2)
         sampled_intent = jax.random.categorical(sample_key, log_probs, axis=-1).astype(jnp.int32)
-        fallback_intent = jax.random.randint(
-            fallback_key,
-            shape=(batch_size,),
-            minval=0,
-            maxval=int(spec.num_intents),
-            dtype=jnp.int32,
-        )
         sampled_log_prob = jnp.take_along_axis(
             log_probs,
             sampled_intent[:, None],
@@ -281,29 +369,25 @@ def _maybe_apply_selector_segment_start(
         entropy = -jnp.sum(probs * log_probs, axis=-1)
         max_prob = jnp.max(probs, axis=-1)
         alpha_used = jax.random.uniform(alpha_key, shape=(batch_size,)) < alpha
-        active = state.intent_active.astype(jnp.bool_)
-        episode_start = active & (state.intent_age == 0)
-        commitment_timeout = (
-            multiselect_enabled
-            & active
-            & (state.intent_age > 0)
-            & (state.intent_commitment_remaining <= 0)
+        (
+            episode_start,
+            commitment_timeout,
+            completed_pass,
+            used,
+            applied,
+            fallback_used,
+        ) = _selector_segment_application_masks(
+            state,
+            alpha_used=alpha_used,
+            multiselect_enabled=multiselect_enabled,
+            completed_pass_boundary=completed_pass_boundary,
+            selector_min_play_steps=selector_min_play_steps,
+            jnp=jnp,
         )
-        completed_pass = (
-            multiselect_enabled
-            & active
-            & jnp.asarray(completed_pass_boundary).astype(jnp.bool_)
-            & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
-        )
-        eligible = episode_start | commitment_timeout | completed_pass
-        used = eligible & alpha_used
-        fallback_used = (commitment_timeout | completed_pass) & (~alpha_used)
-        applied = used | fallback_used
-        chosen_intent = jnp.where(used, sampled_intent, fallback_intent)
         selected_state = set_offense_intent_state_batch(
             static,
             state,
-            chosen_intent,
+            sampled_intent,
             jnp.ones((batch_size,), dtype=jnp.int8),
             jnp,
         )
@@ -452,6 +536,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             )
             transition = TrajectoryBatch(
                 active_mask=active_step.astype(jnp.float32),
+                episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -462,6 +547,10 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
+                phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
+                phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
+                phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -668,6 +757,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             )
             transition = TrajectoryBatch(
                 active_mask=active_step.astype(jnp.float32),
+                episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -678,6 +768,10 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
+                phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
+                phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
+                phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -932,6 +1026,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             )
             transition = TrajectoryBatch(
                 active_mask=active_step.astype(jnp.float32),
+                episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
@@ -942,6 +1037,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
+                phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
+                phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
+                phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -1419,11 +1518,13 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         log_ratio = new_log_prob_state - old_log_prob_state
         ratio = jnp.exp(log_ratio)
         clipped_ratio = jnp.clip(ratio, 1.0 - clip_range, 1.0 + clip_range)
-        mask = batch.active_mask.astype(jnp.float32)
-        mask_den = jnp.maximum(jnp.sum(mask), 1.0)
+        active_mask = batch.active_mask.astype(jnp.float32)
+        loss_weights = batch.loss_weights.astype(jnp.float32)
+        loss_denominator = batch.loss_denominator.astype(jnp.float32)
+        weight_den = jnp.maximum(jnp.max(loss_denominator), 1.0)
 
         def _masked_mean(values):
-            return jnp.sum(values * mask) / mask_den
+            return jnp.sum(values * loss_weights) / weight_den
 
         policy_loss = -_masked_mean(
             jnp.minimum(
@@ -1437,7 +1538,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         clip_fraction = _masked_mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32))
         mean_abs_log_ratio = _masked_mean(jnp.abs(log_ratio))
         max_abs_log_ratio = jnp.max(
-            jnp.where(mask > 0.0, jnp.abs(log_ratio), jnp.zeros_like(log_ratio))
+            jnp.where(active_mask > 0.0, jnp.abs(log_ratio), jnp.zeros_like(log_ratio))
         )
         total_loss = policy_loss + (value_coef * value_loss) - (entropy_coef * entropy_bonus)
         metrics = {
@@ -1450,8 +1551,10 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "clip_fraction": clip_fraction,
             "mean_abs_log_ratio": mean_abs_log_ratio,
             "max_abs_log_ratio": max_abs_log_ratio,
-            "ppo_active_sample_count": jnp.sum(mask),
-            "ppo_active_sample_fraction": jnp.mean(mask),
+            "ppo_active_sample_count": jnp.sum(active_mask),
+            "ppo_active_sample_fraction": jnp.mean(active_mask),
+            "ppo_loss_weight_sum": jnp.sum(loss_weights),
+            "ppo_loss_denominator": weight_den,
         }
         return total_loss, metrics
 
@@ -1602,6 +1705,7 @@ def build_jitted_selector_update_runner(
     selector_value_coef: float,
     selector_entropy_coef: float,
     selector_usage_reg_coef: float,
+    selector_learning_rate: float | None = None,
 ):
     import optax
 
@@ -1611,7 +1715,11 @@ def build_jitted_selector_update_runner(
     usage_reg_coef = jnp.asarray(selector_usage_reg_coef, dtype=jnp.float32)
     transform = build_adam_transform(
         optax,
-        learning_rate=float(trainer_config.learning_rate),
+        learning_rate=(
+            float(trainer_config.learning_rate)
+            if selector_learning_rate is None
+            else float(selector_learning_rate)
+        ),
     )
 
     def _masked_mean(values, mask):
@@ -1696,18 +1804,22 @@ def build_jitted_selector_update_runner(
             batch,
             selector_eps,
         )
-        grad_norm = global_norm(grads, optax)
         sample_count = loss_metrics["selector_train_sample_count"]
-        effective_grads = jax.tree_util.tree_map(
-            lambda grad: jnp.where(sample_count > 0.0, grad, jnp.zeros_like(grad)),
-            grads,
-        )
-        new_params, new_opt_state = optimizer_update(
+        effective_grads = _mask_selector_update_grads(grads, sample_count, jax, jnp)
+        grad_norm = global_norm(effective_grads, optax)
+        candidate_params, new_opt_state = optimizer_update(
             params,
             effective_grads,
             opt_state,
             transform=transform,
             optax=optax,
+        )
+        new_params = _apply_selector_update_param_scope(
+            params,
+            candidate_params,
+            sample_count,
+            jax,
+            jnp,
         )
         post_update_loss, metrics = _loss_fn(new_params, batch, selector_eps)
         metrics = {
@@ -1912,6 +2024,219 @@ def summarize_turnover_diagnostics(
     return metrics
 
 
+def summarize_ppo_eligible_episode_metrics(
+    prefix: str,
+    trajectory: TrajectoryBatch,
+    training_mask,
+    *,
+    include_learner_shots: bool = True,
+    include_opponent_shots: bool = True,
+    role: str | None = None,
+) -> dict[str, float]:
+    """Summarize only the rollout steps that are eligible for PPO loss updates."""
+    mask = np.asarray(training_mask, dtype=np.float32)
+    terminal_steps = np.asarray(trajectory.terminal_episode_steps, dtype=np.int32)
+    terminal_mask = ((terminal_steps > 0) & (mask > 0.5)).astype(np.float32)
+    completed_episodes = int(terminal_mask.sum())
+    completed_denom = float(completed_episodes) if completed_episodes > 0 else 0.0
+    step_count = float(mask.sum())
+
+    def _masked_total(values, event_mask) -> float:
+        return float((np.asarray(values, dtype=np.float32) * event_mask).sum())
+
+    def _per_completed_episode(total: float) -> float:
+        return float(total / completed_denom) if completed_denom > 0.0 else 0.0
+
+    def _per_step(total: float) -> float:
+        return float(total / step_count) if step_count > 0.0 else 0.0
+
+    reward_total = _masked_total(trajectory.rewards, mask)
+    offense_points_total = _masked_total(trajectory.offense_score_delta, mask)
+    defense_points_total = _masked_total(trajectory.defense_score_delta, mask)
+    completed_episode_steps = _masked_total(terminal_steps, terminal_mask)
+    metrics: dict[str, float] = {
+        f"{prefix}_active_step_count": step_count,
+        f"{prefix}_completed_episodes": float(completed_episodes),
+        f"{prefix}_completed_episode_steps": completed_episode_steps,
+        f"{prefix}_completed_episode_count": float(completed_episodes),
+        f"{prefix}_completed_active_step_count": completed_episode_steps,
+        f"{prefix}_mean_completed_episode_length": _per_completed_episode(completed_episode_steps),
+        f"{prefix}_reward_total": reward_total,
+        f"{prefix}_reward_per_step": _per_step(reward_total),
+        f"{prefix}_reward_per_completed_episode": _per_completed_episode(reward_total),
+        f"{prefix}_offense_points_total": offense_points_total,
+        f"{prefix}_offense_points_per_step": _per_step(offense_points_total),
+        f"{prefix}_offense_points_per_completed_episode": _per_completed_episode(
+            offense_points_total
+        ),
+        f"{prefix}_defense_points_total": defense_points_total,
+        f"{prefix}_defense_points_per_step": _per_step(defense_points_total),
+        f"{prefix}_defense_points_per_completed_episode": _per_completed_episode(
+            defense_points_total
+        ),
+    }
+    if role == "offense":
+        learner_points_total = offense_points_total
+        opponent_points_total = defense_points_total
+    elif role == "defense":
+        learner_points_total = defense_points_total
+        opponent_points_total = offense_points_total
+    else:
+        learner_points_total = None
+        opponent_points_total = None
+    if learner_points_total is not None and opponent_points_total is not None:
+        metrics.update(
+            {
+                f"{prefix}_learner_points_total": learner_points_total,
+                f"{prefix}_learner_points_per_step": _per_step(learner_points_total),
+                f"{prefix}_learner_points_per_completed_episode": _per_completed_episode(
+                    learner_points_total
+                ),
+                f"{prefix}_opponent_points_total": opponent_points_total,
+                f"{prefix}_opponent_points_per_step": _per_step(opponent_points_total),
+                f"{prefix}_opponent_points_per_completed_episode": _per_completed_episode(
+                    opponent_points_total
+                ),
+            }
+        )
+
+    step_event_items = {
+        "pass_attempts": trajectory.pass_attempts,
+        "completed_passes": trajectory.completed_passes,
+        "assists": trajectory.assists,
+        "turnovers": trajectory.turnovers,
+        "learner_turnovers": trajectory.learner_turnovers,
+        "opponent_turnovers": trajectory.opponent_turnovers,
+        "offensive_three_seconds": trajectory.offensive_three_seconds,
+        "defensive_lane_violations": trajectory.defensive_lane_violations,
+        "shot_attempts": trajectory.shot_attempts,
+        "shot_makes": trajectory.shot_makes,
+        "shot_dunks": trajectory.shot_dunks,
+        "shot_twos": trajectory.shot_twos,
+        "shot_threes": trajectory.shot_threes,
+    }
+    if include_learner_shots:
+        step_event_items.update(
+            {
+                "learner_shot_attempts": trajectory.learner_shot_attempts,
+                "learner_shot_makes": trajectory.learner_shot_makes,
+                "learner_shot_dunks": trajectory.learner_shot_dunks,
+                "learner_shot_twos": trajectory.learner_shot_twos,
+                "learner_shot_threes": trajectory.learner_shot_threes,
+            }
+        )
+    if include_opponent_shots:
+        step_event_items.update(
+            {
+                "opponent_shot_attempts": trajectory.opponent_shot_attempts,
+                "opponent_shot_makes": trajectory.opponent_shot_makes,
+                "opponent_shot_dunks": trajectory.opponent_shot_dunks,
+                "opponent_shot_twos": trajectory.opponent_shot_twos,
+                "opponent_shot_threes": trajectory.opponent_shot_threes,
+            }
+        )
+    shot_event_names = {
+        "shot_attempts",
+        "shot_makes",
+        "shot_dunks",
+        "shot_twos",
+        "shot_threes",
+        "learner_shot_attempts",
+        "learner_shot_makes",
+        "learner_shot_dunks",
+        "learner_shot_twos",
+        "learner_shot_threes",
+        "opponent_shot_attempts",
+        "opponent_shot_makes",
+        "opponent_shot_dunks",
+        "opponent_shot_twos",
+        "opponent_shot_threes",
+    }
+    for name, values in step_event_items.items():
+        total = _masked_total(values, mask)
+        metrics[f"{prefix}_{name}_total"] = total
+        metrics[f"{prefix}_{name}_per_step"] = _per_step(total)
+        # In this possession-level env, shot events are terminal outcomes. Per-episode
+        # shot-type metrics duplicate the terminal_*_share family, so keep counts
+        # and per-step rates here and use terminal_*_share for possession outcomes.
+        if name not in shot_event_names:
+            metrics[f"{prefix}_{name}_per_completed_episode"] = _per_completed_episode(total)
+
+    terminal_reason_items = {
+        "shot": trajectory.shot_attempts,
+        "turnover": trajectory.turnovers,
+        "learner_turnover": trajectory.learner_turnovers,
+        "opponent_turnover": trajectory.opponent_turnovers,
+        "turnover_pass_out_of_bounds": trajectory.turnover_pass_out_of_bounds,
+        "turnover_intercepted": trajectory.turnover_intercepted,
+        "turnover_defender_pressure": trajectory.turnover_defender_pressure,
+        "turnover_move_out_of_bounds": trajectory.turnover_move_out_of_bounds,
+        "turnover_shot_clock": trajectory.turnover_shot_clock,
+        "turnover_offensive_three_seconds": trajectory.turnover_offensive_three_seconds,
+        "offensive_three_seconds": trajectory.offensive_three_seconds,
+        "defensive_lane_violation": trajectory.defensive_lane_violations,
+        "shot_make": trajectory.shot_makes,
+        "shot_dunk": trajectory.shot_dunks,
+        "shot_two": trajectory.shot_twos,
+        "shot_three": trajectory.shot_threes,
+    }
+    for name, values in terminal_reason_items.items():
+        total = _masked_total(values, terminal_mask)
+        metrics[f"{prefix}_terminal_{name}_episodes"] = total
+        metrics[f"{prefix}_terminal_{name}_share"] = _per_completed_episode(total)
+
+    return metrics
+
+
+def summarize_reward_by_intent_metrics(
+    prefix: str,
+    trajectory: TrajectoryBatch,
+    *,
+    num_intents: int,
+    training_mask=None,
+) -> dict[str, float]:
+    """Attribute completed episode reward to the intent active at episode start."""
+    rewards = np.asarray(trajectory.rewards, dtype=np.float32)
+    intent_index = np.asarray(trajectory.policy_intent_index, dtype=np.int32)
+    episode_start = np.asarray(trajectory.episode_start, dtype=np.float32) > 0.5
+    terminal_steps = np.asarray(trajectory.terminal_episode_steps, dtype=np.int32)
+    active_mask = np.asarray(trajectory.active_mask, dtype=np.float32) > 0.5
+    if training_mask is not None:
+        active_mask = active_mask & (np.asarray(training_mask, dtype=np.float32) > 0.5)
+
+    if rewards.ndim != 2:
+        raise ValueError("trajectory rewards must have shape [time, batch].")
+
+    intent_count = max(1, int(num_intents))
+    reward_totals = np.zeros((intent_count,), dtype=np.float64)
+    episode_counts = np.zeros((intent_count,), dtype=np.float64)
+    time_steps, batch_size = rewards.shape
+    for env_idx in range(batch_size):
+        current_intent = int(np.clip(intent_index[0, env_idx], 0, intent_count - 1))
+        episode_reward = 0.0
+        for step_idx in range(time_steps):
+            if not bool(active_mask[step_idx, env_idx]):
+                continue
+            if bool(episode_start[step_idx, env_idx]):
+                current_intent = int(np.clip(intent_index[step_idx, env_idx], 0, intent_count - 1))
+                episode_reward = 0.0
+            episode_reward += float(rewards[step_idx, env_idx])
+            if int(terminal_steps[step_idx, env_idx]) > 0:
+                reward_totals[current_intent] += episode_reward
+                episode_counts[current_intent] += 1.0
+                episode_reward = 0.0
+
+    metrics: dict[str, float] = {}
+    for intent_idx in range(intent_count):
+        count = float(episode_counts[intent_idx])
+        total = float(reward_totals[intent_idx])
+        metrics[f"{prefix}_completed_episodes_by_intent/{intent_idx}"] = count
+        metrics[f"{prefix}_reward_per_completed_episode_by_intent/{intent_idx}"] = (
+            float(total / count) if count > 0.0 else 0.0
+        )
+    return metrics
+
+
 def summarize_lane_violation_metrics(
     *,
     terminal_episode_steps,
@@ -2011,8 +2336,12 @@ def summarize_training_step(
     minibatch_size = int(ppo_batch_size // minibatch_count) if ppo_batch_size % minibatch_count == 0 else 0
     rollout_active = np.asarray(rollout_out.trajectory.active_mask, dtype=np.float32)
     ppo_active = np.asarray(ppo_batch.active_mask, dtype=np.float32)
+    ppo_loss_weights = np.asarray(ppo_batch.loss_weights, dtype=np.float32)
+    ppo_loss_denominator = np.asarray(ppo_batch.loss_denominator, dtype=np.float32)
     active_count = float(rollout_active.sum())
     active_ppo_count = float(ppo_active.sum())
+    ppo_loss_weight_sum = float(ppo_loss_weights.sum())
+    ppo_loss_denominator_value = float(ppo_loss_denominator.max()) if ppo_loss_denominator.size else 0.0
 
     def _active_mean(values, mask) -> float:
         denom = float(mask.sum())
@@ -2021,6 +2350,14 @@ def summarize_training_step(
         return float((np.asarray(values, dtype=np.float32) * mask).sum() / denom)
 
     reward_mean = _active_mean(rollout_out.trajectory.rewards, rollout_active)
+    phi_r_shape_mean = _active_mean(rollout_out.trajectory.phi_r_shape, rollout_active)
+    phi_r_shape_abs_mean = _active_mean(
+        np.abs(np.asarray(rollout_out.trajectory.phi_r_shape, dtype=np.float32)),
+        rollout_active,
+    )
+    phi_prev_mean = _active_mean(rollout_out.trajectory.phi_prev, rollout_active)
+    phi_next_mean = _active_mean(rollout_out.trajectory.phi_next, rollout_active)
+    phi_beta_mean = _active_mean(rollout_out.trajectory.phi_beta, rollout_active)
     done_rate = _active_mean(rollout_out.trajectory.dones, rollout_active)
     advantage_std = (
         float(np.asarray(ppo_batch.advantages)[ppo_active.astype(bool)].std())
@@ -2043,6 +2380,8 @@ def summarize_training_step(
         "ppo_batch_size": int(ppo_batch_size),
         "ppo_active_sample_count": int(active_ppo_count),
         "ppo_active_sample_fraction": float(active_ppo_count / max(1, int(ppo_batch_size))),
+        "ppo_loss_weight_sum": float(ppo_loss_weight_sum),
+        "ppo_loss_denominator": float(ppo_loss_denominator_value),
         "rollout_active_step_count": int(active_count),
         "rollout_active_step_fraction": float(active_count / max(1, int(total_states))),
         "ppo_update_epochs": int(max(1, int(policy_update_epochs))),
@@ -2067,12 +2406,19 @@ def summarize_training_step(
         "ppo_update_rollout_samples_per_sec": float(ppo_batch_size / update_sec),
         "ppo_update_optimizer_samples_per_sec": float(optimizer_sample_count / update_sec),
         "mean_reward": reward_mean,
+        "phi_r_shape_mean": phi_r_shape_mean,
+        "phi_r_shape_abs_mean": phi_r_shape_abs_mean,
+        "phi_prev_mean": phi_prev_mean,
+        "phi_next_mean": phi_next_mean,
+        "phi_beta_mean": phi_beta_mean,
         "done_rate": done_rate,
         "mean_return": return_mean,
         "mean_value": value_mean,
         "advantage_std": advantage_std,
     }
     summary.update(episode_metrics)
+    summary["completed_episode_count"] = int(episode_metrics["completed_episodes"])
+    summary["completed_active_step_count"] = int(episode_metrics["completed_episode_steps"])
     summary.update(
         summarize_lane_violation_metrics(
             terminal_episode_steps=rollout_out.trajectory.terminal_episode_steps,

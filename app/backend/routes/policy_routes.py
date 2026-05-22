@@ -59,9 +59,18 @@ def set_phi_params(req: SetPhiParamsRequest):
             except Exception:
                 pass
         if req.phi_aggregation_mode is not None:
-            valid_modes = ["team_best", "teammates_best", "teammates_avg", "team_avg"]
+            valid_modes = [
+                "team_best",
+                "teammates_best",
+                "teammates_avg",
+                "team_avg",
+                "teammates_worst",
+                "team_worst",
+            ]
             if str(req.phi_aggregation_mode) in valid_modes:
                 env.phi_aggregation_mode = str(req.phi_aggregation_mode)
+        if game_state.jax_runtime is not None:
+            game_state.jax_runtime.refresh_static_from_display_env()
         return {"status": "success", "params": get_phi_params()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set phi params: {e}")

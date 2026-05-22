@@ -17,6 +17,17 @@ class _ReadOnlySelectorPolicy:
         return logits, values
 
 
+class _ExtremeSelectorPolicy:
+    def has_intent_selector(self):
+        return True
+
+    def get_intent_selector_outputs(self, obs):
+        return (
+            np.asarray([[50.0, -50.0, -50.0]], dtype=np.float32),
+            np.asarray([0.5], dtype=np.float32),
+        )
+
+
 def test_selector_sample_intent_accepts_readonly_numpy_outputs_without_warning():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -40,3 +51,26 @@ def test_selector_sample_intent_accepts_readonly_numpy_outputs_without_warning()
     assert result["intent_index"] == 1
     assert result["used_selector"] is True
     assert not any("not writable" in str(item.message) for item in caught)
+
+
+def test_selector_learned_sample_uses_raw_distribution_not_training_mix():
+    result = selector_sample_intent(
+        {
+            "intent_selector_enabled": True,
+            "intent_selector_mode": "integrated",
+            "intent_selector_alpha_start": 0.0,
+            "intent_selector_alpha_end": 0.0,
+            "intent_selector_eps_start": 1.0,
+            "intent_selector_eps_end": 1.0,
+        },
+        _ExtremeSelectorPolicy(),
+        {},
+        num_intents=3,
+        allow_uniform_fallback=False,
+        selection_mode="learned_sample",
+        rng=np.random.default_rng(123),
+    )
+
+    assert result["intent_index"] == 0
+    assert result["used_selector"] is True
+    assert result["selector_eps"] == 1.0

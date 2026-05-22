@@ -36,6 +36,15 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/three_second_lane_height": "3",
         "jax/env/three_second_max_steps": "3",
         "jax/env/violation_reward": "2.0",
+        "jax/env/enable_phi_shaping": "true",
+        "jax/env/reward_shaping_gamma": "0.97",
+        "jax/env/phi_beta_start": "0.01",
+        "jax/env/phi_beta_end": "0.15",
+        "jax/env/phi_beta_warmup_updates": "50",
+        "jax/env/phi_beta_ramp_updates": "200",
+        "jax/env/phi_blend_weight": "0.5",
+        "jax/env/phi_aggregation_mode": "teammates_best",
+        "jax/env/phi_use_ball_handler_only": "false",
         "jax/env/start_template_library": "/tmp/templates.json",
         "jax/env/start_template_prob": "1.0",
     }
@@ -61,6 +70,16 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["three_second_lane_height"] == 3
     assert merged["three_second_max_steps"] == 3
     assert merged["violation_reward"] == 2.0
+    assert merged["enable_phi_shaping"] is True
+    assert merged["reward_shaping_gamma"] == 0.97
+    assert merged["phi_beta_start"] == 0.01
+    assert merged["phi_beta_end"] == 0.15
+    assert merged["phi_beta"] == 0.15
+    assert merged["phi_beta_warmup_updates"] == 50
+    assert merged["phi_beta_ramp_updates"] == 200
+    assert merged["phi_blend_weight"] == 0.5
+    assert merged["phi_aggregation_mode"] == "teammates_best"
+    assert merged["phi_use_ball_handler_only"] is False
     assert merged["start_template_library"] == "/tmp/templates.json"
     assert merged["start_template_prob"] == 1.0
 
@@ -98,6 +117,9 @@ def test_overlay_jax_mlflow_training_params_exposes_selector_config():
         "jax/intent_selector_multiselect_enabled": "true",
         "jax/intent_selector_min_play_steps": "7",
         "jax/env/layup_std": "0.05",
+        "jax/env/enable_phi_shaping": "true",
+        "jax/env/phi_beta_end": "0.15",
+        "jax/env/phi_beta_warmup_updates": "50",
     }
 
     merged = _overlay_jax_mlflow_training_params(trainer, params)
@@ -116,6 +138,9 @@ def test_overlay_jax_mlflow_training_params_exposes_selector_config():
     assert merged["intent_selector_max_samples_per_update"] == 4096
     assert merged["intent_selector_multiselect_enabled"] is True
     assert merged["intent_selector_min_play_steps"] == 7
+    assert merged["enable_phi_shaping"] is True
+    assert merged["phi_beta_end"] == 0.15
+    assert merged["phi_beta_warmup_updates"] == 50
     assert merged["num_envs"] == 4096
     assert merged["n_steps"] == 128
     assert merged["steps_per_update"] == 1048576
@@ -151,8 +176,16 @@ def test_jax_local_env_config_prefers_checkpoint_env_config():
                 "intent_null_prob": 0.1,
                 "defense_intent_null_prob": 0.2,
                 "intent_visible_to_defense_prob": 0.3,
+                "enable_phi_shaping": True,
+                "reward_shaping_gamma": 0.97,
+                "phi_beta_start": 0.01,
+                "phi_beta_end": 0.15,
+                "phi_blend_weight": 0.5,
+                "phi_aggregation_mode": "teammates_best",
+                "phi_use_ball_handler_only": False,
             },
             "trainer_config": {"kernel_batch_size": 128},
+            "last_metrics": {"phi_beta": 0.123},
         }
 
     required, optional, trainer, phi = _jax_local_env_config_from_metadata(Policy())
@@ -171,6 +204,18 @@ def test_jax_local_env_config_prefers_checkpoint_env_config():
     assert optional["intent_null_prob"] == 0.1
     assert optional["defense_intent_null_prob"] == 0.2
     assert optional["intent_visible_to_defense_prob"] == 0.3
+    assert optional["enable_phi_shaping"] is True
+    assert optional["reward_shaping_gamma"] == 0.97
+    assert optional["phi_beta"] == 0.123
+    assert optional["phi_beta_end"] == 0.15
+    assert optional["phi_blend_weight"] == 0.5
     assert "offensive_three_seconds" not in optional
     assert trainer == {"kernel_batch_size": 128}
-    assert phi == {}
+    assert phi == {
+        "enable_phi_shaping": True,
+        "phi_beta": 0.123,
+        "reward_shaping_gamma": 0.97,
+        "phi_aggregation_mode": "teammates_best",
+        "phi_use_ball_handler_only": False,
+        "phi_blend_weight": 0.5,
+    }

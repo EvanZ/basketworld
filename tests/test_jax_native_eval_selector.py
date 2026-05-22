@@ -86,6 +86,114 @@ def test_native_selector_eval_settings_use_checkpoint_update_schedule():
     assert settings["min_play_steps"] == 7
 
 
+def test_native_selector_eval_settings_prefers_checkpoint_selector_metadata_over_session_defaults():
+    spec = build_actor_critic_spec(
+        np.zeros((1, (6 * TOKEN_OBS_PLAYER_DIM) + TOKEN_OBS_GLOBAL_DIM + 1), dtype=np.float32),
+        np.ones((1, 3, 14), dtype=np.int8),
+        hidden_dims=(),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=TOKEN_OBS_PLAYER_DIM,
+        global_dim=TOKEN_OBS_GLOBAL_DIM,
+        intent_embedding_enabled=True,
+        num_intents=5,
+        intent_selector_enabled=True,
+        intent_selector_hidden_dim=8,
+    )
+    settings = _selector_eval_settings(
+        payload={
+            "update_index": 10,
+            "trainer_config": {
+                "intent_selector_enabled": True,
+                "intent_selector_mode": "integrated",
+                "intent_selector_multiselect_enabled": True,
+                "intent_selector_min_play_steps": 6,
+            },
+            "policy_spec": {"intent_selector_enabled": True},
+        },
+        spec=spec,
+        training_params={
+            "intent_selector_enabled": False,
+            "intent_selector_mode": "callback",
+            "intent_selector_multiselect_enabled": False,
+            "intent_selector_min_play_steps": 2,
+        },
+        intent_selection_mode="learned_sample",
+    )
+
+    assert settings["enabled"] is True
+    assert settings["spec_enabled"] is True
+    assert settings["config_enabled"] is True
+    assert settings["selector_mode"] == "integrated"
+    assert settings["disabled_reason"] is None
+    assert settings["multiselect_enabled"] is True
+    assert settings["min_play_steps"] == 6
+
+
+def test_native_selector_eval_settings_treats_callback_mode_as_legacy_jax_integrated():
+    spec = build_actor_critic_spec(
+        np.zeros((1, (6 * TOKEN_OBS_PLAYER_DIM) + TOKEN_OBS_GLOBAL_DIM + 1), dtype=np.float32),
+        np.ones((1, 3, 14), dtype=np.int8),
+        hidden_dims=(),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=TOKEN_OBS_PLAYER_DIM,
+        global_dim=TOKEN_OBS_GLOBAL_DIM,
+        intent_embedding_enabled=True,
+        num_intents=5,
+        intent_selector_enabled=True,
+        intent_selector_hidden_dim=8,
+    )
+    settings = _selector_eval_settings(
+        payload={
+            "update_index": 10,
+            "trainer_config": {
+                "intent_selector_enabled": True,
+                "intent_selector_mode": "callback",
+            },
+            "policy_spec": {"intent_selector_enabled": True},
+        },
+        spec=spec,
+        training_params={"intent_selector_mode": "callback"},
+        intent_selection_mode="learned_sample",
+    )
+
+    assert settings["enabled"] is True
+    assert settings["selector_mode"] == "integrated"
+    assert settings["disabled_reason"] is None
+
+
+def test_native_selector_eval_settings_uses_policy_spec_when_training_params_are_stale():
+    spec = build_actor_critic_spec(
+        np.zeros((1, (6 * TOKEN_OBS_PLAYER_DIM) + TOKEN_OBS_GLOBAL_DIM + 1), dtype=np.float32),
+        np.ones((1, 3, 14), dtype=np.int8),
+        hidden_dims=(),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=TOKEN_OBS_PLAYER_DIM,
+        global_dim=TOKEN_OBS_GLOBAL_DIM,
+        intent_embedding_enabled=True,
+        num_intents=5,
+        intent_selector_enabled=True,
+        intent_selector_hidden_dim=8,
+    )
+    settings = _selector_eval_settings(
+        payload={
+            "update_index": 10,
+            "policy_spec": {"intent_selector_enabled": True},
+        },
+        spec=spec,
+        training_params={
+            "intent_selector_enabled": False,
+            "intent_selector_mode": "callback",
+        },
+        intent_selection_mode="learned_sample",
+    )
+
+    assert settings["enabled"] is True
+    assert settings["selector_mode"] == "integrated"
+    assert settings["disabled_reason"] is None
+
 def test_native_eval_runner_applies_selector_at_episode_start():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")

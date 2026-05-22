@@ -223,8 +223,17 @@ def init_intent_discriminator_params(jax, jnp, spec: IntentDiscriminatorSpec, *,
     return unfreeze(variables["params"])
 
 
-def build_intent_step_features_from_rollout(rollout: RolloutOutput, spec: IntentDiscriminatorSpec, jnp):
+def build_intent_step_features_from_rollout(
+    rollout: RolloutOutput,
+    spec: IntentDiscriminatorSpec,
+    jnp,
+    *,
+    training_mask=None,
+):
     trajectory = rollout.trajectory
+    if training_mask is None:
+        training_mask = trajectory.active_mask.astype(jnp.float32)
+    training_mask = training_mask.astype(jnp.float32)
     if str(spec.encoder_type) == "set_step":
         flat_obs = trajectory.flat_obs.astype(jnp.float32)
         player_dim = int(spec.token_player_count) * int(spec.token_dim)
@@ -245,7 +254,7 @@ def build_intent_step_features_from_rollout(rollout: RolloutOutput, spec: Intent
         labels = trajectory.policy_intent_index.astype(jnp.int32)
         active_mask = (
             (trajectory.policy_intent_gate.astype(jnp.float32) > 0.5)
-            & (trajectory.active_mask.astype(jnp.float32) > 0.5)
+            & (training_mask > 0.5)
         )
         return {
             "players": players,
@@ -276,7 +285,7 @@ def build_intent_step_features_from_rollout(rollout: RolloutOutput, spec: Intent
     labels = trajectory.policy_intent_index.astype(jnp.int32)
     active_mask = (
         (trajectory.policy_intent_gate.astype(jnp.float32) > 0.5)
-        & (trajectory.active_mask.astype(jnp.float32) > 0.5)
+        & (training_mask > 0.5)
     )
     return features, labels, active_mask
 

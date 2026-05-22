@@ -80,6 +80,7 @@ def build_checkpoint_payload(
     base_key,
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
+    selector_opt_state=None,
     opponent_info: dict[str, Any] | None = None,
     env_config: dict[str, Any] | None = None,
     intent_discriminator_state: dict[str, Any] | None = None,
@@ -104,6 +105,8 @@ def build_checkpoint_payload(
         "last_metrics": None if last_metrics is None else dict(last_metrics),
         "opponent_info": None if opponent_info is None else dict(opponent_info),
     }
+    if selector_opt_state is not None:
+        payload["state"]["selector_opt_state"] = _tree_to_numpy(selector_opt_state)
     if intent_discriminator_state is not None:
         payload["intent_discriminator_state"] = dict(intent_discriminator_state)
         payload["state"]["intent_discriminator_params"] = _tree_to_numpy(
@@ -171,6 +174,7 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         "frozen_config": _from_jsonable(metadata["frozen_config"]),
         "params": state["params"],
         "opt_state": state["opt_state"],
+        "selector_opt_state": state.get("selector_opt_state"),
         "current_state": state["current_state"],
         "eval_initial_state": state["eval_initial_state"],
         "base_key": state["base_key"],

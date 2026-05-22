@@ -15,6 +15,7 @@ from app.backend.schemas import (
     PlaybookAnalysisRequest,
     ReplayCounterfactualRequest,
     SetIntentStateRequest,
+    SetOffenseSkillsRequest,
     StartSelfPlayRequest,
     UpdatePositionRequest,
 )
@@ -37,22 +38,27 @@ class _FakeSpec:
 class _FakeRawJaxModel:
     metadata = {"policy_spec": {"model_type": "mlp"}}
 
-    def __init__(self):
+    def __init__(self, action_bias: int | None = None):
         self.jax = jax
         self.jnp = jnp
         self.params = {}
         self.spec = _FakeSpec()
         self._sample_key = jax.random.PRNGKey(123)
+        self.action_bias = action_bias
 
     def _masked_runner(self, params, flat_obs, team_action_mask, intent_context):
         legal = team_action_mask.astype(jnp.float32)
         denom = jnp.maximum(jnp.sum(legal, axis=-1, keepdims=True), 1.0)
-        probs = legal / denom
-        masked_logits = jnp.where(legal > 0, jnp.log(jnp.maximum(probs, 1.0e-8)), -1.0e9)
+        base_probs = legal / denom
+        masked_logits = jnp.where(legal > 0, jnp.log(jnp.maximum(base_probs, 1.0e-8)), -1.0e9)
+        if self.action_bias is not None:
+            bias = jax.nn.one_hot(int(self.action_bias), team_action_mask.shape[-1]) * 4.0
+            masked_logits = jnp.where(legal > 0, masked_logits + bias, -1.0e9)
+        probs = jax.nn.softmax(masked_logits, axis=-1)
         return {
             "probs": probs,
             "masked_logits": masked_logits,
-            "deterministic_actions": jnp.argmax(legal, axis=-1).astype(jnp.int32),
+            "deterministic_actions": jnp.argmax(masked_logits, axis=-1).astype(jnp.int32),
             "values": jnp.full((flat_obs.shape[0],), 0.5, dtype=jnp.float32),
             "attention_weights": None,
         }
@@ -140,7 +146,7 @@ def test_step_route_dispatches_to_jax_runtime(monkeypatch):
     assert fresh.jax_runtime.called is True
 
 
-def test_jax_dev_runtime_step_does_not_call_python_env_step():
+def test_jax_dev_runtime_step_does_not_call_python_env_step(monkeypatch):
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
@@ -151,6 +157,18 @@ def test_jax_dev_runtime_step_does_not_call_python_env_step():
     game_state.obs = runtime.observation_dict()
 
     runtime.display_env.step = _ExplodingPythonEnv().step
+    choose_calls = 0
+    original_choose = runtime._choose_joint_policy_actions
+
+    def spy_choose_joint_policy_actions(*, player_deterministic, opponent_deterministic):
+        nonlocal choose_calls
+        choose_calls += 1
+        return original_choose(
+            player_deterministic=player_deterministic,
+            opponent_deterministic=opponent_deterministic,
+        )
+
+    monkeypatch.setattr(runtime, "_choose_joint_policy_actions", spy_choose_joint_policy_actions)
 
     before_positions = list(runtime.positions)
     body = runtime.step(
@@ -168,6 +186,54 @@ def test_jax_dev_runtime_step_does_not_call_python_env_step():
     assert len(body["state"]["positions"]) == runtime.n_players
     assert game_state.actions_log
     assert np.asarray(runtime.positions).shape == np.asarray(before_positions).shape
+    assert choose_calls == 2
+    assert {
+        str(pid): probs
+        for pid, probs in runtime._last_policy_probs.items()
+    } == body["state"]["policy_probabilities"]
+
+
+def test_jax_dev_runtime_replace_policies_refreshes_policy_outputs():
+    runtime = _make_runtime()
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.obs = runtime.observation_dict()
+
+    _, old_probs = runtime._choose_joint_policy_actions(
+        player_deterministic=True,
+        opponent_deterministic=True,
+    )
+    runtime._last_attention_payload = {"stale": True}
+    runtime._last_selector_transition = {"stale": True}
+    runtime._playbook_batch_runner_cache = {"spec": runtime.raw_model.spec, "runner": object()}
+
+    new_policy = _FakeRawJaxModel(action_bias=0)
+    runtime.replace_policies(
+        unified_policy=new_policy,
+        opponent_policy=new_policy,
+        game_state=game_state,
+    )
+
+    assert runtime.unified_policy is new_policy
+    assert runtime.opponent_policy is new_policy
+    assert runtime.raw_model is new_policy
+    assert runtime._last_policy_probs is None
+    assert runtime._last_attention_payload is None
+    assert runtime._last_selector_transition is None
+    assert runtime._playbook_batch_runner_cache is None
+    assert game_state.env is runtime.display_env
+    assert game_state.obs is not None
+
+    _, new_probs = runtime._choose_joint_policy_actions(
+        player_deterministic=True,
+        opponent_deterministic=True,
+    )
+    first_player = runtime.offense_ids[0]
+    assert new_probs[first_player][0] > old_probs[first_player][0]
 
 
 def test_jax_dev_runtime_self_play_respects_requested_template_seed():
@@ -493,6 +559,48 @@ def test_jax_dev_runtime_forces_learned_selector_for_interactive_sampling(monkey
     assert debug["force_learned_runtime"] is True
 
 
+def test_jax_dev_runtime_selector_multiselect_prefers_checkpoint_metadata():
+    runtime = _make_runtime(
+        env_params={
+            "enable_intent_learning": True,
+            "num_intents": 8,
+            "intent_commitment_steps": 4,
+        }
+    )
+    runtime.raw_model.spec = _FakeSpec(intent_selector_enabled=True, num_intents=8)
+    runtime.raw_model.metadata = {
+        "policy_spec": {
+            "model_type": "mlp",
+            "intent_selector_enabled": True,
+        },
+        "trainer_config": {
+            "intent_selector_enabled": True,
+            "intent_selector_multiselect_enabled": True,
+            "intent_selector_min_play_steps": 4,
+            "intent_selector_alpha_end": 1.0,
+            "intent_selector_eps_end": 0.0,
+        },
+    }
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.mlflow_training_params = {
+        "intent_selector_enabled": True,
+        # Simulates a default produced by training-param extraction when the
+        # checkpoint metadata carries the real static selector setting.
+        "intent_selector_multiselect_enabled": False,
+        "intent_selector_min_play_steps": 3,
+    }
+
+    debug = runtime._selector_debug_payload(game_state)
+
+    assert debug["runtime_enabled"] is True
+    assert debug["multiselect_enabled"] is True
+    assert debug["min_play_steps"] == 4
+
+
 def test_jax_dev_runtime_turn_step_does_not_reselect_at_episode_start(monkeypatch):
     runtime, game_state = _make_selector_runtime_and_state()
     game_state.self_play_active = False
@@ -698,12 +806,27 @@ def test_jax_dev_runtime_apply_display_env_edits_updates_kernel_state():
     runtime.display_env.positions = cells
     runtime.display_env.ball_holder = 1
     runtime.display_env.shot_clock = 17
+    runtime.display_env.offense_layup_pct_by_player = [0.11, 0.22, 0.33]
+    runtime.display_env.offense_three_pt_pct_by_player = [0.44, 0.55, 0.66]
+    runtime.display_env.offense_dunk_pct_by_player = [0.77, 0.88, 0.99]
 
     runtime.apply_display_env_edits(game_state)
 
     assert runtime.positions == cells
     assert runtime.ball_holder == 1
     assert runtime.shot_clock == 17
+    np.testing.assert_allclose(
+        np.asarray(runtime.jax.device_get(runtime.state.layup_pct))[0, runtime.offense_ids],
+        [0.11, 0.22, 0.33],
+    )
+    np.testing.assert_allclose(
+        np.asarray(runtime.jax.device_get(runtime.state.three_pt_pct))[0, runtime.offense_ids],
+        [0.44, 0.55, 0.66],
+    )
+    np.testing.assert_allclose(
+        np.asarray(runtime.jax.device_get(runtime.state.dunk_pct))[0, runtime.offense_ids],
+        [0.77, 0.88, 0.99],
+    )
     assert isinstance(game_state.obs, dict)
 
 
@@ -789,6 +912,63 @@ def test_update_player_position_route_syncs_jax_runtime(monkeypatch):
     assert body["status"] == "success"
     assert env.positions[0] == (2, 0)
     assert runtime.synced is True
+
+
+def test_set_offense_skills_route_syncs_jax_runtime(monkeypatch):
+    class DummyEnv:
+        players_per_side = 3
+        offense_layup_pct_by_player = [0.5, 0.5, 0.5]
+        offense_three_pt_pct_by_player = [0.35, 0.35, 0.35]
+        offense_dunk_pct_by_player = [0.8, 0.8, 0.8]
+
+    class DummyRuntime:
+        def __init__(self):
+            self.synced = False
+
+        def apply_display_env_edits(self, game_state):
+            self.synced = True
+            game_state.obs = {"action_mask": []}
+
+    fresh = GameState()
+    runtime = DummyRuntime()
+    env = DummyEnv()
+    fresh.jax_runtime = runtime
+    fresh.env = env
+    fresh.obs = {"action_mask": []}
+    fresh.sampled_offense_skills = {
+        "layup": [0.5, 0.5, 0.5],
+        "three_pt": [0.35, 0.35, 0.35],
+        "dunk": [0.8, 0.8, 0.8],
+    }
+    monkeypatch.setattr(backend_state, "game_state", fresh)
+    monkeypatch.setattr(admin_routes, "game_state", fresh)
+    monkeypatch.setattr(
+        admin_routes,
+        "get_ui_game_state",
+        lambda: {
+            "offense_shooting_pct_by_player": {
+                "layup": list(fresh.env.offense_layup_pct_by_player),
+                "three_pt": list(fresh.env.offense_three_pt_pct_by_player),
+                "dunk": list(fresh.env.offense_dunk_pct_by_player),
+            }
+        },
+    )
+
+    body = admin_routes.set_offense_skills(
+        SetOffenseSkillsRequest(
+            skills={
+                "layup": [0.61, 0.62, 0.63],
+                "three_pt": [0.41, 0.42, 0.43],
+                "dunk": [0.81, 0.82, 0.83],
+            }
+        )
+    )
+
+    assert body["status"] == "success"
+    assert runtime.synced is True
+    assert env.offense_layup_pct_by_player == [0.61, 0.62, 0.63]
+    assert env.offense_three_pt_pct_by_player == [0.41, 0.42, 0.43]
+    assert env.offense_dunk_pct_by_player == [0.81, 0.82, 0.83]
 
 
 def test_jax_dev_runtime_set_offense_intent_state_updates_kernel_state():

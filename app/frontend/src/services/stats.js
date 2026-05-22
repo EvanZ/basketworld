@@ -47,6 +47,21 @@ export function getDefaultStats() {
       phiShaping: 0,
       unexplained: 0,
     },
+    selectorDiagnostics: {
+      source: "intent_fallback",
+      enabled: false,
+      specEnabled: false,
+      configEnabled: false,
+      configMode: "",
+      disabledReason: "",
+      mode: "",
+      appliedEpisodeStarts: 0,
+      rawProbCount: 0,
+      meanRawMaxProb: 0,
+      meanRawProbs: [],
+      sampleCounts: {},
+      argmaxCounts: {},
+    },
   };
 }
 
@@ -104,6 +119,23 @@ export function loadStats() {
         assistFullBonus: Number(parsed?.rewardBreakdown?.assistFullBonus) || 0,
         phiShaping: Number(parsed?.rewardBreakdown?.phiShaping) || 0,
         unexplained: Number(parsed?.rewardBreakdown?.unexplained) || 0,
+      },
+      selectorDiagnostics: {
+        source: String(parsed?.selectorDiagnostics?.source || "intent_fallback"),
+        enabled: Boolean(parsed?.selectorDiagnostics?.enabled),
+        specEnabled: Boolean(parsed?.selectorDiagnostics?.specEnabled),
+        configEnabled: Boolean(parsed?.selectorDiagnostics?.configEnabled),
+        configMode: String(parsed?.selectorDiagnostics?.configMode || ""),
+        disabledReason: String(parsed?.selectorDiagnostics?.disabledReason || ""),
+        mode: String(parsed?.selectorDiagnostics?.mode || ""),
+        appliedEpisodeStarts: Number(parsed?.selectorDiagnostics?.appliedEpisodeStarts) || 0,
+        rawProbCount: Number(parsed?.selectorDiagnostics?.rawProbCount) || 0,
+        meanRawMaxProb: Number(parsed?.selectorDiagnostics?.meanRawMaxProb) || 0,
+        meanRawProbs: Array.isArray(parsed?.selectorDiagnostics?.meanRawProbs)
+          ? parsed.selectorDiagnostics.meanRawProbs.map((v) => Number(v) || 0)
+          : [],
+        sampleCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.sampleCounts),
+        argmaxCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.argmaxCounts),
       },
     };
   } catch (e) {

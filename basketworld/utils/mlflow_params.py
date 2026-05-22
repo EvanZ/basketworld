@@ -458,7 +458,12 @@ def get_mlflow_phi_shaping_params(
     # Enable phi shaping
     phi_params["enable_phi_shaping"] = _get_param(
         params,
-        ["enable_phi_shaping", "enable-phi-shaping"],
+        [
+            "jax/env/enable_phi_shaping",
+            "enable_phi_shaping",
+            "enable-phi-shaping",
+            "jax/enable_phi_shaping",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
@@ -467,13 +472,22 @@ def get_mlflow_phi_shaping_params(
     # This is what the model was trained with at the end of training
     phi_beta_end = _get_param(
         params,
-        ["phi_beta_end", "phi-beta-end"],
+        ["jax/env/phi_beta_end", "phi_beta_end", "phi-beta-end", "jax/phi_beta_end"],
         float,
         None,
     )
     phi_beta_start = _get_param(
         params,
-        ["phi_beta_start", "phi-beta-start", "phi_beta", "phi-beta"],
+        [
+            "phi_beta_start",
+            "phi-beta-start",
+            "phi_beta",
+            "phi-beta",
+            "jax/env/phi_beta_start",
+            "jax/env/phi_beta",
+            "jax/phi_beta_start",
+            "jax/phi_beta",
+        ],
         float,
         0.0,
     )
@@ -484,7 +498,12 @@ def get_mlflow_phi_shaping_params(
     # Reward shaping gamma (should match training gamma)
     phi_params["reward_shaping_gamma"] = _get_param(
         params,
-        ["reward_shaping_gamma", "reward-shaping-gamma"],
+        [
+            "jax/env/reward_shaping_gamma",
+            "reward_shaping_gamma",
+            "reward-shaping-gamma",
+            "jax/reward_shaping_gamma",
+        ],
         float,
         1.0,
     )
@@ -492,7 +511,12 @@ def get_mlflow_phi_shaping_params(
     # Ball handler only mode
     phi_params["phi_use_ball_handler_only"] = _get_param(
         params,
-        ["phi_use_ball_handler_only", "phi-use-ball-handler-only"],
+        [
+            "jax/env/phi_use_ball_handler_only",
+            "phi_use_ball_handler_only",
+            "phi-use-ball-handler-only",
+            "jax/phi_use_ball_handler_only",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
@@ -500,7 +524,12 @@ def get_mlflow_phi_shaping_params(
     # Blend weight
     phi_params["phi_blend_weight"] = _get_param(
         params,
-        ["phi_blend_weight", "phi-blend-weight"],
+        [
+            "jax/env/phi_blend_weight",
+            "phi_blend_weight",
+            "phi-blend-weight",
+            "jax/phi_blend_weight",
+        ],
         float,
         0.0,
     )
@@ -508,7 +537,12 @@ def get_mlflow_phi_shaping_params(
     # Aggregation mode
     phi_params["phi_aggregation_mode"] = _get_param(
         params,
-        ["phi_aggregation_mode", "phi-aggregation-mode"],
+        [
+            "jax/env/phi_aggregation_mode",
+            "phi_aggregation_mode",
+            "phi-aggregation-mode",
+            "jax/phi_aggregation_mode",
+        ],
         str,
         "team_best",
     )

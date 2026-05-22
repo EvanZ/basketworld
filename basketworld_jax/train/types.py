@@ -18,10 +18,12 @@ class TrainerConfig:
     policy_update_epochs: int
     ppo_minibatches: int = 1
     single_episode_rollouts: bool = False
+    ppo_completed_episodes_only: bool = False
 
 
 class TrajectoryBatch(NamedTuple):
     active_mask: Any
+    episode_start: Any
     flat_obs: Any
     policy_intent_index: Any
     policy_intent_gate: Any
@@ -32,6 +34,10 @@ class TrajectoryBatch(NamedTuple):
     values: Any
     rewards: Any
     dones: Any
+    phi_r_shape: Any
+    phi_prev: Any
+    phi_next: Any
+    phi_beta: Any
     pass_attempts: Any
     completed_passes: Any
     assists: Any
@@ -106,6 +112,8 @@ class PPOBatch(NamedTuple):
     advantages: Any
     returns: Any
     active_mask: Any
+    loss_weights: Any
+    loss_denominator: Any
 
 
 class SelectorBatch(NamedTuple):
@@ -182,6 +190,51 @@ def compute_gae_and_returns(rewards, values, dones, bootstrap_values, *, gamma: 
     return advantages, returns
 
 
+def build_trajectory_training_masks(trajectory: TrajectoryBatch, trainer_config: TrainerConfig, jax, jnp):
+    active_mask = trajectory.active_mask.astype(jnp.float32)
+    if not bool(getattr(trainer_config, "ppo_completed_episodes_only", False)):
+        return active_mask, active_mask, jnp.sum(active_mask).astype(jnp.float32)
+
+    active_bool = active_mask > 0.5
+    starts = trajectory.episode_start.astype(jnp.bool_) & active_bool
+    dones = trajectory.dones.astype(jnp.bool_) & active_bool
+
+    def _forward_started(carry, start_t):
+        next_carry = carry | start_t
+        return next_carry, next_carry
+
+    _, has_started = jax.lax.scan(
+        _forward_started,
+        jnp.zeros_like(starts[0], dtype=jnp.bool_),
+        starts,
+    )
+
+    def _reverse_complete(carry, scan_inputs):
+        done_t, start_t = scan_inputs
+        complete_t = carry | done_t
+        prev_carry = jnp.where(start_t, jnp.zeros_like(complete_t), complete_t)
+        return prev_carry, complete_t
+
+    _, complete_rev = jax.lax.scan(
+        _reverse_complete,
+        jnp.zeros_like(dones[0], dtype=jnp.bool_),
+        (dones[::-1], starts[::-1]),
+    )
+    completed_episode_mask = active_bool & has_started & complete_rev[::-1]
+
+    completed_episode_count = jnp.sum((dones & completed_episode_mask).astype(jnp.float32))
+    loss_weights = jnp.where(
+        completed_episode_mask,
+        jnp.ones_like(active_mask),
+        jnp.zeros_like(active_mask),
+    )
+    return (
+        completed_episode_mask.astype(jnp.float32),
+        loss_weights.astype(jnp.float32),
+        completed_episode_count.astype(jnp.float32),
+    )
+
+
 def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, jnp) -> PPOBatch:
     advantages, returns = compute_gae_and_returns(
         rollout.trajectory.rewards,
@@ -193,12 +246,18 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         jax=jax,
         jnp=jnp,
     )
-    active_mask = rollout.trajectory.active_mask.astype(jnp.float32)
+    active_mask, loss_weights, loss_denominator = build_trajectory_training_masks(
+        rollout.trajectory,
+        trainer_config,
+        jax,
+        jnp,
+    )
     flat_advantages = advantages.reshape(-1)
     flat_active_mask = active_mask.reshape(-1).astype(jnp.float32)
-    active_count = jnp.maximum(jnp.sum(flat_active_mask), 1.0)
-    adv_mean = jnp.sum(flat_advantages * flat_active_mask) / active_count
-    adv_var = jnp.sum(jnp.square(flat_advantages - adv_mean) * flat_active_mask) / active_count
+    flat_loss_weights = loss_weights.reshape(-1).astype(jnp.float32)
+    adv_norm_den = jnp.maximum(jnp.sum(flat_active_mask), 1.0)
+    adv_mean = jnp.sum(flat_advantages * flat_active_mask) / adv_norm_den
+    adv_var = jnp.sum(jnp.square(flat_advantages - adv_mean) * flat_active_mask) / adv_norm_den
     normalized_advantages = (advantages - adv_mean) / jnp.sqrt(jnp.maximum(adv_var, 1.0e-8))
     normalized_advantages = jnp.where(
         active_mask.astype(jnp.bool_),
@@ -229,6 +288,8 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         advantages=normalized_advantages.reshape(-1),
         returns=returns.reshape(-1),
         active_mask=flat_active_mask,
+        loss_weights=flat_loss_weights,
+        loss_denominator=jnp.full_like(flat_loss_weights, loss_denominator.astype(jnp.float32)),
     )
 
 
@@ -297,9 +358,15 @@ def build_selector_batch(
         jax=jax,
         jnp=jnp,
     )
+    training_mask, _, _ = build_trajectory_training_masks(
+        rollout.trajectory,
+        trainer_config,
+        jax,
+        jnp,
+    )
     flat_mask = (
         rollout.trajectory.selector_used.reshape(-1).astype(jnp.bool_)
-        & (rollout.trajectory.active_mask.reshape(-1).astype(jnp.float32) > 0.5)
+        & (training_mask.reshape(-1).astype(jnp.float32) > 0.5)
     )
     max_samples = int(max_samples_per_update)
     if max_samples > 0:
@@ -333,11 +400,20 @@ def build_selector_batch(
 def concatenate_ppo_batches(batches: Sequence[PPOBatch], jnp) -> PPOBatch:
     if not batches:
         raise ValueError("At least one PPO batch is required.")
+    loss_denominator = jnp.sum(
+        jnp.stack([jnp.max(batch.loss_denominator) for batch in batches]).astype(jnp.float32)
+    )
+    concatenated = {
+        field: jnp.concatenate([getattr(batch, field) for batch in batches], axis=0)
+        for field in PPOBatch._fields
+        if field != "loss_denominator"
+    }
+    concatenated["loss_denominator"] = jnp.full_like(
+        concatenated["loss_weights"],
+        loss_denominator,
+    )
     return PPOBatch(
-        *(
-            jnp.concatenate([getattr(batch, field) for batch in batches], axis=0)
-            for field in PPOBatch._fields
-        )
+        **concatenated
     )
 
 

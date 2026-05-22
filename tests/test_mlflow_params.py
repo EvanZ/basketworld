@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from basketworld.utils.mlflow_params import get_mlflow_params, get_mlflow_training_params
+from basketworld.utils.mlflow_params import (
+    get_mlflow_params,
+    get_mlflow_phi_shaping_params,
+    get_mlflow_training_params,
+)
 
 
 class _FakeClient:
@@ -135,3 +139,30 @@ def test_get_mlflow_training_params_supports_jax_selector_aliases():
     assert training["intent_selector_max_samples_per_update"] == 4096
     assert training["intent_selector_multiselect_enabled"] is True
     assert training["intent_selector_min_play_steps"] == 7
+
+
+def test_get_mlflow_phi_shaping_params_supports_jax_env_aliases():
+    client = _FakeClient(
+        {
+            "jax/env/enable_phi_shaping": "true",
+            "jax/enable_phi_shaping": "false",
+            "jax/env/reward_shaping_gamma": "0.97",
+            "jax/reward_shaping_gamma": "0.50",
+            "jax/env/phi_beta_start": "0.01",
+            "jax/env/phi_beta_end": "0.15",
+            "jax/phi_beta_end": "0.05",
+            "jax/env/phi_blend_weight": "0.5",
+            "jax/phi_blend_weight": "0.1",
+            "jax/env/phi_aggregation_mode": "teammates_best",
+            "jax/env/phi_use_ball_handler_only": "false",
+        }
+    )
+
+    phi = get_mlflow_phi_shaping_params(client, "dummy")
+
+    assert phi["enable_phi_shaping"] is True
+    assert phi["reward_shaping_gamma"] == 0.97
+    assert phi["phi_beta"] == 0.15
+    assert phi["phi_blend_weight"] == 0.5
+    assert phi["phi_aggregation_mode"] == "teammates_best"
+    assert phi["phi_use_ball_handler_only"] is False

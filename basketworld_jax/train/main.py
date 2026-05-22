@@ -72,6 +72,7 @@ from basketworld_jax.train.types import (
     TrainerConfig,
     build_ppo_batch,
     build_selector_batch,
+    build_trajectory_training_masks,
     concatenate_selector_batches,
     concatenate_ppo_batches,
     limit_selector_batch_samples,
@@ -94,6 +95,8 @@ from basketworld_jax.train.runtime import (
     summarize_episode_events,
     summarize_intent_metrics,
     summarize_lane_violation_metrics,
+    summarize_ppo_eligible_episode_metrics,
+    summarize_reward_by_intent_metrics,
     summarize_shot_type_metrics,
     summarize_training_step,
     training_player_ids_from_static,
@@ -114,6 +117,15 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "dunk_pct",
         "illegal_defense_enabled",
         "offensive_three_seconds",
+        "reward_shaping_gamma",
+        "enable_phi_shaping",
+        "phi_beta_start",
+        "phi_beta_end",
+        "phi_beta_warmup_updates",
+        "phi_beta_ramp_updates",
+        "phi_blend_weight",
+        "phi_aggregation_mode",
+        "phi_use_ball_handler_only",
         "enable_intent_learning",
         "enable_defense_intent_learning",
         "intent_diversity_enabled",
@@ -127,6 +139,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "intent_selector_eps_end",
         "intent_selector_eps_warmup_steps",
         "intent_selector_eps_ramp_steps",
+        "intent_selector_learning_rate",
         "intent_selector_entropy_coef",
         "intent_selector_usage_reg_coef",
         "intent_selector_value_coef",
@@ -192,6 +205,12 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "violation_reward",
     "include_hoop_vector",
     "enable_phi_shaping",
+    "reward_shaping_gamma",
+    "phi_beta_start",
+    "phi_beta_end",
+    "phi_beta_warmup_updates",
+    "phi_beta_ramp_updates",
+    "phi_blend_weight",
     "phi_aggregation_mode",
     "phi_use_ball_handler_only",
     "pass_reward",
@@ -385,6 +404,18 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--phi-beta-warmup-updates",
+        type=int,
+        default=0,
+        help="JAX-only PPO updates to hold phi shaping at --phi-beta-start.",
+    )
+    parser.add_argument(
+        "--phi-beta-ramp-updates",
+        type=int,
+        default=1,
+        help="JAX-only PPO updates to ramp phi shaping beta from start to end.",
+    )
+    parser.add_argument(
         "--intent-selector-alpha-warmup-updates",
         type=int,
         default=0,
@@ -409,6 +440,15 @@ def parse_args(argv=None):
         help="PPO updates over which selector epsilon ramps from start to end.",
     )
     parser.add_argument(
+        "--intent-selector-learning-rate",
+        type=float,
+        default=None,
+        help=(
+            "Optional selector PPO optimizer learning rate. Defaults to "
+            "--learning-rate when omitted."
+        ),
+    )
+    parser.add_argument(
         "--policy-seed",
         type=int,
         default=0,
@@ -427,6 +467,15 @@ def parse_args(argv=None):
             "Do not reset completed envs inside a JAX training rollout. "
             "Post-terminal slots are masked out of PPO, making each env "
             "contribute at most one possession per update."
+        ),
+    )
+    parser.add_argument(
+        "--ppo-completed-episodes-only",
+        action="store_true",
+        help=(
+            "Train PPO only on transitions from episodes that start and finish "
+            "inside the collected rollout. Transitions are weighted so each "
+            "completed episode has equal total PPO weight."
         ),
     )
     parser.add_argument(
@@ -491,6 +540,15 @@ def parse_args(argv=None):
         "--log-mlflow",
         action="store_true",
         help="Log params and scalar metrics to MLflow.",
+    )
+    parser.add_argument(
+        "--mlflow-metric-profile",
+        choices=("core", "full"),
+        default="core",
+        help=(
+            "MLflow train metric volume. 'core' drops redundant alias metrics "
+            "while keeping internal summaries unchanged; 'full' logs every scalar."
+        ),
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -640,6 +698,19 @@ def validate_train_args(args) -> None:
         value = getattr(args, key, None)
         if value is not None and int(value) < 0:
             raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    for key in ("phi_beta_start", "phi_beta_end"):
+        value = getattr(args, key, None)
+        if value is not None and float(value) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    for key in ("phi_beta_warmup_updates", "phi_beta_ramp_updates"):
+        if int(getattr(args, key, 0)) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    phi_blend_weight = float(getattr(args, "phi_blend_weight", 0.0))
+    if phi_blend_weight < 0.0 or phi_blend_weight > 1.0:
+        raise SystemExit("--phi-blend-weight must be in [0, 1].")
+    reward_shaping_gamma = getattr(args, "reward_shaping_gamma", None)
+    if reward_shaping_gamma is not None and float(reward_shaping_gamma) < 0.0:
+        raise SystemExit("--reward-shaping-gamma must be >= 0.")
     if bool(getattr(args, "intent_selector_enabled", False)):
         if str(getattr(args, "policy_model", "mlp")) != "attention":
             raise SystemExit("--intent-selector-enabled requires --policy-model attention.")
@@ -673,6 +744,9 @@ def validate_train_args(args) -> None:
         raise SystemExit("--intent-selector-train-every-rollouts must be >= 1.")
     if int(getattr(args, "intent_selector_min_play_steps", 3)) < 1:
         raise SystemExit("--intent-selector-min-play-steps must be >= 1.")
+    selector_learning_rate = getattr(args, "intent_selector_learning_rate", None)
+    if selector_learning_rate is not None and float(selector_learning_rate) <= 0.0:
+        raise SystemExit("--intent-selector-learning-rate must be > 0.")
     if int(getattr(args, "intent_sample_dump_size", 2048)) < 0:
         raise SystemExit("--intent-sample-dump-size must be >= 0.")
     if bool(getattr(args, "intent_diversity_enabled", False)):
@@ -734,7 +808,99 @@ def build_trainer_config(args) -> TrainerConfig:
         policy_update_epochs=int(args.policy_update_epochs),
         ppo_minibatches=int(args.ppo_minibatches),
         single_episode_rollouts=bool(getattr(args, "single_episode_rollouts", False)),
+        ppo_completed_episodes_only=bool(getattr(args, "ppo_completed_episodes_only", False)),
     )
+
+
+def _selector_learning_rate_for_args(args, trainer_config: TrainerConfig) -> float:
+    override = getattr(args, "intent_selector_learning_rate", None)
+    if override is None:
+        return float(trainer_config.learning_rate)
+    return float(override)
+
+
+def _checkpoint_trainer_config_from_args(
+    trainer_config: TrainerConfig,
+    args,
+    *,
+    spec: ActorCriticSpec | None = None,
+) -> dict[str, Any]:
+    """Persist runtime-relevant train settings without widening TrainerConfig."""
+    config = {
+        str(key): to_builtin(value)
+        for key, value in asdict(trainer_config).items()
+    }
+    selector_fields = {
+        "enable_intent_learning": bool(getattr(args, "enable_intent_learning", False)),
+        "enable_defense_intent_learning": bool(
+            getattr(args, "enable_defense_intent_learning", False)
+        ),
+        "num_intents": int(getattr(args, "num_intents", getattr(spec, "num_intents", 8))),
+        "intent_commitment_steps": int(getattr(args, "intent_commitment_steps", 4)),
+        "intent_null_prob": float(getattr(args, "intent_null_prob", 0.2)),
+        "defense_intent_null_prob": float(getattr(args, "defense_intent_null_prob", 1.0)),
+        "intent_visible_to_defense_prob": float(
+            getattr(args, "intent_visible_to_defense_prob", 0.0)
+        ),
+        "intent_selector_enabled": bool(
+            getattr(
+                args,
+                "intent_selector_enabled",
+                getattr(spec, "intent_selector_enabled", False),
+            )
+        ),
+        "intent_selector_mode": str(getattr(args, "intent_selector_mode", "integrated")),
+        "intent_selector_hidden_dim": int(
+            getattr(
+                args,
+                "intent_selector_hidden_dim",
+                getattr(spec, "intent_selector_hidden_dim", 64),
+            )
+        ),
+        "intent_selector_learning_rate": _selector_learning_rate_for_args(
+            args,
+            trainer_config,
+        ),
+        "intent_selector_alpha_start": float(
+            getattr(args, "intent_selector_alpha_start", 0.0)
+        ),
+        "intent_selector_alpha_end": float(getattr(args, "intent_selector_alpha_end", 1.0)),
+        "intent_selector_alpha_warmup_updates": int(
+            getattr(args, "intent_selector_alpha_warmup_updates", 0)
+        ),
+        "intent_selector_alpha_ramp_updates": int(
+            getattr(args, "intent_selector_alpha_ramp_updates", 1)
+        ),
+        "intent_selector_eps_start": float(getattr(args, "intent_selector_eps_start", 0.0)),
+        "intent_selector_eps_end": float(getattr(args, "intent_selector_eps_end", 0.0)),
+        "intent_selector_eps_warmup_updates": int(
+            getattr(args, "intent_selector_eps_warmup_updates", 0)
+        ),
+        "intent_selector_eps_ramp_updates": int(
+            getattr(args, "intent_selector_eps_ramp_updates", 1)
+        ),
+        "intent_selector_entropy_coef": float(
+            getattr(args, "intent_selector_entropy_coef", 0.01)
+        ),
+        "intent_selector_usage_reg_coef": float(
+            getattr(args, "intent_selector_usage_reg_coef", 0.01)
+        ),
+        "intent_selector_value_coef": float(getattr(args, "intent_selector_value_coef", 0.5)),
+        "intent_selector_train_every_rollouts": int(
+            getattr(args, "intent_selector_train_every_rollouts", 1)
+        ),
+        "intent_selector_max_samples_per_update": int(
+            getattr(args, "intent_selector_max_samples_per_update", 0)
+        ),
+        "intent_selector_multiselect_enabled": bool(
+            getattr(args, "intent_selector_multiselect_enabled", False)
+        ),
+        "intent_selector_min_play_steps": int(
+            getattr(args, "intent_selector_min_play_steps", 3)
+        ),
+    }
+    config.update({key: to_builtin(value) for key, value in selector_fields.items()})
+    return config
 
 
 def _policy_model_type(args) -> str:
@@ -908,12 +1074,17 @@ def _save_training_checkpoint(
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
     opponent_info: dict[str, Any] | None,
+    selector_opt_state=None,
     intent_discriminator_state: dict[str, Any] | None = None,
     play_name_metadata: dict[str, Any] | None = None,
 ) -> tuple[str | None, str]:
     payload = build_checkpoint_payload(
         update_index=int(update_index),
-        trainer_config=asdict(trainer_config),
+        trainer_config=_checkpoint_trainer_config_from_args(
+            trainer_config,
+            args,
+            spec=spec,
+        ),
         policy_spec=asdict(spec),
         frozen_config={
             key: to_builtin(getattr(args, key))
@@ -922,6 +1093,7 @@ def _save_training_checkpoint(
         env_config=_jax_env_config_from_args(args),
         params=params,
         opt_state=opt_state,
+        selector_opt_state=selector_opt_state,
         current_state=current_state,
         eval_initial_state=eval_initial_state,
         base_key=base_key,
@@ -1290,12 +1462,14 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/kernel_batch_size": int(args.kernel_batch_size),
         "jax/rollout_horizon": int(args.rollout_horizon),
         "jax/single_episode_rollouts": bool(getattr(args, "single_episode_rollouts", False)),
+        "jax/ppo_completed_episodes_only": bool(getattr(args, "ppo_completed_episodes_only", False)),
         "jax/num_updates": int(args.num_updates),
         "jax/policy_update_epochs": int(args.policy_update_epochs),
         "jax/ppo_minibatches": int(args.ppo_minibatches),
         "jax/log_every_updates": int(args.log_every_updates),
         "jax/eval_every_updates": int(args.eval_every_updates),
         "jax/eval_horizon": int(args.eval_horizon),
+        "jax/mlflow_metric_profile": str(getattr(args, "mlflow_metric_profile", "core")),
         "jax/learning_rate": float(trainer_config.learning_rate),
         "jax/gamma": float(trainer_config.gamma),
         "jax/gae_lambda": float(trainer_config.gae_lambda),
@@ -1340,6 +1514,10 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/num_intents": int(spec.num_intents),
         "jax/intent_selector_enabled": bool(spec.intent_selector_enabled),
         "jax/intent_selector_hidden_dim": int(spec.intent_selector_hidden_dim),
+        "jax/intent_selector_learning_rate": _selector_learning_rate_for_args(
+            args,
+            trainer_config,
+        ),
         "jax/intent_selector_alpha_start": float(getattr(args, "intent_selector_alpha_start", 0.0)),
         "jax/intent_selector_alpha_end": float(getattr(args, "intent_selector_alpha_end", 1.0)),
         "jax/intent_selector_alpha_warmup_updates": int(
@@ -1440,6 +1618,97 @@ def _log_mlflow_metrics(mlflow, metrics: dict[str, Any], *, step: int, prefix: s
             mlflow.log_metric(f"{prefix}/{key}", float(value), step=int(step))
 
 
+def _keep_core_train_metric(key: str) -> bool:
+    """Keep one canonical MLflow path for metrics that are generated as aliases."""
+    # Combined rollout aliases duplicate the role-specific learner/opponent views
+    # after offense and defense rollouts are concatenated.
+    if key.startswith(("all_shot_", "learner_shot_", "opponent_shot_")):
+        return False
+
+    # Within a role rollout, "all" is currently an alias for the active side:
+    # offense_all == offense_learner and defense_all == defense_opponent.
+    if key.startswith(("offense_all_shot_", "defense_all_shot_")):
+        return False
+
+    # Role-role names duplicate the clearer learner/opponent names:
+    # offense_offense == offense_learner, defense_offense == defense_opponent, etc.
+    if key.startswith(
+        (
+            "offense_offense_",
+            "offense_defense_",
+            "defense_offense_",
+            "defense_defense_",
+        )
+    ):
+        return False
+
+    # These are exact aliases for the learner means.
+    if key in {"offense_mean_reward", "defense_mean_reward"}:
+        return False
+
+    # The ppo_eligible group is the primary learning-objective diagnostic. In
+    # the core profile, keep per-episode metrics and terminal shares, but drop
+    # raw totals, raw terminal episode counts, and most per-step variants.
+    if "_ppo_eligible_" in key:
+        if (
+            "_ppo_eligible_shot_" in key
+            and "_ppo_eligible_learner_shot_" not in key
+            and "_ppo_eligible_opponent_shot_" not in key
+            and "_ppo_eligible_terminal_shot_" not in key
+        ):
+            return False
+        if key.endswith("_total"):
+            return False
+        if key.endswith("_completed_episode_steps"):
+            return False
+        if key.endswith("_episodes") and not key.endswith("_completed_episodes"):
+            return False
+        if key.endswith("_per_step") and not key.endswith("reward_per_step"):
+            return False
+
+    # Prefer normalized rates and per-episode values over rollout-size-dependent
+    # raw counts in default MLflow charts.
+    if key.endswith(("_reward_total", "_points_total")):
+        return False
+    if key.endswith(
+        (
+            "_shot_attempts",
+            "_shot_makes",
+            "_shot_dunk_attempts",
+            "_shot_three_attempts",
+            "_shot_two_attempts",
+        )
+    ):
+        return False
+
+    # Per-intent raw counts are high-cardinality and redundant with shares/probs
+    # for charting. Aggregate counts such as selector_used_count are kept.
+    if "/" in key:
+        family = key.rsplit("/", 1)[0]
+        if family.endswith(
+            (
+                "_usage_count",
+                "_label_count_by_intent",
+                "_pred_count_by_intent",
+            )
+        ):
+            return False
+
+    return True
+
+
+def _filter_mlflow_train_metrics(
+    metrics: dict[str, Any],
+    *,
+    profile: str = "core",
+) -> dict[str, Any]:
+    if profile == "full":
+        return dict(metrics)
+    if profile != "core":
+        raise ValueError(f"Unknown MLflow metric profile: {profile}")
+    return {key: value for key, value in metrics.items() if _keep_core_train_metric(key)}
+
+
 def _log_mlflow_checkpoint_artifacts(
     mlflow,
     *,
@@ -1533,6 +1802,80 @@ def _safe_metric_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if float(denominator) > 0.0 else 0.0
 
 
+_CUMULATIVE_EPISODE_USAGE_KEYS = (
+    "active_step_count",
+    "ppo_used_active_step_count",
+    "ppo_unused_active_step_count",
+    "completed_episode_count",
+    "completed_active_step_count",
+    "ppo_used_completed_episode_count",
+    "ppo_used_completed_active_step_count",
+    "ppo_unused_completed_episode_count",
+    "ppo_unused_completed_active_step_count",
+)
+
+
+def _metric_float(metrics: dict[str, Any], key: str) -> float:
+    value = metrics.get(key, 0.0)
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _init_cumulative_episode_usage(last_metrics: dict[str, Any] | None) -> dict[str, float]:
+    metrics = dict(last_metrics or {})
+    return {
+        key: _metric_float(metrics, f"cumulative_{key}")
+        for key in _CUMULATIVE_EPISODE_USAGE_KEYS
+    }
+
+
+def _add_episode_usage_metrics(
+    metrics: dict[str, Any],
+    cumulative: dict[str, float],
+) -> None:
+    active_step_count = _metric_float(metrics, "rollout_active_step_count")
+    ppo_used_active_step_count = _metric_float(metrics, "ppo_active_sample_count")
+    completed_episode_count = _metric_float(metrics, "completed_episode_count")
+    completed_active_step_count = _metric_float(metrics, "completed_active_step_count")
+    ppo_used_completed_episode_count = sum(
+        _metric_float(metrics, f"{role}_ppo_eligible_completed_episode_count")
+        for role in TRAINING_ROLES
+    )
+    ppo_used_completed_active_step_count = sum(
+        _metric_float(metrics, f"{role}_ppo_eligible_completed_active_step_count")
+        for role in TRAINING_ROLES
+    )
+    update_values = {
+        "active_step_count": active_step_count,
+        "ppo_used_active_step_count": ppo_used_active_step_count,
+        "ppo_unused_active_step_count": max(
+            0.0,
+            active_step_count - ppo_used_active_step_count,
+        ),
+        "completed_episode_count": completed_episode_count,
+        "completed_active_step_count": completed_active_step_count,
+        "ppo_used_completed_episode_count": ppo_used_completed_episode_count,
+        "ppo_used_completed_active_step_count": ppo_used_completed_active_step_count,
+        "ppo_unused_completed_episode_count": max(
+            0.0,
+            completed_episode_count - ppo_used_completed_episode_count,
+        ),
+        "ppo_unused_completed_active_step_count": max(
+            0.0,
+            completed_active_step_count - ppo_used_completed_active_step_count,
+        ),
+    }
+
+    metrics.update(update_values)
+    for key, value in update_values.items():
+        cumulative[key] = float(cumulative.get(key, 0.0) + float(value))
+        metrics[f"cumulative_{key}"] = float(cumulative[key])
+
+
 def _linear_update_schedule(
     update_index: int,
     *,
@@ -1622,6 +1965,28 @@ def _task_reward_scale_for_update(args, update_index: int) -> float:
         end=end,
         warmup=int(getattr(args, "task_reward_scale_warmup_steps", 0)),
         ramp=int(getattr(args, "task_reward_scale_ramp_steps", 1)),
+    )
+
+
+def _phi_beta_for_update(args, update_index: int) -> float:
+    if not bool(getattr(args, "enable_phi_shaping", False)):
+        return 0.0
+    start_raw = getattr(args, "phi_beta_start", None)
+    end_raw = getattr(args, "phi_beta_end", None)
+    start = 0.0 if start_raw is None else float(start_raw)
+    end = start if end_raw is None else float(end_raw)
+    return _linear_update_schedule(
+        update_index,
+        start=start,
+        end=end,
+        warmup_updates=int(getattr(args, "phi_beta_warmup_updates", 0)),
+        ramp_updates=int(getattr(args, "phi_beta_ramp_updates", 1)),
+    )
+
+
+def _static_with_phi_beta(static, phi_beta: float, jnp):
+    return static._replace(
+        phi_beta=jnp.asarray(float(phi_beta), dtype=jnp.float32),
     )
 
 
@@ -1730,7 +2095,15 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
     return metrics
 
 
-def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
+def _summarize_role_rollout_metrics(
+    role: str,
+    rollout,
+    *,
+    num_intents: int,
+    trainer_config: TrainerConfig | None = None,
+    jax=None,
+    jnp=None,
+) -> dict[str, Any]:
     rewards = np.asarray(rollout.trajectory.rewards, dtype=np.float32)
     dones = np.asarray(rollout.trajectory.dones, dtype=np.float32)
     terminal_steps = np.asarray(rollout.trajectory.terminal_episode_steps, dtype=np.int32)
@@ -1749,7 +2122,9 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             return 0.0
         return float((np.asarray(values, dtype=np.float32) * active_mask).sum() / active_count)
 
-    completed_episodes = int(((terminal_steps > 0) & active_bool).sum())
+    terminal_mask = (terminal_steps > 0) & active_bool
+    completed_episodes = int(terminal_mask.sum())
+    completed_episode_steps = int((terminal_steps * terminal_mask.astype(np.int32)).sum())
     learner_reward_total = _active_sum(rewards)
     learner_reward_mean = _active_mean(rewards)
     opponent_reward_total = -learner_reward_total
@@ -1769,18 +2144,12 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
         f"{role}_opponent_mean_reward": opponent_reward_mean,
         f"{role}_learner_reward_total": learner_reward_total,
         f"{role}_opponent_reward_total": opponent_reward_total,
-        f"{role}_learner_reward_per_completed_episode": _safe_metric_ratio(
-            learner_reward_total,
-            completed_episodes,
-        ),
-        f"{role}_opponent_reward_per_completed_episode": _safe_metric_ratio(
-            opponent_reward_total,
-            completed_episodes,
-        ),
         f"{role}_done_rate": _active_mean(dones),
         f"{role}_active_step_count": int(active_count),
         f"{role}_active_step_fraction": _safe_metric_ratio(active_count, total_count),
         f"{role}_completed_episodes": int(completed_episodes),
+        f"{role}_completed_episode_count": int(completed_episodes),
+        f"{role}_completed_active_step_count": int(completed_episode_steps),
         f"{role}_offense_points_total": offense_points_total,
         f"{role}_defense_points_total": defense_points_total,
         f"{role}_offense_points_per_completed_episode": _safe_metric_ratio(
@@ -1801,6 +2170,13 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             opponent_points_total,
             completed_episodes,
         ),
+        f"{role}_phi_r_shape_mean": _active_mean(rollout.trajectory.phi_r_shape),
+        f"{role}_phi_r_shape_abs_mean": _active_mean(
+            np.abs(np.asarray(rollout.trajectory.phi_r_shape, dtype=np.float32))
+        ),
+        f"{role}_phi_prev_mean": _active_mean(rollout.trajectory.phi_prev),
+        f"{role}_phi_next_mean": _active_mean(rollout.trajectory.phi_next),
+        f"{role}_phi_beta_mean": _active_mean(rollout.trajectory.phi_beta),
     }
     metrics.update(
         summarize_shot_type_metrics(
@@ -1812,26 +2188,30 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             shot_threes=rollout.trajectory.shot_threes,
         )
     )
-    metrics.update(
-        summarize_shot_type_metrics(
-            f"{role}_learner",
-            shot_attempts=rollout.trajectory.learner_shot_attempts,
-            shot_makes=rollout.trajectory.learner_shot_makes,
-            shot_dunks=rollout.trajectory.learner_shot_dunks,
-            shot_twos=rollout.trajectory.learner_shot_twos,
-            shot_threes=rollout.trajectory.learner_shot_threes,
+    include_learner_shot_metrics = role != "defense"
+    include_opponent_shot_metrics = role != "offense"
+    if include_learner_shot_metrics:
+        metrics.update(
+            summarize_shot_type_metrics(
+                f"{role}_learner",
+                shot_attempts=rollout.trajectory.learner_shot_attempts,
+                shot_makes=rollout.trajectory.learner_shot_makes,
+                shot_dunks=rollout.trajectory.learner_shot_dunks,
+                shot_twos=rollout.trajectory.learner_shot_twos,
+                shot_threes=rollout.trajectory.learner_shot_threes,
+            )
         )
-    )
-    metrics.update(
-        summarize_shot_type_metrics(
-            f"{role}_opponent",
-            shot_attempts=rollout.trajectory.opponent_shot_attempts,
-            shot_makes=rollout.trajectory.opponent_shot_makes,
-            shot_dunks=rollout.trajectory.opponent_shot_dunks,
-            shot_twos=rollout.trajectory.opponent_shot_twos,
-            shot_threes=rollout.trajectory.opponent_shot_threes,
+    if include_opponent_shot_metrics:
+        metrics.update(
+            summarize_shot_type_metrics(
+                f"{role}_opponent",
+                shot_attempts=rollout.trajectory.opponent_shot_attempts,
+                shot_makes=rollout.trajectory.opponent_shot_makes,
+                shot_dunks=rollout.trajectory.opponent_shot_dunks,
+                shot_twos=rollout.trajectory.opponent_shot_twos,
+                shot_threes=rollout.trajectory.opponent_shot_threes,
+            )
         )
-    )
     metrics.update(
         summarize_intent_metrics(
             f"{role}_offense",
@@ -1851,6 +2231,38 @@ def _summarize_role_rollout_metrics(role: str, rollout) -> dict[str, Any]:
             intent_commitment_remaining=rollout.trajectory.defense_intent_commitment_remaining,
         )
     )
+    metrics.update(
+        summarize_reward_by_intent_metrics(
+            f"{role}_intent",
+            rollout.trajectory,
+            num_intents=num_intents,
+        )
+    )
+    if trainer_config is not None and jax is not None and jnp is not None:
+        training_mask, _, _ = build_trajectory_training_masks(
+            rollout.trajectory,
+            trainer_config,
+            jax,
+            jnp,
+        )
+        metrics.update(
+            summarize_ppo_eligible_episode_metrics(
+                f"{role}_ppo_eligible",
+                rollout.trajectory,
+                training_mask,
+                include_learner_shots=include_learner_shot_metrics,
+                include_opponent_shots=include_opponent_shot_metrics,
+                role=role,
+            )
+        )
+        metrics.update(
+            summarize_reward_by_intent_metrics(
+                f"{role}_ppo_eligible_intent",
+                rollout.trajectory,
+                num_intents=num_intents,
+                training_mask=training_mask,
+            )
+        )
     return metrics
 
 
@@ -1867,6 +2279,7 @@ def _print_checkpoint_summary(
         ("steps_per_update", metrics.get("steps_per_update")),
         ("rollout_active_step_fraction", metrics.get("rollout_active_step_fraction")),
         ("ppo_active_sample_fraction", metrics.get("ppo_active_sample_fraction")),
+        ("ppo_loss_weight_sum", metrics.get("ppo_loss_weight_sum")),
         ("end_to_end_steps_per_sec", metrics.get("end_to_end_steps_per_sec")),
         ("active_end_to_end_steps_per_sec", metrics.get("active_end_to_end_steps_per_sec")),
         ("rollout_states_per_sec", metrics.get("rollout_states_per_sec")),
@@ -1880,8 +2293,32 @@ def _print_checkpoint_summary(
         ("ppo_update_epochs", metrics.get("ppo_update_epochs")),
         ("ppo_update_minibatches", metrics.get("ppo_update_minibatches")),
         ("ppo_update_minibatch_size", metrics.get("ppo_update_minibatch_size")),
+        ("phi_beta", metrics.get("phi_beta")),
+        ("phi_r_shape_mean", metrics.get("phi_r_shape_mean")),
+        ("phi_r_shape_abs_mean", metrics.get("phi_r_shape_abs_mean")),
+        ("offense_phi_r_shape_mean", metrics.get("offense_phi_r_shape_mean")),
+        ("defense_phi_r_shape_mean", metrics.get("defense_phi_r_shape_mean")),
         ("completed_episodes", metrics.get("completed_episodes")),
         ("mean_completed_episode_length", metrics.get("mean_completed_episode_length")),
+        ("cumulative_active_step_count", metrics.get("cumulative_active_step_count")),
+        ("cumulative_ppo_used_active_step_count", metrics.get("cumulative_ppo_used_active_step_count")),
+        ("cumulative_ppo_unused_active_step_count", metrics.get("cumulative_ppo_unused_active_step_count")),
+        ("cumulative_completed_episode_count", metrics.get("cumulative_completed_episode_count")),
+        ("cumulative_completed_active_step_count", metrics.get("cumulative_completed_active_step_count")),
+        ("cumulative_ppo_used_completed_episode_count", metrics.get("cumulative_ppo_used_completed_episode_count")),
+        ("cumulative_ppo_unused_completed_episode_count", metrics.get("cumulative_ppo_unused_completed_episode_count")),
+        ("cumulative_ppo_used_completed_active_step_count", metrics.get("cumulative_ppo_used_completed_active_step_count")),
+        ("cumulative_ppo_unused_completed_active_step_count", metrics.get("cumulative_ppo_unused_completed_active_step_count")),
+        ("offense_ppo_eligible_completed_episodes", metrics.get("offense_ppo_eligible_completed_episodes")),
+        ("offense_ppo_eligible_mean_completed_episode_length", metrics.get("offense_ppo_eligible_mean_completed_episode_length")),
+        ("offense_ppo_eligible_reward_per_completed_episode", metrics.get("offense_ppo_eligible_reward_per_completed_episode")),
+        ("offense_ppo_eligible_reward_per_step", metrics.get("offense_ppo_eligible_reward_per_step")),
+        ("offense_ppo_eligible_terminal_shot_share", metrics.get("offense_ppo_eligible_terminal_shot_share")),
+        ("offense_ppo_eligible_terminal_turnover_share", metrics.get("offense_ppo_eligible_terminal_turnover_share")),
+        ("defense_ppo_eligible_completed_episodes", metrics.get("defense_ppo_eligible_completed_episodes")),
+        ("defense_ppo_eligible_mean_completed_episode_length", metrics.get("defense_ppo_eligible_mean_completed_episode_length")),
+        ("defense_ppo_eligible_reward_per_completed_episode", metrics.get("defense_ppo_eligible_reward_per_completed_episode")),
+        ("defense_ppo_eligible_reward_per_step", metrics.get("defense_ppo_eligible_reward_per_step")),
         ("mean_pass_attempts_per_completed_episode", metrics.get("mean_pass_attempts_per_completed_episode")),
         ("mean_completed_passes_per_completed_episode", metrics.get("mean_completed_passes_per_completed_episode")),
         ("mean_assists_per_completed_episode", metrics.get("mean_assists_per_completed_episode")),
@@ -2013,8 +2450,9 @@ def run_training_loop(args) -> dict[str, Any]:
     grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec)
     grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
     update_runner, optimizer_transform = build_jitted_ppo_update_runner(jax, jnp, spec, trainer_config)
+    selector_optimizer_transform = None
     if bool(getattr(args, "intent_selector_enabled", False)):
-        selector_update_runner, _ = build_jitted_selector_update_runner(
+        selector_update_runner, selector_optimizer_transform = build_jitted_selector_update_runner(
             jax,
             jnp,
             spec,
@@ -2022,6 +2460,7 @@ def run_training_loop(args) -> dict[str, Any]:
             selector_value_coef=float(getattr(args, "intent_selector_value_coef", 0.5)),
             selector_entropy_coef=float(getattr(args, "intent_selector_entropy_coef", 0.01)),
             selector_usage_reg_coef=float(getattr(args, "intent_selector_usage_reg_coef", 0.01)),
+            selector_learning_rate=_selector_learning_rate_for_args(args, trainer_config),
         )
     else:
         selector_update_runner = None
@@ -2090,6 +2529,11 @@ def run_training_loop(args) -> dict[str, Any]:
         seed=int(args.policy_seed),
     )
     initial_opt_state = init_optimizer_state(optimizer_transform, initial_params)
+    initial_selector_opt_state = (
+        init_optimizer_state(selector_optimizer_transform, initial_params)
+        if selector_optimizer_transform is not None
+        else None
+    )
 
     if resume_checkpoint:
         checkpoint_payload = load_checkpoint(resume_checkpoint)
@@ -2108,6 +2552,18 @@ def run_training_loop(args) -> dict[str, Any]:
         opt_state = jax.device_put(
             _restore_like_template(checkpoint_payload["opt_state"], initial_opt_state)
         )
+        if initial_selector_opt_state is not None:
+            restored_selector_opt_state = checkpoint_payload.get("selector_opt_state")
+            selector_opt_state = jax.device_put(
+                _restore_like_template(
+                    restored_selector_opt_state,
+                    initial_selector_opt_state,
+                )
+                if restored_selector_opt_state is not None
+                else initial_selector_opt_state
+            )
+        else:
+            selector_opt_state = None
         if intent_disc_enabled:
             restored_disc = dict(checkpoint_payload.get("intent_discriminator_state", {}) or {})
             if restored_disc.get("params") is not None and restored_disc.get("opt_state") is not None:
@@ -2150,12 +2606,15 @@ def run_training_loop(args) -> dict[str, Any]:
         completed_updates = 0
         params = initial_params
         opt_state = initial_opt_state
+        selector_opt_state = initial_selector_opt_state
         intent_disc_params = initial_intent_disc_params
         intent_disc_opt_state = initial_intent_disc_opt_state
         intent_bonus_stats = init_bonus_stats()
         train_history = []
         eval_trajectories = []
         last_metrics = None
+
+    cumulative_episode_usage = _init_cumulative_episode_usage(last_metrics)
 
     mlflow, mlflow_context = _maybe_start_mlflow_run(args, mode="train")
 
@@ -2188,6 +2647,11 @@ def run_training_loop(args) -> dict[str, Any]:
             base_key, update_key, *rollout_keys = jax.random.split(base_key, len(TRAINING_ROLES) + 2)
             entropy_coef = _entropy_coef_for_update(args, update_idx)
             task_reward_scale = _task_reward_scale_for_update(args, update_idx)
+            phi_beta = _phi_beta_for_update(args, update_idx)
+            active_statics = {
+                role: _static_with_phi_beta(statics[role], phi_beta, jnp)
+                for role in TRAINING_ROLES
+            }
             selector_alpha, selector_eps = _selector_schedules_for_update(args, update_idx)
             selector_multiselect_enabled = bool(
                 getattr(args, "intent_selector_multiselect_enabled", False)
@@ -2199,7 +2663,7 @@ def run_training_loop(args) -> dict[str, Any]:
             for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
                 if grouped_opponent_params is not None:
                     role_rollouts[role] = grouped_rollout_runner(
-                        statics[role],
+                        active_statics[role],
                         current_states[role],
                         params,
                         grouped_opponent_params,
@@ -2214,7 +2678,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                 elif opponent_params is None:
                     role_rollouts[role] = rollout_runner(
-                        statics[role],
+                        active_statics[role],
                         current_states[role],
                         params,
                         rollout_key,
@@ -2227,7 +2691,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                 else:
                     role_rollouts[role] = frozen_rollout_runner(
-                        statics[role],
+                        active_statics[role],
                         current_states[role],
                         params,
                         opponent_params,
@@ -2279,10 +2743,17 @@ def run_training_loop(args) -> dict[str, Any]:
                     "intent_disc_skipped_warmup": 1.0 if float(intent_beta) <= 0.0 else 0.0,
                 }
                 if float(intent_beta) > 0.0:
+                    intent_training_mask, _, _ = build_trajectory_training_masks(
+                        role_rollouts["offense"].trajectory,
+                        trainer_config,
+                        jax,
+                        jnp,
+                    )
                     intent_features, intent_labels, intent_active_mask = build_intent_step_features_from_rollout(
                         role_rollouts["offense"],
                         intent_disc_spec,
                         jnp,
+                        training_mask=intent_training_mask,
                     )
                     params_key, update_key = jax.random.split(update_key)
                     intent_disc_params, intent_disc_opt_state, raw_disc_metrics, raw_intent_bonus = intent_disc_runner(
@@ -2386,17 +2857,29 @@ def run_training_loop(args) -> dict[str, Any]:
                     jnp,
                     max_samples=int(getattr(args, "intent_selector_max_samples_per_update", 0)),
                 )
-                params, opt_state, raw_selector_metrics = selector_update_runner(
-                    params,
-                    opt_state,
-                    selector_train_batch,
-                    selector_update_key,
-                    selector_eps,
+                selector_sample_count = float(
+                    np.asarray(jax.device_get(jnp.sum(selector_train_batch.active_mask)))
                 )
-                selector_update_metrics = {
-                    key: float(np.asarray(value))
-                    for key, value in raw_selector_metrics.items()
-                }
+                if selector_sample_count > 0.0:
+                    if selector_opt_state is None:
+                        raise RuntimeError("Selector optimizer state is missing for selector PPO update.")
+                    params, selector_opt_state, raw_selector_metrics = selector_update_runner(
+                        params,
+                        selector_opt_state,
+                        selector_train_batch,
+                        selector_update_key,
+                        selector_eps,
+                    )
+                    selector_update_metrics = {
+                        key: float(np.asarray(value))
+                        for key, value in raw_selector_metrics.items()
+                    }
+                    selector_update_metrics["selector_train_skipped_empty"] = 0.0
+                else:
+                    selector_update_metrics = {
+                        "selector_train_skipped_empty": 1.0,
+                        "selector_train_sample_count": 0.0,
+                    }
                 selector_update_metrics["selector_train_skipped_cadence"] = 0.0
                 selector_update_metrics["selector_train_pending_rollout_count"] = float(
                     len(pending_selector_batches)
@@ -2408,7 +2891,9 @@ def run_training_loop(args) -> dict[str, Any]:
                     "selector_train_sample_count": 0.0,
                     "selector_train_pending_rollout_count": float(len(pending_selector_batches)),
                 }
-            block_until_ready_tree((params, opt_state, update_metrics, selector_update_metrics))
+            block_until_ready_tree(
+                (params, opt_state, selector_opt_state, update_metrics, selector_update_metrics)
+            )
             update_elapsed_ns = perf_counter_ns() - update_start_ns
             if single_episode_rollout:
                 base_key, reset_block_key = jax.random.split(base_key)
@@ -2416,7 +2901,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 current_states = {}
                 for role, role_reset_key in zip(TRAINING_ROLES, role_reset_keys, strict=True):
                     reset_keys = jax.random.split(role_reset_key, int(args.kernel_batch_size))
-                    current_states[role] = reset_batch_minimal(statics[role], reset_keys, jax, jnp)
+                    current_states[role] = reset_batch_minimal(active_statics[role], reset_keys, jax, jnp)
                 block_until_ready_tree(current_states)
             else:
                 current_states = {
@@ -2440,7 +2925,16 @@ def run_training_loop(args) -> dict[str, Any]:
                 ppo_minibatches=int(args.ppo_minibatches),
             )
             for role in TRAINING_ROLES:
-                last_metrics.update(_summarize_role_rollout_metrics(role, role_rollouts[role]))
+                last_metrics.update(
+                    _summarize_role_rollout_metrics(
+                        role,
+                        role_rollouts[role],
+                        num_intents=int(args.num_intents),
+                        trainer_config=trainer_config,
+                        jax=jax,
+                        jnp=jnp,
+                    )
+                )
             if bool(getattr(args, "intent_selector_enabled", False)):
                 last_metrics.update(
                     summarize_selector_metrics(
@@ -2451,10 +2945,21 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                 )
                 last_metrics.update(selector_update_metrics)
+            _add_episode_usage_metrics(last_metrics, cumulative_episode_usage)
             last_metrics["task_reward_scale"] = float(task_reward_scale)
             last_metrics["task_reward_scale_is_scheduled"] = float(
                 getattr(args, "task_reward_scale_start", None) is not None
                 or getattr(args, "task_reward_scale_end", None) is not None
+            )
+            last_metrics["phi_beta"] = float(phi_beta)
+            last_metrics["phi_beta_is_scheduled"] = float(
+                bool(getattr(args, "enable_phi_shaping", False))
+                and (
+                    float(getattr(args, "phi_beta_start", 0.0) or 0.0)
+                    != float(getattr(args, "phi_beta_end", 0.0) or 0.0)
+                    or int(getattr(args, "phi_beta_warmup_updates", 0)) > 0
+                    or int(getattr(args, "phi_beta_ramp_updates", 1)) > 1
+                )
             )
             if intent_disc_metrics:
                 last_metrics.update(intent_disc_metrics)
@@ -2502,7 +3007,10 @@ def run_training_loop(args) -> dict[str, Any]:
                 if mlflow is not None:
                     _log_mlflow_metrics(
                         mlflow,
-                        last_metrics,
+                        _filter_mlflow_train_metrics(
+                            last_metrics,
+                            profile=str(getattr(args, "mlflow_metric_profile", "core")),
+                        ),
                         step=update_idx,
                         prefix="jax/train",
                     )
@@ -2530,7 +3038,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 for role, role_eval_key in zip(TRAINING_ROLES, role_eval_keys, strict=True):
                     if grouped_opponent_params is not None:
                         eval_outputs[role] = grouped_eval_runner(
-                            statics[role],
+                            active_statics[role],
                             eval_initial_states[role],
                             params,
                             grouped_opponent_params,
@@ -2540,7 +3048,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                     elif opponent_params is None:
                         eval_outputs[role] = eval_runner(
-                            statics[role],
+                            active_statics[role],
                             eval_initial_states[role],
                             params,
                             role_eval_key,
@@ -2548,7 +3056,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                     else:
                         eval_outputs[role] = frozen_eval_runner(
-                            statics[role],
+                            active_statics[role],
                             eval_initial_states[role],
                             params,
                             opponent_params,
@@ -2685,6 +3193,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         args=args,
                         params=params,
                         opt_state=opt_state,
+                        selector_opt_state=selector_opt_state,
                         current_state=current_states,
                         eval_initial_state=eval_initial_states,
                         base_key=base_key,
@@ -2738,6 +3247,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             args=args,
                             params=params,
                             opt_state=opt_state,
+                            selector_opt_state=selector_opt_state,
                             current_state=current_states,
                             eval_initial_state=eval_initial_states,
                             base_key=base_key,
@@ -2804,7 +3314,11 @@ def run_training_loop(args) -> dict[str, Any]:
             "script": "basketworld_jax/train/main.py",
             "status": "train_loop",
             "resumed_from_checkpoint": resume_checkpoint or None,
-            "trainer_config": asdict(trainer_config),
+            "trainer_config": _checkpoint_trainer_config_from_args(
+                trainer_config,
+                args,
+                spec=spec,
+            ),
             "frozen_config": {
                 key: to_builtin(getattr(args, key))
                 for key in TRAIN_FROZEN_VALUES
@@ -2955,7 +3469,11 @@ def run_train_scaffold(args) -> dict[str, Any]:
     result = {
         "script": "basketworld_jax/train/main.py",
         "status": "trajectory_and_update_scaffold",
-        "trainer_config": asdict(trainer_config),
+        "trainer_config": _checkpoint_trainer_config_from_args(
+            trainer_config,
+            args,
+            spec=spec,
+        ),
         "frozen_config": {
             key: to_builtin(getattr(args, key))
             for key in TRAIN_FROZEN_VALUES

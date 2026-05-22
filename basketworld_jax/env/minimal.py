@@ -35,6 +35,20 @@ SHOT_TYPE_NONE = 0
 SHOT_TYPE_DUNK = 1
 SHOT_TYPE_TWO = 2
 SHOT_TYPE_THREE = 3
+PHI_MODE_TEAM_BEST = 0
+PHI_MODE_TEAMMATES_BEST = 1
+PHI_MODE_TEAMMATES_AVG = 2
+PHI_MODE_TEAM_AVG = 3
+PHI_MODE_TEAM_WORST = 4
+PHI_MODE_TEAMMATES_WORST = 5
+PHI_AGGREGATION_MODE_IDS = {
+    "team_best": PHI_MODE_TEAM_BEST,
+    "teammates_best": PHI_MODE_TEAMMATES_BEST,
+    "teammates_avg": PHI_MODE_TEAMMATES_AVG,
+    "team_avg": PHI_MODE_TEAM_AVG,
+    "team_worst": PHI_MODE_TEAM_WORST,
+    "teammates_worst": PHI_MODE_TEAMMATES_WORST,
+}
 
 
 class KernelStatic(NamedTuple):
@@ -98,6 +112,7 @@ class KernelStatic(NamedTuple):
     phi_beta: Any
     phi_blend_weight: Any
     phi_use_ball_handler_only: Any
+    phi_aggregation_mode: Any
     pass_oob_turnover_prob: Any
     assist_window: Any
     potential_assist_pct: Any
@@ -177,6 +192,10 @@ class StepBatchOutput(NamedTuple):
     offensive_three_seconds: Any
     defensive_lane_violation: Any
     defensive_lane_violation_player: Any
+    phi_r_shape: Any
+    phi_prev: Any
+    phi_next: Any
+    phi_beta: Any
 
 
 def _player_skill_arrays(env) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -641,6 +660,10 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         phi_beta=xp.asarray(float(env.phi_beta), dtype=xp.float32),
         phi_blend_weight=xp.asarray(float(env.phi_blend_weight), dtype=xp.float32),
         phi_use_ball_handler_only=xp.asarray(1 if env.phi_use_ball_handler_only else 0, dtype=xp.int8),
+        phi_aggregation_mode=xp.asarray(
+            PHI_AGGREGATION_MODE_IDS.get(str(env.phi_aggregation_mode), PHI_MODE_TEAM_BEST),
+            dtype=xp.int32,
+        ),
         pass_oob_turnover_prob=xp.asarray(float(env.pass_oob_turnover_prob), dtype=xp.float32),
         assist_window=xp.asarray(float(env.assist_window), dtype=xp.float32),
         potential_assist_pct=xp.asarray(float(env.potential_assist_pct), dtype=xp.float32),
@@ -982,6 +1005,96 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
 def build_offense_expected_points_batch(static: KernelStatic, state: KernelState, jnp):
     profile = build_shot_profile_batch(static, state, jnp)
     return jnp.take(profile["expected_points"], static.offense_ids, axis=1)
+
+
+def _phi_shot_quality_single(static: KernelStatic, state: KernelState, jnp):
+    """Potential Phi(s): current possession team's pressure-adjusted shot quality."""
+    n_players = int(static.role_encoding.shape[0])
+    holder_valid = state.ball_holder >= 0
+    safe_holder = jnp.clip(state.ball_holder, 0, n_players - 1)
+    batched_state = _single_state_to_batched(state, jnp)
+    expected_points = build_shot_profile_batch(static, batched_state, jnp)["expected_points"][0]
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    holder_is_offense = static.role_encoding[safe_holder] > 0.0
+    team_mask = jnp.where(
+        holder_is_offense,
+        static.role_encoding > 0.0,
+        static.role_encoding < 0.0,
+    )
+    teammate_mask = team_mask & (player_ids != safe_holder)
+    team_count = jnp.maximum(jnp.sum(team_mask.astype(jnp.float32)), 1.0)
+    teammate_count = jnp.sum(teammate_mask.astype(jnp.float32))
+    ball_ep = jnp.where(holder_valid, expected_points[safe_holder], jnp.asarray(0.0, dtype=jnp.float32))
+
+    neg_inf = jnp.asarray(-jnp.inf, dtype=jnp.float32)
+    pos_inf = jnp.asarray(jnp.inf, dtype=jnp.float32)
+    team_best = jnp.max(jnp.where(team_mask, expected_points, neg_inf))
+    team_worst = jnp.min(jnp.where(team_mask, expected_points, pos_inf))
+    team_avg = jnp.sum(jnp.where(team_mask, expected_points, 0.0)) / team_count
+    teammate_best = jnp.max(jnp.where(teammate_mask, expected_points, neg_inf))
+    teammate_worst = jnp.min(jnp.where(teammate_mask, expected_points, pos_inf))
+    teammate_avg = jnp.sum(jnp.where(teammate_mask, expected_points, 0.0)) / jnp.maximum(teammate_count, 1.0)
+    teammate_best = jnp.where(teammate_count > 0.0, teammate_best, ball_ep)
+    teammate_worst = jnp.where(teammate_count > 0.0, teammate_worst, ball_ep)
+    teammate_avg = jnp.where(teammate_count > 0.0, teammate_avg, ball_ep)
+
+    mode = static.phi_aggregation_mode.astype(jnp.int32)
+    aggregate = jnp.where(
+        mode == PHI_MODE_TEAMMATES_BEST,
+        teammate_best,
+        jnp.where(
+            mode == PHI_MODE_TEAMMATES_AVG,
+            teammate_avg,
+            jnp.where(
+                mode == PHI_MODE_TEAM_AVG,
+                team_avg,
+                jnp.where(
+                    mode == PHI_MODE_TEAM_WORST,
+                    team_worst,
+                    jnp.where(
+                        mode == PHI_MODE_TEAMMATES_WORST,
+                        teammate_worst,
+                        team_best,
+                    ),
+                ),
+            ),
+        ),
+    )
+    blend_weight = jnp.clip(static.phi_blend_weight.astype(jnp.float32), 0.0, 1.0)
+    blended = ((1.0 - blend_weight) * aggregate) + (blend_weight * ball_ep)
+    phi = jnp.where(static.phi_use_ball_handler_only.astype(jnp.bool_), ball_ep, blended)
+    return jnp.where(holder_valid, phi, jnp.asarray(0.0, dtype=jnp.float32))
+
+
+def _apply_phi_shaping_single(
+    static: KernelStatic,
+    previous_state: KernelState,
+    next_state: KernelState,
+    rewards,
+    done,
+    jnp,
+):
+    enabled = static.enable_phi_shaping.astype(jnp.bool_)
+    phi_prev = previous_state.cached_phi.astype(jnp.float32)
+    raw_phi_next = _phi_shot_quality_single(static, next_state, jnp)
+    phi_next = jnp.where(done.astype(jnp.bool_), jnp.asarray(0.0, dtype=jnp.float32), raw_phi_next)
+    r_shape = (static.reward_shaping_gamma.astype(jnp.float32) * phi_next) - phi_prev
+    shaped = static.phi_beta.astype(jnp.float32) * r_shape
+    per_team = shaped / static.offense_ids.shape[0]
+    offense_mask = static.role_encoding > 0.0
+    shaped_rewards = rewards + jnp.where(offense_mask, per_team, -per_team)
+    next_state = _replace_state(
+        next_state,
+        cached_phi=jnp.where(enabled, phi_next, next_state.cached_phi),
+    )
+    return (
+        next_state,
+        jnp.where(enabled, shaped_rewards, rewards),
+        jnp.where(enabled, per_team, jnp.asarray(0.0, dtype=jnp.float32)),
+        jnp.where(enabled, phi_prev, jnp.asarray(0.0, dtype=jnp.float32)),
+        jnp.where(enabled, phi_next, jnp.asarray(0.0, dtype=jnp.float32)),
+        jnp.where(enabled, static.phi_beta.astype(jnp.float32), jnp.asarray(0.0, dtype=jnp.float32)),
+    )
 
 
 def build_turnover_probabilities_batch(static: KernelStatic, state: KernelState, jnp):
@@ -1647,6 +1760,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             offensive_three_seconds=zero_flag,
             defensive_lane_violation=zero_flag,
             defensive_lane_violation_player=no_player,
+            phi_r_shape=zero_float,
+            phi_prev=zero_float,
+            phi_next=zero_float,
+            phi_beta=zero_float,
         )
 
     def _run_active(_):
@@ -1676,9 +1793,24 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 ball_holder=pressure_holder,
                 episode_ended=jnp.asarray(1, dtype=next_state.episode_ended.dtype),
             )
+            (
+                pressure_state,
+                pressure_rewards,
+                phi_r_shape,
+                phi_prev,
+                phi_next,
+                phi_beta,
+            ) = _apply_phi_shaping_single(
+                static,
+                state,
+                pressure_state,
+                zero_rewards,
+                jnp.asarray(True),
+                jnp,
+            )
             return StepBatchOutput(
                 state=pressure_state,
-                rewards=zero_rewards,
+                rewards=pressure_rewards,
                 done=jnp.asarray(True),
                 pass_attempt=zero_flag,
                 pass_passer=no_player,
@@ -1703,6 +1835,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 offensive_three_seconds=zero_flag,
                 defensive_lane_violation=zero_flag,
                 defensive_lane_violation_player=no_player,
+                phi_r_shape=phi_r_shape,
+                phi_prev=phi_prev,
+                phi_next=phi_next,
+                phi_beta=phi_beta,
             )
 
         def _normal_step(_):
@@ -2004,6 +2140,21 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 final_state,
                 episode_ended=done.astype(final_state.episode_ended.dtype),
             )
+            (
+                final_state,
+                rewards,
+                phi_r_shape,
+                phi_prev,
+                phi_next,
+                phi_beta,
+            ) = _apply_phi_shaping_single(
+                static,
+                state,
+                final_state,
+                rewards,
+                done,
+                jnp,
+            )
             shot_position = shot_clock_state.positions[shot_shooter]
             shot_type = jnp.where(
                 shot_active,
@@ -2051,6 +2202,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 offensive_three_seconds=offensive_three_seconds_turnover.astype(jnp.int8),
                 defensive_lane_violation=defensive_lane_violation.astype(jnp.int8),
                 defensive_lane_violation_player=defensive_lane_violation_player,
+                phi_r_shape=phi_r_shape,
+                phi_prev=phi_prev,
+                phi_next=phi_next,
+                phi_beta=phi_beta,
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)

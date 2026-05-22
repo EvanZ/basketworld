@@ -257,32 +257,17 @@ def selector_sample_intent(
             "selection_mode": mode,
         }
 
-    if alpha > 0.0 and float(rng.random()) < alpha:
-        dist = torch.distributions.Categorical(probs=mixed_probs_t)
-        chosen = dist.sample().reshape(-1)
-        return {
-            "intent_index": int(chosen[0].item()),
-            "used_selector": True,
-            "alpha": float(alpha),
-            "selector_eps": float(selector_eps),
-            "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
-            "selection_mode": mode,
-        }
-    if allow_uniform_fallback:
-        return {
-            "intent_index": int(rng.integers(0, max(1, int(num_intents)))),
-            "used_selector": False,
-            "alpha": float(alpha),
-            "selector_eps": float(selector_eps),
-            "value": None,
-            "selection_mode": mode,
-        }
+    # Evaluation "learned_sample" should sample the learned selector itself.
+    # The alpha/epsilon exploration mix is a training/runtime deployment detail;
+    # use uniform_random explicitly when a uniform baseline is desired.
+    dist = torch.distributions.Categorical(probs=raw_probs_t)
+    chosen = dist.sample().reshape(-1)
     return {
-        "intent_index": None,
-        "used_selector": False,
+        "intent_index": int(chosen[0].item()),
+        "used_selector": True,
         "alpha": float(alpha),
         "selector_eps": float(selector_eps),
-        "value": None,
+        "value": float(values_t[0].item()) if values_t.numel() > 0 else None,
         "selection_mode": mode,
     }
 
