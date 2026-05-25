@@ -2,35 +2,50 @@
 
 BasketWorld is a hex-grid, Gymnasium-compatible half-court basketball simulator for self-play reinforcement learning. A unified PPO policy (offense/defense encoded with role flags) trains against itself, logs to MLflow, and can be driven through a FastAPI backend plus a Vue front-end for interactive play, analysis, and evaluation. In the web app you can play games against the AI models or have them play against each other ("self-play"). Here are some sample self-play episodes.
 
-![Sample episode](docs/assets/episode_20251207_184600_made_unassisted_3pt.gif)
-![Sample episode](docs/assets/episode_20251208_055831_missed_potentially_assisted_3pt.gif)
-![Sample episode](docs/assets/episode_20251207_202731_missed_potentially_assisted_2pt.gif)
-![Sample episode](docs/assets/episode_20251218_215954_missed_potentially_assisted_2pt.gif)
+![Sample episode](docs/assets/episode_20260523_205602_made_unassisted_dunk.gif)
+![Sample episode](docs/assets/episode_20260525_070339_missed_potentially_assisted_3pt.gif)
 
 You can even run thousands of episodes of self-play and look at a detailed statistical summary of game play and shot charts.
 
 ![Self play example](docs/assets/shot_chart_example.png)
 
 ## What's new
-- **Absolute-coordinate observations**: Egocentric rotation is gone; models need retraining. Ball handler position, hoop location, EP/risk features, and action masks are all absolute-court based.
-- **Unified policy pipeline**: Training saves `unified_*.zip` checkpoints with optional dual-critic/dual-policy heads and pass-logit bias. Role flags encode offense/defense so one network drives both teams.
-- **Pointer-targeted passing mode**: In addition to directional passing, runs can use `--pass-mode pointer_targeted` for explicit teammate-target pass intent with replay/debug visibility (`PASS->id`, `intended_target`).
-- **Interactive stack refresh**: Backend loads policies directly from MLflow by `run_id`, supports policy swapping, evaluation batches, MCTS advice, phi shaping, skill overrides, replays, and shot/pass diagnostics surfaced in the Vue UI.
-- **MLflow-first configuration**: Environment/training params and role-flag encoding are read from MLflow for faithful evaluation; optional `.env.aws` enables S3 artifacts without touching global AWS config.
+- **JAX is now the primary training path for new work**: `basketworld_jax/` contains the batched JAX environment, Flax actor-critic, custom PPO loop, Optax optimization, Orbax checkpointing, MLflow logging, JAX-native evaluation, and JAX-native dev/playable runtime. The SB3/Python stack remains in `basketworld/` and `train/` for legacy models, parity checks, and reference behavior.
+- **JAX-native environment parity**: The JAX env now covers the major gameplay features needed for current experiments: 3-on-3 half-court self-play, absolute/set-token observations, pointer-targeted passing, lane and illegal-defense rules, shot-clock turnovers, start templates with jitter/mirroring, sampled player skills, phi shaping, and deterministic-opponent episode sampling.
+- **Set-token attention model**: Current JAX checkpoints use tokenized player observations, attention over player/global tokens, offense/defense policy and value heads, role conditioning, action masks, pointer-targeted pass logits, state values, and attention payloads for UI inspection.
+- **Intent/play system**: The JAX path includes offensive latent intents with play codenames, intent-conditioned policy embeddings, a set-step discriminator, selector head, optional multiselect, warmup/ramp schedules, intent reward diagnostics, t-SNE sample dumps, playbook analysis, and counterfactual UI tooling.
+- **Historical self-play and opponent sampling**: JAX training supports grouped frozen-opponent sampling from historical MLflow checkpoints, checkpoint pools, deterministic-vs-sampled opponent episodes, and separate rollout/update/end-to-end speed metrics.
+- **JAX-native eval and playable app support**: The backend can load SB3 or JAX runs by MLflow `run_id`. For JAX checkpoints, evaluation, policy visualization, self-play, attention, playbook, counterfactuals, and playable mode run against the JAX-native runtime instead of replaying through the old Python environment.
+- **MLflow-first artifacts and metadata**: Training writes compact checkpoints, metadata, config params, eval summaries, intent samples, and UI-facing run artifacts to MLflow. Local model folders are treated as cache/output directories, not the source of truth.
 
 ## Repo map
 ```
 basketworld/
-- basketworld/           # Core env: envs/, sim/, utils/, custom SB3 policies
-- train/                 # Self-play PPO training loop, callbacks, schedules
+- basketworld/                 # Legacy Python/Gymnasium env, SB3 wrappers, policies, and utility code
+- basketworld_jax/             # Current JAX stack for high-throughput training/eval/inference
+  - env/                       # JAX environment kernel: reset, step, rewards, rules, templates, observations
+  - models/                    # Flax actor-critic: attention policy, value heads, selector, pointer passing
+  - train/                     # CLI, schedules, rollout/update orchestration, MLflow logging, opponent pools
+  - rollout/                   # Rollout helpers and compiled rollout-facing utilities
+  - intent/                    # Intent discriminator, intent bonuses, holdout metrics, sample dumping
+  - eval/                      # Fast JAX-native evaluation path and stat aggregation
+  - inference/                 # Checkpoint loading and backend-facing JAX policy wrapper
+  - checkpoints/               # Orbax save/load plus checkpoint metadata serialization
+  - optim/                     # Optimizer helpers used by the JAX training path
+  - config/                    # JAX config defaults and shared config structures
+- train/                       # Legacy SB3 training entrypoints and callbacks
 - app/
-  - backend/             # FastAPI service that loads MLflow runs and runs games
-  - frontend/            # Vue 3 + Vite UI (board, controls, analytics, replays)
-- analytics/             # Evaluation/visualization scripts (heatmaps, ELO, etc.)
-- readmes/               # Design docs and migration notes (obs, EP, phi, etc.)
-- docs/                  # Research notes (opponent sampling, continuation, ...)
-- requirements.txt       # Python deps (installs package in editable mode)
-- start_mlflow*.sh       # Convenience scripts for local MLflow (optional)
+  - backend/                   # FastAPI app, MLflow loading, SB3/JAX adapters, eval/playable/dev runtimes
+  - frontend/                  # Vue 3 + Vite UI: board, policy, eval, stats, playbook, playable mode
+- analytics/                   # Offline analysis scripts: JAX intent t-SNE, replay checks, eval diagnostics
+- benchmarks/                  # JAX/SB3 throughput and kernel benchmark scripts
+- configs/                     # Shared runtime configs, including start template libraries
+- docs/                        # Current architecture notes, JAX migration plans, objective/stability docs
+- readmes/                     # Older design notes and focused feature specs retained for reference
+- tests/                       # Python tests outside backend-specific tests
+- scripts/                     # Utility scripts for local workflows and maintenance
+- requirements.txt             # Python deps for backend/training/dev usage
+- start_mlflow*.sh             # Convenience scripts for local MLflow tracking/artifacts
 ```
 
 ## Setup
