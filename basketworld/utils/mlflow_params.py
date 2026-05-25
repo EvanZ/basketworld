@@ -458,7 +458,12 @@ def get_mlflow_phi_shaping_params(
     # Enable phi shaping
     phi_params["enable_phi_shaping"] = _get_param(
         params,
-        ["enable_phi_shaping", "enable-phi-shaping"],
+        [
+            "jax/env/enable_phi_shaping",
+            "enable_phi_shaping",
+            "enable-phi-shaping",
+            "jax/enable_phi_shaping",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
@@ -467,13 +472,22 @@ def get_mlflow_phi_shaping_params(
     # This is what the model was trained with at the end of training
     phi_beta_end = _get_param(
         params,
-        ["phi_beta_end", "phi-beta-end"],
+        ["jax/env/phi_beta_end", "phi_beta_end", "phi-beta-end", "jax/phi_beta_end"],
         float,
         None,
     )
     phi_beta_start = _get_param(
         params,
-        ["phi_beta_start", "phi-beta-start", "phi_beta", "phi-beta"],
+        [
+            "phi_beta_start",
+            "phi-beta-start",
+            "phi_beta",
+            "phi-beta",
+            "jax/env/phi_beta_start",
+            "jax/env/phi_beta",
+            "jax/phi_beta_start",
+            "jax/phi_beta",
+        ],
         float,
         0.0,
     )
@@ -484,7 +498,12 @@ def get_mlflow_phi_shaping_params(
     # Reward shaping gamma (should match training gamma)
     phi_params["reward_shaping_gamma"] = _get_param(
         params,
-        ["reward_shaping_gamma", "reward-shaping-gamma"],
+        [
+            "jax/env/reward_shaping_gamma",
+            "reward_shaping_gamma",
+            "reward-shaping-gamma",
+            "jax/reward_shaping_gamma",
+        ],
         float,
         1.0,
     )
@@ -492,7 +511,12 @@ def get_mlflow_phi_shaping_params(
     # Ball handler only mode
     phi_params["phi_use_ball_handler_only"] = _get_param(
         params,
-        ["phi_use_ball_handler_only", "phi-use-ball-handler-only"],
+        [
+            "jax/env/phi_use_ball_handler_only",
+            "phi_use_ball_handler_only",
+            "phi-use-ball-handler-only",
+            "jax/phi_use_ball_handler_only",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
@@ -500,7 +524,12 @@ def get_mlflow_phi_shaping_params(
     # Blend weight
     phi_params["phi_blend_weight"] = _get_param(
         params,
-        ["phi_blend_weight", "phi-blend-weight"],
+        [
+            "jax/env/phi_blend_weight",
+            "phi_blend_weight",
+            "phi-blend-weight",
+            "jax/phi_blend_weight",
+        ],
         float,
         0.0,
     )
@@ -508,7 +537,12 @@ def get_mlflow_phi_shaping_params(
     # Aggregation mode
     phi_params["phi_aggregation_mode"] = _get_param(
         params,
-        ["phi_aggregation_mode", "phi-aggregation-mode"],
+        [
+            "jax/env/phi_aggregation_mode",
+            "phi_aggregation_mode",
+            "phi-aggregation-mode",
+            "jax/phi_aggregation_mode",
+        ],
         str,
         "team_best",
     )
@@ -907,37 +941,40 @@ def get_mlflow_training_params(
     )
     training_params["intent_selector_enabled"] = _get_param(
         params,
-        ["intent_selector_enabled", "intent-selector-enabled"],
+        ["jax/intent_selector_enabled", "intent_selector_enabled", "intent-selector-enabled"],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
     training_params["intent_selector_hidden_dim"] = _get_param(
         params,
-        ["intent_selector_hidden_dim", "intent-selector-hidden-dim"],
+        ["jax/intent_selector_hidden_dim", "intent_selector_hidden_dim", "intent-selector-hidden-dim"],
         int,
         64,
     )
     training_params["intent_selector_mode"] = _get_param(
         params,
-        ["intent_selector_mode", "intent-selector-mode"],
+        ["jax/intent_selector_mode", "intent_selector_mode", "intent-selector-mode"],
         str,
-        "callback",
+        "integrated" if "jax/intent_selector_enabled" in params else "callback",
     )
     training_params["intent_selector_alpha_start"] = _get_param(
         params,
-        ["intent_selector_alpha_start", "intent-selector-alpha-start"],
+        ["jax/intent_selector_alpha_start", "intent_selector_alpha_start", "intent-selector-alpha-start"],
         float,
         0.0,
     )
     training_params["intent_selector_alpha_end"] = _get_param(
         params,
-        ["intent_selector_alpha_end", "intent-selector-alpha-end"],
+        ["jax/intent_selector_alpha_end", "intent_selector_alpha_end", "intent-selector-alpha-end"],
         float,
         1.0,
     )
     training_params["intent_selector_alpha_warmup_steps"] = _get_param(
         params,
         [
+            "jax/intent_selector_alpha_warmup_updates",
+            "jax/intent_selector_alpha_warmup_steps",
+            "intent_selector_alpha_warmup_updates",
             "intent_selector_alpha_warmup_steps",
             "intent-selector-alpha-warmup-steps",
         ],
@@ -946,43 +983,62 @@ def get_mlflow_training_params(
     )
     training_params["intent_selector_alpha_ramp_steps"] = _get_param(
         params,
-        ["intent_selector_alpha_ramp_steps", "intent-selector-alpha-ramp-steps"],
+        [
+            "jax/intent_selector_alpha_ramp_updates",
+            "jax/intent_selector_alpha_ramp_steps",
+            "intent_selector_alpha_ramp_updates",
+            "intent_selector_alpha_ramp_steps",
+            "intent-selector-alpha-ramp-steps",
+        ],
         int,
         1,
     )
     training_params["intent_selector_eps_start"] = _get_param(
         params,
-        ["intent_selector_eps_start", "intent-selector-eps-start"],
+        ["jax/intent_selector_eps_start", "intent_selector_eps_start", "intent-selector-eps-start"],
         float,
         0.0,
     )
     training_params["intent_selector_eps_end"] = _get_param(
         params,
-        ["intent_selector_eps_end", "intent-selector-eps-end"],
+        ["jax/intent_selector_eps_end", "intent_selector_eps_end", "intent-selector-eps-end"],
         float,
         0.0,
     )
     training_params["intent_selector_eps_warmup_steps"] = _get_param(
         params,
-        ["intent_selector_eps_warmup_steps", "intent-selector-eps-warmup-steps"],
+        [
+            "jax/intent_selector_eps_warmup_updates",
+            "jax/intent_selector_eps_warmup_steps",
+            "intent_selector_eps_warmup_updates",
+            "intent_selector_eps_warmup_steps",
+            "intent-selector-eps-warmup-steps",
+        ],
         int,
         0,
     )
     training_params["intent_selector_eps_ramp_steps"] = _get_param(
         params,
-        ["intent_selector_eps_ramp_steps", "intent-selector-eps-ramp-steps"],
+        [
+            "jax/intent_selector_eps_ramp_updates",
+            "jax/intent_selector_eps_ramp_steps",
+            "intent_selector_eps_ramp_updates",
+            "intent_selector_eps_ramp_steps",
+            "intent-selector-eps-ramp-steps",
+        ],
         int,
         1,
     )
     training_params["intent_selector_entropy_coef"] = _get_param(
         params,
-        ["intent_selector_entropy_coef", "intent-selector-entropy-coef"],
+        ["jax/intent_selector_entropy_coef", "intent_selector_entropy_coef", "intent-selector-entropy-coef"],
         float,
         0.01,
     )
     training_params["intent_selector_usage_reg_coef"] = _get_param(
         params,
         [
+            "jax/intent_selector_usage_reg_coef",
             "intent_selector_usage_reg_coef",
             "intent-selector-usage-reg-coef",
         ],
@@ -991,13 +1047,34 @@ def get_mlflow_training_params(
     )
     training_params["intent_selector_value_coef"] = _get_param(
         params,
-        ["intent_selector_value_coef", "intent-selector-value-coef"],
+        ["jax/intent_selector_value_coef", "intent_selector_value_coef", "intent-selector-value-coef"],
         float,
         0.5,
+    )
+    training_params["intent_selector_train_every_rollouts"] = _get_param(
+        params,
+        [
+            "jax/intent_selector_train_every_rollouts",
+            "intent_selector_train_every_rollouts",
+            "intent-selector-train-every-rollouts",
+        ],
+        int,
+        1,
+    )
+    training_params["intent_selector_max_samples_per_update"] = _get_param(
+        params,
+        [
+            "jax/intent_selector_max_samples_per_update",
+            "intent_selector_max_samples_per_update",
+            "intent-selector-max-samples-per-update",
+        ],
+        int,
+        0,
     )
     training_params["intent_selector_multiselect_enabled"] = _get_param(
         params,
         [
+            "jax/intent_selector_multiselect_enabled",
             "intent_selector_multiselect_enabled",
             "intent-selector-multiselect-enabled",
         ],
@@ -1006,7 +1083,7 @@ def get_mlflow_training_params(
     )
     training_params["intent_selector_min_play_steps"] = _get_param(
         params,
-        ["intent_selector_min_play_steps", "intent-selector-min-play-steps"],
+        ["jax/intent_selector_min_play_steps", "intent_selector_min_play_steps", "intent-selector-min-play-steps"],
         int,
         3,
     )

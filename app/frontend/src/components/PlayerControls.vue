@@ -4,6 +4,7 @@ import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import {
   applyStartTemplate,
+  cancelPlaybookAnalysis,
   getActionValues,
   getPlaybookProgress,
   getRewards,
@@ -59,6 +60,15 @@ function deepCloneJson(value, fallback = null) {
     return JSON.parse(JSON.stringify(value));
   } catch {
     return fallback;
+  }
+}
+
+function prettyJson(value) {
+  if (value === null || value === undefined) return 'N/A';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
   }
 }
 
@@ -184,7 +194,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -314,10 +324,39 @@ function buildDisplaySelections(selections) {
   return displaySelections;
 }
 
-const paramCounts = computed(() => props.gameState?.training_params?.param_counts || null);
-const selectorTrainingParams = computed(() => props.gameState?.training_params || {});
+function normalizeTrainingParamsForUi(params) {
+  if (!params || typeof params !== 'object') return {};
+  const normalized = { ...params };
+  for (const [rawKey, value] of Object.entries(params)) {
+    const key = String(rawKey);
+    if (key.startsWith('jax/env/')) {
+      const alias = key.slice('jax/env/'.length);
+      if (alias && normalized[alias] === undefined) normalized[alias] = value;
+      continue;
+    }
+    if (key.startsWith('jax/')) {
+      const alias = key.slice('jax/'.length);
+      if (alias && normalized[alias] === undefined) normalized[alias] = value;
+    }
+  }
+  return normalized;
+}
+
+function coerceTrainingBool(value, fallback = false) {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 't', 'on'].includes(text)) return true;
+  if (['0', 'false', 'no', 'n', 'f', 'off'].includes(text)) return false;
+  return fallback;
+}
+
+const trainingParamsForUi = computed(() => normalizeTrainingParamsForUi(props.gameState?.training_params || {}));
+const paramCounts = computed(() => trainingParamsForUi.value?.param_counts || null);
+const selectorTrainingParams = computed(() => trainingParamsForUi.value || {});
 const selectorEnabled = computed(() =>
-  Boolean(selectorTrainingParams.value?.intent_selector_enabled)
+  coerceTrainingBool(selectorTrainingParams.value?.intent_selector_enabled, false)
 );
 const selectorAlphaSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -331,11 +370,7 @@ const selectorAlphaSummary = computed(() => {
 });
 const selectorScheduleSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.intent_selector_alpha_warmup_steps;
-  const ramp = selectorTrainingParams.value?.intent_selector_alpha_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'intent_selector_alpha');
 });
 const selectorEpsSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -349,14 +384,10 @@ const selectorEpsSummary = computed(() => {
 });
 const selectorEpsScheduleSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.intent_selector_eps_warmup_steps;
-  const ramp = selectorTrainingParams.value?.intent_selector_eps_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'intent_selector_eps');
 });
 const selectorMultiselectEnabled = computed(() =>
-  Boolean(selectorTrainingParams.value?.intent_selector_multiselect_enabled)
+  coerceTrainingBool(selectorTrainingParams.value?.intent_selector_multiselect_enabled, false)
 );
 const selectorMinPlayStepsSummary = computed(() => {
   if (!selectorEnabled.value) return 'Disabled';
@@ -382,11 +413,7 @@ const taskRewardScaleSummary = computed(() => {
 const taskRewardScheduleSummary = computed(() => {
   const start = selectorTrainingParams.value?.task_reward_scale_start;
   if (start === null || start === undefined) return 'Disabled';
-  const warmup = selectorTrainingParams.value?.task_reward_scale_warmup_steps;
-  const ramp = selectorTrainingParams.value?.task_reward_scale_ramp_steps;
-  const warmupText = warmup?.toLocaleString?.() || warmup || '0';
-  const rampText = ramp?.toLocaleString?.() || ramp || '0';
-  return `warmup ${warmupText}, ramp ${rampText}`;
+  return formatScheduleWindow(selectorTrainingParams.value, 'task_reward_scale');
 });
 const selectorHeadContextLabel = computed(() => {
   const policyClass = String(selectorTrainingParams.value?.policy_class || '');
@@ -515,6 +542,19 @@ function handlePolicySelection(type, event) {
   emit('policy-swap-requested', { target: 'opponent', policyName: value });
 }
 
+function formatCheckpointLabel(policyName) {
+  const name = String(policyName || '').trim();
+  if (!name) return 'Unknown checkpoint';
+  const updateMatch = name.match(/(?:phase_a_)?update_(\d+)/);
+  if (updateMatch) {
+    return `Update ${Number(updateMatch[1]).toLocaleString()} (${name})`;
+  }
+  if (name === 'latest' || name === 'phase_a_latest') {
+    return `Latest (${name})`;
+  }
+  return name;
+}
+
 // Offense skill overrides (Environment tab)
 const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
 const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
@@ -536,6 +576,8 @@ const intentStateError = ref(null);
 const counterfactualSnapshotUpdating = ref(false);
 const counterfactualSnapshotError = ref(null);
 const playbookIntentInput = ref('');
+const PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT = 24;
+const PLAYBOOK_MAX_ROLLOUTS_PER_INTENT = 512;
 const playbookNumRollouts = ref(24);
 const playbookMaxSteps = ref(8);
 const playbookRunToEnd = ref(false);
@@ -821,6 +863,10 @@ const defaultEvalConfig = () => ({
   skills: { layup: [], three_pt: [], dunk: [] },
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
+  startTemplateMode: 'checkpoint',
+  startTemplateProb: 1.0,
+  startTemplateJitterScale: 0.0,
+  startTemplateMirrorProb: 0.0,
 });
 const defaultTemplateConfig = () => ({
   positions: [],
@@ -930,6 +976,22 @@ const selectedEditableTemplate = computed(() => {
     : [];
   return idx >= 0 ? templates[idx] || null : null;
 });
+const editableTemplateThumbnailModels = computed(() => {
+  const templates = Array.isArray(templateLibraryDraft.value?.templates)
+    ? templateLibraryDraft.value.templates
+    : [];
+  return templates
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      if (!id) return null;
+      const model = buildStartTemplatePreviewModel(
+        template,
+        false,
+      );
+      return model ? { id, label: id, model } : null;
+    })
+    .filter(Boolean);
+});
 
 const hasEditableTemplateLibrary = computed(() => editableTemplateOptions.value.length > 0);
 const templateLibraryJsonExport = computed(() => JSON.stringify(templateLibraryDraft.value, null, 2));
@@ -984,9 +1046,7 @@ watch(
 );
 
 const startTemplateOptions = computed(() => {
-  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
-    ? props.gameState.start_template_library.templates
-    : [];
+  const templates = startTemplateDefinitions.value;
   return templates
     .map((template) => {
       const id = String(template?.id || '').trim();
@@ -995,26 +1055,67 @@ const startTemplateOptions = computed(() => {
     .filter(Boolean);
 });
 const hasLoadedStartTemplates = computed(() => startTemplateOptions.value.length > 0);
-const selectedStartTemplateDefinition = computed(() => {
-  const templates = Array.isArray(props.gameState?.start_template_library?.templates)
+const startTemplateDefinitions = computed(() => (
+  Array.isArray(props.gameState?.start_template_library?.templates)
     ? props.gameState.start_template_library.templates
-    : [];
+    : []
+));
+const START_TEMPLATE_SELECTION_STORAGE_KEY = 'basketworld.start_template.selection';
+function loadStoredStartTemplateSelection() {
+  if (typeof window === 'undefined') {
+    return { id: '', mirrored: false };
+  }
+  try {
+    const raw = window.sessionStorage.getItem(START_TEMPLATE_SELECTION_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return {
+      id: String(parsed?.id || '').trim(),
+      mirrored: Boolean(parsed?.mirrored),
+    };
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load start-template selection', err);
+    return { id: '', mirrored: false };
+  }
+}
+function persistStartTemplateSelection() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(
+      START_TEMPLATE_SELECTION_STORAGE_KEY,
+      JSON.stringify({
+        id: String(selectedStartTemplateId.value || '').trim(),
+        mirrored: Boolean(selectedStartTemplateMirrored.value),
+      }),
+    );
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist start-template selection', err);
+  }
+}
+const storedStartTemplateSelection = loadStoredStartTemplateSelection();
+const selectedStartTemplateDefinition = computed(() => {
+  const templates = startTemplateDefinitions.value;
   const wantedId = String(selectedStartTemplateId.value || '').trim();
   return templates.find((template) => String(template?.id || '').trim() === wantedId) || null;
 });
-const selectedStartTemplateId = ref('');
-const selectedStartTemplateMirrored = ref(false);
+const selectedStartTemplateId = ref(storedStartTemplateSelection.id);
+const selectedStartTemplateMirrored = ref(storedStartTemplateSelection.mirrored);
 const startTemplateActionStatus = ref('');
 const startTemplateActionError = ref('');
 
 watch(
   startTemplateOptions,
   (options) => {
+    if (!options.length) return;
     const values = new Set(options.map((opt) => opt.value));
     if (!values.has(selectedStartTemplateId.value)) {
       selectedStartTemplateId.value = options[0]?.value || '';
     }
   },
+  { immediate: true }
+);
+watch(
+  [selectedStartTemplateId, selectedStartTemplateMirrored],
+  persistStartTemplateSelection,
   { immediate: true }
 );
 
@@ -1078,8 +1179,7 @@ function previewAxialToCartesian(anchor) {
   };
 }
 
-const startTemplatePreviewModel = computed(() => {
-  const template = selectedStartTemplateDefinition.value;
+function buildStartTemplatePreviewModel(template, mirroredInput = false) {
   const courtWidth = Number(props.gameState?.court_width || 0);
   const courtHeight = Number(props.gameState?.court_height || 0);
   if (!template || courtWidth <= 0 || courtHeight <= 0) return null;
@@ -1110,7 +1210,7 @@ const startTemplatePreviewModel = computed(() => {
   const originX = frame.x + (frame.width - usedWidth) / 2 - minX * scale;
   const originY = frame.y + (frame.height - usedHeight) / 2 - minY * scale;
 
-  const mirrored = Boolean(selectedStartTemplateMirrored.value && template?.mirrorable);
+  const mirrored = Boolean(mirroredInput && template?.mirrorable);
   const entries = [];
   for (const teamName of ['offense', 'defense']) {
     const teamEntries = Array.isArray(template?.[teamName]) ? template[teamName] : [];
@@ -1160,7 +1260,33 @@ const startTemplatePreviewModel = computed(() => {
     court,
     entries,
   };
-});
+}
+
+const startTemplatePreviewModel = computed(() => (
+  buildStartTemplatePreviewModel(
+    selectedStartTemplateDefinition.value,
+    selectedStartTemplateMirrored.value,
+  )
+));
+
+const startTemplateThumbnailModels = computed(() => (
+  startTemplateDefinitions.value
+    .map((template) => {
+      const id = String(template?.id || '').trim();
+      if (!id) return null;
+      const model = buildStartTemplatePreviewModel(
+        template,
+        selectedStartTemplateMirrored.value,
+      );
+      return model ? { id, label: id, model } : null;
+    })
+    .filter(Boolean)
+));
+
+function selectStartTemplate(id) {
+  selectedStartTemplateId.value = String(id || '').trim();
+  clearStartTemplateFeedback();
+}
 
 async function handleApplyStartTemplateToBoard() {
   clearStartTemplateFeedback();
@@ -1182,6 +1308,16 @@ async function handleApplyStartTemplateToBoard() {
   }
 }
 
+function handleStartSelfPlayFromTemplate() {
+  clearStartTemplateFeedback();
+  if (!selectedStartTemplateId.value) return;
+  emit('template-self-play', {
+    templateId: selectedStartTemplateId.value,
+    mirrored: selectedStartTemplateMirrored.value,
+    seed: stableStartTemplateSeed(selectedStartTemplateId.value),
+  });
+}
+
 const evalConfigSafe = computed(() => {
   const base = defaultEvalConfig();
   const incoming = props.evalConfig || {};
@@ -1189,6 +1325,51 @@ const evalConfigSafe = computed(() => {
     ...base,
     ...incoming,
     skills: { ...base.skills, ...(incoming.skills || {}) },
+  };
+});
+
+const envOptionalParamsForUi = computed(() =>
+  normalizeTrainingParamsForUi({
+    ...(props.gameState?.mlflow_env_defaults || {}),
+    ...(props.gameState?.env_optional_params || {}),
+  })
+);
+function firstDefinedValue(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return undefined;
+}
+function formatEvalTemplateNumber(value, digits = 2) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'N/A';
+}
+const evalCheckpointTemplateSettings = computed(() => {
+  const params = {
+    ...(trainingParamsForUi.value || {}),
+    ...(envOptionalParamsForUi.value || {}),
+  };
+  const enabledRaw = firstDefinedValue(
+    params.start_template_enabled,
+    params['jax/start_template_enabled'],
+    params['jax/env/start_template_enabled'],
+  );
+  const enabled = coerceTrainingBool(enabledRaw, false);
+  const prob = firstDefinedValue(params.start_template_prob, enabled ? 1.0 : 0.0);
+  const jitter = firstDefinedValue(params.start_template_jitter_scale, enabled ? 1.0 : 0.0);
+  const mirror = firstDefinedValue(params.start_template_mirror_prob, 0.0);
+  const source = firstDefinedValue(
+    params.start_template_library_artifact_path,
+    params.start_template_library,
+    props.gameState?.start_template_library_source,
+    hasLoadedStartTemplates.value ? templateLibrarySourceLabel.value : undefined,
+  );
+  return {
+    enabled,
+    prob,
+    jitter,
+    mirror,
+    source: source === undefined ? 'N/A' : String(source),
   };
 });
 const templateConfigSafe = computed(() => {
@@ -2027,6 +2208,19 @@ function setEvalIntentSelectionMode(mode) {
   emitEvalConfigUpdate({ intentSelectionMode: normalized });
 }
 
+function setEvalStartTemplateMode(mode) {
+  const normalized = ['checkpoint', 'enabled', 'disabled'].includes(String(mode))
+    ? String(mode)
+    : 'checkpoint';
+  emitEvalConfigUpdate({ startTemplateMode: normalized });
+}
+
+function setEvalStartTemplateNumber(key, value, { min = 0, max = 1 } = {}) {
+  const numeric = Number(value);
+  const safe = Number.isFinite(numeric) ? Math.max(min, Math.min(max, numeric)) : min;
+  emitEvalConfigUpdate({ [key]: safe });
+}
+
 function updateEvalSkill(idx, key, value) {
   const offenseCount = props.gameState?.offense_ids?.length || 0;
   const base = evalConfigSafe.value.skills || {};
@@ -2185,23 +2379,27 @@ async function resetPassLogitBiasDefault() {
   await applyPassLogitBiasOverride();
 }
 
-async function applyIntentStateOverride() {
+function normalizeIntentStatePayload(source = {}) {
+  return {
+    active: Boolean(source.active),
+    intent_index: Math.max(
+      0,
+      Math.min(intentIndexMax.value, Number(source.intent_index) || 0),
+    ),
+    intent_age: Math.max(
+      0,
+      Math.min(intentAgeMax.value, Number(source.intent_age) || 0),
+    ),
+  };
+}
+
+async function commitIntentState(payload) {
   if (!props.gameState || intentControlsDisabled.value) return;
   intentStateUpdating.value = true;
   intentStateError.value = null;
   try {
-    const payload = {
-      active: Boolean(intentStateInput.value.active),
-      intent_index: Math.max(
-        0,
-        Math.min(intentIndexMax.value, Number(intentStateInput.value.intent_index) || 0),
-      ),
-      intent_age: Math.max(
-        0,
-        Math.min(intentAgeMax.value, Number(intentStateInput.value.intent_age) || 0),
-      ),
-    };
-    const res = await setIntentState(payload);
+    const normalizedPayload = normalizeIntentStatePayload(payload);
+    const res = await setIntentState(normalizedPayload);
     if (res?.status === 'success' && res.state) {
       emit('state-updated', res.state);
     } else {
@@ -2213,6 +2411,23 @@ async function applyIntentStateOverride() {
   } finally {
     intentStateUpdating.value = false;
   }
+}
+
+async function applyIntentStateOverride() {
+  await commitIntentState(intentStateInput.value);
+}
+
+async function activateIntentPreference(item) {
+  if (!props.gameState || intentControlsDisabled.value) return;
+  const intentIndex = Number(item?.intent_index);
+  if (!Number.isFinite(intentIndex)) return;
+  const payload = normalizeIntentStatePayload({
+    active: true,
+    intent_index: intentIndex,
+    intent_age: 0,
+  });
+  intentStateInput.value = payload;
+  await commitIntentState(payload);
 }
 
 function resetIntentStateInputs() {
@@ -2423,6 +2638,28 @@ function getPlaybookPrimaryShooterSummary(panel) {
     .join(', ');
 }
 
+function formatPlaybookNextIntentSummary(panel) {
+  const raw = panel?.next_intent_distribution || {};
+  const playMap = playbookResult.value?.play_name_map || props.gameState?.play_name_map;
+  const entries = Object.entries(raw)
+    .map(([key, value]) => {
+      const intentIndex = Number(key);
+      const count = Number(value?.count || 0);
+      const rate = Number(value?.rate || 0);
+      if (!Number.isFinite(intentIndex) || count <= 0) return null;
+      return { intentIndex, count, rate, playName: value?.play_name };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.intentIndex - b.intentIndex;
+    });
+  if (!entries.length) return 'none';
+  return entries
+    .map((entry) => `${formatPlayLabel(entry.intentIndex, playMap, entry.playName)}: ${entry.count} (${(entry.rate * 100).toFixed(0)}%)`)
+    .join(', ');
+}
+
 function formatPlaybookOutcomeSummary(panel) {
   const raw = panel?.terminal_outcomes || {};
   const entries = Object.entries(raw)
@@ -2510,12 +2747,14 @@ async function handleRunPlaybookAnalysis() {
 
   playbookRunning.value = true;
   playbookError.value = null;
-  const totalRollouts = playbookSelectedIntentIndices.value.length * Number(playbookNumRollouts.value || 16);
+  const rolloutsPerIntent = playbookRolloutsPerIntent.value;
+  playbookNumRollouts.value = rolloutsPerIntent;
+  const totalRollouts = playbookSelectedIntentIndices.value.length * rolloutsPerIntent;
   startPlaybookProgressPolling(totalRollouts);
   try {
     const res = await runPlaybookAnalysis({
       intent_indices: playbookSelectedIntentIndices.value,
-      num_rollouts: Number(playbookNumRollouts.value || 16),
+      num_rollouts: rolloutsPerIntent,
       max_steps: Number(playbookMaxSteps.value || 8),
       run_to_end: Boolean(playbookRunToEnd.value),
       use_snapshot: Boolean(playbookUseSnapshot.value),
@@ -2534,6 +2773,13 @@ async function handleRunPlaybookAnalysis() {
         status: 'completed',
         error: null,
       };
+    } else if (res?.status === 'cancelled') {
+      playbookProgress.value = {
+        ...playbookProgress.value,
+        running: false,
+        status: 'cancelled',
+        error: null,
+      };
     } else {
       throw new Error(res?.detail || 'Failed to generate playbook analysis');
     }
@@ -2549,6 +2795,23 @@ async function handleRunPlaybookAnalysis() {
   } finally {
     stopPlaybookProgressPolling();
     playbookRunning.value = false;
+  }
+}
+
+async function handleCancelPlaybookAnalysis() {
+  if (!playbookRunning.value) return;
+  playbookError.value = null;
+  try {
+    const res = await cancelPlaybookAnalysis();
+    playbookProgress.value = {
+      ...playbookProgress.value,
+      ...(res?.progress || {}),
+      status: res?.progress?.status || 'cancel_requested',
+      error: null,
+    };
+  } catch (err) {
+    console.error('[PlayerControls] Failed to cancel playbook analysis', err);
+    playbookError.value = err?.message || 'Failed to cancel playbook analysis';
   }
 }
 
@@ -2813,16 +3076,323 @@ function loadStoredDevTabOrder() {
 const activeTab = ref(String(props.initialActiveTab || 'environment'));
 const devTabOrder = ref(loadStoredDevTabOrder());
 const draggedDevTabId = ref(null);
+const modelCapabilities = computed(() => {
+  const raw = props.gameState?.model_capabilities;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const isJaxModel = computed(() => String(props.gameState?.model_backend || '').startsWith('jax'));
+const jaxModelMetadata = computed(() => {
+  const raw = props.gameState?.model_metadata;
+  return raw && typeof raw === 'object' ? raw : null;
+});
+const jaxEnvConfig = computed(() => {
+  const meta = jaxModelMetadata.value || {};
+  const env = meta.env_config || meta.frozen_config || {};
+  return env && typeof env === 'object' ? env : {};
+});
+const jaxTrainerConfig = computed(() => {
+  const raw = jaxModelMetadata.value?.trainer_config;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const jaxPolicySpec = computed(() => {
+  const raw = jaxModelMetadata.value?.policy_spec;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const jaxTrainerConfigText = computed(() => prettyJson(jaxModelMetadata.value?.trainer_config || null));
+const jaxPolicySpecText = computed(() => prettyJson(jaxModelMetadata.value?.policy_spec || null));
+function firstPresent(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return 'N/A';
+}
+function formatConfigValue(value, fallback = 'N/A') {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'number' && !Number.isFinite(value)) return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toLocaleString() : String(value);
+}
+function formatScheduleWindow(params, prefix) {
+  const warmupUpdates = params?.[`${prefix}_warmup_updates`];
+  const rampUpdates = params?.[`${prefix}_ramp_updates`];
+  if (warmupUpdates !== null && warmupUpdates !== undefined && warmupUpdates !== '') {
+    return `warmup ${formatConfigValue(warmupUpdates, '0')} updates, ramp ${formatConfigValue(rampUpdates, '0')} updates`;
+  }
+  const warmupSteps = params?.[`${prefix}_warmup_steps`];
+  const rampSteps = params?.[`${prefix}_ramp_steps`];
+  return `warmup ${formatConfigValue(warmupSteps, '0')} steps, ramp ${formatConfigValue(rampSteps, '0')} steps`;
+}
+const jaxRuntimeRows = computed(() => {
+  if (!isJaxModel.value) return [];
+  const spec = jaxPolicySpec.value || {};
+  const metadata = jaxModelMetadata.value || {};
+  const rows = [
+    {
+      label: 'Backend',
+      value: props.gameState?.model_backend || 'jax',
+      tooltip: 'Inference/training backend for the currently loaded model.',
+    },
+    {
+      label: 'Checkpoint',
+      value: metadata.checkpoint_path || 'N/A',
+      tooltip: 'MLflow checkpoint artifact currently loaded into the dev runtime.',
+    },
+    {
+      label: 'Saved update',
+      value: metadata.update_index ?? 'N/A',
+      tooltip: 'Training update index stored in the loaded checkpoint metadata.',
+    },
+    {
+      label: 'Saved at',
+      value: metadata.saved_at || 'N/A',
+      tooltip: 'Checkpoint save timestamp from checkpoint metadata.',
+    },
+    {
+      label: 'Model type',
+      value: spec.model_type || 'N/A',
+      tooltip: 'JAX policy representation: attention or MLP.',
+    },
+    {
+      label: 'Hidden dim',
+      value: firstPresent(spec.hidden_dim, spec.attention_embed_dim),
+      tooltip: 'Main hidden/embedding width for the JAX policy network.',
+    },
+    {
+      label: 'Attention layers',
+      value: firstPresent(spec.attention_num_layers),
+      tooltip: 'Number of attention blocks when this is an attention checkpoint.',
+    },
+    {
+      label: 'Attention heads',
+      value: firstPresent(spec.attention_num_heads),
+      tooltip: 'Number of attention heads when this is an attention checkpoint.',
+    },
+  ];
+  if (paramCounts.value?.total !== undefined) {
+    rows.push({
+      label: 'Params',
+      value: formatParamCount(paramCounts.value.total),
+      tooltip: 'Total trainable parameter count exposed by backend metadata.',
+    });
+  }
+  return rows;
+});
+const jaxTrainingLoopRows = computed(() => {
+  if (!isJaxModel.value) return [];
+  const training = selectorTrainingParams.value || {};
+  const trainer = jaxTrainerConfig.value || {};
+  const batchSize = firstPresent(training.kernel_batch_size, trainer.kernel_batch_size);
+  const horizon = firstPresent(training.rollout_horizon, trainer.rollout_horizon);
+  const explicitStepsPerUpdate = firstPresent(
+    training.steps_per_update,
+    trainer.steps_per_update,
+    training.ppo_batch_size,
+    trainer.ppo_batch_size
+  );
+  const roleMultiplier = String(firstPresent(training.mode, trainer.mode, 'train_loop')).toLowerCase() === 'train_loop' ? 2 : 1;
+  const numericStepsPerUpdate = Number(batchSize) * Number(horizon) * roleMultiplier;
+  const stepsPerUpdate = explicitStepsPerUpdate !== 'N/A'
+    ? formatConfigValue(explicitStepsPerUpdate)
+    : formatConfigValue(numericStepsPerUpdate);
+  return [
+    {
+      label: 'Batch envs',
+      value: batchSize,
+      tooltip: 'Number of parallel JAX environment states stepped in one compiled rollout.',
+    },
+    {
+      label: 'Rollout horizon',
+      value: horizon,
+      tooltip: 'Compiled rollout length per PPO update.',
+    },
+    {
+      label: 'Steps/update',
+      value: stepsPerUpdate,
+      tooltip: 'Environment steps collected per PPO update. In train-loop mode this includes both offense and defense role rollouts.',
+    },
+    {
+      label: 'Updates',
+      value: firstPresent(training.num_updates, trainer.num_updates),
+      tooltip: 'Total PPO update count configured for the run.',
+    },
+    {
+      label: 'Update epochs',
+      value: firstPresent(training.policy_update_epochs, trainer.policy_update_epochs),
+      tooltip: 'Number of PPO passes through each collected rollout batch.',
+    },
+    {
+      label: 'Minibatches',
+      value: firstPresent(training.ppo_minibatches, trainer.ppo_minibatches),
+      tooltip: 'Number of minibatches each PPO update is split into.',
+    },
+    {
+      label: 'Learning rate',
+      value: firstPresent(training.learning_rate, trainer.learning_rate),
+      tooltip: 'Optax optimizer learning rate.',
+    },
+    {
+      label: 'Clip range',
+      value: firstPresent(training.ppo_clip_range, trainer.ppo_clip_range),
+      tooltip: 'PPO ratio clipping range.',
+    },
+    {
+      label: 'Value coef',
+      value: firstPresent(training.value_coef, trainer.value_coef),
+      tooltip: 'Weight applied to value-function loss.',
+    },
+    {
+      label: 'Entropy coef',
+      value: firstPresent(training.entropy_coef, trainer.entropy_coef, training.ent_coef),
+      tooltip: 'Weight applied to low-level action entropy.',
+    },
+  ];
+});
+const playDiagnosticsEnabled = computed(() => {
+  const caps = modelCapabilities.value || {};
+  const hasIntentConfig = Boolean(
+    props.gameState?.enable_intent_learning
+    || Number(props.gameState?.num_intents || 0) > 0
+  );
+  return caps.play_metadata !== false && hasIntentConfig;
+});
+const selectorDistributionCapabilityEnabled = computed(() =>
+  (modelCapabilities.value || {}).selector_distribution !== false
+);
+function formatDebugNumber(value, digits = 3) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : 'N/A';
+}
+function formatDebugProb(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `${(num * 100).toFixed(1)}%` : 'N/A';
+}
+const selectorDebug = computed(() => {
+  const raw = props.gameState?.selector_debug;
+  return raw && typeof raw === 'object' ? raw : {};
+});
+const liveSelectorDebugSummary = computed(() => {
+  const debug = selectorDebug.value || {};
+  const transition = debug.last_transition && typeof debug.last_transition === 'object'
+    ? debug.last_transition
+    : null;
+  const currentProbs = debug.current_play_probabilities && typeof debug.current_play_probabilities === 'object'
+    ? debug.current_play_probabilities
+    : null;
+  return {
+    runtimeEnabled: debug.runtime_enabled === true ? 'Yes' : debug.runtime_enabled === false ? 'No' : 'N/A',
+    modelSelectorEnabled: debug.model_selector_enabled === true ? 'Yes' : debug.model_selector_enabled === false ? 'No' : 'N/A',
+    trainingSelectorEnabled: debug.training_selector_enabled === true ? 'Yes' : debug.training_selector_enabled === false ? 'No' : 'N/A',
+    multiselectEnabled: debug.multiselect_enabled === true ? 'Yes' : debug.multiselect_enabled === false ? 'No' : 'N/A',
+    alpha: formatDebugNumber(debug.alpha_current),
+    eps: formatDebugNumber(debug.eps_current),
+    trainingAlpha: formatDebugNumber(debug.training_alpha_current),
+    trainingEps: formatDebugNumber(debug.training_eps_current),
+    forceLearnedRuntime: debug.force_learned_runtime === true ? 'Yes' : debug.force_learned_runtime === false ? 'No' : 'N/A',
+    minPlaySteps: debug.min_play_steps ?? 'N/A',
+    commitmentSteps: debug.commitment_steps ?? 'N/A',
+    eligibleBoundary: debug.eligible_boundary_reason || 'None',
+    lastCompletedPassBoundary: debug.last_completed_pass_boundary === true ? 'Yes' : 'No',
+    completedPassMinStepsMet: debug.completed_pass_min_steps_met === true ? 'Yes' : debug.completed_pass_min_steps_met === false ? 'No' : 'N/A',
+    completedPassMinStepsRemaining: debug.completed_pass_min_steps_remaining ?? 'N/A',
+    lastTransitionSource: debug.last_transition_source || 'N/A',
+    lastTransitionPreviousIntent: transition?.previous_intent_index ?? 'N/A',
+    lastTransitionIntent: transition?.intent_index ?? 'N/A',
+    lastTransitionChanged: transition?.changed_intent === true ? 'Yes' : transition?.changed_intent === false ? 'No' : 'N/A',
+    lastTransitionUsedSelector: transition?.used_selector === true ? 'Yes' : transition?.used_selector === false ? 'No' : 'N/A',
+    lastTransitionAlpha: formatDebugNumber(transition?.alpha),
+    lastTransitionEps: formatDebugNumber(transition?.eps),
+    currentRawProb: formatDebugProb(currentProbs?.raw_prob),
+    currentMixedProb: formatDebugProb(currentProbs?.mixed_prob),
+    currentDeployedProb: formatDebugProb(currentProbs?.deployed_prob),
+    currentDeployedRank: currentProbs?.rank_deployed ?? debug.current_play_rank_deployed ?? 'N/A',
+  };
+});
+const livePlaySummary = computed(() => {
+  const state = props.gameState || {};
+  const active = Boolean(state.intent_active_current);
+  const intentIndex = Number(state.intent_index_current ?? 0);
+  return {
+    active,
+    playLabel: active
+      ? formatPlayLabel(intentIndex, state.play_name_map, state.current_play_name)
+      : 'No active play',
+    age: state.intent_age ?? 'N/A',
+    commitmentRemaining: state.intent_commitment_remaining ?? 'N/A',
+    selectorSegmentIndex: state.selector_segment_index_current ?? 'N/A',
+    boundaryReason: state.selector_last_boundary_reason || 'N/A',
+    visibleToDefense: Boolean(state.intent_visible_to_defense_current),
+    defensePlayLabel: state.defense_intent_active_current
+      ? formatPlayLabel(
+        Number(state.defense_intent_index_current ?? 0),
+        state.play_name_map,
+        state.current_defense_play_name,
+      )
+      : 'No active defense play',
+  };
+});
+const selectorIntentUnavailableReason = computed(() => {
+  if (!selectorEnabled.value) return 'Selector is not enabled for this checkpoint.';
+  if (!selectorDistributionCapabilityEnabled.value) {
+    return 'Loaded model does not expose selector distribution diagnostics.';
+  }
+  if (!props.gameState?.intent_active_current) {
+    return 'No active offense play is present in the current state.';
+  }
+  return 'Selector preferences are unavailable for the current state.';
+});
+
+function isDevTabVisible(tabId) {
+  const caps = modelCapabilities.value || {};
+  if (tabId === 'advisor') return caps.mcts !== false;
+  if (tabId === 'playbook') return caps.playbook !== false && caps.playbook_preview !== false;
+  if (tabId === 'attention') return caps.attention !== false;
+  if (tabId === 'environment' || tabId === 'training') {
+    return isJaxModel.value || caps.env_training_tabs !== false;
+  }
+  if (tabId === 'phi') {
+    return caps.env_training_tabs !== false;
+  }
+  if (tabId === 'observation') return caps.observation_panel !== false;
+  if (tabId === 'eval') return caps.eval !== false;
+  return true;
+}
+
 const orderedDevTabs = computed(() => {
   const tabsById = new Map(DEFAULT_DEV_TABS.map((tab) => [tab.id, tab]));
   return devTabOrder.value
     .map((tabId) => tabsById.get(tabId))
-    .filter((tab) => Boolean(tab));
+    .filter((tab) => Boolean(tab) && isDevTabVisible(tab.id));
 });
 const rewardHistory = ref([]);
 const episodeRewards = ref({ offense: 0.0, defense: 0.0 });
 const rewardParams = ref(null);
 const mlflowPhiParams = ref(null);
+const phiParamsSource = ref(null);
+const phiRewardsEnabled = computed(() => Boolean(mlflowPhiParams.value?.enable_phi_shaping));
+const phiColumnsVisible = computed(() => {
+  if (phiRewardsEnabled.value) return true;
+  return rewardHistory.value.some((row) => (
+    Object.prototype.hasOwnProperty.call(row || {}, 'mlflow_phi_r_shape')
+    || Object.prototype.hasOwnProperty.call(row || {}, 'env_phi_r_shape')
+    || Object.prototype.hasOwnProperty.call(row || {}, 'mlflow_phi_potential')
+  ));
+});
+const phiStatusLabel = computed(() => {
+  if (phiRewardsEnabled.value) return 'Enabled';
+  if (mlflowPhiParams.value) return 'Disabled in loaded params';
+  return 'No phi params loaded';
+});
+const phiSourceLabel = computed(() => {
+  if (phiParamsSource.value === 'mlflow') return 'MLflow run params';
+  if (phiParamsSource.value === 'env') return 'Live environment params';
+  return 'None';
+});
+function phiRewardForRow(row) {
+  if (!row || typeof row !== 'object') return 0;
+  if (row.mlflow_phi_r_shape !== undefined) return Number(row.mlflow_phi_r_shape) || 0;
+  if (row.env_phi_r_shape !== undefined) return Number(row.env_phi_r_shape) || 0;
+  return 0;
+}
 
 // Advisor (MCTS) state
 const advisorMaxDepth = ref(3);
@@ -2894,6 +3464,14 @@ watch(activeTab, async (newTab) => {
     console.warn('Failed to scroll to current shot clock on tab change:', err);
   }
 }, { flush: 'post' });
+
+watch(orderedDevTabs, (tabs) => {
+  const visibleIds = tabs.map((tab) => tab.id);
+  if (visibleIds.length === 0) return;
+  if (!visibleIds.includes(activeTab.value)) {
+    activeTab.value = visibleIds[0];
+  }
+}, { immediate: true });
 
 watch(() => props.initialActiveTab, (nextTab) => {
   const normalized = String(nextTab || '').trim();
@@ -2989,11 +3567,32 @@ function ensureStatsDiagnosticFields(target) {
   target.rewardBreakdown.assistFullBonus = Number(target.rewardBreakdown.assistFullBonus || 0);
   target.rewardBreakdown.phiShaping = Number(target.rewardBreakdown.phiShaping || 0);
   target.rewardBreakdown.unexplained = Number(target.rewardBreakdown.unexplained || 0);
+  if (!target.selectorDiagnostics || typeof target.selectorDiagnostics !== "object") {
+    target.selectorDiagnostics = {};
+  }
+  target.selectorDiagnostics.source = String(target.selectorDiagnostics.source || "intent_fallback");
+  target.selectorDiagnostics.enabled = Boolean(target.selectorDiagnostics.enabled);
+  target.selectorDiagnostics.mode = String(target.selectorDiagnostics.mode || "");
+  target.selectorDiagnostics.appliedEpisodeStarts = Number(target.selectorDiagnostics.appliedEpisodeStarts || 0);
+  target.selectorDiagnostics.rawProbCount = Number(target.selectorDiagnostics.rawProbCount || 0);
+  target.selectorDiagnostics.meanRawMaxProb = Number(target.selectorDiagnostics.meanRawMaxProb || 0);
+  target.selectorDiagnostics.meanRawProbs = Array.isArray(target.selectorDiagnostics.meanRawProbs)
+    ? target.selectorDiagnostics.meanRawProbs.map((v) => Number(v) || 0)
+    : [];
+  target.selectorDiagnostics.sampleCounts = target.selectorDiagnostics.sampleCounts || {};
+  target.selectorDiagnostics.argmaxCounts = target.selectorDiagnostics.argmaxCounts || {};
 }
 
 ensureStatsDiagnosticFields(statsState.value);
 
+function normalizeTurnoverReason(reason) {
+  const key = String(reason || 'unknown');
+  if (key === 'shot_clock') return 'shot_clock_violation';
+  return key;
+}
+
 function formatTurnoverReason(reason) {
+  const key = normalizeTurnoverReason(reason);
   const map = {
     intercepted: 'Intercepted',
     steal: 'Intercepted',
@@ -3003,10 +3602,11 @@ function formatTurnoverReason(reason) {
     offensive_three_seconds: 'Offensive 3-second violation',
     shot_clock_violation: 'Shot Clock',
   };
-  return map[String(reason)] || String(reason || 'unknown');
+  return map[key] || key;
 }
 
 function getTurnoverReasonTooltip(reason) {
+  const key = normalizeTurnoverReason(reason);
   const map = {
     intercepted: 'A defender intercepted a pass before it reached the target.',
     steal: 'Legacy label for an intercepted pass turnover.',
@@ -3014,9 +3614,9 @@ function getTurnoverReasonTooltip(reason) {
     pass_out_of_bounds: 'The selected pass trajectory went out of bounds.',
     move_out_of_bounds: 'The ball handler moved out of bounds.',
     offensive_three_seconds: 'An offensive player stayed in the lane longer than the 3-second limit.',
-    shot_clock_violation: 'Possession ended because the shot clock expired.',
+    shot_clock_violation: 'Possession ended because the shot clock expired. This is a team turnover and is not attributed to an individual offensive player.',
   };
-  return map[String(reason)] || 'Turnover category reported by the environment.';
+  return map[key] || 'Turnover category reported by the environment.';
 }
 
 function getActionMixTooltip(key) {
@@ -3045,7 +3645,12 @@ function getRewardBreakdownTooltip(key) {
 }
 
 const turnoverReasonRows = computed(() => {
-  const rows = Object.entries(statsState.value?.turnoverReasons || {}).map(([reason, count]) => ({
+  const counts = {};
+  for (const [reason, count] of Object.entries(statsState.value?.turnoverReasons || {})) {
+    const key = normalizeTurnoverReason(reason);
+    counts[key] = Number(counts[key] || 0) + Number(count || 0);
+  }
+  const rows = Object.entries(counts).map(([reason, count]) => ({
     reason,
     label: formatTurnoverReason(reason),
     count: Number(count || 0),
@@ -3053,6 +3658,12 @@ const turnoverReasonRows = computed(() => {
   rows.sort((a, b) => b.count - a.count);
   return rows;
 });
+
+const shotClockViolationCount = computed(() => Number(
+  statsState.value?.turnoverReasons?.shot_clock_violation || 0
+) + Number(
+  statsState.value?.turnoverReasons?.shot_clock || 0
+));
 
 const actionMixRows = computed(() => {
   const mix = statsState.value?.actionMix || {};
@@ -3092,6 +3703,33 @@ const intentSelectionRows = computed(() => {
     rows,
     inactiveCount: Number(statsState.value?.intentInactiveCount || 0),
     total: rows.reduce((acc, row) => acc + row.count, 0) + Number(statsState.value?.intentInactiveCount || 0),
+  };
+});
+
+const selectorEvalDiagnostics = computed(() => {
+  const diag = statsState.value?.selectorDiagnostics || {};
+  const meanRawProbs = Array.isArray(diag.meanRawProbs) ? diag.meanRawProbs : [];
+  const rawRows = meanRawProbs
+    .map((prob, intent) => ({
+      intent,
+      label: formatPlayLabel(intent, props.gameState?.play_name_map),
+      prob: Number(prob || 0),
+      argmaxCount: Number(diag.argmaxCounts?.[String(intent)] || 0),
+      sampleCount: Number(diag.sampleCounts?.[String(intent)] || 0),
+    }))
+    .sort((a, b) => b.prob - a.prob);
+  return {
+    source: String(diag.source || "intent_fallback"),
+    enabled: Boolean(diag.enabled),
+    specEnabled: Boolean(diag.specEnabled),
+    configEnabled: Boolean(diag.configEnabled),
+    configMode: String(diag.configMode || ""),
+    disabledReason: String(diag.disabledReason || ""),
+    mode: String(diag.mode || ""),
+    appliedEpisodeStarts: Number(diag.appliedEpisodeStarts || 0),
+    rawProbCount: Number(diag.rawProbCount || 0),
+    meanRawMaxProb: Number(diag.meanRawMaxProb || 0),
+    rawRows,
   };
 });
 
@@ -3357,7 +3995,7 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   const tovCount = turnovers.length;
   statsState.value.turnovers += Number(tovCount || 0);
   for (const turnover of turnovers) {
-    const reason = String(turnover?.reason || 'unknown');
+    const reason = normalizeTurnoverReason(turnover?.reason);
     statsState.value.turnoverReasons[reason] = Number(statsState.value.turnoverReasons[reason] || 0) + 1;
   }
   if (!statsState.value.violations) {
@@ -3485,7 +4123,7 @@ function applyEvaluationStats(
     defensiveLaneCount += Number(defLane || 0);
     const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
     offensiveThreeCount += turnovers.filter(
-      (turnover) => String(turnover?.reason || '') === 'offensive_three_seconds'
+      (turnover) => normalizeTurnoverReason(turnover?.reason) === 'offensive_three_seconds'
     ).length;
   }
 
@@ -3507,7 +4145,10 @@ function applyEvaluationStats(
   }
 
   if (evalDiagnostics && typeof evalDiagnostics === 'object') {
-    const intentRaw = evalDiagnostics.intent_selection_counts || {};
+    const selectorStartRaw = evalDiagnostics.selector?.episode_start_selection_counts || {};
+    const intentRaw = Object.keys(selectorStartRaw).length > 0
+      ? selectorStartRaw
+      : (evalDiagnostics.intent_selection_counts || {});
     next.intentSelectionCounts = {};
     for (const [intent, count] of Object.entries(intentRaw)) {
       const idx = Number(intent);
@@ -3519,8 +4160,14 @@ function applyEvaluationStats(
     const reasonsRaw = evalDiagnostics.turnover_reasons || {};
     next.turnoverReasons = {};
     for (const [reason, count] of Object.entries(reasonsRaw)) {
-      next.turnoverReasons[String(reason)] = Number(count || 0);
+      const key = normalizeTurnoverReason(reason);
+      next.turnoverReasons[key] = Number(next.turnoverReasons[key] || 0) + Number(count || 0);
     }
+    const turnoverReasonTotal = Object.values(next.turnoverReasons || {}).reduce(
+      (sum, count) => sum + Number(count || 0),
+      0
+    );
+    next.turnovers = Math.max(Number(next.turnovers || 0), turnoverReasonTotal);
 
     const mixRaw = evalDiagnostics.action_mix || {};
     next.actionMix = {
@@ -3530,6 +4177,45 @@ function applyEvaluationStats(
       pass: Number(mixRaw.pass || 0),
       other: Number(mixRaw.other || 0),
       total: Number(mixRaw.total || 0),
+    };
+
+    const selectorDiagRaw = evalDiagnostics.selector || {};
+    const nativeSummary = evalDiagnostics.jax_native_summary || {};
+    const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
+    const selectorStartSource = Object.keys(selectorStartCounts).length > 0
+      ? "selector_episode_start"
+      : "intent_fallback";
+    const meanRawProbs = Array.isArray(selectorDiagRaw.episode_start_mean_raw_probs)
+      ? selectorDiagRaw.episode_start_mean_raw_probs.map((v) => Number(v) || 0)
+      : (Array.isArray(nativeSummary.selector_episode_start_mean_raw_probs)
+        ? nativeSummary.selector_episode_start_mean_raw_probs.map((v) => Number(v) || 0)
+        : []);
+    next.selectorDiagnostics = {
+      source: selectorStartSource,
+      enabled: Boolean(nativeSummary.selector_enabled),
+      specEnabled: Boolean(nativeSummary.selector_spec_enabled),
+      configEnabled: Boolean(nativeSummary.selector_config_enabled),
+      configMode: String(nativeSummary.selector_config_mode || ""),
+      disabledReason: String(nativeSummary.selector_disabled_reason || ""),
+      mode: String(nativeSummary.selector_selection_mode || ""),
+      appliedEpisodeStarts: Number(
+        selectorDiagRaw.boundary_episode_start_count
+        ?? nativeSummary.selector_boundary_episode_start_count
+        ?? 0
+      ),
+      rawProbCount: Number(
+        selectorDiagRaw.episode_start_raw_prob_count
+        ?? nativeSummary.selector_episode_start_raw_prob_count
+        ?? 0
+      ),
+      meanRawMaxProb: Number(
+        selectorDiagRaw.episode_start_mean_raw_max_prob
+        ?? nativeSummary.selector_episode_start_mean_raw_max_prob
+        ?? 0
+      ),
+      meanRawProbs,
+      sampleCounts: { ...selectorStartCounts },
+      argmaxCounts: { ...(selectorDiagRaw.episode_start_argmax_counts || {}) },
     };
 
     const rbRaw = evalDiagnostics.reward_breakdown || {};
@@ -3570,6 +4256,7 @@ async function copyStatsMarkdown() {
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
       ['Total potential assists', String(s.dunk.potentialAssists + s.twoPt.potentialAssists + s.threePt.potentialAssists)],
       ['Total turnovers', String(s.turnovers)],
+      ['Shot clock violations', String(shotClockViolationCount.value)],
       ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
       ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
       ['Offensive 3-second violations', String(s.violations?.offensiveThreeSeconds || 0)],
@@ -3961,6 +4648,15 @@ const playbookSelectedIntentIndices = computed(() => {
   }
   return out;
 });
+const playbookMaxRolloutsPerIntent = computed(() => PLAYBOOK_MAX_ROLLOUTS_PER_INTENT);
+const playbookRolloutsPerIntent = computed(() => {
+  const raw = Number(playbookNumRollouts.value || PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT);
+  const rounded = Number.isFinite(raw) ? Math.round(raw) : PLAYBOOK_DEFAULT_ROLLOUTS_PER_INTENT;
+  return Math.max(1, Math.min(playbookMaxRolloutsPerIntent.value, rounded));
+});
+const playbookTotalRollouts = computed(() =>
+  playbookSelectedIntentIndices.value.length * playbookRolloutsPerIntent.value
+);
 
 // Shot probability display is handled on the board
 
@@ -4728,6 +5424,7 @@ const fetchRewards = async () => {
     episodeRewards.value = data.episode_rewards || { offense: 0.0, defense: 0.0 };
     rewardParams.value = data.reward_params || null;
     mlflowPhiParams.value = data.mlflow_phi_params || null;
+    phiParamsSource.value = data.phi_params_source || null;
   } catch (error) {
     console.error('Failed to fetch rewards:', error);
   }
@@ -4992,6 +5689,12 @@ const obsMeta = computed(() => {
   const turnoverStart = offset;
   offset += nOffense;
   const stealStart = offset;
+  offset += nOffense;
+  const roleFlagIdx = offset;
+  offset += 1;
+  const offenseSkillDeltaStart = offset;
+  const offenseSkillDeltaLen = nOffense * 3;
+  offset += offenseSkillDeltaLen;
   return {
     nPlayers,
     shotClockIdx,
@@ -5013,6 +5716,9 @@ const obsMeta = computed(() => {
     expectedPointsLen,
     turnoverStart,
     stealStart,
+    roleFlagIdx,
+    offenseSkillDeltaStart,
+    offenseSkillDeltaLen,
     nOffense,
     teammatePairCount,
   };
@@ -5066,13 +5772,37 @@ const tokenGlobalLabels = computed(() => {
   return labels;
 });
 
-const tokenAttention = computed(() => obsTokens.value?.attention || null);
+const attentionObserverView = ref('player');
+const tokenAttentionByObserver = computed(() => obsTokens.value?.attention_by_observer || null);
+const tokenAttentionObserverOptions = computed(() => {
+  const byObserver = tokenAttentionByObserver.value;
+  if (!byObserver || typeof byObserver !== 'object') return [];
+  const options = [];
+  if (byObserver.player) options.push({ value: 'player', label: 'Player' });
+  if (byObserver.opponent) options.push({ value: 'opponent', label: 'Opponent' });
+  if (!options.length) {
+    if (byObserver.offense) options.push({ value: 'offense', label: 'Offense' });
+    if (byObserver.defense) options.push({ value: 'defense', label: 'Defense' });
+  }
+  return options;
+});
+const tokenAttention = computed(() => {
+  const byObserver = tokenAttentionByObserver.value;
+  if (byObserver && typeof byObserver === 'object') {
+    const selected = byObserver[attentionObserverView.value];
+    if (selected) return selected;
+    if (byObserver.player) return byObserver.player;
+    if (byObserver.offense) return byObserver.offense;
+  }
+  return obsTokens.value?.attention || null;
+});
 const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
 const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
 const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
 const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
 const tokenAttentionRuntimeIntentIndex = computed(() => {
   const value = tokenAttention.value?.runtime_intent_index;
+  if (value === null || value === undefined || value === 'null') return null;
   return Number.isFinite(Number(value)) ? Number(value) : null;
 });
 const tokenAttentionRuntimeIntentGate = computed(() => Boolean(tokenAttention.value?.runtime_intent_gate));
@@ -5089,6 +5819,8 @@ const tokenAttentionRuntimeSummary = computed(() => {
     parts.push(
       `Intent: ${formatPlayLabel(tokenAttentionRuntimeIntentIndex.value, props.gameState?.play_name_map)}`
     );
+  } else {
+    parts.push('Intent: null');
   }
   parts.push(`Gate: ${tokenAttentionRuntimeIntentGate.value ? 'on' : 'off'}`);
   parts.push(`Active: ${tokenAttentionRuntimeIntentActive.value ? 'yes' : 'no'}`);
@@ -5349,6 +6081,30 @@ const stealRisks = computed(() => {
     meta.stealStart + meta.nOffense,
   );
 });
+
+const roleFlagObsValue = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs) return 0;
+  return Number(obs[meta.roleFlagIdx] || 0);
+});
+
+const offenseSkillDeltas = computed(() => {
+  const meta = obsMeta.value;
+  const obs = props.gameState?.obs;
+  if (!meta || !obs || meta.offenseSkillDeltaLen === 0) return [];
+  return obs.slice(
+    meta.offenseSkillDeltaStart,
+    meta.offenseSkillDeltaStart + meta.offenseSkillDeltaLen,
+  );
+});
+
+function offenseSkillDeltaLabel(idx) {
+  const skillNames = ['layup', '3pt', 'dunk'];
+  const playerIdx = Math.floor(idx / 3);
+  const skillIdx = idx % 3;
+  return `O${formatOffenseId(playerIdx)} ${skillNames[skillIdx] || 'skill'} delta`;
+}
 </script>
 
 <template>
@@ -5567,12 +6323,16 @@ const stealRisks = computed(() => {
             <div class="param-item"><span class="param-name">Pass reward:</span><span class="param-value">{{ rewardParams.pass_reward }}</span></div>
             <div class="param-item"><span class="param-name">Violation reward:</span><span class="param-value">{{ rewardParams.violation_reward }}</span></div>
           </div>
-          <div class="param-category" v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
-            <h5>Phi Shaping (from MLflow)</h5>
-            <div class="param-item"><span class="param-name">Beta (β):</span><span class="param-value">{{ mlflowPhiParams.phi_beta }}</span></div>
-            <div class="param-item"><span class="param-name">Gamma (γ):</span><span class="param-value">{{ mlflowPhiParams.reward_shaping_gamma }}</span></div>
-            <div class="param-item"><span class="param-name">Aggregation mode:</span><span class="param-value">{{ mlflowPhiParams.phi_aggregation_mode }}</span></div>
-            <div class="param-item" v-if="mlflowPhiParams.phi_blend_weight > 0"><span class="param-name">Blend weight:</span><span class="param-value">{{ mlflowPhiParams.phi_blend_weight.toFixed(2) }}</span></div>
+          <div class="param-category">
+            <h5>Phi Shaping</h5>
+            <div class="param-item"><span class="param-name">Status:</span><span class="param-value">{{ phiStatusLabel }}</span></div>
+            <div class="param-item"><span class="param-name">Source:</span><span class="param-value">{{ phiSourceLabel }}</span></div>
+            <template v-if="mlflowPhiParams">
+              <div class="param-item"><span class="param-name">Beta (β):</span><span class="param-value">{{ mlflowPhiParams.phi_beta }}</span></div>
+              <div class="param-item"><span class="param-name">Gamma (γ):</span><span class="param-value">{{ mlflowPhiParams.reward_shaping_gamma }}</span></div>
+              <div class="param-item"><span class="param-name">Aggregation mode:</span><span class="param-value">{{ mlflowPhiParams.phi_aggregation_mode }}</span></div>
+              <div class="param-item"><span class="param-name">Blend weight:</span><span class="param-value">{{ Number(mlflowPhiParams.phi_blend_weight || 0).toFixed(2) }}</span></div>
+            </template>
           </div>
         </div>
         <div v-else class="no-rewards">No reward parameters available.</div>
@@ -5594,7 +6354,7 @@ const stealRisks = computed(() => {
           <div v-if="rewardHistory.length === 0" class="no-rewards">
             No rewards recorded yet.
           </div>
-          <div v-else class="reward-table" :class="{ 'with-phi': mlflowPhiParams && mlflowPhiParams.enable_phi_shaping }">
+          <div v-else class="reward-table" :class="{ 'with-phi': phiColumnsVisible }">
             <div class="reward-header">
               <span>Turn</span>
               <span>Shot Clock</span>
@@ -5602,7 +6362,8 @@ const stealRisks = computed(() => {
               <span>Off. Reason</span>
               <span>Defense</span>
               <span>Def. Reason</span>
-              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">Φ</span>
+              <span v-if="phiColumnsVisible">Φ Reward</span>
+              <span v-if="phiColumnsVisible">Φ Potential</span>
             </div>
             <div 
               v-for="reward in rewardHistory" 
@@ -5620,7 +6381,13 @@ const stealRisks = computed(() => {
                 {{ reward.defense.toFixed(3) }}
               </span>
               <span class="reason-text">{{ reward.defense_reason }}</span>
-              <span v-if="mlflowPhiParams && mlflowPhiParams.enable_phi_shaping">
+              <span
+                v-if="phiColumnsVisible"
+                :class="{ positive: phiRewardForRow(reward) > 0, negative: phiRewardForRow(reward) < 0 }"
+              >
+                {{ phiRewardForRow(reward).toFixed(3) }}
+              </span>
+              <span v-if="phiColumnsVisible">
                 {{ (reward.mlflow_phi_potential || 0).toFixed(3) }}
               </span>
             </div>
@@ -5717,6 +6484,7 @@ const stealRisks = computed(() => {
             <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
             <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
+            <div class="param-item" data-tooltip="Shot clock expirations. These count as team turnovers but are not assigned to an individual offensive player."><span class="param-name">Shot clock violations:</span><span class="param-value">{{ shotClockViolationCount }}</span></div>
             <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
             <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offense kept a player in the lane beyond the 3-second limit, causing turnovers."><span class="param-name">Offensive 3-second violations:</span><span class="param-value">{{ statsState.violations?.offensiveThreeSeconds || 0 }}</span></div>
@@ -5803,6 +6571,66 @@ const stealRisks = computed(() => {
             <div v-if="intentSelectionRows.total === 0" class="param-item" data-tooltip="No offense intent start counts were recorded in this evaluation window.">
               <span class="param-name">(none)</span>
               <span class="param-value">0</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
+              Selector Diagnostics
+              <span
+                class="category-help"
+                title="Diagnostics for JAX learned selector sampling at eval episode starts. If source is intent_fallback, the table above is not using selector-applied starts."
+                aria-label="Selector diagnostics help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div class="param-item" data-tooltip="Whether native JAX eval considered the learned selector enabled for this run.">
+              <span class="param-name">Selector enabled:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.enabled ? "Yes" : "No" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Which source populated Offense Intent Starts: selector episode-start applications, or fallback reset intent counts.">
+              <span class="param-name">Start count source:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.source }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the loaded JAX checkpoint policy_spec contains a selector head.">
+              <span class="param-name">Spec selector:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.specEnabled ? "Yes" : "No" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether checkpoint/session config enables the selector after metadata resolution.">
+              <span class="param-name">Config selector:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.configEnabled ? "Yes" : "No" }}</span>
+            </div>
+            <div v-if="selectorEvalDiagnostics.disabledReason" class="param-item" data-tooltip="Why native JAX eval disabled selector application.">
+              <span class="param-name">Disabled reason:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.disabledReason }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Requested eval intent selection mode. learned_sample should use raw learned selector probabilities.">
+              <span class="param-name">Mode:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.mode || "N/A" }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of episode starts where the selector actually applied a play.">
+              <span class="param-name">Applied starts:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.appliedEpisodeStarts }}</span>
+            </div>
+            <div class="param-item" data-tooltip="How many episode-start raw probability vectors were averaged below.">
+              <span class="param-name">Raw prob samples:</span>
+              <span class="param-value">{{ selectorEvalDiagnostics.rawProbCount }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Mean max raw selector probability at episode starts. About 12.5% for 8 intents means near-uniform.">
+              <span class="param-name">Mean raw max prob:</span>
+              <span class="param-value">{{ percentFromProb(selectorEvalDiagnostics.meanRawMaxProb).toFixed(1) }}%</span>
+            </div>
+            <div
+              v-for="row in selectorEvalDiagnostics.rawRows"
+              :key="`selector-raw-prob-${row.intent}`"
+              class="param-item"
+              data-tooltip="Mean raw selector probability at eval episode starts. Argmax/sample counts help distinguish a uniform model from a sampling/display issue."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ percentFromProb(row.prob).toFixed(1) }}% | argmax {{ row.argmaxCount }} | sampled {{ row.sampleCount }}</span>
+            </div>
+            <div v-if="selectorEvalDiagnostics.rawRows.length === 0" class="param-item" data-tooltip="No native selector probability diagnostics were returned. This usually means eval did not use the native JAX selector path.">
+              <span class="param-name">Raw probs:</span>
+              <span class="param-value">N/A</span>
             </div>
           </div>
           <div class="param-category">
@@ -5936,6 +6764,321 @@ const stealRisks = computed(() => {
         <h4>Policy Probabilities ({{ policyTeamLabel }})</h4>
         <p class="entropy-note">Legal-action probabilities for the current state, filtered to the selected team.</p>
 
+        <div v-if="isJaxModel" class="param-category selector-intent-card">
+          <h5>JAX Checkpoint</h5>
+          <p class="entropy-note">
+            Load a different checkpoint artifact from the current MLflow run without resetting the board. Opponent can mirror the player checkpoint or use its own selected checkpoint.
+          </p>
+          <div class="eval-row">
+            <label>Player</label>
+            <select
+              :value="userPolicySelection || ''"
+              :disabled="policiesLoading || props.isPolicySwapping || props.isEvaluating || props.isReplaying"
+              @change="handlePolicySelection('user', $event)"
+            >
+              <option v-if="availablePolicies.length === 0 && !userPolicySelection" disabled value="">
+                No checkpoints available
+              </option>
+              <option
+                v-for="policy in availablePolicies"
+                :key="`jax-player-checkpoint-${policy}`"
+                :value="policy"
+              >
+                {{ formatCheckpointLabel(policy) }}
+              </option>
+              <option
+                v-if="userPolicySelection && !availablePolicies.includes(userPolicySelection)"
+                :value="userPolicySelection"
+              >
+                {{ formatCheckpointLabel(userPolicySelection) }} (current)
+              </option>
+            </select>
+
+            <label>Opponent</label>
+            <select
+              :value="opponentPolicySelection || ''"
+              :disabled="policiesLoading || props.isPolicySwapping || props.isEvaluating || props.isReplaying"
+              @change="handlePolicySelection('opponent', $event)"
+            >
+              <option value="">Mirror player checkpoint</option>
+              <option
+                v-for="policy in availablePolicies"
+                :key="`jax-opponent-checkpoint-${policy}`"
+                :value="policy"
+              >
+                {{ formatCheckpointLabel(policy) }}
+              </option>
+              <option
+                v-if="opponentPolicySelection && opponentPolicySelection !== '' && !availablePolicies.includes(opponentPolicySelection)"
+                :value="opponentPolicySelection"
+              >
+                {{ formatCheckpointLabel(opponentPolicySelection) }} (current)
+              </option>
+            </select>
+
+            <button
+              class="ghost-btn"
+              @click="$emit('refresh-policies')"
+              :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
+              title="Refresh checkpoint list from MLflow"
+            >
+              <span v-if="policiesLoading">Loading...</span>
+              <span v-else>Refresh checkpoints</span>
+            </button>
+          </div>
+          <div class="status-note">
+            Current player: {{ formatCheckpointLabel(userPolicySelection) }}
+            <span v-if="opponentPolicySelection">
+              · opponent: {{ formatCheckpointLabel(opponentPolicySelection) }}
+            </span>
+            <span v-else>
+              · opponent mirrors player
+            </span>
+          </div>
+          <div v-if="policyLoadError" class="policy-status error">
+            {{ policyLoadError }}
+          </div>
+        </div>
+
+        <div v-if="playDiagnosticsEnabled" class="param-category selector-intent-card">
+          <h5>Live Play State</h5>
+          <div class="parameters-grid">
+            <div class="param-item" data-tooltip="Current offense play conditioning applied to the low-level policy.">
+              <span class="param-name">Offense play:</span>
+              <span class="param-value">{{ livePlaySummary.playLabel }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether an offense play is currently active.">
+              <span class="param-name">Active:</span>
+              <span class="param-value">{{ livePlaySummary.active ? 'Yes' : 'No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Number of environment steps elapsed under the current offense play.">
+              <span class="param-name">Age:</span>
+              <span class="param-value">{{ livePlaySummary.age }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Remaining commitment steps before selector reselection is eligible.">
+              <span class="param-name">Commitment remaining:</span>
+              <span class="param-value">{{ livePlaySummary.commitmentRemaining }}</span>
+            </div>
+            <div class="param-item" data-tooltip="App-side selector segment counter for this possession.">
+              <span class="param-name">Selector segment:</span>
+              <span class="param-value">{{ livePlaySummary.selectorSegmentIndex }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Most recent selector boundary that advanced the segment.">
+              <span class="param-name">Last boundary:</span>
+              <span class="param-value">{{ livePlaySummary.boundaryReason }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Boundary that would trigger if the next model-driven step started from the currently displayed state.">
+              <span class="param-name">Eligible boundary:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.eligibleBoundary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether JAX runtime selector logic is active for this loaded checkpoint and current team.">
+              <span class="param-name">Selector runtime:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.runtimeEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the loaded model exposes an intent selector head.">
+              <span class="param-name">Model selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.modelSelectorEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether selector training/runtime was enabled in the MLflow training params for this run.">
+              <span class="param-name">Training selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingSelectorEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the selector can reselect after timeout or completed-pass boundaries.">
+              <span class="param-name">Multiselect:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.multiselectEnabled }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether interactive JAX runtime bypasses training alpha fallback and samples from the learned selector distribution whenever possible.">
+              <span class="param-name">Force learned runtime:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.forceLearnedRuntime }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Effective runtime selector alpha. In dev UI this should normally be 1.0 so selection uses the learned selector instead of training-time uniform fallback.">
+              <span class="param-name">Runtime alpha:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.alpha }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current selector epsilon floor mixed into learned probabilities before alpha fallback.">
+              <span class="param-name">Runtime eps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.eps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Training alpha loaded from MLflow/checkpoint metadata before the dev-runtime override.">
+              <span class="param-name">Training alpha:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingAlpha }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Training epsilon loaded from MLflow/checkpoint metadata before the dev-runtime override.">
+              <span class="param-name">Training eps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.trainingEps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Minimum current-play age before a completed pass can trigger reselection.">
+              <span class="param-name">Min play steps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.minPlaySteps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Commitment length used when a new selector play is applied.">
+              <span class="param-name">Commitment steps:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.commitmentSteps }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Source of the last selector transition: learned_selector means sampled from learned selector distribution; uniform_fallback means alpha fallback chose uniformly.">
+              <span class="param-name">Last source:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionSource }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent index selected by the last selector transition.">
+              <span class="param-name">Last selected z:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionIntent }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Intent index that was active immediately before the last selector transition.">
+              <span class="param-name">Previous z:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionPreviousIntent }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the last selector transition changed the active play index. No means the selector resampled the same play.">
+              <span class="param-name">Changed play:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionChanged }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the last transition used the learned selector rather than uniform fallback.">
+              <span class="param-name">Used selector:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastTransitionUsedSelector }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Deployed probability assigned to the current play by the selector distribution.">
+              <span class="param-name">Current deployed prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentDeployedProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Raw learned selector probability for the current play before epsilon and alpha mixing.">
+              <span class="param-name">Current raw prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentRawProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Mixed selector probability for the current play after epsilon but before alpha fallback.">
+              <span class="param-name">Current mixed prob:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentMixedProb }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Rank of the current play by deployed selector probability; 1 is most likely.">
+              <span class="param-name">Current deployed rank:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.currentDeployedRank }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the previous executed step completed a pass and can be considered for pass-boundary reselection.">
+              <span class="param-name">Completed-pass boundary:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastCompletedPassBoundary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether that completed-pass boundary has reached the configured minimum play age and can trigger selector reselection now.">
+              <span class="param-name">Pass min met:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.completedPassMinStepsMet }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Additional current-play steps needed before a completed-pass boundary can trigger selector reselection.">
+              <span class="param-name">Pass min remaining:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.completedPassMinStepsRemaining }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the current offense play is visible to the defensive policy view.">
+              <span class="param-name">Defense-visible:</span>
+              <span class="param-value">{{ livePlaySummary.visibleToDefense ? 'Yes' : 'No' }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Current defense intent state, if defense intent learning is enabled.">
+              <span class="param-name">Defense play:</span>
+              <span class="param-value">{{ livePlaySummary.defensePlayLabel }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="param-category selector-intent-card">
+          <h5>Start Template</h5>
+          <p class="entropy-note">
+            Use the loaded template library as a playable setup. Loading a library alone does not change the board until you apply or start from a template.
+          </p>
+          <div v-if="hasLoadedStartTemplates" class="start-template-thumbnail-grid">
+            <button
+              v-for="thumb in startTemplateThumbnailModels"
+              :key="`policy-template-thumb-${thumb.id}`"
+              type="button"
+              class="start-template-thumbnail-btn"
+              :class="{ active: selectedStartTemplateId === thumb.id }"
+              :title="`Select ${thumb.label}${thumb.model.mirrored ? ' (mirrored)' : ''}`"
+              @click="selectStartTemplate(thumb.id)"
+            >
+              <svg
+                class="start-template-thumbnail-svg"
+                :viewBox="`0 0 ${thumb.model.viewBox.width} ${thumb.model.viewBox.height}`"
+                aria-hidden="true"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="thumb.model.court.x"
+                  :y="thumb.model.court.y"
+                  :width="thumb.model.court.width"
+                  :height="thumb.model.court.height"
+                  rx="4"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="thumb.model.court.backboardX"
+                  :y1="thumb.model.court.laneY"
+                  :x2="thumb.model.court.backboardX"
+                  :y2="thumb.model.court.laneY + thumb.model.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="thumb.model.court.hoopX"
+                  :cy="thumb.model.court.hoopY"
+                  :r="thumb.model.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="thumb.model.court.laneX"
+                  :y="thumb.model.court.laneY"
+                  :width="thumb.model.court.laneWidth"
+                  :height="thumb.model.court.laneHeight"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${thumb.model.court.arcLineX} ${thumb.model.court.arcTopY}
+                       A ${thumb.model.court.arcRadius} ${thumb.model.court.arcRadius} 0 0 1 ${thumb.model.court.arcLineX} ${thumb.model.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in thumb.model.entries"
+                  :key="`policy-thumb-${thumb.id}-${entry.key}`"
+                  :x="entry.x"
+                  :y="entry.y"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                  :class="['start-template-preview-marker', 'thumbnail-marker', `team-${entry.team}`]"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <span class="start-template-thumbnail-label">{{ thumb.label }}</span>
+            </button>
+          </div>
+          <div v-if="hasLoadedStartTemplates" class="eval-row">
+            <label>Template</label>
+            <select v-model="selectedStartTemplateId" :disabled="props.isEvaluating || props.isReplaying">
+              <option v-for="opt in startTemplateOptions" :key="`policy-template-${opt.value}`" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <label class="inline-label">
+              <input type="checkbox" v-model="selectedStartTemplateMirrored" :disabled="props.isEvaluating || props.isReplaying" />
+              Mirror
+            </label>
+            <button
+              class="ghost-btn"
+              @click="handleApplyStartTemplateToBoard"
+              :disabled="props.isEvaluating || props.isReplaying || !selectedStartTemplateId"
+            >
+              Apply to board
+            </button>
+            <button
+              class="ghost-btn"
+              @click="handleStartSelfPlayFromTemplate"
+              :disabled="props.isEvaluating || props.isReplaying || !props.aiMode || props.gameState?.done || !selectedStartTemplateId"
+            >
+              Start self-play from template
+            </button>
+          </div>
+          <div v-else class="policy-status">
+            No start-template library is loaded. Load one in the Template tab first.
+          </div>
+          <div v-if="startTemplateActionStatus" class="status-note">
+            {{ startTemplateActionStatus }}
+          </div>
+          <div v-if="startTemplateActionError" class="policy-status error">
+            {{ startTemplateActionError }}
+          </div>
+        </div>
+
         <div v-if="hasSelectorIntentPreferences" class="param-category selector-intent-card">
           <h5>Intent Preferences</h5>
           <div class="eval-row selector-plot-row">
@@ -5980,6 +7123,7 @@ const stealRisks = computed(() => {
           </p>
           <p class="entropy-note">
             Raw = selector softmax. Mixed = selector-branch probabilities after epsilon floor. Deployed = final runtime distribution after alpha mixes the selector branch with uniform fallback.
+            Click a play row to make it the active play for the current possession.
           </p>
           <div class="entropy-table-wrapper">
             <table class="entropy-table">
@@ -5998,8 +7142,18 @@ const stealRisks = computed(() => {
                   v-for="(item, idx) in selectorIntentPreferences.items"
                   :key="`selector-intent-${item.intent_index}`"
                   class="selector-intent-row"
-                  :class="{ 'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex) }"
+                  :class="{
+                    'current-intent-row': Number(item.intent_index) === Number(selectorIntentPreferences.currentIntentIndex),
+                    'selector-intent-row-disabled': intentControlsDisabled,
+                  }"
                   :style="{ '--selector-prob-width': `${Math.max(0, Math.min(100, getSelectorIntentPlotProb(item) * 100)).toFixed(2)}%` }"
+                  :tabindex="intentControlsDisabled ? -1 : 0"
+                  role="button"
+                  :aria-disabled="intentControlsDisabled ? 'true' : 'false'"
+                  :aria-label="`Activate ${formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name)}`"
+                  @click="activateIntentPreference(item)"
+                  @keydown.enter.prevent="activateIntentPreference(item)"
+                  @keydown.space.prevent="activateIntentPreference(item)"
                 >
                   <td>{{ idx + 1 }}</td>
                   <td>{{ formatPlayLabel(item.intent_index, props.gameState?.play_name_map, item.play_name) }}</td>
@@ -6011,6 +7165,15 @@ const stealRisks = computed(() => {
               </tbody>
             </table>
           </div>
+          <div class="policy-status error" v-if="intentStateError">
+            {{ intentStateError }}
+          </div>
+        </div>
+        <div
+          v-else-if="selectorEnabled"
+          class="policy-status"
+        >
+          {{ selectorIntentUnavailableReason }}
         </div>
 
         <div v-if="!policyProbabilities || !hasPolicyData" class="no-data">
@@ -6078,14 +7241,21 @@ const stealRisks = computed(() => {
           </div>
 
           <div class="eval-row">
-            <label>Rollouts</label>
+            <label>Rollouts / play</label>
             <input
               type="number"
               min="1"
-              max="512"
+              :max="playbookMaxRolloutsPerIntent"
               v-model.number="playbookNumRollouts"
               :disabled="playbookControlsDisabled"
             />
+            <span class="status-note">
+              Total: {{ playbookTotalRollouts.toLocaleString() }} rollouts
+              ({{ playbookRolloutsPerIntent.toLocaleString() }} per play × {{ playbookSelectedIntentIndices.length }} plays)
+            </span>
+            <span class="status-note" v-if="isJaxModel">
+              JAX Playbook uses a batched compiled path for checkpoint-backed models.
+            </span>
             <label>Horizon</label>
             <input
               type="number"
@@ -6109,6 +7279,14 @@ const stealRisks = computed(() => {
             >
               {{ playbookRunning ? 'Generating…' : 'Generate' }}
             </button>
+            <button
+              v-if="playbookRunning"
+              class="eval-run-btn secondary"
+              @click="handleCancelPlaybookAnalysis"
+              type="button"
+            >
+              Cancel
+            </button>
           </div>
 
           <div v-if="playbookRunning" class="eval-progress-wrap">
@@ -6126,7 +7304,7 @@ const stealRisks = computed(() => {
               />
             </div>
             <span class="eval-status">
-              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || (playbookSelectedIntentIndices.length * Number(playbookNumRollouts || 0)) }}
+              {{ playbookProgressSafe.completed }}/{{ playbookProgressSafe.total || playbookTotalRollouts }}
             </span>
             <span class="eval-status" v-if="playbookProgressSafe.total > 0">({{ playbookProgressPercent }})</span>
           </div>
@@ -6203,6 +7381,7 @@ const stealRisks = computed(() => {
                 <th>Avg First Shot Step</th>
                 <th>Avg Terminated Steps</th>
                 <th>Primary Shooter</th>
+                <th>Next Selected Plays</th>
                 <th
                   v-for="playerId in playbookOffenseColumnIds"
                   :key="`playbook-summary-head-p${playerId}`"
@@ -6227,6 +7406,7 @@ const stealRisks = computed(() => {
                 <td>{{ panel?.avg_first_shot_step == null ? 'none' : Number(panel.avg_first_shot_step).toFixed(2) }}</td>
                 <td>{{ panel?.avg_terminated_steps == null ? 'n/a' : Number(panel.avg_terminated_steps).toFixed(2) }}</td>
                 <td>{{ getPlaybookPrimaryShooterSummary(panel) }}</td>
+                <td>{{ formatPlaybookNextIntentSummary(panel) }}</td>
                 <td
                   v-for="playerId in playbookOffenseColumnIds"
                   :key="`playbook-summary-${panel.intent_index}-p${playerId}`"
@@ -6466,17 +7646,69 @@ const stealRisks = computed(() => {
             <span v-if="templateCopyStatus" class="status-note">{{ templateCopyStatus }}</span>
           </div>
           <div
-            v-if="editableTemplateOptions.length"
-            class="template-library-chip-list"
+            v-if="editableTemplateThumbnailModels.length"
+            class="start-template-thumbnail-grid template-editor-thumbnail-grid"
           >
             <button
-              v-for="opt in editableTemplateOptions"
-              :key="`template-chip-${opt.value}`"
-              class="template-chip-btn"
-              :class="{ active: selectedEditableTemplateId === opt.value }"
-              @click="selectedEditableTemplateId = opt.value"
+              v-for="thumb in editableTemplateThumbnailModels"
+              :key="`editable-template-thumb-${thumb.id}`"
+              type="button"
+              class="start-template-thumbnail-btn"
+              :class="{ active: selectedEditableTemplateId === thumb.id }"
+              :title="`Edit ${thumb.label}`"
+              @click="selectedEditableTemplateId = thumb.id"
             >
-              {{ opt.label }}
+              <svg
+                class="start-template-thumbnail-svg"
+                :viewBox="`0 0 ${thumb.model.viewBox.width} ${thumb.model.viewBox.height}`"
+                aria-hidden="true"
+              >
+                <rect
+                  class="start-template-preview-board"
+                  :x="thumb.model.court.x"
+                  :y="thumb.model.court.y"
+                  :width="thumb.model.court.width"
+                  :height="thumb.model.court.height"
+                  rx="4"
+                />
+                <line
+                  class="start-template-preview-line"
+                  :x1="thumb.model.court.backboardX"
+                  :y1="thumb.model.court.laneY"
+                  :x2="thumb.model.court.backboardX"
+                  :y2="thumb.model.court.laneY + thumb.model.court.laneHeight"
+                />
+                <circle
+                  class="start-template-preview-line"
+                  :cx="thumb.model.court.hoopX"
+                  :cy="thumb.model.court.hoopY"
+                  :r="thumb.model.court.hoopRadius"
+                />
+                <rect
+                  class="start-template-preview-line"
+                  :x="thumb.model.court.laneX"
+                  :y="thumb.model.court.laneY"
+                  :width="thumb.model.court.laneWidth"
+                  :height="thumb.model.court.laneHeight"
+                />
+                <path
+                  class="start-template-preview-line"
+                  :d="`M ${thumb.model.court.arcLineX} ${thumb.model.court.arcTopY}
+                       A ${thumb.model.court.arcRadius} ${thumb.model.court.arcRadius} 0 0 1 ${thumb.model.court.arcLineX} ${thumb.model.court.arcBottomY}`"
+                />
+                <text
+                  v-for="entry in thumb.model.entries"
+                  :key="`editable-thumb-${thumb.id}-${entry.key}`"
+                  :x="entry.x"
+                  :y="entry.y"
+                  text-anchor="middle"
+                  dominant-baseline="middle"
+                  :class="['start-template-preview-marker', 'thumbnail-marker', `team-${entry.team}`]"
+                >
+                  {{ entry.marker }}
+                </text>
+              </svg>
+              <span class="start-template-thumbnail-label">{{ thumb.label }}</span>
             </button>
           </div>
         </div>
@@ -6730,6 +7962,103 @@ const stealRisks = computed(() => {
         </span>
       </div>
 
+      <div class="eval-row">
+        <label>Start templates</label>
+        <select
+          :value="evalConfigSafe.startTemplateMode"
+          :disabled="props.isEvaluating"
+          @change="setEvalStartTemplateMode($event.target.value)"
+        >
+          <option value="checkpoint">Checkpoint/default behavior</option>
+          <option value="enabled" :disabled="!hasLoadedStartTemplates">Use loaded template library</option>
+          <option value="disabled">Disable templates for eval</option>
+        </select>
+        <span v-if="hasLoadedStartTemplates" class="status-note">
+          {{ startTemplateOptions.length }} templates loaded from {{ templateLibrarySourceLabel }}.
+        </span>
+        <span v-else class="status-note">
+          No template library loaded.
+        </span>
+      </div>
+
+      <div v-if="evalConfigSafe.startTemplateMode === 'checkpoint'" class="eval-row">
+        <label>Effective template settings</label>
+        <span class="status-note">
+          enabled: {{ evalCheckpointTemplateSettings.enabled ? 'Yes' : 'No' }}
+          · prob: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.prob, 2) }}
+          · jitter: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.jitter, 2) }}
+          · mirror: {{ formatEvalTemplateNumber(evalCheckpointTemplateSettings.mirror, 2) }}
+        </span>
+      </div>
+      <div v-if="evalConfigSafe.startTemplateMode === 'checkpoint' && evalCheckpointTemplateSettings.source !== 'N/A'" class="eval-row">
+        <label>Template source</label>
+        <span class="status-note path-note">{{ evalCheckpointTemplateSettings.source }}</span>
+      </div>
+      <div v-else-if="evalConfigSafe.startTemplateMode === 'disabled'" class="eval-row">
+        <label>Effective template settings</label>
+        <span class="status-note">Templates forced off for this eval run.</span>
+      </div>
+
+      <div v-if="evalConfigSafe.startTemplateMode === 'enabled'" class="eval-row">
+        <label>Template eval params</label>
+        <label class="inline-label compact-field">
+          prob
+          <span
+            class="template-help"
+            data-tooltip="Probability that each eval episode starts from a sampled template. 1.0 means every episode uses the loaded template library; 0.0 falls back to the normal spawn generator."
+            title="Probability that each eval episode starts from a sampled template."
+            aria-label="Template probability help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            :value="evalConfigSafe.startTemplateProb"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateProb', $event.target.value, { min: 0, max: 1 })"
+          />
+        </label>
+        <label class="inline-label compact-field">
+          jitter
+          <span
+            class="template-help"
+            data-tooltip="Global multiplier for each template anchor's jitter radius. 0 keeps exact template positions; higher values randomize positions around each anchor."
+            title="Global multiplier for template position jitter."
+            aria-label="Template jitter help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            :value="evalConfigSafe.startTemplateJitterScale"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateJitterScale', $event.target.value, { min: 0, max: 10 })"
+          />
+        </label>
+        <label class="inline-label compact-field">
+          mirror
+          <span
+            class="template-help"
+            data-tooltip="Probability of left-right mirroring for mirrorable templates. 0 never mirrors; 1 always mirrors when the selected template permits mirroring."
+            title="Probability of mirroring mirrorable templates."
+            aria-label="Template mirror help"
+            tabindex="0"
+          >?</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            :value="evalConfigSafe.startTemplateMirrorProb"
+            :disabled="props.isEvaluating"
+            @input="setEvalStartTemplateNumber('startTemplateMirrorProb', $event.target.value, { min: 0, max: 1 })"
+          />
+        </label>
+      </div>
+
       <div v-if="evalModeIsCustom" class="eval-custom">
         <div class="eval-row">
           <label class="inline-label">
@@ -6801,6 +8130,18 @@ const stealRisks = computed(() => {
         </div>
         <div v-else>
         <div class="parameters-grid">
+          <div v-if="isJaxModel" class="param-category">
+            <h5>Model Runtime</h5>
+            <div
+              v-for="row in jaxRuntimeRows"
+              :key="`jax-runtime-${row.label}`"
+              class="param-item"
+              :data-tooltip="row.tooltip"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+          </div>
           <div v-if="hasLoadedStartTemplates" class="param-category">
             <h5>Start Templates</h5>
             <div class="eval-row">
@@ -7452,6 +8793,18 @@ const stealRisks = computed(() => {
             </div>
           </div>
 
+          <div v-if="isJaxModel" class="param-category">
+            <h5>Advanced JAX Metadata</h5>
+            <details class="jax-metadata-details">
+              <summary>Environment config</summary>
+              <pre class="jax-config-pre">{{ prettyJson(jaxEnvConfig) }}</pre>
+            </details>
+            <details class="jax-metadata-details">
+              <summary>Policy spec</summary>
+              <pre class="jax-config-pre">{{ jaxPolicySpecText }}</pre>
+            </details>
+          </div>
+
           <div class="param-category">
             <h5>Counterfactual Snapshot</h5>
             <div class="param-item" data-tooltip="Whether a branch point snapshot is currently stored for restoring the exact current state later.">
@@ -7665,6 +9018,22 @@ const stealRisks = computed(() => {
           No training parameters available
         </div>
         <div v-else class="parameters-grid">
+          <div v-if="isJaxModel" class="param-category">
+            <h5>JAX PPO Loop</h5>
+            <div
+              v-for="row in jaxTrainingLoopRows"
+              :key="`jax-training-loop-${row.label}`"
+              class="param-item"
+              :data-tooltip="row.tooltip"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+            <details class="jax-metadata-details">
+              <summary>Trainer config</summary>
+              <pre class="jax-config-pre">{{ jaxTrainerConfigText }}</pre>
+            </details>
+          </div>
           <div class="param-category">
             <h5>PPO Core</h5>
             <div class="param-item" data-tooltip="Step size for gradient descent. Lower = slower but more stable training.">
@@ -8223,6 +9592,32 @@ const stealRisks = computed(() => {
                 <td v-if="risk > 0" class="notes highlight">⚠️ Risk</td>
                 <td v-else class="notes">Safe</td>
               </tr>
+
+              <!-- Role Flag -->
+              <tr class="group-role-flag">
+                <td class="group-label">Role Flag</td>
+                <td>Observer role</td>
+                <td class="value-mono">{{ roleFlagObsValue.toFixed(4) }}</td>
+                <td class="notes">{{ roleFlagObsValue > 0 ? 'Offense policy view' : 'Defense policy view' }}</td>
+              </tr>
+
+              <!-- Offense Skill Deltas -->
+              <tr
+                v-for="(delta, idx) in offenseSkillDeltas"
+                :key="`skill-delta-${idx}`"
+                class="group-skill-deltas"
+              >
+                <td
+                  v-if="idx === 0"
+                  :rowspan="offenseSkillDeltas.length"
+                  class="group-label"
+                >
+                  Offense Skill Deltas
+                </td>
+                <td>{{ offenseSkillDeltaLabel(idx) }}</td>
+                <td class="value-mono">{{ delta.toFixed(4) }}</td>
+                <td class="notes">Sampled player skill minus configured mean</td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -8293,6 +9688,18 @@ const stealRisks = computed(() => {
               </div>
               <div v-else class="token-table-wrapper">
                 <div class="token-attn-controls" v-if="tokenAttentionHeads">
+                  <template v-if="tokenAttentionObserverOptions.length > 1">
+                    <label for="token-attn-observer">Observer:</label>
+                    <select id="token-attn-observer" v-model="attentionObserverView">
+                      <option
+                        v-for="option in tokenAttentionObserverOptions"
+                        :key="`attn-observer-${option.value}`"
+                        :value="option.value"
+                      >
+                        {{ option.label }}
+                      </option>
+                    </select>
+                  </template>
                   <label for="token-attn-view">View:</label>
                   <select id="token-attn-view" v-model="attentionView">
                     <option value="avg">Average</option>
@@ -8430,6 +9837,21 @@ const stealRisks = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+
+.jax-config-pre {
+  margin: 0;
+  padding: 0.75rem;
+  max-height: 18rem;
+  overflow: auto;
+  border: 1px solid var(--app-panel-border);
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--app-text);
+  font-size: 0.85rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Player tabs */
@@ -8799,6 +10221,7 @@ const stealRisks = computed(() => {
   background-image: linear-gradient(90deg, rgba(56, 189, 248, 0.24), rgba(56, 189, 248, 0.24));
   background-repeat: no-repeat;
   background-size: var(--selector-prob-width) 100%;
+  cursor: pointer;
   transition: background-size 160ms ease-out;
 }
 
@@ -8813,6 +10236,20 @@ const stealRisks = computed(() => {
 .probability-bar-row:hover td,
 .selector-intent-row:hover td {
   background: rgba(148, 163, 184, 0.06);
+}
+
+.selector-intent-row:focus-visible td {
+  outline: 1px solid rgba(56, 189, 248, 0.75);
+  outline-offset: -2px;
+}
+
+.selector-intent-row-disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.selector-intent-row-disabled:hover td {
+  background: transparent;
 }
 
 .current-intent-row {
@@ -8857,7 +10294,7 @@ const stealRisks = computed(() => {
 }
 
 .reward-table.with-phi .reward-header {
-  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr 1fr;
 }
 
 .reward-row {
@@ -8871,7 +10308,7 @@ const stealRisks = computed(() => {
 }
 
 .reward-table.with-phi .reward-row {
-  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.5fr 1fr 1.5fr 1fr 1fr;
 }
 
 .reward-row:last-child {
@@ -9178,6 +10615,63 @@ const stealRisks = computed(() => {
 
 .start-template-preview-marker.team-defense {
   fill: rgba(226, 232, 240, 0.82);
+}
+
+.start-template-thumbnail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+  margin: 0.85rem 0 1rem;
+}
+
+.template-editor-thumbnail-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.start-template-thumbnail-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: stretch;
+  padding: 0.55rem;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--app-text);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+
+.start-template-thumbnail-btn:hover {
+  border-color: rgba(56, 189, 248, 0.58);
+  background: rgba(15, 23, 42, 0.78);
+  transform: translateY(-1px);
+}
+
+.start-template-thumbnail-btn.active {
+  border-color: var(--app-accent);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35), 0 10px 24px rgba(8, 47, 73, 0.22);
+}
+
+.start-template-thumbnail-svg {
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+  border-radius: 9px;
+}
+
+.start-template-preview-marker.thumbnail-marker {
+  font-size: 19px;
+}
+
+.start-template-thumbnail-label {
+  overflow: hidden;
+  color: var(--app-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .param-category h5 {
@@ -9704,6 +11198,9 @@ const stealRisks = computed(() => {
   align-items: center;
   gap: 0.35rem;
 }
+.eval-tab .compact-field input {
+  width: 5.5rem;
+}
 .playbook-controls .eval-row {
   display: flex;
   gap: 0.75rem;
@@ -9959,9 +11456,15 @@ const stealRisks = computed(() => {
   transition: opacity 0.2s ease, visibility 0.2s ease;
 }
 .template-help[data-tooltip]:hover::before,
-.template-help[data-tooltip]:hover::after {
+.template-help[data-tooltip]:hover::after,
+.template-help[data-tooltip]:focus::before,
+.template-help[data-tooltip]:focus::after {
   opacity: 1;
   visibility: visible;
+}
+.template-help:focus {
+  outline: 2px solid rgba(56, 189, 248, 0.65);
+  outline-offset: 2px;
 }
 .template-library-chip-list {
   display: flex;

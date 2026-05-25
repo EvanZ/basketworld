@@ -143,6 +143,36 @@ def test_counterfactual_snapshot_restores_state_and_rng(isolated_game_state):
     ]
 
 
+def test_play_name_map_prefers_policy_metadata(isolated_game_state):
+    env = HexagonBasketballEnv(
+        players=3,
+        enable_intent_learning=True,
+        num_intents=3,
+        training_team=Team.OFFENSE,
+    )
+    isolated_game_state.env = env
+    isolated_game_state.unified_policy = type(
+        "PolicyWithMetadata",
+        (),
+        {
+            "metadata": {
+                "play_name_map": {
+                    "0": "Atlas Cut",
+                    "1": "Cinder Flare",
+                    "2": "Nova Screen",
+                    "9": "Ignored Extra",
+                }
+            }
+        },
+    )()
+
+    assert backend_state.get_current_play_name_map(3) == {
+        "0": "Atlas Cut",
+        "1": "Cinder Flare",
+        "2": "Nova Screen",
+    }
+
+
 def test_counterfactual_snapshot_routes_capture_and_restore(isolated_game_state):
     _init_live_game(isolated_game_state)
     baseline_positions = [tuple(pos) for pos in isolated_game_state.env.positions]
@@ -306,6 +336,45 @@ def test_playbook_analysis_run_to_end_ignores_max_steps(isolated_game_state, mon
     assert progress["total"] == 1
 
 
+def test_playbook_analysis_can_be_cancelled(isolated_game_state, monkeypatch):
+    _init_live_game(isolated_game_state)
+    backend_state.capture_counterfactual_snapshot()
+
+    steps = {"count": 0}
+
+    def fake_step(_req):
+        steps["count"] += 1
+        admin_routes.cancel_playbook_analysis_route()
+        return {
+            "state": {
+                "done": False,
+                "positions": [tuple(pos) for pos in isolated_game_state.env.positions],
+                "ball_holder": isolated_game_state.env.ball_holder,
+                "last_action_results": {},
+            }
+        }
+
+    monkeypatch.setattr(lifecycle_routes, "step", fake_step)
+
+    body = admin_routes.playbook_analysis_route(
+        PlaybookAnalysisRequest(
+            intent_indices=[0],
+            num_rollouts=2,
+            max_steps=8,
+            run_to_end=False,
+            use_snapshot=True,
+            player_deterministic=False,
+            opponent_deterministic=True,
+        )
+    )
+
+    assert body["status"] == "cancelled"
+    assert steps["count"] == 1
+    progress = admin_routes.playbook_progress()
+    assert progress["status"] == "cancelled"
+    assert progress["running"] is False
+
+
 def test_playbook_analysis_parallel_path_passes_training_params_and_merges_payload(
     isolated_game_state,
     monkeypatch,
@@ -450,7 +519,7 @@ def test_init_game_clears_counterfactual_snapshot(monkeypatch, isolated_game_sta
         },
     )
     monkeypatch.setattr(lifecycle_routes, "get_unified_policy_path", lambda client, run_id, unified_name=None: "/tmp/fake.zip")
-    monkeypatch.setattr(lifecycle_routes, "load_ppo_for_inference", lambda *args, **kwargs: DummyPPO())
+    monkeypatch.setattr(lifecycle_routes, "load_inference_policy", lambda *args, **kwargs: DummyPPO())
     monkeypatch.setattr(lifecycle_routes, "validate_policy_observation_schema", lambda policy, env, obs, **kwargs: obs)
     monkeypatch.setattr(lifecycle_routes, "_compute_param_counts_from_policy", lambda policy: None)
     monkeypatch.setattr(lifecycle_routes.mlflow.tracking, "MlflowClient", lambda: object())

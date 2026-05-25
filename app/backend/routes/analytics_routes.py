@@ -161,6 +161,21 @@ def get_rewards():
     sys.stdout.flush()
 
     mlflow_phi_params = game_state.mlflow_phi_shaping_params
+    phi_params_source = "mlflow"
+    if not (mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False)):
+        env = getattr(game_state, "env", None)
+        if env is not None and bool(get_env_attr(env, "enable_phi_shaping", False)):
+            mlflow_phi_params = {
+                "enable_phi_shaping": True,
+                "phi_beta": float(get_env_attr(env, "phi_beta", 0.0)),
+                "reward_shaping_gamma": float(get_env_attr(env, "reward_shaping_gamma", 1.0)),
+                "phi_aggregation_mode": str(get_env_attr(env, "phi_aggregation_mode", "team_best")),
+                "phi_use_ball_handler_only": bool(
+                    get_env_attr(env, "phi_use_ball_handler_only", False)
+                ),
+                "phi_blend_weight": float(get_env_attr(env, "phi_blend_weight", 0.0)),
+            }
+            phi_params_source = "env"
     mlflow_phi_r_shape_values = []
     if mlflow_phi_params and mlflow_phi_params.get("enable_phi_shaping", False):
         beta = mlflow_phi_params.get("phi_beta", 0.0)
@@ -276,6 +291,8 @@ def get_rewards():
                 "defense": 0.0,
                 "offense_reason": "Initial State",
                 "defense_reason": "Initial State",
+                "mlflow_phi_r_shape": 0.0,
+                "env_phi_r_shape": 0.0,
                 "mlflow_phi_potential": float(initial_phi),
             }
         )
@@ -309,6 +326,8 @@ def get_rewards():
                 "defense": float(defense_with_mlflow),
                 "offense_reason": reward.get("offense_reason", "Unknown"),
                 "defense_reason": reward.get("defense_reason", "Unknown"),
+                "mlflow_phi_r_shape": float(mlflow_phi_r_shape),
+                "env_phi_r_shape": float(env_phi_r_shape_total),
                 "mlflow_phi_potential": float(mlflow_phi_potential),
             }
         )
@@ -353,4 +372,5 @@ def get_rewards():
         },
         "reward_params": reward_params,
         "mlflow_phi_params": mlflow_phi_params_serialized,
+        "phi_params_source": phi_params_source if mlflow_phi_params_serialized else None,
     }

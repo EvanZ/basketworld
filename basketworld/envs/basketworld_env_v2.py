@@ -1384,6 +1384,14 @@ class HexagonBasketballEnv(gym.Env):
 
         # Check shot clock expiration
         if self.shot_clock <= 0:
+            if not action_results.get("shots") and not action_results.get("turnovers"):
+                action_results["turnovers"].append(
+                    {
+                        "player_id": None,
+                        "reason": "shot_clock_violation",
+                        "turnover_pos": None,
+                    }
+                )
             done = True
 
         self.episode_ended = done

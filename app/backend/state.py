@@ -14,6 +14,16 @@ from basketworld.utils.play_names import (
 )
 from basketworld.utils.wrappers import SetObservationWrapper
 from app.backend.env_access import env_view, get_env_attr
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    get_policy_metadata,
+    policy_attention_payload,
+    policy_observation_tokens,
+    policy_observation_vector,
+    prepare_policy_for_role,
+    unwrap_policy_module,
+)
 
 
 class GameState:
@@ -21,6 +31,9 @@ class GameState:
 
     def __init__(self):
         self.env = None
+        # JAX-native dev runtime. When set, JAX checkpoints should use this for
+        # interactive reset/step instead of stepping the Python env bridge.
+        self.jax_runtime = None
         self.offense_policy = None
         self.defense_policy = None
         self.unified_policy = None
@@ -37,6 +50,10 @@ class GameState:
         self.unified_policy_key: str | None = None
         # Opponent unified policy (if different from unified)
         self.opponent_unified_policy_key: str | None = None
+        self.unified_policy_backend: str | None = None
+        self.defense_policy_backend: str | None = None
+        self.unified_policy_capabilities: dict | None = None
+        self.defense_policy_capabilities: dict | None = None
         # Self-play / replay tracking
         self.self_play_active: bool = False
         self.replay_seed: int | None = None
@@ -103,6 +120,7 @@ class GameState:
             "finished_at": None,
             "status": "idle",
             "error": None,
+            "cancel_requested": False,
         }
 
 
@@ -171,6 +189,7 @@ def reset_playbook_progress(total: int = 0) -> None:
             "finished_at": None,
             "status": "running" if total > 0 else "idle",
             "error": None,
+            "cancel_requested": False,
         }
 
 
@@ -180,12 +199,17 @@ def update_playbook_progress(completed: int, total: int | None = None) -> None:
         next_total = current_total if total is None else int(max(0, total))
         next_completed = int(max(0, completed))
         running = next_completed < next_total if next_total > 0 else False
+        cancel_requested = bool(game_state.playbook_progress.get("cancel_requested"))
         game_state.playbook_progress.update(
             {
                 "completed": next_completed,
                 "total": next_total,
                 "running": running,
-                "status": "running" if running else ("completed" if next_total > 0 else "idle"),
+                "status": (
+                    "cancel_requested"
+                    if cancel_requested
+                    else ("running" if running else ("completed" if next_total > 0 else "idle"))
+                ),
             }
         )
         if not running and next_total > 0:
@@ -200,6 +224,38 @@ def fail_playbook_progress(error: str) -> None:
                 "status": "failed",
                 "error": str(error),
                 "finished_at": time.time(),
+                "cancel_requested": False,
+            }
+        )
+
+
+def request_playbook_cancel() -> dict:
+    with game_state._playbook_progress_lock:
+        running = bool(game_state.playbook_progress.get("running"))
+        game_state.playbook_progress.update(
+            {
+                "cancel_requested": True,
+                "status": "cancel_requested" if running else "cancelled",
+                "running": running,
+                "finished_at": None if running else time.time(),
+            }
+        )
+        return dict(game_state.playbook_progress)
+
+
+def playbook_cancel_requested() -> bool:
+    with game_state._playbook_progress_lock:
+        return bool(game_state.playbook_progress.get("cancel_requested"))
+
+
+def cancel_playbook_progress() -> None:
+    with game_state._playbook_progress_lock:
+        game_state.playbook_progress.update(
+            {
+                "running": False,
+                "status": "cancelled",
+                "finished_at": time.time(),
+                "cancel_requested": False,
             }
         )
 
@@ -268,6 +324,50 @@ def _build_counterfactual_snapshot_metadata() -> dict:
     }
 
 
+def _coerce_play_name_map(raw_map, *, num_intents: int | None = None) -> dict[str, str]:
+    if not isinstance(raw_map, dict):
+        return {}
+    out: dict[str, str] = {}
+    limit = None if num_intents is None else max(0, int(num_intents))
+    for raw_idx, raw_name in raw_map.items():
+        try:
+            idx = int(raw_idx)
+        except Exception:
+            continue
+        if idx < 0 or (limit is not None and idx >= limit):
+            continue
+        name = str(raw_name or "").strip()
+        if name:
+            out[str(idx)] = name
+    return out
+
+
+def _play_name_map_from_metadata(metadata: dict | None, *, num_intents: int | None = None) -> dict[str, str]:
+    if not isinstance(metadata, dict):
+        return {}
+    direct = _coerce_play_name_map(metadata.get("play_name_map"), num_intents=num_intents)
+    if direct:
+        return direct
+    play_meta = metadata.get("play_name_metadata")
+    if not isinstance(play_meta, dict):
+        return {}
+    mapped: dict[str, str] = {}
+    limit = None if num_intents is None else max(0, int(num_intents))
+    for item in play_meta.get("play_names", []) or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("intent_index"))
+        except Exception:
+            continue
+        if idx < 0 or (limit is not None and idx >= limit):
+            continue
+        name = str(item.get("play_name", "")).strip()
+        if name:
+            mapped[str(idx)] = name
+    return mapped
+
+
 def get_current_play_name_map(num_intents: int | None = None) -> dict[str, str]:
     env_obj = env_view(game_state.env) if game_state.env else None
     count = int(
@@ -280,6 +380,17 @@ def get_current_play_name_map(num_intents: int | None = None) -> dict[str, str]:
     )
     if count <= 0:
         return {}
+    for policy_obj in (
+        getattr(game_state, "unified_policy", None),
+        getattr(game_state, "offense_policy", None),
+        getattr(game_state, "defense_policy", None),
+    ):
+        mapping = _play_name_map_from_metadata(
+            get_policy_metadata(policy_obj),
+            num_intents=count,
+        )
+        if mapping:
+            return mapping
     seed_key = play_name_seed_key(
         run_id=getattr(game_state, "run_id", None),
         unified_policy_key=getattr(game_state, "unified_policy_key", None),
@@ -311,8 +422,14 @@ def _capture_restorable_backend_state() -> dict:
     if not game_state.env or game_state.obs is None:
         raise RuntimeError("Game not initialized.")
 
+    jax_runtime = getattr(game_state, "jax_runtime", None)
     return {
         "env": copy.deepcopy(game_state.env),
+        "jax_runtime": (
+            jax_runtime.capture_snapshot()
+            if jax_runtime is not None and hasattr(jax_runtime, "capture_snapshot")
+            else None
+        ),
         "user_team": copy.deepcopy(game_state.user_team),
         "obs": copy.deepcopy(game_state.obs),
         "prev_obs": copy.deepcopy(game_state.prev_obs),
@@ -365,8 +482,13 @@ def _restore_restorable_backend_state(snapshot: dict) -> None:
         snapshot.get("selector_last_boundary_reason", None)
     )
 
-    _rebuild_cached_obs()
-    _capture_turn_start_snapshot()
+    jax_snapshot = snapshot.get("jax_runtime")
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None and jax_snapshot is not None:
+        jax_runtime.restore_snapshot(jax_snapshot, game_state=game_state)
+    else:
+        _rebuild_cached_obs()
+        _capture_turn_start_snapshot()
 
 
 def get_counterfactual_snapshot_summary() -> dict:
@@ -408,6 +530,15 @@ def get_full_game_state(
     include_state_values: bool = False,
 ):
     """Construct a JSON-friendly snapshot of the current game state."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        return jax_runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=include_policy_probs,
+            include_action_values=include_action_values,
+            include_state_values=include_state_values,
+        )
+
     if not game_state.env:
         return {}
 
@@ -422,7 +553,6 @@ def get_full_game_state(
     from app.backend.selector_runtime import selector_ranked_intent_preferences
     from basketworld.utils.intent_policy_sensitivity import (
         clear_policy_runtime_intent_override,
-        sync_policy_runtime_intent_override_from_env,
     )
 
     # Use FastAPI's jsonable_encoder for numpy-safe encoding
@@ -520,10 +650,55 @@ def get_full_game_state(
         except Exception:
             obs_tokens = obs_tokens
 
+    if get_policy_backend_kind(game_state.unified_policy) == "jax":
+        try:
+            obs_like = game_state.obs if isinstance(game_state.obs, dict) else {}
+            role_flag_arr = np.asarray(
+                obs_like.get("role_flag", [1.0]),
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0) if role_flag_arr.size else True
+            jax_tokens = policy_observation_tokens(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+            if jax_tokens is not None:
+                obs_tokens = {
+                    key: (
+                        value.tolist()
+                        if hasattr(value, "tolist")
+                        else value
+                    )
+                    for key, value in dict(jax_tokens).items()
+                }
+        except Exception:
+            obs_tokens = obs_tokens
+
     attention_payload = None
     if obs_tokens is not None and game_state.unified_policy is not None:
         try:
-            policy_obj = getattr(game_state.unified_policy, "policy", None)
+            obs_like = game_state.obs if isinstance(game_state.obs, dict) else {}
+            role_flag_arr = np.asarray(
+                obs_like.get("role_flag", [1.0]),
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0)
+            attention_payload = policy_attention_payload(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+        except Exception:
+            attention_payload = None
+
+    if attention_payload is None and obs_tokens is not None and game_state.unified_policy is not None:
+        try:
+            unified_caps = get_policy_capabilities(game_state.unified_policy) or {}
+            if not unified_caps.get("attention", True):
+                policy_obj = None
+            else:
+                policy_obj = unwrap_policy_module(game_state.unified_policy)
             extractor = getattr(policy_obj, "features_extractor", None)
             if (
                 extractor is not None
@@ -575,7 +750,7 @@ def get_full_game_state(
                 device = next(extractor.parameters()).device
                 try:
                     with torch.no_grad():
-                        sync_policy_runtime_intent_override_from_env(
+                        prepare_policy_for_role(
                             game_state.unified_policy,
                             game_state.env,
                             observer_is_offense=observer_is_offense,
@@ -686,6 +861,23 @@ def get_full_game_state(
     counterfactual_snapshot = get_counterfactual_snapshot_summary()
     base_env = getattr(game_state.env, "unwrapped", game_state.env)
     play_name_map = get_current_play_name_map(int(getattr(env, "num_intents", 0) or 0))
+    obs_vector = game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else []
+    if get_policy_backend_kind(game_state.unified_policy) == "jax":
+        try:
+            role_flag_arr = np.asarray(
+                game_state.obs.get("role_flag", [1.0]) if game_state.obs else [1.0],
+                dtype=np.float32,
+            ).reshape(-1)
+            observer_is_offense = bool(float(role_flag_arr[0]) > 0.0) if role_flag_arr.size else True
+            jax_obs = policy_observation_vector(
+                game_state.unified_policy,
+                game_state.env,
+                observer_is_offense=observer_is_offense,
+            )
+            if jax_obs is not None:
+                obs_vector = np.asarray(jax_obs, dtype=np.float32).reshape(-1).tolist()
+        except Exception:
+            obs_vector = obs_vector
 
     state = {
         "players_per_side": int(env.players_per_side or 3),
@@ -716,7 +908,7 @@ def get_full_game_state(
         "counterfactual_snapshot_captured_at": counterfactual_snapshot["captured_at"],
         "action_space": {action.name: action.value for action in ActionType},
         "action_mask": action_mask_py,
-        "obs": game_state.obs["obs"].tolist() if game_state.obs and "obs" in game_state.obs else [],
+        "obs": obs_vector,
         "obs_tokens": (
             {**obs_tokens, "attention": attention_payload} if obs_tokens is not None else None
         ),
@@ -849,10 +1041,23 @@ def get_full_game_state(
             else "noop"
         ),
         "pass_logit_bias": float(
-            getattr(game_state.unified_policy.policy, "pass_logit_bias", 0.0)
+            getattr(unwrap_policy_module(game_state.unified_policy), "pass_logit_bias", 0.0)
             if game_state.unified_policy
-            and hasattr(game_state.unified_policy, "policy")
             else 0.0
+        ),
+        "model_backend": get_policy_backend_kind(getattr(game_state, "unified_policy", None)),
+        "model_capabilities": copy.deepcopy(
+            get_policy_capabilities(getattr(game_state, "unified_policy", None))
+        ),
+        "model_metadata": copy.deepcopy(
+            get_policy_metadata(getattr(game_state, "unified_policy", None))
+        ),
+        "opponent_model_backend": get_policy_backend_kind(getattr(game_state, "defense_policy", None)),
+        "opponent_model_capabilities": copy.deepcopy(
+            get_policy_capabilities(getattr(game_state, "defense_policy", None))
+        ),
+        "opponent_model_metadata": copy.deepcopy(
+            get_policy_metadata(getattr(game_state, "defense_policy", None))
         ),
         "run_id": getattr(game_state, "run_id", None),
         "run_name": getattr(game_state, "run_name", None),

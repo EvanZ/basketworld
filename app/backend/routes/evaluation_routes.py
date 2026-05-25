@@ -1,3 +1,4 @@
+import copy
 import time
 import multiprocessing as mp
 
@@ -35,6 +36,84 @@ _NUMPY_SAFE_ENCODER = {
 def _to_jsonable(value):
     """Force NumPy-safe, JSON-serializable payloads for FastAPI responses."""
     return jsonable_encoder(value, custom_encoder=_NUMPY_SAFE_ENCODER)
+
+
+def _clip_probability(value, *, default: float) -> float:
+    try:
+        numeric = float(default if value is None else value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    return float(max(0.0, min(1.0, numeric)))
+
+
+def _build_evaluation_optional_params(request: EvaluationRequest) -> tuple[dict, dict]:
+    """Apply eval-only start-template overrides without mutating session metadata."""
+    optional_params = copy.deepcopy(game_state.env_optional_params or {})
+    template_library = copy.deepcopy(
+        getattr(game_state, "mlflow_start_template_library", None)
+    )
+    mode = str(getattr(request, "start_template_mode", "checkpoint") or "checkpoint")
+    if mode not in {"checkpoint", "enabled", "disabled"}:
+        mode = "checkpoint"
+
+    diagnostics = {
+        "start_template_mode": mode,
+        "start_template_library_available": bool(template_library),
+        "start_template_source": getattr(game_state, "start_template_library_source", None),
+    }
+
+    if mode == "disabled":
+        optional_params["start_template_enabled"] = False
+        optional_params.pop("start_template_library", None)
+        diagnostics["start_template_enabled"] = False
+        return optional_params, diagnostics
+
+    if mode == "enabled":
+        if not template_library:
+            raise HTTPException(
+                status_code=400,
+                detail="No start-template library is loaded for this UI session.",
+            )
+        optional_params["start_template_enabled"] = True
+        optional_params["start_template_library"] = template_library
+        optional_params["start_template_prob"] = _clip_probability(
+            getattr(request, "start_template_prob", None),
+            default=float(optional_params.get("start_template_prob", 1.0) or 1.0),
+        )
+        optional_params["start_template_jitter_scale"] = max(
+            0.0,
+            float(
+                getattr(request, "start_template_jitter_scale", None)
+                if getattr(request, "start_template_jitter_scale", None) is not None
+                else optional_params.get("start_template_jitter_scale", 1.0)
+            ),
+        )
+        optional_params["start_template_mirror_prob"] = _clip_probability(
+            getattr(request, "start_template_mirror_prob", None),
+            default=float(optional_params.get("start_template_mirror_prob", 0.0) or 0.0),
+        )
+        diagnostics["start_template_enabled"] = True
+        diagnostics["start_template_prob"] = optional_params["start_template_prob"]
+        diagnostics["start_template_jitter_scale"] = optional_params["start_template_jitter_scale"]
+        diagnostics["start_template_mirror_prob"] = optional_params["start_template_mirror_prob"]
+        return optional_params, diagnostics
+
+    if bool(optional_params.get("start_template_enabled", False)) and template_library:
+        optional_params["start_template_library"] = template_library
+        diagnostics["start_template_enabled"] = True
+        diagnostics["start_template_prob"] = optional_params.get("start_template_prob")
+        diagnostics["start_template_jitter_scale"] = optional_params.get(
+            "start_template_jitter_scale"
+        )
+        diagnostics["start_template_mirror_prob"] = optional_params.get(
+            "start_template_mirror_prob"
+        )
+    else:
+        optional_params.pop("start_template_library", None)
+        diagnostics["start_template_enabled"] = bool(
+            optional_params.get("start_template_enabled", False)
+        )
+    return optional_params, diagnostics
 
 
 @router.post("/api/pass_steal_preview")
@@ -76,6 +155,7 @@ def run_evaluation(request: EvaluationRequest):
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
     randomize_offense_perm = bool(getattr(request, "randomize_offense_permutation", False))
     intent_selection_mode = str(getattr(request, "intent_selection_mode", "learned_sample") or "learned_sample")
+    eval_optional_params, eval_template_diagnostics = _build_evaluation_optional_params(request)
 
     # Log shot clock configuration before evaluation
     print(f"[Evaluation] Starting {num_episodes} episodes (parallel)")
@@ -83,6 +163,8 @@ def run_evaluation(request: EvaluationRequest):
     print(f"  - Player deterministic: {player_deterministic}")
     print(f"  - Opponent deterministic: {opponent_deterministic}")
     print(f"  - Intent selection mode: {intent_selection_mode}")
+    print(f"  - Start-template eval mode: {eval_template_diagnostics.get('start_template_mode')}")
+    print(f"  - Start-template enabled: {eval_template_diagnostics.get('start_template_enabled')}")
     print(f"  - Using opponent policy: {game_state.defense_policy is not None}")
     print(f"  - User team: {game_state.user_team.name}")
     print(f"  - Unified policy (user): {game_state.unified_policy_key}")
@@ -125,7 +207,7 @@ def run_evaluation(request: EvaluationRequest):
             player_deterministic=player_deterministic,
             opponent_deterministic=opponent_deterministic,
             required_params=game_state.env_required_params,
-            optional_params=game_state.env_optional_params,
+            optional_params=eval_optional_params,
             training_params=game_state.mlflow_training_params,
             unified_policy_path=game_state.unified_policy_path,
             opponent_policy_path=game_state.opponent_policy_path,
@@ -150,6 +232,7 @@ def run_evaluation(request: EvaluationRequest):
         per_player_stats = raw_results.get("per_player_stats", {}) or {}
         per_intent_stats = raw_results.get("per_intent_stats", {}) or {}
         eval_diagnostics = raw_results.get("eval_diagnostics", {}) or {}
+        eval_diagnostics["start_template_eval"] = eval_template_diagnostics
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
             shot_accumulator = raw_shots
@@ -158,6 +241,7 @@ def run_evaluation(request: EvaluationRequest):
         per_player_stats = {}
         per_intent_stats = {}
         eval_diagnostics = {}
+        eval_diagnostics["start_template_eval"] = eval_template_diagnostics
         episode_payload = raw_results
 
     elapsed_time = time.time() - start_time

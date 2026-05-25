@@ -14,6 +14,7 @@ from fastapi.encoders import jsonable_encoder
 import mlflow
 import numpy as np
 from stable_baselines3 import PPO
+from basketworld.envs.basketworld_env_v2 import Team
 from basketworld.utils.start_templates import (
     load_start_template_library,
     resolve_start_template,
@@ -31,6 +32,12 @@ from app.backend.rollout_runtime import (
     predict_joint_policy_actions,
 )
 from app.backend.env_access import env_view
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    load_inference_policy,
+    unwrap_inference_model,
+)
 from app.backend.schemas import (
     ActionRequest,
     ApplyStartTemplateRequest,
@@ -56,12 +63,15 @@ from app.backend.state import (
     _capture_restorable_backend_state,
     _rebuild_cached_obs,
     _restore_restorable_backend_state,
+    cancel_playbook_progress,
     capture_counterfactual_snapshot,
     fail_playbook_progress,
     get_current_play_name_map,
     get_playbook_progress,
     get_ui_game_state,
     game_state,
+    playbook_cancel_requested,
+    request_playbook_cancel,
     reset_playbook_progress,
     restore_counterfactual_snapshot,
     update_playbook_progress,
@@ -79,9 +89,32 @@ _NUMPY_SAFE_ENCODER = {
 }
 
 
+class _PlaybookCancelled(RuntimeError):
+    pass
+
+
 def _base_env():
     env = game_state.env
     return getattr(env, "unwrapped", env)
+
+
+def _raise_if_playbook_cancelled() -> None:
+    if playbook_cancel_requested():
+        raise _PlaybookCancelled("Playbook analysis cancelled.")
+
+
+def _refresh_after_live_env_edit() -> None:
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        try:
+            jax_runtime.apply_display_env_edits(game_state)
+        except Exception as err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to sync live edit to JAX runtime: {err}",
+            ) from err
+        return
+    _rebuild_cached_obs()
 
 
 def _template_players_per_side() -> int:
@@ -391,6 +424,7 @@ def _init_playbook_panel_accumulator(offense_ids: list[int]) -> dict:
         "terminated_rollout_steps_sum": 0,
         "terminated_rollouts": 0,
         "primary_shooter_counts": {},
+        "next_intent_counts": {},
         "num_rollouts": 0,
         "base_state": None,
     }
@@ -434,14 +468,24 @@ def apply_start_template(req: ApplyStartTemplateRequest):
             detail="Cannot apply a start template after the episode has ended.",
         )
 
-    env.positions = [tuple(pos) for pos in (resolved.get("initial_positions") or [])]
-    if resolved.get("ball_holder") is not None:
-        env.ball_holder = int(resolved["ball_holder"])
-    if resolved.get("shot_clock") is not None:
-        env.shot_clock = int(resolved["shot_clock"])
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        try:
+            jax_runtime.apply_resolved_start_template(resolved, game_state)
+        except Exception as err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to apply start template to JAX runtime: {err}",
+            ) from err
+    else:
+        env.positions = [tuple(pos) for pos in (resolved.get("initial_positions") or [])]
+        if resolved.get("ball_holder") is not None:
+            env.ball_holder = int(resolved["ball_holder"])
+        if resolved.get("shot_clock") is not None:
+            env.shot_clock = int(resolved["shot_clock"])
 
-    _rebuild_cached_obs()
-    _capture_turn_start_snapshot()
+        _rebuild_cached_obs()
+        _capture_turn_start_snapshot()
 
     updated_state = get_ui_game_state()
     if game_state.episode_states:
@@ -741,6 +785,8 @@ def _merge_playbook_panel_accumulator(dest: dict, src: dict) -> None:
         dest[key] = int(dest.get(key, 0)) + int(src.get(key, 0) or 0)
     for key, count in (src.get("primary_shooter_counts") or {}).items():
         _increment_count(dest["primary_shooter_counts"], str(key), int(count or 0))
+    for key, count in (src.get("next_intent_counts") or {}).items():
+        _increment_count(dest["next_intent_counts"], str(key), int(count or 0))
     if dest.get("base_state") is None and src.get("base_state") is not None:
         dest["base_state"] = copy.deepcopy(src.get("base_state"))
 
@@ -973,6 +1019,563 @@ def _run_playbook_batch_worker(args: tuple) -> dict:
     return payload
 
 
+def _run_jax_playbook_batch(
+    *,
+    jax_runtime,
+    base_jax_state,
+    base_ui_state: dict,
+    intent_indices: list[int],
+    num_rollouts: int,
+    commitment_steps: int,
+    max_steps: int,
+    run_to_end: bool,
+    player_deterministic: bool,
+    opponent_deterministic: bool,
+    user_team,
+    offense_ids: list[int],
+    play_name_map: dict[str, str],
+    selector_multiselect_enabled: bool,
+    selector_alpha: float,
+    selector_eps: float,
+    selector_min_play_steps: int,
+) -> tuple[dict[int, dict], dict[str, object]]:
+    """Run Playbook rollouts in one compiled JAX batch.
+
+    This is intentionally narrower than the live dev runtime: each panel forces
+    one starting offense intent and disables selector re-sampling, matching the
+    existing Playbook counterfactual semantics.
+    """
+    from basketworld_jax.env.minimal import (
+        TURNOVER_REASON_DEFENDER_PRESSURE,
+        TURNOVER_REASON_INTERCEPTED,
+        TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
+        TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
+        TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
+        TURNOVER_REASON_SHOT_CLOCK,
+        set_offense_intent_state_batch,
+    )
+
+    raw_model = unwrap_inference_model(getattr(jax_runtime, "unified_policy", None))
+    if raw_model is None:
+        raw_model = getattr(jax_runtime, "raw_model", None)
+    if raw_model is None or not hasattr(raw_model, "params"):
+        raise RuntimeError("JAX Playbook fast path requires a loaded JAX model.")
+    opponent_raw = unwrap_inference_model(getattr(jax_runtime, "opponent_policy", None))
+    if opponent_raw is None:
+        opponent_raw = raw_model
+    if getattr(opponent_raw, "spec", None) != getattr(raw_model, "spec", None):
+        raise RuntimeError("JAX Playbook fast path requires matching policy specs.")
+
+    jax = raw_model.jax
+    jnp = raw_model.jnp
+    spec = raw_model.spec
+    static = jax_runtime.static
+    selector_num_intents = int(max(1, getattr(spec, "num_intents", 1)))
+    n_players = int(np.asarray(jax.device_get(static.role_encoding)).shape[0])
+    total = int(len(intent_indices) * int(num_rollouts))
+    if total <= 0:
+        return {}, {"used_jax_fast_path": True, "compiled_batch_size": 0}
+
+    horizon = int(max(1, max_steps))
+    if bool(run_to_end):
+        horizon = int(max(horizon, int(getattr(jax_runtime.display_env, "shot_clock_steps", horizon)) + 2))
+
+    intent_vector = np.asarray(
+        [int(intent_index) for intent_index in intent_indices for _ in range(int(num_rollouts))],
+        dtype=np.int32,
+    )
+
+    def _repeat_state(state):
+        repeated = []
+        for field in state:
+            arr = jnp.asarray(field)
+            if int(arr.shape[0]) != 1:
+                arr = arr[:1]
+            repeated.append(jnp.repeat(arr, total, axis=0))
+        return type(state)(*repeated)
+
+    initial_state = _repeat_state(base_jax_state)
+    initial_state = set_offense_intent_state_batch(
+        static,
+        initial_state,
+        jnp.asarray(intent_vector, dtype=jnp.int32),
+        jnp.ones((total,), dtype=jnp.int8),
+        jnp,
+    )
+
+    if user_team == Team.OFFENSE:
+        offense_params = raw_model.params
+        defense_params = opponent_raw.params
+        offense_det = bool(player_deterministic)
+        defense_det = bool(opponent_deterministic)
+    else:
+        offense_params = opponent_raw.params
+        defense_params = raw_model.params
+        offense_det = bool(opponent_deterministic)
+        defense_det = bool(player_deterministic)
+
+    runner_cache = getattr(jax_runtime, "_playbook_batch_runner_cache", None)
+    runner = (
+        runner_cache.get("runner")
+        if isinstance(runner_cache, dict) and runner_cache.get("spec") == spec
+        else None
+    )
+    if runner is None:
+        from basketworld_jax.env.minimal import (
+            assemble_full_actions_jax,
+            build_action_masks_batch,
+            build_policy_intent_context_batch_with_role_flag,
+            build_policy_observation_batch_with_role_flag,
+            step_batch_minimal,
+        )
+        from basketworld_jax.models import actor_critic_forward, apply_action_mask
+
+        def _build_runner():
+            def _runner(
+                static_arg,
+                state_arg,
+                offense_params_arg,
+                defense_params_arg,
+                eval_key_arg,
+                role_flag_offense_arg,
+                role_flag_defense_arg,
+                horizon_arg: int,
+                offense_deterministic_arg: bool,
+                defense_deterministic_arg: bool,
+                selector_multiselect_enabled_arg: bool,
+                selector_alpha_arg: float,
+                selector_eps_arg: float,
+                selector_min_play_steps_arg: int,
+            ):
+                offense_ids_arg = static_arg.offense_ids.astype(jnp.int32)
+                defense_ids_arg = static_arg.defense_ids.astype(jnp.int32)
+
+                def _team_actions(params_arg, flat_obs_arg, action_mask_arg, intent_context_arg, key_arg, deterministic_arg: bool):
+                    forward_out = actor_critic_forward(
+                        params_arg,
+                        flat_obs_arg,
+                        spec,
+                        jnp,
+                        intent_context=intent_context_arg,
+                    )
+                    masked_out = apply_action_mask(
+                        forward_out["flat_policy_logits"],
+                        action_mask_arg,
+                        spec,
+                        jax,
+                        jnp,
+                    )
+                    if deterministic_arg:
+                        return masked_out["deterministic_actions"]
+                    return jax.random.categorical(
+                        key_arg,
+                        masked_out["masked_logits"],
+                        axis=-1,
+                    ).astype(jnp.int32)
+
+                def _scan_step(carry, _):
+                    state_in, key_in, last_completed_pass_boundary = carry
+                    (
+                        key_next,
+                        selector_key,
+                        selector_alpha_key,
+                        selector_fallback_key,
+                        offense_key,
+                        defense_key,
+                        env_key,
+                    ) = jax.random.split(key_in, 7)
+                    batch_size = state_in.positions.shape[0]
+                    selector_transition = jnp.zeros((batch_size,), dtype=jnp.int8)
+                    selector_new_intent = jnp.full((batch_size,), -1, dtype=jnp.int32)
+                    state_for_action = state_in
+
+                    if selector_multiselect_enabled_arg:
+                        active = state_in.intent_active.astype(jnp.bool_)
+                        age = state_in.intent_age.astype(jnp.int32)
+                        timeout_boundary = (
+                            active
+                            & (age > 0)
+                            & (state_in.intent_commitment_remaining.astype(jnp.int32) <= 0)
+                        )
+                        completed_pass_boundary = (
+                            active
+                            & last_completed_pass_boundary.astype(jnp.bool_)
+                            & (age >= int(selector_min_play_steps_arg))
+                        )
+                        selector_boundary = timeout_boundary | completed_pass_boundary
+                        selector_obs = build_policy_observation_batch_with_role_flag(
+                            static_arg,
+                            state_in,
+                            role_flag_offense_arg,
+                            jnp,
+                            model_type=spec.model_type,
+                        )
+                        neutral_context = {
+                            "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
+                            "intent_gate": jnp.zeros((batch_size,), dtype=jnp.float32),
+                        }
+                        selector_out = actor_critic_forward(
+                            offense_params_arg,
+                            selector_obs,
+                            spec,
+                            jnp,
+                            intent_context=neutral_context,
+                        )
+                        raw_probs = jax.nn.softmax(selector_out["selector_logits"], axis=-1)
+                        uniform_probs = jnp.full_like(raw_probs, 1.0 / float(selector_num_intents))
+                        mixed_probs = ((1.0 - float(selector_eps_arg)) * raw_probs) + (
+                            float(selector_eps_arg) * uniform_probs
+                        )
+                        learned_sample = jax.random.categorical(
+                            selector_key,
+                            jnp.log(jnp.maximum(mixed_probs, 1.0e-8)),
+                            axis=-1,
+                        ).astype(jnp.int32)
+                        fallback_sample = jax.random.randint(
+                            selector_fallback_key,
+                            shape=(batch_size,),
+                            minval=0,
+                            maxval=selector_num_intents,
+                            dtype=jnp.int32,
+                        )
+                        use_selector = (
+                            jax.random.uniform(selector_alpha_key, shape=(batch_size,))
+                            < float(selector_alpha_arg)
+                        )
+                        sampled_intent = jnp.where(use_selector, learned_sample, fallback_sample)
+                        state_for_action = state_in._replace(
+                            intent_index=jnp.where(selector_boundary, sampled_intent, state_in.intent_index),
+                            intent_active=jnp.where(
+                                selector_boundary,
+                                jnp.ones_like(state_in.intent_active, dtype=jnp.int8),
+                                state_in.intent_active,
+                            ),
+                            intent_age=jnp.where(
+                                selector_boundary,
+                                jnp.zeros_like(state_in.intent_age, dtype=jnp.int32),
+                                state_in.intent_age,
+                            ),
+                            intent_commitment_remaining=jnp.where(
+                                selector_boundary,
+                                static_arg.intent_commitment_steps.astype(jnp.int32),
+                                state_in.intent_commitment_remaining,
+                            ),
+                        )
+                        selector_transition = selector_boundary.astype(jnp.int8)
+                        selector_new_intent = jnp.where(selector_boundary, sampled_intent, selector_new_intent)
+
+                    full_action_mask = build_action_masks_batch(static_arg, state_for_action, jnp)
+                    offense_mask = full_action_mask[:, offense_ids_arg, :]
+                    defense_mask = full_action_mask[:, defense_ids_arg, :]
+                    offense_obs = build_policy_observation_batch_with_role_flag(
+                        static_arg,
+                        state_for_action,
+                        role_flag_offense_arg,
+                        jnp,
+                        model_type=spec.model_type,
+                    )
+                    defense_obs = build_policy_observation_batch_with_role_flag(
+                        static_arg,
+                        state_for_action,
+                        role_flag_defense_arg,
+                        jnp,
+                        model_type=spec.model_type,
+                    )
+                    offense_context = build_policy_intent_context_batch_with_role_flag(
+                        static_arg,
+                        state_for_action,
+                        role_flag_offense_arg,
+                        jnp,
+                    )
+                    defense_context = build_policy_intent_context_batch_with_role_flag(
+                        static_arg,
+                        state_for_action,
+                        role_flag_defense_arg,
+                        jnp,
+                    )
+                    offense_actions = _team_actions(
+                        offense_params_arg,
+                        offense_obs,
+                        offense_mask,
+                        offense_context,
+                        offense_key,
+                        offense_deterministic_arg,
+                    )
+                    defense_actions = _team_actions(
+                        defense_params_arg,
+                        defense_obs,
+                        defense_mask,
+                        defense_context,
+                        defense_key,
+                        defense_deterministic_arg,
+                    )
+                    full_actions = assemble_full_actions_jax(
+                        offense_actions,
+                        defense_actions,
+                        offense_ids_arg,
+                        defense_ids_arg,
+                        int(n_players),
+                        jnp,
+                    )
+                    env_keys = jax.random.split(env_key, state_for_action.positions.shape[0])
+                    out = step_batch_minimal(static_arg, state_for_action, full_actions, env_keys, jax, jnp)
+                    trace = {
+                        "pre_positions": state_for_action.positions.astype(jnp.int32),
+                        "pre_ball_holder": state_for_action.ball_holder.astype(jnp.int32),
+                        "post_positions": out.state.positions.astype(jnp.int32),
+                        "post_ball_holder": out.state.ball_holder.astype(jnp.int32),
+                        "post_shot_clock": out.state.shot_clock.astype(jnp.int32),
+                        "done": out.done.astype(jnp.int8),
+                        "pass_attempt": out.pass_attempt.astype(jnp.int8),
+                        "pass_passer": out.pass_passer.astype(jnp.int32),
+                        "pass_receiver": out.pass_receiver.astype(jnp.int32),
+                        "completed_pass": out.completed_pass.astype(jnp.int8),
+                        "shot_attempt": out.shot_attempt.astype(jnp.int8),
+                        "shot_success": out.shot_success.astype(jnp.int8),
+                        "shot_shooter": out.shot_shooter.astype(jnp.int32),
+                        "shot_q": out.shot_q.astype(jnp.int32),
+                        "shot_r": out.shot_r.astype(jnp.int32),
+                        "turnover": out.turnover.astype(jnp.int8),
+                        "turnover_player": out.turnover_player.astype(jnp.int32),
+                        "turnover_reason": out.turnover_reason.astype(jnp.int32),
+                        "offensive_three_seconds": out.offensive_three_seconds.astype(jnp.int8),
+                        "defensive_lane_violation": out.defensive_lane_violation.astype(jnp.int8),
+                        "selector_transition": selector_transition,
+                        "selector_new_intent": selector_new_intent,
+                    }
+                    next_completed_pass_boundary = (
+                        out.completed_pass.astype(jnp.bool_) & ~out.done.astype(jnp.bool_)
+                    )
+                    return (out.state, key_next, next_completed_pass_boundary), trace
+
+                (_, _, _), trace_out = jax.lax.scan(
+                    _scan_step,
+                    (
+                        state_arg,
+                        eval_key_arg,
+                        jnp.zeros((state_arg.positions.shape[0],), dtype=jnp.bool_),
+                    ),
+                    xs=None,
+                    length=int(horizon_arg),
+                )
+                return trace_out
+
+            return jax.jit(_runner, static_argnums=(7, 8, 9, 10, 11, 12, 13))
+
+        runner = _build_runner()
+        setattr(jax_runtime, "_playbook_batch_runner_cache", {"spec": spec, "runner": runner})
+
+    seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+    trace = jax.device_get(
+        runner(
+            static,
+            initial_state,
+            offense_params,
+            defense_params,
+            jax.random.PRNGKey(seed),
+            jnp.asarray(float(jax_runtime.role_flag_offense), dtype=jnp.float32),
+            jnp.asarray(float(jax_runtime.role_flag_defense), dtype=jnp.float32),
+            int(horizon),
+            bool(offense_det),
+            bool(defense_det),
+            bool(selector_multiselect_enabled),
+            float(selector_alpha),
+            float(selector_eps),
+            int(selector_min_play_steps),
+        )
+    )
+    initial_positions = np.asarray(jax.device_get(initial_state.positions), dtype=np.int32)
+    initial_ball_holder = np.asarray(jax.device_get(initial_state.ball_holder), dtype=np.int32)
+
+    def _turnover_reason_name(reason_code: int) -> str:
+        reason_map = {
+            TURNOVER_REASON_PASS_OUT_OF_BOUNDS: "pass_out_of_bounds",
+            TURNOVER_REASON_INTERCEPTED: "steal",
+            TURNOVER_REASON_DEFENDER_PRESSURE: "defender_pressure",
+            TURNOVER_REASON_MOVE_OUT_OF_BOUNDS: "move_out_of_bounds",
+            TURNOVER_REASON_SHOT_CLOCK: "shot_clock_violation",
+            TURNOVER_REASON_OFFENSIVE_THREE_SECONDS: "offensive_three_seconds",
+        }
+        return reason_map.get(int(reason_code), "turnover")
+
+    panel_accumulators = {
+        int(intent_index): _init_playbook_panel_accumulator(offense_ids)
+        for intent_index in intent_indices
+    }
+
+    for batch_idx, intent_index in enumerate(intent_vector.tolist()):
+        panel = panel_accumulators[int(intent_index)]
+        if panel.get("base_state") is None:
+            forced_base = copy.deepcopy(base_ui_state or {})
+            forced_base["intent_active_current"] = True
+            forced_base["intent_index_current"] = int(intent_index)
+            forced_base["current_play_name"] = lookup_play_name(play_name_map, int(intent_index))
+            forced_base["intent_age"] = 0
+            forced_base["intent_commitment_remaining"] = int(commitment_steps)
+            panel["base_state"] = forced_base
+
+        prev_positions = initial_positions[batch_idx]
+        prev_ball_holder = int(initial_ball_holder[batch_idx])
+        initial_state_payload = {
+            "positions": [[int(q), int(r)] for q, r in prev_positions.tolist()],
+            "ball_holder": prev_ball_holder if prev_ball_holder >= 0 else None,
+            "last_action_results": {},
+        }
+        _count_rollout_state(
+            initial_state_payload,
+            offense_ids,
+            panel["player_heatmaps"],
+            panel["ball_heatmap"],
+            panel["shot_heatmap"],
+            panel["player_shot_heatmaps"],
+            panel["player_shot_stats"],
+            panel["pass_links"],
+            panel["pass_path_segments"],
+        )
+
+        done_series = np.asarray(trace["done"])[:, batch_idx].astype(bool)
+        done_indices = np.flatnonzero(done_series)
+        rollout_steps = int(done_indices[0] + 1) if done_indices.size else int(horizon)
+        done = bool(done_indices.size > 0)
+        passes_count = 0
+        shots_count = 0
+        first_shot_step: int | None = None
+        first_next_intent: int | None = None
+        rollout_shots_by_player: dict[int, int] = {}
+
+        for step_idx in range(rollout_steps):
+            post_positions = np.asarray(trace["post_positions"][step_idx, batch_idx], dtype=np.int32)
+            post_ball_holder = int(trace["post_ball_holder"][step_idx, batch_idx])
+            post_state_payload = {
+                "positions": [[int(q), int(r)] for q, r in post_positions.tolist()],
+                "ball_holder": post_ball_holder if post_ball_holder >= 0 else None,
+                "last_action_results": {},
+            }
+            _count_rollout_transition(
+                {
+                    "positions": [[int(q), int(r)] for q, r in prev_positions.tolist()],
+                    "ball_holder": prev_ball_holder if prev_ball_holder >= 0 else None,
+                    "last_action_results": {},
+                },
+                post_state_payload,
+                offense_ids,
+                panel["player_path_segments"],
+                panel["ball_path_segments"],
+            )
+            for pid in offense_ids:
+                if 0 <= int(pid) < post_positions.shape[0]:
+                    _heatmap_increment(panel["player_heatmaps"].setdefault(str(pid), {}), post_positions[int(pid)].tolist())
+            if 0 <= post_ball_holder < post_positions.shape[0]:
+                _heatmap_increment(panel["ball_heatmap"], post_positions[post_ball_holder].tolist())
+
+            if int(trace["pass_attempt"][step_idx, batch_idx]):
+                passer = int(trace["pass_passer"][step_idx, batch_idx])
+                receiver = int(trace["pass_receiver"][step_idx, batch_idx])
+                if int(trace["completed_pass"][step_idx, batch_idx]) and receiver >= 0:
+                    key = f"{passer}->{receiver}"
+                    panel["pass_links"][key] = int(panel["pass_links"].get(key, 0)) + 1
+                    if 0 <= passer < post_positions.shape[0] and 0 <= receiver < post_positions.shape[0]:
+                        _pass_segment_increment(
+                            panel["pass_path_segments"],
+                            passer,
+                            receiver,
+                            post_positions[passer].tolist(),
+                            post_positions[receiver].tolist(),
+                        )
+                    passes_count += 1
+
+            if int(trace["shot_attempt"][step_idx, batch_idx]):
+                shooter = int(trace["shot_shooter"][step_idx, batch_idx])
+                shot_pos = [
+                    int(trace["shot_q"][step_idx, batch_idx]),
+                    int(trace["shot_r"][step_idx, batch_idx]),
+                ]
+                _heatmap_increment(panel["shot_heatmap"], shot_pos)
+                _heatmap_increment(panel["player_shot_heatmaps"].setdefault(str(shooter), {}), shot_pos)
+                shooter_stats = panel["player_shot_stats"].setdefault(str(shooter), {"attempts": 0, "makes": 0})
+                shooter_stats["attempts"] = int(shooter_stats.get("attempts", 0)) + 1
+                shooter_stats["makes"] = int(shooter_stats.get("makes", 0)) + int(
+                    bool(int(trace["shot_success"][step_idx, batch_idx]))
+                )
+                shots_count += 1
+                rollout_shots_by_player[shooter] = int(rollout_shots_by_player.get(shooter, 0)) + 1
+                if first_shot_step is None:
+                    first_shot_step = int(step_idx) + 1
+
+            if first_next_intent is None and int(trace["selector_transition"][step_idx, batch_idx]):
+                selected_intent = int(trace["selector_new_intent"][step_idx, batch_idx])
+                if selected_intent >= 0:
+                    first_next_intent = int(selected_intent)
+
+            prev_positions = post_positions
+            prev_ball_holder = post_ball_holder
+
+        panel["rollout_lengths_sum"] += int(rollout_steps)
+        panel["rollout_passes_sum"] += int(passes_count)
+        panel["rollout_shots_sum"] += int(shots_count)
+        if first_shot_step is not None:
+            panel["rollouts_with_shot"] += 1
+            panel["first_shot_step_sum"] += int(first_shot_step)
+        if first_next_intent is not None:
+            _increment_count(panel["next_intent_counts"], str(first_next_intent), 1)
+        panel["terminated_rollouts"] += int(done)
+        if done:
+            panel["terminated_rollout_steps_sum"] += int(rollout_steps)
+        if rollout_shots_by_player:
+            primary_shooter = min(
+                rollout_shots_by_player.items(),
+                key=lambda item: (-int(item[1]), int(item[0])),
+            )[0]
+            _increment_count(panel["primary_shooter_counts"], str(primary_shooter), 1)
+        panel["num_rollouts"] += 1
+
+        if not done:
+            terminal_key, turnover_reason = "horizon_cutoff", None
+        else:
+            last_idx = max(0, rollout_steps - 1)
+            if int(trace["shot_attempt"][last_idx, batch_idx]):
+                terminal_key = "shot_make" if int(trace["shot_success"][last_idx, batch_idx]) else "shot_miss"
+                turnover_reason = None
+            elif int(trace["defensive_lane_violation"][last_idx, batch_idx]):
+                terminal_key, turnover_reason = "defensive_violation", None
+            elif int(trace["turnover"][last_idx, batch_idx]):
+                terminal_key = "turnover"
+                turnover_reason = _turnover_reason_name(int(trace["turnover_reason"][last_idx, batch_idx]))
+            else:
+                terminal_key, turnover_reason = "other_terminal", None
+        _increment_count(panel["terminal_outcomes"], terminal_key, 1)
+        if turnover_reason:
+            _increment_count(panel["turnover_reasons"], turnover_reason, 1)
+
+    return panel_accumulators, {
+        "used_jax_fast_path": True,
+        "compiled_batch_size": int(total),
+        "horizon": int(horizon),
+        "seed": int(seed),
+        "selector_multiselect_enabled": bool(selector_multiselect_enabled),
+    }
+
+
+def _can_run_jax_playbook_batch(jax_runtime) -> bool:
+    raw_model = unwrap_inference_model(getattr(jax_runtime, "unified_policy", None))
+    if raw_model is None:
+        raw_model = getattr(jax_runtime, "raw_model", None)
+    if raw_model is None or not hasattr(raw_model, "params"):
+        return False
+    spec = getattr(raw_model, "spec", None)
+    required_spec_attrs = (
+        "action_dim_per_player",
+        "pass_action_start",
+        "pass_action_end",
+        "model_type",
+        "num_intents",
+    )
+    if spec is None or any(not hasattr(spec, attr) for attr in required_spec_attrs):
+        return False
+    opponent_raw = unwrap_inference_model(getattr(jax_runtime, "opponent_policy", None))
+    return opponent_raw is None or getattr(opponent_raw, "spec", None) == spec
+
+
 @router.post("/api/batch_update_player_positions")
 def batch_update_player_positions(req: BatchUpdatePositionRequest):
     """Updates positions for multiple players at once."""
@@ -998,7 +1601,7 @@ def batch_update_player_positions(req: BatchUpdatePositionRequest):
                 raise HTTPException(status_code=400, detail=f"Position {new_pos} is occupied by Player {i}.")
         env.positions[pid] = new_pos
 
-    _rebuild_cached_obs()
+    _refresh_after_live_env_edit()
 
     updated_state = get_ui_game_state()
     if game_state.episode_states:
@@ -1031,7 +1634,7 @@ def update_player_position(req: UpdatePositionRequest):
 
     env.positions[pid] = new_pos
 
-    _rebuild_cached_obs()
+    _refresh_after_live_env_edit()
 
     updated_state = get_ui_game_state()
     if game_state.episode_states:
@@ -1058,12 +1661,14 @@ def update_shot_clock(req: UpdateShotClockRequest):
         else:
             new_val = max(0, new_val)
         env.shot_clock = int(new_val)
-        _rebuild_cached_obs()
+        _refresh_after_live_env_edit()
         return {
             "status": "success",
             "shot_clock": int(env.shot_clock),
             "state": get_ui_game_state(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1086,7 +1691,7 @@ def set_ball_holder(req: SetBallHolderRequest):
 
     env.ball_holder = int(req.player_id)
     try:
-        _rebuild_cached_obs()
+        _refresh_after_live_env_edit()
         updated_state = get_ui_game_state()
         if game_state.episode_states:
             game_state.episode_states[-1] = updated_state
@@ -1125,12 +1730,22 @@ def set_intent_state(req: SetIntentStateRequest):
         else:
             intent_commitment_remaining = max(0, max_age - intent_age)
 
-        env.intent_active = active
-        env.intent_index = int(intent_index)
-        env.intent_age = int(intent_age)
-        env.intent_commitment_remaining = int(intent_commitment_remaining)
+        jax_runtime = getattr(game_state, "jax_runtime", None)
+        if jax_runtime is not None:
+            jax_runtime.set_offense_intent_state(
+                active=active,
+                intent_index=int(intent_index),
+                intent_age=int(intent_age),
+                intent_commitment_remaining=int(intent_commitment_remaining),
+                game_state=game_state,
+            )
+        else:
+            env.intent_active = active
+            env.intent_index = int(intent_index)
+            env.intent_age = int(intent_age)
+            env.intent_commitment_remaining = int(intent_commitment_remaining)
 
-        _rebuild_cached_obs()
+            _rebuild_cached_obs()
 
         updated_state = get_ui_game_state()
         if game_state.episode_states:
@@ -1265,8 +1880,10 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     training_params = getattr(game_state, "mlflow_training_params", None) or {}
     playbook_training_params = copy.deepcopy(training_params) if isinstance(training_params, dict) else {}
     playbook_training_params["intent_selector_multiselect_enabled"] = False
+    jax_runtime = getattr(game_state, "jax_runtime", None)
     can_parallelize = bool(
-        game_state.env_required_params is not None
+        jax_runtime is None
+        and game_state.env_required_params is not None
         and game_state.unified_policy_path is not None
         and game_state.user_team is not None
         and total_rollouts > 1
@@ -1298,7 +1915,48 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             for intent_index in intent_indices
         }
 
-        if num_workers is not None:
+        jax_fast_path_meta: dict[str, object] = {}
+        if jax_runtime is not None and _can_run_jax_playbook_batch(jax_runtime):
+            _raise_if_playbook_cancelled()
+            jax_snapshot = (base_state or {}).get("jax_runtime") if isinstance(base_state, dict) else None
+            base_jax_state = (jax_snapshot or {}).get("state") if isinstance(jax_snapshot, dict) else None
+            if base_jax_state is None:
+                raise RuntimeError("JAX Playbook fast path could not find a captured JAX state.")
+            panel_accumulators, jax_fast_path_meta = _run_jax_playbook_batch(
+                jax_runtime=jax_runtime,
+                base_jax_state=base_jax_state,
+                base_ui_state=base_ui_state,
+                intent_indices=intent_indices,
+                num_rollouts=int(num_rollouts),
+                commitment_steps=int(commitment_steps),
+                max_steps=int(max_steps),
+                run_to_end=bool(run_to_end),
+                player_deterministic=bool(req.player_deterministic),
+                opponent_deterministic=bool(req.opponent_deterministic),
+                user_team=game_state.user_team,
+                offense_ids=offense_ids,
+                play_name_map=get_current_play_name_map(int(num_intents)),
+                selector_multiselect_enabled=bool(jax_runtime._selector_multiselect_enabled(game_state)),
+                selector_alpha=float(jax_runtime._selector_alpha_eps(game_state)[0]),
+                selector_eps=float(jax_runtime._selector_alpha_eps(game_state)[1]),
+                selector_min_play_steps=max(
+                    1,
+                    int(
+                        (jax_runtime._selector_training_params(game_state) or {}).get(
+                            "intent_selector_min_play_steps",
+                            (jax_runtime._selector_training_params(game_state) or {}).get(
+                                "jax/intent_selector_min_play_steps",
+                                3,
+                            ),
+                        )
+                        or 3
+                    ),
+                ),
+            )
+            _raise_if_playbook_cancelled()
+            update_playbook_progress(total_rollouts, total_rollouts)
+        elif num_workers is not None:
+            _raise_if_playbook_cancelled()
             parallel_base_env = copy.deepcopy(getattr(base_state["env"], "unwrapped", base_state["env"]))
             rollout_specs = [
                 (int(order), int(intent_index), int(np.random.randint(0, 2**31 - 1)))
@@ -1359,6 +2017,10 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     for batch in batches
                 }
                 while pending:
+                    if playbook_cancel_requested():
+                        for future in pending:
+                            future.cancel()
+                        raise _PlaybookCancelled("Playbook analysis cancelled.")
                     done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
                     while True:
                         try:
@@ -1392,17 +2054,29 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             game_state.mlflow_training_params = playbook_training_params
             completed = 0
             for intent_index in intent_indices:
+                _raise_if_playbook_cancelled()
                 panel = panel_accumulators[int(intent_index)]
                 for _ in range(num_rollouts):
+                    _raise_if_playbook_cancelled()
                     _restore_restorable_backend_state(base_state)
                     game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
 
-                    base_env = _base_env()
-                    base_env.intent_active = True
-                    base_env.intent_index = int(intent_index)
-                    base_env.intent_age = 0
-                    base_env.intent_commitment_remaining = int(commitment_steps)
-                    _rebuild_cached_obs()
+                    jax_runtime = getattr(game_state, "jax_runtime", None)
+                    if jax_runtime is not None:
+                        jax_runtime.set_offense_intent_state(
+                            active=True,
+                            intent_index=int(intent_index),
+                            intent_age=0,
+                            intent_commitment_remaining=int(commitment_steps),
+                            game_state=game_state,
+                        )
+                    else:
+                        base_env = _base_env()
+                        base_env.intent_active = True
+                        base_env.intent_index = int(intent_index)
+                        base_env.intent_age = 0
+                        base_env.intent_commitment_remaining = int(commitment_steps)
+                        _rebuild_cached_obs()
                     initial_state = copy.deepcopy(get_ui_game_state())
                     if panel.get("base_state") is None:
                         panel["base_state"] = copy.deepcopy(initial_state)
@@ -1428,6 +2102,7 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     done = bool(env_view(game_state.env).episode_ended)
 
                     while not done and (run_to_end or rollout_steps < max_steps):
+                        _raise_if_playbook_cancelled()
                         step_body = step_route(
                             ActionRequest(
                                 actions={},
@@ -1525,6 +2200,20 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                     key=lambda item: (-int(item[1] or 0), int(item[0])),
                 )
             }
+            next_intent_total = int(
+                sum(int(count or 0) for count in (panel.get("next_intent_counts") or {}).values())
+            )
+            next_intent_distribution = {
+                str(idx): {
+                    "count": int(count or 0),
+                    "rate": float(int(count or 0) / max(1, next_intent_total)),
+                    "play_name": lookup_play_name(play_name_map, int(idx)),
+                }
+                for idx, count in sorted(
+                    (panel.get("next_intent_counts") or {}).items(),
+                    key=lambda item: (-int(item[1] or 0), int(item[0])),
+                )
+            }
             total_shot_attempts = int(
                 sum(stats["attempts"] for stats in shot_stats_by_player.values())
             )
@@ -1571,6 +2260,8 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
                         },
                     },
                     "primary_shooter_distribution": primary_shooter_distribution,
+                    "next_intent_distribution": next_intent_distribution,
+                    "next_intent_total": int(next_intent_total),
                     "terminal_outcomes": terminal_outcomes,
                     "turnover_reasons": turnover_reasons,
                     "pass_links": dict(sorted(panel["pass_links"].items())),
@@ -1592,10 +2283,29 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             "max_steps": int(max_steps),
             "run_to_end": bool(run_to_end),
             "offense_ids": offense_ids,
+            "used_jax_fast_path": bool(jax_fast_path_meta.get("used_jax_fast_path", False)),
+            "jax_fast_path": jax_fast_path_meta,
             "used_parallel": bool(num_workers is not None),
             "num_workers": int(num_workers or 1),
             "play_name_map": play_name_map,
             "panels": panels,
+        }, custom_encoder=_NUMPY_SAFE_ENCODER)
+    except _PlaybookCancelled:
+        cancel_playbook_progress()
+        return jsonable_encoder({
+            "status": "cancelled",
+            "source": source_label,
+            "num_rollouts": int(num_rollouts),
+            "total_rollouts": int(total_rollouts),
+            "max_steps": int(max_steps),
+            "run_to_end": bool(run_to_end),
+            "offense_ids": offense_ids,
+            "used_jax_fast_path": False,
+            "jax_fast_path": {},
+            "used_parallel": bool(num_workers is not None),
+            "num_workers": int(num_workers or 1),
+            "play_name_map": get_current_play_name_map(int(num_intents)),
+            "panels": [],
         }, custom_encoder=_NUMPY_SAFE_ENCODER)
     except HTTPException:
         raise
@@ -1613,6 +2323,14 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
 @router.get("/api/playbook_progress")
 def playbook_progress():
     return get_playbook_progress()
+
+
+@router.post("/api/cancel_playbook_analysis")
+def cancel_playbook_analysis_route():
+    return jsonable_encoder({
+        "status": "success",
+        "progress": request_playbook_cancel(),
+    }, custom_encoder=_NUMPY_SAFE_ENCODER)
 
 
 @router.post("/api/offense_skills")
@@ -1657,6 +2375,7 @@ def set_offense_skills(req: SetOffenseSkillsRequest):
             env.offense_three_pt_pct_by_player = three_pt
             env.offense_dunk_pct_by_player = dunk
 
+        _refresh_after_live_env_edit()
         return {
             "status": "success",
             "state": get_ui_game_state(),
@@ -2043,7 +2762,7 @@ def set_defender_pressure_params(req: SetPressureParamsRequest):
 
 @router.post("/api/swap_policies")
 def swap_policies(req: SwapPoliciesRequest):
-    """Swap the active PPO policies without resetting the environment."""
+    """Swap the active inference policies without resetting the environment."""
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     if not game_state.run_id:
@@ -2064,22 +2783,48 @@ def swap_policies(req: SwapPoliciesRequest):
     }
 
     def _apply_pass_mode(policy_obj) -> None:
-        policy = getattr(policy_obj, "policy", None)
-        if policy is None:
+        if policy_obj is None:
             return
         mode_value = str(getattr(game_state.env, "pass_mode", "directional"))
-        if hasattr(policy, "set_pass_mode"):
+        if hasattr(policy_obj, "set_pass_mode"):
             try:
-                policy.set_pass_mode(mode_value)
+                policy_obj.set_pass_mode(mode_value)
             except Exception:
                 pass
+            return
+        policy = getattr(policy_obj, "policy", None)
+        if policy is None or not hasattr(policy, "set_pass_mode"):
+            return
+        try:
+            policy.set_pass_mode(mode_value)
+        except Exception:
+            pass
+
+    def _refresh_policy_metadata() -> None:
+        game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
+        game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
+        game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
+        game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
+
+    def _sync_jax_runtime_policy_refs() -> None:
+        jax_runtime = getattr(game_state, "jax_runtime", None)
+        if jax_runtime is not None and hasattr(jax_runtime, "replace_policies"):
+            jax_runtime.replace_policies(
+                unified_policy=game_state.unified_policy,
+                opponent_policy=game_state.defense_policy,
+                game_state=game_state,
+            )
 
     policies_changed = False
 
     if requested_user_policy is not None and requested_user_policy != game_state.unified_policy_key:
         try:
             user_path = get_unified_policy_path(client, game_state.run_id, requested_user_policy)
-            game_state.unified_policy = PPO.load(user_path, custom_objects=custom_objects)
+            game_state.unified_policy = load_inference_policy(
+                user_path,
+                device="cpu",
+                custom_objects=custom_objects,
+            )
             _apply_pass_mode(game_state.unified_policy)
             game_state.unified_policy_key = os.path.basename(user_path)
             game_state.unified_policy_path = user_path
@@ -2102,11 +2847,17 @@ def swap_policies(req: SwapPoliciesRequest):
                 game_state.defense_policy = None
                 game_state.opponent_unified_policy_key = None
                 game_state.opponent_policy_path = None
+                game_state.defense_policy_backend = None
+                game_state.defense_policy_capabilities = None
                 policies_changed = True
         elif requested_opponent_policy != game_state.opponent_unified_policy_key:
             try:
                 opp_path = get_unified_policy_path(client, game_state.run_id, requested_opponent_policy)
-                game_state.defense_policy = PPO.load(opp_path, custom_objects=custom_objects)
+                game_state.defense_policy = load_inference_policy(
+                    opp_path,
+                    device="cpu",
+                    custom_objects=custom_objects,
+                )
                 _apply_pass_mode(game_state.defense_policy)
                 game_state.opponent_unified_policy_key = os.path.basename(opp_path)
                 game_state.opponent_policy_path = opp_path
@@ -2124,11 +2875,15 @@ def swap_policies(req: SwapPoliciesRequest):
                 raise HTTPException(status_code=500, detail=f"Failed to load opponent policy '{requested_opponent_policy}': {e}")
 
     if not policies_changed:
+        _refresh_policy_metadata()
+        _sync_jax_runtime_policy_refs()
         return {
             "status": "no_change",
             "state": get_ui_game_state(),
         }
 
+    _refresh_policy_metadata()
+    _sync_jax_runtime_policy_refs()
     updated_state = get_ui_game_state()
     if game_state.episode_states:
         game_state.episode_states[-1] = updated_state

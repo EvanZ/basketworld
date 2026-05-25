@@ -4,7 +4,7 @@ import queue
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import basketworld
@@ -12,19 +12,18 @@ from basketworld.envs.basketworld_env_v2 import Team
 from fastapi import HTTPException
 from basketworld.utils.action_resolution import (
     IllegalActionStrategy,
-    get_policy_action_probabilities,
     resolve_illegal_actions,
-)
-from basketworld.utils.intent_policy_sensitivity import (
-    sync_policy_runtime_intent_override_from_env,
 )
 from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
 from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
-from stable_baselines3 import PPO
-from basketworld.utils.policy_loading import load_ppo_for_inference
 
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.env_access import env_view, get_env_attr
+from app.backend.inference_adapters import (
+    load_inference_policy,
+    policy_action_probabilities,
+    prepare_policy_for_role,
+)
 from app.backend.observations import (
     _ensure_set_obs,
     _predict_policy_actions,
@@ -37,6 +36,7 @@ from app.backend.rollout_runtime import (
     predict_joint_policy_actions,
 )
 from app.backend.state import game_state
+from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
 
 
 # Worker-local storage (each process has its own copy)
@@ -88,7 +88,6 @@ def _init_evaluation_worker(
     from basketworld.envs.basketworld_env_v2 import Team as _Team
     from basketworld.utils.action_resolution import (
         IllegalActionStrategy as _IllegalActionStrategy,
-        get_policy_action_probabilities as _get_policy_action_probabilities,
         resolve_illegal_actions as _resolve_illegal_actions,
     )
 
@@ -111,13 +110,13 @@ def _init_evaluation_worker(
         "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
         "SetAttentionExtractor": SetAttentionExtractor,
     }
-    unified_policy = load_ppo_for_inference(
+    unified_policy = load_inference_policy(
         unified_policy_path,
         device="cpu",
         custom_objects=custom_objects,
     )
     opponent_policy = (
-        load_ppo_for_inference(
+        load_inference_policy(
             opponent_policy_path,
             device="cpu",
             custom_objects=custom_objects,
@@ -128,14 +127,12 @@ def _init_evaluation_worker(
 
     pass_mode = str(optional_params.get("pass_mode", "directional"))
     for policy_obj in (unified_policy, opponent_policy):
-        policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
-        if policy is None:
+        if policy_obj is None:
             continue
-        if hasattr(policy, "set_pass_mode"):
-            try:
-                policy.set_pass_mode(pass_mode)
-            except Exception:
-                pass
+        try:
+            policy_obj.set_pass_mode(pass_mode)
+        except Exception:
+            pass
 
     user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
 
@@ -151,7 +148,6 @@ def _init_evaluation_worker(
         "np": _np,
         "Team": _Team,
         "IllegalActionStrategy": _IllegalActionStrategy,
-        "get_policy_action_probabilities": _get_policy_action_probabilities,
         "resolve_illegal_actions": _resolve_illegal_actions,
         "progress_queue": progress_queue,
     }
@@ -234,7 +230,6 @@ def _worker_predict_actions_for_team(
     """Predict actions for a team in worker context."""
     _np = _worker_state["np"]
     _Team = _worker_state["Team"]
-    _get_policy_action_probabilities = _worker_state["get_policy_action_probabilities"]
     _resolve_illegal_actions = _worker_state["resolve_illegal_actions"]
 
     actions_by_player: dict[int, int] = {}
@@ -252,7 +247,7 @@ def _worker_predict_actions_for_team(
     conditioned_obs = _worker_clone_obs_with_role_flag(base_obs, role_flag_value)
 
     try:
-        sync_policy_runtime_intent_override_from_env(
+        prepare_policy_for_role(
             policy,
             env,
             observer_is_offense=bool(float(role_flag_value) > 0.0),
@@ -280,7 +275,7 @@ def _worker_predict_actions_for_team(
     else:
         team_pred_actions = raw_actions[: len(team_ids)]
 
-    probs = _get_policy_action_probabilities(policy, conditioned_obs)
+    probs = policy_action_probabilities(policy, conditioned_obs)
     if probs is not None:
         probs = [_np.asarray(p, dtype=_np.float32) for p in probs]
         if len(probs) == int(get_env_attr(env, "n_players", len(probs)) or len(probs)):
@@ -507,7 +502,12 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                         )
                     except Exception:
                         continue
-            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_turnover_reasons(
+                eval_diagnostics,
+                turnovers_raw_step,
+                user_team_ids_set,
+                count_unattributed_team_turnovers=user_team == _Team.OFFENSE,
+            )
             _accumulate_reward_breakdown(
                 eval_diagnostics,
                 env,
@@ -901,8 +901,19 @@ def _accumulate_intent_selection(eval_diagnostics: dict, env) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
 
 
+def _canonical_turnover_reason(reason: object) -> str:
+    key = str(reason or "unknown")
+    if key == "shot_clock":
+        return "shot_clock_violation"
+    return key
+
+
 def _accumulate_turnover_reasons(
-    eval_diagnostics: dict, turnovers_raw_step, user_team_ids_set: set[int]
+    eval_diagnostics: dict,
+    turnovers_raw_step,
+    user_team_ids_set: set[int],
+    *,
+    count_unattributed_team_turnovers: bool = False,
 ) -> None:
     turnover_reasons = eval_diagnostics.setdefault("turnover_reasons", {})
     if not isinstance(turnovers_raw_step, (list, tuple)):
@@ -910,15 +921,17 @@ def _accumulate_turnover_reasons(
     for turnover in turnovers_raw_step:
         if not isinstance(turnover, dict):
             continue
+        reason = _canonical_turnover_reason(turnover.get("reason") or "unknown")
         pid = turnover.get("player_id")
         if pid is None:
+            if count_unattributed_team_turnovers and reason == "shot_clock_violation":
+                turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
             continue
         try:
             if int(pid) not in user_team_ids_set:
                 continue
         except Exception:
             continue
-        reason = str(turnover.get("reason") or "unknown")
         turnover_reasons[reason] = int(turnover_reasons.get(reason, 0)) + 1
 
 
@@ -1170,8 +1183,8 @@ def _run_sequential_evaluation(
     opponent_deterministic: bool,
     env,
     training_params: dict | None,
-    unified_policy: PPO,
-    opponent_policy: PPO | None,
+    unified_policy: Any,
+    opponent_policy: Any | None,
     user_team: Team,
     role_flag_offense: float,
     role_flag_defense: float,
@@ -1327,7 +1340,12 @@ def _run_sequential_evaluation(
                         )
                     except Exception:
                         continue
-            _accumulate_turnover_reasons(eval_diagnostics, turnovers_raw_step, user_team_ids_set)
+            _accumulate_turnover_reasons(
+                eval_diagnostics,
+                turnovers_raw_step,
+                user_team_ids_set,
+                count_unattributed_team_turnovers=user_team == Team.OFFENSE,
+            )
             _accumulate_reward_breakdown(
                 eval_diagnostics,
                 env,
@@ -1641,6 +1659,29 @@ def run_evaluation(
     num_workers: int | None = None,
     progress_callback=None,
 ):
+    if can_run_native_jax_evaluation(
+        unified_policy_path=unified_policy_path,
+        opponent_policy_path=opponent_policy_path,
+        custom_setup=custom_setup,
+        randomize_offense_permutation=randomize_offense_permutation,
+    ):
+        print("[Evaluation] Using JAX-native compiled evaluation fast path")
+        return run_native_jax_evaluation(
+            num_episodes=num_episodes,
+            player_deterministic=player_deterministic,
+            opponent_deterministic=opponent_deterministic,
+            required_params=required_params,
+            optional_params=optional_params,
+            training_params=training_params,
+            unified_policy_path=unified_policy_path,
+            opponent_policy_path=opponent_policy_path,
+            user_team_name=user_team_name,
+            role_flag_offense=role_flag_offense,
+            role_flag_defense=role_flag_defense,
+            intent_selection_mode=intent_selection_mode,
+            progress_callback=progress_callback,
+        )
+
     if num_workers is None or num_workers <= 1:
         env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
         custom_objects = {
@@ -1649,13 +1690,13 @@ def run_evaluation(
             "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
             "SetAttentionExtractor": SetAttentionExtractor,
         }
-        unified_policy = load_ppo_for_inference(
+        unified_policy = load_inference_policy(
             unified_policy_path,
             device="cpu",
             custom_objects=custom_objects,
         )
         opponent_policy = (
-            load_ppo_for_inference(
+            load_inference_policy(
                 opponent_policy_path,
                 device="cpu",
                 custom_objects=custom_objects,
@@ -1665,14 +1706,12 @@ def run_evaluation(
         )
         pass_mode = str(optional_params.get("pass_mode", "directional"))
         for policy_obj in (unified_policy, opponent_policy):
-            policy = getattr(policy_obj, "policy", None) if policy_obj is not None else None
-            if policy is None:
+            if policy_obj is None:
                 continue
-            if hasattr(policy, "set_pass_mode"):
-                try:
-                    policy.set_pass_mode(pass_mode)
-                except Exception:
-                    pass
+            try:
+                policy_obj.set_pass_mode(pass_mode)
+            except Exception:
+                pass
         user_team = Team.OFFENSE if user_team_name == "OFFENSE" else Team.DEFENSE
 
         return _run_sequential_evaluation(

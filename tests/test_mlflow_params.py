@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from basketworld.utils.mlflow_params import get_mlflow_params, get_mlflow_training_params
+from basketworld.utils.mlflow_params import (
+    get_mlflow_params,
+    get_mlflow_phi_shaping_params,
+    get_mlflow_training_params,
+)
 
 
 class _FakeClient:
@@ -90,3 +94,75 @@ def test_get_mlflow_training_params_includes_multiselect_and_disc_priors():
     assert training["intent_selector_min_play_steps"] == 4
     assert training["intent_disc_lambda_shot"] == 0.2
     assert training["intent_disc_lambda_q"] == 0.05
+
+
+def test_get_mlflow_training_params_supports_jax_selector_aliases():
+    client = _FakeClient(
+        {
+            "jax/intent_selector_enabled": "true",
+            "jax/intent_selector_hidden_dim": "96",
+            "jax/intent_selector_alpha_start": "0.1",
+            "jax/intent_selector_alpha_end": "0.8",
+            "jax/intent_selector_alpha_warmup_updates": "20",
+            "jax/intent_selector_alpha_ramp_updates": "100",
+            "jax/intent_selector_eps_start": "0.5",
+            "jax/intent_selector_eps_end": "0.05",
+            "jax/intent_selector_eps_warmup_updates": "10",
+            "jax/intent_selector_eps_ramp_updates": "50",
+            "jax/intent_selector_entropy_coef": "0.02",
+            "jax/intent_selector_usage_reg_coef": "0.03",
+            "jax/intent_selector_value_coef": "0.4",
+            "jax/intent_selector_train_every_rollouts": "2",
+            "jax/intent_selector_max_samples_per_update": "4096",
+            "jax/intent_selector_multiselect_enabled": "true",
+            "jax/intent_selector_min_play_steps": "7",
+        }
+    )
+
+    training = get_mlflow_training_params(client, "dummy")
+
+    assert training["intent_selector_enabled"] is True
+    assert training["intent_selector_mode"] == "integrated"
+    assert training["intent_selector_hidden_dim"] == 96
+    assert training["intent_selector_alpha_start"] == 0.1
+    assert training["intent_selector_alpha_end"] == 0.8
+    assert training["intent_selector_alpha_warmup_steps"] == 20
+    assert training["intent_selector_alpha_ramp_steps"] == 100
+    assert training["intent_selector_eps_start"] == 0.5
+    assert training["intent_selector_eps_end"] == 0.05
+    assert training["intent_selector_eps_warmup_steps"] == 10
+    assert training["intent_selector_eps_ramp_steps"] == 50
+    assert training["intent_selector_entropy_coef"] == 0.02
+    assert training["intent_selector_usage_reg_coef"] == 0.03
+    assert training["intent_selector_value_coef"] == 0.4
+    assert training["intent_selector_train_every_rollouts"] == 2
+    assert training["intent_selector_max_samples_per_update"] == 4096
+    assert training["intent_selector_multiselect_enabled"] is True
+    assert training["intent_selector_min_play_steps"] == 7
+
+
+def test_get_mlflow_phi_shaping_params_supports_jax_env_aliases():
+    client = _FakeClient(
+        {
+            "jax/env/enable_phi_shaping": "true",
+            "jax/enable_phi_shaping": "false",
+            "jax/env/reward_shaping_gamma": "0.97",
+            "jax/reward_shaping_gamma": "0.50",
+            "jax/env/phi_beta_start": "0.01",
+            "jax/env/phi_beta_end": "0.15",
+            "jax/phi_beta_end": "0.05",
+            "jax/env/phi_blend_weight": "0.5",
+            "jax/phi_blend_weight": "0.1",
+            "jax/env/phi_aggregation_mode": "teammates_best",
+            "jax/env/phi_use_ball_handler_only": "false",
+        }
+    )
+
+    phi = get_mlflow_phi_shaping_params(client, "dummy")
+
+    assert phi["enable_phi_shaping"] is True
+    assert phi["reward_shaping_gamma"] == 0.97
+    assert phi["phi_beta"] == 0.15
+    assert phi["phi_blend_weight"] == 0.5
+    assert phi["phi_aggregation_mode"] == "teammates_best"
+    assert phi["phi_use_ball_handler_only"] is False

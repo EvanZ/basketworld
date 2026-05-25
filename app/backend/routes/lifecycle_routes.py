@@ -17,10 +17,16 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_training_params,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
-from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.utils.start_templates import resolve_start_template
 from basketworld.utils.wrappers import SetObservationWrapper
 
+from app.backend.inference_adapters import (
+    get_policy_backend_kind,
+    get_policy_capabilities,
+    get_policy_metadata,
+    load_inference_policy,
+)
 from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
     _compute_q_values_for_player,
@@ -45,6 +51,7 @@ from app.backend.schemas import (
     InitGameRequest,
     ListPoliciesRequest,
     MCTSAdviseRequest,
+    StartSelfPlayRequest,
     TemplateBootstrapRequest,
 )
 from app.backend.state import (
@@ -71,6 +78,307 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     return env_kwargs, wrapper_kwargs
 
 
+def _str_to_bool(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
+
+
+_JAX_MLFLOW_ENV_PARAM_CASTS = {
+    "training_team": str,
+    "players": int,
+    "court_rows": int,
+    "court_cols": int,
+    "shot_clock": int,
+    "min_shot_clock": int,
+    "allow_dunks": _str_to_bool,
+    "layup_pct": float,
+    "three_pt_pct": float,
+    "dunk_pct": float,
+    "layup_std": float,
+    "three_pt_std": float,
+    "dunk_std": float,
+    "three_point_distance": float,
+    "three_point_short_distance": float,
+    "three_pt_extra_hex_decay": float,
+    "shot_pressure_enabled": _str_to_bool,
+    "shot_pressure_max": float,
+    "shot_pressure_lambda": float,
+    "shot_pressure_arc_degrees": float,
+    "defender_pressure_distance": int,
+    "defender_pressure_turnover_chance": float,
+    "defender_pressure_decay_lambda": float,
+    "base_steal_rate": float,
+    "steal_perp_decay": float,
+    "steal_distance_factor": float,
+    "steal_position_weight_min": float,
+    "spawn_distance": int,
+    "max_spawn_distance": int,
+    "defender_spawn_distance": int,
+    "defender_guard_distance": int,
+    "assist_window": int,
+    "mask_occupied_moves": _str_to_bool,
+    "enable_pass_gating": _str_to_bool,
+    "pass_mode": str,
+    "use_set_obs": _str_to_bool,
+    "illegal_defense_enabled": _str_to_bool,
+    "offensive_three_seconds": _str_to_bool,
+    "three_second_lane_width": int,
+    "three_second_lane_height": int,
+    "three_second_max_steps": int,
+    "violation_reward": float,
+    "include_hoop_vector": _str_to_bool,
+    "enable_phi_shaping": _str_to_bool,
+    "reward_shaping_gamma": float,
+    "phi_beta": float,
+    "phi_beta_start": float,
+    "phi_beta_end": float,
+    "phi_beta_warmup_updates": int,
+    "phi_beta_ramp_updates": int,
+    "phi_blend_weight": float,
+    "phi_aggregation_mode": str,
+    "phi_use_ball_handler_only": _str_to_bool,
+    "pass_reward": float,
+    "potential_assist_pct": float,
+    "full_assist_bonus_pct": float,
+    "start_template_enabled": _str_to_bool,
+    "start_template_library": str,
+    "start_template_prob": float,
+    "start_template_jitter_scale": float,
+    "start_template_mirror_prob": float,
+    "start_template_strict": _str_to_bool,
+    "enable_intent_learning": _str_to_bool,
+    "enable_defense_intent_learning": _str_to_bool,
+    "num_intents": int,
+    "intent_commitment_steps": int,
+    "intent_null_prob": float,
+    "defense_intent_null_prob": float,
+    "intent_visible_to_defense_prob": float,
+}
+
+
+def _coerce_jax_mlflow_env_param(raw_value, cast):
+    if raw_value is None:
+        return None
+    raw_str = str(raw_value).strip()
+    if raw_str == "" or raw_str.lower() in {"none", "null"}:
+        return None
+    if cast is int:
+        return int(float(raw_str))
+    return cast(raw_value)
+
+
+def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -> dict:
+    merged = dict(optional_params or {})
+    for key, cast in _JAX_MLFLOW_ENV_PARAM_CASTS.items():
+        names = (f"jax/env/{key}",)
+        if key == "offensive_three_seconds":
+            names = (f"jax/env/{key}", "jax/env/offensive_three_seconds_enabled")
+        for name in names:
+            if name not in mlflow_params:
+                continue
+            value = _coerce_jax_mlflow_env_param(mlflow_params.get(name), cast)
+            if key == "training_team" and isinstance(value, str):
+                merged[key] = Team.DEFENSE if value.strip().lower() == "defense" else Team.OFFENSE
+            elif key == "offensive_three_seconds":
+                merged["offensive_three_seconds_enabled"] = bool(value)
+            else:
+                merged[key] = value
+            break
+    return _normalize_jax_phi_runtime_env_params(merged)
+
+
+def _normalize_jax_phi_runtime_env_params(
+    config: dict,
+    *,
+    current_phi_beta: float | None = None,
+) -> dict:
+    """Map JAX phi schedule metadata into the env's runtime phi fields.
+
+    The trainer persists phi schedule knobs (`phi_beta_start/end`) for
+    reproducibility, but the live env/runtime expects the active field
+    `phi_beta`. For checkpoints, prefer the checkpoint's recorded current beta;
+    otherwise fall back to the target end beta and then start beta.
+    """
+    merged = dict(config or {})
+    if "phi_beta" not in merged or merged.get("phi_beta") in ("", None):
+        beta_value = current_phi_beta
+        if beta_value is None:
+            for beta_key in ("phi_beta_end", "phi_beta_start"):
+                raw = merged.get(beta_key)
+                if raw in ("", None):
+                    continue
+                try:
+                    beta_value = float(raw)
+                    break
+                except Exception:
+                    continue
+        if beta_value is not None:
+            merged["phi_beta"] = float(beta_value)
+    return merged
+
+
+def _coerce_jax_mlflow_training_value(raw_value):
+    if raw_value is None:
+        return None
+    raw_str = str(raw_value).strip()
+    if raw_str == "":
+        return raw_value
+    raw_lower = raw_str.lower()
+    if raw_lower in {"none", "null"}:
+        return None
+    if raw_lower in {"true", "false"}:
+        return raw_lower == "true"
+    try:
+        if all(token not in raw_str for token in (".", "e", "E")):
+            return int(raw_str)
+    except Exception:
+        pass
+    try:
+        return float(raw_str)
+    except Exception:
+        return raw_value
+
+
+def _jax_param_is_missing(value) -> bool:
+    return value is None or value == ""
+
+
+def _jax_setdefault_param(params: dict, key: str, value) -> None:
+    if _jax_param_is_missing(value):
+        return
+    if key not in params or _jax_param_is_missing(params.get(key)):
+        params[key] = value
+
+
+def _jax_int_param(params: dict, key: str, default: int | None = None) -> int | None:
+    value = params.get(key, default)
+    if _jax_param_is_missing(value):
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _populate_jax_training_ui_aliases(training_params: dict) -> dict:
+    """Populate SB3-style UI aliases from JAX-native MLflow/trainer params."""
+    merged = dict(training_params or {})
+
+    kernel_batch_size = _jax_int_param(merged, "kernel_batch_size")
+    rollout_horizon = _jax_int_param(merged, "rollout_horizon")
+    ppo_minibatches = max(1, _jax_int_param(merged, "ppo_minibatches", 1) or 1)
+    role_multiplier = 2 if str(merged.get("mode", "train_loop")).lower() == "train_loop" else 1
+    steps_per_update = None
+    if kernel_batch_size is not None and rollout_horizon is not None:
+        steps_per_update = int(kernel_batch_size * rollout_horizon * role_multiplier)
+        _jax_setdefault_param(merged, "num_envs", kernel_batch_size)
+        _jax_setdefault_param(merged, "n_steps", rollout_horizon)
+        _jax_setdefault_param(merged, "steps_per_update", steps_per_update)
+        _jax_setdefault_param(merged, "ppo_batch_size", steps_per_update)
+        minibatch_size = (
+            steps_per_update // ppo_minibatches
+            if steps_per_update % ppo_minibatches == 0
+            else steps_per_update
+        )
+        _jax_setdefault_param(merged, "batch_size", minibatch_size)
+
+    alias_pairs = {
+        "n_epochs": "policy_update_epochs",
+        "clip_range": "ppo_clip_range",
+        "vf_coef": "value_coef",
+        "ent_coef": "entropy_coef",
+    }
+    for ui_key, jax_key in alias_pairs.items():
+        _jax_setdefault_param(merged, ui_key, merged.get(jax_key))
+
+    has_model_config = any(
+        not _jax_param_is_missing(merged.get(key))
+        for key in (
+            "policy_model",
+            "model_type",
+            "attention_embed_dim",
+            "policy_hidden_dims",
+        )
+    )
+
+    if "policy_class" not in merged and has_model_config:
+        model = str(merged.get("policy_model", "") or merged.get("model_type", "") or "").strip()
+        if not model:
+            model = "attention" if merged.get("attention_embed_dim") else "mlp"
+        merged["policy_class"] = f"JAX {model} actor-critic"
+
+    if has_model_config:
+        _jax_setdefault_param(merged, "use_dual_critic", bool(merged.get("use_dual_critic", False)))
+    if "net_arch_used" not in merged and has_model_config:
+        if merged.get("attention_embed_dim"):
+            pi = merged.get("attention_pi_head_hidden_dims")
+            vf = merged.get("attention_vf_head_hidden_dims")
+            parts = [
+                f"attention embed={merged.get('attention_embed_dim')}",
+                f"heads={merged.get('attention_num_heads', 'N/A')}",
+                f"token_mlp={merged.get('attention_token_mlp_dim', 'N/A')}",
+            ]
+            if pi:
+                parts.append(f"pi=[{pi}]")
+            if vf:
+                parts.append(f"vf=[{vf}]")
+            merged["net_arch_used"] = ", ".join(parts)
+        elif merged.get("policy_hidden_dims"):
+            merged["net_arch_used"] = str(merged.get("policy_hidden_dims"))
+
+    if steps_per_update is not None:
+        for prefix in (
+            "intent_selector_alpha",
+            "intent_selector_eps",
+            "task_reward_scale",
+            "intent_diversity",
+        ):
+            for phase in ("warmup", "ramp"):
+                update_key = f"{prefix}_{phase}_updates"
+                steps_key = f"{prefix}_{phase}_steps"
+                updates = _jax_int_param(merged, update_key)
+                if updates is None or updates < 0:
+                    continue
+                _jax_setdefault_param(merged, steps_key, int(updates * steps_per_update))
+    return merged
+
+
+def _overlay_jax_mlflow_training_params(training_params: dict, mlflow_params: dict) -> dict:
+    """Expose JAX MLflow params as normal unprefixed training params for the UI/runtime."""
+    merged = dict(training_params or {})
+    for raw_key, raw_value in dict(mlflow_params or {}).items():
+        if not str(raw_key).startswith("jax/"):
+            continue
+        key = str(raw_key)[len("jax/") :]
+        if not key or key.startswith("env/"):
+            continue
+        merged[key] = _coerce_jax_mlflow_training_value(raw_value)
+    for raw_key, raw_value in dict(mlflow_params or {}).items():
+        if not str(raw_key).startswith("jax/env/"):
+            continue
+        key = str(raw_key)[len("jax/env/") :]
+        if key in {
+            "enable_phi_shaping",
+            "reward_shaping_gamma",
+            "phi_beta_start",
+            "phi_beta_end",
+            "phi_beta_warmup_updates",
+            "phi_beta_ramp_updates",
+            "phi_blend_weight",
+            "phi_aggregation_mode",
+            "phi_use_ball_handler_only",
+            "start_template_enabled",
+            "start_template_library",
+            "start_template_prob",
+            "start_template_jitter_scale",
+            "start_template_mirror_prob",
+            "start_template_strict",
+        }:
+            merged[key] = _coerce_jax_mlflow_training_value(raw_value)
+    if bool(merged.get("intent_selector_enabled", False)):
+        merged.setdefault("intent_selector_mode", "integrated")
+    return _populate_jax_training_ui_aliases(merged)
+
+
 def _load_start_template_library_for_run(
     mlflow_client: mlflow.tracking.MlflowClient, run_id: str
 ) -> dict | None:
@@ -80,6 +388,106 @@ def _load_start_template_library_for_run(
     except Exception as exc:
         print(f"[start_templates] Failed to load template library for run {run_id}: {exc}")
         return None
+
+
+_SESSION_START_TEMPLATE_SOURCES = {"local_file", "file_upload", "session_editor"}
+
+
+def _resolve_start_template_library_for_init(
+    *,
+    mlflow_client: mlflow.tracking.MlflowClient,
+    run_id: str,
+    mlflow_training_params: dict,
+    previous_library: dict | None,
+    previous_source: str | None,
+    previous_path: str | None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Prefer a run artifact, but keep manually loaded session templates across New Game."""
+    run_library = _load_start_template_library_for_run(mlflow_client, run_id)
+    if run_library is not None:
+        return (
+            run_library,
+            "mlflow_artifact",
+            str(
+                mlflow_training_params.get(
+                    "start_template_library_artifact_path",
+                    "metadata/start_template_library.json",
+                )
+            ),
+        )
+
+    source = str(previous_source or "").strip()
+    if previous_library is not None and source in _SESSION_START_TEMPLATE_SOURCES:
+        return copy.deepcopy(previous_library), source, previous_path
+    return None, None, None
+
+
+def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, dict | None]:
+    metadata = get_policy_metadata(policy_obj) or {}
+    frozen_config = dict(metadata.get("frozen_config", {}) or {})
+    env_config = dict(metadata.get("env_config", {}) or {})
+    config = env_config or frozen_config
+    if not config:
+        raise HTTPException(
+            status_code=400,
+            detail="JAX checkpoint is missing env_config/frozen_config metadata.",
+        )
+    training_team = config.get("training_team")
+    if isinstance(training_team, str):
+        config["training_team"] = (
+            Team.DEFENSE if training_team.strip().lower() == "defense" else Team.OFFENSE
+        )
+    if "offensive_three_seconds" in config and "offensive_three_seconds_enabled" not in config:
+        config["offensive_three_seconds_enabled"] = bool(config.pop("offensive_three_seconds"))
+    if "allow_dunks" not in config:
+        # Historical JAX checkpoints were trained with the trainer default
+        # allow_dunks=True but did not persist that key. Preserve JAX behavior
+        # instead of falling back to the base env constructor default False.
+        config["allow_dunks"] = True
+    trainer_config = dict(metadata.get("trainer_config", {}) or {})
+    policy_spec = dict(metadata.get("policy_spec", {}) or {})
+    last_metrics = dict(metadata.get("last_metrics", {}) or {})
+    current_phi_beta = None
+    for beta_metric in ("phi_beta", "phi_beta_mean", "offense_phi_beta_mean"):
+        if beta_metric not in last_metrics:
+            continue
+        try:
+            current_phi_beta = float(last_metrics[beta_metric])
+            break
+        except Exception:
+            continue
+    config = _normalize_jax_phi_runtime_env_params(
+        config,
+        current_phi_beta=current_phi_beta,
+    )
+    if bool(policy_spec.get("intent_selector_enabled", False)):
+        trainer_config.setdefault("intent_selector_enabled", True)
+        trainer_config.setdefault("intent_selector_mode", "integrated")
+        current_alpha = float(last_metrics.get("selector_alpha", 1.0) or 0.0)
+        current_eps = float(last_metrics.get("selector_eps", 0.0) or 0.0)
+        trainer_config.setdefault("intent_selector_alpha_start", current_alpha)
+        trainer_config.setdefault("intent_selector_alpha_end", current_alpha)
+        trainer_config.setdefault("intent_selector_alpha_warmup_steps", 0)
+        trainer_config.setdefault("intent_selector_alpha_ramp_steps", 0)
+        trainer_config.setdefault("intent_selector_eps_start", current_eps)
+        trainer_config.setdefault("intent_selector_eps_end", current_eps)
+        trainer_config.setdefault("intent_selector_eps_warmup_steps", 0)
+        trainer_config.setdefault("intent_selector_eps_ramp_steps", 0)
+        trainer_config.setdefault("intent_selector_value_coef", 0.5)
+        trainer_config.setdefault("intent_selector_multiselect_enabled", True)
+        trainer_config.setdefault("intent_selector_min_play_steps", 3)
+    trainer_config = _populate_jax_training_ui_aliases(trainer_config)
+    required_params: dict = {}
+    optional_params = dict(config)
+    phi_params = {
+        "enable_phi_shaping": bool(config.get("enable_phi_shaping", False)),
+        "phi_beta": float(config.get("phi_beta", 0.0) or 0.0),
+        "reward_shaping_gamma": float(config.get("reward_shaping_gamma", 1.0) or 1.0),
+        "phi_aggregation_mode": str(config.get("phi_aggregation_mode", "team_best")),
+        "phi_use_ball_handler_only": bool(config.get("phi_use_ball_handler_only", False)),
+        "phi_blend_weight": float(config.get("phi_blend_weight", 0.0) or 0.0),
+    }
+    return required_params, optional_params, trainer_config, phi_params
 
 
 def _selector_runtime_active_for_app() -> bool:
@@ -105,6 +513,90 @@ def _apply_app_segment_start(*, allow_uniform_fallback: bool) -> bool:
     if result.get("obs") is not None:
         game_state.obs = result["obs"]
     return bool(result.get("used_selector", False))
+
+
+def _resolve_self_play_start_template(
+    request: StartSelfPlayRequest,
+) -> tuple[list[tuple[int, int]], int | None, int | None, dict | None]:
+    template_id = str(getattr(request, "template_id", "") or "").strip()
+    if not template_id:
+        return [], None, None, None
+    if not game_state.env:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+    library = getattr(game_state, "mlflow_start_template_library", None)
+    if not library or not isinstance(library, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="No start-template library is loaded for this UI session.",
+        )
+
+    template = next(
+        (
+            dict(item)
+            for item in list(library.get("templates") or [])
+            if str(item.get("id", "")).strip() == template_id
+        ),
+        None,
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail=f"Unknown start template: {template_id}")
+
+    env = getattr(game_state.env, "unwrapped", game_state.env)
+    original_rng = getattr(env, "_rng", None)
+    seed = getattr(request, "template_seed", None)
+    if seed is not None:
+        setattr(env, "_rng", np.random.default_rng(int(seed)))
+    elif original_rng is None:
+        setattr(env, "_rng", np.random.default_rng())
+    rng = getattr(env, "_rng")
+
+    mirrored_requested = getattr(request, "template_mirrored", None)
+    if mirrored_requested is None:
+        training_params = getattr(game_state, "mlflow_training_params", None) or {}
+        try:
+            mirror_prob = float(training_params.get("start_template_mirror_prob", 0.5))
+        except Exception:
+            mirror_prob = 0.5
+        mirrored = bool(template.get("mirrorable", False) and float(rng.random()) < mirror_prob)
+    else:
+        mirrored = bool(mirrored_requested) and bool(template.get("mirrorable", False))
+
+    training_params = getattr(game_state, "mlflow_training_params", None) or {}
+    try:
+        jitter_scale = float(training_params.get("start_template_jitter_scale", 1.0))
+    except Exception:
+        jitter_scale = 1.0
+
+    try:
+        resolved = resolve_start_template(
+            env,
+            template,
+            jitter_scale=jitter_scale,
+            mirror=mirrored,
+        )
+    finally:
+        if seed is not None:
+            setattr(env, "_rng", original_rng)
+
+    positions = [
+        (int(pos[0]), int(pos[1]))
+        for pos in list(resolved.get("initial_positions") or [])
+    ]
+    if not positions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Start template {template_id} did not resolve any positions.",
+        )
+    return (
+        positions,
+        int(resolved["ball_holder"]) if resolved.get("ball_holder") is not None else None,
+        int(resolved["shot_clock"]) if resolved.get("shot_clock") is not None else None,
+        {
+            "template_id": str(resolved.get("template_id") or template_id),
+            "mirrored": bool(resolved.get("mirrored", mirrored)),
+            "source": getattr(game_state, "start_template_library_source", None),
+        },
+    )
 
 
 def _initialize_app_selector_runtime_for_episode() -> None:
@@ -175,39 +667,25 @@ async def init_game(request: InitGameRequest):
     mlflow_client = mlflow.tracking.MlflowClient()
 
     run_name = request.run_name
-    run_id = request.run_id
+    run_id = str(request.run_id or "").strip()
     unified_policy_name = request.unified_policy_name
     opponent_unified_policy_name = request.opponent_unified_policy_name
+    if not run_id:
+        raise HTTPException(status_code=400, detail="init_game requires run_id.")
+    previous_start_template_library = copy.deepcopy(
+        getattr(game_state, "mlflow_start_template_library", None)
+    )
+    previous_start_template_source = getattr(game_state, "start_template_library_source", None)
+    previous_start_template_path = getattr(game_state, "start_template_library_path", None)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
-            mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
-            mlflow_training_params = get_mlflow_training_params(mlflow_client, run_id)
-        except Exception as e:
-            msg = str(e)
-            if "RESOURCE_DOES_NOT_EXIST" in msg:
-                raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
-
-        start_template_library = _load_start_template_library_for_run(
-            mlflow_client, run_id
-        )
-
-        # Extract role_flag encoding for backward compatibility (not passed to env)
-        game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
-        game_state.role_flag_defense = optional_params.pop("role_flag_defense_value", -1.0)
-        optional_params.pop("role_flag_encoding_version", None)
-
-        # Apply request overrides for optional parameters
-        if request.spawn_distance is not None:
-            optional_params["spawn_distance"] = request.spawn_distance
-        if request.defender_spawn_distance is not None:
-            optional_params["defender_spawn_distance"] = request.defender_spawn_distance
-        if request.allow_dunks is not None:
-            optional_params["allow_dunks"] = request.allow_dunks
-        if request.dunk_pct is not None:
-            optional_params["dunk_pct"] = request.dunk_pct
+        required_params: dict
+        optional_params: dict
+        mlflow_phi_params: dict
+        mlflow_training_params: dict
+        start_template_library: dict | None
+        start_template_library_source: str | None = None
+        start_template_library_path: str | None = None
 
         try:
             unified_path = get_unified_policy_path(mlflow_client, run_id, unified_policy_name)
@@ -226,27 +704,143 @@ async def init_game(request: InitGameRequest):
                     raise HTTPException(status_code=404, detail=f"Opponent policy not found for run {run_id}")
                 raise HTTPException(status_code=500, detail=f"Failed to download opponent policy: {e}")
 
-        game_state.unified_policy = load_ppo_for_inference(unified_path, device="cpu")
+        game_state.unified_policy = load_inference_policy(unified_path, device="cpu")
         game_state.offense_policy = None
         game_state.defense_policy = (
-            load_ppo_for_inference(opponent_unified_path, device="cpu")
+            load_inference_policy(opponent_unified_path, device="cpu")
             if opponent_unified_path
             else None
         )
+
+        if get_policy_backend_kind(game_state.unified_policy) == "jax":
+            (
+                required_params,
+                optional_params,
+                mlflow_training_params,
+                mlflow_phi_params,
+            ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
+            policy_metadata = get_policy_metadata(game_state.unified_policy) or {}
+            run_params = {}
+            try:
+                run_params = dict(mlflow_client.get_run(run_id).data.params or {})
+                mlflow_training_params = _overlay_jax_mlflow_training_params(
+                    mlflow_training_params,
+                    run_params,
+                )
+                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
+            except Exception as e:
+                print(f"[init_game] Warning: failed to apply JAX MLflow training params: {e}")
+            try:
+                optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
+            except Exception as e:
+                print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
+            (
+                start_template_library,
+                start_template_library_source,
+                start_template_library_path,
+            ) = _resolve_start_template_library_for_init(
+                mlflow_client=mlflow_client,
+                run_id=run_id,
+                mlflow_training_params=mlflow_training_params,
+                previous_library=previous_start_template_library,
+                previous_source=previous_start_template_source,
+                previous_path=previous_start_template_path,
+            )
+            if start_template_library is not None:
+                optional_params["start_template_library"] = start_template_library
+                if start_template_library_source == "mlflow_artifact":
+                    mlflow_training_params.setdefault(
+                        "start_template_library_artifact_path",
+                        start_template_library_path or "metadata/start_template_library.json",
+                    )
+            else:
+                # Checkpoint metadata stores the source path for reproducibility,
+                # but the live Python env expects the resolved library dict.
+                optional_params.pop("start_template_library", None)
+        else:
+            try:
+                required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
+                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
+                mlflow_training_params = get_mlflow_training_params(mlflow_client, run_id)
+            except Exception as e:
+                msg = str(e)
+                if "RESOURCE_DOES_NOT_EXIST" in msg:
+                    raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
+                raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
+
+            (
+                start_template_library,
+                start_template_library_source,
+                start_template_library_path,
+            ) = _resolve_start_template_library_for_init(
+                mlflow_client=mlflow_client,
+                run_id=run_id,
+                mlflow_training_params=mlflow_training_params,
+                previous_library=previous_start_template_library,
+                previous_source=previous_start_template_source,
+                previous_path=previous_start_template_path,
+            )
+
+        # Extract role_flag encoding for backward compatibility (not passed to env)
+        game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
+        game_state.role_flag_defense = optional_params.pop("role_flag_defense_value", -1.0)
+        optional_params.pop("role_flag_encoding_version", None)
+
+        # Apply request overrides for optional parameters
+        if request.spawn_distance is not None:
+            optional_params["spawn_distance"] = request.spawn_distance
+        if request.defender_spawn_distance is not None:
+            optional_params["defender_spawn_distance"] = request.defender_spawn_distance
+        if request.allow_dunks is not None:
+            optional_params["allow_dunks"] = request.allow_dunks
+        if request.dunk_pct is not None:
+            optional_params["dunk_pct"] = request.dunk_pct
+
         game_state.unified_policy_key = os.path.basename(unified_path)
         game_state.opponent_unified_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
+        game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
+        game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
+        game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
 
         env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(optional_params)
         use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
-        game_state.env = basketworld.HexagonBasketballEnv(
-            **required_params,
-            **env_optional_params,
-            render_mode="rgb_array",
-        )
-        if use_set_obs:
-            game_state.env = SetObservationWrapper(game_state.env)
+        resolved_user_team = Team[request.user_team_name.upper()]
+        game_state.user_team = resolved_user_team
+
+        if game_state.unified_policy_backend == "jax":
+            from app.backend.jax_dev_runtime import JaxDevRuntime
+
+            game_state.jax_runtime = JaxDevRuntime(
+                required_params=required_params,
+                env_params=env_optional_params,
+                unified_policy=game_state.unified_policy,
+                opponent_policy=game_state.defense_policy,
+                user_team=resolved_user_team,
+                role_flag_offense=game_state.role_flag_offense,
+                role_flag_defense=game_state.role_flag_defense,
+            )
+            game_state.jax_runtime.reset()
+            game_state.env = game_state.jax_runtime.display_env
+            game_state.obs = game_state.jax_runtime.observation_dict(
+                observer_is_offense=resolved_user_team != Team.DEFENSE
+            )
+        else:
+            game_state.jax_runtime = None
+            game_state.env = basketworld.HexagonBasketballEnv(
+                **required_params,
+                **env_optional_params,
+                render_mode="rgb_array",
+            )
+            if use_set_obs:
+                game_state.env = SetObservationWrapper(game_state.env)
 
         def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
+            if policy_obj is None:
+                return
+            if hasattr(policy_obj, "set_pass_mode"):
+                policy_obj.set_pass_mode(mode_value)
+                return
             policy = getattr(policy_obj, "policy", None)
             if policy is None:
                 return
@@ -261,7 +855,8 @@ async def init_game(request: InitGameRequest):
         _apply_policy_pass_mode(game_state.unified_policy, current_pass_mode)
         _apply_policy_pass_mode(game_state.defense_policy, current_pass_mode)
 
-        game_state.obs, _ = game_state.env.reset()
+        if game_state.jax_runtime is None:
+            game_state.obs, _ = game_state.env.reset()
         try:
             game_state.obs = validate_policy_observation_schema(
                 game_state.unified_policy,
@@ -298,9 +893,9 @@ async def init_game(request: InitGameRequest):
 
         _capture_turn_start_snapshot()
 
-        game_state.user_team = Team[request.user_team_name.upper()]
-        game_state.run_id = request.run_id
-        game_state.run_name = run_name or request.run_id
+        game_state.user_team = resolved_user_team
+        game_state.run_id = run_id
+        game_state.run_name = run_name or run_id
         game_state.mlflow_phi_shaping_params = mlflow_phi_params
         game_state.mlflow_training_params = mlflow_training_params
         game_state.counterfactual_snapshot = None
@@ -311,7 +906,11 @@ async def init_game(request: InitGameRequest):
         game_state.episode_states = []
         game_state.phi_log = []
         game_state.playable_session = None
-        _initialize_app_selector_runtime_for_episode()
+        if game_state.jax_runtime is None:
+            _initialize_app_selector_runtime_for_episode()
+        else:
+            game_state.selector_segment_index = 0
+            game_state.selector_last_boundary_reason = None
 
         try:
             frame = game_state.env.render()
@@ -388,13 +987,8 @@ async def init_game(request: InitGameRequest):
     game_state.mlflow_training_params = mlflow_training_params
     game_state.mlflow_start_template_library = copy.deepcopy(start_template_library)
     if start_template_library is not None:
-        game_state.start_template_library_source = "mlflow_artifact"
-        game_state.start_template_library_path = str(
-            mlflow_training_params.get(
-                "start_template_library_artifact_path",
-                "metadata/start_template_library.json",
-            )
-        )
+        game_state.start_template_library_source = start_template_library_source
+        game_state.start_template_library_path = start_template_library_path
     else:
         game_state.start_template_library_source = None
         game_state.start_template_library_path = None
@@ -477,6 +1071,10 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     game_state.defense_policy = None
     game_state.unified_policy_key = None
     game_state.opponent_unified_policy_key = None
+    game_state.unified_policy_backend = None
+    game_state.defense_policy_backend = None
+    game_state.unified_policy_capabilities = None
+    game_state.defense_policy_capabilities = None
     game_state.unified_policy_path = None
     game_state.opponent_policy_path = None
 
@@ -486,6 +1084,7 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
         "render_mode": "rgb_array",
     }
 
+    game_state.jax_runtime = None
     game_state.env = basketworld.HexagonBasketballEnv(**env_kwargs)
     game_state.obs, _ = game_state.env.reset()
     game_state.prev_obs = None
@@ -533,7 +1132,7 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     initial_state = get_full_game_state(
         include_policy_probs=False,
         include_action_values=False,
-        include_state_values=False,
+        include_state_values=True,
     )
     game_state.episode_states.append(initial_state)
 
@@ -602,6 +1201,17 @@ def _normalize_action_overrides(raw_actions, n_players: int) -> tuple[dict[int, 
 @router.post("/api/step")
 def step(request: ActionRequest):
     """Takes a single step in the environment (restored full behavior from pre-refactor)."""
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.step(request, game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"JAX runtime step failed: {err}")
+
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
@@ -1081,8 +1691,20 @@ def mcts_advise(request: MCTSAdviseRequest):
 
 
 @router.post("/api/start_self_play")
-def start_self_play():
+def start_self_play(request: StartSelfPlayRequest | None = None):
     """Prepare deterministic self-play by resetting with current initial conditions and a fixed seed."""
+    request = request or StartSelfPlayRequest()
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.start_self_play(request, game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"JAX runtime self-play reset failed: {err}")
+
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
@@ -1093,6 +1715,16 @@ def start_self_play():
         int(env_read.ball_holder) if env_read.ball_holder is not None else None
     )
     init_shot_clock = int(env_read.shot_clock or 24)
+    template_metadata = None
+    template_positions, template_ball_holder, template_shot_clock, template_metadata = (
+        _resolve_self_play_start_template(request)
+    )
+    if template_positions:
+        init_positions = template_positions
+        if template_ball_holder is not None:
+            init_ball_holder = int(template_ball_holder)
+        if template_shot_clock is not None:
+            init_shot_clock = int(template_shot_clock)
     preserved_intent_state = None
     if bool(getattr(base_env, "intent_active", False)):
         preserved_intent_state = {
@@ -1183,12 +1815,24 @@ def start_self_play():
         "status": "success",
         "state": get_ui_game_state(),
         "seed": episode_seed,
+        "start_template": template_metadata,
     }
 
 
 @router.post("/api/reset_turn_state")
 def reset_turn_state():
     """Restore positions/ball holder/shot clock to the start-of-turn snapshot."""
+    if getattr(game_state, "jax_runtime", None) is not None:
+        try:
+            return game_state.jax_runtime.reset_turn_state(game_state)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+        except Exception as err:
+            import traceback
+
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to reset JAX turn: {err}")
+
     if not game_state.env or game_state.obs is None:
         raise HTTPException(status_code=400, detail="Game not initialized.")
     if not game_state.turn_start_positions:

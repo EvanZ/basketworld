@@ -1,5 +1,5 @@
-import pytest
 import math
+import pytest
 
 from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv
 
@@ -50,6 +50,7 @@ def test_three_point_hex_uses_distance_decay_without_pressure():
     if distance > d1:
         extra_hexes = max(0, int(distance) - int(math.floor(d1)))
         expected -= float(env.three_pt_extra_hex_decay) * float(extra_hexes)
+    expected = max(0.01, min(0.99, expected))
 
     assert base_prob == pytest.approx(expected, abs=1e-9)
     assert final_prob == pytest.approx(expected, abs=1e-9)

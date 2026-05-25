@@ -13,7 +13,12 @@ const useDifferentOpponentPolicy = ref(false);
 const selectedOpponentUnifiedPolicy = ref(null);
 
 async function fetchPolicies() {
-  if (!runId.value) return;
+  if (!runId.value) {
+    unifiedPolicies.value = [];
+    selectedUnifiedPolicy.value = null;
+    selectedOpponentUnifiedPolicy.value = null;
+    return;
+  }
   try {
     const res = await listPolicies(runId.value);
     unifiedPolicies.value = res.unified || [];
@@ -55,12 +60,18 @@ function openTemplateSandbox() {
 <template>
     <div class="setup-container">
         <h2>Game Setup</h2>
-        <p>Enter an MLflow Run ID to load the trained agents.</p>
+        <p>Enter an MLflow Run ID to load either an SB3 model or a JAX checkpoint artifact from that run.</p>
         
         <form @submit.prevent="startGame">
             <div class="form-group">
                 <label for="runId">MLflow Run ID:</label>
-                <input type="text" id="runId" v-model.trim="runId" placeholder="e.g., ab0f402bc060442fb669c60f696af773" required>
+                <input
+                  type="text"
+                  id="runId"
+                  v-model.trim="runId"
+                  placeholder="e.g., ab0f402bc060442fb669c60f696af773"
+                  required
+                >
             </div>
             
             <div class="form-group">
