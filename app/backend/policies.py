@@ -73,13 +73,18 @@ def list_policies_from_run(client, run_id):
     return combined
 
 
+def _jax_update_index(path: str) -> int | None:
+    match = re.search(r"(?:phase_a_)?update_(\d+)$", path)
+    return int(match.group(1)) if match else None
+
+
 def _model_artifact_sort_key(path: str) -> tuple[int, int, str]:
     zip_match = re.search(r"_(\d+)\.zip$", path)
     if zip_match:
         return (0, int(zip_match.group(1)), path)
-    jax_match = re.search(r"(?:phase_a_)?update_(\d+)$", path)
-    if jax_match:
-        return (1, int(jax_match.group(1)), path)
+    jax_index = _jax_update_index(path)
+    if jax_index is not None:
+        return (1, jax_index, path)
     if path.endswith("latest") or path.endswith("phase_a_latest"):
         return (1, 10**12, path)
     return (2, 0, path)
@@ -108,6 +113,29 @@ def get_unified_policy_path(client, run_id, policy_name: str | None):
 
     if policy_name and any(p.endswith(policy_name) for p in choices):
         chosen_artifact = next(p for p in choices if p.endswith(policy_name))
+    elif policy_name:
+        # Playable/public configs historically named SB3 artifacts as
+        # unified_iter_N.zip. JAX checkpoints use models/update_N instead, so
+        # preserve the same checkpoint index semantics across backends.
+        zip_match = re.search(r"unified_iter_(\d+)\.zip$", policy_name)
+        target_update_index = (
+            int(zip_match.group(1)) if zip_match else _jax_update_index(policy_name)
+        )
+        if target_update_index is not None:
+            chosen_artifact = next(
+                (p for p in choices if _jax_update_index(p) == target_update_index),
+                None,
+            )
+        else:
+            chosen_artifact = None
+        if chosen_artifact is None:
+            chosen_artifact = (
+                latest_jax_artifact
+                if latest_jax_artifact and latest_jax_artifact in choices and not any(
+                    p.endswith(".zip") for p in choices
+                )
+                else sorted(choices, key=_model_artifact_sort_key)[-1]
+            )
     elif latest_jax_artifact and latest_jax_artifact in choices and not any(
         p.endswith(".zip") for p in choices
     ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from app.backend.schemas import (
 )
 from app.backend.state import GameState
 from basketworld.envs.basketworld_env_v2 import Team
+from basketworld_jax.env.minimal import SHOT_TYPE_DUNK
 
 
 jax = pytest.importorskip("jax")
@@ -601,6 +603,37 @@ def test_jax_dev_runtime_selector_multiselect_prefers_checkpoint_metadata():
     assert debug["min_play_steps"] == 4
 
 
+def test_jax_dev_runtime_action_results_preserve_assisted_shot_metadata():
+    runtime = _make_runtime()
+    prev_state = runtime.state
+    out = SimpleNamespace(
+        state=prev_state,
+        shot_attempt=np.asarray([1], dtype=np.int8),
+        shot_shooter=np.asarray([1], dtype=np.int32),
+        shot_value=np.asarray([2.0], dtype=np.float32),
+        shot_expected_points=np.asarray([1.4], dtype=np.float32),
+        shot_distance=np.asarray([0.0], dtype=np.float32),
+        shot_success=np.asarray([1], dtype=np.int8),
+        shot_type=np.asarray([SHOT_TYPE_DUNK], dtype=np.int32),
+        assist=np.asarray([1], dtype=np.int8),
+        potential_assist=np.asarray([1], dtype=np.int8),
+        assist_passer=np.asarray([0], dtype=np.int32),
+        pass_attempt=np.asarray([0], dtype=np.int8),
+        turnover=np.asarray([0], dtype=np.int8),
+        offensive_three_seconds=np.asarray([0], dtype=np.int8),
+        defensive_lane_violation=np.asarray([0], dtype=np.int8),
+    )
+
+    results = runtime._action_results_from_step(prev_state, out)
+
+    shot = results["shots"]["1"]
+    assert shot["success"] is True
+    assert shot["distance"] == 0
+    assert shot["assist_full"] is True
+    assert shot["assist_potential"] is True
+    assert shot["assist_passer_id"] == 0
+
+
 def test_jax_dev_runtime_turn_step_does_not_reselect_at_episode_start(monkeypatch):
     runtime, game_state = _make_selector_runtime_and_state()
     game_state.self_play_active = False
@@ -708,6 +741,36 @@ def test_jax_dev_runtime_reselects_after_natural_commitment_expiry(monkeypatch):
     assert second["selector_transition"]["intent_index"] == 4
     assert second["state"]["intent_index_current"] == 4
     assert second["state"]["selector_last_boundary_reason"] == "commitment_timeout"
+
+
+def test_jax_dev_runtime_self_play_ignores_completed_pass_before_min_play(monkeypatch):
+    runtime, game_state = _make_selector_runtime_and_state()
+    runtime.set_offense_intent_state(
+        active=True,
+        intent_index=2,
+        intent_age=2,
+        intent_commitment_remaining=2,
+        game_state=game_state,
+    )
+    runtime._last_completed_pass_boundary = True
+
+    def _fail_sample(_game_state):
+        raise AssertionError("completed pass before min play should not sample selector")
+
+    monkeypatch.setattr(runtime, "_sample_selector_intent", _fail_sample)
+    monkeypatch.setattr(runtime, "_selector_preferences", lambda _game_state: None)
+
+    body = runtime.step(
+        ActionRequest(actions={}, player_deterministic=True, opponent_deterministic=True),
+        game_state,
+    )
+
+    assert body["status"] == "success"
+    assert body["selector_transition"] is None
+    assert body["state"]["intent_index_current"] == 2
+    debug = body["state"]["selector_debug"]
+    assert debug["min_play_steps"] == 3
+    assert debug["completed_pass_min_steps_met"] is False
 
 
 def test_jax_dev_runtime_self_play_reselects_after_completed_pass_boundary(monkeypatch):

@@ -30,6 +30,7 @@ class TrajectoryBatch(NamedTuple):
     action_mask: Any
     actions: Any
     full_actions: Any
+    opponent_deterministic_episode: Any
     selected_log_probs: Any
     values: Any
     rewards: Any

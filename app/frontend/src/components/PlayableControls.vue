@@ -83,6 +83,64 @@ function formatPlayerNameWithId(playerId) {
   return `Player ${id}`;
 }
 
+function formatPlayLabelForHints(intentIndex, playMap, fallbackName) {
+  const idx = Number(intentIndex);
+  const fallback = typeof fallbackName === 'string' ? fallbackName.trim() : '';
+  if (fallback) {
+    return Number.isFinite(idx) ? `${fallback} (z=${idx})` : fallback;
+  }
+  const map = playMap && typeof playMap === 'object' ? playMap : {};
+  const mapped = Number.isFinite(idx) ? (map[idx] ?? map[String(idx)]) : null;
+  if (typeof mapped === 'string' && mapped.trim()) {
+    return `${mapped.trim()} (z=${idx})`;
+  }
+  return Number.isFinite(idx) ? `Intent z=${idx}` : 'N/A';
+}
+
+function formatSelectorSource(source) {
+  const normalized = String(source || '').trim();
+  if (normalized === 'learned_selector') return 'learned selector';
+  if (normalized === 'uniform_fallback') return 'uniform fallback';
+  if (normalized === 'manual') return 'manual';
+  return normalized || 'N/A';
+}
+
+const activePlayHintSummary = computed(() => {
+  const gs = props.gameState;
+  if (!gs || typeof gs !== 'object' || !gs.enable_intent_learning) return null;
+  if (gs.intent_active_current === false) return null;
+
+  const intentIndex = Number(gs.intent_index_current);
+  if (!Number.isFinite(intentIndex)) return null;
+
+  const selectorDebug = gs.selector_debug && typeof gs.selector_debug === 'object'
+    ? gs.selector_debug
+    : {};
+  const transition = selectorDebug.last_transition && typeof selectorDebug.last_transition === 'object'
+    ? selectorDebug.last_transition
+    : {};
+  const age = Number(gs.intent_age ?? gs.intent_age_current);
+  const remaining = Number(gs.intent_commitment_remaining ?? gs.intent_commitment_remaining_current);
+  const configuredCommitment = Number(selectorDebug.commitment_steps);
+  const commitment = Number.isFinite(configuredCommitment)
+    ? configuredCommitment
+    : (Number.isFinite(age) && Number.isFinite(remaining) ? age + remaining : NaN);
+
+  const parts = [
+    formatPlayLabelForHints(intentIndex, gs.play_name_map, gs.current_play_name),
+    `source: ${formatSelectorSource(selectorDebug.last_transition_source || transition.source)}`,
+  ];
+  if (Number.isFinite(age) && Number.isFinite(commitment) && commitment > 0) {
+    parts.push(`age: ${age}/${commitment}`);
+  } else if (Number.isFinite(age)) {
+    parts.push(`age: ${age}`);
+  }
+  if (Number.isFinite(remaining)) {
+    parts.push(`remaining: ${remaining}`);
+  }
+  return parts.join(' · ');
+});
+
 const policyHintRows = computed(() => {
   const gs = props.gameState;
   if (!gs || typeof gs !== 'object') return [];
@@ -537,6 +595,9 @@ defineExpose({
             You {{ formatPlayerNameWithId(activePolicyHintRow?.playerId) }}
             <span v-if="activePolicyHintRow?.isBallHandler"> (Ball)</span>
           </p>
+          <p v-if="activePlayHintSummary" class="ai-hints-play">
+            <strong>Active offense play:</strong> {{ activePlayHintSummary }}
+          </p>
           <ul v-if="activePolicyHintRow && activePolicyHintRow.hints.length > 0" class="ai-hints-list">
             <li
               v-for="hint in activePolicyHintRow.hints"
@@ -807,6 +868,18 @@ h3 {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--app-text);
+}
+
+.ai-hints-play {
+  margin: 0;
+  color: var(--app-text-muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.ai-hints-play strong {
+  color: var(--app-accent);
+  font-weight: 700;
 }
 
 .ai-hints-list {

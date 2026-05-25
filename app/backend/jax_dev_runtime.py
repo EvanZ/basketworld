@@ -190,6 +190,10 @@ class JaxDevRuntime:
         self._rng_key = self.jax.random.PRNGKey(self._rng_seed)
         self._last_policy_probs: dict[int, list[float]] | None = None
         self._last_attention_payload: dict[str, Any] | None = None
+        self._last_attention_payloads: dict[str, dict[str, Any] | None] = {
+            "offense": None,
+            "defense": None,
+        }
         self._last_completed_pass_boundary = False
         self._last_selector_transition: dict[str, Any] | None = None
 
@@ -208,6 +212,10 @@ class JaxDevRuntime:
     def _next_key(self):
         self._rng_key, key = self.jax.random.split(self._rng_key)
         return key
+
+    def _clear_attention_payload_cache(self) -> None:
+        self._last_attention_payload = None
+        self._last_attention_payloads = {"offense": None, "defense": None}
 
     def _clone_jax_tree(self, value):
         if value is None:
@@ -240,6 +248,7 @@ class JaxDevRuntime:
             "last_action_results": copy.deepcopy(self.last_action_results),
             "last_policy_probs": copy.deepcopy(self._last_policy_probs),
             "last_attention_payload": copy.deepcopy(self._last_attention_payload),
+            "last_attention_payloads": copy.deepcopy(self._last_attention_payloads),
             "last_completed_pass_boundary": bool(self._last_completed_pass_boundary),
             "last_selector_transition": copy.deepcopy(self._last_selector_transition),
         }
@@ -270,6 +279,17 @@ class JaxDevRuntime:
         )
         self._last_policy_probs = copy.deepcopy(snapshot.get("last_policy_probs"))
         self._last_attention_payload = copy.deepcopy(snapshot.get("last_attention_payload"))
+        payloads = snapshot.get("last_attention_payloads")
+        if isinstance(payloads, dict):
+            self._last_attention_payloads = {
+                "offense": copy.deepcopy(payloads.get("offense")),
+                "defense": copy.deepcopy(payloads.get("defense")),
+            }
+        else:
+            self._last_attention_payloads = {
+                "offense": copy.deepcopy(self._last_attention_payload),
+                "defense": None,
+            }
         self._last_completed_pass_boundary = bool(snapshot.get("last_completed_pass_boundary", False))
         self._last_selector_transition = copy.deepcopy(snapshot.get("last_selector_transition"))
         self._sync_display_env()
@@ -283,7 +303,7 @@ class JaxDevRuntime:
         """Refresh immutable JAX kernel config after live display-env edits."""
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         if hasattr(self, "_playbook_batch_runner_cache"):
             self._playbook_batch_runner_cache = None
 
@@ -306,7 +326,7 @@ class JaxDevRuntime:
         self.jnp = raw_model.jnp
 
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._last_selector_transition = None
         if hasattr(self, "_playbook_batch_runner_cache"):
             self._playbook_batch_runner_cache = None
@@ -336,11 +356,108 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         return {"start_template": template_metadata} if template_metadata else {}
+
+    def _playable_skill_updates(self, offense_skills: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(offense_skills, dict):
+            return {}
+        offense_ids = np.asarray(self.offense_ids, dtype=np.int32)
+        expected = int(offense_ids.size)
+        field_map = {
+            "layup": "layup_pct",
+            "three_pt": "three_pt_pct",
+            "dunk": "dunk_pct",
+        }
+        updates: dict[str, Any] = {}
+        for skill_key, field_name in field_map.items():
+            raw_values = offense_skills.get(skill_key)
+            if raw_values is None:
+                continue
+            values = np.asarray(raw_values, dtype=np.float32).reshape(-1)
+            if values.size != expected:
+                continue
+            current = np.asarray(_field0(self.state, field_name), dtype=np.float32).copy()
+            current[offense_ids] = values
+            updates[field_name] = self.jnp.asarray(current[None, ...], dtype=self.jnp.float32)
+        return updates
+
+    def _apply_selector_episode_start(self, game_state: Any) -> dict[str, Any] | None:
+        game_state.selector_segment_index = 0
+        game_state.selector_last_boundary_reason = None
+        if not self._selector_runtime_enabled(game_state):
+            return None
+        selection = self._sample_selector_intent(game_state)
+        if selection is None:
+            return None
+        commitment_steps = max(1, _as_int(self.static.intent_commitment_steps))
+        self.set_offense_intent_state(
+            active=True,
+            intent_index=int(selection["intent_index"]),
+            intent_age=0,
+            intent_commitment_remaining=commitment_steps,
+            game_state=game_state,
+        )
+        transition = {
+            "reason": "episode_start",
+            "previous_intent_index": None,
+            "intent_index": int(selection["intent_index"]),
+            "changed_intent": None,
+            "used_selector": bool(selection.get("used_selector", False)),
+            "source": "learned_selector" if bool(selection.get("used_selector", False)) else "uniform_fallback",
+            "alpha": float(selection.get("alpha", 0.0)),
+            "eps": float(selection.get("eps", 0.0)),
+            "value": selection.get("value"),
+        }
+        self._last_selector_transition = transition
+        game_state.selector_last_boundary_reason = "episode_start"
+        return dict(transition)
+
+    def reset_playable_possession(
+        self,
+        *,
+        game_state: Any,
+        user_team: Team,
+        offense_skills: dict[str, Any] | None = None,
+        shot_clock: int = 24,
+        seed: int | None = None,
+    ) -> dict[str, Any]:
+        """Reset the authoritative JAX state for playable-mode possession changes."""
+        self.user_team = user_team
+        self.reset(seed=seed)
+        updates: dict[str, Any] = {
+            "shot_clock": self.jnp.asarray([int(shot_clock)], dtype=self.jnp.int32),
+        }
+        updates.update(self._playable_skill_updates(offense_skills))
+        self.state = self.state._replace(**updates)
+        self.last_step_output = None
+        self.last_action_results = self._empty_action_results()
+        self._last_policy_probs = None
+        self._clear_attention_payload_cache()
+        self._last_completed_pass_boundary = False
+        self._last_selector_transition = None
+        self._sync_display_env()
+        self.display_env.training_team = user_team
+        self.display_env.shot_clock_steps = int(shot_clock)
+        self.display_env.min_shot_clock = int(shot_clock)
+
+        game_state.user_team = user_team
+        game_state.env = self.display_env
+        game_state.obs = self.observation_dict(observer_is_offense=user_team != Team.DEFENSE)
+        game_state.prev_obs = None
+        self._apply_selector_episode_start(game_state)
+        self._sync_display_env()
+        game_state.obs = self.observation_dict(observer_is_offense=user_team != Team.DEFENSE)
+        self._capture_turn_start(game_state)
+        return self.get_full_game_state(
+            game_state,
+            include_policy_probs=True,
+            include_action_values=True,
+            include_state_values=True,
+        )
 
     def _apply_forced_template(
         self,
@@ -524,7 +641,13 @@ class JaxDevRuntime:
             full_actions[pid] = defense_out.actions[pid]
         probs = {**offense_out.probs_by_player, **defense_out.probs_by_player}
         self._last_policy_probs = probs
-        self._last_attention_payload = self._attention_payload_from_weights(offense_out.attention_weights, True)
+        offense_attention = self._attention_payload_from_weights(offense_out.attention_weights, True)
+        defense_attention = self._attention_payload_from_weights(defense_out.attention_weights, False)
+        self._last_attention_payloads = {
+            "offense": offense_attention,
+            "defense": defense_attention,
+        }
+        self._last_attention_payload = offense_attention
         return full_actions, probs
 
     def _normalize_overrides(self, raw_actions: Any) -> tuple[dict[int, int], dict[int, dict[str, Any]]]:
@@ -603,7 +726,7 @@ class JaxDevRuntime:
         self.last_action_results = self._action_results_from_step(prev_state, out)
         self._last_completed_pass_boundary = bool(_as_bool(out.completed_pass[0]) and not _as_bool(out.done[0]))
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
         game_state.prev_obs = None
@@ -792,7 +915,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
@@ -841,7 +964,7 @@ class JaxDevRuntime:
         }
         self.state = self.state._replace(**updates)
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
         game_state.prev_obs = None
@@ -867,7 +990,7 @@ class JaxDevRuntime:
             ),
         )
         self._last_policy_probs = None
-        self._last_attention_payload = None
+        self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
@@ -1013,6 +1136,9 @@ class JaxDevRuntime:
             shot_value = _as_float(out.shot_value[0])
             expected = _as_float(out.shot_expected_points[0])
             prob = expected / shot_value if shot_value > 0 else 0.0
+            assist_potential = _as_bool(getattr(out, "potential_assist", np.asarray([0]))[0])
+            assist_full = _as_bool(getattr(out, "assist", np.asarray([0]))[0])
+            assist_passer = _as_int(getattr(out, "assist_passer", np.asarray([-1]))[0])
             results["shots"][str(shooter)] = {
                 "success": _as_bool(out.shot_success[0]),
                 "distance": int(round(_as_float(out.shot_distance[0]))),
@@ -1022,6 +1148,9 @@ class JaxDevRuntime:
                 "pressure_multiplier": 1.0,
                 "is_three": _as_int(out.shot_type[0]) == SHOT_TYPE_THREE,
                 "expected_points": expected,
+                "assist_potential": assist_potential,
+                "assist_full": assist_full,
+                "assist_passer_id": assist_passer if assist_passer >= 0 else None,
             }
         if _as_bool(out.pass_attempt[0]):
             passer = _as_int(out.pass_passer[0])
@@ -1115,6 +1244,9 @@ class JaxDevRuntime:
                     "pressure_multiplier": float(shot.get("pressure_multiplier", -1.0)),
                     "expected_points": float(shot.get("expected_points", 0.0)),
                     "shooter_fg_pct": float(shot.get("probability", 0.0)),
+                    "assist_potential": bool(shot.get("assist_potential", False)),
+                    "assist_full": bool(shot.get("assist_full", False)),
+                    "assist_passer_id": shot.get("assist_passer_id"),
                 }
             )
 
@@ -1163,17 +1295,64 @@ class JaxDevRuntime:
         if len(labels) != int(weights.shape[-1]):
             labels = [f"T{idx}" for idx in range(int(weights.shape[-1]))]
             cls_labels = []
+        if observer_is_offense:
+            runtime_intent_index = int(_as_int(_field0(self.state, "intent_index")))
+            runtime_intent_active = bool(_as_bool(_field0(self.state, "intent_active")))
+            runtime_intent_visible = True
+            runtime_intent_gate = runtime_intent_active
+        else:
+            runtime_intent_active = bool(_as_bool(_field0(self.state, "defense_intent_active")))
+            runtime_intent_index = (
+                int(_as_int(_field0(self.state, "defense_intent_index")))
+                if runtime_intent_active
+                else None
+            )
+            runtime_intent_visible = bool(_as_bool(_field0(self.state, "intent_visible_to_defense")))
+            runtime_intent_gate = runtime_intent_active
         return {
             "weights_avg": weights.mean(axis=0).tolist(),
             "weights_heads": weights.tolist(),
             "labels": labels,
             "heads": int(weights.shape[0]),
-            "runtime_intent_index": int(_as_int(_field0(self.state, "intent_index"))),
-            "runtime_intent_active": bool(_as_bool(_field0(self.state, "intent_active"))),
-            "runtime_intent_visible": bool(_as_bool(_field0(self.state, "intent_visible_to_defense"))),
-            "runtime_intent_gate": bool(_as_bool(_field0(self.state, "intent_active"))),
+            "runtime_intent_index": runtime_intent_index,
+            "runtime_intent_active": runtime_intent_active,
+            "runtime_intent_visible": runtime_intent_visible,
+            "runtime_intent_gate": runtime_intent_gate,
             "observer_role": "offense" if observer_is_offense else "defense",
             "cls_labels": cls_labels,
+        }
+
+    def _attention_payloads_for_state(self, observer_is_offense: bool) -> dict[str, Any]:
+        payloads = {
+            "offense": self._last_attention_payloads.get("offense"),
+            "defense": self._last_attention_payloads.get("defense"),
+        }
+        if str(getattr(self.raw_model.spec, "model_type", "")) == "attention":
+            if payloads["offense"] is None:
+                offense_weights = self._team_policy_output(
+                    self.unified_policy,
+                    observer_is_offense=True,
+                    deterministic=True,
+                ).attention_weights
+                payloads["offense"] = self._attention_payload_from_weights(offense_weights, True)
+            if payloads["defense"] is None:
+                defense_policy = self.opponent_policy or self.unified_policy
+                defense_weights = self._team_policy_output(
+                    defense_policy,
+                    observer_is_offense=False,
+                    deterministic=True,
+                ).attention_weights
+                payloads["defense"] = self._attention_payload_from_weights(defense_weights, False)
+        self._last_attention_payloads = payloads
+        self._last_attention_payload = payloads["offense"] if observer_is_offense else payloads["defense"]
+        player_key = "offense" if self.user_team != Team.DEFENSE else "defense"
+        opponent_key = "defense" if player_key == "offense" else "offense"
+        return {
+            "default": self._last_attention_payload,
+            "offense": payloads["offense"],
+            "defense": payloads["defense"],
+            "player": payloads[player_key],
+            "opponent": payloads[opponent_key],
         }
 
     def _selector_training_params(self, game_state: Any) -> dict[str, Any]:
@@ -1413,6 +1592,12 @@ class JaxDevRuntime:
             1,
             _coerce_int(_param_lookup(params, "intent_selector_min_play_steps", 3), default=3),
         )
+        intent_age = _as_int(_field0(self.state, "intent_age"))
+        last_completed_pass_boundary = bool(self._last_completed_pass_boundary)
+        completed_pass_min_steps_remaining = max(0, int(min_play_steps) - int(intent_age))
+        completed_pass_min_steps_met = (
+            last_completed_pass_boundary and completed_pass_min_steps_remaining == 0
+        )
         current_intent = _as_int(_field0(self.state, "intent_index"))
         current_probs = None
         current_rank = None
@@ -1447,7 +1632,9 @@ class JaxDevRuntime:
             "min_play_steps": int(min_play_steps),
             "commitment_steps": int(max(1, _as_int(self.static.intent_commitment_steps))),
             "eligible_boundary_reason": self._selector_boundary_reason(game_state),
-            "last_completed_pass_boundary": bool(self._last_completed_pass_boundary),
+            "last_completed_pass_boundary": bool(last_completed_pass_boundary),
+            "completed_pass_min_steps_met": bool(completed_pass_min_steps_met),
+            "completed_pass_min_steps_remaining": int(completed_pass_min_steps_remaining),
             "last_transition": last_transition,
             "last_transition_source": (
                 None
@@ -1537,14 +1724,8 @@ class JaxDevRuntime:
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
         globals_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
-        attention_payload = self._last_attention_payload
-        if attention_payload is None and str(getattr(self.raw_model.spec, "model_type", "")) == "attention":
-            attention_payload = self._team_policy_output(
-                self.unified_policy,
-                observer_is_offense=observer_is_offense,
-                deterministic=True,
-            ).attention_weights
-            attention_payload = self._attention_payload_from_weights(attention_payload, observer_is_offense)
+        attention_payloads = self._attention_payloads_for_state(observer_is_offense)
+        attention_payload = attention_payloads["default"]
 
         state = {
             "players_per_side": int(self.display_env.players_per_side or 3),
@@ -1575,6 +1756,7 @@ class JaxDevRuntime:
                 "globals": np.asarray(obs_dict["globals"], dtype=np.float32).tolist(),
                 "globals_labels": globals_labels,
                 "attention": attention_payload,
+                "attention_by_observer": attention_payloads,
             },
             "obs_tokens_version": 1,
             "last_action_results": copy.deepcopy(self.last_action_results),

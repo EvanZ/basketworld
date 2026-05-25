@@ -48,6 +48,7 @@ PLAYABLE_DEMO_ENABLED_ENV = "BW_PLAYABLE_DEMO_ENABLED"
 PLAYABLE_DEMO_RUN_ID_ENV = "BW_PLAYABLE_DEMO_RUN_ID"
 PLAYABLE_DEMO_ALTERNATION_ENV = "BW_PLAYABLE_DEMO_ALTERNATION_NUMBER"
 PLAYABLE_DEMO_CHECKPOINT_ENV = "BW_PLAYABLE_DEMO_CHECKPOINT"
+PLAYABLE_DEMO_POLICY_NAME_ENV = "BW_PLAYABLE_DEMO_POLICY_NAME"
 PLAYABLE_DEMO_PERIOD_MODE_ENV = "BW_PLAYABLE_DEMO_PERIOD_MODE"
 PLAYABLE_DEMO_PERIOD_LENGTH_ENV = "BW_PLAYABLE_DEMO_PERIOD_LENGTH_MINUTES"
 
@@ -239,12 +240,15 @@ def _build_playable_demo_config() -> dict[str, Any]:
             f" (or {PLAYABLE_DEMO_CHECKPOINT_ENV})"
         )
 
+    policy_name_override = str(os.getenv(PLAYABLE_DEMO_POLICY_NAME_ENV) or "").strip()
+    default_policy_name = f"unified_iter_{int(checkpoint)}.zip" if checkpoint is not None else ""
+
     return {
         "enabled": bool(enabled),
         "available": bool(enabled and run_id and checkpoint is not None),
         "run_id": run_id,
         "checkpoint_index": int(checkpoint) if checkpoint is not None else None,
-        "policy_name": f"unified_iter_{int(checkpoint)}.zip" if checkpoint is not None else "",
+        "policy_name": policy_name_override or default_policy_name,
         "period_mode": period_mode,
         "total_periods": int(PLAYABLE_PERIOD_MODE_TO_COUNT[period_mode]),
         "period_length_minutes": int(period_length_minutes),
@@ -505,10 +509,11 @@ def _get_playable_matrix_from_json() -> dict[int, dict[str, dict[str, Any]]]:
             checkpoint = _to_int(cfg.get("checkpoint_index"))
             if not run_id or checkpoint is None:
                 continue
+            policy_name = str(cfg.get("policy_name") or "").strip()
             matrix[players][diff_key] = {
                 "run_id": run_id,
                 "checkpoint_index": int(checkpoint),
-                "policy_name": f"unified_iter_{int(checkpoint)}.zip",
+                "policy_name": policy_name or f"unified_iter_{int(checkpoint)}.zip",
                 "available": True,
             }
     return matrix
@@ -531,11 +536,12 @@ def _load_playable_matrix() -> dict[int, dict[str, dict[str, Any]]]:
             prefix = f"BW_PLAYABLE_{players}_{diff.upper()}"
             run_id = str(os.getenv(f"{prefix}_RUN_ID") or "").strip()
             checkpoint = _to_int(os.getenv(f"{prefix}_CHECKPOINT"))
+            policy_name = str(os.getenv(f"{prefix}_POLICY_NAME") or "").strip()
             if run_id and checkpoint is not None:
                 matrix[players][diff] = {
                     "run_id": run_id,
                     "checkpoint_index": int(checkpoint),
-                    "policy_name": f"unified_iter_{int(checkpoint)}.zip",
+                    "policy_name": policy_name or f"unified_iter_{int(checkpoint)}.zip",
                     "available": True,
                 }
             elif run_id or checkpoint is not None:
@@ -836,6 +842,22 @@ def _reset_playable_possession(session: dict[str, Any]) -> dict[str, Any]:
         len(offense_skill_set.get(key, [])) == players_per_side
         for key in ("layup", "three_pt", "dunk")
     )
+
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        state = jax_runtime.reset_playable_possession(
+            game_state=game_state,
+            user_team=current_team,
+            offense_skills=offense_skill_set if has_expected_skill_len else None,
+            shot_clock=24,
+        )
+        game_state.sampled_offense_skills = (
+            copy.deepcopy(offense_skill_set)
+            if has_expected_skill_len
+            else _read_env_offense_skills()
+        )
+        game_state.episode_states.append(copy.deepcopy(state))
+        return state
 
     reset_options: dict[str, Any] = {"shot_clock": 24}
     if has_expected_skill_len:

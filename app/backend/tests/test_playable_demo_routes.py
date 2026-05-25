@@ -8,6 +8,7 @@ from app.backend.state import GameState
 
 class DummyPlayableEnv:
     def __init__(self):
+        self.reset_calls = []
         self.shot_clock = 24
         self.last_action_results = {}
         self.pass_mode = "directional"
@@ -19,6 +20,7 @@ class DummyPlayableEnv:
         self.offense_dunk_pct_by_player = [0.2]
 
     def reset(self, options=None):
+        self.reset_calls.append(options or {})
         if isinstance(options, dict) and "shot_clock" in options:
             self.shot_clock = int(options["shot_clock"])
         return {"obs": []}, {}
@@ -189,3 +191,49 @@ def test_reset_playable_possession_runs_selector_episode_init(monkeypatch):
 
     assert state == {"done": False}
     assert captured["called"] == 1
+
+
+def test_reset_playable_possession_uses_jax_runtime_branch(monkeypatch):
+    target_state = _build_dummy_playable_state(demo_mode=False)
+    target_state.user_team = None
+    target_state.playable_session["side_skills"] = {
+        "user": {"layup": [0.7], "three_pt": [0.4], "dunk": [0.3]},
+        "ai": {"layup": [0.5], "three_pt": [0.2], "dunk": [0.1]},
+    }
+
+    class DummyJaxRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def reset_playable_possession(self, **kwargs):
+            self.calls.append(kwargs)
+            kwargs["game_state"].env = target_state.env
+            kwargs["game_state"].obs = {"obs": []}
+            return {"done": False, "jax": True}
+
+    jax_runtime = DummyJaxRuntime()
+    target_state.jax_runtime = jax_runtime
+
+    monkeypatch.setattr(playable_routes, "game_state", target_state)
+
+    state = playable_routes._reset_playable_possession(target_state.playable_session)
+
+    assert state == {"done": False, "jax": True}
+    assert target_state.env.reset_calls == []
+    assert len(jax_runtime.calls) == 1
+    call = jax_runtime.calls[0]
+    assert call["user_team"] == playable_routes.Team.OFFENSE
+    assert call["shot_clock"] == 24
+    assert call["offense_skills"] == {"layup": [0.7], "three_pt": [0.4], "dunk": [0.3]}
+    assert target_state.episode_states == [{"done": False, "jax": True}]
+
+
+def test_playable_matrix_json_accepts_policy_name_override(monkeypatch):
+    monkeypatch.setenv(
+        "BW_PLAYABLE_POLICY_MATRIX_JSON",
+        '{"3":{"easy":{"run_id":"jax-run","checkpoint_index":150,"policy_name":"update_150"}}}',
+    )
+
+    matrix = playable_routes._get_playable_matrix_from_json()
+
+    assert matrix[3]["easy"]["policy_name"] == "update_150"

@@ -3292,6 +3292,8 @@ const liveSelectorDebugSummary = computed(() => {
     commitmentSteps: debug.commitment_steps ?? 'N/A',
     eligibleBoundary: debug.eligible_boundary_reason || 'None',
     lastCompletedPassBoundary: debug.last_completed_pass_boundary === true ? 'Yes' : 'No',
+    completedPassMinStepsMet: debug.completed_pass_min_steps_met === true ? 'Yes' : debug.completed_pass_min_steps_met === false ? 'No' : 'N/A',
+    completedPassMinStepsRemaining: debug.completed_pass_min_steps_remaining ?? 'N/A',
     lastTransitionSource: debug.last_transition_source || 'N/A',
     lastTransitionPreviousIntent: transition?.previous_intent_index ?? 'N/A',
     lastTransitionIntent: transition?.intent_index ?? 'N/A',
@@ -5770,13 +5772,37 @@ const tokenGlobalLabels = computed(() => {
   return labels;
 });
 
-const tokenAttention = computed(() => obsTokens.value?.attention || null);
+const attentionObserverView = ref('player');
+const tokenAttentionByObserver = computed(() => obsTokens.value?.attention_by_observer || null);
+const tokenAttentionObserverOptions = computed(() => {
+  const byObserver = tokenAttentionByObserver.value;
+  if (!byObserver || typeof byObserver !== 'object') return [];
+  const options = [];
+  if (byObserver.player) options.push({ value: 'player', label: 'Player' });
+  if (byObserver.opponent) options.push({ value: 'opponent', label: 'Opponent' });
+  if (!options.length) {
+    if (byObserver.offense) options.push({ value: 'offense', label: 'Offense' });
+    if (byObserver.defense) options.push({ value: 'defense', label: 'Defense' });
+  }
+  return options;
+});
+const tokenAttention = computed(() => {
+  const byObserver = tokenAttentionByObserver.value;
+  if (byObserver && typeof byObserver === 'object') {
+    const selected = byObserver[attentionObserverView.value];
+    if (selected) return selected;
+    if (byObserver.player) return byObserver.player;
+    if (byObserver.offense) return byObserver.offense;
+  }
+  return obsTokens.value?.attention || null;
+});
 const tokenAttentionLabels = computed(() => tokenAttention.value?.labels || []);
 const tokenAttentionAvgWeights = computed(() => tokenAttention.value?.weights_avg || []);
 const tokenAttentionHeadWeights = computed(() => tokenAttention.value?.weights_heads || []);
 const tokenAttentionHeads = computed(() => tokenAttention.value?.heads ?? null);
 const tokenAttentionRuntimeIntentIndex = computed(() => {
   const value = tokenAttention.value?.runtime_intent_index;
+  if (value === null || value === undefined || value === 'null') return null;
   return Number.isFinite(Number(value)) ? Number(value) : null;
 });
 const tokenAttentionRuntimeIntentGate = computed(() => Boolean(tokenAttention.value?.runtime_intent_gate));
@@ -5793,6 +5819,8 @@ const tokenAttentionRuntimeSummary = computed(() => {
     parts.push(
       `Intent: ${formatPlayLabel(tokenAttentionRuntimeIntentIndex.value, props.gameState?.play_name_map)}`
     );
+  } else {
+    parts.push('Intent: null');
   }
   parts.push(`Gate: ${tokenAttentionRuntimeIntentGate.value ? 'on' : 'off'}`);
   parts.push(`Active: ${tokenAttentionRuntimeIntentActive.value ? 'yes' : 'no'}`);
@@ -6923,9 +6951,17 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">Current deployed rank:</span>
               <span class="param-value">{{ liveSelectorDebugSummary.currentDeployedRank }}</span>
             </div>
-            <div class="param-item" data-tooltip="Whether the previous executed step completed a pass and is eligible to trigger a pass-boundary reselection subject to min play steps.">
+            <div class="param-item" data-tooltip="Whether the previous executed step completed a pass and can be considered for pass-boundary reselection.">
               <span class="param-name">Completed-pass boundary:</span>
               <span class="param-value">{{ liveSelectorDebugSummary.lastCompletedPassBoundary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether that completed-pass boundary has reached the configured minimum play age and can trigger selector reselection now.">
+              <span class="param-name">Pass min met:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.completedPassMinStepsMet }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Additional current-play steps needed before a completed-pass boundary can trigger selector reselection.">
+              <span class="param-name">Pass min remaining:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.completedPassMinStepsRemaining }}</span>
             </div>
             <div class="param-item" data-tooltip="Whether the current offense play is visible to the defensive policy view.">
               <span class="param-name">Defense-visible:</span>
@@ -9652,6 +9688,18 @@ function offenseSkillDeltaLabel(idx) {
               </div>
               <div v-else class="token-table-wrapper">
                 <div class="token-attn-controls" v-if="tokenAttentionHeads">
+                  <template v-if="tokenAttentionObserverOptions.length > 1">
+                    <label for="token-attn-observer">Observer:</label>
+                    <select id="token-attn-observer" v-model="attentionObserverView">
+                      <option
+                        v-for="option in tokenAttentionObserverOptions"
+                        :key="`attn-observer-${option.value}`"
+                        :value="option.value"
+                      >
+                        {{ option.label }}
+                      </option>
+                    </select>
+                  </template>
                   <label for="token-attn-view">View:</label>
                   <select id="token-attn-view" v-model="attentionView">
                     <option value="avg">Average</option>

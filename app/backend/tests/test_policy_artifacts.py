@@ -92,3 +92,40 @@ def test_get_unified_policy_path_still_resolves_latest_sb3_zip():
         ("run-2", "models/unified_policy_200.zip", "episodes/_policy_cache")
     ]
     assert local_path.endswith("unified_policy_200.zip")
+
+
+def test_get_unified_policy_path_maps_sb3_checkpoint_name_to_jax_update():
+    client = _FakeMlflowClient(
+        {
+            "models": [
+                "models/update_0000100",
+                "models/update_0000200",
+            ],
+        }
+    )
+
+    local_path = get_unified_policy_path(client, "run-3", "unified_iter_200.zip")
+
+    assert client.download_calls == [
+        ("run-3", "models/update_0000200", "episodes/_policy_cache")
+    ]
+    assert local_path.endswith("update_0000200")
+
+
+def test_get_unified_policy_path_maps_jax_update_alias_to_padded_artifact():
+    client = _FakeMlflowClient(
+        {
+            "models": [
+                "models/update_0000100",
+                "models/update_0000150",
+            ],
+        }
+    )
+
+    local_path = get_unified_policy_path(client, "run-4", "update_150")
+
+    assert client.download_calls == [
+        ("run-4", "models/update_0000150", "episodes/_policy_cache")
+    ]
+    assert local_path.endswith("update_0000150")
+

@@ -543,6 +543,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_deterministic_episode=jnp.zeros_like(active_step, dtype=jnp.float32),
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
                 rewards=masked_reward,
@@ -649,13 +650,20 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         selector_multiselect_enabled=False,
         selector_min_play_steps=3,
         single_episode_rollout=False,
+        opponent_deterministic_episode_prob=0.0,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
+        batch_size = int(initial_state.positions.shape[0])
+        opponent_deterministic_episode_prob = jnp.clip(
+            jnp.asarray(opponent_deterministic_episode_prob, dtype=jnp.float32),
+            0.0,
+            1.0,
+        )
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary = carry
-            key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
+            state, key, completed_pass_boundary, opponent_deterministic_episode = carry
+            key, selector_key, policy_key, opponent_key, env_key, reset_key, opponent_det_key = jax.random.split(key, 7)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
@@ -718,9 +726,14 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
                 intent_context=opponent_intent_context,
             )
+            opponent_actions = jnp.where(
+                opponent_deterministic_episode[:, None],
+                opponent_out["deterministic_actions"],
+                opponent_out["sampled_actions"],
+            )
             full_actions = assemble_full_actions_jax(
                 policy_out["sampled_actions"],
-                opponent_out["sampled_actions"],
+                opponent_actions,
                 training_ids,
                 opponent_ids,
                 n_players,
@@ -739,6 +752,16 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
             reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
             next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
+            next_opponent_deterministic_episode_sample = jax.random.bernoulli(
+                opponent_det_key,
+                opponent_deterministic_episode_prob,
+                (batch_size,),
+            )
+            next_opponent_deterministic_episode = jnp.where(
+                reset_done,
+                next_opponent_deterministic_episode_sample,
+                opponent_deterministic_episode,
+            )
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
@@ -764,6 +787,11 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_deterministic_episode=jnp.where(
+                    active_step,
+                    opponent_deterministic_episode.astype(jnp.float32),
+                    0.0,
+                ),
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
                 rewards=masked_reward,
@@ -811,15 +839,31 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 & env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
-            return (next_state, key, next_completed_pass_boundary), transition
+            return (
+                next_state,
+                key,
+                next_completed_pass_boundary,
+                next_opponent_deterministic_episode,
+            ), transition
 
+        scan_key, opponent_det_init_key = jax.random.split(rollout_key)
         initial_completed_pass_boundary = jnp.zeros(
-            (int(initial_state.positions.shape[0]),),
+            (batch_size,),
             dtype=jnp.bool_,
         )
-        (final_state, _, _), trajectory = jax.lax.scan(
+        initial_opponent_deterministic_episode = jax.random.bernoulli(
+            opponent_det_init_key,
+            opponent_deterministic_episode_prob,
+            (batch_size,),
+        )
+        (final_state, _, _, _), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key, initial_completed_pass_boundary),
+            (
+                initial_state,
+                scan_key,
+                initial_completed_pass_boundary,
+                initial_opponent_deterministic_episode,
+            ),
             xs=None,
             length=int(horizon),
         )
@@ -871,12 +915,18 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         selector_multiselect_enabled=False,
         selector_min_play_steps=3,
         single_episode_rollout=False,
+        opponent_deterministic_episode_prob=0.0,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
         group_count = int(opponent_group_count)
         batch_size = int(initial_state.positions.shape[0])
         group_size = batch_size // group_count
+        opponent_deterministic_episode_prob = jnp.clip(
+            jnp.asarray(opponent_deterministic_episode_prob, dtype=jnp.float32),
+            0.0,
+            1.0,
+        )
 
         def _sample_grouped_opponent_actions(
             opponent_flat_obs,
@@ -912,23 +962,29 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     jnp,
                     intent_context=group_intent_context,
                 )
-                return group_out["sampled_actions"]
+                return group_out["sampled_actions"], group_out["deterministic_actions"]
 
-            grouped_actions = jax.vmap(_run_group)(
+            grouped_sampled_actions, grouped_deterministic_actions = jax.vmap(_run_group)(
                 opponent_params_by_group,
                 grouped_obs,
                 grouped_mask,
                 grouped_intent_context,
                 group_keys,
             )
-            return grouped_actions.reshape(
-                batch_size,
-                int(spec.training_player_count),
+            return (
+                grouped_sampled_actions.reshape(
+                    batch_size,
+                    int(spec.training_player_count),
+                ),
+                grouped_deterministic_actions.reshape(
+                    batch_size,
+                    int(spec.training_player_count),
+                ),
             )
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary = carry
-            key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
+            state, key, completed_pass_boundary, opponent_deterministic_episode = carry
+            key, selector_key, policy_key, opponent_key, env_key, reset_key, opponent_det_key = jax.random.split(key, 7)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
@@ -981,11 +1037,16 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 jnp,
                 intent_context=policy_intent_context,
             )
-            opponent_actions = _sample_grouped_opponent_actions(
+            sampled_opponent_actions, deterministic_opponent_actions = _sample_grouped_opponent_actions(
                 opponent_flat_obs,
                 opponent_action_mask,
                 opponent_intent_context,
                 opponent_key,
+            )
+            opponent_actions = jnp.where(
+                opponent_deterministic_episode[:, None],
+                deterministic_opponent_actions,
+                sampled_opponent_actions,
             )
             full_actions = assemble_full_actions_jax(
                 policy_out["sampled_actions"],
@@ -1008,6 +1069,16 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
             reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
             next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
+            next_opponent_deterministic_episode_sample = jax.random.bernoulli(
+                opponent_det_key,
+                opponent_deterministic_episode_prob,
+                (batch_size,),
+            )
+            next_opponent_deterministic_episode = jnp.where(
+                reset_done,
+                next_opponent_deterministic_episode_sample,
+                opponent_deterministic_episode,
+            )
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
@@ -1033,6 +1104,11 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_deterministic_episode=jnp.where(
+                    active_step,
+                    opponent_deterministic_episode.astype(jnp.float32),
+                    0.0,
+                ),
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
                 rewards=masked_reward,
@@ -1080,15 +1156,31 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 & env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
-            return (next_state, key, next_completed_pass_boundary), transition
+            return (
+                next_state,
+                key,
+                next_completed_pass_boundary,
+                next_opponent_deterministic_episode,
+            ), transition
 
+        scan_key, opponent_det_init_key = jax.random.split(rollout_key)
         initial_completed_pass_boundary = jnp.zeros(
-            (int(initial_state.positions.shape[0]),),
+            (batch_size,),
             dtype=jnp.bool_,
         )
-        (final_state, _, _), trajectory = jax.lax.scan(
+        initial_opponent_deterministic_episode = jax.random.bernoulli(
+            opponent_det_init_key,
+            opponent_deterministic_episode_prob,
+            (batch_size,),
+        )
+        (final_state, _, _, _), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key, initial_completed_pass_boundary),
+            (
+                initial_state,
+                scan_key,
+                initial_completed_pass_boundary,
+                initial_opponent_deterministic_episode,
+            ),
             xs=None,
             length=int(horizon),
         )
@@ -2188,6 +2280,68 @@ def summarize_ppo_eligible_episode_metrics(
     return metrics
 
 
+def summarize_ppo_eligible_reward_component_metrics(
+    prefix: str,
+    trajectory: TrajectoryBatch,
+    training_mask,
+    *,
+    task_rewards,
+    phi_rewards,
+    intent_bonus_rewards,
+) -> dict[str, float]:
+    """Summarize PPO-eligible reward components on the same denominator as total reward."""
+    mask = np.asarray(training_mask, dtype=np.float32)
+    terminal_steps = np.asarray(trajectory.terminal_episode_steps, dtype=np.int32)
+    terminal_mask = ((terminal_steps > 0) & (mask > 0.5)).astype(np.float32)
+    completed_episodes = int(terminal_mask.sum())
+    completed_denom = float(completed_episodes) if completed_episodes > 0 else 0.0
+    step_count = float(mask.sum())
+
+    def _masked_total(values) -> float:
+        return float((np.asarray(values, dtype=np.float32) * mask).sum())
+
+    def _per_completed_episode(total: float) -> float:
+        return float(total / completed_denom) if completed_denom > 0.0 else 0.0
+
+    def _per_step(total: float) -> float:
+        return float(total / step_count) if step_count > 0.0 else 0.0
+
+    component_items = {
+        "task_reward": task_rewards,
+        "phi_reward": phi_rewards,
+        "intent_bonus": intent_bonus_rewards,
+    }
+    metrics: dict[str, float] = {}
+    for name, values in component_items.items():
+        total = _masked_total(values)
+        metrics[f"{prefix}_{name}_total"] = total
+        metrics[f"{prefix}_{name}_per_step"] = _per_step(total)
+        metrics[f"{prefix}_{name}_per_completed_episode"] = _per_completed_episode(total)
+
+    composed = np.asarray(trajectory.rewards, dtype=np.float32)
+    residual = composed - (
+        np.asarray(task_rewards, dtype=np.float32)
+        + np.asarray(phi_rewards, dtype=np.float32)
+        + np.asarray(intent_bonus_rewards, dtype=np.float32)
+    )
+    residual_total = _masked_total(residual)
+    composed_total = _masked_total(composed)
+    intent_total = metrics[f"{prefix}_intent_bonus_total"]
+    phi_total = metrics[f"{prefix}_phi_reward_total"]
+    metrics[f"{prefix}_reward_component_residual_total"] = residual_total
+    metrics[f"{prefix}_reward_component_residual_per_step"] = _per_step(residual_total)
+    metrics[f"{prefix}_reward_component_residual_per_completed_episode"] = (
+        _per_completed_episode(residual_total)
+    )
+    metrics[f"{prefix}_intent_bonus_abs_share_of_reward"] = (
+        float(abs(intent_total) / max(abs(composed_total), 1.0e-8))
+    )
+    metrics[f"{prefix}_phi_reward_abs_share_of_reward"] = (
+        float(abs(phi_total) / max(abs(composed_total), 1.0e-8))
+    )
+    return metrics
+
+
 def summarize_reward_by_intent_metrics(
     prefix: str,
     trajectory: TrajectoryBatch,
@@ -2359,6 +2513,10 @@ def summarize_training_step(
     phi_next_mean = _active_mean(rollout_out.trajectory.phi_next, rollout_active)
     phi_beta_mean = _active_mean(rollout_out.trajectory.phi_beta, rollout_active)
     done_rate = _active_mean(rollout_out.trajectory.dones, rollout_active)
+    opponent_deterministic_episode_rate = _active_mean(
+        rollout_out.trajectory.opponent_deterministic_episode,
+        rollout_active,
+    )
     advantage_std = (
         float(np.asarray(ppo_batch.advantages)[ppo_active.astype(bool)].std())
         if active_ppo_count > 0.0
@@ -2412,6 +2570,7 @@ def summarize_training_step(
         "phi_next_mean": phi_next_mean,
         "phi_beta_mean": phi_beta_mean,
         "done_rate": done_rate,
+        "opponent_deterministic_episode_rate": opponent_deterministic_episode_rate,
         "mean_return": return_mean,
         "mean_value": value_mean,
         "advantage_std": advantage_std,

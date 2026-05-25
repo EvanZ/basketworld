@@ -96,6 +96,7 @@ from basketworld_jax.train.runtime import (
     summarize_intent_metrics,
     summarize_lane_violation_metrics,
     summarize_ppo_eligible_episode_metrics,
+    summarize_ppo_eligible_reward_component_metrics,
     summarize_reward_by_intent_metrics,
     summarize_shot_type_metrics,
     summarize_training_step,
@@ -615,6 +616,16 @@ def parse_args(argv=None):
             "when --grouped-opponent-sampling is enabled."
         ),
     )
+    parser.add_argument(
+        "--opponent-deterministic-episode-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability that a frozen opponent episode uses deterministic argmax "
+            "actions instead of sampled actions. The choice is held fixed until "
+            "that env row resets."
+        ),
+    )
     args = parser.parse_args(argv_list)
     if bool(getattr(args, "use_set_obs", False)):
         args.policy_model = "attention"
@@ -662,6 +673,11 @@ def validate_train_args(args) -> None:
         raise SystemExit("--num-intents must be >= 1.")
     if int(getattr(args, "intent_commitment_steps", 4)) < 1:
         raise SystemExit("--intent-commitment-steps must be >= 1.")
+    opponent_deterministic_episode_prob = float(
+        getattr(args, "opponent_deterministic_episode_prob", 0.0)
+    )
+    if opponent_deterministic_episode_prob < 0.0 or opponent_deterministic_episode_prob > 1.0:
+        raise SystemExit("--opponent-deterministic-episode-prob must be in [0, 1].")
     for key in (
         "intent_null_prob",
         "defense_intent_null_prob",
@@ -897,6 +913,9 @@ def _checkpoint_trainer_config_from_args(
         ),
         "intent_selector_min_play_steps": int(
             getattr(args, "intent_selector_min_play_steps", 3)
+        ),
+        "opponent_deterministic_episode_prob": float(
+            getattr(args, "opponent_deterministic_episode_prob", 0.0)
         ),
     }
     config.update({key: to_builtin(value) for key, value in selector_fields.items()})
@@ -1580,6 +1599,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/opponent_pool_size": int(getattr(args, "opponent_pool_size", 10)),
         "jax/opponent_pool_beta": float(getattr(args, "opponent_pool_beta", 0.7)),
         "jax/opponent_pool_exploration": float(getattr(args, "opponent_pool_exploration", 0.0)),
+        "jax/opponent_deterministic_episode_prob": float(
+            getattr(args, "opponent_deterministic_episode_prob", 0.0)
+        ),
         "jax/grouped_opponent_sampling": _uses_grouped_opponent_sampling(args),
         "jax/opponent_group_count": int(getattr(args, "opponent_group_count", 8)),
         "jax/intent_diversity_enabled": bool(getattr(args, "intent_diversity_enabled", False)),
@@ -1663,7 +1685,10 @@ def _keep_core_train_metric(key: str) -> bool:
             return False
         if key.endswith("_episodes") and not key.endswith("_completed_episodes"):
             return False
-        if key.endswith("_per_step") and not key.endswith("reward_per_step"):
+        if key.endswith("_per_step") and not (
+            key.endswith("reward_per_step")
+            or key.endswith("_intent_bonus_per_step")
+        ):
             return False
 
     # Prefer normalized rates and per-episode values over rollout-size-dependent
@@ -1999,6 +2024,33 @@ def _apply_task_reward_scale_to_rollout(rollout, scale: float, jnp):
     )
 
 
+def _rollout_phi_reward_component(rollout, static, task_reward_scale: float, jnp):
+    role_signs = jnp.where(
+        static.role_encoding.astype(jnp.float32) > 0.0,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(-1.0, dtype=jnp.float32),
+    )
+    training_sign_sum = jnp.sum(static.training_player_mask.astype(jnp.float32) * role_signs)
+    static_scale = jnp.asarray(static.task_reward_scale, dtype=jnp.float32)
+    schedule_scale = jnp.asarray(float(task_reward_scale), dtype=jnp.float32)
+    return (
+        rollout.trajectory.phi_r_shape.astype(jnp.float32)
+        * training_sign_sum
+        * static_scale
+        * schedule_scale
+    )
+
+
+def _build_reward_component_arrays(rollout, static, task_reward_scale: float, jnp) -> dict[str, Any]:
+    phi_reward = _rollout_phi_reward_component(rollout, static, task_reward_scale, jnp)
+    task_reward = rollout.trajectory.rewards.astype(jnp.float32) - phi_reward
+    return {
+        "task_reward": task_reward,
+        "phi_reward": phi_reward,
+        "intent_bonus": jnp.zeros_like(task_reward, dtype=jnp.float32),
+    }
+
+
 def _selector_schedules_for_update(args, update_index: int) -> tuple[float, float]:
     if not bool(getattr(args, "intent_selector_enabled", False)):
         return 0.0, 0.0
@@ -2040,6 +2092,8 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
     selector_max_prob = np.asarray(rollout.trajectory.selector_max_prob, dtype=np.float32)
     selector_value = np.asarray(rollout.trajectory.selector_value, dtype=np.float32)
     selector_log_prob = np.asarray(rollout.trajectory.selector_old_log_prob, dtype=np.float32)
+    active_mask = np.asarray(rollout.trajectory.active_mask, dtype=np.float32) > 0.5
+    dones = np.asarray(rollout.trajectory.dones, dtype=bool)
     used_count = int(selector_used.sum())
     total_steps = int(selector_used.size)
     metrics: dict[str, Any] = {
@@ -2092,6 +2146,61 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
         )
         for intent_idx in range(int(num_intents)):
             metrics[f"selector_usage_by_intent/{intent_idx}"] = 0.0
+
+    segment_step_sums = np.zeros((int(num_intents),), dtype=np.float64)
+    segment_counts = np.zeros((int(num_intents),), dtype=np.int64)
+    segment_lengths: list[int] = []
+    if selector_used.ndim == 2:
+        horizon, batch_size = selector_used.shape
+        for env_idx in range(batch_size):
+            current_intent: int | None = None
+            current_length = 0
+            for step_idx in range(horizon):
+                if not bool(active_mask[step_idx, env_idx]):
+                    if current_intent is not None:
+                        segment_step_sums[current_intent] += float(current_length)
+                        segment_counts[current_intent] += 1
+                        segment_lengths.append(int(current_length))
+                        current_intent = None
+                        current_length = 0
+                    continue
+
+                if bool(selector_used[step_idx, env_idx]):
+                    if current_intent is not None:
+                        segment_step_sums[current_intent] += float(current_length)
+                        segment_counts[current_intent] += 1
+                        segment_lengths.append(int(current_length))
+                    selected_intent = int(selector_intent_index[step_idx, env_idx])
+                    current_intent = (
+                        selected_intent if 0 <= selected_intent < int(num_intents) else None
+                    )
+                    current_length = 0
+
+                if current_intent is not None:
+                    current_length += 1
+
+                if bool(dones[step_idx, env_idx]) and current_intent is not None:
+                    segment_step_sums[current_intent] += float(current_length)
+                    segment_counts[current_intent] += 1
+                    segment_lengths.append(int(current_length))
+                    current_intent = None
+                    current_length = 0
+
+            if current_intent is not None:
+                segment_step_sums[current_intent] += float(current_length)
+                segment_counts[current_intent] += 1
+                segment_lengths.append(int(current_length))
+
+    metrics["selector_segment_count"] = int(segment_counts.sum())
+    metrics["selector_segment_mean_steps"] = (
+        float(np.mean(np.asarray(segment_lengths, dtype=np.float32))) if segment_lengths else 0.0
+    )
+    for intent_idx in range(int(num_intents)):
+        count = int(segment_counts[intent_idx])
+        metrics[f"selector_segment_count_by_intent/{intent_idx}"] = count
+        metrics[f"selector_segment_mean_steps_by_intent/{intent_idx}"] = (
+            float(segment_step_sums[intent_idx] / float(count)) if count > 0 else 0.0
+        )
     return metrics
 
 
@@ -2313,6 +2422,10 @@ def _print_checkpoint_summary(
         ("offense_ppo_eligible_mean_completed_episode_length", metrics.get("offense_ppo_eligible_mean_completed_episode_length")),
         ("offense_ppo_eligible_reward_per_completed_episode", metrics.get("offense_ppo_eligible_reward_per_completed_episode")),
         ("offense_ppo_eligible_reward_per_step", metrics.get("offense_ppo_eligible_reward_per_step")),
+        ("offense_ppo_eligible_task_reward_per_completed_episode", metrics.get("offense_ppo_eligible_task_reward_per_completed_episode")),
+        ("offense_ppo_eligible_phi_reward_per_completed_episode", metrics.get("offense_ppo_eligible_phi_reward_per_completed_episode")),
+        ("offense_ppo_eligible_intent_bonus_per_completed_episode", metrics.get("offense_ppo_eligible_intent_bonus_per_completed_episode")),
+        ("offense_ppo_eligible_intent_bonus_abs_share_of_reward", metrics.get("offense_ppo_eligible_intent_bonus_abs_share_of_reward")),
         ("offense_ppo_eligible_terminal_shot_share", metrics.get("offense_ppo_eligible_terminal_shot_share")),
         ("offense_ppo_eligible_terminal_turnover_share", metrics.get("offense_ppo_eligible_terminal_turnover_share")),
         ("defense_ppo_eligible_completed_episodes", metrics.get("defense_ppo_eligible_completed_episodes")),
@@ -2365,6 +2478,7 @@ def _print_checkpoint_summary(
         ("opponent_source", metrics.get("opponent_source")),
         ("opponent_group_count", metrics.get("opponent_group_count")),
         ("opponent_unique_update_count", metrics.get("opponent_unique_update_count")),
+        ("opponent_deterministic_episode_rate", metrics.get("opponent_deterministic_episode_rate")),
         ("task_reward_scale", metrics.get("task_reward_scale")),
         ("intent_disc_active_count", metrics.get("intent_disc_active_count")),
         ("intent_disc_loss", metrics.get("intent_disc_loss")),
@@ -2675,6 +2789,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_multiselect_enabled,
                         selector_min_play_steps,
                         single_episode_rollout,
+                        float(getattr(args, "opponent_deterministic_episode_prob", 0.0)),
                     )
                 elif opponent_params is None:
                     role_rollouts[role] = rollout_runner(
@@ -2702,6 +2817,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_multiselect_enabled,
                         selector_min_play_steps,
                         single_episode_rollout,
+                        float(getattr(args, "opponent_deterministic_episode_prob", 0.0)),
                     )
             block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
@@ -2712,6 +2828,15 @@ def run_training_loop(args) -> dict[str, Any]:
                     jnp,
                 )
                 for role, rollout in role_rollouts.items()
+            }
+            role_reward_components = {
+                role: _build_reward_component_arrays(
+                    role_rollouts[role],
+                    active_statics[role],
+                    task_reward_scale,
+                    jnp,
+                )
+                for role in TRAINING_ROLES
             }
 
             if bool(getattr(args, "intent_selector_enabled", False)):
@@ -2784,6 +2909,10 @@ def run_training_loop(args) -> dict[str, Any]:
                         intent_bonus,
                         jnp,
                     )
+                    role_reward_components["offense"] = {
+                        **role_reward_components["offense"],
+                        "intent_bonus": intent_bonus.astype(jnp.float32),
+                    }
                     norm_bonus_np = np.asarray(jax.device_get(intent_bonus), dtype=np.float32)
                     active_norm_bonus = norm_bonus_np[active_mask_np]
                     intent_disc_metrics.update(
@@ -2933,6 +3062,23 @@ def run_training_loop(args) -> dict[str, Any]:
                         trainer_config=trainer_config,
                         jax=jax,
                         jnp=jnp,
+                    )
+                )
+                role_training_mask, _, _ = build_trajectory_training_masks(
+                    role_rollouts[role].trajectory,
+                    trainer_config,
+                    jax,
+                    jnp,
+                )
+                role_components = role_reward_components[role]
+                last_metrics.update(
+                    summarize_ppo_eligible_reward_component_metrics(
+                        f"{role}_ppo_eligible",
+                        role_rollouts[role].trajectory,
+                        role_training_mask,
+                        task_rewards=role_components["task_reward"],
+                        phi_rewards=role_components["phi_reward"],
+                        intent_bonus_rewards=role_components["intent_bonus"],
                     )
                 )
             if bool(getattr(args, "intent_selector_enabled", False)):
