@@ -112,6 +112,34 @@ TRAIN_LOOP_SUMMARY_ARTIFACT_PATH = (
 )
 JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
     {
+        # These structural/geometry/physics settings are valid for fresh runs.
+        # Checkpoint/resume compatibility is still enforced by saved frozen config.
+        "players",
+        "court_rows",
+        "court_cols",
+        "shot_clock",
+        "min_shot_clock",
+        "three_point_distance",
+        "three_point_short_distance",
+        "three_pt_extra_hex_decay",
+        "shot_pressure_enabled",
+        "shot_pressure_max",
+        "shot_pressure_lambda",
+        "shot_pressure_arc_degrees",
+        "defender_pressure_distance",
+        "defender_pressure_turnover_chance",
+        "defender_pressure_decay_lambda",
+        "base_steal_rate",
+        "steal_perp_decay",
+        "steal_distance_factor",
+        "steal_position_weight_min",
+        "spawn_distance",
+        "max_spawn_distance",
+        "defender_spawn_distance",
+        "defender_guard_distance",
+        "assist_window",
+        "mask_occupied_moves",
+        "enable_pass_gating",
         "allow_dunks",
         "layup_pct",
         "three_pt_pct",
@@ -669,6 +697,52 @@ def validate_train_args(args) -> None:
             "--ppo-minibatches must evenly divide the PPO batch size. "
             f"ppo_batch_size={ppo_sample_count}, ppo_minibatches={ppo_minibatches}."
         )
+    for key in (
+        "players",
+        "court_rows",
+        "court_cols",
+        "shot_clock",
+        "min_shot_clock",
+        "spawn_distance",
+    ):
+        value = getattr(args, key, None)
+        if value is not None and int(value) < 1:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 1.")
+    for key in ("defender_spawn_distance", "defender_guard_distance", "assist_window"):
+        value = getattr(args, key, None)
+        if value is not None and int(value) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    max_spawn_distance = getattr(args, "max_spawn_distance", None)
+    if max_spawn_distance is not None and int(max_spawn_distance) < 1:
+        raise SystemExit("--max-spawn-distance must be >= 1 when set.")
+    if int(getattr(args, "min_shot_clock", 1)) > int(getattr(args, "shot_clock", 1)):
+        raise SystemExit("--min-shot-clock must be <= --shot-clock.")
+    for key in (
+        "three_point_distance",
+        "three_pt_extra_hex_decay",
+        "shot_pressure_lambda",
+        "defender_pressure_decay_lambda",
+        "steal_perp_decay",
+        "steal_distance_factor",
+    ):
+        value = getattr(args, key, None)
+        if value is not None and float(value) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    three_point_short_distance = getattr(args, "three_point_short_distance", None)
+    if three_point_short_distance is not None and float(three_point_short_distance) < 0.0:
+        raise SystemExit("--three-point-short-distance must be >= 0 when set.")
+    for key in (
+        "shot_pressure_max",
+        "defender_pressure_turnover_chance",
+        "base_steal_rate",
+        "steal_position_weight_min",
+    ):
+        value = getattr(args, key, None)
+        if value is not None and (float(value) < 0.0 or float(value) > 1.0):
+            raise SystemExit(f"--{key.replace('_', '-')} must be in [0, 1].")
+    shot_pressure_arc_degrees = float(getattr(args, "shot_pressure_arc_degrees", 0.0))
+    if shot_pressure_arc_degrees <= 0.0 or shot_pressure_arc_degrees > 360.0:
+        raise SystemExit("--shot-pressure-arc-degrees must be in (0, 360].")
     if int(getattr(args, "num_intents", 8)) < 1:
         raise SystemExit("--num-intents must be >= 1.")
     if int(getattr(args, "intent_commitment_steps", 4)) < 1:

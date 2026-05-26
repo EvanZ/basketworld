@@ -911,6 +911,9 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
     batch_size, n_players, _ = state.positions.shape
     basket = jnp.broadcast_to(static.basket_position, (batch_size, n_players, 2))
     distances = _hex_distance(state.positions, basket, jnp).astype(jnp.int32)
+    basket_delta = static.basket_position[None, None, :] - state.positions
+    shot_x, shot_y = _axial_to_cartesian(basket_delta[..., 0], basket_delta[..., 1], jnp)
+    shot_distances_f = jnp.sqrt((shot_x**2) + (shot_y**2)) / SQRT3
 
     cell_indices, found = _lookup_cell_indices(static.cell_coords, state.positions, jnp)
     is_three = jnp.where(
@@ -921,14 +924,14 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
 
     d0 = jnp.asarray(1.0, dtype=jnp.float32)
     d1 = jnp.maximum(static.three_point_distance + 1.0, d0 + 1.0)
-    distances_f = distances.astype(jnp.float32)
-    t = (distances_f - d0) / (d1 - d0)
+    hex_distances_f = distances.astype(jnp.float32)
+    t = (shot_distances_f - d0) / (d1 - d0)
     t = jnp.clip(t, 0.0, 1.0)
     base_prob = state.layup_pct + (state.three_pt_pct - state.layup_pct) * t
     base_prob = jnp.where(distances <= 1, state.layup_pct, base_prob)
-    extra_hexes = jnp.maximum(0.0, distances_f - jnp.floor(d1))
+    extra_hexes = jnp.maximum(0.0, shot_distances_f - jnp.floor(d1))
     base_prob = jnp.where(
-        distances_f > d1,
+        shot_distances_f > d1,
         base_prob - (static.three_pt_extra_hex_decay * extra_hexes),
         base_prob,
     )
@@ -942,7 +945,6 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
     shooter_pos = state.positions[:, :, None, :]
     defender_pos = state.positions[:, None, :, :]
     defender_delta = defender_pos - shooter_pos
-    basket_delta = static.basket_position[None, None, :] - state.positions
 
     dir_x, dir_y = _axial_to_cartesian(basket_delta[..., 0], basket_delta[..., 1], jnp)
     vx, vy = _axial_to_cartesian(defender_delta[..., 0], defender_delta[..., 1], jnp)
@@ -957,7 +959,7 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         static.opponent_mask[None, :, :].astype(jnp.bool_)
         & (vnorm > 0.0)
         & in_arc
-        & (defender_distance <= distances_f[:, :, None])
+        & (defender_distance <= hex_distances_f[:, :, None])
     )
 
     angle_factor = (cosang - static.shot_pressure_cos_threshold) / (1.0 - static.shot_pressure_cos_threshold)
