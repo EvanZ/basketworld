@@ -1425,6 +1425,67 @@ const displayedShotClockValue = computed(() => {
   return shotClockValue.value;
 });
 
+function drawLaneStepClockIndicators(ctx, scale, shotClockBox) {
+  const stacks = laneStepIndicatorStacks.value;
+  if (props.minimalChrome || hasShotCounts.value || !Array.isArray(stacks) || stacks.length === 0) {
+    return;
+  }
+
+  const lightRadius = 5.5 * scale;
+  const lightGap = 12 * scale;
+  const stackGap = 24 * scale;
+  const labelGap = 8 * scale;
+  const bottomY = shotClockBox.y + shotClockBox.height - (lightRadius * 1.15);
+  const rightX = shotClockBox.x - (14 * scale);
+  const firstX = rightX - ((stacks.length - 1) * stackGap);
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.font = `${12 * scale}px sans-serif`;
+
+  stacks.forEach((stack, idx) => {
+    const x = firstX + (idx * stackGap);
+    const maxSteps = Math.max(1, Number(stack.maxSteps) || 1);
+    const steps = Math.max(0, Number(stack.steps) || 0);
+    const color = stack.color || "#94a3b8";
+    const labelY = bottomY - ((maxSteps - 1) * (lightRadius * 2 + lightGap)) - lightRadius - labelGap;
+
+    ctx.shadowBlur = 3 * scale;
+    ctx.shadowColor = "rgba(2, 6, 23, 0.75)";
+    ctx.fillStyle = color;
+    ctx.fillText(stack.shortLabel || "", x, labelY);
+    ctx.shadowBlur = 0;
+
+    for (let i = 0; i < maxSteps; i += 1) {
+      const y = bottomY - (i * (lightRadius * 2 + lightGap));
+      const lit = i < Math.min(maxSteps, steps);
+      const violation = steps >= maxSteps;
+
+      ctx.beginPath();
+      ctx.arc(x, y, lightRadius, 0, Math.PI * 2);
+      if (lit) {
+        ctx.fillStyle = "#ffffff";
+        ctx.shadowColor = color;
+        ctx.shadowBlur = (violation ? 9 : 6) * scale;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5 * scale;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = "rgba(148, 163, 184, 0.2)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(15, 23, 42, 0.75)";
+        ctx.lineWidth = 1 * scale;
+        ctx.stroke();
+      }
+    }
+  });
+
+  ctx.restore();
+}
+
 watch(shotClockValue, (newVal) => {
   if (!props.isShotClockUpdating) {
     pendingShotClock.value = null;
@@ -3336,6 +3397,8 @@ async function renderStateToPng() {
             ctx.textBaseline = 'top';
             ctx.fillText(shotClockVal, x + paddingX, y + paddingY);
             ctx.shadowBlur = 0;
+
+            drawLaneStepClockIndicators(ctx, scale, { x, y, width: boxWidth, height: boxHeight });
           }
           
           // Convert canvas to PNG data URL
