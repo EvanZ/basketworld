@@ -67,6 +67,8 @@ benchmarks/jax_phase_a_train_scaffold.json
 *.csv
 basketworld_jax/results/
 analytics/jax_intent_sample_embed/
+analytics/rebound_sim/outputs/
+analytics/rebound_physics/outputs/
 
 
 # temp
