@@ -13,7 +13,8 @@ As of May 30, 2026:
 - Milestone 1 is complete. We have shown that the MuJoCo prototype can generate plausible trajectories, contact diagnostics, landing heatmaps, side/3D views, and animated GIFs.
 - Milestone 2 is deferred. The current `target_noise` and `release_noise` shot controls are enough for the next phase. More detailed miss-type conditioning can be added later if fitting exposes a gap.
 - Milestone 3 is implemented and being revised to export separate rebound tables by explicit shot type. We can now generate shot-location-conditioned rebound data for canonical court locations, retain raw made/missed diagnostics, filter made baskets out of the fitting dataset, and export transition tables plus per-shot heatmaps.
-- Milestone 4 has started: `run_rebound_fit.py` exports a filtered, pseudocount-smoothed table model from the completed sweep without rerunning MuJoCo. The default model uses catch-height targets and filters behind-backboard artifacts.
+- Milestone 4 has a working table export: `run_rebound_fit.py` exports a filtered, pseudocount-smoothed table model from the completed sweep without rerunning MuJoCo. The default model uses catch-height targets and filters behind-backboard artifacts.
+- Milestone 6 has started: `analytics/rebound_sim` can load the fitted catch table, sample target cells with canonical-shot reflection, and reuse the existing rebound-winner prototype logic.
 
 ## Rationale
 
@@ -257,7 +258,11 @@ This lets us compare the current hand-authored rebound assumptions against the p
 
 Success criteria:
 
-- The current rebound sim can load fitted landing distributions.
+- The current rebound sim can load fitted landing distributions. Complete for the fitted catch table via `--fitted-target-model-dir`.
+- Target sampling uses the fitted shot-type table: `dunk`, `finger_roll`, `layup`, or `jumper`. Complete.
+- Symmetry is handled at runtime by canonicalizing the shot and reflecting sampled target cells back to the original side. Complete.
+- Existing rebound-winner logic can run on top of fitted target samples. Complete.
+- Remaining before JAX: validate fitted-vs-heuristic aggregate behavior, decide whether winner logic stays heuristic or gets table-derived inputs, then port the table lookup/sampling path to `basketworld_jax`.
 - Existing heatmap visualizations work for fitted distributions.
 - Player rebound winner logic remains independent from landing physics.
 

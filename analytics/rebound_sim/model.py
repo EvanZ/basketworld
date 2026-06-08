@@ -4,14 +4,14 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 
 from basketworld.envs.core import geometry
 
-ReboundKind = Literal["short", "normal", "long"]
-ReboundRegion = Literal["weak", "same", "middle"]
+ReboundKind = Literal["short", "normal", "long", "table"]
+ReboundRegion = Literal["weak", "same", "middle", "table"]
 
 
 @dataclass(frozen=True)
@@ -65,12 +65,7 @@ class ReboundParams:
     long_weak_prob: float = 0.22
     long_same_prob: float = 0.47
 
-    defense_rebound_bias: float = 0.55
-    boxout_bias: float = 0.35
-    inside_position_weight: float = 0.24
     target_distance_weight: float = 1.10
-    rebound_skill_weight: float = 0.35
-    rebound_skill_std: float = 0.35
     winner_temperature: float = 0.75
 
 
@@ -305,6 +300,7 @@ def simulate_rebounds(
     court: Court | None = None,
     params: ReboundParams | None = None,
     shot_indices: np.ndarray | None = None,
+    target_sampler: Callable[[np.random.Generator, Court, int], int] | None = None,
 ) -> ReboundSimulationResult:
     court = court or build_court()
     params = params or ReboundParams()
@@ -329,23 +325,27 @@ def simulate_rebounds(
     winner_distances = np.zeros(samples, dtype=np.float32)
 
     for i, shot_idx in enumerate(shot_indices_arr):
-        is_three = bool(court.three_point_mask[shot_idx])
-        kind = _choice_label(rng, ("short", "normal", "long"), rebound_kind_probabilities(court.distance_hex[shot_idx], is_three))
-        region_probs = rebound_region_probabilities(court, int(shot_idx), kind, params)
-        region = _choice_label(
-            rng,
-            ("weak", "same", "middle"),
-            np.asarray([region_probs["weak"], region_probs["same"], region_probs["middle"]]),
-        )
-        target_weights = rebound_target_weights(court, int(shot_idx), kind, region, params)
-        target_idx = int(rng.choice(len(court.cells), p=target_weights))
-        positions, shooter_id = _sample_player_positions(court, rng, int(shot_idx))
+        if target_sampler is None:
+            is_three = bool(court.three_point_mask[shot_idx])
+            kind = _choice_label(rng, ("short", "normal", "long"), rebound_kind_probabilities(court.distance_hex[shot_idx], is_three))
+            region_probs = rebound_region_probabilities(court, int(shot_idx), kind, params)
+            region = _choice_label(
+                rng,
+                ("weak", "same", "middle"),
+                np.asarray([region_probs["weak"], region_probs["same"], region_probs["middle"]]),
+            )
+            target_weights = rebound_target_weights(court, int(shot_idx), kind, region, params)
+            target_idx = int(rng.choice(len(court.cells), p=target_weights))
+        else:
+            kind = "table"
+            region = "table"
+            target_idx = int(target_sampler(rng, court, int(shot_idx)))
+        positions, _ = _sample_player_positions(court, rng, int(shot_idx))
         winner_id, winner_distance = _sample_rebound_winner(
             court,
             rng,
             positions,
             target_idx,
-            shooter_id,
             params,
         )
         target_indices[i] = target_idx
@@ -418,28 +418,10 @@ def _sample_rebound_winner(
     rng: np.random.Generator,
     positions: np.ndarray,
     target_index: int,
-    shooter_id: int,
     params: ReboundParams,
 ) -> tuple[int, float]:
     dist_to_target = court.hex_distance_lut[positions, int(target_index)].astype(np.float64)
-    dist_to_rim = court.distance_hex[positions]
-    max_rim_dist = float(np.max(court.distance_hex)) or 1.0
-    is_defense = np.arange(10) >= 5
-    skills = rng.normal(0.0, params.rebound_skill_std, size=10)
-    boxout = np.zeros(10, dtype=np.float64)
-    for did in range(5, 10):
-        oid = did - 5
-        if dist_to_rim[did] <= dist_to_rim[oid] and court.hex_distance_lut[positions[did], positions[oid]] <= 2:
-            boxout[did] = params.boxout_bias
-    scores = (
-        -params.target_distance_weight * dist_to_target
-        + params.rebound_skill_weight * skills
-        + params.inside_position_weight * ((max_rim_dist - dist_to_rim) / max_rim_dist)
-        + params.defense_rebound_bias * is_defense.astype(np.float64)
-        + boxout
-    )
-    # Shooters have a harder time rebounding their own miss in the immediate-resolution model.
-    scores[int(shooter_id)] -= 0.15
+    scores = -params.target_distance_weight * dist_to_target
     weights = _softmax(scores / max(1e-6, params.winner_temperature))
     winner = int(rng.choice(10, p=weights))
     return winner, float(dist_to_target[winner])

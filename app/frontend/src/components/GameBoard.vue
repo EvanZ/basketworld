@@ -51,6 +51,10 @@ const props = defineProps({
     type: String,
     default: '',
   },
+  reboundTargetOverlay: {
+    type: Object,
+    default: null,
+  },
   placementMode: {
     type: Boolean,
     default: false,
@@ -713,6 +717,105 @@ const maxShotAttempts = computed(() => {
   return max || 1;
 });
 
+const reboundTargetCells = computed(() => {
+  if (props.placementMode) return [];
+  const rawCells = props.reboundTargetOverlay?.target_cells;
+  if (!Array.isArray(rawCells)) return [];
+  return rawCells
+    .map((cell) => {
+      const q = Number(cell?.q);
+      const r = Number(cell?.r);
+      const prob = Number(cell?.prob);
+      const index = Number(cell?.index);
+      if (!Number.isFinite(q) || !Number.isFinite(r) || !Number.isFinite(prob) || prob <= 0) {
+        return null;
+      }
+      return {
+        key: `${q},${r}`,
+        q,
+        r,
+        index: Number.isFinite(index) ? index : null,
+        prob,
+      };
+    })
+    .filter(Boolean);
+});
+
+const hasReboundTargetOverlay = computed(() => reboundTargetCells.value.length > 0);
+
+const reboundTargetOverlayPoints = computed(() => {
+  if (!hasReboundTargetOverlay.value) return [];
+  return reboundTargetCells.value.map((entry) => {
+    const { x, y } = axialToCartesian(entry.q, entry.r);
+    return {
+      ...entry,
+      x,
+      y,
+    };
+  });
+});
+
+const maxReboundTargetProb = computed(() => {
+  let max = 0;
+  for (const pt of reboundTargetOverlayPoints.value) {
+    if (pt.prob > max) max = pt.prob;
+  }
+  return max || 1;
+});
+
+const sampledReboundTargetKey = computed(() => {
+  const target = props.reboundTargetOverlay?.sampled_target;
+  if (!target) return '';
+  const q = Number(target.q);
+  const r = Number(target.r);
+  if (!Number.isFinite(q) || !Number.isFinite(r)) return '';
+  return `${q},${r}`;
+});
+
+const reboundTargetLabelPoints = computed(() => {
+  const sampledKey = sampledReboundTargetKey.value;
+  return reboundTargetOverlayPoints.value.filter((pt) => pt.prob >= 0.01 || pt.key === sampledKey);
+});
+
+const reboundOverlayTitle = computed(() => {
+  if (!hasReboundTargetOverlay.value) return '';
+  const shot = props.reboundTargetOverlay?.shot || {};
+  const pid = shot.player_id ?? shot.playerId;
+  const shotType = shot.shot_type || shot.shotType || 'miss';
+  const prefix = pid === undefined || pid === null ? 'Rebound target P' : `Rebound target P | P${pid}`;
+  return `${prefix} ${shotType}`;
+});
+
+function reboundTargetFill(prob) {
+  const denom = Math.max(1e-9, maxReboundTargetProb.value);
+  const t = Math.max(0, Math.min(1, Number(prob || 0) / denom));
+  const alpha = 0.10 + 0.72 * Math.sqrt(t);
+  const r = Math.round(14 + (251 - 14) * t);
+  const g = Math.round(165 + (191 - 165) * t);
+  const b = Math.round(233 + (36 - 233) * t);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function reboundTargetStroke(pt) {
+  if (pt?.key === sampledReboundTargetKey.value) {
+    return 'rgba(251, 191, 36, 0.98)';
+  }
+  const denom = Math.max(1e-9, maxReboundTargetProb.value);
+  const t = Math.max(0, Math.min(1, Number(pt?.prob || 0) / denom));
+  return `rgba(103, 232, 249, ${0.28 + 0.5 * t})`;
+}
+
+function reboundTargetStrokeWidth(pt) {
+  return pt?.key === sampledReboundTargetKey.value ? 2.4 : 1.1;
+}
+
+function reboundTargetLabel(prob) {
+  const pct = Number(prob || 0) * 100;
+  if (pct >= 10) return `${pct.toFixed(0)}%`;
+  if (pct >= 1) return `${pct.toFixed(1)}%`;
+  return `${pct.toFixed(2)}%`;
+}
+
 function volumeFill(att) {
   return volumeFillFor(att, maxShotAttempts.value, 0.75);
 }
@@ -808,7 +911,7 @@ const hasPlaybookOverlay = computed(() => {
 });
 
 const showPlayers = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value);
-const showValueAnnotations = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value);
+const showValueAnnotations = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value && !hasReboundTargetOverlay.value);
 
 const playbookPlayerColorMap = computed(() => {
   const gs = currentGameState.value;
@@ -1126,6 +1229,58 @@ const basketPosition = computed(() => {
     const [q, r] = currentGameState.value.basket_position;
     // The basket axial coordinates already match the environment; no offset needed.
     return axialToCartesian(q, r);
+});
+
+const sampledReboundTargetPoint = computed(() => {
+  const target = props.reboundTargetOverlay?.sampled_target;
+  const q = Number(target?.q);
+  const r = Number(target?.r);
+  if (!Number.isFinite(q) || !Number.isFinite(r)) return null;
+  return axialToCartesian(q, r);
+});
+
+const reboundWinnerPoint = computed(() => {
+  if (!hasReboundTargetOverlay.value) return null;
+  const winner = props.reboundTargetOverlay?.sampled_winner;
+  const playerId = Number(winner?.player_id ?? winner?.playerId);
+  const pos = currentGameState.value?.positions?.[playerId];
+  if (!Number.isFinite(playerId) || !Array.isArray(pos) || pos.length < 2) return null;
+  const point = axialToCartesian(Number(pos[0]), Number(pos[1]));
+  return {
+    ...point,
+    playerId,
+    team: winner?.team || null,
+  };
+});
+
+const reboundResultOverlay = computed(() => {
+  const winner = reboundWinnerPoint.value;
+  if (!hasReboundTargetOverlay.value || !winner) return null;
+  const start = basketPosition.value;
+  const end = { x: winner.x, y: winner.y };
+  const target = sampledReboundTargetPoint.value || {
+    x: (start.x + end.x) / 2,
+    y: (start.y + end.y) / 2,
+  };
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  const nx = -dy / dist;
+  const ny = dx / dist;
+  const bend = Math.min(HEX_RADIUS * 1.8, Math.max(HEX_RADIUS * 0.55, dist * 0.18));
+  const control = {
+    x: target.x + nx * bend,
+    y: target.y + ny * bend - HEX_RADIUS * 0.35,
+  };
+  const path = `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} Q ${control.x.toFixed(2)} ${control.y.toFixed(2)} ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
+  return {
+    start,
+    control,
+    end,
+    path,
+    playerId: winner.playerId,
+    team: winner.team,
+  };
 });
 
 // Action indicator configuration
@@ -4116,6 +4271,87 @@ onBeforeUnmount(() => {
             {{ pt.attempts }}
           </text>
         </g>
+
+        <!-- Rebound target probabilities (read-only preview after terminal missed shots) -->
+        <g class="rebound-target-layer" v-if="hasReboundTargetOverlay">
+          <text
+            v-if="reboundOverlayTitle"
+            :x="shotChartTitlePos.x"
+            :y="shotChartTitlePos.y"
+            text-anchor="end"
+            class="rebound-target-title"
+          >
+            {{ reboundOverlayTitle }}
+          </text>
+          <polygon
+            v-for="pt in reboundTargetOverlayPoints"
+            :key="`rebound-target-poly-${pt.key}`"
+            :points="hexPointsFor(pt.x, pt.y, HEX_RADIUS)"
+            :fill="reboundTargetFill(pt.prob)"
+            :stroke="reboundTargetStroke(pt)"
+            :stroke-width="reboundTargetStrokeWidth(pt)"
+            :class="['rebound-target-cell', { sampled: pt.key === sampledReboundTargetKey }]"
+          />
+          <text
+            v-for="pt in reboundTargetLabelPoints"
+            :key="`rebound-target-label-${pt.key}`"
+            :x="pt.x"
+            :y="pt.y + HEX_RADIUS * 0.08"
+            text-anchor="middle"
+            class="rebound-target-text"
+          >
+            {{ reboundTargetLabel(pt.prob) }}
+          </text>
+        </g>
+
+        <!-- Sampled rebound result: ball flight and final winner marker. -->
+        <g class="rebound-result-layer" v-if="reboundResultOverlay">
+          <path
+            :d="reboundResultOverlay.path"
+            class="rebound-flight-path"
+          />
+          <circle
+            :cx="reboundResultOverlay.start.x"
+            :cy="reboundResultOverlay.start.y"
+            :r="HEX_RADIUS * 0.16"
+            class="rebound-flight-origin"
+          />
+          <circle
+            v-if="!disableTransitions"
+            :r="HEX_RADIUS * 0.18"
+            class="rebound-flight-ball"
+          >
+            <animateMotion
+              :path="reboundResultOverlay.path"
+              dur="1.15s"
+              repeatCount="indefinite"
+            />
+          </circle>
+          <g :transform="`translate(${reboundResultOverlay.end.x}, ${reboundResultOverlay.end.y})`">
+            <title>Sampled rebound winner P{{ reboundResultOverlay.playerId }}</title>
+            <circle
+              :r="HEX_RADIUS * 0.96"
+              class="rebound-winner-ring"
+            />
+            <circle
+              :cx="HEX_RADIUS * 0.6"
+              :cy="-HEX_RADIUS * 0.6"
+              :r="HEX_RADIUS * 0.24"
+              class="rebound-winner-ball"
+            />
+            <path
+              :d="`M ${HEX_RADIUS * 0.46} ${-HEX_RADIUS * 0.6} Q ${HEX_RADIUS * 0.6} ${-HEX_RADIUS * 0.73} ${HEX_RADIUS * 0.74} ${-HEX_RADIUS * 0.6}`"
+              class="rebound-winner-ball-seam"
+            />
+            <text
+              :x="HEX_RADIUS * 1.1"
+              :y="-HEX_RADIUS * 0.78"
+              text-anchor="start"
+              dominant-baseline="middle"
+              class="rebound-winner-label"
+            >REB</text>
+          </g>
+        </g>
         
         <!-- Draw Pass Rays (ball handler to teammates with pass success probabilities) - drawn after players for visibility -->
         <g v-if="showPlayers" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
@@ -5107,6 +5343,104 @@ onBeforeUnmount(() => {
 
 .shot-count-layer {
   pointer-events: none;
+}
+
+.rebound-target-layer {
+  pointer-events: none;
+}
+
+.rebound-target-title {
+  fill: #67e8f9;
+  font-size: 0.82rem;
+  font-weight: 800;
+  text-shadow: 0 0 8px rgba(0, 0, 0, 0.65);
+}
+
+.rebound-target-cell {
+  transition: opacity 0.18s ease;
+}
+
+.rebound-target-cell.sampled {
+  filter: drop-shadow(0 0 7px rgba(251, 191, 36, 0.65));
+}
+
+.rebound-target-text {
+  fill: #ecfeff;
+  font-size: 0.58rem;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.9);
+  stroke-width: 1px;
+}
+
+.rebound-result-layer {
+  pointer-events: none;
+}
+
+.rebound-flight-path {
+  fill: none;
+  stroke: rgba(251, 191, 36, 0.92);
+  stroke-width: 2.4px;
+  stroke-linecap: round;
+  stroke-dasharray: 7 7;
+  opacity: 0.86;
+  filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.45));
+  animation: rebound-flight-pulse 1.15s ease-in-out infinite;
+}
+
+.rebound-flight-origin {
+  fill: rgba(251, 191, 36, 0.88);
+  stroke: rgba(255, 247, 237, 0.9);
+  stroke-width: 1.1px;
+}
+
+.rebound-flight-ball,
+.rebound-winner-ball {
+  fill: #f97316;
+  stroke: #fff7ed;
+  stroke-width: 1.2px;
+  filter: drop-shadow(0 0 5px rgba(249, 115, 22, 0.78));
+}
+
+.rebound-winner-ring {
+  fill: rgba(249, 115, 22, 0.08);
+  stroke: #fb923c;
+  stroke-width: 3.2px;
+  stroke-dasharray: 5 6;
+  filter: drop-shadow(0 0 7px rgba(249, 115, 22, 0.65));
+  animation: rebound-winner-pulse 1.15s ease-in-out infinite;
+}
+
+.rebound-winner-ball-seam {
+  fill: none;
+  stroke: rgba(124, 45, 18, 0.72);
+  stroke-width: 1px;
+  stroke-linecap: round;
+}
+
+.rebound-winner-label {
+  fill: #fef3c7;
+  font-size: 0.52rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.88);
+  stroke-width: 1.2px;
+}
+
+.no-move-transitions .rebound-flight-path,
+.no-move-transitions .rebound-winner-ring {
+  animation: none !important;
+}
+
+@keyframes rebound-flight-pulse {
+  0%, 100% { opacity: 0.62; stroke-dashoffset: 0; }
+  50% { opacity: 1; stroke-dashoffset: -14; }
+}
+
+@keyframes rebound-winner-pulse {
+  0%, 100% { opacity: 0.78; }
+  50% { opacity: 1; }
 }
 
 .shot-count-text {

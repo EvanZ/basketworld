@@ -39,6 +39,7 @@ from app.backend.selector_runtime import (
     maybe_apply_rollout_multisegment_boundary,
     selector_runtime_active_for_rollout,
 )
+from app.backend.rebound_preview import compute_rebound_preview
 from app.backend.policies import (
     _compute_param_counts_from_policy,
     get_latest_policies_from_run,
@@ -51,6 +52,7 @@ from app.backend.schemas import (
     InitGameRequest,
     ListPoliciesRequest,
     MCTSAdviseRequest,
+    ReboundPreviewRequest,
     StartSelfPlayRequest,
     TemplateBootstrapRequest,
 )
@@ -1688,6 +1690,21 @@ def mcts_advise(request: MCTSAdviseRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MCTS failed: {e}")
+
+
+@router.post("/api/rebound_preview")
+def rebound_preview(request: ReboundPreviewRequest | None = None):
+    """Read-only rebound target/winner preview for terminal missed shots."""
+    request = request or ReboundPreviewRequest()
+    try:
+        return jsonable_encoder(compute_rebound_preview(game_state, request))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as err:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Rebound preview failed: {err}")
 
 
 @router.post("/api/start_self_play")

@@ -213,6 +213,19 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
     return response.json();
 }
 
+export async function getReboundPreview(options = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/rebound_preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options || {}),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to compute rebound preview');
+  }
+  return response.json();
+}
+
 export async function mctsAdvise(options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/mcts_advise`, {
     method: 'POST',

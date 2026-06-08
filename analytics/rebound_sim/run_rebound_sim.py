@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,7 @@ from analytics.rebound_sim.plotting import (
     plot_rebound_region_flow,
     plot_rebound_summary,
 )
+from analytics.rebound_sim.table_model import FittedReboundTableModel
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,10 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--court-cols", type=int, default=8)
     parser.add_argument("--three-point-distance", type=float, default=4.25)
     parser.add_argument("--three-point-short-distance", type=float, default=3.0)
-    parser.add_argument("--defense-rebound-bias", type=float, default=ReboundParams.defense_rebound_bias)
-    parser.add_argument("--boxout-bias", type=float, default=ReboundParams.boxout_bias)
-    parser.add_argument("--target-distance-weight", type=float, default=ReboundParams.target_distance_weight)
-    parser.add_argument("--winner-temperature", type=float, default=ReboundParams.winner_temperature)
+    _add_rebound_param_args(parser)
     parser.add_argument(
         "--shot-cells",
         type=str,
@@ -44,9 +43,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Samples per conditioned shot cell. Defaults to --samples.",
     )
     parser.add_argument("--out-dir", type=Path, default=Path("analytics/rebound_sim/outputs"))
+    parser.add_argument(
+        "--fitted-target-model-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional fitted MuJoCo rebound table directory. When set, rebound target "
+            "cells come from the table while rebound winner logic remains prototype-based."
+        ),
+    )
     parser.add_argument("--no-plot", action="store_true", help="Skip PNG generation.")
     argv_list = _normalize_shot_cells_arg(sys.argv[1:] if argv is None else list(argv))
     return parser.parse_args(argv_list)
+
+
+def _add_rebound_param_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group(
+        "rebound model parameters",
+        "Every ReboundParams field is exposed as a kebab-case CLI flag.",
+    )
+    for field in fields(ReboundParams):
+        flag = f"--{field.name.replace('_', '-')}"
+        group.add_argument(flag, type=float, default=float(field.default))
+
+
+def _rebound_params_from_args(args: argparse.Namespace) -> ReboundParams:
+    values = {field.name: float(getattr(args, field.name)) for field in fields(ReboundParams)}
+    return ReboundParams(**values)
 
 
 def _normalize_shot_cells_arg(argv: list[str]) -> list[str]:
@@ -75,13 +98,20 @@ def main() -> None:
             three_point_short_distance=args.three_point_short_distance,
         )
     )
-    params = ReboundParams(
-        defense_rebound_bias=args.defense_rebound_bias,
-        boxout_bias=args.boxout_bias,
-        target_distance_weight=args.target_distance_weight,
-        winner_temperature=args.winner_temperature,
+    params = _rebound_params_from_args(args)
+    fitted_model = (
+        FittedReboundTableModel.load(args.fitted_target_model_dir, court=court)
+        if args.fitted_target_model_dir is not None
+        else None
     )
-    result = simulate_rebounds(args.samples, seed=args.seed, court=court, params=params)
+    target_sampler = fitted_model.sample_target_index if fitted_model is not None else None
+    result = simulate_rebounds(
+        args.samples,
+        seed=args.seed,
+        court=court,
+        params=params,
+        target_sampler=target_sampler,
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = args.out_dir / "rebound_sim_summary.json"
     result.save_summary_json(summary_path)
@@ -108,6 +138,7 @@ def main() -> None:
             court=court,
             params=params,
             shot_indices=shot_indices,
+            target_sampler=target_sampler,
         )
         key = _shot_cell_key(cell)
         conditioned_summary = conditioned.summary()

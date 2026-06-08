@@ -6,7 +6,7 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -138,8 +138,95 @@ const potentialAssistLinksByPair = ref({});
 const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
 const sankeyFlowMode = ref('assisted');
 const sankeyShotType = ref('all');
+const reboundPreviewEnabled = ref(false);
+const reboundPreview = ref(null);
+const reboundPreviewLoading = ref(false);
+const reboundPreviewError = ref(null);
+const reboundPreviewParams = ref({
+  targetTemperature: 1.0,
+  targetUniformMix: 0.0,
+  targetDistanceWeight: 1.10,
+  winnerTemperature: 0.75,
+});
 
 const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
+
+const REBOUND_REASON_LABELS = {
+  disabled: 'Disabled',
+  game_not_initialized: 'Game not initialized',
+  episode_not_done: 'Waiting for a completed episode',
+  terminal_not_missed_shot: 'Last terminal event was not a missed shot',
+  last_terminal_shot_was_made: 'Last terminal shot was made',
+  fitted_table_missing: 'Fitted rebound table not found',
+  missing_positions: 'Missing player positions',
+  position_outside_rebound_table_court: 'Current court/positions do not match rebound table',
+  shooter_position_unavailable: 'Shooter position unavailable',
+};
+
+function clearReboundPreview() {
+  reboundPreview.value = null;
+  reboundPreviewError.value = null;
+  reboundPreviewLoading.value = false;
+}
+
+function reboundPct(value, digits = 1) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '0.0%';
+  return `${(Math.max(0, Math.min(1, num)) * 100).toFixed(digits)}%`;
+}
+
+function reboundReasonLabel(reason) {
+  const key = String(reason || '').trim();
+  return REBOUND_REASON_LABELS[key] || key || 'No rebound preview available';
+}
+
+function reboundTeamLabel(team) {
+  const normalized = String(team || '').toLowerCase();
+  if (normalized === 'offense') return 'O';
+  if (normalized === 'defense') return 'D';
+  return 'P';
+}
+
+function reboundPlayerLabel(player) {
+  if (!player || player.player_id === undefined || player.player_id === null) return 'N/A';
+  return `${reboundTeamLabel(player.team)}${player.player_id}`;
+}
+
+const reboundPreviewWinnerRows = computed(() => {
+  const rows = Array.isArray(reboundPreview.value?.winner_probs) ? reboundPreview.value.winner_probs : [];
+  return rows.slice().sort((a, b) => Number(b?.conditional_prob || 0) - Number(a?.conditional_prob || 0));
+});
+
+const reboundPreviewStatusText = computed(() => {
+  if (reboundPreviewLoading.value) return 'Computing rebound preview...';
+  if (reboundPreviewError.value) return reboundPreviewError.value;
+  if (reboundPreview.value?.available) return '';
+  return reboundReasonLabel(reboundPreview.value?.reason);
+});
+
+async function refreshReboundPreview() {
+  if (!reboundPreviewEnabled.value || !gameState.value) {
+    clearReboundPreview();
+    return;
+  }
+  reboundPreviewLoading.value = true;
+  reboundPreviewError.value = null;
+  try {
+    const params = reboundPreviewParams.value || {};
+    reboundPreview.value = await getReboundPreview({
+      enabled: true,
+      target_temperature: Number(params.targetTemperature ?? 1.0),
+      target_uniform_mix: Number(params.targetUniformMix ?? 0.0),
+      target_distance_weight: Number(params.targetDistanceWeight ?? 1.10),
+      winner_temperature: Number(params.winnerTemperature ?? 0.75),
+    });
+  } catch (err) {
+    reboundPreview.value = null;
+    reboundPreviewError.value = err?.message || 'Failed to compute rebound preview';
+  } finally {
+    reboundPreviewLoading.value = false;
+  }
+}
 
 function emptyAssistLinkTypeMap() {
   return { dunk: {}, two: {}, three: {} };
@@ -475,14 +562,24 @@ const boardPolicyProbabilities = computed(() =>
 const boardSelectedActionsDisplay = computed(() =>
   (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : visibleBoardSelectedActions.value
 );
+const boardReboundTargetOverlay = computed(() =>
+  (!isPlaybookBoardPreviewActive.value
+    && !isBoardEditingMode.value
+    && reboundPreviewEnabled.value
+    && reboundPreview.value?.available)
+    ? reboundPreview.value
+    : null
+);
 const boardShotAccumulatorDisplay = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : shotAccumulatorForBoard.value
+  (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
+    ? {}
+    : shotAccumulatorForBoard.value
 );
 const initialControlsTab = computed(() =>
   templateSandboxMode.value ? 'template' : 'environment'
 );
 const boardShotChartLabelDisplay = computed(() =>
-  isPlaybookBoardPreviewActive.value ? '' : boardShotChartLabel.value
+  (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value) ? '' : boardShotChartLabel.value
 );
 
 const selectedSankeyLinkMap = computed(() => {
@@ -574,11 +671,19 @@ const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 // Watch for when episodes end to stop auto-play behavior
 watch(gameState, async (newState, oldState) => {
     syncPolicyProbsFromState(newState);
+    if (!newState || !newState.done) {
+        if (reboundPreview.value?.available || reboundPreviewError.value) {
+            clearReboundPreview();
+        }
+    }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
         // Allow replay after any completed episode (manual or self-play)
         canReplay.value = true;
+        if (reboundPreviewEnabled.value) {
+            await refreshReboundPreview();
+        }
         // Automatically load episode for manual stepping (with small delay and error handling)
         setTimeout(async () => {
             try {
@@ -590,6 +695,20 @@ watch(gameState, async (newState, oldState) => {
         }, 100);
     }
 });
+
+watch(reboundPreviewEnabled, async (enabled) => {
+  if (!enabled) {
+    clearReboundPreview();
+    return;
+  }
+  await refreshReboundPreview();
+});
+
+watch(reboundPreviewParams, async () => {
+  if (reboundPreviewEnabled.value && gameState.value?.done) {
+    await refreshReboundPreview();
+  }
+}, { deep: true });
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
@@ -616,6 +735,7 @@ async function handleGameStarted(setupData) {
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   // Clear any self-play selections state
   currentSelections.value = null;
   userSelections.value = {};
@@ -693,6 +813,7 @@ async function handleTemplateSandboxStarted(setupData = {}) {
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   currentSelections.value = null;
   userSelections.value = {};
   isSelfPlaying.value = false;
@@ -1714,6 +1835,7 @@ async function handleEvaluation() {
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
   perIntentEvalStats.value = {};
@@ -2206,6 +2328,7 @@ function handlePlayAgain() {
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   placementPassPreview.value = {};
   evalConfig.value = defaultEvalConfig();
   activePlayerId.value = null;
@@ -2476,6 +2599,7 @@ onBeforeUnmount(() => {
           :selected-actions="boardSelectedActionsDisplay"
           :shot-accumulator="boardShotAccumulatorDisplay"
           :shot-chart-label="boardShotChartLabelDisplay"
+          :rebound-target-overlay="boardReboundTargetOverlay"
           :placement-mode="isBoardEditingMode"
           :placement-editable="isTemplatePlacementMode ? true : evalConfig.placementEditing"
           :placement-positions="isTemplatePlacementMode ? templateConfig.positions : evalConfig.positions"
@@ -2590,6 +2714,60 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+
+
+        <div v-if="gameState && !isBoardEditingMode && !isPlaybookBoardPreviewActive" class="rebound-preview-panel">
+          <div class="rebound-preview-header">
+            <label class="inline-check rebound-preview-toggle">
+              <input type="checkbox" v-model="reboundPreviewEnabled" />
+              <span>Rebound preview after missed terminal shot</span>
+            </label>
+            <button
+              v-if="reboundPreviewEnabled"
+              class="rebound-preview-refresh"
+              @click="refreshReboundPreview"
+              :disabled="reboundPreviewLoading"
+            >
+              Refresh
+            </button>
+          </div>
+          <div v-if="reboundPreviewEnabled" class="rebound-preview-controls">
+            <label>
+              Target temp
+              <input type="number" min="0.1" max="5" step="0.05" v-model.number="reboundPreviewParams.targetTemperature" />
+            </label>
+            <label>
+              Uniform mix
+              <input type="number" min="0" max="1" step="0.05" v-model.number="reboundPreviewParams.targetUniformMix" />
+            </label>
+            <label>
+              Distance wt
+              <input type="number" min="0" max="5" step="0.05" v-model.number="reboundPreviewParams.targetDistanceWeight" />
+            </label>
+            <label>
+              Winner temp
+              <input type="number" min="0.1" max="5" step="0.05" v-model.number="reboundPreviewParams.winnerTemperature" />
+            </label>
+          </div>
+          <div v-if="reboundPreviewEnabled && reboundPreviewStatusText" class="rebound-preview-status">
+            {{ reboundPreviewStatusText }}
+          </div>
+          <div v-if="reboundPreviewEnabled && reboundPreview?.available" class="rebound-preview-summary">
+            <div class="rebound-preview-meta">
+              <span>Shot: {{ reboundPlayerLabel(reboundPreview.shot) }} {{ reboundPreview.shot?.shot_type }}</span>
+              <span>Target: {{ reboundPreview.sampled_target?.q }},{{ reboundPreview.sampled_target?.r }} ({{ reboundPct(reboundPreview.sampled_target?.prob) }})</span>
+              <span>Winner: {{ reboundPlayerLabel(reboundPreview.sampled_winner) }} {{ reboundPct(reboundPreview.sampled_winner?.conditional_prob) }}</span>
+            </div>
+            <div class="rebound-winner-list">
+              <div class="rebound-winner-list-title">Win probability given sampled target</div>
+              <div v-for="row in reboundPreviewWinnerRows" :key="`rebound-winner-${row.player_id}`" class="rebound-winner-row">
+                <span class="rebound-winner-player">{{ reboundPlayerLabel(row) }}</span>
+                <span class="rebound-winner-bar"><span :style="{ width: reboundPct(row.conditional_prob) }"></span></span>
+                <span class="rebound-winner-prob">{{ reboundPct(row.conditional_prob) }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
         <div v-if="gameState.done || isManualStepping" class="save-episode-row">
           <div class="gif-speed-control">
             <label for="gif-speed-slider">GIF speed</label>
@@ -2987,5 +3165,118 @@ header {
   .top-row {
     grid-template-columns: 1fr;
   }
+}
+
+.rebound-preview-panel {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 18px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.rebound-preview-header,
+.rebound-preview-meta,
+.rebound-preview-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.rebound-preview-header {
+  justify-content: space-between;
+}
+
+.rebound-preview-toggle {
+  color: var(--app-text);
+}
+
+.rebound-preview-refresh {
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--app-accent);
+  padding: 0.35rem 0.8rem;
+}
+
+.rebound-preview-controls {
+  margin-top: 0.75rem;
+}
+
+.rebound-preview-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: var(--app-text-muted);
+  font-size: 0.75rem;
+}
+
+.rebound-preview-controls input {
+  width: 92px;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.65);
+  color: var(--app-text);
+}
+
+.rebound-preview-status {
+  margin-top: 0.75rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.rebound-preview-summary {
+  margin-top: 0.8rem;
+}
+
+.rebound-preview-meta {
+  color: var(--app-text);
+  font-size: 0.84rem;
+}
+
+.rebound-winner-list {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+
+.rebound-winner-list-title {
+  color: var(--app-text-muted);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+}
+
+.rebound-winner-row {
+  display: grid;
+  grid-template-columns: 44px minmax(80px, 1fr) 48px;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.rebound-winner-player {
+  color: var(--app-text);
+  font-weight: 700;
+}
+
+.rebound-winner-bar {
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.9);
+  overflow: hidden;
+}
+
+.rebound-winner-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #fbbf24);
+}
+
+.rebound-winner-prob {
+  color: var(--app-accent);
+  text-align: right;
 }
 </style>

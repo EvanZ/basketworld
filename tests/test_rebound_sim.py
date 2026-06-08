@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 from analytics.rebound_sim.model import (
+    ReboundParams,
+    _sample_rebound_winner,
     build_court,
     rebound_region_probabilities,
     simulate_rebounds,
@@ -34,6 +36,32 @@ def test_corner_short_rebound_biases_weak_side_more_than_same_side():
 
     assert probs["weak"] > probs["same"]
     assert probs["middle"] > 0.0
+
+
+def test_rebound_winner_depends_only_on_distance_to_target():
+    court = build_court()
+    target_idx = court.basket_index
+    far_idx = int(np.argmax(court.distance_hex))
+    positions = np.full(10, far_idx, dtype=np.int32)
+    positions[0] = target_idx
+    positions[5] = target_idx
+    rng = np.random.default_rng(2026)
+    params = ReboundParams(
+        target_distance_weight=8.0,
+        winner_temperature=0.25,
+    )
+
+    winners = np.asarray(
+        [
+            _sample_rebound_winner(court, rng, positions, target_idx, params=params)[0]
+            for _ in range(4000)
+        ]
+    )
+    contested = winners[(winners == 0) | (winners == 5)]
+
+    assert len(contested) == len(winners)
+    defense_share = float(np.mean(contested == 5))
+    assert 0.44 <= defense_share <= 0.56
 
 
 def test_rebound_simulation_outputs_valid_rates_and_cell_indices():

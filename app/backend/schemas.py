@@ -71,6 +71,16 @@ class PassStealPreviewRequest(BaseModel):
     ball_holder: int
 
 
+class ReboundPreviewRequest(BaseModel):
+    enabled: bool = True
+    seed: int | None = None
+    target_temperature: float = 1.0
+    target_uniform_mix: float = 0.0
+    target_distance_weight: float | None = None
+    winner_temperature: float | None = None
+    table_model_dir: str | None = None
+
+
 class ActionRequest(BaseModel):
     actions: dict[str, object]  # Accept ints, action names, or structured payloads like {type:"PASS", target:id}.
     player_deterministic: bool | None = None

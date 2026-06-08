@@ -69,6 +69,7 @@ basketworld_jax/results/
 analytics/jax_intent_sample_embed/
 analytics/rebound_sim/outputs/
 analytics/rebound_physics/outputs/
+analytics/rebound_sim/outputs_fitted_table/*.json
 
 
 # temp
