@@ -9,12 +9,99 @@ def calculate_steal_probability_for_pass(env, passer_pos: Tuple[int, int], recv_
     Shared helper for steal probability computation. Mirrors env._calculate_steal_probability_for_pass.
     """
     pass_distance = env._hex_distance(passer_pos, recv_pos)
+    pass_model = str(getattr(env, "pass_interception_model", "line") or "line").strip().lower()
+    lob_aware = pass_model in {"lob_aware", "lob-aware", "lob"}
+    reaction_model = pass_model in {"reaction", "speed", "speed_based", "speed-based"}
 
     forward_defenders = []
     dir_q = recv_pos[0] - passer_pos[0]
     dir_r = recv_pos[1] - passer_pos[1]
     dir_x, dir_y = env._axial_to_cartesian(dir_q, dir_r)
     dir_norm = math.hypot(dir_x, dir_y) or 1.0
+
+    lob_candidate = False
+    if lob_aware:
+        basket_pos = getattr(env, "basket_position", None)
+        if basket_pos is not None:
+            lob_candidate = (
+                env._hex_distance(recv_pos, basket_pos)
+                <= float(getattr(env, "pass_lob_receiver_distance", 1.0))
+            )
+    lane_multiplier = (
+        float(getattr(env, "pass_lob_lane_multiplier", 0.35))
+        if lob_candidate
+        else 1.0
+    )
+
+    if reaction_model:
+        pass_speed = max(0.1, float(getattr(env, "pass_speed", 3.5)))
+        reaction_time = max(0.0, float(getattr(env, "defender_reaction_time", 0.35)))
+        defender_speed = max(0.0, float(getattr(env, "defender_speed", 1.25)))
+        reach_radius = max(0.0, float(getattr(env, "defender_reach_radius", 0.65)))
+        reaction_softness = max(0.05, float(getattr(env, "reaction_softness", 0.55)))
+        base_passer_risk = max(0.0, min(1.0, float(getattr(env, "base_passer_risk", 0.06))))
+        passer_decay = max(0.0, float(getattr(env, "passer_pressure_decay", 1.35)))
+        base_receiver_risk = max(0.0, min(1.0, float(getattr(env, "base_receiver_risk", 0.35))))
+        alignment_min = max(0.0, min(1.0, float(getattr(env, "receiver_alignment_min", 0.35))))
+        alignment_width = max(0.1, float(getattr(env, "receiver_alignment_width", 2.0)))
+        max_receiver_hazard = max(0.0, min(1.0, float(getattr(env, "max_receiver_hazard", 0.85))))
+        lane_weight = max(0.0, min(1.0, float(getattr(env, "lane_weight", 0.0))))
+        pass_time = float(pass_distance) / pass_speed
+        available_time = max(0.0, pass_time - reaction_time)
+        reachable = defender_speed * available_time + reach_radius
+
+        component_hazards = []
+        defender_contributions = []
+        for did in env.defense_ids:
+            defender_pos = env.positions[did]
+            if defender_pos == passer_pos or defender_pos == recv_pos:
+                continue
+            perp_distance = env._point_to_line_distance(defender_pos, passer_pos, recv_pos)
+            position_t = env._get_position_on_line(defender_pos, passer_pos, recv_pos)
+            in_lane_segment = 0.0 < position_t < 1.0
+            position_weight = env.steal_position_weight_min + (1.0 - env.steal_position_weight_min) * position_t
+            lane_contrib = (
+                env.base_steal_rate
+                * math.exp(-env.steal_perp_decay * perp_distance)
+                * (1.0 + env.steal_distance_factor * pass_distance)
+                * position_weight
+                * lane_multiplier
+            ) if in_lane_segment else 0.0
+            lane_hazard = max(0.0, min(1.0, lane_weight * lane_contrib))
+
+            passer_dist = env._hex_distance(passer_pos, defender_pos)
+            passer_hazard = max(0.0, min(
+                1.0,
+                base_passer_risk * math.exp(-passer_decay * max(0.0, float(passer_dist) - 1.0)),
+            ))
+
+            catch_dist = env._hex_distance(defender_pos, recv_pos)
+            reaction_arg = (reachable - float(catch_dist)) / reaction_softness
+            reaction_prob = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, reaction_arg))))
+            alignment = (1.0 - max(0.0, min(1.0, perp_distance / alignment_width))) if in_lane_segment else 0.0
+            alignment_multiplier = alignment_min + (1.0 - alignment_min) * alignment
+            receiver_hazard = max(0.0, min(
+                max_receiver_hazard,
+                base_receiver_risk * reaction_prob * alignment_multiplier,
+            ))
+            component_hazards.extend([passer_hazard, receiver_hazard, lane_hazard])
+            defender_total = 1.0 - ((1.0 - passer_hazard) * (1.0 - receiver_hazard) * (1.0 - lane_hazard))
+            defender_contributions.append((did, defender_total, perp_distance, position_t))
+
+        complement_product = 1.0
+        for hazard in component_hazards:
+            complement_product *= (1.0 - max(0.0, min(1.0, hazard)))
+        return 1.0 - complement_product, defender_contributions
+    passer_pressure_weight = (
+        float(getattr(env, "pass_passer_pressure_weight", 0.0))
+        if lob_aware
+        else 0.0
+    )
+    receiver_pressure_weight = (
+        float(getattr(env, "pass_receiver_pressure_weight", 0.0))
+        if lob_aware
+        else 0.0
+    )
 
     for did in env.defense_ids:
         defender_pos = env.positions[did]
@@ -33,12 +120,54 @@ def calculate_steal_probability_for_pass(env, passer_pos: Tuple[int, int], recv_
         perp_distance = env._point_to_line_distance(defender_pos, passer_pos, recv_pos)
         position_t = env._get_position_on_line(defender_pos, passer_pos, recv_pos)
         position_weight = env.steal_position_weight_min + (1.0 - env.steal_position_weight_min) * position_t
-        steal_contrib = (
+        lane_contrib = (
             env.base_steal_rate
             * math.exp(-env.steal_perp_decay * perp_distance)
             * (1.0 + env.steal_distance_factor * pass_distance)
             * position_weight
+            * lane_multiplier
         )
+
+        passer_contrib = 0.0
+        if passer_pressure_weight > 0.0:
+            pdq = defender_pos[0] - passer_pos[0]
+            pdr = defender_pos[1] - passer_pos[1]
+            px, py = env._axial_to_cartesian(pdq, pdr)
+            pnorm = math.hypot(px, py)
+            if pnorm > 0.0:
+                alignment = max(0.0, min(1.0, ((px * dir_x) + (py * dir_y)) / (pnorm * dir_norm)))
+                passer_dist = env._hex_distance(passer_pos, defender_pos)
+                passer_contrib = (
+                    env.base_steal_rate
+                    * passer_pressure_weight
+                    * math.exp(-env.steal_perp_decay * max(0.0, float(passer_dist) - 1.0))
+                    * (1.0 + env.steal_distance_factor * pass_distance)
+                    * alignment
+                )
+
+        receiver_contrib = 0.0
+        if receiver_pressure_weight > 0.0:
+            rdq = defender_pos[0] - recv_pos[0]
+            rdr = defender_pos[1] - recv_pos[1]
+            rx, ry = env._axial_to_cartesian(rdq, rdr)
+            rnorm = math.hypot(rx, ry)
+            if rnorm > 0.0:
+                # Receiver pressure is strongest when the defender is near the catch point
+                # and between the passer and receiver.
+                alignment = max(0.0, min(1.0, -(((rx * dir_x) + (ry * dir_y)) / (rnorm * dir_norm))))
+                receiver_dist = env._hex_distance(recv_pos, defender_pos)
+                receiver_contrib = (
+                    env.base_steal_rate
+                    * receiver_pressure_weight
+                    * math.exp(-env.steal_perp_decay * max(0.0, float(receiver_dist) - 1.0))
+                    * (1.0 + env.steal_distance_factor * pass_distance)
+                    * alignment
+                )
+
+        if not (0.0 < position_t < 1.0):
+            lane_contrib = 0.0
+
+        steal_contrib = lane_contrib + passer_contrib + receiver_contrib
         steal_contrib = max(0.0, min(1.0, steal_contrib))
         defender_contributions.append((did, steal_contrib, perp_distance, position_t))
 

@@ -18,7 +18,7 @@ from basketworld.utils.mlflow_params import (
 )
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
-from basketworld.utils.start_templates import resolve_start_template
+from basketworld.utils.start_templates import load_start_template_library, resolve_start_template
 from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.inference_adapters import (
@@ -69,6 +69,20 @@ from fastapi.encoders import jsonable_encoder
 router = APIRouter()
 
 
+_JAX_RUNTIME_STATIC_ENV_KEYS = {
+    # JAX kernel-only env/static fields. The legacy Python env constructor does
+    # not accept these, but build_kernel_static_from_env reads them from attrs.
+    "enable_rebounds",
+    "rebound_table_model_dir",
+    "rebound_target_temperature",
+    "rebound_target_uniform_mix",
+    "rebound_winner_distance_weight",
+    "rebound_winner_temperature",
+    "offensive_rebound_shot_clock_reset",
+    "rebound_terminal_reward_mode",
+}
+
+
 def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     """Separate real env kwargs from wrapper/training-only metadata."""
     env_signature = inspect.signature(basketworld.HexagonBasketballEnv.__init__)
@@ -78,6 +92,15 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
     wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
     return env_kwargs, wrapper_kwargs
+
+
+def _jax_runtime_env_params(env_kwargs: dict, optional_params: dict) -> dict:
+    """Merge constructor-safe env kwargs with JAX static-only attrs."""
+    merged = dict(env_kwargs or {})
+    for key in _JAX_RUNTIME_STATIC_ENV_KEYS:
+        if key in optional_params:
+            merged[key] = optional_params[key]
+    return merged
 
 
 def _str_to_bool(value) -> bool:
@@ -112,6 +135,23 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "steal_perp_decay": float,
     "steal_distance_factor": float,
     "steal_position_weight_min": float,
+    "pass_interception_model": str,
+    "pass_passer_pressure_weight": float,
+    "pass_receiver_pressure_weight": float,
+    "pass_lob_lane_multiplier": float,
+    "pass_lob_receiver_distance": float,
+    "pass_speed": float,
+    "defender_reaction_time": float,
+    "defender_speed": float,
+    "defender_reach_radius": float,
+    "reaction_softness": float,
+    "base_passer_risk": float,
+    "passer_pressure_decay": float,
+    "base_receiver_risk": float,
+    "receiver_alignment_min": float,
+    "receiver_alignment_width": float,
+    "max_receiver_hazard": float,
+    "lane_weight": float,
     "spawn_distance": int,
     "max_spawn_distance": int,
     "defender_spawn_distance": int,
@@ -154,6 +194,14 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "intent_null_prob": float,
     "defense_intent_null_prob": float,
     "intent_visible_to_defense_prob": float,
+    "enable_rebounds": _str_to_bool,
+    "rebound_table_model_dir": str,
+    "rebound_target_temperature": float,
+    "rebound_target_uniform_mix": float,
+    "rebound_winner_distance_weight": float,
+    "rebound_winner_temperature": float,
+    "offensive_rebound_shot_clock_reset": int,
+    "rebound_terminal_reward_mode": str,
 }
 
 
@@ -392,6 +440,35 @@ def _load_start_template_library_for_run(
         return None
 
 
+def _load_start_template_library_from_training_params(
+    mlflow_training_params: dict,
+) -> tuple[dict | None, str | None]:
+    """Best-effort fallback for local/dev runs when the MLflow artifact is absent."""
+    source_path = str(mlflow_training_params.get("start_template_library") or "").strip()
+    if not source_path:
+        return None, None
+
+    expanded = os.path.expandvars(os.path.expanduser(source_path))
+    candidates = [Path(expanded)]
+    if not candidates[0].is_absolute():
+        repo_root = Path(basketworld.__file__).resolve().parents[1]
+        candidates.extend([Path.cwd() / expanded, repo_root / expanded])
+
+    players_per_side = int(mlflow_training_params.get("players") or 3)
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            library = load_start_template_library(
+                candidate,
+                players_per_side=players_per_side,
+            )
+            return library, str(candidate)
+        except Exception as exc:
+            print(f"[start_templates] Failed to load local template library {candidate}: {exc}")
+    return None, None
+
+
 _SESSION_START_TEMPLATE_SOURCES = {"local_file", "file_upload", "session_editor"}
 
 
@@ -417,6 +494,12 @@ def _resolve_start_template_library_for_init(
                 )
             ),
         )
+
+    local_library, local_path = _load_start_template_library_from_training_params(
+        mlflow_training_params
+    )
+    if local_library is not None:
+        return local_library, "local_file", local_path
 
     source = str(previous_source or "").strip()
     if previous_library is not None and source in _SESSION_START_TEMPLATE_SOURCES:
@@ -815,7 +898,7 @@ async def init_game(request: InitGameRequest):
 
             game_state.jax_runtime = JaxDevRuntime(
                 required_params=required_params,
-                env_params=env_optional_params,
+                env_params=_jax_runtime_env_params(env_optional_params, optional_params),
                 unified_policy=game_state.unified_policy,
                 opponent_policy=game_state.defense_policy,
                 user_team=resolved_user_team,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
 import numpy as np
@@ -21,8 +22,8 @@ PASS_ACTION_START = ActionType.PASS_E.value
 PASS_ACTION_END = ActionType.PASS_SE.value + 1
 ACTION_COUNT = len(ActionType)
 SQRT3 = float(np.sqrt(3.0))
-TOKEN_OBS_PLAYER_DIM = 15
-TOKEN_OBS_GLOBAL_DIM = 4
+TOKEN_OBS_PLAYER_DIM = 17
+TOKEN_OBS_GLOBAL_DIM = 8
 TOKEN_OBS_ROLE_FLAG_DIM = 1
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -35,6 +36,20 @@ SHOT_TYPE_NONE = 0
 SHOT_TYPE_DUNK = 1
 SHOT_TYPE_TWO = 2
 SHOT_TYPE_THREE = 3
+REBOUND_TERMINAL_REWARD_ACTUAL_POINTS = 0
+REBOUND_TERMINAL_REWARD_LAST_SHOT_EP_ON_DEFENSIVE_REBOUND = 1
+REBOUND_TERMINAL_REWARD_LAST_SHOT_EP = 2
+REBOUND_TERMINAL_REWARD_MODE_IDS = {
+    "actual_points": REBOUND_TERMINAL_REWARD_ACTUAL_POINTS,
+    "last_shot_ep_on_defensive_rebound": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP_ON_DEFENSIVE_REBOUND,
+    "last_shot_ep": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP,
+}
+REBOUND_SHOT_TYPE_TO_JAX = {
+    "dunk": SHOT_TYPE_DUNK,
+    "finger_roll": SHOT_TYPE_TWO,
+    "layup": SHOT_TYPE_TWO,
+    "jumper": SHOT_TYPE_THREE,
+}
 PHI_MODE_TEAM_BEST = 0
 PHI_MODE_TEAMMATES_BEST = 1
 PHI_MODE_TEAMMATES_AVG = 2
@@ -48,6 +63,19 @@ PHI_AGGREGATION_MODE_IDS = {
     "team_avg": PHI_MODE_TEAM_AVG,
     "team_worst": PHI_MODE_TEAM_WORST,
     "teammates_worst": PHI_MODE_TEAMMATES_WORST,
+}
+PASS_INTERCEPTION_MODEL_LINE = 0
+PASS_INTERCEPTION_MODEL_LOB_AWARE = 1
+PASS_INTERCEPTION_MODEL_REACTION = 2
+PASS_INTERCEPTION_MODEL_IDS = {
+    "line": PASS_INTERCEPTION_MODEL_LINE,
+    "lob": PASS_INTERCEPTION_MODEL_LOB_AWARE,
+    "lob-aware": PASS_INTERCEPTION_MODEL_LOB_AWARE,
+    "lob_aware": PASS_INTERCEPTION_MODEL_LOB_AWARE,
+    "reaction": PASS_INTERCEPTION_MODEL_REACTION,
+    "speed": PASS_INTERCEPTION_MODEL_REACTION,
+    "speed_based": PASS_INTERCEPTION_MODEL_REACTION,
+    "speed-based": PASS_INTERCEPTION_MODEL_REACTION,
 }
 
 
@@ -93,6 +121,23 @@ class KernelStatic(NamedTuple):
     steal_perp_decay: Any
     steal_distance_factor: Any
     steal_position_weight_min: Any
+    pass_interception_model_id: Any
+    pass_passer_pressure_weight: Any
+    pass_receiver_pressure_weight: Any
+    pass_lob_lane_multiplier: Any
+    pass_lob_receiver_distance: Any
+    pass_speed: Any
+    defender_reaction_time: Any
+    defender_speed: Any
+    defender_reach_radius: Any
+    reaction_softness: Any
+    base_passer_risk: Any
+    passer_pressure_decay: Any
+    base_receiver_risk: Any
+    receiver_alignment_min: Any
+    receiver_alignment_width: Any
+    max_receiver_hazard: Any
+    lane_weight: Any
     three_point_distance: Any
     three_pt_extra_hex_decay: Any
     shot_clock_min: Any
@@ -133,6 +178,14 @@ class KernelStatic(NamedTuple):
     intent_null_prob: Any
     defense_intent_null_prob: Any
     intent_visible_to_defense_prob: Any
+    enable_rebounds: Any
+    rebound_target_probs: Any
+    rebound_target_temperature: Any
+    rebound_target_uniform_mix: Any
+    rebound_winner_distance_weight: Any
+    rebound_winner_temperature: Any
+    offensive_rebound_shot_clock_reset: Any
+    rebound_terminal_reward_mode: Any
 
 
 class KernelState(NamedTuple):
@@ -192,6 +245,12 @@ class StepBatchOutput(NamedTuple):
     offensive_three_seconds: Any
     defensive_lane_violation: Any
     defensive_lane_violation_player: Any
+    rebound_attempt: Any
+    offensive_rebound: Any
+    defensive_rebound: Any
+    rebound_target_cell: Any
+    rebound_winner: Any
+    shot_clock_reset_14: Any
     phi_r_shape: Any
     phi_prev: Any
     phi_next: Any
@@ -390,6 +449,78 @@ def stack_state_snapshots(
         ),
     )
 
+
+
+def _compiled_rebound_target_probs(env, cells: list[tuple[int, int]]) -> np.ndarray:
+    """Pre-expand fitted rebound target tables into JAX cell order.
+
+    Runtime JAX code only indexes this dense array; all Python artifact loading,
+    canonical reflection, and shot-type dispatch happens here.
+    """
+    n_cells = len(cells)
+    fallback = np.zeros((4, n_cells, n_cells), dtype=np.float32)
+    basket_idx = 0
+    try:
+        basket_idx = cells.index(tuple(int(v) for v in env.basket_position))
+    except ValueError:
+        basket_idx = 0
+    fallback[:, :, basket_idx] = 1.0
+
+    if not bool(getattr(env, "enable_rebounds", False)):
+        return fallback
+    model_dir = str(getattr(env, "rebound_table_model_dir", "") or "").strip()
+    if not model_dir:
+        raise ValueError("enable_rebounds=True requires rebound_table_model_dir.")
+    if not Path(model_dir).exists():
+        raise FileNotFoundError(f"Missing rebound table model dir: {model_dir}")
+
+    try:
+        from analytics.rebound_sim.model import CourtSpec, build_court
+        from analytics.rebound_sim.table_model import FittedReboundTableModel
+    except Exception as exc:  # pragma: no cover - import errors should be explicit in training setup
+        raise RuntimeError("Unable to import fitted rebound table helpers for JAX rebounds.") from exc
+
+    court = build_court(
+        CourtSpec(
+            rows=int(env.court_height),
+            cols=int(env.court_width),
+            basket_col=0,
+            basket_row=int(env.court_height) // 2,
+            three_point_distance=float(env.three_point_distance),
+            three_point_short_distance=float(getattr(env, "three_point_short_distance", 3.0)),
+        )
+    )
+    if tuple(court.cells) != tuple(cells):
+        court_index_by_cell = {tuple(cell): idx for idx, cell in enumerate(court.cells)}
+        jax_to_court = np.asarray([court_index_by_cell[tuple(cell)] for cell in cells], dtype=np.int32)
+    else:
+        jax_to_court = np.arange(n_cells, dtype=np.int32)
+
+    model = FittedReboundTableModel.load(model_dir, court=court)
+    dense = np.zeros((4, n_cells, n_cells), dtype=np.float32)
+    row_counts = np.zeros((4, n_cells), dtype=np.int32)
+    for jax_shot_idx in range(n_cells):
+        court_shot_idx = int(jax_to_court[jax_shot_idx])
+        shot_type_name = model.shot_type_for_shot(court, court_shot_idx)
+        if shot_type_name == "jumper":
+            jax_type = SHOT_TYPE_THREE if bool(court.three_point_mask[court_shot_idx]) else SHOT_TYPE_TWO
+        else:
+            jax_type = int(REBOUND_SHOT_TYPE_TO_JAX.get(shot_type_name, SHOT_TYPE_TWO))
+        probs_court = np.asarray(model.target_probabilities(court, court_shot_idx), dtype=np.float64)
+        probs_jax = probs_court[jax_to_court]
+        total = float(np.sum(probs_jax))
+        if not np.isfinite(total) or total <= 0.0:
+            probs_jax = fallback[jax_type, jax_shot_idx]
+        else:
+            probs_jax = probs_jax / total
+        dense[jax_type, jax_shot_idx, :] = probs_jax.astype(np.float32)
+        row_counts[jax_type, jax_shot_idx] = 1
+
+    for shot_type in range(1, 4):
+        missing = row_counts[shot_type] == 0
+        dense[shot_type, missing, :] = fallback[shot_type, missing, :]
+    dense[SHOT_TYPE_NONE, :, :] = fallback[SHOT_TYPE_NONE, :, :]
+    return dense
 
 def _compiled_start_template_arrays(env) -> dict[str, np.ndarray | float | bool]:
     n_players = int(env.n_players)
@@ -592,6 +723,7 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         pass_slot_mask[passer_id, : len(teammates)] = 1
         pass_target_ids[passer_id, : len(teammates)] = np.asarray(teammates, dtype=np.int32)
     start_templates = _compiled_start_template_arrays(env)
+    rebound_target_probs = _compiled_rebound_target_probs(env, cells)
 
     return KernelStatic(
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
@@ -638,6 +770,29 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         steal_perp_decay=xp.asarray(float(env.steal_perp_decay), dtype=xp.float32),
         steal_distance_factor=xp.asarray(float(env.steal_distance_factor), dtype=xp.float32),
         steal_position_weight_min=xp.asarray(float(env.steal_position_weight_min), dtype=xp.float32),
+        pass_interception_model_id=xp.asarray(
+            PASS_INTERCEPTION_MODEL_IDS.get(
+                str(getattr(env, "pass_interception_model", "line") or "line").strip().lower(),
+                PASS_INTERCEPTION_MODEL_LINE,
+            ),
+            dtype=xp.int32,
+        ),
+        pass_passer_pressure_weight=xp.asarray(float(getattr(env, "pass_passer_pressure_weight", 0.0)), dtype=xp.float32),
+        pass_receiver_pressure_weight=xp.asarray(float(getattr(env, "pass_receiver_pressure_weight", 0.0)), dtype=xp.float32),
+        pass_lob_lane_multiplier=xp.asarray(float(getattr(env, "pass_lob_lane_multiplier", 0.35)), dtype=xp.float32),
+        pass_lob_receiver_distance=xp.asarray(float(getattr(env, "pass_lob_receiver_distance", 1.0)), dtype=xp.float32),
+        pass_speed=xp.asarray(float(getattr(env, "pass_speed", 3.5)), dtype=xp.float32),
+        defender_reaction_time=xp.asarray(float(getattr(env, "defender_reaction_time", 0.35)), dtype=xp.float32),
+        defender_speed=xp.asarray(float(getattr(env, "defender_speed", 1.25)), dtype=xp.float32),
+        defender_reach_radius=xp.asarray(float(getattr(env, "defender_reach_radius", 0.65)), dtype=xp.float32),
+        reaction_softness=xp.asarray(float(getattr(env, "reaction_softness", 0.55)), dtype=xp.float32),
+        base_passer_risk=xp.asarray(float(getattr(env, "base_passer_risk", 0.06)), dtype=xp.float32),
+        passer_pressure_decay=xp.asarray(float(getattr(env, "passer_pressure_decay", 1.35)), dtype=xp.float32),
+        base_receiver_risk=xp.asarray(float(getattr(env, "base_receiver_risk", 0.35)), dtype=xp.float32),
+        receiver_alignment_min=xp.asarray(float(getattr(env, "receiver_alignment_min", 0.35)), dtype=xp.float32),
+        receiver_alignment_width=xp.asarray(float(getattr(env, "receiver_alignment_width", 2.0)), dtype=xp.float32),
+        max_receiver_hazard=xp.asarray(float(getattr(env, "max_receiver_hazard", 0.85)), dtype=xp.float32),
+        lane_weight=xp.asarray(float(getattr(env, "lane_weight", 0.0)), dtype=xp.float32),
         three_point_distance=xp.asarray(float(env.three_point_distance), dtype=xp.float32),
         three_pt_extra_hex_decay=xp.asarray(float(env.three_pt_extra_hex_decay), dtype=xp.float32),
         shot_clock_min=xp.asarray(int(env.min_shot_clock), dtype=xp.int32),
@@ -701,6 +856,35 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         intent_visible_to_defense_prob=xp.asarray(
             float(np.clip(float(getattr(env, "intent_visible_to_defense_prob", 0.0)), 0.0, 1.0)),
             dtype=xp.float32,
+        ),
+        enable_rebounds=xp.asarray(1 if bool(getattr(env, "enable_rebounds", False)) else 0, dtype=xp.int8),
+        rebound_target_probs=xp.asarray(rebound_target_probs, dtype=xp.float32),
+        rebound_target_temperature=xp.asarray(
+            max(1.0e-6, float(getattr(env, "rebound_target_temperature", 1.0))),
+            dtype=xp.float32,
+        ),
+        rebound_target_uniform_mix=xp.asarray(
+            float(np.clip(float(getattr(env, "rebound_target_uniform_mix", 0.0)), 0.0, 1.0)),
+            dtype=xp.float32,
+        ),
+        rebound_winner_distance_weight=xp.asarray(
+            max(0.0, float(getattr(env, "rebound_winner_distance_weight", 1.0))),
+            dtype=xp.float32,
+        ),
+        rebound_winner_temperature=xp.asarray(
+            max(1.0e-6, float(getattr(env, "rebound_winner_temperature", 1.0))),
+            dtype=xp.float32,
+        ),
+        offensive_rebound_shot_clock_reset=xp.asarray(
+            max(1, int(getattr(env, "offensive_rebound_shot_clock_reset", 14))),
+            dtype=xp.int32,
+        ),
+        rebound_terminal_reward_mode=xp.asarray(
+            REBOUND_TERMINAL_REWARD_MODE_IDS.get(
+                str(getattr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+                REBOUND_TERMINAL_REWARD_ACTUAL_POINTS,
+            ),
+            dtype=xp.int32,
         ),
     )
 
@@ -1009,6 +1193,122 @@ def build_offense_expected_points_batch(static: KernelStatic, state: KernelState
     return jnp.take(profile["expected_points"], static.offense_ids, axis=1)
 
 
+def build_rebound_observation_features_batch(
+    static: KernelStatic,
+    state: KernelState,
+    shot_profile,
+    jnp,
+) -> dict[str, Any]:
+    """Table-derived rebound features for the current ball holder's shot.
+
+    The environment samples rebound targets from the fitted table only after a
+    miss. These features expose the pre-sample distribution implied by the
+    current shooter's location, without revealing the future random draw.
+    """
+    batch_size, n_players, _ = state.positions.shape
+    norm_den = static.court_norm_den
+    holder_valid = state.ball_holder >= 0
+    safe_holder = jnp.clip(state.ball_holder, 0, n_players - 1)
+    holder_pos = jnp.take_along_axis(state.positions, safe_holder[:, None, None], axis=1)[:, 0, :]
+    holder_cell_idx, holder_cell_found = _lookup_cell_indices(static.cell_coords, holder_pos, jnp)
+    holder_cell_idx = jnp.where(
+        holder_cell_found,
+        holder_cell_idx.astype(jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+
+    holder_distance = jnp.take_along_axis(
+        shot_profile["distance"],
+        safe_holder[:, None],
+        axis=1,
+    )[:, 0]
+    holder_is_three = jnp.take_along_axis(
+        shot_profile["is_three"].astype(jnp.int8),
+        safe_holder[:, None],
+        axis=1,
+    )[:, 0].astype(jnp.bool_)
+    shot_type = jnp.where(
+        static.allow_dunks.astype(jnp.bool_) & (holder_distance == 0),
+        jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
+        jnp.where(
+            holder_is_three,
+            jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
+            jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
+        ),
+    )
+    rebound_available = (
+        static.enable_rebounds.astype(jnp.bool_)
+        & holder_valid
+        & holder_cell_found
+        & (static.role_encoding[safe_holder] > 0.0)
+    )
+
+    raw_target_probs = static.rebound_target_probs[
+        jnp.clip(shot_type, 0, static.rebound_target_probs.shape[0] - 1),
+        jnp.clip(holder_cell_idx, 0, static.rebound_target_probs.shape[1] - 1),
+    ]
+    uniform_probs = jnp.full_like(raw_target_probs, 1.0 / float(raw_target_probs.shape[1]))
+    mixed_probs = (
+        ((1.0 - static.rebound_target_uniform_mix) * raw_target_probs)
+        + (static.rebound_target_uniform_mix * uniform_probs)
+    )
+    def _softmax(logits, axis):
+        shifted = logits - jnp.max(logits, axis=axis, keepdims=True)
+        exp_values = jnp.exp(shifted)
+        denom = jnp.maximum(jnp.sum(exp_values, axis=axis, keepdims=True), 1.0e-8)
+        return exp_values / denom
+
+    target_logits = jnp.log(jnp.maximum(mixed_probs, 1.0e-8)) / static.rebound_target_temperature
+    target_probs = _softmax(target_logits, axis=-1)
+    target_probs = jnp.where(rebound_available[:, None], target_probs, jnp.zeros_like(target_probs))
+
+    target_coords = static.cell_coords.astype(jnp.float32)
+    expected_target_q = jnp.sum(target_probs * target_coords[None, :, 0], axis=-1)
+    expected_target_r = jnp.sum(target_probs * target_coords[None, :, 1], axis=-1)
+    target_entropy = -jnp.sum(
+        jnp.where(target_probs > 0.0, target_probs * jnp.log(jnp.maximum(target_probs, 1.0e-8)), 0.0),
+        axis=-1,
+    )
+    max_entropy = jnp.log(jnp.asarray(float(static.cell_coords.shape[0]), dtype=jnp.float32))
+    target_entropy_norm = jnp.where(max_entropy > 0.0, target_entropy / max_entropy, 0.0)
+
+    player_cell_idx, player_cell_found = _lookup_cell_indices(static.cell_coords, state.positions, jnp)
+    safe_player_cell_idx = jnp.where(
+        player_cell_found,
+        player_cell_idx.astype(jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    target_indices = jnp.arange(static.cell_coords.shape[0], dtype=jnp.int32)
+    player_target_distances = static.cell_distance_matrix[
+        jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[..., None],
+        target_indices[None, None, :],
+    ].astype(jnp.float32)
+    expected_target_distance = jnp.sum(
+        player_target_distances * target_probs[:, None, :],
+        axis=-1,
+    ) / norm_den
+
+    winner_logits = (
+        -static.rebound_winner_distance_weight * player_target_distances
+    ) / static.rebound_winner_temperature
+    winner_probs_by_target = _softmax(jnp.swapaxes(winner_logits, 1, 2), axis=-1)
+    rebound_win_prob = jnp.sum(winner_probs_by_target * target_probs[:, :, None], axis=1)
+    rebound_win_prob = jnp.where(rebound_available[:, None], rebound_win_prob, jnp.zeros_like(rebound_win_prob))
+    orb_prob = jnp.sum(
+        rebound_win_prob * (static.role_encoding[None, :] > 0.0).astype(jnp.float32),
+        axis=-1,
+    )
+
+    return {
+        "expected_target_q": expected_target_q / norm_den,
+        "expected_target_r": expected_target_r / norm_den,
+        "target_entropy": target_entropy_norm,
+        "orb_prob": orb_prob,
+        "dist_to_expected_target": expected_target_distance,
+        "win_prob": rebound_win_prob,
+    }
+
+
 def _phi_shot_quality_single(static: KernelStatic, state: KernelState, jnp):
     """Potential Phi(s): current possession team's pressure-adjusted shot quality."""
     n_players = int(static.role_encoding.shape[0])
@@ -1143,10 +1443,16 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
 
     line_delta = offense_positions - passer_pos[:, None, :]
     line_x, line_y = _axial_to_cartesian(line_delta[..., 0], line_delta[..., 1], jnp)
+    line_mag = jnp.sqrt((line_x**2) + (line_y**2))
+    safe_line_mag = jnp.where(line_mag == 0.0, 1.0, line_mag)
     pass_distance = _hex_distance(passer_pos[:, None, :], offense_positions, jnp).astype(jnp.float32)
+    distance_factor = 1.0 + (static.steal_distance_factor * pass_distance[:, :, None])
+    lob_aware = static.pass_interception_model_id == PASS_INTERCEPTION_MODEL_LOB_AWARE
+    reaction_model = static.pass_interception_model_id == PASS_INTERCEPTION_MODEL_REACTION
 
     defender_delta = defense_positions[:, None, :, :] - passer_pos[:, None, None, :]
     defender_x, defender_y = _axial_to_cartesian(defender_delta[..., 0], defender_delta[..., 1], jnp)
+    defender_mag = jnp.sqrt((defender_x**2) + (defender_y**2))
     dot = (defender_x * line_x[:, :, None]) + (defender_y * line_y[:, :, None])
     forward_defender = dot >= 0.0
 
@@ -1161,20 +1467,89 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
     )
     between_endpoints = (position_t > 0.0) & (position_t < 1.0)
     position_weight = static.steal_position_weight_min + ((1.0 - static.steal_position_weight_min) * position_t)
-    steal_contrib = (
+
+    receiver_basket_distance = _hex_distance(offense_positions, static.basket_position[None, :], jnp).astype(jnp.float32)
+    lob_candidate = lob_aware & (receiver_basket_distance <= static.pass_lob_receiver_distance)
+    lane_multiplier = jnp.where(lob_candidate[:, :, None], static.pass_lob_lane_multiplier, 1.0)
+    lane_contrib = (
         static.base_steal_rate
         * jnp.exp(-static.steal_perp_decay * perp_distance)
-        * (1.0 + (static.steal_distance_factor * pass_distance[:, :, None]))
+        * distance_factor
         * position_weight
+        * lane_multiplier
     )
-    steal_contrib = jnp.clip(steal_contrib, 0.0, 1.0)
+    lane_contrib = jnp.where(
+        forward_defender & between_endpoints,
+        lane_contrib,
+        0.0,
+    )
+
+    alignment_den = jnp.where((defender_mag * safe_line_mag[:, :, None]) == 0.0, 1.0, defender_mag * safe_line_mag[:, :, None])
+    passer_alignment = jnp.clip(dot / alignment_den, 0.0, 1.0)
+    passer_distance = _hex_distance(passer_pos[:, None, None, :], defense_positions[:, None, :, :], jnp).astype(jnp.float32)
+    passer_contrib = (
+        static.base_steal_rate
+        * static.pass_passer_pressure_weight
+        * jnp.exp(-static.steal_perp_decay * jnp.maximum(0.0, passer_distance - 1.0))
+        * distance_factor
+        * passer_alignment
+    )
+
+    receiver_delta = defense_positions[:, None, :, :] - offense_positions[:, :, None, :]
+    receiver_x, receiver_y = _axial_to_cartesian(receiver_delta[..., 0], receiver_delta[..., 1], jnp)
+    receiver_mag = jnp.sqrt((receiver_x**2) + (receiver_y**2))
+    receiver_dot = (receiver_x * line_x[:, :, None]) + (receiver_y * line_y[:, :, None])
+    receiver_den = jnp.where((receiver_mag * safe_line_mag[:, :, None]) == 0.0, 1.0, receiver_mag * safe_line_mag[:, :, None])
+    receiver_alignment = jnp.clip(-(receiver_dot / receiver_den), 0.0, 1.0)
+    receiver_distance = _hex_distance(offense_positions[:, :, None, :], defense_positions[:, None, :, :], jnp).astype(jnp.float32)
+    receiver_contrib = (
+        static.base_steal_rate
+        * static.pass_receiver_pressure_weight
+        * jnp.exp(-static.steal_perp_decay * jnp.maximum(0.0, receiver_distance - 1.0))
+        * distance_factor
+        * receiver_alignment
+    )
+
+    pressure_contrib = jnp.where(lob_aware, passer_contrib + receiver_contrib, 0.0)
+    legacy_steal_contrib = jnp.clip(lane_contrib + pressure_contrib, 0.0, 1.0)
+
+    safe_pass_speed = jnp.maximum(static.pass_speed, 0.1)
+    safe_reaction_softness = jnp.maximum(static.reaction_softness, 0.05)
+    safe_alignment_width = jnp.maximum(static.receiver_alignment_width, 0.1)
+    pass_time = pass_distance / safe_pass_speed
+    available_time = jnp.maximum(0.0, pass_time - jnp.maximum(static.defender_reaction_time, 0.0))
+    reachable = (jnp.maximum(static.defender_speed, 0.0) * available_time) + jnp.maximum(static.defender_reach_radius, 0.0)
+
+    reaction_passer_hazard = jnp.clip(
+        static.base_passer_risk
+        * jnp.exp(-static.passer_pressure_decay * jnp.maximum(0.0, passer_distance - 1.0)),
+        0.0,
+        1.0,
+    )
+    reaction_arg = jnp.clip((reachable[:, :, None] - receiver_distance) / safe_reaction_softness, -60.0, 60.0)
+    reaction_prob = 1.0 / (1.0 + jnp.exp(-reaction_arg))
+    receiver_alignment_fade = 1.0 - jnp.clip(perp_distance / safe_alignment_width, 0.0, 1.0)
+    receiver_alignment_multiplier = static.receiver_alignment_min + (
+        (1.0 - static.receiver_alignment_min)
+        * jnp.where(between_endpoints, receiver_alignment_fade, 0.0)
+    )
+    reaction_receiver_hazard = jnp.clip(
+        static.base_receiver_risk * reaction_prob * receiver_alignment_multiplier,
+        0.0,
+        static.max_receiver_hazard,
+    )
+    reaction_lane_hazard = jnp.clip(static.lane_weight * lane_contrib, 0.0, 1.0)
+    reaction_steal_contrib = 1.0 - (
+        (1.0 - reaction_passer_hazard)
+        * (1.0 - reaction_receiver_hazard)
+        * (1.0 - reaction_lane_hazard)
+    )
+    steal_contrib = jnp.where(reaction_model, reaction_steal_contrib, legacy_steal_contrib)
     steal_contrib = jnp.where(
         valid_receivers[:, :, None]
-        & forward_defender
-        & between_endpoints
         & (~same_as_passer)
         & (~same_as_receiver),
-        steal_contrib,
+        jnp.clip(steal_contrib, 0.0, 1.0),
         0.0,
     )
     total_steal = 1.0 - jnp.prod(1.0 - steal_contrib, axis=-1)
@@ -1240,7 +1615,9 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
         state.offense_lane_steps,
         state.defense_lane_steps,
     ).astype(jnp.float32)
-    ep_values = build_offense_expected_points_batch(static, state, jnp)
+    shot_profile = build_shot_profile_batch(static, state, jnp)
+    ep_values = jnp.take(shot_profile["expected_points"], static.offense_ids, axis=1)
+    rebound_features = build_rebound_observation_features_batch(static, state, shot_profile, jnp)
     turnover_probs = build_turnover_probabilities_batch(static, state, jnp)
     steal_risks = build_pass_steal_probabilities_batch(static, state, jnp)
 
@@ -1261,6 +1638,12 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
             ep_values,
             turnover_probs,
             steal_risks,
+            rebound_features["dist_to_expected_target"],
+            rebound_features["win_prob"],
+            rebound_features["expected_target_q"][:, None],
+            rebound_features["expected_target_r"][:, None],
+            rebound_features["target_entropy"][:, None],
+            rebound_features["orb_prob"][:, None],
         ],
         axis=1,
     )
@@ -1357,6 +1740,7 @@ def build_token_observation_components_batch(
         axis=1,
     )[:, 0, :]
 
+    rebound_features = build_rebound_observation_features_batch(static, state, shot_profile, jnp)
     turnover_probs = _scatter_offense_features(
         static,
         build_turnover_probabilities_batch(static, state, jnp),
@@ -1403,6 +1787,8 @@ def build_token_observation_components_batch(
             dist_to_best_ep,
             dist_to_nearest_opp,
             dist_to_nearest_team,
+            rebound_features["dist_to_expected_target"],
+            rebound_features["win_prob"],
         ],
         axis=-1,
     ).astype(jnp.float32)
@@ -1413,6 +1799,10 @@ def build_token_observation_components_batch(
             state.pressure_exposure.astype(jnp.float32),
             jnp.full((batch_size,), static.basket_position[0].astype(jnp.float32) / norm_den, dtype=jnp.float32),
             jnp.full((batch_size,), static.basket_position[1].astype(jnp.float32) / norm_den, dtype=jnp.float32),
+            rebound_features["expected_target_q"],
+            rebound_features["expected_target_r"],
+            rebound_features["target_entropy"],
+            rebound_features["orb_prob"],
         ],
         axis=-1,
     ).astype(jnp.float32)
@@ -1762,6 +2152,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             offensive_three_seconds=zero_flag,
             defensive_lane_violation=zero_flag,
             defensive_lane_violation_player=no_player,
+            rebound_attempt=zero_flag,
+            offensive_rebound=zero_flag,
+            defensive_rebound=zero_flag,
+            rebound_target_cell=no_player,
+            rebound_winner=no_player,
+            shot_clock_reset_14=zero_flag,
             phi_r_shape=zero_float,
             phi_prev=zero_float,
             phi_next=zero_float,
@@ -1837,6 +2233,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 offensive_three_seconds=zero_flag,
                 defensive_lane_violation=zero_flag,
                 defensive_lane_violation_player=no_player,
+                rebound_attempt=zero_flag,
+                offensive_rebound=zero_flag,
+                defensive_rebound=zero_flag,
+                rebound_target_cell=no_player,
+                rebound_winner=no_player,
+                shot_clock_reset_14=zero_flag,
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
@@ -1853,7 +2255,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             is_pass = holder_has_ball & (holder_action >= PASS_ACTION_START) & (holder_action < PASS_ACTION_END)
             pass_attempt = is_pass.astype(jnp.int8)
 
-            shot_key, pass_key = jax.random.split(action_key)
+            shot_key, pass_key, rebound_target_key, rebound_winner_key = jax.random.split(action_key, 4)
             positions_after = shot_clock_state.positions
             ball_holder_after = shot_clock_state.ball_holder
             assist_active = shot_clock_state.assist_active
@@ -1979,19 +2381,45 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 operand=None,
             )
 
-            movement_skipped = shot_active | turnover_from_action
+            player_indices = jnp.arange(actions.shape[0], dtype=jnp.int32)
+            shooter_fixed_actions = jnp.where(
+                shot_active & (player_indices == safe_holder),
+                jnp.asarray(ActionType.NOOP.value, dtype=jnp.int32),
+                actions,
+            )
+            non_holder_pass = (player_indices != safe_holder) & (actions >= PASS_ACTION_START) & (actions < PASS_ACTION_END)
+            movement_actions = jnp.where(
+                shot_active & non_holder_pass,
+                jnp.asarray(ActionType.NOOP.value, dtype=jnp.int32),
+                shooter_fixed_actions,
+            )
+            movement_skipped = turnover_from_action
             positions_after, ball_holder_after, movement_turnover, movement_turnover_player = jax.lax.cond(
                 movement_skipped,
                 lambda _: (positions_after, ball_holder_after, jnp.asarray(False), no_player),
                 lambda _: _resolve_movement_single(
                     static,
                     _replace_state(shot_clock_state, positions=positions_after, ball_holder=ball_holder_after),
-                    actions,
+                    movement_actions,
                     move_key,
                     jax,
                     jnp,
                 ),
                 operand=None,
+            )
+
+            shot_type = jnp.where(
+                shot_active,
+                jnp.where(
+                    shot_distance <= 0.0,
+                    jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
+                    jnp.where(
+                        shot_is_three[safe_holder].astype(jnp.bool_),
+                        jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
+                        jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
+                    ),
+                ),
+                jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
             )
 
             final_state = _replace_state(
@@ -2011,14 +2439,99 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 defense_score=final_state.defense_score + jnp.where(shooter_is_offense, 0.0, scored_points),
             )
 
+            shot_position = shot_clock_state.positions[shot_shooter]
+            shot_cell_idx, shot_cell_found = _lookup_cell_indices(static.cell_coords, shot_position, jnp)
+            shot_cell_idx = jnp.where(shot_cell_found, shot_cell_idx.astype(jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+            missed_shot = shot_active & (~shot_success)
+            rebound_enabled = static.enable_rebounds.astype(jnp.bool_)
+            rebound_active = rebound_enabled & missed_shot
+            raw_rebound_probs = static.rebound_target_probs[
+                jnp.clip(shot_type, 0, static.rebound_target_probs.shape[0] - 1),
+                jnp.clip(shot_cell_idx, 0, static.rebound_target_probs.shape[1] - 1),
+            ]
+            uniform_probs = jnp.full_like(raw_rebound_probs, 1.0 / float(raw_rebound_probs.shape[0]))
+            mixed_rebound_probs = (
+                ((1.0 - static.rebound_target_uniform_mix) * raw_rebound_probs)
+                + (static.rebound_target_uniform_mix * uniform_probs)
+            )
+            target_logits = jnp.log(jnp.maximum(mixed_rebound_probs, 1.0e-8)) / static.rebound_target_temperature
+            sampled_rebound_target = jax.random.categorical(rebound_target_key, target_logits).astype(jnp.int32)
+            player_cell_idx, player_cell_found = _lookup_cell_indices(static.cell_coords, final_state.positions, jnp)
+            safe_player_cell_idx = jnp.where(player_cell_found, player_cell_idx.astype(jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+            rebound_distances = static.cell_distance_matrix[
+                jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1),
+                jnp.clip(sampled_rebound_target, 0, static.cell_distance_matrix.shape[1] - 1),
+            ].astype(jnp.float32)
+            winner_logits = (-static.rebound_winner_distance_weight * rebound_distances) / static.rebound_winner_temperature
+            sampled_rebound_winner = jax.random.categorical(rebound_winner_key, winner_logits).astype(jnp.int32)
+            rebound_winner_is_offense = static.role_encoding[jnp.clip(sampled_rebound_winner, 0, static.role_encoding.shape[0] - 1)] > 0.0
+            offensive_rebound = rebound_active & rebound_winner_is_offense
+            defensive_rebound = rebound_active & (~rebound_winner_is_offense)
+            shot_clock_reset_14 = offensive_rebound & (final_state.shot_clock < static.offensive_rebound_shot_clock_reset)
+            final_state = _replace_state(
+                final_state,
+                ball_holder=jnp.where(rebound_active, sampled_rebound_winner, final_state.ball_holder),
+                shot_clock=jnp.where(
+                    offensive_rebound,
+                    jnp.maximum(final_state.shot_clock, static.offensive_rebound_shot_clock_reset),
+                    final_state.shot_clock,
+                ),
+                offense_lane_steps=jnp.where(
+                    offensive_rebound,
+                    jnp.zeros_like(final_state.offense_lane_steps),
+                    final_state.offense_lane_steps,
+                ),
+                defense_lane_steps=jnp.where(
+                    offensive_rebound,
+                    jnp.zeros_like(final_state.defense_lane_steps),
+                    final_state.defense_lane_steps,
+                ),
+            )
+
             per_team_pass = static.pass_reward / static.offense_ids.shape[0]
             offense_mask = static.role_encoding > 0.0
             rewards = rewards + (
                 jnp.where(offense_mask, per_team_pass, -per_team_pass) * pass_success.astype(jnp.float32)
             )
 
-            done = turnover_from_action | movement_turnover | shot_active
-            per_team_shot = shot_expected_points / static.offense_ids.shape[0]
+            shot_terminal = shot_active & (shot_success | (~rebound_enabled) | defensive_rebound)
+            done = turnover_from_action | movement_turnover | shot_terminal
+            use_rebound_terminal_ep = (
+                rebound_enabled
+                & (
+                    static.rebound_terminal_reward_mode
+                    == jnp.asarray(REBOUND_TERMINAL_REWARD_LAST_SHOT_EP_ON_DEFENSIVE_REBOUND, dtype=jnp.int32)
+                )
+            )
+            use_rebound_last_shot_ep = (
+                rebound_enabled
+                & (
+                    static.rebound_terminal_reward_mode
+                    == jnp.asarray(REBOUND_TERMINAL_REWARD_LAST_SHOT_EP, dtype=jnp.int32)
+                )
+            )
+            rebound_actual_reward = scored_points
+            rebound_terminal_ep_reward = jnp.where(
+                shot_success,
+                scored_points,
+                jnp.where(defensive_rebound, shot_expected_points, jnp.asarray(0.0, dtype=jnp.float32)),
+            )
+            rebound_last_shot_ep_reward = jnp.where(
+                shot_terminal,
+                shot_expected_points,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+            rebound_reward_value = jnp.where(
+                use_rebound_last_shot_ep,
+                rebound_last_shot_ep_reward,
+                jnp.where(
+                    use_rebound_terminal_ep,
+                    rebound_terminal_ep_reward,
+                    rebound_actual_reward,
+                ),
+            )
+            shot_reward_value = jnp.where(rebound_enabled, rebound_reward_value, shot_expected_points)
+            per_team_shot = shot_reward_value / static.offense_ids.shape[0]
             rewards = rewards + (
                 jnp.where(offense_mask, per_team_shot, -per_team_shot) * shot_active.astype(jnp.float32)
             )
@@ -2097,7 +2610,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 * defensive_lane_violation.astype(jnp.float32)
             )
 
-            shot_clock_turnover = final_state.shot_clock <= 0
+            shot_clock_turnover = (final_state.shot_clock <= 0) & (~shot_active)
             done = done | offensive_three_seconds_turnover | defensive_lane_violation
             turnover_event = (
                 turnover_from_action
@@ -2157,20 +2670,6 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 done,
                 jnp,
             )
-            shot_position = shot_clock_state.positions[shot_shooter]
-            shot_type = jnp.where(
-                shot_active,
-                jnp.where(
-                    shot_distance <= 0.0,
-                    jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
-                    jnp.where(
-                        shot_is_three[safe_holder].astype(jnp.bool_),
-                        jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
-                        jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
-                    ),
-                ),
-                jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
-            )
             potential_assist_event = (assist_valid & shot_active).astype(jnp.int8)
             event_assist_passer = jnp.where(potential_assist_event.astype(jnp.bool_), assist_passer, no_player)
             return StepBatchOutput(
@@ -2204,6 +2703,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 offensive_three_seconds=offensive_three_seconds_turnover.astype(jnp.int8),
                 defensive_lane_violation=defensive_lane_violation.astype(jnp.int8),
                 defensive_lane_violation_player=defensive_lane_violation_player,
+                rebound_attempt=rebound_active.astype(jnp.int8),
+                offensive_rebound=offensive_rebound.astype(jnp.int8),
+                defensive_rebound=defensive_rebound.astype(jnp.int8),
+                rebound_target_cell=jnp.where(rebound_active, sampled_rebound_target.astype(jnp.int32), no_player),
+                rebound_winner=jnp.where(rebound_active, sampled_rebound_winner.astype(jnp.int32), no_player),
+                shot_clock_reset_14=shot_clock_reset_14.astype(jnp.int8),
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
@@ -2665,6 +3170,17 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
     training_team = resolve_training_team(args.training_team)
     wrapped_env = setup_environment(args, training_team)
     base_env = wrapped_env.unwrapped
+    for key in (
+        "enable_rebounds",
+        "rebound_table_model_dir",
+        "rebound_target_temperature",
+        "rebound_target_uniform_mix",
+        "rebound_winner_distance_weight",
+        "rebound_winner_temperature",
+        "offensive_rebound_shot_clock_reset",
+    ):
+        if hasattr(args, key):
+            setattr(base_env, key, getattr(args, key))
 
     try:
         snapshots = []

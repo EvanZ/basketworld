@@ -291,6 +291,7 @@ const passStealProbs = ref({});
 const ballColor = '#ffa500';
 const PASS_FLASH_DURATION_MS = 1100;
 const SHOT_FLASH_DURATION_MS = 1100;
+const REBOUND_OVERLAY_REVEAL_PROGRESS = 0.45;
 const PROJECTILE_ARROW_LENGTH_SCALE = 0.5;
 const passFlash = ref(null);
 let passFlashSerial = 0;
@@ -717,7 +718,45 @@ const maxShotAttempts = computed(() => {
   return max || 1;
 });
 
+const currentActionResults = computed(() => currentGameState.value?.last_action_results || null);
+
+function actionResultsHaveShot(results) {
+  const shots = results?.shots;
+  return Boolean(shots && typeof shots === 'object' && Object.keys(shots).length > 0);
+}
+
+function actionResultsHaveRebound(results) {
+  if (!results || typeof results !== 'object') return false;
+  if (results.rebound && typeof results.rebound === 'object') return true;
+  return Boolean(Array.isArray(results.rebounds) && results.rebounds.length > 0);
+}
+
+const isLiveReboundStepOverlay = computed(() =>
+  props.reboundTargetOverlay?.source === 'live_rebound_step'
+);
+
+const shouldDelayLiveReboundOverlay = computed(() => (
+  isLiveReboundStepOverlay.value
+  && actionResultsHaveShot(currentActionResults.value)
+  && actionResultsHaveRebound(currentActionResults.value)
+));
+
+const reboundOverlayRevealProgress = computed(() => {
+  if (!shouldDelayLiveReboundOverlay.value) return 1;
+  if (props.disableTransitions) {
+    return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
+  }
+  if (!shotFlash.value) return 1;
+  return shotFlashProgress.value;
+});
+
+const showReboundTargetOverlay = computed(() => (
+  !shouldDelayLiveReboundOverlay.value
+  || reboundOverlayRevealProgress.value >= REBOUND_OVERLAY_REVEAL_PROGRESS
+));
+
 const reboundTargetCells = computed(() => {
+  if (!showReboundTargetOverlay.value) return [];
   if (props.placementMode) return [];
   const rawCells = props.reboundTargetOverlay?.target_cells;
   if (!Array.isArray(rawCells)) return [];
@@ -741,10 +780,14 @@ const reboundTargetCells = computed(() => {
     .filter(Boolean);
 });
 
-const hasReboundTargetOverlay = computed(() => reboundTargetCells.value.length > 0);
+const hasReboundTargetOverlay = computed(() => {
+  if (!showReboundTargetOverlay.value) return false;
+  if (reboundTargetCells.value.length > 0) return true;
+  return Boolean(sampledReboundTargetKey.value && props.reboundTargetOverlay?.sampled_winner);
+});
 
 const reboundTargetOverlayPoints = computed(() => {
-  if (!hasReboundTargetOverlay.value) return [];
+  if (reboundTargetCells.value.length === 0) return [];
   return reboundTargetCells.value.map((entry) => {
     const { x, y } = axialToCartesian(entry.q, entry.r);
     return {
@@ -1232,6 +1275,7 @@ const basketPosition = computed(() => {
 });
 
 const sampledReboundTargetPoint = computed(() => {
+  if (!showReboundTargetOverlay.value) return null;
   const target = props.reboundTargetOverlay?.sampled_target;
   const q = Number(target?.q);
   const r = Number(target?.r);
@@ -1280,6 +1324,86 @@ const reboundResultOverlay = computed(() => {
     path,
     playerId: winner.playerId,
     team: winner.team,
+    color: "#fbbf24",
+  };
+});
+
+const reboundProjectileProgress = computed(() => {
+  if (!reboundResultOverlay.value) return 0;
+  if (!shouldDelayLiveReboundOverlay.value) return 1;
+  const span = Math.max(1e-6, 1 - REBOUND_OVERLAY_REVEAL_PROGRESS);
+  return Math.max(0, Math.min(1, (reboundOverlayRevealProgress.value - REBOUND_OVERLAY_REVEAL_PROGRESS) / span));
+});
+
+const reboundProjectile = computed(() => {
+  const overlay = reboundResultOverlay.value;
+  if (!overlay) return null;
+
+  const start = overlay.start;
+  const control = overlay.control;
+  const end = overlay.end;
+  const t = reboundProjectileProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+
+  const tip = quadraticBezierPoint(start, control, end, eased);
+  const tangent = quadraticBezierTangent(start, control, end, eased);
+  const tangentNorm = Math.hypot(tangent.x, tangent.y) || 1;
+  const ux = tangent.x / tangentNorm;
+  const uy = tangent.y / tangentNorm;
+  const px = -uy;
+  const py = ux;
+
+  const totalDist = Math.hypot(end.x - start.x, end.y - start.y);
+  const headLength = Math.min(HEX_RADIUS * 0.95, totalDist * 0.18) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const headHalfWidth = headLength * 0.56;
+  const headBaseX = tip.x - ux * headLength;
+  const headBaseY = tip.y - uy * headLength;
+  const leftX = headBaseX + px * headHalfWidth;
+  const leftY = headBaseY + py * headHalfWidth;
+  const rightX = headBaseX - px * headHalfWidth;
+  const rightY = headBaseY - py * headHalfWidth;
+
+  const shaftLength = Math.min(HEX_RADIUS * 1.5, totalDist * 0.28) * PROJECTILE_ARROW_LENGTH_SCALE;
+  const shaftX1 = headBaseX;
+  const shaftY1 = headBaseY;
+  const shaftX2 = headBaseX - ux * shaftLength;
+  const shaftY2 = headBaseY - uy * shaftLength;
+
+  const impactPhase = Math.max(0, Math.min(1, (eased - 0.82) / 0.18));
+  const impactOpacity = impactPhase > 0 ? (1 - impactPhase) * (0.35 + t * 0.65) : 0;
+  const impactRadius = HEX_RADIUS * (0.35 + impactPhase * 1.0);
+
+  return {
+    laneOpacity: 0.22 + (0.35 + t * 0.65) * 0.28,
+    projectileOpacity: 0.35 + t * 0.65,
+    shaftX1,
+    shaftY1,
+    shaftX2,
+    shaftY2,
+    headPoints: `${tip.x},${tip.y} ${leftX},${leftY} ${rightX},${rightY}`,
+    impactX: end.x,
+    impactY: end.y,
+    impactOpacity,
+    impactRadius,
+  };
+});
+
+const reboundBallOutline = computed(() => {
+  const overlay = reboundResultOverlay.value;
+  if (!overlay) return null;
+
+  const t = reboundProjectileProgress.value;
+  const eased = 1 - ((1 - t) * (1 - t));
+  const point = quadraticBezierPoint(overlay.start, overlay.control, overlay.end, eased);
+  const edgeFade = Math.max(0, Math.min(1, t / 0.12, (1 - t) / 0.12));
+  const opacity = edgeFade * (0.6 + 0.4 * (0.35 + t * 0.65));
+
+  return {
+    x: point.x,
+    y: point.y,
+    radius: HEX_RADIUS * (0.55 + 0.05 * Math.sin(Math.PI * t)),
+    opacity,
+    dashOffset: (1 - t) * 22,
   };
 });
 
@@ -2412,6 +2536,7 @@ function normalizeForcedEpisodeOutcome(rawOutcome) {
         'SHOT_CLOCK_VIOLATION',
         'MADE_SHOT',
         'MISSED_SHOT',
+        'DEFENSIVE_REBOUND',
     ]);
     if (!allowedTypes.has(type)) return null;
 
@@ -2461,6 +2586,15 @@ const episodeOutcome = computed(() => {
         }
         return resolveOutcomePointForPlayer(violation.player_id);
     };
+
+    const rebound = results.rebound || (Array.isArray(results.rebounds) ? results.rebounds[0] : null);
+    if (rebound?.defensive) {
+        return {
+            type: 'DEFENSIVE_REBOUND',
+            playerId: rebound.winner,
+            shotShooter: rebound.shot_shooter,
+        };
+    }
 
     // Check for shot results
     if (results.shots && Object.keys(results.shots).length > 0) {
@@ -4304,29 +4438,51 @@ onBeforeUnmount(() => {
           </text>
         </g>
 
-        <!-- Sampled rebound result: ball flight and final winner marker. -->
+        <!-- Sampled rebound result: shot-style ball flight and final winner marker. -->
         <g class="rebound-result-layer" v-if="reboundResultOverlay">
           <path
             :d="reboundResultOverlay.path"
-            class="rebound-flight-path"
+            :stroke="reboundResultOverlay.color"
+            class="shot-flash-line rebound-flight-lane"
+            fill="none"
+            :opacity="reboundProjectile?.laneOpacity ?? 0.4"
+            :style="{ filter: `drop-shadow(0 0 10px ${reboundResultOverlay.color})` }"
+          />
+          <line
+            v-if="reboundProjectile"
+            :x1="reboundProjectile.shaftX1"
+            :y1="reboundProjectile.shaftY1"
+            :x2="reboundProjectile.shaftX2"
+            :y2="reboundProjectile.shaftY2"
+            class="shot-projectile-shaft rebound-projectile-shaft"
+            :stroke="reboundResultOverlay.color"
+            :opacity="reboundProjectile.projectileOpacity"
+          />
+          <polygon
+            v-if="reboundProjectile"
+            :points="reboundProjectile.headPoints"
+            class="shot-projectile-head rebound-projectile-head"
+            :fill="reboundResultOverlay.color"
+            :opacity="reboundProjectile.projectileOpacity"
           />
           <circle
-            :cx="reboundResultOverlay.start.x"
-            :cy="reboundResultOverlay.start.y"
-            :r="HEX_RADIUS * 0.16"
-            class="rebound-flight-origin"
+            v-if="reboundProjectile && reboundProjectile.impactOpacity > 0.01"
+            :cx="reboundProjectile.impactX"
+            :cy="reboundProjectile.impactY"
+            :r="reboundProjectile.impactRadius"
+            class="shot-projectile-impact rebound-projectile-impact"
+            :stroke="reboundResultOverlay.color"
+            :opacity="reboundProjectile.impactOpacity"
           />
           <circle
-            v-if="!disableTransitions"
-            :r="HEX_RADIUS * 0.18"
-            class="rebound-flight-ball"
-          >
-            <animateMotion
-              :path="reboundResultOverlay.path"
-              dur="1.15s"
-              repeatCount="indefinite"
-            />
-          </circle>
+            v-if="reboundBallOutline"
+            :cx="reboundBallOutline.x"
+            :cy="reboundBallOutline.y"
+            :r="reboundBallOutline.radius"
+            class="shot-ball-outline rebound-ball-outline"
+            :opacity="reboundBallOutline.opacity"
+            :style="{ strokeDashoffset: `${reboundBallOutline.dashOffset}` }"
+          />
           <g :transform="`translate(${reboundResultOverlay.end.x}, ${reboundResultOverlay.end.y})`">
             <title>Sampled rebound winner P{{ reboundResultOverlay.playerId }}</title>
             <circle
@@ -4582,6 +4738,10 @@ onBeforeUnmount(() => {
           <text v-if="episodeOutcome.type === 'MISSED_SHOT'" x="50%" y="15%" class="outcome-text missed">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Missed Dunk!' : (episodeOutcome.isThree ? 'Missed 3!' : 'Missed 2!') }}</tspan>
+          </text>
+          <text v-if="episodeOutcome.type === 'DEFENSIVE_REBOUND'" x="50%" y="15%" class="outcome-text missed long-outcome-text">
+              <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
+              <tspan x="50%" dy="1.2em">Defensive rebound</tspan>
           </text>
           <text v-if="episodeOutcome.type === 'TURNOVER'" x="50%" y="15%" class="outcome-text turnover long-outcome-text">
               <tspan v-if="hasOutcomePlayer(episodeOutcome.playerId)" class="player-outcome-text" x="50%" dy="-1.2em">

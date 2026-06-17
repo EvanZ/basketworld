@@ -95,6 +95,31 @@ P(winner = i) = softmax(score_i / winner_temperature)
 
 There is no explicit offense/defense side bonus, boxout term, inside-position bonus, player-skill bonus, or shooter penalty in this winner formula. At this prototype stage, only distance to the sampled rebound target affects the winner distribution.
 
+## JAX Training Feature Bridge
+
+The JAX halfcourt environment now uses the fitted target table for both rebound
+sampling and rebound-aware policy observations. For the current offensive ball
+handler's hypothetical shot, the observation exposes distributional features
+before any miss/rebound sample is drawn:
+
+Global features:
+
+- `expected_rebound_target_q`
+- `expected_rebound_target_r`
+- `target_entropy`
+- `orb_prob_if_current_shot_misses`
+
+Per-player features:
+
+- `dist_to_expected_rebound_target`
+- `rebound_win_prob_if_current_shot_misses`
+
+`drb_prob_if_current_shot_misses` is intentionally omitted because it is exactly
+`1 - orb_prob_if_current_shot_misses`. These features are zeroed when rebounds
+are disabled or when there is no valid offensive ball holder. They use the full
+target distribution, not the sampled future rebound target, so they provide
+learnable rebounding context without leaking the random outcome.
+
 The conditioned heatmap flow also works with the fitted table:
 
 ```bash

@@ -206,6 +206,25 @@ def _build_shot_type_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     }
 
 
+def _build_rebound_transition_metrics(env_out, jnp) -> dict[str, Any]:
+    return {
+        "rebound_attempts": env_out.rebound_attempt.astype(jnp.int8),
+        "offensive_rebounds": env_out.offensive_rebound.astype(jnp.int8),
+        "defensive_rebounds": env_out.defensive_rebound.astype(jnp.int8),
+        "rebound_target_cells": env_out.rebound_target_cell.astype(jnp.int32),
+        "rebound_winners": env_out.rebound_winner.astype(jnp.int32),
+        "shot_clock_reset_14": env_out.shot_clock_reset_14.astype(jnp.int8),
+    }
+
+
+def _mask_rebound_transition_metrics(metrics: dict[str, Any], active_step, jnp) -> dict[str, Any]:
+    masked: dict[str, Any] = {}
+    for key, value in metrics.items():
+        fallback = -1 if key in {"rebound_target_cells", "rebound_winners"} else 0
+        masked[key] = jnp.where(active_step, value, fallback)
+    return masked
+
+
 def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     turnover = env_out.turnover.astype(jnp.int8)
     turnover_bool = turnover.astype(jnp.bool_)
@@ -522,6 +541,11 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
             shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            rebound_metrics = _mask_rebound_transition_metrics(
+                _build_rebound_transition_metrics(env_out, jnp),
+                active_step,
+                jnp,
+            )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
@@ -558,6 +582,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
                 **turnover_metrics,
                 **shot_metrics,
+                **rebound_metrics,
                 **intent_metrics,
                 **selector_metrics,
                 offensive_three_seconds=jnp.where(
@@ -588,7 +613,10 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             )
             next_completed_pass_boundary = (
                 active_step
-                & env_out.completed_pass.astype(jnp.bool_)
+                & (
+                    env_out.completed_pass.astype(jnp.bool_)
+                    | env_out.offensive_rebound.astype(jnp.bool_)
+                )
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (next_state, key, next_completed_pass_boundary), transition
@@ -766,6 +794,11 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
             shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            rebound_metrics = _mask_rebound_transition_metrics(
+                _build_rebound_transition_metrics(env_out, jnp),
+                active_step,
+                jnp,
+            )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
@@ -806,6 +839,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
                 **turnover_metrics,
                 **shot_metrics,
+                **rebound_metrics,
                 **intent_metrics,
                 **selector_metrics,
                 offensive_three_seconds=jnp.where(
@@ -836,7 +870,10 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             )
             next_completed_pass_boundary = (
                 active_step
-                & env_out.completed_pass.astype(jnp.bool_)
+                & (
+                    env_out.completed_pass.astype(jnp.bool_)
+                    | env_out.offensive_rebound.astype(jnp.bool_)
+                )
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (
@@ -1083,6 +1120,11 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
             shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
+            rebound_metrics = _mask_rebound_transition_metrics(
+                _build_rebound_transition_metrics(env_out, jnp),
+                active_step,
+                jnp,
+            )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
@@ -1123,6 +1165,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
                 **turnover_metrics,
                 **shot_metrics,
+                **rebound_metrics,
                 **intent_metrics,
                 **selector_metrics,
                 offensive_three_seconds=jnp.where(
@@ -1153,7 +1196,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             )
             next_completed_pass_boundary = (
                 active_step
-                & env_out.completed_pass.astype(jnp.bool_)
+                & (
+                    env_out.completed_pass.astype(jnp.bool_)
+                    | env_out.offensive_rebound.astype(jnp.bool_)
+                )
                 & (~env_out.done.astype(jnp.bool_))
             )
             return (
@@ -1274,6 +1320,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -1286,6 +1333,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **rebound_metrics,
                 **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
@@ -1378,6 +1426,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -1390,6 +1439,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **rebound_metrics,
                 **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
@@ -1537,6 +1587,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 jnp,
             )
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -1549,6 +1600,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
                 **shot_metrics,
+                **rebound_metrics,
                 **_build_intent_transition_metrics(state),
                 offensive_three_seconds=env_out.offensive_three_seconds.astype(jnp.int8),
                 defensive_lane_violations=env_out.defensive_lane_violation.astype(jnp.int8),
@@ -2002,6 +2054,7 @@ def summarize_episode_events(
     completed_passes,
     assists,
     turnovers,
+    shot_attempts=None,
 ) -> dict[str, float]:
     done_arr = np.asarray(dones, dtype=np.float32)
     terminal_steps_arr = np.asarray(terminal_episode_steps, dtype=np.int32)
@@ -2009,6 +2062,11 @@ def summarize_episode_events(
     completed_passes_arr = np.asarray(completed_passes, dtype=np.float32)
     assists_arr = np.asarray(assists, dtype=np.float32)
     turnovers_arr = np.asarray(turnovers, dtype=np.float32)
+    shot_attempts_arr = (
+        np.asarray(shot_attempts, dtype=np.float32)
+        if shot_attempts is not None
+        else None
+    )
 
     completed_episodes = int((terminal_steps_arr > 0).sum())
     completed_episode_steps = int(terminal_steps_arr.sum())
@@ -2021,8 +2079,9 @@ def summarize_episode_events(
     total_completed_passes = float(completed_passes_arr.sum())
     total_assists = float(assists_arr.sum())
     total_turnovers = float(turnovers_arr.sum())
+    total_shot_attempts = float(shot_attempts_arr.sum()) if shot_attempts_arr is not None else None
 
-    return {
+    metrics = {
         "completed_episodes": int(completed_episodes),
         "completed_episode_steps": int(completed_episode_steps),
         "mean_completed_episode_length": (
@@ -2037,6 +2096,10 @@ def summarize_episode_events(
         "mean_assists_per_completed_episode": _mean_per_episode(total_assists),
         "mean_turnovers_per_completed_episode": _mean_per_episode(total_turnovers),
     }
+    if total_shot_attempts is not None:
+        metrics["total_shot_attempts"] = total_shot_attempts
+        metrics["shots_per_completed_episode"] = _mean_per_episode(total_shot_attempts)
+    return metrics
 
 
 def summarize_shot_type_metrics(
@@ -2047,6 +2110,7 @@ def summarize_shot_type_metrics(
     shot_dunks,
     shot_twos,
     shot_threes,
+    completed_episodes: int | float | None = None,
 ) -> dict[str, float]:
     attempts = float(np.asarray(shot_attempts, dtype=np.float32).sum())
     makes = float(np.asarray(shot_makes, dtype=np.float32).sum())
@@ -2058,7 +2122,12 @@ def summarize_shot_type_metrics(
     def _rate(value: float) -> float:
         return float(value / safe_attempts) if safe_attempts > 0.0 else 0.0
 
-    return {
+    completed_denom = float(completed_episodes or 0.0)
+
+    def _per_completed_episode(value: float) -> float:
+        return float(value / completed_denom) if completed_denom > 0.0 else 0.0
+
+    metrics = {
         f"{prefix}_shot_attempts": attempts,
         f"{prefix}_shot_makes": makes,
         f"{prefix}_shot_make_rate": _rate(makes),
@@ -2069,6 +2138,18 @@ def summarize_shot_type_metrics(
         f"{prefix}_shot_two_share": _rate(twos),
         f"{prefix}_shot_three_share": _rate(threes),
     }
+    if completed_episodes is not None:
+        metrics.update(
+            {
+                f"{prefix}_shot_makes_per_completed_episode": _per_completed_episode(makes),
+                f"{prefix}_shot_dunks_per_completed_episode": _per_completed_episode(dunks),
+                f"{prefix}_shot_twos_per_completed_episode": _per_completed_episode(twos),
+                f"{prefix}_shot_threes_per_completed_episode": _per_completed_episode(threes),
+            }
+        )
+        if prefix != "all" and not prefix.endswith("_all"):
+            metrics[f"{prefix}_shots_per_completed_episode"] = _per_completed_episode(attempts)
+    return metrics
 
 
 def summarize_turnover_diagnostics(
@@ -2248,10 +2329,10 @@ def summarize_ppo_eligible_episode_metrics(
         total = _masked_total(values, mask)
         metrics[f"{prefix}_{name}_total"] = total
         metrics[f"{prefix}_{name}_per_step"] = _per_step(total)
-        # In this possession-level env, shot events are terminal outcomes. Per-episode
-        # shot-type metrics duplicate the terminal_*_share family, so keep counts
-        # and per-step rates here and use terminal_*_share for possession outcomes.
-        if name not in shot_event_names:
+        if name.endswith("shot_attempts"):
+            alias = name.replace("shot_attempts", "shots")
+            metrics[f"{prefix}_{alias}_per_completed_episode"] = _per_completed_episode(total)
+        else:
             metrics[f"{prefix}_{name}_per_completed_episode"] = _per_completed_episode(total)
 
     terminal_reason_items = {
@@ -2531,6 +2612,7 @@ def summarize_training_step(
         rollout_out.trajectory.completed_passes,
         rollout_out.trajectory.assists,
         rollout_out.trajectory.turnovers,
+        rollout_out.trajectory.shot_attempts,
     )
     summary = {
         "update_index": int(update_index),
@@ -2585,6 +2667,20 @@ def summarize_training_step(
             defensive_lane_violations=rollout_out.trajectory.defensive_lane_violations,
         )
     )
+    rebound_attempts = float(np.asarray(rollout_out.trajectory.rebound_attempts, dtype=np.float32).sum())
+    offensive_rebounds = float(np.asarray(rollout_out.trajectory.offensive_rebounds, dtype=np.float32).sum())
+    defensive_rebounds = float(np.asarray(rollout_out.trajectory.defensive_rebounds, dtype=np.float32).sum())
+    shot_clock_resets = float(np.asarray(rollout_out.trajectory.shot_clock_reset_14, dtype=np.float32).sum())
+    summary.update(
+        {
+            "rebound_attempts": int(rebound_attempts),
+            "offensive_rebounds": int(offensive_rebounds),
+            "defensive_rebounds": int(defensive_rebounds),
+            "offensive_rebound_rate": float(offensive_rebounds / max(1.0, rebound_attempts)),
+            "defensive_rebound_rate": float(defensive_rebounds / max(1.0, rebound_attempts)),
+            "shot_clock_reset_14_count": int(shot_clock_resets),
+        }
+    )
     summary.update(
         summarize_turnover_diagnostics(
             terminal_episode_steps=rollout_out.trajectory.terminal_episode_steps,
@@ -2606,6 +2702,7 @@ def summarize_training_step(
             shot_dunks=rollout_out.trajectory.shot_dunks,
             shot_twos=rollout_out.trajectory.shot_twos,
             shot_threes=rollout_out.trajectory.shot_threes,
+            completed_episodes=episode_metrics["completed_episodes"],
         )
     )
     summary.update(
@@ -2616,6 +2713,7 @@ def summarize_training_step(
             shot_dunks=rollout_out.trajectory.learner_shot_dunks,
             shot_twos=rollout_out.trajectory.learner_shot_twos,
             shot_threes=rollout_out.trajectory.learner_shot_threes,
+            completed_episodes=episode_metrics["completed_episodes"],
         )
     )
     summary.update(
@@ -2626,6 +2724,7 @@ def summarize_training_step(
             shot_dunks=rollout_out.trajectory.opponent_shot_dunks,
             shot_twos=rollout_out.trajectory.opponent_shot_twos,
             shot_threes=rollout_out.trajectory.opponent_shot_threes,
+            completed_episodes=episode_metrics["completed_episodes"],
         )
     )
     summary.update(
@@ -2673,6 +2772,12 @@ def serialize_eval_trace(
     shot_dunks = np.asarray(trace.shot_dunks)
     shot_twos = np.asarray(trace.shot_twos)
     shot_threes = np.asarray(trace.shot_threes)
+    rebound_attempts = np.asarray(trace.rebound_attempts)
+    offensive_rebounds = np.asarray(trace.offensive_rebounds)
+    defensive_rebounds = np.asarray(trace.defensive_rebounds)
+    rebound_target_cells = np.asarray(trace.rebound_target_cells)
+    rebound_winners = np.asarray(trace.rebound_winners)
+    shot_clock_reset_14 = np.asarray(trace.shot_clock_reset_14)
     intent_index = np.asarray(trace.intent_index)
     intent_active = np.asarray(trace.intent_active)
     intent_age = np.asarray(trace.intent_age)
@@ -2708,6 +2813,12 @@ def serialize_eval_trace(
         "shot_dunks": shot_dunks[:, env_index].astype(np.int8),
         "shot_twos": shot_twos[:, env_index].astype(np.int8),
         "shot_threes": shot_threes[:, env_index].astype(np.int8),
+        "rebound_attempts": rebound_attempts[:, env_index].astype(np.int8),
+        "offensive_rebounds": offensive_rebounds[:, env_index].astype(np.int8),
+        "defensive_rebounds": defensive_rebounds[:, env_index].astype(np.int8),
+        "rebound_target_cells": rebound_target_cells[:, env_index].astype(np.int32),
+        "rebound_winners": rebound_winners[:, env_index].astype(np.int32),
+        "shot_clock_reset_14": shot_clock_reset_14[:, env_index].astype(np.int8),
         "intent_index": intent_index[:, env_index].astype(np.int32),
         "intent_active": intent_active[:, env_index].astype(np.int8),
         "intent_age": intent_age[:, env_index].astype(np.int32),

@@ -516,6 +516,9 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 reward,
                 user_team,
             )
+            for rebound in _iter_rebound_entries(action_results):
+                _record_rebound_for_stats(per_player_stats, rebound, offense_ids)
+                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids)
 
             # Update role_flag for next step
             episode_rewards["offense"] += float(reward[offense_ids].sum())
@@ -551,6 +554,8 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                     "shots": last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {},
                     "turnovers": last_action_results.get("turnovers", []) if isinstance(last_action_results, dict) else [],
                     "defensive_lane_violations": last_action_results.get("defensive_lane_violations", []) if isinstance(last_action_results, dict) else [],
+                    "rebounds": last_action_results.get("rebounds", []) if isinstance(last_action_results, dict) else [],
+                    "rebound": last_action_results.get("rebound") if isinstance(last_action_results, dict) else None,
                     "shot_clock": shot_clock,
                     "three_point_distance": three_point_distance,
                 },
@@ -586,6 +591,8 @@ def _init_player_stats(n_players: int) -> dict:
             "potential_assists": 0,
             "turnovers": 0,
             "points": 0.0,
+            "offensive_rebounds": 0,
+            "rebound_chances": 0,
             "episodes": 0,
             "steps": 0,
             "shot_chart": {},
@@ -604,6 +611,8 @@ def _init_aggregate_stats() -> dict:
         "potential_assists": 0,
         "turnovers": 0,
         "points": 0.0,
+        "offensive_rebounds": 0,
+        "rebound_chances": 0,
         "episodes": 0,
         "steps": 0,
         "shot_chart": {},
@@ -623,6 +632,8 @@ def _merge_aggregate_stats(dest: dict | None, src: dict | None) -> dict:
     dest["potential_assists"] += int(src.get("potential_assists", 0) or 0)
     dest["turnovers"] += int(src.get("turnovers", 0) or 0)
     dest["points"] += float(src.get("points", 0.0) or 0.0)
+    dest["offensive_rebounds"] += int(src.get("offensive_rebounds", 0) or 0)
+    dest["rebound_chances"] += int(src.get("rebound_chances", 0) or 0)
     dest["episodes"] += int(src.get("episodes", 0) or 0)
     dest["steps"] += int(src.get("steps", 0) or 0)
 
@@ -667,6 +678,7 @@ def _accumulate_team_stats_from_players(
     if not player_stats:
         return _merge_aggregate_stats(dest, merged)
 
+    max_rebound_chances = 0
     for pid_raw in team_ids or []:
         pid = int(pid_raw)
         entry = player_stats.get(pid)
@@ -674,7 +686,9 @@ def _accumulate_team_stats_from_players(
             entry = player_stats.get(str(pid))
         if not isinstance(entry, dict):
             continue
+        max_rebound_chances = max(max_rebound_chances, int(entry.get("rebound_chances", 0) or 0))
         merged = _merge_aggregate_stats(merged, entry)
+    merged["rebound_chances"] = max_rebound_chances
     return _merge_aggregate_stats(dest, merged)
 
 
@@ -692,6 +706,8 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
                 "potential_assists": 0,
                 "turnovers": 0,
                 "points": 0.0,
+                "offensive_rebounds": 0,
+                "rebound_chances": 0,
                 "episodes": 0,
                 "steps": 0,
                 "shot_chart": {},
@@ -704,6 +720,8 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
         dst_stats["potential_assists"] += int(src_stats.get("potential_assists", 0))
         dst_stats["turnovers"] += int(src_stats.get("turnovers", 0))
         dst_stats["points"] += float(src_stats.get("points", 0.0))
+        dst_stats["offensive_rebounds"] += int(src_stats.get("offensive_rebounds", 0))
+        dst_stats["rebound_chances"] += int(src_stats.get("rebound_chances", 0))
         dst_stats["episodes"] += int(src_stats.get("episodes", 0))
         dst_stats["steps"] += int(src_stats.get("steps", 0))
 
@@ -1039,11 +1057,32 @@ def _accumulate_reward_breakdown(
     step_known += pass_amt
 
     shots = action_results.get("shots", {}) or {}
+    rebound_entries = action_results.get("rebounds") or []
+    defensive_rebound_step = any(
+        isinstance(entry, dict) and bool(entry.get("defensive")) for entry in rebound_entries
+    )
+    rebounds_enabled = bool(get_env_attr(env, "enable_rebounds", False))
+    rebound_reward_mode = str(
+        get_env_attr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"
+    )
     for shot_result in shots.values():
         if not isinstance(shot_result, dict):
             continue
         expected_points = float(shot_result.get("expected_points", 0.0) or 0.0)
-        expected_amt = offense_sign * expected_points
+        shot_value = float(
+            shot_result.get("shot_value")
+            or (3.0 if bool(shot_result.get("is_three", False)) else 2.0)
+        )
+        shot_success = bool(shot_result.get("success", False))
+        if rebounds_enabled and rebound_reward_mode == "last_shot_ep":
+            shot_reward_component = expected_points if (shot_success or defensive_rebound_step) else 0.0
+        elif rebounds_enabled and rebound_reward_mode == "last_shot_ep_on_defensive_rebound":
+            shot_reward_component = shot_value if shot_success else (expected_points if defensive_rebound_step else 0.0)
+        elif rebounds_enabled:
+            shot_reward_component = shot_value if shot_success else 0.0
+        else:
+            shot_reward_component = expected_points
+        expected_amt = offense_sign * shot_reward_component
         reward_breakdown["expected_points"] = float(reward_breakdown.get("expected_points", 0.0)) + expected_amt
         step_known += expected_amt
 
@@ -1154,6 +1193,35 @@ def _record_turnover_for_stats(stats: dict, player_id: Optional[int]):
     pid = int(player_id)
     if pid in stats:
         stats[pid]["turnovers"] += 1
+
+
+def _iter_rebound_entries(action_results) -> list[dict]:
+    if not isinstance(action_results, dict):
+        return []
+    entries = action_results.get("rebounds")
+    if not entries:
+        one = action_results.get("rebound")
+        entries = [one] if one else []
+    if not isinstance(entries, (list, tuple)):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict) and entry.get("attempt", True) is not False]
+
+
+def _record_rebound_for_stats(stats: dict, rebound: dict, offense_ids: list[int] | tuple[int, ...]):
+    if stats is None or not isinstance(rebound, dict):
+        return
+    for pid_raw in offense_ids or []:
+        pid = int(pid_raw)
+        if pid in stats:
+            stats[pid]["rebound_chances"] = int(stats[pid].get("rebound_chances", 0)) + 1
+    if not bool(rebound.get("offensive", False)):
+        return
+    winner_raw = rebound.get("winner", rebound.get("winner_player_id", rebound.get("player_id")))
+    if winner_raw is None:
+        return
+    winner = int(winner_raw)
+    if winner in stats:
+        stats[winner]["offensive_rebounds"] = int(stats[winner].get("offensive_rebounds", 0)) + 1
 
 
 def _build_reset_options_for_custom_setup(custom_setup: dict | None, enforce_fixed_skills: bool = False) -> dict:
@@ -1354,6 +1422,9 @@ def _run_sequential_evaluation(
                 reward,
                 user_team,
             )
+            for rebound in _iter_rebound_entries(action_results):
+                _record_rebound_for_stats(per_player_stats, rebound, offense_ids)
+                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids)
 
             episode_rewards["offense"] += float(reward[offense_ids].sum())
             episode_rewards["defense"] += float(reward[defense_ids].sum())
@@ -1384,6 +1455,8 @@ def _run_sequential_evaluation(
                     "shots": last_action_results.get("shots", {}) if isinstance(last_action_results, dict) else {},
                     "turnovers": last_action_results.get("turnovers", []) if isinstance(last_action_results, dict) else [],
                     "defensive_lane_violations": last_action_results.get("defensive_lane_violations", []) if isinstance(last_action_results, dict) else [],
+                    "rebounds": last_action_results.get("rebounds", []) if isinstance(last_action_results, dict) else [],
+                    "rebound": last_action_results.get("rebound") if isinstance(last_action_results, dict) else None,
                     "shot_clock": shot_clock,
                     "three_point_distance": three_point_distance,
                 },

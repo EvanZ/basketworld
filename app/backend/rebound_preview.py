@@ -291,14 +291,21 @@ def _params_from_request(request: Any) -> ReboundParams:
 
 def _adjust_target_distribution(probs: np.ndarray, request: Any) -> np.ndarray:
     adjusted = np.asarray(probs, dtype=np.float64)
-    temp = _positive_float(getattr(request, "target_temperature", 1.0), 1.0)
-    if abs(temp - 1.0) > 1e-9:
-        logits = np.log(np.maximum(adjusted, 1e-12)) / temp
-        adjusted = _softmax(logits)
+    total = float(adjusted.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        adjusted = np.ones_like(adjusted, dtype=np.float64) / float(adjusted.size)
+    else:
+        adjusted = adjusted / total
+
     mix = _clamp01(getattr(request, "target_uniform_mix", 0.0))
     if mix > 0.0:
         uniform = np.ones_like(adjusted, dtype=np.float64) / float(adjusted.size)
         adjusted = (1.0 - mix) * adjusted + mix * uniform
+
+    temp = _positive_float(getattr(request, "target_temperature", 1.0), 1.0)
+    if abs(temp - 1.0) > 1e-9:
+        logits = np.log(np.maximum(adjusted, 1e-12)) / temp
+        adjusted = _softmax(logits)
     total = float(adjusted.sum())
     if total <= 0.0 or not np.isfinite(total):
         return np.ones_like(adjusted, dtype=np.float64) / float(adjusted.size)

@@ -262,6 +262,8 @@ def run_evaluation(request: EvaluationRequest):
                 "defensive_lane_violations": _to_jsonable(
                     outcome_info.get("defensive_lane_violations", [])
                 ),
+                "rebounds": _to_jsonable(outcome_info.get("rebounds", [])),
+                "rebound": _to_jsonable(outcome_info.get("rebound")),
             },
             "shot_clock": outcome_info.get("shot_clock", 0),
             "three_point_distance": outcome_info.get("three_point_distance", 4.0),

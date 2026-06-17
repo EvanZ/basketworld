@@ -110,6 +110,105 @@ def _param(training_params: dict[str, Any], key: str, default: Any = None) -> An
     return default
 
 
+_JAX_STATIC_ONLY_ENV_KEYS = {
+    "enable_rebounds",
+    "rebound_table_model_dir",
+    "rebound_target_temperature",
+    "rebound_target_uniform_mix",
+    "rebound_winner_distance_weight",
+    "rebound_winner_temperature",
+    "offensive_rebound_shot_clock_reset",
+    "rebound_terminal_reward_mode",
+}
+
+_JAX_STATIC_ONLY_ENV_DEFAULTS = {
+    "enable_rebounds": False,
+    "rebound_table_model_dir": "",
+    "rebound_target_temperature": 1.0,
+    "rebound_target_uniform_mix": 0.0,
+    "rebound_winner_distance_weight": 1.0,
+    "rebound_winner_temperature": 1.0,
+    "offensive_rebound_shot_clock_reset": 14,
+    "rebound_terminal_reward_mode": "actual_points",
+}
+
+_JAX_STATIC_ONLY_ENV_CASTS = {
+    "enable_rebounds": "bool",
+    "rebound_table_model_dir": "str",
+    "rebound_target_temperature": "float",
+    "rebound_target_uniform_mix": "float",
+    "rebound_winner_distance_weight": "float",
+    "rebound_winner_temperature": "float",
+    "offensive_rebound_shot_clock_reset": "int",
+    "rebound_terminal_reward_mode": "str",
+}
+
+
+def _coerce_runtime_static_value(key: str, value: Any) -> Any:
+    kind = _JAX_STATIC_ONLY_ENV_CASTS.get(key)
+    if kind == "bool":
+        return _coerce_bool(value)
+    if kind == "float":
+        return _coerce_float(value)
+    if kind == "int":
+        return _coerce_int(value)
+    if kind == "str":
+        return str(value)
+    return value
+
+
+def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
+    """Extract JAX kernel-only env attrs from checkpoint metadata."""
+    out: dict[str, Any] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        sources = (
+            payload.get("frozen_config"),
+            payload.get("env_config"),
+            payload.get("trainer_config"),
+        )
+        if any(isinstance(source, dict) for source in sources[:2]):
+            for key, value in _JAX_STATIC_ONLY_ENV_DEFAULTS.items():
+                out.setdefault(key, value)
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in _JAX_STATIC_ONLY_ENV_KEYS:
+                if key in source and source[key] not in (None, ""):
+                    out[key] = _coerce_runtime_static_value(key, source[key])
+    return out
+
+
+def _split_native_env_params(optional_params: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    params = dict(optional_params or {})
+    env_kwargs = {
+        key: value for key, value in params.items() if key not in _JAX_STATIC_ONLY_ENV_KEYS
+    }
+    static_overrides = {
+        key: _coerce_runtime_static_value(key, value)
+        for key, value in params.items()
+        if key in _JAX_STATIC_ONLY_ENV_KEYS
+    }
+    return env_kwargs, static_overrides
+
+
+def _native_eval_horizon(env, training_params: dict[str, Any] | None, payload: dict[str, Any]) -> int:
+    shot_clock_steps = int(getattr(env, "shot_clock_steps", 24))
+    params = dict(training_params or {})
+    payload_config = payload.get("trainer_config") if isinstance(payload, dict) else None
+    if isinstance(payload_config, dict):
+        payload_params = dict(payload_config)
+        payload_params.update(params)
+        params = payload_params
+    configured = _coerce_int(_param(params, "eval_horizon", 0), 0)
+    horizon = max(shot_clock_steps + 2, configured)
+    if bool(getattr(env, "enable_rebounds", False)):
+        reset_steps = max(1, int(getattr(env, "offensive_rebound_shot_clock_reset", 14)))
+        horizon = max(horizon, shot_clock_steps + 3 * reset_steps + 2)
+    return int(horizon)
+
+
 def _selector_training_params_from_checkpoint(
     payload: dict[str, Any],
     training_params: dict[str, Any] | None,
@@ -511,6 +610,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             env_out = step_batch_minimal(static, policy_state, full_actions, env_keys, jax, jnp)
             trace = {
                 "full_actions": full_actions.astype(jnp.int32),
+                "ball_holder": policy_state.ball_holder.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
@@ -543,6 +643,11 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
                 "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
                 "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
+                "rebound_attempt": env_out.rebound_attempt.astype(jnp.int8),
+                "offensive_rebound": env_out.offensive_rebound.astype(jnp.int8),
+                "defensive_rebound": env_out.defensive_rebound.astype(jnp.int8),
+                "rebound_target_cell": env_out.rebound_target_cell.astype(jnp.int32),
+                "rebound_winner": env_out.rebound_winner.astype(jnp.int32),
                 "intent_index": policy_state.intent_index.astype(jnp.int32),
                 "intent_active": policy_state.intent_active.astype(jnp.int8),
                 "intent_age": policy_state.intent_age.astype(jnp.int32),
@@ -590,6 +695,9 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "completed_passes": np.asarray(trace["completed_passes"])[:, :take].sum(axis=0),
         "assists": np.asarray(trace["assists"])[:, :take].sum(axis=0),
         "turnovers": np.asarray(trace["turnovers"])[:, :take].sum(axis=0),
+        "rebound_attempts": np.asarray(trace["rebound_attempt"])[:, :take].sum(axis=0),
+        "offensive_rebounds": np.asarray(trace["offensive_rebound"])[:, :take].sum(axis=0),
+        "defensive_rebounds": np.asarray(trace["defensive_rebound"])[:, :take].sum(axis=0),
     }
 
 
@@ -614,6 +722,8 @@ def _init_player_stats(n_players: int) -> dict[int, dict[str, Any]]:
             "potential_assists": 0,
             "turnovers": 0,
             "points": 0.0,
+            "offensive_rebounds": 0,
+            "rebound_chances": 0,
             "episodes": 0,
             "steps": 0,
             "shot_chart": {},
@@ -633,6 +743,8 @@ def _init_aggregate_stats() -> dict[str, Any]:
         "potential_assists": 0,
         "turnovers": 0,
         "points": 0.0,
+        "offensive_rebounds": 0,
+        "rebound_chances": 0,
         "episodes": 0,
         "steps": 0,
         "shot_chart": {},
@@ -673,6 +785,14 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "other": 0,
             "total": 0,
         },
+        "holder_action_mix": {
+            "noop": 0,
+            "move": 0,
+            "shoot": 0,
+            "pass": 0,
+            "other": 0,
+            "total": 0,
+        },
         "reward_breakdown": {
             "total_reward": 0.0,
             "expected_points": 0.0,
@@ -683,6 +803,12 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "phi_shaping": 0.0,
             "unexplained": 0.0,
         },
+        "rebounds": {
+            "attempts": 0,
+            "offensive": 0,
+            "defensive": 0,
+            "by_player_offensive": {},
+        },
     }
 
 
@@ -692,7 +818,7 @@ def _merge_aggregate_stats(dest: dict[str, Any] | None, src: dict[str, Any] | No
     if not src:
         return dest
 
-    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "episodes", "steps"):
+    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "episodes", "steps", "offensive_rebounds", "rebound_chances"):
         dest[key] = int(dest.get(key, 0) or 0) + int(src.get(key, 0) or 0)
     dest["points"] = float(dest.get("points", 0.0) or 0.0) + float(src.get("points", 0.0) or 0.0)
 
@@ -726,10 +852,13 @@ def _accumulate_team_stats_from_players(
     merged = _init_aggregate_stats()
     merged["episodes"] = int(episodes)
     merged["steps"] = int(steps)
+    max_rebound_chances = 0
     for pid in team_ids:
         entry = player_stats.get(int(pid))
         if entry:
+            max_rebound_chances = max(max_rebound_chances, int(entry.get("rebound_chances", 0) or 0))
             merged = _merge_aggregate_stats(merged, entry)
+    merged["rebound_chances"] = max_rebound_chances
     return _merge_aggregate_stats(dest, merged)
 
 
@@ -772,6 +901,21 @@ def _record_action_mix(eval_diagnostics: dict[str, Any], actions: np.ndarray, us
         bucket = _action_bucket(int(actions[int(pid)]))
         action_mix[bucket] = int(action_mix.get(bucket, 0)) + 1
         action_mix["total"] = int(action_mix.get("total", 0)) + 1
+
+
+def _record_holder_action_mix(
+    eval_diagnostics: dict[str, Any],
+    actions: np.ndarray,
+    ball_holder: int,
+    user_team_ids_set: set[int],
+) -> None:
+    holder_id = int(ball_holder)
+    if holder_id not in user_team_ids_set:
+        return
+    holder_mix = eval_diagnostics["holder_action_mix"]
+    bucket = _action_bucket(int(actions[holder_id]))
+    holder_mix[bucket] = int(holder_mix.get(bucket, 0)) + 1
+    holder_mix["total"] = int(holder_mix.get("total", 0)) + 1
 
 
 def _record_shot_event(
@@ -947,13 +1091,18 @@ def run_native_jax_evaluation(
         intent_selection_mode=intent_selection_mode,
     )
 
+    env_kwargs, static_overrides = _split_native_env_params(optional_params)
+    static_params = _jax_static_env_params_from_payload(unified_payload, opponent_payload)
+    static_params.update(static_overrides)
     env = basketworld.HexagonBasketballEnv(
         **required_params,
-        **optional_params,
+        **env_kwargs,
         render_mode=None,
     )
+    for key, value in static_params.items():
+        setattr(env, key, value)
     static = build_kernel_static_from_env(env, jnp)
-    horizon = int(getattr(env, "shot_clock_steps", 24)) + 2
+    horizon = _native_eval_horizon(env, training_params, unified_payload)
     configured_batch_size = int(
         dict(unified_payload.get("trainer_config", {})).get("kernel_batch_size", 4096)
     )
@@ -988,6 +1137,9 @@ def run_native_jax_evaluation(
     all_completed_passes: list[float] = []
     all_assists: list[float] = []
     all_turnovers: list[float] = []
+    all_rebound_attempts: list[float] = []
+    all_offensive_rebounds: list[float] = []
+    all_defensive_rebounds: list[float] = []
 
     start = perf_counter()
     completed_episodes = 0
@@ -1029,6 +1181,7 @@ def run_native_jax_evaluation(
             shots_payload: dict[str, dict[str, Any]] = {}
             turnovers_payload: list[dict[str, Any]] = []
             defensive_lane_violations_payload: list[dict[str, Any]] = []
+            rebounds_payload: list[dict[str, Any]] = []
             episode_shots: dict[str, list[int]] = {}
             selector_start_applied = (
                 bool(int(trace["selector_applied"][0, idx]))
@@ -1124,6 +1277,12 @@ def run_native_jax_evaluation(
 
             for t in range(active_steps):
                 _record_action_mix(eval_diagnostics, trace["full_actions"][t, idx], user_team_ids)
+                _record_holder_action_mix(
+                    eval_diagnostics,
+                    trace["full_actions"][t, idx],
+                    int(trace["ball_holder"][t, idx]),
+                    user_team_ids_set,
+                )
                 if int(trace["pass_attempts"][t, idx]):
                     _record_pass_link_diagnostics(
                         eval_diagnostics,
@@ -1232,15 +1391,78 @@ def run_native_jax_evaluation(
                             "reason": "illegal_defense",
                         }
                     )
+                if int(trace["rebound_attempt"][t, idx]):
+                    rebound_offensive = bool(int(trace["offensive_rebound"][t, idx]))
+                    rebound_defensive = bool(int(trace["defensive_rebound"][t, idx]))
+                    rebound_winner = int(trace["rebound_winner"][t, idx])
+                    rebound_target_cell = int(trace["rebound_target_cell"][t, idx])
+                    rebound_diag = eval_diagnostics.setdefault(
+                        "rebounds",
+                        {"attempts": 0, "offensive": 0, "defensive": 0, "by_player_offensive": {}},
+                    )
+                    rebound_diag["attempts"] = int(rebound_diag.get("attempts", 0)) + 1
+                    rebound_diag["offensive"] = int(rebound_diag.get("offensive", 0)) + int(rebound_offensive)
+                    rebound_diag["defensive"] = int(rebound_diag.get("defensive", 0)) + int(rebound_defensive)
+                    for stats_target in (per_player_stats, episode_player_stats):
+                        for offense_pid in offense_ids:
+                            if offense_pid in stats_target:
+                                stats_target[offense_pid]["rebound_chances"] = int(stats_target[offense_pid].get("rebound_chances", 0)) + 1
+                        if rebound_offensive and rebound_winner in stats_target:
+                            stats_target[rebound_winner]["offensive_rebounds"] = int(
+                                stats_target[rebound_winner].get("offensive_rebounds", 0)
+                            ) + 1
+                    if rebound_offensive and rebound_winner >= 0:
+                        by_player = rebound_diag.setdefault("by_player_offensive", {})
+                        rebound_key = str(int(rebound_winner))
+                        by_player[rebound_key] = int(by_player.get(rebound_key, 0)) + 1
+                    rebounds_payload.append(
+                        {
+                            "attempt": True,
+                            "offensive": rebound_offensive,
+                            "defensive": rebound_defensive,
+                            "winner": rebound_winner if rebound_winner >= 0 else None,
+                            "winner_team": "OFFENSE" if rebound_offensive else ("DEFENSE" if rebound_defensive else None),
+                            "target_cell_index": rebound_target_cell if rebound_target_cell >= 0 else None,
+                        }
+                    )
 
             completed_passes = float(np.asarray(trace["completed_passes"])[:active_steps, idx].sum())
             defensive_lane_violations = float(
                 np.asarray(trace["defensive_lane_violation"])[:active_steps, idx].sum()
             )
+            shot_attempts = np.asarray(trace["shot_attempt"])[:active_steps, idx].astype(bool)
+            shot_success_flags = np.asarray(trace["shot_success"])[:active_steps, idx].astype(bool)
+            shot_values = np.asarray(trace["shot_value"])[:active_steps, idx].astype(np.float32)
             shot_expected_points = np.asarray(trace["shot_expected_points"])[:active_steps, idx]
+            defensive_rebound_flags = np.asarray(trace["defensive_rebound"])[:active_steps, idx].astype(bool)
             potential_flags = np.asarray(trace["potential_assist"])[:active_steps, idx].astype(bool)
             assist_flags = np.asarray(trace["assists"])[:active_steps, idx].astype(bool)
-            expected_amt = offense_sign * float(shot_expected_points.sum())
+            if bool(getattr(env, "enable_rebounds", False)):
+                rebound_reward_mode = str(
+                    getattr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"
+                )
+                scored_points = shot_values * shot_success_flags.astype(np.float32)
+                if rebound_reward_mode == "last_shot_ep":
+                    shot_reward_component = np.where(
+                        shot_attempts & (shot_success_flags | defensive_rebound_flags),
+                        shot_expected_points,
+                        0.0,
+                    )
+                elif rebound_reward_mode == "last_shot_ep_on_defensive_rebound":
+                    shot_reward_component = np.where(
+                        shot_attempts & shot_success_flags,
+                        scored_points,
+                        np.where(
+                            shot_attempts & defensive_rebound_flags,
+                            shot_expected_points,
+                            0.0,
+                        ),
+                    )
+                else:
+                    shot_reward_component = np.where(shot_attempts, scored_points, 0.0)
+            else:
+                shot_reward_component = shot_expected_points
+            expected_amt = offense_sign * float(shot_reward_component.sum())
             pass_amt = offense_sign * pass_reward * completed_passes
             violation_amt = offense_sign * violation_reward * defensive_lane_violations
             potential_amt = offense_sign * potential_assist_pct * float(shot_expected_points[potential_flags].sum())
@@ -1280,6 +1502,8 @@ def run_native_jax_evaluation(
                         "shots": shots_payload,
                         "turnovers": turnovers_payload,
                         "defensive_lane_violations": defensive_lane_violations_payload,
+                        "rebounds": rebounds_payload,
+                        "rebound": rebounds_payload[-1] if rebounds_payload else None,
                         "shot_clock": shot_clock_steps,
                         "three_point_distance": three_point_distance,
                     },
@@ -1296,6 +1520,9 @@ def run_native_jax_evaluation(
         all_completed_passes.extend([float(v) for v in stats["completed_passes"].tolist()])
         all_assists.extend([float(v) for v in stats["assists"].tolist()])
         all_turnovers.extend([float(v) for v in stats["turnovers"].tolist()])
+        all_rebound_attempts.extend([float(v) for v in stats["rebound_attempts"].tolist()])
+        all_offensive_rebounds.extend([float(v) for v in stats["offensive_rebounds"].tolist()])
+        all_defensive_rebounds.extend([float(v) for v in stats["defensive_rebounds"].tolist()])
         completed_episodes += take
         if progress_callback is not None:
             progress_callback(completed_episodes, int(num_episodes))
@@ -1367,8 +1594,17 @@ def run_native_jax_evaluation(
         "completed_passes_per_episode": _mean(all_completed_passes),
         "assists_per_episode": _mean(all_assists),
         "turnovers_per_episode": _mean(all_turnovers),
+        "rebound_attempts_per_episode": _mean(all_rebound_attempts),
+        "offensive_rebounds_per_episode": _mean(all_offensive_rebounds),
+        "defensive_rebounds_per_episode": _mean(all_defensive_rebounds),
         "total_offense_points": _sum(all_offense_points),
         "total_defense_points": _sum(all_defense_points),
+        "total_rebound_attempts": int(_sum(all_rebound_attempts)),
+        "total_offensive_rebounds": int(_sum(all_offensive_rebounds)),
+        "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
+        "offensive_rebounds_by_player": dict(
+            (eval_diagnostics.get("rebounds") or {}).get("by_player_offensive", {}) or {}
+        ),
         "total_shot_attempts": int(total_shot_attempts),
         "total_shot_dunk_attempts": int(shot_type_attempts["dunk"]),
         "total_shot_two_attempts": int(shot_type_attempts["two"]),

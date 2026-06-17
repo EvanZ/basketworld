@@ -19,6 +19,11 @@ export function getDefaultStats() {
     twoPt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
     threePt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
     turnovers: 0,
+    rebounds: {
+      offensive: 0,
+      defensive: 0,
+      byPlayer: {},
+    },
     violations: {
       defensiveLane: 0,
       offensiveThreeSeconds: 0,
@@ -30,6 +35,14 @@ export function getDefaultStats() {
     intentInactiveCount: 0,
     turnoverReasons: {},
     actionMix: {
+      noop: 0,
+      move: 0,
+      shoot: 0,
+      pass: 0,
+      other: 0,
+      total: 0,
+    },
+    actionMixHolder: {
       noop: 0,
       move: 0,
       shoot: 0,
@@ -92,6 +105,11 @@ export function loadStats() {
         potentialAssists: Number(parsed?.threePt?.potentialAssists) || 0,
       },
       turnovers: Number(parsed.turnovers) || 0,
+      rebounds: {
+        offensive: Number(parsed?.rebounds?.offensive) || 0,
+        defensive: Number(parsed?.rebounds?.defensive) || 0,
+        byPlayer: normalizeNumberRecord(parsed?.rebounds?.byPlayer),
+      },
       violations: {
         defensiveLane: Number(parsed?.violations?.defensiveLane) || 0,
         offensiveThreeSeconds: Number(parsed?.violations?.offensiveThreeSeconds) || 0,
@@ -109,6 +127,14 @@ export function loadStats() {
         pass: Number(parsed?.actionMix?.pass) || 0,
         other: Number(parsed?.actionMix?.other) || 0,
         total: Number(parsed?.actionMix?.total) || 0,
+      },
+      actionMixHolder: {
+        noop: Number(parsed?.actionMixHolder?.noop) || 0,
+        move: Number(parsed?.actionMixHolder?.move) || 0,
+        shoot: Number(parsed?.actionMixHolder?.shoot) || 0,
+        pass: Number(parsed?.actionMixHolder?.pass) || 0,
+        other: Number(parsed?.actionMixHolder?.other) || 0,
+        total: Number(parsed?.actionMixHolder?.total) || 0,
       },
       rewardBreakdown: {
         totalReward: Number(parsed?.rewardBreakdown?.totalReward) || 0,

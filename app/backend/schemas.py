@@ -213,6 +213,23 @@ class SetPressureParamsRequest(BaseModel):
     steal_perp_decay: float | None = None
     steal_distance_factor: float | None = None
     steal_position_weight_min: float | None = None
+    pass_interception_model: str | None = None
+    pass_passer_pressure_weight: float | None = None
+    pass_receiver_pressure_weight: float | None = None
+    pass_lob_lane_multiplier: float | None = None
+    pass_lob_receiver_distance: float | None = None
+    pass_speed: float | None = None
+    defender_reaction_time: float | None = None
+    defender_speed: float | None = None
+    defender_reach_radius: float | None = None
+    reaction_softness: float | None = None
+    base_passer_risk: float | None = None
+    passer_pressure_decay: float | None = None
+    base_receiver_risk: float | None = None
+    receiver_alignment_min: float | None = None
+    receiver_alignment_width: float | None = None
+    max_receiver_hazard: float | None = None
+    lane_weight: float | None = None
     # Defender turnover pressure
     defender_pressure_distance: int | None = None
     defender_pressure_turnover_chance: float | None = None

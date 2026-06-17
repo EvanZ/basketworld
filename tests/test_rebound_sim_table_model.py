@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,12 @@ import pytest
 from analytics.rebound_physics.dataset import court_mujoco_xy, mapping_record, nearest_court_cell_index
 from analytics.rebound_sim.model import build_court, simulate_rebounds
 from analytics.rebound_sim.table_model import FittedReboundTableModel
+from basketworld_jax.env.minimal import (
+    SHOT_TYPE_DUNK,
+    SHOT_TYPE_THREE,
+    SHOT_TYPE_TWO,
+    _compiled_rebound_target_probs,
+)
 
 
 def test_fitted_table_model_samples_and_reflects_targets(tmp_path: Path) -> None:
@@ -44,6 +51,48 @@ def test_fitted_table_model_target_probabilities_reflect_rows(tmp_path: Path) ->
     assert float(left_probs.sum()) == pytest.approx(1.0)
     assert int(np.argmax(left_probs)) == expected_left_target
     assert expected_left_target != canonical_target_idx
+
+
+def test_jax_compiled_rebound_table_preserves_fitted_target_cell_order(tmp_path: Path) -> None:
+    court = build_court()
+    model_dir = _write_order_sensitive_table_model(tmp_path, court)
+    model = FittedReboundTableModel.load(model_dir, court=court)
+
+    cells = sorted(court.cells)
+    fake_env = SimpleNamespace(
+        enable_rebounds=True,
+        rebound_table_model_dir=str(model_dir),
+        court_height=int(court.spec.rows),
+        court_width=int(court.spec.cols),
+        basket_position=tuple(court.basket_axial),
+        three_point_distance=float(court.spec.three_point_distance),
+        three_point_short_distance=float(court.spec.three_point_short_distance),
+    )
+    dense = _compiled_rebound_target_probs(fake_env, cells)
+
+    shot_cell = (-1, 8)
+    assert shot_cell in court.cell_index
+    shot_idx = int(court.cell_index[shot_cell])
+    shot_type = model.shot_type_for_shot(court, shot_idx)
+    if shot_type == "dunk":
+        jax_type = SHOT_TYPE_DUNK
+    elif shot_type == "jumper" and bool(court.three_point_mask[shot_idx]):
+        jax_type = SHOT_TYPE_THREE
+    else:
+        jax_type = SHOT_TYPE_TWO
+
+    jax_shot_idx = int(cells.index(shot_cell))
+    compiled_sorted_order = np.asarray(dense[jax_type, jax_shot_idx], dtype=np.float64)
+    compiled_court_order = np.asarray(
+        [compiled_sorted_order[int(cells.index(cell))] for cell in court.cells],
+        dtype=np.float64,
+    )
+    fitted_court_order = model.target_probabilities(court, shot_idx)
+
+    np.testing.assert_allclose(compiled_court_order, fitted_court_order, atol=1e-7, rtol=0.0)
+    assert tuple(court.cells[int(np.argmax(compiled_court_order))]) == tuple(
+        court.cells[int(np.argmax(fitted_court_order))]
+    )
 
 
 def test_simulate_rebounds_can_use_fitted_table_target_sampler(tmp_path: Path) -> None:
@@ -135,3 +184,56 @@ def _mirror_target_index(model: FittedReboundTableModel, canonical_target_idx: i
     target_xy = model.court_xy_mujoco[int(canonical_target_idx)].copy()
     target_xy[0] *= -1.0
     return nearest_court_cell_index(model.court_xy_mujoco, target_xy)
+
+
+def _write_order_sensitive_table_model(tmp_path: Path, court):
+    model_dir = tmp_path / "order_model"
+    meters_per_bw_unit = 0.9835331644547978
+    n_cells = len(court.cells)
+    row_indices = np.arange(n_cells, dtype=np.int32)
+    for shot_type in ("dunk", "finger_roll", "layup", "jumper"):
+        shot_type_dir = model_dir / "shot_type_models" / shot_type
+        shot_type_dir.mkdir(parents=True)
+        probs = np.zeros((n_cells, n_cells), dtype=np.float64)
+        for row in range(n_cells):
+            target = (row * 7 + 11) % n_cells
+            if target == row:
+                target = (target + 1) % n_cells
+            probs[row, target] = 1.0
+        np.save(shot_type_dir / "rebound_transition_probs.npy", probs)
+        np.save(shot_type_dir / "rebound_transition_row_shot_cell_indices.npy", row_indices)
+
+    (model_dir / "rebound_fit_summary.json").write_text(
+        json.dumps(
+            {
+                "court_rows": court.spec.rows,
+                "court_cols": court.spec.cols,
+                "meters_per_bw_unit": meters_per_bw_unit,
+                "layup_max_distance_hex": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    records = [
+        mapping_record(
+            court,
+            type(
+                "Mapping",
+                (),
+                {
+                    "shot_cell_index": idx,
+                    "canonical_cell_index": idx,
+                    "reflection_sign": 1,
+                    "symmetry_class": "canonical_right",
+                },
+            )(),
+            meters_per_bw_unit=meters_per_bw_unit,
+        )
+        for idx in range(n_cells)
+    ]
+    (model_dir / "rebound_canonical_shot_mapping.json").write_text(
+        json.dumps(records) + "\n",
+        encoding="utf-8",
+    )
+    return model_dir

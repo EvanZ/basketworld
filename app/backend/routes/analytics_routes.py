@@ -335,11 +335,35 @@ def get_rewards():
     env = game_state.env
     reward_params = {}
     try:
+        rebounds_enabled = bool(get_env_attr(env, "enable_rebounds", False))
+        rebound_reward_mode = str(
+            get_env_attr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"
+        )
+        if rebounds_enabled and rebound_reward_mode == "last_shot_ep":
+            shot_reward_type = "last_shot_ep"
+            shot_reward_description = (
+                "Reward = terminal shot expected points. Misses recovered by the offense pay 0 until the possession ends."
+            )
+        elif rebounds_enabled and rebound_reward_mode == "last_shot_ep_on_defensive_rebound":
+            shot_reward_type = "last_shot_ep_on_defensive_rebound"
+            shot_reward_description = (
+                "Legacy reward = actual points on makes plus expected points on terminal defensive rebounds. "
+                "This is biased high relative to PPP."
+            )
+        elif rebounds_enabled:
+            shot_reward_type = "actual_points"
+            shot_reward_description = "Reward = actual shot points; missed shots pay 0."
+        else:
+            shot_reward_type = "expected_points"
+            shot_reward_description = (
+                "Reward = shot_value × pressure-adjusted make probability (applies to makes and misses)"
+            )
         reward_params = {
             "pass_reward": float(get_env_attr(env, "pass_reward", 0.0)),
             "turnover_reward": 0.0,
-            "shot_reward_type": "expected_points",
-            "shot_reward_description": "Reward = shot_value × pressure-adjusted make probability (applies to makes and misses)",
+            "shot_reward_type": shot_reward_type,
+            "shot_reward_description": shot_reward_description,
+            "rebound_terminal_reward_mode": rebound_reward_mode if rebounds_enabled else None,
             "violation_reward": float(get_env_attr(env, "violation_reward", 0.0)),
             "potential_assist_pct": float(get_env_attr(env, "potential_assist_pct", 0.0)),
             "full_assist_bonus_pct": float(get_env_attr(env, "full_assist_bonus_pct", 0.0)),

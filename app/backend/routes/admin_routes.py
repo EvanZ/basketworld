@@ -117,6 +117,31 @@ def _refresh_after_live_env_edit() -> None:
     _rebuild_cached_obs()
 
 
+def _refresh_after_static_env_param_edit(updated_params: dict) -> None:
+    """Refresh cached runtime state after env parameters used by kernel statics change."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        try:
+            if hasattr(jax_runtime, "env_params") and isinstance(jax_runtime.env_params, dict):
+                jax_runtime.env_params.update(updated_params or {})
+            if hasattr(jax_runtime, "refresh_static_from_display_env"):
+                jax_runtime.refresh_static_from_display_env()
+            game_state.env = getattr(jax_runtime, "display_env", game_state.env)
+            if hasattr(jax_runtime, "observation_dict"):
+                user_team = getattr(game_state, "user_team", Team.OFFENSE)
+                game_state.obs = jax_runtime.observation_dict(
+                    observer_is_offense=user_team != Team.DEFENSE
+                )
+                game_state.prev_obs = None
+        except Exception as err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to refresh JAX runtime env parameters: {err}",
+            ) from err
+        return
+    _rebuild_cached_obs()
+
+
 def _template_players_per_side() -> int:
     env = _base_env()
     players_per_side = getattr(env, "players_per_side", None)
@@ -2455,6 +2480,23 @@ def _set_pressure_params_impl(
         "steal_perp_decay",
         "steal_distance_factor",
         "steal_position_weight_min",
+        "pass_interception_model",
+        "pass_passer_pressure_weight",
+        "pass_receiver_pressure_weight",
+        "pass_lob_lane_multiplier",
+        "pass_lob_receiver_distance",
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "base_passer_risk",
+        "passer_pressure_decay",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "receiver_alignment_width",
+        "max_receiver_hazard",
+        "lane_weight",
         "defender_pressure_distance",
         "defender_pressure_turnover_chance",
         "defender_pressure_decay_lambda",
@@ -2473,6 +2515,23 @@ def _set_pressure_params_impl(
             "steal_perp_decay",
             "steal_distance_factor",
             "steal_position_weight_min",
+            "pass_interception_model",
+            "pass_passer_pressure_weight",
+            "pass_receiver_pressure_weight",
+            "pass_lob_lane_multiplier",
+            "pass_lob_receiver_distance",
+            "pass_speed",
+            "defender_reaction_time",
+            "defender_speed",
+            "defender_reach_radius",
+            "reaction_softness",
+            "base_passer_risk",
+            "passer_pressure_decay",
+            "base_receiver_risk",
+            "receiver_alignment_min",
+            "receiver_alignment_width",
+            "max_receiver_hazard",
+            "lane_weight",
         },
         "defender_pressure": {
             "defender_pressure_distance",
@@ -2522,6 +2581,57 @@ def _set_pressure_params_impl(
             "steal_position_weight_min": _default_value(
                 "steal_position_weight_min", getattr(env, "steal_position_weight_min", 0.3)
             ),
+            "pass_interception_model": _default_value(
+                "pass_interception_model", getattr(env, "pass_interception_model", "line")
+            ),
+            "pass_passer_pressure_weight": _default_value(
+                "pass_passer_pressure_weight", getattr(env, "pass_passer_pressure_weight", 0.0)
+            ),
+            "pass_receiver_pressure_weight": _default_value(
+                "pass_receiver_pressure_weight", getattr(env, "pass_receiver_pressure_weight", 0.0)
+            ),
+            "pass_lob_lane_multiplier": _default_value(
+                "pass_lob_lane_multiplier", getattr(env, "pass_lob_lane_multiplier", 0.35)
+            ),
+            "pass_lob_receiver_distance": _default_value(
+                "pass_lob_receiver_distance", getattr(env, "pass_lob_receiver_distance", 1.0)
+            ),
+            "pass_speed": _default_value(
+                "pass_speed", getattr(env, "pass_speed", 3.5)
+            ),
+            "defender_reaction_time": _default_value(
+                "defender_reaction_time", getattr(env, "defender_reaction_time", 0.35)
+            ),
+            "defender_speed": _default_value(
+                "defender_speed", getattr(env, "defender_speed", 1.25)
+            ),
+            "defender_reach_radius": _default_value(
+                "defender_reach_radius", getattr(env, "defender_reach_radius", 0.65)
+            ),
+            "reaction_softness": _default_value(
+                "reaction_softness", getattr(env, "reaction_softness", 0.55)
+            ),
+            "base_passer_risk": _default_value(
+                "base_passer_risk", getattr(env, "base_passer_risk", 0.06)
+            ),
+            "passer_pressure_decay": _default_value(
+                "passer_pressure_decay", getattr(env, "passer_pressure_decay", 1.35)
+            ),
+            "base_receiver_risk": _default_value(
+                "base_receiver_risk", getattr(env, "base_receiver_risk", 0.35)
+            ),
+            "receiver_alignment_min": _default_value(
+                "receiver_alignment_min", getattr(env, "receiver_alignment_min", 0.35)
+            ),
+            "receiver_alignment_width": _default_value(
+                "receiver_alignment_width", getattr(env, "receiver_alignment_width", 2.0)
+            ),
+            "max_receiver_hazard": _default_value(
+                "max_receiver_hazard", getattr(env, "max_receiver_hazard", 0.85)
+            ),
+            "lane_weight": _default_value(
+                "lane_weight", getattr(env, "lane_weight", 0.0)
+            ),
             "defender_pressure_distance": _default_value(
                 "defender_pressure_distance", getattr(env, "defender_pressure_distance", 1)
             ),
@@ -2562,6 +2672,23 @@ def _set_pressure_params_impl(
             "steal_perp_decay": req.steal_perp_decay,
             "steal_distance_factor": req.steal_distance_factor,
             "steal_position_weight_min": req.steal_position_weight_min,
+            "pass_interception_model": req.pass_interception_model,
+            "pass_passer_pressure_weight": req.pass_passer_pressure_weight,
+            "pass_receiver_pressure_weight": req.pass_receiver_pressure_weight,
+            "pass_lob_lane_multiplier": req.pass_lob_lane_multiplier,
+            "pass_lob_receiver_distance": req.pass_lob_receiver_distance,
+            "pass_speed": req.pass_speed,
+            "defender_reaction_time": req.defender_reaction_time,
+            "defender_speed": req.defender_speed,
+            "defender_reach_radius": req.defender_reach_radius,
+            "reaction_softness": req.reaction_softness,
+            "base_passer_risk": req.base_passer_risk,
+            "passer_pressure_decay": req.passer_pressure_decay,
+            "base_receiver_risk": req.base_receiver_risk,
+            "receiver_alignment_min": req.receiver_alignment_min,
+            "receiver_alignment_width": req.receiver_alignment_width,
+            "max_receiver_hazard": req.max_receiver_hazard,
+            "lane_weight": req.lane_weight,
             "defender_pressure_distance": req.defender_pressure_distance,
             "defender_pressure_turnover_chance": req.defender_pressure_turnover_chance,
             "defender_pressure_decay_lambda": req.defender_pressure_decay_lambda,
@@ -2674,6 +2801,70 @@ def _set_pressure_params_impl(
             0.0,
             1.0,
         )
+    if "pass_interception_model" in payload:
+        model = str(payload["pass_interception_model"] or "line").strip().lower()
+        aliases = {
+            "line": "line",
+            "legacy": "line",
+            "lob": "lob_aware",
+            "lob-aware": "lob_aware",
+            "lob_aware": "lob_aware",
+            "reaction": "reaction",
+            "speed": "reaction",
+            "speed_based": "reaction",
+            "speed-based": "reaction",
+        }
+        if model not in aliases:
+            raise HTTPException(
+                status_code=400,
+                detail="pass_interception_model must be one of: line, lob_aware, reaction.",
+            )
+        normalized["pass_interception_model"] = aliases[model]
+    if "pass_passer_pressure_weight" in payload:
+        normalized["pass_passer_pressure_weight"] = _validate_min(
+            _as_float(payload["pass_passer_pressure_weight"], "pass_passer_pressure_weight"),
+            "pass_passer_pressure_weight",
+            0.0,
+        )
+    if "pass_receiver_pressure_weight" in payload:
+        normalized["pass_receiver_pressure_weight"] = _validate_min(
+            _as_float(payload["pass_receiver_pressure_weight"], "pass_receiver_pressure_weight"),
+            "pass_receiver_pressure_weight",
+            0.0,
+        )
+    if "pass_lob_lane_multiplier" in payload:
+        normalized["pass_lob_lane_multiplier"] = _validate_range(
+            _as_float(payload["pass_lob_lane_multiplier"], "pass_lob_lane_multiplier"),
+            "pass_lob_lane_multiplier",
+            0.0,
+            1.0,
+        )
+    if "pass_lob_receiver_distance" in payload:
+        normalized["pass_lob_receiver_distance"] = _validate_min(
+            _as_float(payload["pass_lob_receiver_distance"], "pass_lob_receiver_distance"),
+            "pass_lob_receiver_distance",
+            0.0,
+        )
+    for key in (
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "passer_pressure_decay",
+        "receiver_alignment_width",
+    ):
+        if key in payload:
+            normalized[key] = _validate_min(_as_float(payload[key], key), key, 0.0)
+    for key in (
+        "base_passer_risk",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "max_receiver_hazard",
+        "lane_weight",
+    ):
+        if key in payload:
+            normalized[key] = _validate_range(_as_float(payload[key], key), key, 0.0, 1.0)
 
     if "defender_pressure_distance" in payload:
         normalized["defender_pressure_distance"] = _as_int(
@@ -2716,7 +2907,7 @@ def _set_pressure_params_impl(
             game_state.env_optional_params = {}
         game_state.env_optional_params.update(normalized)
 
-        _rebuild_cached_obs()
+        _refresh_after_static_env_param_edit(normalized)
 
         updated_state = get_ui_game_state()
         if game_state.episode_states:

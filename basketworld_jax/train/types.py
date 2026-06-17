@@ -66,6 +66,12 @@ class TrajectoryBatch(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_target_cells: Any
+    rebound_winners: Any
+    shot_clock_reset_14: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any
@@ -153,6 +159,12 @@ class EvalTrace(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_target_cells: Any
+    rebound_winners: Any
+    shot_clock_reset_14: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any

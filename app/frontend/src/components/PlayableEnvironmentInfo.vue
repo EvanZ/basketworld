@@ -121,6 +121,43 @@ function formatPlayerLabel(playerId) {
 
 const userSkillRows = computed(() => buildSkillRows(userIds.value, sampledSideSkills.value.user));
 const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills.value.ai));
+
+const passInterceptionModel = computed(() => {
+  const raw = props.gameState?.pass_interception_model;
+  const model = String(raw || 'line').trim().toLowerCase();
+  if (model === 'lob' || model === 'lob-aware') return 'lob_aware';
+  if (model === 'speed' || model === 'speed_based' || model === 'speed-based') return 'reaction';
+  return model || 'line';
+});
+
+const passInterceptionModelLabel = computed(() => {
+  switch (passInterceptionModel.value) {
+    case 'reaction':
+      return 'Reaction / speed';
+    case 'lob_aware':
+      return 'Lob-aware line';
+    case 'line':
+      return 'Line / lane';
+    default:
+      return passInterceptionModel.value;
+  }
+});
+
+const passInterceptionModelNote = computed(() => {
+  switch (passInterceptionModel.value) {
+    case 'reaction':
+      return 'Uses pass flight time, defender reaction time, defender speed/reach, passer pressure, receiver pressure, and optional legacy lane blending.';
+    case 'lob_aware':
+      return 'Uses the legacy lane model with separate passer/receiver pressure weights and lob-specific lane damping.';
+    case 'line':
+      return 'Uses the legacy line-of-pass interception model.';
+    default:
+      return 'Unknown pass interception model id loaded from the runtime environment.';
+  }
+});
+
+const usesReactionPassModel = computed(() => passInterceptionModel.value === 'reaction');
+const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lob_aware');
 </script>
 
 <template>
@@ -189,12 +226,55 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
         <div class="param-row"><span>Decay lambda</span><strong>{{ formatValue(gameState.defender_pressure_decay_lambda) }}</strong></div>
       </article>
 
-      <article class="env-card">
+      <article class="env-card env-card-wide">
         <h4>Pass Interception</h4>
+        <div class="param-row">
+          <span>Loaded model type</span>
+          <strong class="mode-badge">{{ passInterceptionModelLabel }}</strong>
+        </div>
+        <div class="param-row"><span>Raw model id</span><strong class="mono">{{ passInterceptionModel }}</strong></div>
+        <p class="env-note">{{ passInterceptionModelNote }}</p>
+
+        <div class="param-subhead">
+          Reaction Model
+          <span class="subhead-status" :class="{ active: usesReactionPassModel }">
+            {{ usesReactionPassModel ? 'Active' : 'Inactive' }}
+          </span>
+        </div>
+        <div class="param-row"><span>Pass speed</span><strong>{{ formatValue(gameState.pass_speed) }}</strong></div>
+        <div class="param-row"><span>Defender reaction time</span><strong>{{ formatValue(gameState.defender_reaction_time) }}</strong></div>
+        <div class="param-row"><span>Defender speed</span><strong>{{ formatValue(gameState.defender_speed) }}</strong></div>
+        <div class="param-row"><span>Defender reach radius</span><strong>{{ formatValue(gameState.defender_reach_radius) }}</strong></div>
+        <div class="param-row"><span>Reaction softness</span><strong>{{ formatValue(gameState.reaction_softness) }}</strong></div>
+        <div class="param-row"><span>Base passer risk</span><strong>{{ formatPercent(gameState.base_passer_risk, 2) }}</strong></div>
+        <div class="param-row"><span>Passer pressure decay</span><strong>{{ formatValue(gameState.passer_pressure_decay) }}</strong></div>
+        <div class="param-row"><span>Base receiver risk</span><strong>{{ formatPercent(gameState.base_receiver_risk, 2) }}</strong></div>
+        <div class="param-row"><span>Receiver alignment min</span><strong>{{ formatValue(gameState.receiver_alignment_min) }}</strong></div>
+        <div class="param-row"><span>Receiver alignment width</span><strong>{{ formatValue(gameState.receiver_alignment_width) }}</strong></div>
+        <div class="param-row"><span>Max receiver hazard</span><strong>{{ formatPercent(gameState.max_receiver_hazard, 2) }}</strong></div>
+        <div class="param-row"><span>Legacy lane blend weight</span><strong>{{ formatValue(gameState.lane_weight) }}</strong></div>
+
+        <div class="param-subhead">
+          Legacy Line Model
+          <span class="subhead-status" :class="{ active: !usesReactionPassModel || Number(gameState.lane_weight || 0) > 0 }">
+            {{ !usesReactionPassModel ? 'Active' : (Number(gameState.lane_weight || 0) > 0 ? 'Blended' : 'Inactive') }}
+          </span>
+        </div>
         <div class="param-row"><span>Base steal rate</span><strong>{{ formatPercent(gameState.base_steal_rate, 2) }}</strong></div>
         <div class="param-row"><span>Perpendicular decay</span><strong>{{ formatValue(gameState.steal_perp_decay) }}</strong></div>
         <div class="param-row"><span>Distance factor</span><strong>{{ formatValue(gameState.steal_distance_factor) }}</strong></div>
         <div class="param-row"><span>Position weight min</span><strong>{{ formatValue(gameState.steal_position_weight_min) }}</strong></div>
+
+        <div class="param-subhead">
+          Lob-Aware Terms
+          <span class="subhead-status" :class="{ active: usesLobAwarePassModel }">
+            {{ usesLobAwarePassModel ? 'Active' : 'Inactive' }}
+          </span>
+        </div>
+        <div class="param-row"><span>Passer pressure weight</span><strong>{{ formatValue(gameState.pass_passer_pressure_weight) }}</strong></div>
+        <div class="param-row"><span>Receiver pressure weight</span><strong>{{ formatValue(gameState.pass_receiver_pressure_weight) }}</strong></div>
+        <div class="param-row"><span>Lob lane multiplier</span><strong>{{ formatValue(gameState.pass_lob_lane_multiplier) }}</strong></div>
+        <div class="param-row"><span>Lob receiver distance</span><strong>{{ formatValue(gameState.pass_lob_receiver_distance) }}</strong></div>
       </article>
 
       <article class="env-card">
@@ -316,6 +396,47 @@ const aiSkillRows = computed(() => buildSkillRows(aiIds.value, sampledSideSkills
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--app-text-muted);
+}
+
+.env-note {
+  margin: 0.2rem 0 0.55rem;
+  color: var(--app-text-muted);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.param-subhead {
+  margin: 0.58rem 0 0.22rem;
+  padding-top: 0.42rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  color: var(--app-accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.subhead-status {
+  display: inline-flex;
+  margin-left: 0.45rem;
+  padding: 0.08rem 0.34rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  color: var(--app-text-muted);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+
+.subhead-status.active {
+  border-color: rgba(34, 211, 238, 0.55);
+  color: var(--app-accent);
+  background: rgba(34, 211, 238, 0.08);
+}
+
+.mode-badge {
+  color: var(--app-accent) !important;
+  font-weight: 700;
 }
 
 .param-row {

@@ -6,7 +6,7 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview } from './services/api';
+import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -119,6 +119,37 @@ function syncPolicyProbsFromState(state) {
   policyProbs.value = hasAnyProbabilities(snapshotProbs) ? snapshotProbs : null;
 }
 
+function getRandomStartTemplateOptionsFromControls() {
+  const controls = controlsRef.value;
+  return controls?.getRandomStartTemplateOptions?.()
+    || controls?.getRandomSelfPlayStartTemplateOptions?.()
+    || null;
+}
+
+async function applyStartTemplateOptionsToCurrentState(options) {
+  if (!options?.templateId) return false;
+  const response = await applyStartTemplate(
+    options.templateId,
+    options.mirrored ?? null,
+    true,
+    options.seed ?? null,
+  );
+  if (!response?.state) {
+    throw new Error(response?.message || 'Failed to apply random start template.');
+  }
+  gameState.value = response.state;
+  if (gameHistory.value.length > 0) {
+    gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
+  } else {
+    gameHistory.value = [cloneState(response.state)];
+  }
+  syncPolicyProbsFromState(response.state);
+  clearReboundPreview();
+  currentSelections.value = null;
+  userSelections.value = {};
+  return true;
+}
+
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
@@ -145,8 +176,8 @@ const reboundPreviewError = ref(null);
 const reboundPreviewParams = ref({
   targetTemperature: 1.0,
   targetUniformMix: 0.0,
-  targetDistanceWeight: 1.10,
-  winnerTemperature: 0.75,
+  targetDistanceWeight: 1.0,
+  winnerTemperature: 1.0,
 });
 
 const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
@@ -217,8 +248,8 @@ async function refreshReboundPreview() {
       enabled: true,
       target_temperature: Number(params.targetTemperature ?? 1.0),
       target_uniform_mix: Number(params.targetUniformMix ?? 0.0),
-      target_distance_weight: Number(params.targetDistanceWeight ?? 1.10),
-      winner_temperature: Number(params.winnerTemperature ?? 0.75),
+      target_distance_weight: Number(params.targetDistanceWeight ?? 1.0),
+      winner_temperature: Number(params.winnerTemperature ?? 1.0),
     });
   } catch (err) {
     reboundPreview.value = null;
@@ -436,9 +467,32 @@ const templateConfig = ref(defaultTemplateAuthoringConfig());
 const perPlayerEvalStats = ref({});
 const perIntentEvalStats = ref({});
 const placementPassPreview = ref({});
+const passLabBoardConfig = ref({ active: false, positions: [], ballHolder: null, passProbs: {} });
 const isEvalPlacementMode = computed(() => evalConfig.value.mode === 'custom');
 const isTemplatePlacementMode = computed(() => activeControlsTab.value === 'template');
-const isBoardEditingMode = computed(() => isEvalPlacementMode.value || isTemplatePlacementMode.value);
+const isPassLabPlacementMode = computed(() => activeControlsTab.value === 'pass_lab' && Boolean(passLabBoardConfig.value?.active));
+const isBoardEditingMode = computed(() => isEvalPlacementMode.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
+const boardPlacementEditable = computed(() => {
+  if (isTemplatePlacementMode.value || isPassLabPlacementMode.value) return true;
+  return Boolean(evalConfig.value.placementEditing);
+});
+const boardPlacementPositions = computed(() => {
+  if (isTemplatePlacementMode.value) return templateConfig.value.positions;
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.positions || [];
+  return evalConfig.value.positions;
+});
+const boardPlacementBallHolder = computed(() => {
+  if (isTemplatePlacementMode.value) return templateConfig.value.ballHolder;
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.ballHolder;
+  return evalConfig.value.ballHolder;
+});
+const boardPlacementPassProbs = computed(() => {
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.passProbs || {};
+  if (isTemplatePlacementMode.value) return {};
+  return placementPassPreview.value;
+});
+const boardShowCoordinates = computed(() => isTemplatePlacementMode.value || isPassLabPlacementMode.value);
+const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const activeControlsTab = ref('controls');
 const shotChartOptions = computed(() => {
   const opts = [{ label: 'Team', value: 'team' }];
@@ -557,19 +611,78 @@ const boardRenderKey = computed(() => {
   ].join('-');
 });
 const boardPolicyProbabilities = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? null : policyProbs.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value) ? null : policyProbs.value
 );
 const boardSelectedActionsDisplay = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : visibleBoardSelectedActions.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value) ? {} : visibleBoardSelectedActions.value
 );
-const boardReboundTargetOverlay = computed(() =>
-  (!isPlaybookBoardPreviewActive.value
-    && !isBoardEditingMode.value
-    && reboundPreviewEnabled.value
-    && reboundPreview.value?.available)
-    ? reboundPreview.value
-    : null
-);
+function buildReboundTargetOverlayFromState(state) {
+  const results = state?.last_action_results;
+  const rebound = results?.rebound || (Array.isArray(results?.rebounds) ? results.rebounds[0] : null);
+  if (!rebound || !rebound.attempt) return null;
+
+  const targetProb = Number(rebound.target_prob);
+  const target = Array.isArray(rebound.target) && rebound.target.length >= 2
+    ? {
+      q: Number(rebound.target[0]),
+      r: Number(rebound.target[1]),
+      prob: Number.isFinite(targetProb) ? targetProb : 1,
+      index: rebound.target_cell_index ?? null,
+    }
+    : null;
+  const targetCells = Array.isArray(rebound.target_cells)
+    ? rebound.target_cells
+      .map((cell) => ({
+        q: Number(cell?.q),
+        r: Number(cell?.r),
+        prob: Number(cell?.prob),
+        index: cell?.index ?? null,
+      }))
+      .filter((cell) => Number.isFinite(cell.q) && Number.isFinite(cell.r) && Number.isFinite(cell.prob) && cell.prob > 0)
+    : [];
+  const winnerId = Number(rebound.winner);
+  const winnerProb = Number(rebound.winner_conditional_prob);
+  const sampledWinner = Number.isFinite(winnerId)
+    ? {
+      player_id: winnerId,
+      team: rebound.winner_team || null,
+      conditional_prob: Number.isFinite(winnerProb) ? winnerProb : 1,
+    }
+    : null;
+  if (!target || !sampledWinner) return null;
+
+  return {
+    available: true,
+    source: 'live_rebound_step',
+    target_cells: targetCells.length ? targetCells : [target],
+    sampled_target: target,
+    sampled_winner: sampledWinner,
+    winner_probs: Array.isArray(rebound.winner_probs) ? rebound.winner_probs : [],
+    shot: {
+      player_id: rebound.shot_shooter,
+      shot_type: rebound.offensive ? 'offensive rebound' : 'defensive rebound',
+    },
+  };
+}
+
+const visibleBoardStateForOverlay = computed(() => {
+  const history = boardGameHistory.value;
+  if (Array.isArray(history) && history.length > 0) {
+    return history[history.length - 1];
+  }
+  return gameState.value;
+});
+
+const liveReboundTargetOverlay = computed(() => buildReboundTargetOverlayFromState(visibleBoardStateForOverlay.value));
+
+const boardReboundTargetOverlay = computed(() => {
+  if (isPlaybookBoardPreviewActive.value || isBoardEditingMode.value) return null;
+  // Eval shot charts should not be hidden by a stale live rebound overlay from the current board state.
+  if (hasShotChartData.value && !reboundPreviewEnabled.value) return null;
+  if (disableTransitionsForCapture.value) return liveReboundTargetOverlay.value;
+  if (reboundPreviewEnabled.value && reboundPreview.value?.available) return reboundPreview.value;
+  return liveReboundTargetOverlay.value;
+});
 const boardShotAccumulatorDisplay = computed(() =>
   (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
     ? {}
@@ -987,6 +1100,7 @@ async function handleResetPositions() {
     if (gameHistory.value.length > 0) {
       gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
     }
+    syncPolicyProbsFromState(response.state);
 
   } catch (err) {
     console.error('[App] Failed to reset turn via backend:', err);
@@ -1348,9 +1462,11 @@ function handleSelfPlayButton() {
     console.log('[App] Self-play disabled in sandbox/editing modes');
     return;
   }
-  // Get current selections from PlayerControls
-  const preselected = controlsRef.value?.getSelectedActions?.() || null;
-  handleSelfPlay(preselected);
+  // Get current selections from PlayerControls. If self-play is configured
+  // to reset onto a random template, discard stale actions from the old board.
+  const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
+  const preselected = startTemplateOptions ? null : (controlsRef.value?.getSelectedActions?.() || null);
+  handleSelfPlay(preselected, startTemplateOptions);
 }
 
 function handleTemplateSelfPlay(options = {}) {
@@ -1761,9 +1877,38 @@ function handleTemplatePlacementUpdate({ playerId, q, r }) {
   handleTemplateConfigChanged({ positions });
 }
 
+function handlePassLabConfigChanged(config) {
+  const positions = Array.isArray(config?.positions)
+    ? config.positions.map((pos) => Array.isArray(pos) ? [Number(pos[0]) || 0, Number(pos[1]) || 0] : [0, 0])
+    : [];
+  passLabBoardConfig.value = {
+    active: Boolean(config?.active),
+    positions,
+    ballHolder: config?.ballHolder ?? null,
+    passProbs: config?.passProbs && typeof config.passProbs === 'object' ? { ...config.passProbs } : {},
+  };
+}
+
+function handlePassLabPlacementUpdate({ playerId, q, r }) {
+  if (playerId === undefined || playerId === null) return;
+  const next = Array.isArray(passLabBoardConfig.value.positions)
+    ? passLabBoardConfig.value.positions.map((pos) => [pos[0], pos[1]])
+    : [];
+  next[Number(playerId)] = [Number(q) || 0, Number(r) || 0];
+  passLabBoardConfig.value = {
+    ...passLabBoardConfig.value,
+    positions: next,
+  };
+  controlsRef.value?.handlePassLabPlacementUpdate?.({ playerId, q, r });
+}
+
 function handleBoardPlacementUpdate(payload) {
   if (isTemplatePlacementMode.value) {
     handleTemplatePlacementUpdate(payload);
+    return;
+  }
+  if (isPassLabPlacementMode.value) {
+    handlePassLabPlacementUpdate(payload);
     return;
   }
   handleEvalPlacementUpdate(payload);
@@ -2009,6 +2154,7 @@ function stateHasAnimatedFlash(state) {
   if (!results) return false;
 
   const hasShot = results.shots && Object.keys(results.shots).length > 0;
+  const hasRebound = Array.isArray(results.rebounds) && results.rebounds.length > 0;
   const hasPass =
     results.passes &&
     Object.values(results.passes).some(
@@ -2018,7 +2164,7 @@ function stateHasAnimatedFlash(state) {
         Number.isFinite(Number(passRes.target))
     );
 
-  return Boolean(hasShot || hasPass);
+  return Boolean(hasShot || hasPass || hasRebound);
 }
 
 function captureOffsetsForState(state) {
@@ -2058,8 +2204,18 @@ async function handleSaveEpisode() {
     disableTransitionsForCapture.value = true;
     moveProgressForCapture.value = 1;
     await nextTick();
-    // Check if we have episode states to render
-    const states = replayStates.value.length > 0 ? replayStates.value : [gameState.value];
+    // Check if we have episode states to render. Prefer the longest history so
+    // self-play possessions that continue after offensive rebounds are not truncated
+    // by a shorter/manual replay buffer.
+    const stateSources = [
+      Array.isArray(replayStates.value) ? replayStates.value : [],
+      Array.isArray(gameHistory.value) ? gameHistory.value : [],
+      gameState.value ? [gameState.value] : [],
+    ];
+    const states = stateSources.reduce(
+      (best, candidate) => (candidate.length > best.length ? candidate : best),
+      [],
+    );
     
     if (!states || states.length === 0) {
       alert('No episode states available to save');
@@ -2316,7 +2472,8 @@ function toggleReplayPause() {
   isReplayPaused.value = !isReplayPaused.value;
 }
 
-function handlePlayAgain() {
+async function handlePlayAgain() {
+  const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
   cancelReplayAnimation();
   gameState.value = null;
   gameHistory.value = [];
@@ -2348,9 +2505,17 @@ function handlePlayAgain() {
   evalNumEpisodes.value = 100;
   if (initialSetup.value) {
     if (initialSetup.value.mode === 'template_sandbox') {
-      handleTemplateSandboxStarted(initialSetup.value);
+      await handleTemplateSandboxStarted(initialSetup.value);
     } else {
-      handleGameStarted(initialSetup.value);
+      await handleGameStarted(initialSetup.value);
+      if (startTemplateOptions) {
+        try {
+          await applyStartTemplateOptionsToCurrentState(startTemplateOptions);
+        } catch (err) {
+          console.error('[App] Failed to apply random start template after New Game:', err);
+          alert(`Failed to apply random start template: ${err.message}`);
+        }
+      }
     }
   }
 }
@@ -2601,18 +2766,18 @@ onBeforeUnmount(() => {
           :shot-chart-label="boardShotChartLabelDisplay"
           :rebound-target-overlay="boardReboundTargetOverlay"
           :placement-mode="isBoardEditingMode"
-          :placement-editable="isTemplatePlacementMode ? true : evalConfig.placementEditing"
-          :placement-positions="isTemplatePlacementMode ? templateConfig.positions : evalConfig.positions"
-          :placement-ball-holder="isTemplatePlacementMode ? templateConfig.ballHolder : evalConfig.ballHolder"
-          :placement-pass-probs="isTemplatePlacementMode ? {} : placementPassPreview"
-          :show-coordinates="isTemplatePlacementMode"
+          :placement-editable="boardPlacementEditable"
+          :placement-positions="boardPlacementPositions"
+          :placement-ball-holder="boardPlacementBallHolder"
+          :placement-pass-probs="boardPlacementPassProbs"
+          :show-coordinates="boardShowCoordinates"
           @update-player-position="handlePlayerPositionUpdate"
           @update-placement="handleBoardPlacementUpdate"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
-          :disable-backend-value-fetches="isPlaybookBoardPreviewActive || isTemplatePlacementMode"
+          :disable-backend-value-fetches="boardDisableBackendValueFetches"
           :allow-position-drag="!isPlaybookBoardPreviewActive"
           :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"
         />
@@ -2675,6 +2840,7 @@ onBeforeUnmount(() => {
           @eval-run="handleEvalRunRequested"
           @template-self-play="handleTemplateSelfPlay"
           @active-tab-changed="handleActiveTabChanged"
+          @pass-lab-config-changed="handlePassLabConfigChanged"
           @stats-reset="handleStatsReset"
           ref="controlsRef"
         />

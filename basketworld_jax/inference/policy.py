@@ -240,6 +240,10 @@ class JAXInferenceModel:
                 "pressure_exposure",
                 "hoop_q_norm",
                 "hoop_r_norm",
+                "expected_rebound_target_q",
+                "expected_rebound_target_r",
+                "target_entropy",
+                "orb_prob_if_current_shot_misses",
             ],
         }
 

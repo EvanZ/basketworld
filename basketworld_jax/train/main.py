@@ -133,6 +133,23 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "steal_perp_decay",
         "steal_distance_factor",
         "steal_position_weight_min",
+        "pass_interception_model",
+        "pass_passer_pressure_weight",
+        "pass_receiver_pressure_weight",
+        "pass_lob_lane_multiplier",
+        "pass_lob_receiver_distance",
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "base_passer_risk",
+        "passer_pressure_decay",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "receiver_alignment_width",
+        "max_receiver_hazard",
+        "lane_weight",
         "spawn_distance",
         "max_spawn_distance",
         "defender_spawn_distance",
@@ -187,6 +204,14 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "start_template_jitter_scale",
         "start_template_mirror_prob",
         "start_template_strict",
+        "enable_rebounds",
+        "rebound_table_model_dir",
+        "rebound_target_temperature",
+        "rebound_target_uniform_mix",
+        "rebound_winner_distance_weight",
+        "rebound_winner_temperature",
+        "offensive_rebound_shot_clock_reset",
+        "rebound_terminal_reward_mode",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -217,6 +242,23 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "steal_perp_decay",
     "steal_distance_factor",
     "steal_position_weight_min",
+    "pass_interception_model",
+    "pass_passer_pressure_weight",
+    "pass_receiver_pressure_weight",
+    "pass_lob_lane_multiplier",
+    "pass_lob_receiver_distance",
+    "pass_speed",
+    "defender_reaction_time",
+    "defender_speed",
+    "defender_reach_radius",
+    "reaction_softness",
+    "base_passer_risk",
+    "passer_pressure_decay",
+    "base_receiver_risk",
+    "receiver_alignment_min",
+    "receiver_alignment_width",
+    "max_receiver_hazard",
+    "lane_weight",
     "spawn_distance",
     "max_spawn_distance",
     "defender_spawn_distance",
@@ -258,6 +300,14 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "intent_null_prob",
     "defense_intent_null_prob",
     "intent_visible_to_defense_prob",
+    "enable_rebounds",
+    "rebound_table_model_dir",
+    "rebound_target_temperature",
+    "rebound_target_uniform_mix",
+    "rebound_winner_distance_weight",
+    "rebound_winner_temperature",
+    "offensive_rebound_shot_clock_reset",
+    "rebound_terminal_reward_mode",
 )
 
 
@@ -594,8 +644,37 @@ def parse_args(argv=None):
         type=int,
         default=0,
         help=(
-            "Save a numbered checkpoint every N updates. Final update is always "
-            "saved when checkpoint publishing is enabled."
+            "Save a numbered checkpoint every N updates in fixed mode, or use "
+            "this as the capped late-training interval in logarithmic mode. "
+            "Final update is always saved when checkpoint publishing is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-schedule",
+        choices=("fixed", "log"),
+        default="fixed",
+        help=(
+            "Periodic checkpoint cadence. 'fixed' preserves the legacy modulo "
+            "behavior. 'log' starts from --checkpoint-log-initial-updates and "
+            "grows logarithmically until capped by --checkpoint-every-updates."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-log-initial-updates",
+        type=int,
+        default=1,
+        help=(
+            "Initial periodic checkpoint interval for --checkpoint-schedule log. "
+            "Ignored in fixed mode."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-log-ramp-updates",
+        type=int,
+        default=0,
+        help=(
+            "Update index by which the logarithmic checkpoint interval reaches "
+            "--checkpoint-every-updates. 0 means --num-updates."
         ),
     )
     parser.add_argument(
@@ -652,6 +731,53 @@ def parse_args(argv=None):
             "Probability that a frozen opponent episode uses deterministic argmax "
             "actions instead of sampled actions. The choice is held fixed until "
             "that env row resets."
+        ),
+    )
+    parser.add_argument(
+        "--enable-rebounds",
+        action="store_true",
+        help=(
+            "Enable half-court offensive rebound continuation after missed shots. "
+            "Requires --rebound-table-model-dir."
+        ),
+    )
+    parser.add_argument(
+        "--rebound-table-model-dir",
+        type=str,
+        default="",
+        help="Path to a fitted rebound target table artifact directory.",
+    )
+    parser.add_argument(
+        "--rebound-target-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied when sampling rebound landing target cells.",
+    )
+    parser.add_argument(
+        "--rebound-target-uniform-mix",
+        type=float,
+        default=0.0,
+        help="Uniform mixture weight for rebound target sampling, in [0, 1].",
+    )
+    parser.add_argument(
+        "--rebound-winner-distance-weight",
+        type=float,
+        default=1.0,
+        help="Distance penalty weight for choosing the rebound winner from the target cell.",
+    )
+    parser.add_argument(
+        "--rebound-winner-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied when sampling the rebound winner from distance logits.",
+    )
+    parser.add_argument(
+        "--offensive-rebound-shot-clock-reset",
+        type=int,
+        default=14,
+        help=(
+            "Shot-clock value used after an offensive rebound when the current clock "
+            "is lower than this value."
         ),
     )
     args = parser.parse_args(argv_list)
@@ -724,6 +850,16 @@ def validate_train_args(args) -> None:
         "defender_pressure_decay_lambda",
         "steal_perp_decay",
         "steal_distance_factor",
+        "pass_passer_pressure_weight",
+        "pass_receiver_pressure_weight",
+        "pass_lob_receiver_distance",
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "passer_pressure_decay",
+        "receiver_alignment_width",
     ):
         value = getattr(args, key, None)
         if value is not None and float(value) < 0.0:
@@ -736,10 +872,19 @@ def validate_train_args(args) -> None:
         "defender_pressure_turnover_chance",
         "base_steal_rate",
         "steal_position_weight_min",
+        "pass_lob_lane_multiplier",
+        "base_passer_risk",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "max_receiver_hazard",
+        "lane_weight",
     ):
         value = getattr(args, key, None)
         if value is not None and (float(value) < 0.0 or float(value) > 1.0):
             raise SystemExit(f"--{key.replace('_', '-')} must be in [0, 1].")
+    pass_interception_model = str(getattr(args, "pass_interception_model", "line") or "line").strip().lower()
+    if pass_interception_model not in {"line", "lob_aware", "lob-aware", "lob", "reaction", "speed", "speed_based", "speed-based"}:
+        raise SystemExit("--pass-interception-model must be one of: line, lob_aware, reaction.")
     shot_pressure_arc_degrees = float(getattr(args, "shot_pressure_arc_degrees", 0.0))
     if shot_pressure_arc_degrees <= 0.0 or shot_pressure_arc_degrees > 360.0:
         raise SystemExit("--shot-pressure-arc-degrees must be in (0, 360].")
@@ -752,6 +897,28 @@ def validate_train_args(args) -> None:
     )
     if opponent_deterministic_episode_prob < 0.0 or opponent_deterministic_episode_prob > 1.0:
         raise SystemExit("--opponent-deterministic-episode-prob must be in [0, 1].")
+    if bool(getattr(args, "enable_rebounds", False)):
+        rebound_table_model_dir = str(getattr(args, "rebound_table_model_dir", "") or "").strip()
+        if not rebound_table_model_dir:
+            raise SystemExit("--enable-rebounds requires --rebound-table-model-dir.")
+        if not Path(rebound_table_model_dir).exists():
+            raise SystemExit(f"--rebound-table-model-dir does not exist: {rebound_table_model_dir}")
+    for key in ("rebound_target_temperature", "rebound_winner_temperature"):
+        value = float(getattr(args, key, 1.0))
+        if value <= 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be > 0.")
+    rebound_target_uniform_mix = float(getattr(args, "rebound_target_uniform_mix", 0.0))
+    if rebound_target_uniform_mix < 0.0 or rebound_target_uniform_mix > 1.0:
+        raise SystemExit("--rebound-target-uniform-mix must be in [0, 1].")
+    if float(getattr(args, "rebound_winner_distance_weight", 1.0)) < 0.0:
+        raise SystemExit("--rebound-winner-distance-weight must be >= 0.")
+    if int(getattr(args, "offensive_rebound_shot_clock_reset", 14)) < 1:
+        raise SystemExit("--offensive-rebound-shot-clock-reset must be >= 1.")
+    rebound_terminal_reward_mode = str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points")
+    if rebound_terminal_reward_mode not in {"actual_points", "last_shot_ep_on_defensive_rebound", "last_shot_ep"}:
+        raise SystemExit(
+            "--rebound-terminal-reward-mode must be 'actual_points', 'last_shot_ep_on_defensive_rebound', or 'last_shot_ep'."
+        )
     for key in (
         "intent_null_prob",
         "defense_intent_null_prob",
@@ -909,6 +1076,57 @@ def _selector_learning_rate_for_args(args, trainer_config: TrainerConfig) -> flo
     return float(override)
 
 
+def _checkpoint_interval_for_update(args, update_index: int) -> int:
+    max_interval = int(getattr(args, "checkpoint_every_updates", 0) or 0)
+    if max_interval <= 0:
+        return 0
+
+    schedule = str(getattr(args, "checkpoint_schedule", "fixed") or "fixed").strip().lower()
+    if schedule != "log":
+        return max_interval
+
+    min_interval = int(getattr(args, "checkpoint_log_initial_updates", 1) or 1)
+    min_interval = max(1, min(min_interval, max_interval))
+    if max_interval <= min_interval:
+        return max_interval
+
+    ramp_updates = int(getattr(args, "checkpoint_log_ramp_updates", 0) or 0)
+    if ramp_updates <= 0:
+        ramp_updates = int(getattr(args, "num_updates", max_interval) or max_interval)
+    ramp_updates = max(1, ramp_updates)
+
+    update = max(1, int(update_index))
+    progress = float(np.log1p(update)) / float(np.log1p(ramp_updates))
+    progress = max(0.0, min(1.0, progress))
+    interval = int(round(min_interval + (max_interval - min_interval) * progress))
+    return max(min_interval, min(max_interval, interval))
+
+
+def _periodic_checkpoint_updates(args) -> set[int]:
+    max_update = int(getattr(args, "num_updates", 0) or 0)
+    max_interval = int(getattr(args, "checkpoint_every_updates", 0) or 0)
+    if max_update <= 0 or max_interval <= 0:
+        return set()
+
+    schedule = str(getattr(args, "checkpoint_schedule", "fixed") or "fixed").strip().lower()
+    if schedule != "log":
+        return {
+            update
+            for update in range(1, max_update + 1)
+            if update % max_interval == 0
+        }
+
+    due_updates: set[int] = set()
+    min_interval = int(getattr(args, "checkpoint_log_initial_updates", 1) or 1)
+    min_interval = max(1, min(min_interval, max_interval))
+    next_due = min_interval
+    while next_due <= max_update:
+        due_updates.add(int(next_due))
+        interval = max(1, _checkpoint_interval_for_update(args, next_due))
+        next_due += interval
+    return due_updates
+
+
 def _checkpoint_trainer_config_from_args(
     trainer_config: TrainerConfig,
     args,
@@ -991,6 +1209,16 @@ def _checkpoint_trainer_config_from_args(
         "opponent_deterministic_episode_prob": float(
             getattr(args, "opponent_deterministic_episode_prob", 0.0)
         ),
+        "enable_rebounds": bool(getattr(args, "enable_rebounds", False)),
+        "rebound_table_model_dir": str(getattr(args, "rebound_table_model_dir", "") or ""),
+        "rebound_target_temperature": float(getattr(args, "rebound_target_temperature", 1.0)),
+        "rebound_target_uniform_mix": float(getattr(args, "rebound_target_uniform_mix", 0.0)),
+        "rebound_winner_distance_weight": float(getattr(args, "rebound_winner_distance_weight", 1.0)),
+        "rebound_winner_temperature": float(getattr(args, "rebound_winner_temperature", 1.0)),
+        "offensive_rebound_shot_clock_reset": int(
+            getattr(args, "offensive_rebound_shot_clock_reset", 14)
+        ),
+        "rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
     }
     config.update({key: to_builtin(value) for key, value in selector_fields.items()})
     return config
@@ -1640,6 +1868,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
             getattr(args, "intent_selector_multiselect_enabled", False)
         ),
         "jax/intent_selector_min_play_steps": int(getattr(args, "intent_selector_min_play_steps", 3)),
+        "jax/rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
         "jax/task_reward_scale_start": (
             ""
             if getattr(args, "task_reward_scale_start", None) is None
@@ -1666,6 +1895,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
         "jax/checkpoint_every_updates": int(args.checkpoint_every_updates),
+        "jax/checkpoint_schedule": str(getattr(args, "checkpoint_schedule", "fixed")),
+        "jax/checkpoint_log_initial_updates": int(getattr(args, "checkpoint_log_initial_updates", 1)),
+        "jax/checkpoint_log_ramp_updates": int(getattr(args, "checkpoint_log_ramp_updates", 0)),
         "jax/frozen_opponent_checkpoint": str(getattr(args, "frozen_opponent_checkpoint", "") or ""),
         "jax/frozen_opponent_run_id": str(getattr(args, "frozen_opponent_run_id", "") or ""),
         "jax/frozen_opponent_artifact": str(getattr(args, "frozen_opponent_artifact", "") or ""),
@@ -2829,6 +3061,7 @@ def run_training_loop(args) -> dict[str, Any]:
             unit="event",
         )
         pending_selector_batches = []
+        periodic_checkpoint_updates = _periodic_checkpoint_updates(args)
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
             loop_start_ns = perf_counter_ns()
@@ -3388,10 +3621,7 @@ def run_training_loop(args) -> dict[str, Any]:
             checkpoint_enabled = bool(checkpoint_dir) or mlflow is not None
             should_checkpoint = checkpoint_enabled and (
                 update_idx == int(args.num_updates)
-                or (
-                    int(args.checkpoint_every_updates) > 0
-                    and update_idx % int(args.checkpoint_every_updates) == 0
-                )
+                or int(update_idx) in periodic_checkpoint_updates
             )
             if should_checkpoint:
                 saved_candidate_info = None

@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
+import MathEquation from './MathEquation.vue';
 import {
   applyStartTemplate,
   cancelPlaybookAnalysis,
@@ -194,7 +195,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded', 'pass-lab-config-changed']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -607,6 +608,23 @@ const pressureParamsInput = ref({
   steal_perp_decay: 1.5,
   steal_distance_factor: 0.08,
   steal_position_weight_min: 0.3,
+  pass_interception_model: 'line',
+  pass_passer_pressure_weight: 0.0,
+  pass_receiver_pressure_weight: 0.0,
+  pass_lob_lane_multiplier: 0.35,
+  pass_lob_receiver_distance: 1.0,
+  pass_speed: 3.5,
+  defender_reaction_time: 0.35,
+  defender_speed: 1.25,
+  defender_reach_radius: 0.65,
+  reaction_softness: 0.55,
+  base_passer_risk: 0.06,
+  passer_pressure_decay: 1.35,
+  base_receiver_risk: 0.35,
+  receiver_alignment_min: 0.35,
+  receiver_alignment_width: 2.0,
+  max_receiver_hazard: 0.85,
+  lane_weight: 0.0,
   defender_pressure_distance: 1,
   defender_pressure_turnover_chance: 0.05,
   defender_pressure_decay_lambda: 1.0,
@@ -633,6 +651,23 @@ const PASS_INTERCEPTION_PARAM_KEYS = [
   'steal_perp_decay',
   'steal_distance_factor',
   'steal_position_weight_min',
+  'pass_interception_model',
+  'pass_passer_pressure_weight',
+  'pass_receiver_pressure_weight',
+  'pass_lob_lane_multiplier',
+  'pass_lob_receiver_distance',
+  'pass_speed',
+  'defender_reaction_time',
+  'defender_speed',
+  'defender_reach_radius',
+  'reaction_softness',
+  'base_passer_risk',
+  'passer_pressure_decay',
+  'base_receiver_risk',
+  'receiver_alignment_min',
+  'receiver_alignment_width',
+  'max_receiver_hazard',
+  'lane_weight',
 ];
 
 function isPressureSectionUpdating(section) {
@@ -781,6 +816,23 @@ function syncPressureParamsInputs(state) {
     steal_perp_decay: Number(src.steal_perp_decay ?? 1.5),
     steal_distance_factor: Number(src.steal_distance_factor ?? 0.08),
     steal_position_weight_min: Number(src.steal_position_weight_min ?? 0.3),
+    pass_interception_model: String(src.pass_interception_model || 'line'),
+    pass_passer_pressure_weight: Number(src.pass_passer_pressure_weight ?? 0.0),
+    pass_receiver_pressure_weight: Number(src.pass_receiver_pressure_weight ?? 0.0),
+    pass_lob_lane_multiplier: Number(src.pass_lob_lane_multiplier ?? 0.35),
+    pass_lob_receiver_distance: Number(src.pass_lob_receiver_distance ?? 1.0),
+    pass_speed: Number(src.pass_speed ?? 3.5),
+    defender_reaction_time: Number(src.defender_reaction_time ?? 0.35),
+    defender_speed: Number(src.defender_speed ?? 1.25),
+    defender_reach_radius: Number(src.defender_reach_radius ?? 0.65),
+    reaction_softness: Number(src.reaction_softness ?? 0.55),
+    base_passer_risk: Number(src.base_passer_risk ?? 0.06),
+    passer_pressure_decay: Number(src.passer_pressure_decay ?? 1.35),
+    base_receiver_risk: Number(src.base_receiver_risk ?? 0.35),
+    receiver_alignment_min: Number(src.receiver_alignment_min ?? 0.35),
+    receiver_alignment_width: Number(src.receiver_alignment_width ?? 2.0),
+    max_receiver_hazard: Number(src.max_receiver_hazard ?? 0.85),
+    lane_weight: Number(src.lane_weight ?? 0.0),
     defender_pressure_distance: Number(src.defender_pressure_distance ?? 1),
     defender_pressure_turnover_chance: Number(src.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(src.defender_pressure_decay_lambda ?? 1.0),
@@ -813,6 +865,23 @@ watch(
     props.gameState?.steal_perp_decay,
     props.gameState?.steal_distance_factor,
     props.gameState?.steal_position_weight_min,
+    props.gameState?.pass_interception_model,
+    props.gameState?.pass_passer_pressure_weight,
+    props.gameState?.pass_receiver_pressure_weight,
+    props.gameState?.pass_lob_lane_multiplier,
+    props.gameState?.pass_lob_receiver_distance,
+    props.gameState?.pass_speed,
+    props.gameState?.defender_reaction_time,
+    props.gameState?.defender_speed,
+    props.gameState?.defender_reach_radius,
+    props.gameState?.reaction_softness,
+    props.gameState?.base_passer_risk,
+    props.gameState?.passer_pressure_decay,
+    props.gameState?.base_receiver_risk,
+    props.gameState?.receiver_alignment_min,
+    props.gameState?.receiver_alignment_width,
+    props.gameState?.max_receiver_hazard,
+    props.gameState?.lane_weight,
     props.gameState?.defender_pressure_distance,
     props.gameState?.defender_pressure_turnover_chance,
     props.gameState?.defender_pressure_decay_lambda,
@@ -827,6 +896,517 @@ watch(
   },
   { immediate: true }
 );
+
+
+const PASS_LAB_SQRT3 = Math.sqrt(3);
+const passLabPositions = ref([]);
+const passLabBallHolder = ref(null);
+const passLabParams = ref({});
+const passLabInitialized = ref(false);
+
+const PASS_LAB_PARAM_META = {
+  pass_speed: {
+    symbol: 'v_pass',
+    tooltip: 'Pass speed in board hexes per decision step. Higher values reduce pass flight time and give defenders less reaction time.',
+  },
+  defender_reaction_time: {
+    symbol: 't_react',
+    tooltip: 'Defender reaction delay before they can move toward the catch point. Higher values make long passes safer.',
+  },
+  defender_speed: {
+    symbol: 'v_d',
+    tooltip: 'Defender closing speed after reaction time elapses, measured in board hexes per decision step.',
+  },
+  defender_reach_radius: {
+    symbol: 'r_d',
+    tooltip: 'Extra catch-point radius a defender can contest without needing to move into the exact receiver hex.',
+  },
+  reaction_softness: {
+    symbol: 's_react',
+    tooltip: 'Sigmoid softness for converting defender reach surplus into receiver-side interception probability.',
+  },
+  base_passer_risk: {
+    symbol: 'b_p',
+    tooltip: 'Base noisy-or hazard contributed by a defender pressuring the passer at close range.',
+  },
+  passer_pressure_decay: {
+    symbol: 'lambda_p',
+    tooltip: 'Exponential decay rate for passer pressure as defenders move farther from the passer.',
+  },
+  base_receiver_risk: {
+    symbol: 'b_r',
+    tooltip: 'Base receiver-side hazard multiplier applied to each defender who can react into the catch window.',
+  },
+  receiver_alignment_min: {
+    symbol: 'a_min',
+    tooltip: 'Minimum alignment multiplier for receiver pressure when the defender is not directly in the pass lane.',
+  },
+  receiver_alignment_width: {
+    symbol: 'w_a',
+    tooltip: 'Perpendicular-distance width over which receiver alignment fades from direct-lane pressure toward the floor.',
+  },
+  max_receiver_hazard: {
+    symbol: 'h_max',
+    tooltip: 'Maximum per-defender receiver-side interception hazard before noisy-or aggregation.',
+  },
+  lane_weight: {
+    symbol: 'w_lane',
+    tooltip: 'Weight on the legacy line-interception term inside the speed/reaction model. Zero disables the legacy lane term.',
+  },
+  base_steal_rate: {
+    symbol: 'b_legacy',
+    tooltip: 'Legacy line-model base steal contribution before distance, perpendicular, and position modifiers.',
+  },
+  steal_perp_decay: {
+    symbol: 'k_perp',
+    tooltip: 'Legacy line-model exponential decay as a defender moves farther perpendicular to the pass line.',
+  },
+  steal_distance_factor: {
+    symbol: 'k_dist',
+    tooltip: 'Legacy line-model multiplier for longer passes. Higher values increase turnover risk with pass distance.',
+  },
+  steal_position_weight_min: {
+    symbol: 'w_min',
+    tooltip: 'Legacy line-model minimum position weight along the pass path before ramping toward the receiver side.',
+  },
+  pass_passer_pressure_weight: {
+    symbol: 'w_passer',
+    tooltip: 'Legacy lob-aware passer-pressure multiplier. Only used by the production lob-aware model.',
+  },
+  pass_receiver_pressure_weight: {
+    symbol: 'w_receiver',
+    tooltip: 'Legacy lob-aware receiver-pressure multiplier. Only used by the production lob-aware model.',
+  },
+  pass_lob_lane_multiplier: {
+    symbol: 'm_lob',
+    tooltip: 'Legacy lob-aware multiplier applied to line-lane risk for passes to near-basket receivers.',
+  },
+  pass_lob_receiver_distance: {
+    symbol: 'd_lob',
+    tooltip: 'Receiver-to-basket distance threshold for treating a pass target as a lob candidate in the legacy lob-aware model.',
+  },
+};
+
+function passLabParamMeta(key) {
+  return PASS_LAB_PARAM_META[key] || { symbol: '', tooltip: '' };
+}
+
+
+function passLabClamp01(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.min(1, numeric));
+}
+
+function passLabNumber(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function passLabPercent(value) {
+  return `${(passLabClamp01(value) * 100).toFixed(1)}%`;
+}
+
+function normalizePassLabParams(input) {
+  return {
+    pass_interception_model: String(input?.pass_interception_model || 'reaction'),
+    pass_speed: Math.max(0.1, passLabNumber(input?.pass_speed, 3.5)),
+    defender_reaction_time: Math.max(0, passLabNumber(input?.defender_reaction_time, 0.35)),
+    defender_speed: Math.max(0, passLabNumber(input?.defender_speed, 1.25)),
+    defender_reach_radius: Math.max(0, passLabNumber(input?.defender_reach_radius, 0.65)),
+    reaction_softness: Math.max(0.05, passLabNumber(input?.reaction_softness, 0.55)),
+    base_passer_risk: passLabClamp01(input?.base_passer_risk ?? 0.06),
+    passer_pressure_decay: Math.max(0, passLabNumber(input?.passer_pressure_decay, 1.35)),
+    base_receiver_risk: passLabClamp01(input?.base_receiver_risk ?? 0.35),
+    receiver_alignment_min: passLabClamp01(input?.receiver_alignment_min ?? 0.35),
+    receiver_alignment_width: Math.max(0.1, passLabNumber(input?.receiver_alignment_width, 2.0)),
+    max_receiver_hazard: passLabClamp01(input?.max_receiver_hazard ?? 0.85),
+    lane_weight: passLabClamp01(input?.lane_weight ?? 0.0),
+    base_steal_rate: Math.max(0, passLabNumber(input?.base_steal_rate, 0.35)),
+    steal_perp_decay: Math.max(0, passLabNumber(input?.steal_perp_decay, 1.5)),
+    steal_distance_factor: Math.max(0, passLabNumber(input?.steal_distance_factor, 0.08)),
+    steal_position_weight_min: passLabClamp01(input?.steal_position_weight_min ?? 0.3),
+    pass_passer_pressure_weight: Math.max(0, passLabNumber(input?.pass_passer_pressure_weight, 0.0)),
+    pass_receiver_pressure_weight: Math.max(0, passLabNumber(input?.pass_receiver_pressure_weight, 0.0)),
+    pass_lob_lane_multiplier: passLabClamp01(input?.pass_lob_lane_multiplier ?? 0.35),
+    pass_lob_receiver_distance: Math.max(0, passLabNumber(input?.pass_lob_receiver_distance, 1.0)),
+  };
+}
+
+function copyPassLabParamsFromRuntime() {
+  passLabParams.value = {
+    ...normalizePassLabParams(pressureParamsInput.value || {}),
+    pass_interception_model: 'reaction',
+  };
+}
+
+function passLabModelKey(params = passLabParams.value || {}) {
+  return String(params?.pass_interception_model || 'reaction').trim().toLowerCase();
+}
+
+function passLabUsesReactionModelValue(params = passLabParams.value || {}) {
+  return ['reaction', 'speed', 'speed_based', 'speed-based'].includes(passLabModelKey(params));
+}
+
+function passLabUsesLobAwareModelValue(params = passLabParams.value || {}) {
+  return ['lob_aware', 'lob-aware', 'lob'].includes(passLabModelKey(params));
+}
+
+const passLabUsesReactionModel = computed(() => passLabUsesReactionModelValue(passLabParams.value || {}));
+const passLabRuntimeApplyEnabled = computed(() => {
+  const model = passLabModelKey(passLabParams.value || {});
+  return ['line', 'lob_aware', 'lob-aware', 'lob'].includes(model);
+});
+
+function passLabNoisyOr(values) {
+  let complementProduct = 1.0;
+  for (const value of values || []) {
+    complementProduct *= (1.0 - passLabClamp01(value));
+  }
+  return passLabClamp01(1.0 - complementProduct);
+}
+
+function passLabSigmoid(value) {
+  const x = passLabNumber(value, 0);
+  if (x >= 40) return 1.0;
+  if (x <= -40) return 0.0;
+  return 1.0 / (1.0 + Math.exp(-x));
+}
+
+function passLabAxialToCartesian(q, r) {
+  return {
+    x: PASS_LAB_SQRT3 * Number(q || 0) + (PASS_LAB_SQRT3 / 2) * Number(r || 0),
+    y: 1.5 * Number(r || 0),
+  };
+}
+
+function passLabHexDistance(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return 0;
+  const q1 = Number(a[0] || 0);
+  const r1 = Number(a[1] || 0);
+  const q2 = Number(b[0] || 0);
+  const r2 = Number(b[1] || 0);
+  return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
+}
+
+function passLabClonePositions(positions) {
+  if (!Array.isArray(positions)) return [];
+  return positions.map((pos) => Array.isArray(pos) ? [Number(pos[0] || 0), Number(pos[1] || 0)] : [0, 0]);
+}
+
+function passLabUniqueIds(values) {
+  const ids = [];
+  const seen = new Set();
+  for (const raw of values || []) {
+    const id = Number(raw);
+    if (!Number.isFinite(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function resetPassLabFromGameState(copyParams = true) {
+  const gs = props.gameState;
+  passLabPositions.value = passLabClonePositions(gs?.positions || []);
+  const offenseIds = passLabUniqueIds(gs?.offense_ids || []);
+  const fallbackBallHolder = offenseIds.length ? offenseIds[0] : (passLabPositions.value.length ? 0 : null);
+  const stateBallHolder = Number(gs?.ball_holder);
+  passLabBallHolder.value = Number.isFinite(stateBallHolder) ? stateBallHolder : fallbackBallHolder;
+  if (copyParams) copyPassLabParamsFromRuntime();
+  passLabInitialized.value = true;
+}
+
+const passLabStateShapeKey = computed(() => {
+  const gs = props.gameState || {};
+  return [
+    Array.isArray(gs.positions) ? gs.positions.length : 0,
+    Array.isArray(gs.offense_ids) ? gs.offense_ids.join(',') : '',
+    Array.isArray(gs.defense_ids) ? gs.defense_ids.join(',') : '',
+  ].join('|');
+});
+
+watch(
+  passLabStateShapeKey,
+  () => {
+    if (!props.gameState) return;
+    if (!passLabInitialized.value || passLabPositions.value.length !== (props.gameState.positions?.length || 0)) {
+      resetPassLabFromGameState(true);
+    }
+  },
+  { immediate: true }
+);
+
+const passLabPlayerOptions = computed(() => {
+  const gs = props.gameState || {};
+  const fromTeams = passLabUniqueIds([...(gs.offense_ids || []), ...(gs.defense_ids || [])]);
+  if (fromTeams.length) return fromTeams;
+  return passLabPositions.value.map((_, idx) => idx);
+});
+
+const passLabTeamIds = computed(() => {
+  const gs = props.gameState || {};
+  const passerId = Number(passLabBallHolder.value);
+  const offenseIds = passLabUniqueIds(gs.offense_ids || []);
+  const defenseIds = passLabUniqueIds(gs.defense_ids || []);
+  if (offenseIds.includes(passerId)) return offenseIds;
+  if (defenseIds.includes(passerId)) return defenseIds;
+  return passLabPlayerOptions.value;
+});
+
+const passLabOpponentIds = computed(() => {
+  const gs = props.gameState || {};
+  const passerId = Number(passLabBallHolder.value);
+  const offenseIds = passLabUniqueIds(gs.offense_ids || []);
+  const defenseIds = passLabUniqueIds(gs.defense_ids || []);
+  if (offenseIds.includes(passerId)) return defenseIds;
+  if (defenseIds.includes(passerId)) return offenseIds;
+  return [];
+});
+
+const passLabReceiverIds = computed(() => {
+  const passerId = Number(passLabBallHolder.value);
+  return passLabTeamIds.value.filter((id) => id !== passerId);
+});
+function passLabPlayerLabel(playerId) {
+  const id = Number(playerId);
+  const offenseIds = passLabUniqueIds(props.gameState?.offense_ids || []);
+  const defenseIds = passLabUniqueIds(props.gameState?.defense_ids || []);
+  if (offenseIds.includes(id)) return `O${offenseIds.indexOf(id)} / P${id}`;
+  if (defenseIds.includes(id)) return `D${defenseIds.indexOf(id)} / P${id}`;
+  return `P${id}`;
+}
+
+function calculatePassLabRisk(receiverId) {
+  const positions = passLabPositions.value;
+  const passerId = Number(passLabBallHolder.value);
+  const recvId = Number(receiverId);
+  const passerPos = positions?.[passerId];
+  const recvPos = positions?.[recvId];
+  if (!Array.isArray(passerPos) || !Array.isArray(recvPos)) return null;
+
+  const params = normalizePassLabParams(passLabParams.value || {});
+  const passDistance = passLabHexDistance(passerPos, recvPos);
+  const dir = passLabAxialToCartesian(recvPos[0] - passerPos[0], recvPos[1] - passerPos[1]);
+  const dirNorm = Math.hypot(dir.x, dir.y) || 1;
+  const model = passLabModelKey(params);
+  const reactionModel = passLabUsesReactionModelValue(params);
+  const lobAware = passLabUsesLobAwareModelValue(params);
+  const basketPos = Array.isArray(props.gameState?.basket_position) ? props.gameState.basket_position : null;
+  const lobCandidate = Boolean(
+    lobAware &&
+    basketPos &&
+    passLabHexDistance(recvPos, basketPos) <= params.pass_lob_receiver_distance
+  );
+  const laneMultiplier = lobCandidate ? params.pass_lob_lane_multiplier : 1.0;
+  const defenderRows = [];
+  const passerHazards = [];
+  const receiverHazards = [];
+  const laneHazards = [];
+  const passTime = passDistance / Math.max(0.1, params.pass_speed);
+
+  for (const defenderId of passLabOpponentIds.value) {
+    const defenderPos = positions?.[defenderId];
+    if (!Array.isArray(defenderPos)) continue;
+    if (
+      (defenderPos[0] === passerPos[0] && defenderPos[1] === passerPos[1]) ||
+      (defenderPos[0] === recvPos[0] && defenderPos[1] === recvPos[1])
+    ) {
+      continue;
+    }
+
+    const rel = passLabAxialToCartesian(defenderPos[0] - passerPos[0], defenderPos[1] - passerPos[1]);
+    const dot = rel.x * dir.x + rel.y * dir.y;
+    const perpDistance = Math.abs(rel.x * dir.y - rel.y * dir.x) / dirNorm;
+    const positionT = dot / (dirNorm * dirNorm);
+    const inLaneSegment = dot >= 0.0 && 0.0 < positionT && positionT < 1.0;
+    const positionWeight = params.steal_position_weight_min + (1.0 - params.steal_position_weight_min) * positionT;
+    const rawLaneContrib = inLaneSegment ? (
+      params.base_steal_rate *
+      Math.exp(-params.steal_perp_decay * perpDistance) *
+      (1.0 + params.steal_distance_factor * passDistance) *
+      positionWeight *
+      laneMultiplier
+    ) : 0.0;
+    const laneContrib = passLabClamp01(rawLaneContrib);
+
+    if (reactionModel) {
+      const passerDist = passLabHexDistance(passerPos, defenderPos);
+      const passerHazard = passLabClamp01(
+        params.base_passer_risk * Math.exp(-params.passer_pressure_decay * Math.max(0.0, passerDist - 1.0))
+      );
+      const catchDist = passLabHexDistance(defenderPos, recvPos);
+      const availableTime = Math.max(0.0, passTime - params.defender_reaction_time);
+      const reachable = params.defender_speed * availableTime + params.defender_reach_radius;
+      const reactionProb = passLabSigmoid((reachable - catchDist) / params.reaction_softness);
+      const alignment = inLaneSegment ? (1.0 - passLabClamp01(perpDistance / params.receiver_alignment_width)) : 0.0;
+      const alignmentMultiplier = params.receiver_alignment_min + (1.0 - params.receiver_alignment_min) * alignment;
+      const receiverHazard = Math.min(
+        params.max_receiver_hazard,
+        passLabClamp01(params.base_receiver_risk * reactionProb * alignmentMultiplier)
+      );
+      const laneHazard = passLabClamp01(params.lane_weight * laneContrib);
+      const total = passLabNoisyOr([passerHazard, receiverHazard, laneHazard]);
+      passerHazards.push(passerHazard);
+      receiverHazards.push(receiverHazard);
+      laneHazards.push(laneHazard);
+      defenderRows.push({
+        defenderId,
+        total,
+        lane: laneHazard,
+        passer: passerHazard,
+        receiver: receiverHazard,
+        perpDistance,
+        positionT,
+        catchDist,
+        reachable,
+        reactionProb,
+      });
+      continue;
+    }
+
+    if (dot < 0) continue;
+    let passerContrib = 0.0;
+    if (lobAware && params.pass_passer_pressure_weight > 0.0) {
+      const pRel = passLabAxialToCartesian(defenderPos[0] - passerPos[0], defenderPos[1] - passerPos[1]);
+      const pNorm = Math.hypot(pRel.x, pRel.y);
+      if (pNorm > 0.0) {
+        const alignment = passLabClamp01((pRel.x * dir.x + pRel.y * dir.y) / (pNorm * dirNorm));
+        const passerDist = passLabHexDistance(passerPos, defenderPos);
+        passerContrib = (
+          params.base_steal_rate *
+          params.pass_passer_pressure_weight *
+          Math.exp(-params.steal_perp_decay * Math.max(0.0, passerDist - 1.0)) *
+          (1.0 + params.steal_distance_factor * passDistance) *
+          alignment
+        );
+      }
+    }
+
+    let receiverContrib = 0.0;
+    if (lobAware && params.pass_receiver_pressure_weight > 0.0) {
+      const rRel = passLabAxialToCartesian(defenderPos[0] - recvPos[0], defenderPos[1] - recvPos[1]);
+      const rNorm = Math.hypot(rRel.x, rRel.y);
+      if (rNorm > 0.0) {
+        const alignment = passLabClamp01(-((rRel.x * dir.x + rRel.y * dir.y) / (rNorm * dirNorm)));
+        const receiverDist = passLabHexDistance(recvPos, defenderPos);
+        receiverContrib = (
+          params.base_steal_rate *
+          params.pass_receiver_pressure_weight *
+          Math.exp(-params.steal_perp_decay * Math.max(0.0, receiverDist - 1.0)) *
+          (1.0 + params.steal_distance_factor * passDistance) *
+          alignment
+        );
+      }
+    }
+
+    const total = passLabClamp01(laneContrib + passerContrib + receiverContrib);
+    defenderRows.push({
+      defenderId,
+      total,
+      lane: passLabClamp01(laneContrib),
+      passer: passLabClamp01(passerContrib),
+      receiver: passLabClamp01(receiverContrib),
+      perpDistance,
+      positionT,
+    });
+  }
+
+  let passerRisk = 0.0;
+  let receiverRisk = 0.0;
+  let laneRisk = 0.0;
+  let turnover = 0.0;
+  if (reactionModel) {
+    passerRisk = passLabNoisyOr(passerHazards);
+    receiverRisk = passLabNoisyOr(receiverHazards);
+    laneRisk = passLabNoisyOr(laneHazards);
+    turnover = passLabNoisyOr([passerRisk, receiverRisk, laneRisk]);
+  } else {
+    turnover = passLabNoisyOr(defenderRows.map((row) => row.total));
+    laneRisk = turnover;
+  }
+
+  const topDefenders = [...defenderRows]
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 3)
+    .filter((row) => row.total > 0.0005)
+    .map((row) => `${passLabPlayerLabel(row.defenderId)} ${passLabPercent(row.total)}`)
+    .join(', ');
+
+  return {
+    receiverId: recvId,
+    distance: passDistance,
+    passTime: reactionModel ? passTime : null,
+    turnover,
+    completion: 1.0 - turnover,
+    model,
+    lobCandidate,
+    passerRisk,
+    receiverRisk,
+    laneRisk,
+    topDefenders: topDefenders || 'None',
+    defenderRows,
+  };
+}
+
+const passLabRows = computed(() => {
+  return passLabReceiverIds.value
+    .map((receiverId) => calculatePassLabRisk(receiverId))
+    .filter(Boolean)
+    .sort((a, b) => a.receiverId - b.receiverId);
+});
+
+const passLabPassProbs = computed(() => {
+  const out = {};
+  for (const row of passLabRows.value) {
+    out[row.receiverId] = row.turnover;
+  }
+  return out;
+});
+
+function getPassLabBoardConfig(activeOverride = null) {
+  const active = activeOverride === null ? activeTab.value === 'pass_lab' : Boolean(activeOverride);
+  return {
+    active,
+    positions: passLabClonePositions(passLabPositions.value),
+    ballHolder: passLabBallHolder.value,
+    passProbs: { ...(passLabPassProbs.value || {}) },
+  };
+}
+
+function emitPassLabConfig(activeOverride = null) {
+  emit('pass-lab-config-changed', getPassLabBoardConfig(activeOverride));
+}
+
+function handlePassLabPlacementUpdate(payload) {
+  if (!payload || payload.playerId === null || payload.playerId === undefined) return;
+  const playerId = Number(payload.playerId);
+  if (!Number.isFinite(playerId)) return;
+  const next = passLabClonePositions(passLabPositions.value);
+  if (!next[playerId]) return;
+  next[playerId] = [Number(payload.q || 0), Number(payload.r || 0)];
+  passLabPositions.value = next;
+  emitPassLabConfig();
+}
+
+async function applyPassLabParamsToRuntime() {
+  if (!passLabRuntimeApplyEnabled.value) return;
+  const params = normalizePassLabParams(passLabParams.value || {});
+  pressureParamsInput.value = {
+    ...(pressureParamsInput.value || {}),
+    base_steal_rate: params.base_steal_rate,
+    steal_perp_decay: params.steal_perp_decay,
+    steal_distance_factor: params.steal_distance_factor,
+    steal_position_weight_min: params.steal_position_weight_min,
+    pass_interception_model: params.pass_interception_model,
+    pass_passer_pressure_weight: params.pass_passer_pressure_weight,
+    pass_receiver_pressure_weight: params.pass_receiver_pressure_weight,
+    pass_lob_lane_multiplier: params.pass_lob_lane_multiplier,
+    pass_lob_receiver_distance: params.pass_lob_receiver_distance,
+  };
+  await applyPassInterceptionOverrides();
+}
+
 
 const offenseSkillRows = computed(() => {
   const ids = props.gameState?.offense_ids || [];
@@ -1061,6 +1641,7 @@ const startTemplateDefinitions = computed(() => (
     : []
 ));
 const START_TEMPLATE_SELECTION_STORAGE_KEY = 'basketworld.start_template.selection';
+const RANDOM_START_TEMPLATE_TOGGLE_STORAGE_KEY = 'basketworld.start_template.random_on_live_start';
 function loadStoredStartTemplateSelection() {
   if (typeof window === 'undefined') {
     return { id: '', mirrored: false };
@@ -1091,6 +1672,26 @@ function persistStartTemplateSelection() {
     console.warn('[PlayerControls] Failed to persist start-template selection', err);
   }
 }
+function loadStoredRandomStartTemplateToggle() {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(RANDOM_START_TEMPLATE_TOGGLE_STORAGE_KEY) === 'true';
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to load random start-template toggle', err);
+    return false;
+  }
+}
+function persistRandomStartTemplateToggle() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(
+      RANDOM_START_TEMPLATE_TOGGLE_STORAGE_KEY,
+      randomStartTemplateForSelfPlay.value ? 'true' : 'false',
+    );
+  } catch (err) {
+    console.warn('[PlayerControls] Failed to persist random start-template toggle', err);
+  }
+}
 const storedStartTemplateSelection = loadStoredStartTemplateSelection();
 const selectedStartTemplateDefinition = computed(() => {
   const templates = startTemplateDefinitions.value;
@@ -1101,6 +1702,7 @@ const selectedStartTemplateId = ref(storedStartTemplateSelection.id);
 const selectedStartTemplateMirrored = ref(storedStartTemplateSelection.mirrored);
 const startTemplateActionStatus = ref('');
 const startTemplateActionError = ref('');
+const randomStartTemplateForSelfPlay = ref(loadStoredRandomStartTemplateToggle());
 
 watch(
   startTemplateOptions,
@@ -1118,6 +1720,11 @@ watch(
   persistStartTemplateSelection,
   { immediate: true }
 );
+watch(
+  randomStartTemplateForSelfPlay,
+  persistRandomStartTemplateToggle,
+  { immediate: true }
+);
 
 function clearStartTemplateFeedback() {
   startTemplateActionStatus.value = '';
@@ -1132,6 +1739,10 @@ function stableStartTemplateSeed(templateId) {
     hash = Math.imul(hash, 16777619);
   }
   return Math.abs(hash >>> 0);
+}
+
+function randomStartTemplateSeed() {
+  return Math.floor(Math.random() * 2147483647);
 }
 
 function previewOffsetToAxial(col, row) {
@@ -1318,6 +1929,24 @@ function handleStartSelfPlayFromTemplate() {
   });
 }
 
+function getRandomStartTemplateOptions() {
+  if (!randomStartTemplateForSelfPlay.value) return null;
+  const options = startTemplateOptions.value;
+  if (!Array.isArray(options) || options.length === 0) return null;
+  const selected = options[Math.floor(Math.random() * options.length)];
+  const templateId = selected?.value ? String(selected.value) : '';
+  if (!templateId) return null;
+  return {
+    templateId,
+    mirrored: null,
+    seed: randomStartTemplateSeed(),
+  };
+}
+
+function getRandomSelfPlayStartTemplateOptions() {
+  return getRandomStartTemplateOptions();
+}
+
 const evalConfigSafe = computed(() => {
   const base = defaultEvalConfig();
   const incoming = props.evalConfig || {};
@@ -1344,6 +1973,26 @@ function formatEvalTemplateNumber(value, digits = 2) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'N/A';
 }
+function formatTemplateSourceValue(value) {
+  if (value === null || value === undefined || value === '') return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (typeof value === 'object') {
+    const templates = Array.isArray(value.templates) ? value.templates : [];
+    const templateCount = templates.length;
+    const playersPerSide = Number(value.players_per_side);
+    const playerLabel = Number.isFinite(playersPerSide) && playersPerSide > 0
+      ? ', ' + Math.round(playersPerSide) + '-on-' + Math.round(playersPerSide)
+      : '';
+    if (templateCount > 0) {
+      return 'inline template library (' + templateCount + ' templates' + playerLabel + ')';
+    }
+    return 'inline template library';
+  }
+  return String(value);
+}
 const evalCheckpointTemplateSettings = computed(() => {
   const params = {
     ...(trainingParamsForUi.value || {}),
@@ -1360,7 +2009,10 @@ const evalCheckpointTemplateSettings = computed(() => {
   const mirror = firstDefinedValue(params.start_template_mirror_prob, 0.0);
   const source = firstDefinedValue(
     params.start_template_library_artifact_path,
-    params.start_template_library,
+    params.start_template_library_path,
+    props.gameState?.start_template_library_path,
+    formatTemplateSourceValue(params.start_template_library),
+    formatTemplateSourceValue(props.gameState?.start_template_library),
     props.gameState?.start_template_library_source,
     hasLoadedStartTemplates.value ? templateLibrarySourceLabel.value : undefined,
   );
@@ -2826,6 +3478,23 @@ function _normalizePressurePayload(input) {
     steal_perp_decay: Number(input?.steal_perp_decay ?? 1.5),
     steal_distance_factor: Number(input?.steal_distance_factor ?? 0.08),
     steal_position_weight_min: Number(input?.steal_position_weight_min ?? 0.3),
+    pass_interception_model: String(input?.pass_interception_model || 'line'),
+    pass_passer_pressure_weight: Number(input?.pass_passer_pressure_weight ?? 0.0),
+    pass_receiver_pressure_weight: Number(input?.pass_receiver_pressure_weight ?? 0.0),
+    pass_lob_lane_multiplier: Number(input?.pass_lob_lane_multiplier ?? 0.35),
+    pass_lob_receiver_distance: Number(input?.pass_lob_receiver_distance ?? 1.0),
+    pass_speed: Number(input?.pass_speed ?? 3.5),
+    defender_reaction_time: Number(input?.defender_reaction_time ?? 0.35),
+    defender_speed: Number(input?.defender_speed ?? 1.25),
+    defender_reach_radius: Number(input?.defender_reach_radius ?? 0.65),
+    reaction_softness: Number(input?.reaction_softness ?? 0.55),
+    base_passer_risk: Number(input?.base_passer_risk ?? 0.06),
+    passer_pressure_decay: Number(input?.passer_pressure_decay ?? 1.35),
+    base_receiver_risk: Number(input?.base_receiver_risk ?? 0.35),
+    receiver_alignment_min: Number(input?.receiver_alignment_min ?? 0.35),
+    receiver_alignment_width: Number(input?.receiver_alignment_width ?? 2.0),
+    max_receiver_hazard: Number(input?.max_receiver_hazard ?? 0.85),
+    lane_weight: Number(input?.lane_weight ?? 0.0),
     defender_pressure_distance: Math.round(Number(input?.defender_pressure_distance ?? 1)),
     defender_pressure_turnover_chance: Number(input?.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(input?.defender_pressure_decay_lambda ?? 1.0),
@@ -3037,6 +3706,7 @@ const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'playbook', label: 'Playbook' },
   { id: 'advisor', label: 'Advisor' },
   { id: 'moves', label: 'Moves' },
+  { id: 'pass_lab', label: 'Pass Lab' },
   { id: 'eval', label: 'Eval' },
   { id: 'training', label: 'Training' },
   { id: 'phi', label: 'Phi Shaping' },
@@ -3074,6 +3744,20 @@ function loadStoredDevTabOrder() {
 }
 
 const activeTab = ref(String(props.initialActiveTab || 'environment'));
+
+
+watch(
+  () => [
+    activeTab.value,
+    passLabBallHolder.value,
+    JSON.stringify(passLabPositions.value || []),
+    JSON.stringify(passLabPassProbs.value || {}),
+  ],
+  () => {
+    emitPassLabConfig();
+  },
+);
+
 const devTabOrder = ref(loadStoredDevTabOrder());
 const draggedDevTabId = ref(null);
 const modelCapabilities = computed(() => {
@@ -3126,6 +3810,17 @@ const jaxRuntimeRows = computed(() => {
   if (!isJaxModel.value) return [];
   const spec = jaxPolicySpec.value || {};
   const metadata = jaxModelMetadata.value || {};
+  const reboundRuntime = props.gameState?.rebound_runtime || {};
+  const reboundEnabledRaw = firstPresent(
+    reboundRuntime.enabled,
+    reboundRuntime.kernel_enabled,
+    jaxEnvConfig.value?.enable_rebounds,
+    trainingParamsForUi.value?.enable_rebounds,
+    envOptionalParamsForUi.value?.enable_rebounds,
+  );
+  const reboundEnabledLabel = reboundEnabledRaw === 'N/A'
+    ? 'N/A'
+    : (coerceTrainingBool(reboundEnabledRaw, false) ? 'Enabled' : 'Disabled');
   const rows = [
     {
       label: 'Backend',
@@ -3153,6 +3848,11 @@ const jaxRuntimeRows = computed(() => {
       tooltip: 'JAX policy representation: attention or MLP.',
     },
     {
+      label: 'Rebounding',
+      value: reboundEnabledLabel,
+      tooltip: 'Whether half-court rebound continuation is enabled in the loaded JAX runtime/checkpoint.',
+    },
+    {
       label: 'Hidden dim',
       value: firstPresent(spec.hidden_dim, spec.attention_embed_dim),
       tooltip: 'Main hidden/embedding width for the JAX policy network.',
@@ -3176,6 +3876,79 @@ const jaxRuntimeRows = computed(() => {
     });
   }
   return rows;
+});
+
+const reboundingRows = computed(() => {
+  if (!isJaxModel.value) return [];
+  const runtime = props.gameState?.rebound_runtime || {};
+  const env = jaxEnvConfig.value || {};
+  const training = trainingParamsForUi.value || {};
+  const optional = envOptionalParamsForUi.value || {};
+  const valueFor = (runtimeKey, configKey) => firstPresent(
+    runtime?.[runtimeKey],
+    env?.[configKey],
+    training?.[configKey],
+    optional?.[configKey],
+  );
+  const boolLabel = (value) => (
+    value === 'N/A' ? 'N/A' : (coerceTrainingBool(value, false) ? 'Enabled' : 'Disabled')
+  );
+  const tableShape = Array.isArray(runtime.target_table_shape) && runtime.target_table_shape.length > 0
+    ? runtime.target_table_shape.map((v) => formatConfigValue(v)).join(' × ')
+    : 'N/A';
+  const rows = [
+    {
+      label: 'Runtime enabled',
+      value: boolLabel(valueFor('enabled', 'enable_rebounds')),
+      tooltip: 'Whether the display/runtime environment has rebound continuation enabled.',
+    },
+    {
+      label: 'Kernel enabled',
+      value: boolLabel(firstPresent(runtime.kernel_enabled, env.enable_rebounds, training.enable_rebounds, optional.enable_rebounds)),
+      tooltip: 'Whether the loaded JAX static kernel was compiled/configured with rebound continuation enabled.',
+    },
+    {
+      label: 'Table model dir',
+      value: valueFor('table_model_dir', 'rebound_table_model_dir'),
+      tooltip: 'Directory containing the fitted rebound target table used by the JAX environment.',
+    },
+    {
+      label: 'Target table shape',
+      value: tableShape,
+      tooltip: 'Shape of the rebound target probability table currently loaded into the runtime.',
+    },
+    {
+      label: 'Target temperature',
+      value: formatConfigValue(valueFor('target_temperature', 'rebound_target_temperature')),
+      tooltip: 'Softmax temperature for sampling rebound target cells from the fitted table.',
+    },
+    {
+      label: 'Target uniform mix',
+      value: formatConfigValue(valueFor('target_uniform_mix', 'rebound_target_uniform_mix')),
+      tooltip: 'Uniform-probability mixture added to rebound target sampling.',
+    },
+    {
+      label: 'Winner distance weight',
+      value: formatConfigValue(valueFor('winner_distance_weight', 'rebound_winner_distance_weight')),
+      tooltip: 'Weight on player distance to the sampled rebound target when computing rebound winner probabilities.',
+    },
+    {
+      label: 'Winner temperature',
+      value: formatConfigValue(valueFor('winner_temperature', 'rebound_winner_temperature')),
+      tooltip: 'Softmax temperature for sampling the player who wins the rebound.',
+    },
+    {
+      label: 'ORB clock reset',
+      value: formatConfigValue(valueFor('offensive_rebound_shot_clock_reset', 'offensive_rebound_shot_clock_reset')),
+      tooltip: 'Shot clock reset value after an offensive rebound when the current clock is below this threshold.',
+    },
+    {
+      label: 'Terminal reward mode',
+      value: valueFor('terminal_reward_mode', 'rebound_terminal_reward_mode'),
+      tooltip: 'Reward accounting mode used for possessions with rebounding enabled.',
+    },
+  ];
+  return rows.filter((row) => row.value !== undefined && row.value !== null && row.value !== '');
 });
 const jaxTrainingLoopRows = computed(() => {
   if (!isJaxModel.value) return [];
@@ -3537,6 +4310,11 @@ const totalViolations = computed(() => (
 const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
+const totalReboundChances = computed(() => (
+  Number(statsState.value?.rebounds?.offensive || 0)
+  + Number(statsState.value?.rebounds?.defensive || 0)
+));
+const overallOrbPct = computed(() => safeDiv(Number(statsState.value?.rebounds?.offensive || 0), totalReboundChances.value) * 100);
 
 function ensureStatsDiagnosticFields(target) {
   if (!target || typeof target !== 'object') return;
@@ -3546,6 +4324,17 @@ function ensureStatsDiagnosticFields(target) {
   target.intentInactiveCount = Number(target.intentInactiveCount || 0);
   if (!target.turnoverReasons || typeof target.turnoverReasons !== 'object') {
     target.turnoverReasons = {};
+  }
+  if (!target.rebounds || typeof target.rebounds !== 'object') {
+    target.rebounds = {};
+  }
+  target.rebounds.offensive = Number(target.rebounds.offensive || 0);
+  target.rebounds.defensive = Number(target.rebounds.defensive || 0);
+  if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
+    target.rebounds.byPlayer = {};
+  }
+  for (const [pid, count] of Object.entries(target.rebounds.byPlayer || {})) {
+    target.rebounds.byPlayer[String(pid)] = Number(count || 0);
   }
   if (!target.actionMix || typeof target.actionMix !== 'object') {
     target.actionMix = {};
@@ -3559,6 +4348,15 @@ function ensureStatsDiagnosticFields(target) {
   target.actionMix.pass = Number(target.actionMix.pass || 0);
   target.actionMix.other = Number(target.actionMix.other || 0);
   target.actionMix.total = Number(target.actionMix.total || 0);
+  if (!target.actionMixHolder || typeof target.actionMixHolder !== 'object') {
+    target.actionMixHolder = {};
+  }
+  target.actionMixHolder.noop = Number(target.actionMixHolder.noop || 0);
+  target.actionMixHolder.move = Number(target.actionMixHolder.move || 0);
+  target.actionMixHolder.shoot = Number(target.actionMixHolder.shoot || 0);
+  target.actionMixHolder.pass = Number(target.actionMixHolder.pass || 0);
+  target.actionMixHolder.other = Number(target.actionMixHolder.other || 0);
+  target.actionMixHolder.total = Number(target.actionMixHolder.total || 0);
   target.rewardBreakdown.totalReward = Number(target.rewardBreakdown.totalReward || 0);
   target.rewardBreakdown.expectedPoints = Number(target.rewardBreakdown.expectedPoints || 0);
   target.rewardBreakdown.passReward = Number(target.rewardBreakdown.passReward || 0);
@@ -3589,6 +4387,46 @@ function normalizeTurnoverReason(reason) {
   const key = String(reason || 'unknown');
   if (key === 'shot_clock') return 'shot_clock_violation';
   return key;
+}
+
+function getReboundEntries(results) {
+  if (!results) return [];
+  if (Array.isArray(results)) {
+    return results.filter((entry) => entry && entry.attempt !== false);
+  }
+  if (typeof results !== 'object') return [];
+  const entries = Array.isArray(results.rebounds) && results.rebounds.length > 0
+    ? results.rebounds
+    : (results.rebound ? [results.rebound] : []);
+  return entries.filter((entry) => entry && entry.attempt !== false);
+}
+
+function getReboundWinnerId(rebound) {
+  const raw = rebound?.winner ?? rebound?.winner_player_id ?? rebound?.player_id;
+  const winner = Number(raw);
+  return Number.isFinite(winner) && winner >= 0 ? winner : null;
+}
+
+function addReboundStats(target, results) {
+  if (!target || typeof target !== 'object') return;
+  if (!target.rebounds || typeof target.rebounds !== 'object') {
+    target.rebounds = { offensive: 0, defensive: 0, byPlayer: {} };
+  }
+  if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
+    target.rebounds.byPlayer = {};
+  }
+  for (const rebound of getReboundEntries(results)) {
+    if (rebound.offensive) {
+      target.rebounds.offensive = Number(target.rebounds.offensive || 0) + 1;
+      const winner = getReboundWinnerId(rebound);
+      if (winner !== null) {
+        const key = String(winner);
+        target.rebounds.byPlayer[key] = Number(target.rebounds.byPlayer[key] || 0) + 1;
+      }
+    } else if (rebound.defensive) {
+      target.rebounds.defensive = Number(target.rebounds.defensive || 0) + 1;
+    }
+  }
 }
 
 function formatTurnoverReason(reason) {
@@ -3633,7 +4471,7 @@ function getActionMixTooltip(key) {
 function getRewardBreakdownTooltip(key) {
   const map = {
     totalReward: 'Sum of all user-team rewards across evaluated episodes.',
-    expectedPoints: 'Shot expected-points term (shot value × pressure-adjusted make probability).',
+    expectedPoints: 'Shot reward component paid by the env. With rebounding this may be actual points or terminal-shot EP, depending on reward mode.',
     passReward: 'Reward term from successful passes.',
     assistPotential: 'Potential-assist shaping reward component.',
     assistFullBonus: 'Full-assist bonus reward component.',
@@ -3665,11 +4503,10 @@ const shotClockViolationCount = computed(() => Number(
   statsState.value?.turnoverReasons?.shot_clock || 0
 ));
 
-const actionMixRows = computed(() => {
-  const mix = statsState.value?.actionMix || {};
-  const total = Number(mix.total || 0);
+function buildActionMixRows(mix) {
+  const total = Number(mix?.total || 0);
   const asRow = (key, label) => {
-    const count = Number(mix[key] || 0);
+    const count = Number(mix?.[key] || 0);
     return {
       key,
       label,
@@ -3687,7 +4524,10 @@ const actionMixRows = computed(() => {
       asRow('other', 'OTHER'),
     ],
   };
-});
+}
+
+const actionMixRows = computed(() => buildActionMixRows(statsState.value?.actionMix || {}));
+const holderActionMixRows = computed(() => buildActionMixRows(statsState.value?.actionMixHolder || {}));
 
 const intentSelectionRows = computed(() => {
   const raw = statsState.value?.intentSelectionCounts || {};
@@ -3737,7 +4577,7 @@ const rewardBreakdownRows = computed(() => {
   const rb = statsState.value?.rewardBreakdown || {};
   return [
     { key: 'totalReward', label: 'Total reward', value: Number(rb.totalReward || 0) },
-    { key: 'expectedPoints', label: 'Expected points', value: Number(rb.expectedPoints || 0) },
+    { key: 'expectedPoints', label: 'Shot reward', value: Number(rb.expectedPoints || 0) },
     { key: 'passReward', label: 'Pass reward', value: Number(rb.passReward || 0) },
     { key: 'assistPotential', label: 'Potential assist', value: Number(rb.assistPotential || 0) },
     { key: 'assistFullBonus', label: 'Full assist bonus', value: Number(rb.assistFullBonus || 0) },
@@ -3761,6 +4601,31 @@ const offensePlayerIdsForStats = computed(() => {
   return Array.isArray(offense) ? offense.map(Number) : [];
 });
 
+const offensiveReboundPlayerRows = computed(() => {
+  const byPlayer = statsState.value?.rebounds?.byPlayer || {};
+  const ids = new Set();
+  offensePlayerIdsForStats.value.forEach((pid) => {
+    if (Number.isFinite(Number(pid))) ids.add(Number(pid));
+  });
+  Object.keys(byPlayer).forEach((pid) => {
+    const numeric = Number(pid);
+    if (Number.isFinite(numeric)) ids.add(numeric);
+  });
+  const chances = totalReboundChances.value;
+  return Array.from(ids)
+    .sort((a, b) => a - b)
+    .map((playerId) => {
+      const count = Number(byPlayer[playerId] ?? byPlayer[String(playerId)] ?? 0);
+      return {
+        playerId,
+        count,
+        chances,
+        orbPct: chances > 0 ? (count / chances) * 100 : 0,
+      };
+    })
+    .filter((row) => row.chances > 0 || row.count > 0);
+});
+
 function aggregatePlayerStats(entries) {
   const base = {
     shots: 0,
@@ -3769,6 +4634,8 @@ function aggregatePlayerStats(entries) {
     potential_assists: 0,
     turnovers: 0,
     points: 0,
+    offensive_rebounds: 0,
+    rebound_chances: 0,
     shot_types: { dunk: [0, 0], two: [0, 0], three: [0, 0] },
     shot_chart: {},
   };
@@ -3780,6 +4647,8 @@ function aggregatePlayerStats(entries) {
     base.potential_assists += Number(entry.potential_assists || 0);
     base.turnovers += Number(entry.turnovers || 0);
     base.points += Number(entry.points || 0);
+    base.offensive_rebounds += Number(entry.offensive_rebounds || 0);
+    base.rebound_chances = Math.max(base.rebound_chances, Number(entry.rebound_chances || 0));
     const st = entry.shot_types || {};
     ['dunk', 'two', 'three'].forEach((k) => {
       const vals = st[k] || [0, 0];
@@ -3815,6 +4684,8 @@ function buildEvalAggregateRow(entry) {
   const makes = Number(entry?.makes || 0);
   const episodes = Number(entry?.episodes || 0);
   const points = Number(entry?.points || 0);
+  const offensiveRebounds = Number(entry?.offensive_rebounds || 0);
+  const reboundChances = Number(entry?.rebound_chances || 0);
   return {
     attempts,
     makes,
@@ -3826,6 +4697,9 @@ function buildEvalAggregateRow(entry) {
     potentialAssists: Number(entry?.potential_assists || 0),
     turnovers: Number(entry?.turnovers || 0),
     points,
+    offensiveRebounds,
+    reboundChances,
+    orbPct: reboundChances > 0 ? (offensiveRebounds / reboundChances) * 100 : 0,
     episodes,
     ppp: episodes > 0 ? points / episodes : 0,
     unassisted: {
@@ -3990,6 +4864,10 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
     }
   }
 
+  // Rebounds after missed shots. Prefer the full possession history when JAX rebounding extends play.
+  const episodeRebounds = Array.isArray(finalState?.episode_rebounds) ? finalState.episode_rebounds : [];
+  addReboundStats(statsState.value, episodeRebounds.length > 0 ? episodeRebounds : results);
+
   // Turnovers at termination (array contains a single turnover if present)
   const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
   const tovCount = turnovers.length;
@@ -4115,12 +4993,27 @@ function applyEvaluationStats(
 
   let defensiveLaneCount = 0;
   let offensiveThreeCount = 0;
+  let offensiveReboundCount = 0;
+  let defensiveReboundCount = 0;
+  const offensiveReboundsByPlayer = {};
   for (const row of episodeResults || []) {
     const results = row?.final_state?.last_action_results || {};
     const defLane = Array.isArray(results?.defensive_lane_violations)
       ? results.defensive_lane_violations.length
       : 0;
     defensiveLaneCount += Number(defLane || 0);
+    for (const rebound of getReboundEntries(results)) {
+      if (rebound.offensive) {
+        offensiveReboundCount += 1;
+        const winner = getReboundWinnerId(rebound);
+        if (winner !== null) {
+          const key = String(winner);
+          offensiveReboundsByPlayer[key] = Number(offensiveReboundsByPlayer[key] || 0) + 1;
+        }
+      } else if (rebound.defensive) {
+        defensiveReboundCount += 1;
+      }
+    }
     const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
     offensiveThreeCount += turnovers.filter(
       (turnover) => normalizeTurnoverReason(turnover?.reason) === 'offensive_three_seconds'
@@ -4130,6 +5023,11 @@ function applyEvaluationStats(
   next.violations = {
     defensiveLane: Number(defensiveLaneCount || 0),
     offensiveThreeSeconds: Number(offensiveThreeCount || 0),
+  };
+  next.rebounds = {
+    offensive: Number(offensiveReboundCount || 0),
+    defensive: Number(defensiveReboundCount || 0),
+    byPlayer: offensiveReboundsByPlayer,
   };
   // Defensive lane violation awards one point to offense.
   if (String(userTeamName || 'OFFENSE').toUpperCase() === 'OFFENSE') {
@@ -4178,9 +5076,49 @@ function applyEvaluationStats(
       other: Number(mixRaw.other || 0),
       total: Number(mixRaw.total || 0),
     };
+    const holderMixRaw = evalDiagnostics.holder_action_mix || {};
+    next.actionMixHolder = {
+      noop: Number(holderMixRaw.noop || 0),
+      move: Number(holderMixRaw.move || 0),
+      shoot: Number(holderMixRaw.shoot || 0),
+      pass: Number(holderMixRaw.pass || 0),
+      other: Number(holderMixRaw.other || 0),
+      total: Number(holderMixRaw.total || 0),
+    };
 
     const selectorDiagRaw = evalDiagnostics.selector || {};
     const nativeSummary = evalDiagnostics.jax_native_summary || {};
+    const nativeEpisodeCount = Number(nativeSummary.num_episodes ?? 0);
+    const nativeTeamPrefix = String(userTeamName || 'OFFENSE').toUpperCase() === 'DEFENSE'
+      ? 'defense'
+      : 'offense';
+    const nativeTotalPoints = Number(nativeSummary[`total_${nativeTeamPrefix}_points`]);
+    const nativeRewardPerEpisode = Number(nativeSummary[`${nativeTeamPrefix}_reward_per_episode`]);
+    if (Number.isFinite(nativeTotalPoints)) {
+      next.points = nativeTotalPoints;
+    }
+    if (nativeEpisodeCount > 0 && Number.isFinite(nativeRewardPerEpisode)) {
+      next.rewardSum = nativeRewardPerEpisode * nativeEpisodeCount;
+      next.episodes = nativeEpisodeCount;
+    }
+    const rbDiag = evalDiagnostics.rebounds || {};
+    const diagOffensiveRebounds = Number(
+      rbDiag.offensive ?? nativeSummary.total_offensive_rebounds ?? next.rebounds?.offensive ?? 0
+    );
+    const diagDefensiveRebounds = Number(
+      rbDiag.defensive ?? nativeSummary.total_defensive_rebounds ?? next.rebounds?.defensive ?? 0
+    );
+    const diagByPlayer = rbDiag.by_player_offensive || nativeSummary.offensive_rebounds_by_player || {};
+    const mergedByPlayer = { ...(next.rebounds?.byPlayer || {}) };
+    for (const [pid, count] of Object.entries(diagByPlayer || {})) {
+      const key = String(pid);
+      mergedByPlayer[key] = Math.max(Number(mergedByPlayer[key] || 0), Number(count || 0));
+    }
+    next.rebounds = {
+      offensive: Math.max(Number(next.rebounds?.offensive || 0), Number(diagOffensiveRebounds || 0)),
+      defensive: Math.max(Number(next.rebounds?.defensive || 0), Number(diagDefensiveRebounds || 0)),
+      byPlayer: mergedByPlayer,
+    };
     const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
     const selectorStartSource = Object.keys(selectorStartCounts).length > 0
       ? "selector_episode_start"
@@ -4251,11 +5189,14 @@ async function copyStatsMarkdown() {
     const summary = [
       ['Episodes', String(s.episodes)],
       ['PPP', ppp.value.toFixed(2)],
-      ['Avg reward/ep', avgRewardPerEp.value.toFixed(2)],
+      ['Avg total reward/ep', avgRewardPerEp.value.toFixed(2)],
       ['Avg ep length (steps)', safeDiv(s.episodeStepsSum, Math.max(1, s.episodes)).toFixed(1)],
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
       ['Total potential assists', String(s.dunk.potentialAssists + s.twoPt.potentialAssists + s.threePt.potentialAssists)],
       ['Total turnovers', String(s.turnovers)],
+      ['Offensive rebounds', String(s.rebounds?.offensive || 0)],
+      ['Defensive rebounds', String(s.rebounds?.defensive || 0)],
+      ['ORB%', overallOrbPct.value.toFixed(1) + '%'],
       ['Shot clock violations', String(shotClockViolationCount.value)],
       ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
       ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
@@ -4290,7 +5231,7 @@ async function copyStatsMarkdown() {
     const rb = s.rewardBreakdown || {};
     const rewardRows = [
       ['Total reward', Number(rb.totalReward || 0).toFixed(2)],
-      ['Expected points', Number(rb.expectedPoints || 0).toFixed(2)],
+      ['Shot reward', Number(rb.expectedPoints || 0).toFixed(2)],
       ['Pass reward', Number(rb.passReward || 0).toFixed(2)],
       ['Potential assist', Number(rb.assistPotential || 0).toFixed(2)],
       ['Full assist bonus', Number(rb.assistFullBonus || 0).toFixed(2)],
@@ -4356,7 +5297,18 @@ async function copyStatsMarkdown() {
 }
 
 // Expose for parent (keyboard shortcut)
-defineExpose({ resetStats, copyStatsMarkdown, submitActions, recordEpisodeStats, applyEvaluationStats, getSelectedActions });
+defineExpose({
+  resetStats,
+  copyStatsMarkdown,
+  submitActions,
+  recordEpisodeStats,
+  applyEvaluationStats,
+  getSelectedActions,
+  getRandomStartTemplateOptions,
+  getRandomSelfPlayStartTemplateOptions,
+  getPassLabBoardConfig,
+  handlePassLabPlacementUpdate,
+});
 
 const isDefense = computed(() => {
   if (!props.gameState || props.activePlayerId === null) return false;
@@ -5725,7 +6677,7 @@ const obsMeta = computed(() => {
 });
 
 const obsTokens = computed(() => props.gameState?.obs_tokens || null);
-const tokenFeatureLabels = [
+const tokenFeatureBaseLabels = [
   'q_norm',
   'r_norm',
   'role',
@@ -5742,12 +6694,33 @@ const tokenFeatureLabels = [
   'dist_to_nearest_opp',
   'dist_to_nearest_team',
 ];
+const tokenFeatureReboundLabels = [
+  'dist_to_expected_rebound_target',
+  'rebound_win_prob_if_current_shot_misses',
+];
 const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
 const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible', 'intent_age_norm'];
 
 const tokenPlayers = computed(() => {
   const players = obsTokens.value?.players;
   return Array.isArray(players) ? players : [];
+});
+
+const tokenFeatureLabels = computed(() => {
+  const maxLen = tokenPlayers.value.reduce((acc, row) => {
+    if (!Array.isArray(row)) return acc;
+    return Math.max(acc, row.length);
+  }, 0);
+  if (maxLen <= 0) return tokenFeatureBaseLabels;
+  const labels = [...tokenFeatureBaseLabels];
+  if (maxLen > labels.length) {
+    const reboundTake = Math.min(tokenFeatureReboundLabels.length, maxLen - labels.length);
+    labels.push(...tokenFeatureReboundLabels.slice(0, reboundTake));
+  }
+  while (labels.length < maxLen) {
+    labels.push(`feature_${labels.length}`);
+  }
+  return labels.slice(0, maxLen);
 });
 
 const tokenGlobals = computed(() => {
@@ -6125,6 +7098,16 @@ function offenseSkillDeltaLabel(idx) {
         <span v-if="ballHolderError" class="error-note">{{ ballHolderError }}</span>
       </div>
 
+      <label class="self-play-template-toggle" :class="{ disabled: !hasLoadedStartTemplates }">
+        <input
+          v-model="randomStartTemplateForSelfPlay"
+          type="checkbox"
+          :disabled="!hasLoadedStartTemplates"
+        />
+        <span>Random start template on Self-Play</span>
+        <span class="status-note">{{ hasLoadedStartTemplates ? `${startTemplateOptions.length} loaded` : 'No templates loaded' }}</span>
+      </label>
+
       <div class="player-tabs">
           <button
               v-for="playerId in controlsTabPlayerIds"
@@ -6304,7 +7287,7 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item">
               <span class="param-name">Shot reward:</span>
               <span class="param-value">
-                {{ rewardParams.shot_reward_description || 'Expected points (shot value × pressure-adjusted make probability, applies to makes and misses)' }}
+                {{ rewardParams.shot_reward_description || 'Configured shot reward term. With rebounding this may be actual points or terminal-shot EP, depending on reward mode.' }}
               </span>
             </div>
             <div class="param-item">
@@ -6411,6 +7394,7 @@ function offenseSkillDeltaLabel(idx) {
               <th>Assists</th>
               <th>Pot. Ast</th>
               <th>TOV</th>
+              <th>ORB%</th>
               <th>Points</th>
             </tr>
           </thead>
@@ -6424,6 +7408,7 @@ function offenseSkillDeltaLabel(idx) {
               <td>{{ row.assists }}</td>
               <td>{{ row.potentialAssists }}</td>
               <td>{{ row.turnovers }}</td>
+              <td>{{ row.offensiveRebounds }}/{{ row.reboundChances }} ({{ row.orbPct.toFixed(1) }}%)</td>
               <td>{{ row.points.toFixed(1) }}</td>
             </tr>
           </tbody>
@@ -6484,13 +7469,36 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
             <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
+            <div class="param-item" data-tooltip="Missed shots recovered by the offense, extending the possession."><span class="param-name">Offensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.offensive || 0 }}</span></div>
+            <div class="param-item" data-tooltip="Missed shots recovered by the defense, ending the possession."><span class="param-name">Defensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.defensive || 0 }}</span></div>
+            <div class="param-item" data-tooltip="Offensive rebound percentage: offensive rebounds divided by all resolved rebound chances."><span class="param-name">ORB%:</span><span class="param-value">{{ overallOrbPct.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Shot clock expirations. These count as team turnovers but are not assigned to an individual offensive player."><span class="param-name">Shot clock violations:</span><span class="param-value">{{ shotClockViolationCount }}</span></div>
             <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
             <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offense kept a player in the lane beyond the 3-second limit, causing turnovers."><span class="param-name">Offensive 3-second violations:</span><span class="param-value">{{ statsState.violations?.offensiveThreeSeconds || 0 }}</span></div>
             <div class="param-item" data-tooltip="Points per possession proxy here: total points scored by user team divided by episodes."><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
-            <div class="param-item" data-tooltip="Average total episode reward for the user team."><span class="param-name">Avg reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
+            <div class="param-item" data-tooltip="Average total environment reward for the user team, including scoring reward plus any assist, violation, phi-shaping, or other configured reward terms. This is only expected to match PPP when those auxiliary terms are disabled and the terminal reward mode is PPP-compatible."><span class="param-name">Avg total reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
             <div class="param-item" data-tooltip="Average number of steps per episode."><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
+          </div>
+          <div v-if="offensiveReboundPlayerRows.length" class="param-category">
+            <h5>
+              ORB% by Player
+              <span
+                class="category-help"
+                title="Per-player offensive rebound percentage: this player's offensive rebounds divided by all resolved rebound chances."
+                aria-label="ORB percent by player help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in offensiveReboundPlayerRows"
+              :key="`orb-player-${row.playerId}`"
+              class="param-item"
+              data-tooltip="Player offensive rebounds divided by total rebound chances."
+            >
+              <span class="param-name">Player {{ row.playerId }}:</span>
+              <span class="param-value">{{ row.count }}/{{ row.chances }} ({{ row.orbPct.toFixed(1) }}%)</span>
+            </div>
           </div>
           <div class="param-category">
             <h5>
@@ -7481,6 +8489,420 @@ function offenseSkillDeltaLabel(idx) {
       </div>
     </div>
 
+    <!-- Pass Lab Tab -->
+    <div v-if="activeTab === 'pass_lab'" class="tab-content pass-lab-tab">
+      <div class="param-category pass-lab-shell">
+        <div class="pass-lab-header">
+          <div>
+            <h5>Pass Turnover Playground</h5>
+            <p class="status-note">
+              Drag players on the board and tune parameters locally. The board labels show pass completion; the table shows turnover risk.
+            </p>
+          </div>
+          <div class="pass-lab-actions">
+            <button class="refresh-policies-btn" type="button" @click="resetPassLabFromGameState(true)">
+              Reset from board
+            </button>
+            <button class="refresh-policies-btn" type="button" @click="copyPassLabParamsFromRuntime">
+              Copy runtime params
+            </button>
+            <button
+              class="refresh-policies-btn"
+              type="button"
+              @click="applyPassLabParamsToRuntime"
+              :disabled="isPressureSectionUpdating('pass') || !passLabRuntimeApplyEnabled"
+              :title="passLabRuntimeApplyEnabled ? 'Apply these local pass parameters to the live environment runtime' : 'Speed/reaction Pass Lab is local-only until it is ported to the backend runtime'"
+            >
+              {{ isPressureSectionUpdating('pass') ? 'Saving...' : 'Apply to live env' }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="!props.gameState || !passLabPositions.length" class="no-data">
+          Load a game state to use the pass playground.
+        </div>
+        <div v-else class="pass-lab-layout pass-lab-main-board-mode">
+          <div class="pass-lab-board-note">
+            <h5>Main Board Active</h5>
+            <p>
+              Use the main game board to drag players. Pass Lab supplies the placement positions and pass-risk overlay while this tab is open.
+            </p>
+          </div>
+
+          <div class="pass-lab-side-panel">
+            <div class="pass-lab-control-card">
+              <h5>Setup</h5>
+              <div class="pass-lab-form-row">
+                <label>Passer</label>
+                <select v-model.number="passLabBallHolder">
+                  <option v-for="pid in passLabPlayerOptions" :key="`pass-lab-passer-${pid}`" :value="pid">
+                    {{ passLabPlayerLabel(pid) }}
+                  </option>
+                </select>
+              </div>
+              <div class="pass-lab-summary-grid">
+                <div>
+                  <span>Targets</span>
+                  <strong>{{ passLabRows.length }}</strong>
+                </div>
+                <div>
+                  <span>Defenders</span>
+                  <strong>{{ passLabOpponentIds.length }}</strong>
+                </div>
+                <div>
+                  <span>Model</span>
+                  <strong>{{ passLabParams.pass_interception_model || 'reaction' }}</strong>
+                </div>
+              </div>
+            </div>
+
+            <div class="pass-lab-control-card">
+              <h5>Local Parameters</h5>
+              <div class="pass-lab-form-row">
+                <label>Model</label>
+                <select v-model="passLabParams.pass_interception_model">
+                  <option value="reaction">Speed / reaction (primary)</option>
+                  <option value="line">Production line</option>
+                  <option value="lob_aware">Production lob-aware</option>
+                </select>
+              </div>
+              <div v-if="passLabUsesReactionModel" class="pass-lab-param-section">
+                <div class="pass-lab-section-title">Speed Model</div>
+                <div class="pass-lab-param-grid">
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Pass speed <code>{{ passLabParamMeta('pass_speed').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('pass_speed').tooltip"
+                        :title="passLabParamMeta('pass_speed').tooltip"
+                        aria-label="Pass speed parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0.1" step="0.1" v-model.number="passLabParams.pass_speed" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Reaction time <code>{{ passLabParamMeta('defender_reaction_time').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('defender_reaction_time').tooltip"
+                        :title="passLabParamMeta('defender_reaction_time').tooltip"
+                        aria-label="Reaction time parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.defender_reaction_time" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Defender speed <code>{{ passLabParamMeta('defender_speed').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('defender_speed').tooltip"
+                        :title="passLabParamMeta('defender_speed').tooltip"
+                        aria-label="Defender speed parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.defender_speed" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Reach radius <code>{{ passLabParamMeta('defender_reach_radius').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('defender_reach_radius').tooltip"
+                        :title="passLabParamMeta('defender_reach_radius').tooltip"
+                        aria-label="Reach radius parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.defender_reach_radius" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Reaction softness <code>{{ passLabParamMeta('reaction_softness').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('reaction_softness').tooltip"
+                        :title="passLabParamMeta('reaction_softness').tooltip"
+                        aria-label="Reaction softness parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0.05" step="0.05" v-model.number="passLabParams.reaction_softness" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Base passer risk <code>{{ passLabParamMeta('base_passer_risk').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('base_passer_risk').tooltip"
+                        :title="passLabParamMeta('base_passer_risk').tooltip"
+                        aria-label="Base passer risk parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.01" v-model.number="passLabParams.base_passer_risk" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Passer decay <code>{{ passLabParamMeta('passer_pressure_decay').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('passer_pressure_decay').tooltip"
+                        :title="passLabParamMeta('passer_pressure_decay').tooltip"
+                        aria-label="Passer decay parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.passer_pressure_decay" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Base receiver risk <code>{{ passLabParamMeta('base_receiver_risk').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('base_receiver_risk').tooltip"
+                        :title="passLabParamMeta('base_receiver_risk').tooltip"
+                        aria-label="Base receiver risk parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.01" v-model.number="passLabParams.base_receiver_risk" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Alignment floor <code>{{ passLabParamMeta('receiver_alignment_min').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('receiver_alignment_min').tooltip"
+                        :title="passLabParamMeta('receiver_alignment_min').tooltip"
+                        aria-label="Alignment floor parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.05" v-model.number="passLabParams.receiver_alignment_min" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Alignment width <code>{{ passLabParamMeta('receiver_alignment_width').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('receiver_alignment_width').tooltip"
+                        :title="passLabParamMeta('receiver_alignment_width').tooltip"
+                        aria-label="Alignment width parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0.1" step="0.1" v-model.number="passLabParams.receiver_alignment_width" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Max receiver hazard <code>{{ passLabParamMeta('max_receiver_hazard').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('max_receiver_hazard').tooltip"
+                        :title="passLabParamMeta('max_receiver_hazard').tooltip"
+                        aria-label="Max receiver hazard parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.05" v-model.number="passLabParams.max_receiver_hazard" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Legacy lane weight <code>{{ passLabParamMeta('lane_weight').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('lane_weight').tooltip"
+                        :title="passLabParamMeta('lane_weight').tooltip"
+                        aria-label="Legacy lane weight parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.05" v-model.number="passLabParams.lane_weight" />
+                  </label>
+                </div>
+              </div>
+              <div class="pass-lab-param-section">
+                <div class="pass-lab-section-title">
+                  {{ passLabUsesReactionModel ? 'Legacy Line Term' : 'Legacy Line Model' }}
+                </div>
+                <p v-if="passLabUsesReactionModel" class="pass-lab-help-text">
+                  These line-model parameters only matter when Legacy lane weight is above zero.
+                </p>
+                <div class="pass-lab-param-grid">
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Base steal rate <code>{{ passLabParamMeta('base_steal_rate').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('base_steal_rate').tooltip"
+                        :title="passLabParamMeta('base_steal_rate').tooltip"
+                        aria-label="Base steal rate parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.01" v-model.number="passLabParams.base_steal_rate" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Perp decay <code>{{ passLabParamMeta('steal_perp_decay').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('steal_perp_decay').tooltip"
+                        :title="passLabParamMeta('steal_perp_decay').tooltip"
+                        aria-label="Perp decay parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.01" v-model.number="passLabParams.steal_perp_decay" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Distance factor <code>{{ passLabParamMeta('steal_distance_factor').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('steal_distance_factor').tooltip"
+                        :title="passLabParamMeta('steal_distance_factor').tooltip"
+                        aria-label="Distance factor parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.01" v-model.number="passLabParams.steal_distance_factor" />
+                  </label>
+                  <label>
+                    <span class="pass-lab-param-label">
+                      <span>Position min <code>{{ passLabParamMeta('steal_position_weight_min').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('steal_position_weight_min').tooltip"
+                        :title="passLabParamMeta('steal_position_weight_min').tooltip"
+                        aria-label="Position min parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.01" v-model.number="passLabParams.steal_position_weight_min" />
+                  </label>
+                  <label v-if="!passLabUsesReactionModel">
+                    <span class="pass-lab-param-label">
+                      <span>Passer pressure <code>{{ passLabParamMeta('pass_passer_pressure_weight').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('pass_passer_pressure_weight').tooltip"
+                        :title="passLabParamMeta('pass_passer_pressure_weight').tooltip"
+                        aria-label="Passer pressure parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.pass_passer_pressure_weight" />
+                  </label>
+                  <label v-if="!passLabUsesReactionModel">
+                    <span class="pass-lab-param-label">
+                      <span>Receiver pressure <code>{{ passLabParamMeta('pass_receiver_pressure_weight').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('pass_receiver_pressure_weight').tooltip"
+                        :title="passLabParamMeta('pass_receiver_pressure_weight').tooltip"
+                        aria-label="Receiver pressure parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.05" v-model.number="passLabParams.pass_receiver_pressure_weight" />
+                  </label>
+                  <label v-if="!passLabUsesReactionModel">
+                    <span class="pass-lab-param-label">
+                      <span>Lob lane mult <code>{{ passLabParamMeta('pass_lob_lane_multiplier').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('pass_lob_lane_multiplier').tooltip"
+                        :title="passLabParamMeta('pass_lob_lane_multiplier').tooltip"
+                        aria-label="Lob lane mult parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" max="1" step="0.05" v-model.number="passLabParams.pass_lob_lane_multiplier" />
+                  </label>
+                  <label v-if="!passLabUsesReactionModel">
+                    <span class="pass-lab-param-label">
+                      <span>Lob distance <code>{{ passLabParamMeta('pass_lob_receiver_distance').symbol }}</code></span>
+                      <span
+                        class="template-help pass-lab-param-help"
+                        :data-tooltip="passLabParamMeta('pass_lob_receiver_distance').tooltip"
+                        :title="passLabParamMeta('pass_lob_receiver_distance').tooltip"
+                        aria-label="Lob distance parameter help"
+                        tabindex="0"
+                      >?</span>
+                    </span>
+                    <input type="number" min="0" step="0.5" v-model.number="passLabParams.pass_lob_receiver_distance" />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="pass-lab-control-card pass-lab-results-card">
+              <h5>Receiver Outcomes</h5>
+              <div class="pass-lab-table-wrap">
+                <table class="pass-lab-table">
+                  <thead>
+                    <tr>
+                      <th>Receiver</th>
+                      <th>Dist</th>
+                      <th>Time</th>
+                      <th>Turnover</th>
+                      <th>Complete</th>
+                      <th>Components</th>
+                      <th>Top defender pressure</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-if="!passLabRows.length">
+                      <td colspan="7" class="no-data">No legal pass targets for the selected passer.</td>
+                    </tr>
+                    <tr v-for="row in passLabRows" :key="`pass-lab-row-${row.receiverId}`">
+                      <td>
+                        {{ passLabPlayerLabel(row.receiverId) }}
+                        <span v-if="row.lobCandidate" class="pass-lab-chip">lob</span>
+                      </td>
+                      <td>{{ row.distance.toFixed(1) }}</td>
+                      <td>{{ row.passTime === null ? '—' : row.passTime.toFixed(2) }}</td>
+                      <td class="risk-cell">{{ passLabPercent(row.turnover) }}</td>
+                      <td class="safe-cell">{{ passLabPercent(row.completion) }}</td>
+                      <td class="notes pass-lab-components">
+                        P {{ passLabPercent(row.passerRisk) }} · R {{ passLabPercent(row.receiverRisk) }} · L {{ passLabPercent(row.laneRisk) }}
+                      </td>
+                      <td class="notes">{{ row.topDefenders }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="pass-lab-control-card pass-lab-equations-card">
+              <h5>Speed Model Equations</h5>
+              <p class="pass-lab-help-text">
+                Units are board hexes and decision-step time. The production environment still uses the runtime-backed line model until this local model is ported.
+              </p>
+              <div class="pass-lab-equation-list">
+                <div class="math-line"><MathEquation tex="d_{pass}=dist(A,B),\quad t_{pass}=\frac{d_{pass}}{v_{pass}}" /></div>
+                <div class="math-line"><MathEquation tex="p_{passer}=1-\prod_i\left(1-b_p e^{-\lambda_p\max(0,dist(D_i,A)-1)}\right)" /></div>
+                <div class="math-line"><MathEquation tex="t_i=\max(0,t_{pass}-t_{react}),\quad reach_i=v_d t_i+r_d" /></div>
+                <div class="math-line"><MathEquation tex="p^{react}_i=\sigma\left(\frac{reach_i-dist(D_i,B)}{s_{react}}\right)" /></div>
+                <div class="math-line"><MathEquation tex="a_i=a_{min}+(1-a_{min})\left(1-clip\left(\frac{perp_i}{w_a},0,1\right)\right)" /></div>
+                <div class="math-line"><MathEquation tex="h_i=clip\left(b_r\,p^{react}_i\,a_i,0,h_{max}\right)" /></div>
+                <div class="math-line"><MathEquation tex="p_{receiver}=1-\prod_i(1-h_i)" /></div>
+                <div class="math-line"><MathEquation tex="p_{lane}=w_{lane}\,p_{\mathrm{legacy\ lane}}" /></div>
+                <div class="math-line"><MathEquation tex="p_{turnover}=1-(1-p_{passer})(1-p_{receiver})(1-p_{lane})" /></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Template Tab -->
     <div v-if="activeTab === 'template'" class="tab-content eval-tab template-tab">
       <div class="template-library-shell">
@@ -8142,6 +9564,18 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-value">{{ row.value }}</span>
             </div>
           </div>
+          <div v-if="isJaxModel && reboundingRows.length" class="param-category">
+            <h5>Rebounding</h5>
+            <div
+              v-for="row in reboundingRows"
+              :key="`rebounding-${row.label}`"
+              class="param-item"
+              :data-tooltip="row.tooltip"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+          </div>
           <div v-if="hasLoadedStartTemplates" class="param-category">
             <h5>Start Templates</h5>
             <div class="eval-row">
@@ -8513,52 +9947,101 @@ function offenseSkillDeltaLabel(idx) {
             </div>
           </div>
           <div class="param-category">
-            <h5>Pass Interception (Line-of-Sight)</h5>
-            <div class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line">
-              <span class="param-name">Base steal rate:</span>
-              <input
+            <h5>Pass Interception</h5>
+            <div class="param-item" data-tooltip="Select the production pass interception model used by the runtime environment.">
+              <span class="param-name">Model:</span>
+              <select
                 class="env-param-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                v-model.number="pressureParamsInput.base_steal_rate"
+                v-model="pressureParamsInput.pass_interception_model"
                 :disabled="pressureParamsUpdating"
-              />
+              >
+                <option value="line">Line / lane</option>
+                <option value="lob_aware">Lob-aware line</option>
+                <option value="reaction">Reaction / speed</option>
+              </select>
+            </div>
+            <div class="param-section-label">Reaction model</div>
+            <div class="param-item" data-tooltip="Pass speed in board hexes per decision step. Higher values reduce flight time and lower receiver-side reaction risk.">
+              <span class="param-name">Pass speed:</span>
+              <input class="env-param-input" type="number" min="0.1" step="0.1" v-model.number="pressureParamsInput.pass_speed" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Defender reaction delay before they can move toward the catch point.">
+              <span class="param-name">Reaction time:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_reaction_time" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Defender closing speed after reaction time elapses, in board hexes per decision step.">
+              <span class="param-name">Defender speed:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_speed" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Extra catch-point radius a defender can contest without reaching the exact receiver hex.">
+              <span class="param-name">Reach radius:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_reach_radius" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Sigmoid softness for converting defender reach surplus into receiver-side hazard.">
+              <span class="param-name">Reaction softness:</span>
+              <input class="env-param-input" type="number" min="0.05" step="0.05" v-model.number="pressureParamsInput.reaction_softness" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Base noisy-or hazard from close defender pressure on the passer.">
+              <span class="param-name">Base passer risk:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_passer_risk" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Exponential decay rate for passer pressure as defenders move away from the passer.">
+              <span class="param-name">Passer decay:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.passer_pressure_decay" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Base receiver-side hazard multiplier for each defender who can react into the catch window.">
+              <span class="param-name">Base receiver risk:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_receiver_risk" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Minimum alignment multiplier for receiver pressure when a defender is not directly in the pass lane.">
+              <span class="param-name">Alignment floor:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.receiver_alignment_min" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Perpendicular-distance width over which receiver alignment fades from direct-lane pressure toward the floor.">
+              <span class="param-name">Alignment width:</span>
+              <input class="env-param-input" type="number" min="0.1" step="0.1" v-model.number="pressureParamsInput.receiver_alignment_width" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Maximum per-defender receiver-side hazard before noisy-or aggregation.">
+              <span class="param-name">Max receiver hazard:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.max_receiver_hazard" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Weight on the legacy line-interception term inside the reaction model. Zero disables the legacy lane blend.">
+              <span class="param-name">Legacy lane weight:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.lane_weight" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-section-label">Legacy line model</div>
+            <div class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line.">
+              <span class="param-name">Base steal rate:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_steal_rate" :disabled="pressureParamsUpdating" />
             </div>
             <div class="param-item" data-tooltip="How quickly steal probability drops as defender is further from pass line. Higher = faster decay.">
               <span class="param-name">Perpendicular decay:</span>
-              <input
-                class="env-param-input"
-                type="number"
-                min="0"
-                step="0.01"
-                v-model.number="pressureParamsInput.steal_perp_decay"
-                :disabled="pressureParamsUpdating"
-              />
+              <input class="env-param-input" type="number" min="0" step="0.01" v-model.number="pressureParamsInput.steal_perp_decay" :disabled="pressureParamsUpdating" />
             </div>
             <div class="param-item" data-tooltip="How pass distance affects interception chance. Longer passes are easier to intercept.">
               <span class="param-name">Distance factor:</span>
-              <input
-                class="env-param-input"
-                type="number"
-                min="0"
-                step="0.01"
-                v-model.number="pressureParamsInput.steal_distance_factor"
-                :disabled="pressureParamsUpdating"
-              />
+              <input class="env-param-input" type="number" min="0" step="0.01" v-model.number="pressureParamsInput.steal_distance_factor" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver)">
+            <div class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver).">
               <span class="param-name">Position weight min:</span>
-              <input
-                class="env-param-input"
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                v-model.number="pressureParamsInput.steal_position_weight_min"
-                :disabled="pressureParamsUpdating"
-              />
+              <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.steal_position_weight_min" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-section-label">Lob-aware terms</div>
+            <div class="param-item" data-tooltip="Lob-aware extra risk from defenders near the passer and aligned with the pass direction.">
+              <span class="param-name">Passer pressure weight:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.pass_passer_pressure_weight" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Lob-aware extra risk from defenders near the receiver and aligned with the catch path.">
+              <span class="param-name">Receiver pressure weight:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.pass_receiver_pressure_weight" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Multiplier applied to lane interception risk for lob-aware passes to near-rim receivers.">
+              <span class="param-name">Lob lane multiplier:</span>
+              <input class="env-param-input" type="number" min="0" max="1" step="0.05" v-model.number="pressureParamsInput.pass_lob_lane_multiplier" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Receiver distance from the basket, in hexes, at or below which lob-aware lane-risk reduction applies.">
+              <span class="param-name">Lob receiver distance:</span>
+              <input class="env-param-input" type="number" min="0" step="0.5" v-model.number="pressureParamsInput.pass_lob_receiver_distance" :disabled="pressureParamsUpdating" />
             </div>
             <div class="offense-skill-actions">
               <button
@@ -9439,6 +10922,54 @@ function offenseSkillDeltaLabel(idx) {
         <div v-if="!props.gameState || !props.gameState.obs" class="no-data">
           No observation data available.
         </div>
+        <div v-else-if="obsTokens" class="observation-table-wrapper">
+          <div class="token-table-scroll">
+            <table class="observation-table token-table">
+              <thead>
+                <tr>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th v-for="label in tokenFeatureLabels" :key="`obs-token-head-${label}`">
+                    {{ label }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="row in tokenRows"
+                  :key="`obs-token-${row.playerId}`"
+                  :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
+                >
+                  <td>Player {{ row.playerId }}</td>
+                  <td>{{ row.teamLabel }}</td>
+                  <td
+                    v-for="(label, fIdx) in tokenFeatureLabels"
+                    :key="`obs-token-${row.playerId}-${label}`"
+                    class="value-mono"
+                  >
+                    {{ formatTokenValue(row.features[fIdx]) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h5 class="token-subtitle">Globals</h5>
+          <table class="observation-table token-table">
+            <thead>
+              <tr>
+                <th>Global</th>
+                <th>Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in tokenGlobalRows" :key="`obs-token-global-${row.label}`">
+                <td>{{ row.label }}</td>
+                <td class="value-mono">{{ formatTokenValue(row.value) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
         <div v-else class="observation-table-wrapper">
           <table class="observation-table">
             <thead>
@@ -9629,119 +11160,69 @@ function offenseSkillDeltaLabel(idx) {
     <div v-if="activeTab === 'attention'" class="tab-content">
       <div class="observation-section">
         <div class="token-section">
-          <h4>Token View (Set-Observation)</h4>
+          <h4>Attention Map (Set-Observation)</h4>
           <div v-if="!obsTokens" class="no-data">
             No token data available.
           </div>
-          <div v-else class="token-table-wrapper">
-            <div class="token-table-scroll">
-              <table class="observation-table token-table">
-                <thead>
-                  <tr>
-                    <th>Player</th>
-                    <th>Team</th>
-                    <th v-for="label in tokenFeatureLabels" :key="`token-head-${label}`">
-                      {{ label }}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr
-                    v-for="row in tokenRows"
-                    :key="`token-${row.playerId}`"
-                    :class="{ 'token-ball-holder': row.playerId === props.gameState.ball_holder }"
-                  >
-                    <td>Player {{ row.playerId }}</td>
-                    <td>{{ row.teamLabel }}</td>
-                    <td
-                      v-for="(label, fIdx) in tokenFeatureLabels"
-                      :key="`token-${row.playerId}-${label}`"
-                      class="value-mono"
-                    >
-                      {{ formatTokenValue(row.features[fIdx]) }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+          <div v-else class="token-attn-section">
+            <div v-if="tokenAttentionMatrix.length === 0" class="no-data">
+              Attention weights are not available.
             </div>
-
-            <h5 class="token-subtitle">Globals</h5>
-            <table class="observation-table token-table">
-              <thead>
-                <tr>
-                  <th>Global</th>
-                  <th>Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="row in tokenGlobalRows" :key="`token-global-${row.label}`">
-                  <td>{{ row.label }}</td>
-                  <td class="value-mono">{{ formatTokenValue(row.value) }}</td>
-                </tr>
-              </tbody>
-            </table>
-
-            <div class="token-attn-section">
-              <h5 class="token-subtitle">Attention Map</h5>
-              <div v-if="tokenAttentionMatrix.length === 0" class="no-data">
-                Attention weights are not available.
-              </div>
-              <div v-else class="token-table-wrapper">
-                <div class="token-attn-controls" v-if="tokenAttentionHeads">
-                  <template v-if="tokenAttentionObserverOptions.length > 1">
-                    <label for="token-attn-observer">Observer:</label>
-                    <select id="token-attn-observer" v-model="attentionObserverView">
-                      <option
-                        v-for="option in tokenAttentionObserverOptions"
-                        :key="`attn-observer-${option.value}`"
-                        :value="option.value"
-                      >
-                        {{ option.label }}
-                      </option>
-                    </select>
-                  </template>
-                  <label for="token-attn-view">View:</label>
-                  <select id="token-attn-view" v-model="attentionView">
-                    <option value="avg">Average</option>
-                    <option v-for="idx in attentionHeadOptions" :key="`head-${idx}`" :value="String(idx)">
-                      Head {{ idx + 1 }}
+            <div v-else class="token-table-wrapper">
+              <div class="token-attn-controls" v-if="tokenAttentionHeads">
+                <template v-if="tokenAttentionObserverOptions.length > 1">
+                  <label for="token-attn-observer">Observer:</label>
+                  <select id="token-attn-observer" v-model="attentionObserverView">
+                    <option
+                      v-for="option in tokenAttentionObserverOptions"
+                      :key="`attn-observer-${option.value}`"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
                     </option>
                   </select>
-                  <button class="token-attn-download" type="button" @click="downloadAttentionPng">
-                    Download PNG
-                  </button>
-                </div>
-                <div class="token-attn-note" v-if="tokenAttentionSubtitle">
-                  {{ tokenAttentionSubtitle }}
-                </div>
-                <div class="token-attn-note" v-if="tokenAttentionRuntimeSummary">
-                  {{ tokenAttentionRuntimeSummary }}
-                </div>
-                <div class="token-table-scroll">
-                  <table class="observation-table token-table token-attn-table">
-                    <thead>
-                      <tr>
-                        <th>From \ To</th>
-                        <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
-                          {{ label }}
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
-                        <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
-                        <td
-                          v-for="(val, cIdx) in row"
-                          :key="`attn-${rIdx}-${cIdx}`"
-                          class="value-mono"
-                          :style="attentionCellStyle(val)"
-                        >
-                          {{ formatTokenValue(val) }}
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
+                </template>
+                <label for="token-attn-view">View:</label>
+                <select id="token-attn-view" v-model="attentionView">
+                  <option value="avg">Average</option>
+                  <option v-for="idx in attentionHeadOptions" :key="`head-${idx}`" :value="String(idx)">
+                    Head {{ idx + 1 }}
+                  </option>
+                </select>
+                <button class="token-attn-download" type="button" @click="downloadAttentionPng">
+                  Download PNG
+                </button>
+              </div>
+              <div class="token-attn-note" v-if="tokenAttentionSubtitle">
+                {{ tokenAttentionSubtitle }}
+              </div>
+              <div class="token-attn-note" v-if="tokenAttentionRuntimeSummary">
+                {{ tokenAttentionRuntimeSummary }}
+              </div>
+              <div class="token-table-scroll">
+                <table class="observation-table token-table token-attn-table">
+                  <thead>
+                    <tr>
+                      <th>From \ To</th>
+                      <th v-for="label in tokenAttentionLabels" :key="`attn-head-${label}`">
+                        {{ label }}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(row, rIdx) in tokenAttentionMatrix" :key="`attn-row-${rIdx}`">
+                      <td>{{ tokenAttentionLabels[rIdx] || `T${rIdx}` }}</td>
+                      <td
+                        v-for="(val, cIdx) in row"
+                        :key="`attn-${rIdx}-${cIdx}`"
+                        class="value-mono"
+                        :style="attentionCellStyle(val)"
+                      >
+                        {{ formatTokenValue(val) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -10685,6 +12166,17 @@ function offenseSkillDeltaLabel(idx) {
   letter-spacing: 0.05em;
 }
 
+.param-section-label {
+  margin: 0.75rem 0 0.15rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  color: var(--app-accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .category-help {
   display: inline-flex;
   align-items: center;
@@ -11139,6 +12631,23 @@ function offenseSkillDeltaLabel(idx) {
   outline: none;
   border-color: var(--app-accent-strong);
   box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+}
+
+.self-play-template-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.65rem;
+  color: var(--app-text);
+  font-size: 0.82rem;
+}
+
+.self-play-template-toggle input {
+  accent-color: var(--app-accent);
+}
+
+.self-play-template-toggle.disabled {
+  opacity: 0.55;
 }
 
 .status-note {
@@ -11639,7 +13148,312 @@ function offenseSkillDeltaLabel(idx) {
 .per-player-table td {
   color: #e2e8f0;
 }
+
 .group-steal td:first-child { background-color: rgba(251, 113, 133, 0.08); }
+
+.pass-lab-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.pass-lab-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--app-panel-border);
+  padding-bottom: 0.75rem;
+}
+
+.pass-lab-header h5 {
+  margin-bottom: 0.35rem;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.pass-lab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.pass-lab-layout {
+  display: grid;
+  grid-template-columns: minmax(460px, 1.25fr) minmax(340px, 0.75fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+
+.pass-lab-main-board-mode {
+  grid-template-columns: minmax(240px, 0.45fr) minmax(420px, 1fr);
+}
+
+.pass-lab-board-note {
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  border-radius: 12px;
+  background: rgba(8, 47, 73, 0.18);
+  padding: 0.85rem;
+  color: var(--app-text-muted);
+}
+
+.pass-lab-board-note h5 {
+  margin-bottom: 0.45rem;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.pass-lab-board-note p {
+  margin: 0;
+  line-height: 1.35;
+}
+
+.pass-lab-board-panel {
+  min-width: 0;
+  min-height: 620px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.34);
+  overflow: hidden;
+}
+
+.pass-lab-board-panel :deep(.game-board-container.minimal-chrome) {
+  min-height: 620px;
+  padding: 0.35rem;
+}
+
+.pass-lab-board-panel :deep(.board-svg) {
+  max-height: 680px;
+}
+
+.pass-lab-side-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  min-width: 0;
+}
+
+.pass-lab-control-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.52);
+  padding: 0.85rem;
+}
+
+.pass-lab-control-card h5 {
+  margin: 0 0 0.65rem 0;
+  padding-bottom: 0.45rem;
+}
+
+.pass-lab-form-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.pass-lab-form-row select,
+.pass-lab-param-grid input {
+  border: 1px solid var(--app-panel-border);
+  border-radius: 7px;
+  background: rgba(13, 20, 38, 0.88);
+  color: var(--app-text);
+  padding: 0.35rem 0.45rem;
+}
+
+.pass-lab-form-row select {
+  min-width: 145px;
+}
+
+.pass-lab-checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--app-text);
+  margin-bottom: 0.75rem;
+}
+
+.pass-lab-param-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.pass-lab-param-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  color: var(--app-text-muted);
+  font-size: 0.82rem;
+}
+
+.pass-lab-param-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  min-height: 18px;
+}
+
+.pass-lab-param-label code {
+  color: var(--app-accent);
+  font-size: 0.75rem;
+  font-weight: 700;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 999px;
+  padding: 0.05rem 0.32rem;
+}
+
+.pass-lab-param-help {
+  flex: 0 0 auto;
+  margin-left: 0;
+}
+
+
+.pass-lab-param-grid input {
+  width: 100%;
+  color: var(--app-text);
+}
+
+.pass-lab-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.pass-lab-summary-grid > div {
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.25);
+  padding: 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.pass-lab-summary-grid span {
+  color: var(--app-text-muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pass-lab-summary-grid strong {
+  color: var(--app-text);
+  font-size: 0.95rem;
+}
+
+.pass-lab-results-card {
+  min-height: 0;
+}
+
+.pass-lab-table-wrap {
+  overflow-x: auto;
+}
+
+.pass-lab-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+}
+
+.pass-lab-table th,
+.pass-lab-table td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+  text-align: left;
+  vertical-align: top;
+}
+
+.pass-lab-table th {
+  color: var(--app-text-muted);
+  font-weight: 700;
+}
+
+.pass-lab-table tr:last-child td {
+  border-bottom: none;
+}
+
+.pass-lab-chip {
+  display: inline-flex;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.14);
+  color: var(--app-accent);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.risk-cell {
+  color: #fb7185;
+  font-weight: 700;
+}
+
+.safe-cell {
+  color: #34d399;
+  font-weight: 700;
+}
+
+.pass-lab-param-section {
+  margin-top: 0.85rem;
+}
+
+.pass-lab-section-title {
+  color: #cbd5e1;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  margin-bottom: 0.55rem;
+  text-transform: uppercase;
+}
+
+.pass-lab-help-text {
+  color: var(--app-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  margin: 0 0 0.65rem 0;
+}
+
+.pass-lab-components {
+  min-width: 150px;
+  white-space: nowrap;
+}
+
+.pass-lab-equations-card {
+  border-color: rgba(56, 189, 248, 0.22);
+  background: linear-gradient(180deg, rgba(8, 47, 73, 0.2), rgba(15, 23, 42, 0.52));
+}
+
+.pass-lab-equation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.math-line {
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.42);
+  color: #e2e8f0;
+  font-family: 'Times New Roman', Georgia, serif;
+  font-size: 1.9rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  padding: 0.7rem 0.85rem;
+  white-space: nowrap;
+}
+
+@media (max-width: 1100px) {
+  .pass-lab-layout {
+    grid-template-columns: 1fr;
+  }
+}
 
 .no-data {
   text-align: center;

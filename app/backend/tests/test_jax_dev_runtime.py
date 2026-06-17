@@ -40,11 +40,12 @@ class _FakeSpec:
 class _FakeRawJaxModel:
     metadata = {"policy_spec": {"model_type": "mlp"}}
 
-    def __init__(self, action_bias: int | None = None):
+    def __init__(self, action_bias: int | None = None, metadata: dict | None = None):
         self.jax = jax
         self.jnp = jnp
         self.params = {}
         self.spec = _FakeSpec()
+        self.metadata = dict(metadata or self.metadata)
         self._sample_key = jax.random.PRNGKey(123)
         self.action_bias = action_bias
 
@@ -236,6 +237,64 @@ def test_jax_dev_runtime_replace_policies_refreshes_policy_outputs():
     )
     first_player = runtime.offense_ids[0]
     assert new_probs[first_player][0] > old_probs[first_player][0]
+
+
+
+def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata():
+    runtime = _make_runtime(
+        env_params={
+            "rebound_target_temperature": 0.25,
+            "rebound_winner_temperature": 0.25,
+        }
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.obs = runtime.observation_dict()
+
+    new_policy = _FakeRawJaxModel(
+        metadata={
+            "policy_spec": {"model_type": "mlp"},
+            "env_config": {
+                "enable_rebounds": False,
+                "rebound_target_temperature": 0.75,
+                "rebound_winner_temperature": 0.5,
+                "offensive_rebound_shot_clock_reset": 13,
+            },
+        }
+    )
+    runtime.replace_policies(
+        unified_policy=new_policy,
+        opponent_policy=new_policy,
+        game_state=game_state,
+    )
+
+    assert runtime.env_params["enable_rebounds"] is False
+    assert runtime.display_env.enable_rebounds is False
+    assert float(np.asarray(runtime.static.rebound_target_temperature)) == pytest.approx(0.75)
+    assert float(np.asarray(runtime.static.rebound_winner_temperature)) == pytest.approx(0.5)
+    assert int(np.asarray(runtime.static.offensive_rebound_shot_clock_reset)) == 13
+
+    runtime.env_params["enable_rebounds"] = True
+    runtime.display_env.enable_rebounds = True
+    non_rebound_policy = _FakeRawJaxModel(
+        metadata={
+            "policy_spec": {"model_type": "mlp"},
+            "env_config": {},
+        }
+    )
+    runtime.replace_policies(
+        unified_policy=non_rebound_policy,
+        opponent_policy=non_rebound_policy,
+        game_state=game_state,
+    )
+
+    assert runtime.env_params["enable_rebounds"] is False
+    assert runtime.display_env.enable_rebounds is False
+    assert int(np.asarray(runtime.static.enable_rebounds)) == 0
 
 
 def test_jax_dev_runtime_self_play_respects_requested_template_seed():

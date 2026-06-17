@@ -809,13 +809,23 @@ def get_mlflow_training_params(
     )
     training_params["start_template_enabled"] = _get_param(
         params,
-        ["start_template_enabled", "start-template-enabled"],
+        [
+            "start_template_enabled",
+            "start-template-enabled",
+            "jax/env/start_template_enabled",
+            "jax/start_template_enabled",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
     training_params["start_template_library"] = _get_param(
         params,
-        ["start_template_library", "start-template-library"],
+        [
+            "start_template_library",
+            "start-template-library",
+            "jax/env/start_template_library",
+            "jax/start_template_library",
+        ],
         lambda v: None if v in ("", "None", "null") else str(v),
         None,
     )
@@ -824,6 +834,8 @@ def get_mlflow_training_params(
         [
             "start_template_library_artifact_path",
             "start-template-library-artifact-path",
+            "jax/env/start_template_library_artifact_path",
+            "jax/start_template_library_artifact_path",
         ],
         lambda v: None if v in ("", "None", "null") else str(v),
         None,
@@ -833,31 +845,53 @@ def get_mlflow_training_params(
         [
             "start_template_library_template_count",
             "start-template-library-template-count",
+            "jax/env/start_template_library_template_count",
+            "jax/start_template_library_template_count",
         ],
         lambda v: None if v in ("", "None", "null") else int(v),
         None,
     )
     training_params["start_template_prob"] = _get_param(
         params,
-        ["start_template_prob", "start-template-prob"],
+        [
+            "start_template_prob",
+            "start-template-prob",
+            "jax/env/start_template_prob",
+            "jax/start_template_prob",
+        ],
         float,
         0.0,
     )
     training_params["start_template_jitter_scale"] = _get_param(
         params,
-        ["start_template_jitter_scale", "start-template-jitter-scale"],
+        [
+            "start_template_jitter_scale",
+            "start-template-jitter-scale",
+            "jax/env/start_template_jitter_scale",
+            "jax/start_template_jitter_scale",
+        ],
         float,
         1.0,
     )
     training_params["start_template_mirror_prob"] = _get_param(
         params,
-        ["start_template_mirror_prob", "start-template-mirror-prob"],
+        [
+            "start_template_mirror_prob",
+            "start-template-mirror-prob",
+            "jax/env/start_template_mirror_prob",
+            "jax/start_template_mirror_prob",
+        ],
         float,
         0.5,
     )
     training_params["start_template_strict"] = _get_param(
         params,
-        ["start_template_strict", "start-template-strict"],
+        [
+            "start_template_strict",
+            "start-template-strict",
+            "jax/env/start_template_strict",
+            "jax/start_template_strict",
+        ],
         lambda v: str(v).lower() in ["1", "true", "yes", "y", "t"],
         False,
     )
@@ -1115,7 +1149,7 @@ def get_mlflow_start_template_library(
     run = client.get_run(run_id)
     players_per_side = _get_param(
         run.data.params,
-        ["players"],
+        ["players", "jax/env/players", "jax/players", "jax/training_player_count"],
         int,
         3,
     )

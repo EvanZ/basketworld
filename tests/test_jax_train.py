@@ -4,6 +4,11 @@ import pytest
 import numpy as np
 
 from basketworld_jax.checkpoints import build_checkpoint_payload, load_checkpoint
+from basketworld_jax.env import (
+    TOKEN_OBS_GLOBAL_DIM,
+    TOKEN_OBS_PLAYER_DIM,
+    TOKEN_OBS_ROLE_FLAG_DIM,
+)
 from basketworld_jax.intent.discriminator import (
     IntentDiscriminatorSpec,
     build_intent_step_features_from_rollout,
@@ -19,8 +24,10 @@ from basketworld_jax.train.types import (
 )
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
+    _checkpoint_interval_for_update,
     _checkpoint_trainer_config_from_args,
     _entropy_coef_for_update,
+    _periodic_checkpoint_updates,
     _filter_mlflow_train_metrics,
     _phi_beta_for_update,
     _log_mlflow_params,
@@ -47,6 +54,46 @@ def test_trainer_parser_defaults_match_frozen_scope():
 
     for key, expected in TRAIN_FROZEN_VALUES.items():
         assert getattr(args, key) == expected
+
+
+def test_fixed_checkpoint_schedule_preserves_modulo_cadence():
+    args = parse_args(
+        [
+            "--num-updates",
+            "10",
+            "--checkpoint-every-updates",
+            "3",
+        ]
+    )
+
+    assert _checkpoint_interval_for_update(args, 1) == 3
+    assert _periodic_checkpoint_updates(args) == {3, 6, 9}
+
+
+def test_log_checkpoint_schedule_starts_frequent_and_caps_interval():
+    args = parse_args(
+        [
+            "--num-updates",
+            "20",
+            "--checkpoint-every-updates",
+            "10",
+            "--checkpoint-schedule",
+            "log",
+            "--checkpoint-log-initial-updates",
+            "2",
+            "--checkpoint-log-ramp-updates",
+            "20",
+        ]
+    )
+
+    due_updates = sorted(_periodic_checkpoint_updates(args))
+    intervals = [b - a for a, b in zip(due_updates, due_updates[1:], strict=False)]
+
+    assert due_updates[0] == 2
+    assert intervals
+    assert intervals[0] < int(args.checkpoint_every_updates)
+    assert max(intervals) <= int(args.checkpoint_every_updates)
+    assert _checkpoint_interval_for_update(args, 20) == 10
 
 
 def test_checkpoint_payload_preserves_selector_optimizer_state():
@@ -1081,7 +1128,8 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     result = run_train_scaffold(args)
 
     spec = result["trajectory_spec"]
-    assert spec["trajectory_flat_obs_shape"] == [4, 4, 91]
+    flat_obs_dim = 107
+    assert spec["trajectory_flat_obs_shape"] == [4, 4, flat_obs_dim]
     assert spec["trajectory_policy_intent_index_shape"] == [4, 4]
     assert spec["trajectory_policy_intent_gate_shape"] == [4, 4]
     assert spec["trajectory_action_mask_shape"] == [4, 4, 3, 14]
@@ -1101,7 +1149,7 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     assert spec["trajectory_offense_score_delta_shape"] == [4, 4]
     assert spec["trajectory_defense_score_delta_shape"] == [4, 4]
     assert spec["bootstrap_values_shape"] == [4]
-    assert spec["ppo_batch_flat_obs_shape"] == [16, 91]
+    assert spec["ppo_batch_flat_obs_shape"] == [16, flat_obs_dim]
     assert spec["ppo_batch_policy_intent_index_shape"] == [16]
     assert spec["ppo_batch_policy_intent_gate_shape"] == [16]
     assert spec["ppo_batch_action_mask_shape"] == [16, 3, 14]
@@ -1162,16 +1210,17 @@ def test_train_scaffold_supports_attention_policy_model():
     assert result["policy_spec"]["model_type"] == "attention"
     assert result["policy_spec"]["action_head_mode"] == "pointer_targeted"
     assert result["policy_spec"]["token_player_count"] == 6
-    assert result["policy_spec"]["token_dim"] == 15
-    assert result["policy_spec"]["global_dim"] == 4
+    assert result["policy_spec"]["token_dim"] == TOKEN_OBS_PLAYER_DIM
+    assert result["policy_spec"]["global_dim"] == TOKEN_OBS_GLOBAL_DIM
     assert result["policy_spec"]["attention_pi_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_vf_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_head_activation"] == "relu"
     assert result["policy_spec"]["intent_embedding_enabled"] is True
     assert result["policy_spec"]["intent_embedding_dim"] == 6
     assert result["trainer_config"]["ppo_minibatches"] == 2
-    assert result["trajectory_spec"]["flat_obs_shape"] == [2, 95]
-    assert result["trajectory_spec"]["trajectory_flat_obs_shape"] == [2, 2, 95]
+    token_obs_dim = (6 * TOKEN_OBS_PLAYER_DIM) + TOKEN_OBS_GLOBAL_DIM + TOKEN_OBS_ROLE_FLAG_DIM
+    assert result["trajectory_spec"]["flat_obs_shape"] == [2, token_obs_dim]
+    assert result["trajectory_spec"]["trajectory_flat_obs_shape"] == [2, 2, token_obs_dim]
     assert result["ppo_update_final_metrics"]["total_loss"] != 0.0
 
 
@@ -1829,7 +1878,7 @@ def test_train_loop_runs_offense_intent_discriminator_and_sample_dump(tmp_path):
         assert sample["embedding"].shape[0] == sample["features"].shape[0]
         assert sample["intent_index"].shape[0] == sample["features"].shape[0]
         assert sample["players"].shape[0] == sample["features"].shape[0]
-        assert sample["globals"].shape[1] == 4
+        assert sample["globals"].shape[1] == TOKEN_OBS_GLOBAL_DIM
         assert np.all(sample["globals"][:, 0] == 0.0)
         assert np.all(sample["globals"][:, 1] == 0.0)
 
