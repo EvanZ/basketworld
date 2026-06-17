@@ -611,6 +611,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             trace = {
                 "full_actions": full_actions.astype(jnp.int32),
                 "ball_holder": policy_state.ball_holder.astype(jnp.int32),
+                "positions": env_out.state.positions.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
@@ -954,6 +955,51 @@ def _record_shot_event(
             entry["unassisted"][shot_type] = int(entry["unassisted"].get(shot_type, 0)) + 1
 
 
+def _record_rebound_heatmap_event(
+    *,
+    rebound_accumulator: dict[str, Any],
+    shot_q: int,
+    shot_r: int,
+    target_cell: int,
+    winner_id: int,
+    offensive: bool,
+    positions: np.ndarray,
+    cell_coords: np.ndarray,
+) -> None:
+    source_key = f"{int(shot_q)},{int(shot_r)}"
+    bucket = rebound_accumulator.setdefault(
+        source_key,
+        {
+            "total": 0,
+            "targets": {},
+            "target_offensive": {},
+            "rebounders": {},
+            "rebounder_offensive": {},
+        },
+    )
+    bucket["total"] = int(bucket.get("total", 0)) + 1
+
+    target_idx = int(target_cell)
+    if 0 <= target_idx < int(cell_coords.shape[0]):
+        target_coord = cell_coords[target_idx]
+        target_key = f"{int(target_coord[0])},{int(target_coord[1])}"
+        targets = bucket.setdefault("targets", {})
+        targets[target_key] = int(targets.get(target_key, 0)) + 1
+        if bool(offensive):
+            target_offensive = bucket.setdefault("target_offensive", {})
+            target_offensive[target_key] = int(target_offensive.get(target_key, 0)) + 1
+
+    winner = int(winner_id)
+    if 0 <= winner < int(positions.shape[0]):
+        winner_pos = positions[winner]
+        winner_key = f"{int(winner_pos[0])},{int(winner_pos[1])}"
+        rebounders = bucket.setdefault("rebounders", {})
+        rebounders[winner_key] = int(rebounders.get(winner_key, 0)) + 1
+        if bool(offensive):
+            rebounder_offensive = bucket.setdefault("rebounder_offensive", {})
+            rebounder_offensive[winner_key] = int(rebounder_offensive.get(winner_key, 0)) + 1
+
+
 def _record_shot_diagnostics(
     eval_diagnostics: dict[str, Any],
     *,
@@ -1124,6 +1170,8 @@ def run_native_jax_evaluation(
 
     results: list[dict[str, Any]] = []
     shot_accumulator: dict[str, list[int]] = {}
+    rebound_accumulator: dict[str, Any] = {}
+    cell_coords_np = np.asarray(jax.device_get(static.cell_coords), dtype=np.int32)
     per_player_stats = _init_player_stats(n_players)
     per_intent_stats: dict[str, dict[str, Any]] = {}
     eval_diagnostics = _init_eval_diagnostics()
@@ -1415,6 +1463,16 @@ def run_native_jax_evaluation(
                         by_player = rebound_diag.setdefault("by_player_offensive", {})
                         rebound_key = str(int(rebound_winner))
                         by_player[rebound_key] = int(by_player.get(rebound_key, 0)) + 1
+                    _record_rebound_heatmap_event(
+                        rebound_accumulator=rebound_accumulator,
+                        shot_q=int(trace["shot_q"][t, idx]),
+                        shot_r=int(trace["shot_r"][t, idx]),
+                        target_cell=rebound_target_cell,
+                        winner_id=rebound_winner,
+                        offensive=rebound_offensive,
+                        positions=np.asarray(trace["positions"][t, idx], dtype=np.int32),
+                        cell_coords=cell_coords_np,
+                    )
                     rebounds_payload.append(
                         {
                             "attempt": True,
@@ -1657,6 +1715,7 @@ def run_native_jax_evaluation(
     return {
         "results": results,
         "shot_accumulator": shot_accumulator,
+        "rebound_accumulator": rebound_accumulator,
         "per_player_stats": per_player_stats,
         "per_intent_stats": per_intent_stats,
         "eval_diagnostics": {

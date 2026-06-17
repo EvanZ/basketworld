@@ -23,6 +23,47 @@ function normalizeShotAccumulator(acc) {
   return result;
 }
 
+function normalizeReboundCountMap(rawMap) {
+  const out = {};
+  if (!rawMap || typeof rawMap !== 'object') return out;
+  for (const [rawKey, rawCount] of Object.entries(rawMap)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    const count = Number(rawCount || 0);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !Number.isFinite(count) || count <= 0) continue;
+    out[`${q},${r}`] = (out[`${q},${r}`] || 0) + count;
+  }
+  return out;
+}
+
+function normalizeReboundAccumulator(acc) {
+  const result = {};
+  if (!acc || typeof acc !== 'object') return result;
+  for (const [rawKey, rawBucket] of Object.entries(acc)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !rawBucket || typeof rawBucket !== 'object') continue;
+    const targets = normalizeReboundCountMap(rawBucket.targets || rawBucket.target || {});
+    const targetOffensive = normalizeReboundCountMap(rawBucket.target_offensive || rawBucket.targets_offensive || {});
+    const rebounders = normalizeReboundCountMap(rawBucket.rebounders || rawBucket.winners || {});
+    const rebounderOffensive = normalizeReboundCountMap(rawBucket.rebounder_offensive || rawBucket.rebounders_offensive || {});
+    const totalRaw = Number(rawBucket.total || 0);
+    const total = Number.isFinite(totalRaw) && totalRaw > 0
+      ? totalRaw
+      : Math.max(
+        Object.values(targets).reduce((sum, val) => sum + Number(val || 0), 0),
+        Object.values(rebounders).reduce((sum, val) => sum + Number(val || 0), 0),
+      );
+    if (total <= 0) continue;
+    result[`${q},${r}`] = { total, targets, targetOffensive, rebounders, rebounderOffensive };
+  }
+  return result;
+}
+
 function probToPercent(prob) {
   const num = Number(prob ?? 0);
   if (Number.isNaN(num)) return 0;
@@ -155,6 +196,12 @@ const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
+const reboundAccumulator = ref({});
+const reboundHeatmapEnabled = ref(false);
+const reboundHeatmapKind = ref('targets');
+const selectedReboundShotKey = ref('');
+const selectedReboundShotKeys = ref([]);
+const isReboundMultiSelecting = ref(false);
 const playbookAnalysis = ref(null);
 const selectedPlaybookIntent = ref(null);
 const playbookShowPlayerPaths = ref(true);
@@ -523,6 +570,82 @@ const shotChartOptions = computed(() => {
 const hasShotChartData = computed(
   () => !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0,
 );
+const hasReboundHeatmapData = computed(
+  () => !!reboundAccumulator.value && Object.keys(reboundAccumulator.value).length > 0,
+);
+const showReboundHeatmapSelector = computed(
+  () => !isBoardEditingMode.value && hasReboundHeatmapData.value,
+);
+const reboundHeatmapSourceAccumulator = computed(() => {
+  const out = {};
+  for (const [key, bucket] of Object.entries(reboundAccumulator.value || {})) {
+    const total = Number(bucket?.total || 0);
+    if (total > 0) out[key] = [total, 0];
+  }
+  return out;
+});
+const selectedReboundShotKeysDisplay = computed(() => (
+  Array.isArray(selectedReboundShotKeys.value) ? selectedReboundShotKeys.value : []
+));
+const selectedReboundShotLabel = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value;
+  if (keys.length === 0) return '';
+  if (keys.length === 1) return keys[0];
+  return `${keys.length} sources`;
+});
+function addReboundCounts(target, source) {
+  for (const [key, value] of Object.entries(source || {})) {
+    const count = Number(value || 0);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    target[key] = (target[key] || 0) + count;
+  }
+}
+const selectedReboundHeatmapBucket = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value.filter((key) => reboundAccumulator.value?.[key]);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) return reboundAccumulator.value[keys[0]];
+  const bucket = { total: 0, targets: {}, targetOffensive: {}, rebounders: {}, rebounderOffensive: {} };
+  for (const key of keys) {
+    const src = reboundAccumulator.value[key] || {};
+    bucket.total += Number(src.total || 0);
+    addReboundCounts(bucket.targets, src.targets);
+    addReboundCounts(bucket.targetOffensive, src.targetOffensive);
+    addReboundCounts(bucket.rebounders, src.rebounders);
+    addReboundCounts(bucket.rebounderOffensive, src.rebounderOffensive);
+  }
+  return bucket;
+});
+const boardEvalReboundOverlay = computed(() => {
+  if (!reboundHeatmapEnabled.value || isReboundMultiSelecting.value || selectedReboundShotKeysDisplay.value.length === 0) return null;
+  const bucket = selectedReboundHeatmapBucket.value;
+  if (!bucket) return null;
+  const mapName = reboundHeatmapKind.value === 'rebounders' ? 'rebounders' : 'targets';
+  const rawMap = bucket[mapName] || {};
+  const offensiveMap = mapName === 'rebounders' ? (bucket.rebounderOffensive || {}) : (bucket.targetOffensive || {});
+  const total = Object.values(rawMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const offensiveTotal = Object.values(offensiveMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  if (total <= 0) return null;
+  const targetCells = Object.entries(rawMap)
+    .map(([key, count]) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      const c = Number(count || 0);
+      if (!Number.isFinite(q) || !Number.isFinite(r) || c <= 0) return null;
+      const offensiveCount = Number(offensiveMap[key] || 0);
+      return { q, r, prob: c / total, count: c, offensive_count: offensiveCount, orb_pct: c > 0 ? offensiveCount / c : 0 };
+    })
+    .filter(Boolean);
+  const kindLabel = mapName === 'rebounders' ? 'rebounder location' : 'catch target';
+  return {
+    available: true,
+    source: 'eval_rebound_heatmap',
+    title: `Eval rebounds from ${selectedReboundShotLabel.value} | ${kindLabel}`,
+    summary: `Total ORB ${((offensiveTotal / total) * 100).toFixed(1)}% (${Math.round(offensiveTotal)}/${Math.round(total)})`,
+    target_cells: targetCells,
+    shot: { player_id: null, shot_type: kindLabel },
+  };
+});
 const hasAssistSankeyData = computed(
   () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
 );
@@ -677,23 +800,28 @@ const liveReboundTargetOverlay = computed(() => buildReboundTargetOverlayFromSta
 
 const boardReboundTargetOverlay = computed(() => {
   if (isPlaybookBoardPreviewActive.value || isBoardEditingMode.value) return null;
+  if (boardEvalReboundOverlay.value) return boardEvalReboundOverlay.value;
   // Eval shot charts should not be hidden by a stale live rebound overlay from the current board state.
   if (hasShotChartData.value && !reboundPreviewEnabled.value) return null;
   if (disableTransitionsForCapture.value) return liveReboundTargetOverlay.value;
   if (reboundPreviewEnabled.value && reboundPreview.value?.available) return reboundPreview.value;
   return liveReboundTargetOverlay.value;
 });
-const boardShotAccumulatorDisplay = computed(() =>
-  (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
+const boardShotAccumulatorDisplay = computed(() => {
+  if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) {
+    return reboundHeatmapSourceAccumulator.value;
+  }
+  return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
     ? {}
-    : shotAccumulatorForBoard.value
-);
+    : shotAccumulatorForBoard.value;
+});
 const initialControlsTab = computed(() =>
   templateSandboxMode.value ? 'template' : 'environment'
 );
-const boardShotChartLabelDisplay = computed(() =>
-  (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value) ? '' : boardShotChartLabel.value
-);
+const boardShotChartLabelDisplay = computed(() => {
+  if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) return 'Select shot source for rebound heatmap';
+  return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value) ? '' : boardShotChartLabel.value;
+});
 
 const selectedSankeyLinkMap = computed(() => {
   const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
@@ -840,6 +968,9 @@ async function handleGameStarted(setupData) {
   // Clear move history for new game
   moveHistory.value = [];
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
@@ -918,6 +1049,9 @@ async function handleTemplateSandboxStarted(setupData = {}) {
 
   moveHistory.value = [];
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
@@ -1153,6 +1287,33 @@ function handlePatchedGameState(newState) {
   const clonedState = cloneState(newState);
   gameHistory.value = [clonedState];
   syncPolicyProbsFromState(newState);
+}
+
+function syncSelectedReboundShotKey() {
+  const keys = Array.isArray(selectedReboundShotKeys.value) ? selectedReboundShotKeys.value : [];
+  selectedReboundShotKey.value = keys.length === 1 ? keys[0] : keys.join(' + ');
+}
+
+function handleReboundShotSelected(key, meta = {}) {
+  const normalized = String(key || '').trim();
+  if (!reboundHeatmapEnabled.value || !normalized) return;
+  if (!reboundAccumulator.value?.[normalized]) return;
+  const current = Array.isArray(selectedReboundShotKeys.value) ? [...selectedReboundShotKeys.value] : [];
+  if (meta?.shiftKey) {
+    const idx = current.indexOf(normalized);
+    if (idx >= 0) current.splice(idx, 1);
+    else current.push(normalized);
+    selectedReboundShotKeys.value = current;
+  } else {
+    selectedReboundShotKeys.value = [normalized];
+  }
+  syncSelectedReboundShotKey();
+}
+
+function clearSelectedReboundShot() {
+  selectedReboundShotKeys.value = [];
+  selectedReboundShotKey.value = '';
+  isReboundMultiSelecting.value = false;
 }
 
 async function handleShotClockAdjustment(delta) {
@@ -1974,6 +2135,9 @@ async function handleEvaluation() {
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
   potentialAssistLinksByPair.value = {};
@@ -2058,6 +2222,8 @@ async function handleEvaluation() {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      reboundAccumulator.value = normalizeReboundAccumulator(response.rebound_accumulator || {});
+      if (!reboundAccumulator.value[selectedReboundShotKey.value]) selectedReboundShotKey.value = '';
       const evalDiagnostics = response.eval_diagnostics || {};
       assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
       assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
@@ -2479,6 +2645,9 @@ async function handlePlayAgain() {
   gameHistory.value = [];
   policyProbs.value = null;
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
   potentialAssistLinksByPair.value = {};
@@ -2522,6 +2691,9 @@ async function handlePlayAgain() {
 
 function clearEvaluationArtifacts() {
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
   potentialAssistLinksByPair.value = {};
@@ -2586,6 +2758,7 @@ function startEvaluationProgressPolling(expectedTotal) {
 
 // --- Global keyboard shortcuts ---
 function onKeydown(e) {
+  if (e.key === 'Shift' && reboundHeatmapEnabled.value) isReboundMultiSelecting.value = true;
   const tag = (e.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') return; // avoid typing conflicts
   const key = e.key?.toLowerCase();
@@ -2641,14 +2814,20 @@ function onKeydown(e) {
   }
 }
 
+function onKeyup(e) {
+  if (e.key === 'Shift') isReboundMultiSelecting.value = false;
+}
+
 onMounted(() => {
   // Clear persisted stats once per app load
   try { resetStatsStorage(); } catch (_) {}
   window.addEventListener('keydown', onKeydown);
+  window.addEventListener('keyup', onKeyup);
 });
 onBeforeUnmount(() => {
   stopEvaluationProgressPolling();
   window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('keyup', onKeyup);
 });
 </script>
 
@@ -2698,14 +2877,33 @@ onBeforeUnmount(() => {
       <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
       <div class="top-row">
       <div class="board-area">
-        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
+        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector || showReboundHeatmapSelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
           <template v-if="activeControlsTab !== 'playbook' && showShotChartSelector">
             <label>Shot chart:</label>
-            <select v-model="shotChartTarget">
+            <select v-model="shotChartTarget" :disabled="reboundHeatmapEnabled">
               <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
                 {{ opt.label }}
               </option>
             </select>
+          </template>
+          <template v-if="activeControlsTab !== 'playbook' && showReboundHeatmapSelector">
+            <label class="inline-check">
+              <input type="checkbox" v-model="reboundHeatmapEnabled" />
+              <span>Rebound mode</span>
+            </label>
+            <select v-model="reboundHeatmapKind" :disabled="!reboundHeatmapEnabled">
+              <option value="targets">Catch target</option>
+              <option value="rebounders">Rebounder location</option>
+            </select>
+            <button
+              v-if="reboundHeatmapEnabled && selectedReboundShotKeysDisplay.length > 0"
+              class="small-action-button"
+              type="button"
+              @click="clearSelectedReboundShot"
+            >
+              Change source ({{ selectedReboundShotLabel }})
+            </button>
+            <span v-else-if="reboundHeatmapEnabled" class="status-note">Click a shot hex, or hold Shift and click multiple</span>
           </template>
           <template v-if="activeControlsTab !== 'playbook' && showSankeySelector">
             <label>Sankey:</label>
@@ -2764,6 +2962,11 @@ onBeforeUnmount(() => {
           :selected-actions="boardSelectedActionsDisplay"
           :shot-accumulator="boardShotAccumulatorDisplay"
           :shot-chart-label="boardShotChartLabelDisplay"
+          :shot-cells-clickable="reboundHeatmapEnabled && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :shot-chart-count-only="reboundHeatmapEnabled && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :selected-shot-cells="reboundHeatmapEnabled ? selectedReboundShotKeysDisplay : []"
+          :hide-players="reboundHeatmapEnabled"
+          :hide-clock-overlays="reboundHeatmapEnabled"
           :rebound-target-overlay="boardReboundTargetOverlay"
           :placement-mode="isBoardEditingMode"
           :placement-editable="boardPlacementEditable"
@@ -2773,6 +2976,7 @@ onBeforeUnmount(() => {
           :show-coordinates="boardShowCoordinates"
           @update-player-position="handlePlayerPositionUpdate"
           @update-placement="handleBoardPlacementUpdate"
+          @select-shot-cell="handleReboundShotSelected"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
@@ -3221,6 +3425,14 @@ header {
 }
 .shot-chart-selector .status-note {
   color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+.shot-chart-selector .small-action-button {
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 999px;
+  background: rgba(13, 20, 38, 0.85);
+  color: var(--app-text);
+  padding: 0.25rem 0.6rem;
   font-size: 0.85rem;
 }
 

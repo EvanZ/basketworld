@@ -193,6 +193,7 @@ def run_evaluation(request: EvaluationRequest):
 
     start_time = time.time()
     shot_accumulator: dict[str, list[int]] = {}
+    rebound_accumulator: dict[str, dict] = {}
 
     PARALLEL_THRESHOLD = 1000
     num_workers = None
@@ -236,6 +237,9 @@ def run_evaluation(request: EvaluationRequest):
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
             shot_accumulator = raw_shots
+        raw_rebounds = raw_results.get("rebound_accumulator")
+        if isinstance(raw_rebounds, dict):
+            rebound_accumulator = raw_rebounds
         episode_payload = raw_results.get("results", [])
     else:
         per_player_stats = {}
@@ -304,6 +308,7 @@ def run_evaluation(request: EvaluationRequest):
         "results": episode_results,
         "current_state": current_game_state,
         "shot_accumulator": shot_accumulator,
+        "rebound_accumulator": rebound_accumulator,
         "per_player_stats": per_player_stats,
         "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,

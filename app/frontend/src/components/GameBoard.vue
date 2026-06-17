@@ -35,6 +35,26 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  shotCellsClickable: {
+    type: Boolean,
+    default: false,
+  },
+  shotChartCountOnly: {
+    type: Boolean,
+    default: false,
+  },
+  selectedShotCells: {
+    type: Array,
+    default: () => [],
+  },
+  hidePlayers: {
+    type: Boolean,
+    default: false,
+  },
+  hideClockOverlays: {
+    type: Boolean,
+    default: false,
+  },
   disableTransitions: {
     type: Boolean,
     default: false,
@@ -109,7 +129,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement']);
+const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement', 'select-shot-cell']);
 
 // ------------------------------------------------------------
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
@@ -769,12 +789,18 @@ const reboundTargetCells = computed(() => {
       if (!Number.isFinite(q) || !Number.isFinite(r) || !Number.isFinite(prob) || prob <= 0) {
         return null;
       }
+      const count = Number(cell?.count ?? cell?.total ?? 0);
+      const offensiveCount = Number(cell?.offensive_count ?? cell?.offensiveCount ?? 0);
+      const orbPctRaw = Number(cell?.orb_pct ?? cell?.orbPct);
       return {
         key: `${q},${r}`,
         q,
         r,
         index: Number.isFinite(index) ? index : null,
         prob,
+        count: Number.isFinite(count) ? count : 0,
+        offensiveCount: Number.isFinite(offensiveCount) ? offensiveCount : 0,
+        orbPct: Number.isFinite(orbPctRaw) ? orbPctRaw : null,
       };
     })
     .filter(Boolean);
@@ -806,6 +832,20 @@ const maxReboundTargetProb = computed(() => {
   return max || 1;
 });
 
+const selectedShotCellPoints = computed(() => {
+  const keys = Array.isArray(props.selectedShotCells) ? props.selectedShotCells : [];
+  return keys
+    .map((key) => {
+      const [qStr, rStr] = String(key || '').split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      if (!Number.isFinite(q) || !Number.isFinite(r)) return null;
+      const { x, y } = axialToCartesian(q, r);
+      return { key: `${q},${r}`, q, r, x, y };
+    })
+    .filter(Boolean);
+});
+
 const sampledReboundTargetKey = computed(() => {
   const target = props.reboundTargetOverlay?.sampled_target;
   if (!target) return '';
@@ -822,11 +862,19 @@ const reboundTargetLabelPoints = computed(() => {
 
 const reboundOverlayTitle = computed(() => {
   if (!hasReboundTargetOverlay.value) return '';
+  const explicitTitle = props.reboundTargetOverlay?.title;
+  if (typeof explicitTitle === 'string' && explicitTitle.trim()) return explicitTitle.trim();
   const shot = props.reboundTargetOverlay?.shot || {};
   const pid = shot.player_id ?? shot.playerId;
   const shotType = shot.shot_type || shot.shotType || 'miss';
   const prefix = pid === undefined || pid === null ? 'Rebound target P' : `Rebound target P | P${pid}`;
   return `${prefix} ${shotType}`;
+});
+
+const reboundOverlaySummary = computed(() => {
+  if (!hasReboundTargetOverlay.value) return '';
+  const summary = props.reboundTargetOverlay?.summary;
+  return typeof summary === 'string' ? summary.trim() : '';
 });
 
 function reboundTargetFill(prob) {
@@ -852,11 +900,28 @@ function reboundTargetStrokeWidth(pt) {
   return pt?.key === sampledReboundTargetKey.value ? 2.4 : 1.1;
 }
 
-function reboundTargetLabel(prob) {
+function reboundTargetPctLabel(prob) {
   const pct = Number(prob || 0) * 100;
   if (pct >= 10) return `${pct.toFixed(0)}%`;
   if (pct >= 1) return `${pct.toFixed(1)}%`;
   return `${pct.toFixed(2)}%`;
+}
+
+function reboundTargetCountLabel(pt) {
+  const count = Number(pt?.count || 0);
+  return count > 0 ? `n=${Math.round(count)}` : "";
+}
+
+function reboundTargetOrbLabel(pt) {
+  if (pt?.orbPct === null || pt?.orbPct === undefined) return "";
+  const pct = Number(pt.orbPct) * 100;
+  if (!Number.isFinite(pct)) return "";
+  return `ORB ${pct.toFixed(0)}%`;
+}
+
+function handleShotCellClick(key, event = null) {
+  if (!props.shotCellsClickable) return;
+  emit('select-shot-cell', key, { shiftKey: Boolean(event?.shiftKey) });
 }
 
 function volumeFill(att) {
@@ -953,7 +1018,7 @@ const hasPlaybookOverlay = computed(() => {
   return hasBallSegments || hasPlayerSegments;
 });
 
-const showPlayers = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value);
+const showPlayers = computed(() => !props.hidePlayers && !hasShotCounts.value && !hasPlaybookOverlay.value);
 const showValueAnnotations = computed(() => !hasShotCounts.value && !hasPlaybookOverlay.value && !hasReboundTargetOverlay.value);
 
 const playbookPlayerColorMap = computed(() => {
@@ -3522,7 +3587,7 @@ async function downloadBoardAsImage() {
     // Capture state variables before async operations to ensure consistency
     const shotClock = currentGameState.value?.shot_clock;
     const hasShotClock = shotClock !== undefined && shotClock !== null;
-    const shouldDrawShotClock = !hasShotCounts.value && hasShotClock;
+    const shouldDrawShotClock = !props.hideClockOverlays && !hasShotCounts.value && hasShotClock;
     const shotClockVal = String(shotClock);
 
     img.onload = () => {
@@ -3640,7 +3705,7 @@ async function renderStateToPng() {
       const img = new Image();
       const shotClock = currentGameState.value?.shot_clock;
       const hasShotClock = shotClock !== undefined && shotClock !== null;
-      const shouldDrawShotClock = !hasShotCounts.value && hasShotClock;
+      const shouldDrawShotClock = !props.hideClockOverlays && !hasShotCounts.value && hasShotClock;
       const shotClockVal = String(shotClock);
 
       img.onload = () => {
@@ -4366,7 +4431,7 @@ onBeforeUnmount(() => {
         </g>
         
         <!-- Shot count annotations (from evaluation) -->
-        <g class="shot-count-layer" v-if="hasShotCounts">
+        <g :class="['shot-count-layer', { clickable: shotCellsClickable }]" v-if="hasShotCounts">
         <text
           v-if="shotChartLabel"
           :x="shotChartTitlePos.x"
@@ -4383,8 +4448,13 @@ onBeforeUnmount(() => {
           :fill="volumeFill(pt.attempts)"
             :stroke="volumeStroke(pt.attempts)"
             stroke-width="1.4"
-          />
+            :class="['shot-count-cell', { clickable: shotCellsClickable }]"
+            @click="handleShotCellClick(pt.key, $event)"
+          >
+            <title>{{ shotCellsClickable ? `Show rebound destinations for ${pt.key}` : `${pt.key}: ${pt.attempts} attempts` }}</title>
+          </polygon>
           <text
+            v-if="!shotChartCountOnly"
             v-for="pt in shotOverlayPoints"
             :key="`shot-${pt.key}`"
             :x="pt.x"
@@ -4398,9 +4468,10 @@ onBeforeUnmount(() => {
             v-for="pt in shotOverlayPoints"
             :key="`shot-atts-${pt.key}`"
             :x="pt.x"
-            :y="pt.y + HEX_RADIUS * 0.55"
+            :y="pt.y + (shotChartCountOnly ? HEX_RADIUS * 0.12 : HEX_RADIUS * 0.55)"
             text-anchor="middle"
-            class="shot-count-attempts"
+            :class="['shot-count-attempts', { clickable: shotCellsClickable }]"
+            @click="handleShotCellClick(pt.key, $event)"
           >
             {{ pt.attempts }}
           </text>
@@ -4417,6 +4488,15 @@ onBeforeUnmount(() => {
           >
             {{ reboundOverlayTitle }}
           </text>
+          <text
+            v-if="reboundOverlaySummary"
+            :x="shotChartTitlePos.x"
+            :y="shotChartTitlePos.y + HEX_RADIUS * 0.72"
+            text-anchor="end"
+            class="rebound-target-summary"
+          >
+            {{ reboundOverlaySummary }}
+          </text>
           <polygon
             v-for="pt in reboundTargetOverlayPoints"
             :key="`rebound-target-poly-${pt.key}`"
@@ -4430,12 +4510,24 @@ onBeforeUnmount(() => {
             v-for="pt in reboundTargetLabelPoints"
             :key="`rebound-target-label-${pt.key}`"
             :x="pt.x"
-            :y="pt.y + HEX_RADIUS * 0.08"
+            :y="pt.y - HEX_RADIUS * 0.26"
             text-anchor="middle"
             class="rebound-target-text"
           >
-            {{ reboundTargetLabel(pt.prob) }}
+            <tspan :x="pt.x" dy="0">{{ reboundTargetPctLabel(pt.prob) }}</tspan>
+            <tspan v-if="reboundTargetCountLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetCountLabel(pt) }}</tspan>
+            <tspan v-if="reboundTargetOrbLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetOrbLabel(pt) }}</tspan>
           </text>
+        </g>
+
+        <!-- Selected rebound source shot cells -->
+        <g class="selected-shot-source-layer" v-if="selectedShotCellPoints.length > 0">
+          <polygon
+            v-for="pt in selectedShotCellPoints"
+            :key="`selected-shot-source-${pt.key}`"
+            :points="hexPointsFor(pt.x, pt.y, HEX_RADIUS * 1.02)"
+            class="selected-shot-source-cell"
+          />
         </g>
 
         <!-- Sampled rebound result: shot-style ball flight and final winner marker. -->
@@ -4808,7 +4900,7 @@ onBeforeUnmount(() => {
       </g>
 
     </svg>
-    <div class="shot-clock-wrapper" v-if="!hasShotCounts">
+    <div class="shot-clock-wrapper" v-if="!hideClockOverlays && !hasShotCounts">
       <div v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-clock-indicators">
         <div
           v-for="stack in laneStepIndicatorStacks"
@@ -5505,6 +5597,43 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.shot-count-layer.clickable {
+  pointer-events: auto;
+}
+
+.shot-count-cell.clickable {
+  cursor: pointer;
+  transition: filter 0.15s ease, opacity 0.15s ease;
+}
+
+.shot-count-cell.clickable:hover {
+  filter: drop-shadow(0 0 8px rgba(103, 232, 249, 0.8));
+}
+
+.shot-count-attempts.clickable {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.shot-count-layer.clickable .shot-count-text {
+  pointer-events: none;
+}
+
+.selected-shot-source-layer {
+  pointer-events: none;
+}
+
+.selected-shot-source-cell {
+  fill: none;
+  stroke: rgba(255, 49, 91, 1);
+  stroke-width: 2px;
+  stroke-linejoin: round;
+  filter:
+    drop-shadow(0 0 2px rgba(255, 255, 255, 0.95))
+    drop-shadow(0 0 7px rgba(255, 49, 91, 1))
+    drop-shadow(0 0 14px rgba(255, 49, 91, 0.85));
+}
+
 .rebound-target-layer {
   pointer-events: none;
 }
@@ -5514,6 +5643,15 @@ onBeforeUnmount(() => {
   font-size: 0.82rem;
   font-weight: 800;
   text-shadow: 0 0 8px rgba(0, 0, 0, 0.65);
+}
+
+.rebound-target-summary {
+  fill: #facc15;
+  font-size: 0.72rem;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.9);
+  stroke-width: 1px;
 }
 
 .rebound-target-cell {
@@ -5526,11 +5664,11 @@ onBeforeUnmount(() => {
 
 .rebound-target-text {
   fill: #ecfeff;
-  font-size: 0.58rem;
-  font-weight: 800;
+  font-size: 0.48rem;
+  font-weight: 600;
   paint-order: stroke;
   stroke: rgba(2, 6, 23, 0.9);
-  stroke-width: 1px;
+  stroke-width: 0px;
 }
 
 .rebound-result-layer {
@@ -5846,7 +5984,7 @@ onBeforeUnmount(() => {
   font-weight: 800;
   paint-order: stroke;
   stroke: #0a0f1e;
-  stroke-width: 3px;
+  stroke-width: 4px;
   letter-spacing: 0.5px;
 }
 
