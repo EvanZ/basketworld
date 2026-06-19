@@ -1441,6 +1441,8 @@ const defaultEvalConfig = () => ({
   ballHolder: null,
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
+  reboundSkills: [],
+  showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
   startTemplateMode: 'checkpoint',
@@ -1954,6 +1956,8 @@ const evalConfigSafe = computed(() => {
     ...base,
     ...incoming,
     skills: { ...base.skills, ...(incoming.skills || {}) },
+    reboundSkills: Array.isArray(incoming.reboundSkills) ? incoming.reboundSkills : base.reboundSkills,
+    showReboundSkillsOnBoard: Boolean(incoming.showReboundSkillsOnBoard ?? base.showReboundSkillsOnBoard),
   };
 });
 
@@ -2802,6 +2806,14 @@ function seedEvalConfigFromGameState(copySkills = true) {
     props.gameState.offense_shooting_pct_by_player ||
     null;
   const skills = copySkills ? { layup: [], three_pt: [], dunk: [] } : (evalConfigSafe.value.skills || {});
+  const liveReboundSkills = props.gameState.player_rebound_skills || {};
+  const totalPlayers = allPlayerIds.value.length;
+  const reboundSkills = Array.from({ length: totalPlayers }, (_, idx) => {
+    const pid = allPlayerIds.value[idx];
+    const value = liveReboundSkills?.[String(pid)] ?? liveReboundSkills?.[pid] ?? 0;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
   if (copySkills && sourceSkills) {
     skills.layup = Array.from({ length: offenseCount }, (_, idx) => percentFromProb(sourceSkills?.layup?.[idx]));
     skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => percentFromProb(sourceSkills?.three_pt?.[idx]));
@@ -2816,6 +2828,7 @@ function seedEvalConfigFromGameState(copySkills = true) {
     ballHolder: nextBallHolder,
     mode: evalConfigSafe.value.mode,
     skills: copySkills ? skills : (evalConfigSafe.value.skills || skills),
+    reboundSkills,
   };
   emitEvalConfigUpdate(patch);
 }
@@ -2888,6 +2901,24 @@ function updateEvalSkill(idx, key, value) {
   emitEvalConfigUpdate({ skills: nextSkills });
 }
 
+function updateEvalReboundSkill(idx, value) {
+  const totalPlayers = allPlayerIds.value.length;
+  const base = Array.isArray(evalConfigSafe.value.reboundSkills) ? evalConfigSafe.value.reboundSkills : [];
+  const nextSkills = Array.from({ length: totalPlayers }, (_, i) => {
+    if (i === idx) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : 0;
+    }
+    const numeric = Number(base[i] ?? 0);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+  emitEvalConfigUpdate({ reboundSkills: nextSkills });
+}
+
+function setEvalShowReboundSkillsOnBoard(value) {
+  emitEvalConfigUpdate({ showReboundSkillsOnBoard: Boolean(value) });
+}
+
 function handleEvalRunClick() {
   emit('eval-run', {
     numEpisodes: evalEpisodesInput.value,
@@ -2932,6 +2963,19 @@ const evalOffenseSkillRows = computed(() => {
     threePt: Number(three[idx] ?? 0),
     dunk: Number(dunk[idx] ?? 0),
   }));
+});
+
+const evalReboundSkillRows = computed(() => {
+  const reboundSkills = Array.isArray(evalConfigSafe.value.reboundSkills) ? evalConfigSafe.value.reboundSkills : [];
+  const offense = new Set((props.gameState?.offense_ids || []).map(Number));
+  return allPlayerIds.value.map((pid, idx) => {
+    const numeric = Number(reboundSkills[idx] ?? 0);
+    return {
+      playerId: pid,
+      team: offense.has(Number(pid)) ? 'Offense' : 'Defense',
+      skill: Number.isFinite(numeric) ? numeric : 0,
+    };
+  });
 });
 
 async function applyOffenseSkillOverrides() {
@@ -3938,6 +3982,16 @@ const reboundingRows = computed(() => {
       tooltip: 'Softmax temperature for sampling the player who wins the rebound.',
     },
     {
+      label: 'Rebound skill std',
+      value: formatConfigValue(valueFor('skill_std', 'rebound_skill_std')),
+      tooltip: 'Standard deviation used to sample each player\'s per-episode rebound skill. Zero disables variation.',
+    },
+    {
+      label: 'Rebound skill weight',
+      value: formatConfigValue(valueFor('skill_weight', 'rebound_skill_weight')),
+      tooltip: 'Multiplier converting rebound skill into effective hex-distance offset in winner logits.',
+    },
+    {
       label: 'ORB clock reset',
       value: formatConfigValue(valueFor('offensive_rebound_shot_clock_reset', 'offensive_rebound_shot_clock_reset')),
       tooltip: 'Shot clock reset value after an offensive rebound when the current clock is below this threshold.',
@@ -4333,8 +4387,16 @@ function ensureStatsDiagnosticFields(target) {
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
-  for (const [pid, count] of Object.entries(target.rebounds.byPlayer || {})) {
-    target.rebounds.byPlayer[String(pid)] = Number(count || 0);
+  if (!target.rebounds.byPlayerOffensive || typeof target.rebounds.byPlayerOffensive !== 'object') {
+    target.rebounds.byPlayerOffensive = { ...(target.rebounds.byPlayer || {}) };
+  }
+  if (!target.rebounds.byPlayerDefensive || typeof target.rebounds.byPlayerDefensive !== 'object') {
+    target.rebounds.byPlayerDefensive = {};
+  }
+  for (const key of ['byPlayer', 'byPlayerOffensive', 'byPlayerDefensive']) {
+    for (const [pid, count] of Object.entries(target.rebounds[key] || {})) {
+      target.rebounds[key][String(pid)] = Number(count || 0);
+    }
   }
   if (!target.actionMix || typeof target.actionMix !== 'object') {
     target.actionMix = {};
@@ -4410,21 +4472,32 @@ function getReboundWinnerId(rebound) {
 function addReboundStats(target, results) {
   if (!target || typeof target !== 'object') return;
   if (!target.rebounds || typeof target.rebounds !== 'object') {
-    target.rebounds = { offensive: 0, defensive: 0, byPlayer: {} };
+    target.rebounds = { offensive: 0, defensive: 0, byPlayer: {}, byPlayerOffensive: {}, byPlayerDefensive: {} };
   }
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
+  if (!target.rebounds.byPlayerOffensive || typeof target.rebounds.byPlayerOffensive !== 'object') {
+    target.rebounds.byPlayerOffensive = { ...(target.rebounds.byPlayer || {}) };
+  }
+  if (!target.rebounds.byPlayerDefensive || typeof target.rebounds.byPlayerDefensive !== 'object') {
+    target.rebounds.byPlayerDefensive = {};
+  }
   for (const rebound of getReboundEntries(results)) {
+    const winner = getReboundWinnerId(rebound);
     if (rebound.offensive) {
       target.rebounds.offensive = Number(target.rebounds.offensive || 0) + 1;
-      const winner = getReboundWinnerId(rebound);
       if (winner !== null) {
         const key = String(winner);
         target.rebounds.byPlayer[key] = Number(target.rebounds.byPlayer[key] || 0) + 1;
+        target.rebounds.byPlayerOffensive[key] = Number(target.rebounds.byPlayerOffensive[key] || 0) + 1;
       }
     } else if (rebound.defensive) {
       target.rebounds.defensive = Number(target.rebounds.defensive || 0) + 1;
+      if (winner !== null) {
+        const key = String(winner);
+        target.rebounds.byPlayerDefensive[key] = Number(target.rebounds.byPlayerDefensive[key] || 0) + 1;
+      }
     }
   }
 }
@@ -4601,13 +4674,17 @@ const offensePlayerIdsForStats = computed(() => {
   return Array.isArray(offense) ? offense.map(Number) : [];
 });
 
-const offensiveReboundPlayerRows = computed(() => {
-  const byPlayer = statsState.value?.rebounds?.byPlayer || {};
+const defensePlayerIdsForStats = computed(() => {
+  const defense = props.gameState?.defense_ids || [];
+  return Array.isArray(defense) ? defense.map(Number).filter((pid) => Number.isFinite(pid)) : [];
+});
+
+function buildReboundPlayerRows(playerIds, byPlayer, pctKey) {
   const ids = new Set();
-  offensePlayerIdsForStats.value.forEach((pid) => {
+  playerIds.forEach((pid) => {
     if (Number.isFinite(Number(pid))) ids.add(Number(pid));
   });
-  Object.keys(byPlayer).forEach((pid) => {
+  Object.keys(byPlayer || {}).forEach((pid) => {
     const numeric = Number(pid);
     if (Number.isFinite(numeric)) ids.add(numeric);
   });
@@ -4615,15 +4692,25 @@ const offensiveReboundPlayerRows = computed(() => {
   return Array.from(ids)
     .sort((a, b) => a - b)
     .map((playerId) => {
-      const count = Number(byPlayer[playerId] ?? byPlayer[String(playerId)] ?? 0);
+      const count = Number(byPlayer?.[playerId] ?? byPlayer?.[String(playerId)] ?? 0);
       return {
         playerId,
         count,
         chances,
-        orbPct: chances > 0 ? (count / chances) * 100 : 0,
+        [pctKey]: chances > 0 ? (count / chances) * 100 : 0,
       };
     })
     .filter((row) => row.chances > 0 || row.count > 0);
+}
+
+const offensiveReboundPlayerRows = computed(() => {
+  const byPlayer = statsState.value?.rebounds?.byPlayerOffensive || statsState.value?.rebounds?.byPlayer || {};
+  return buildReboundPlayerRows(offensePlayerIdsForStats.value, byPlayer, 'orbPct');
+});
+
+const defensiveReboundPlayerRows = computed(() => {
+  const byPlayer = statsState.value?.rebounds?.byPlayerDefensive || {};
+  return buildReboundPlayerRows(defensePlayerIdsForStats.value, byPlayer, 'drbPct');
 });
 
 function aggregatePlayerStats(entries) {
@@ -4635,6 +4722,7 @@ function aggregatePlayerStats(entries) {
     turnovers: 0,
     points: 0,
     offensive_rebounds: 0,
+    defensive_rebounds: 0,
     rebound_chances: 0,
     shot_types: { dunk: [0, 0], two: [0, 0], three: [0, 0] },
     shot_chart: {},
@@ -4648,6 +4736,7 @@ function aggregatePlayerStats(entries) {
     base.turnovers += Number(entry.turnovers || 0);
     base.points += Number(entry.points || 0);
     base.offensive_rebounds += Number(entry.offensive_rebounds || 0);
+    base.defensive_rebounds += Number(entry.defensive_rebounds || 0);
     base.rebound_chances = Math.max(base.rebound_chances, Number(entry.rebound_chances || 0));
     const st = entry.shot_types || {};
     ['dunk', 'two', 'three'].forEach((k) => {
@@ -4685,6 +4774,7 @@ function buildEvalAggregateRow(entry) {
   const episodes = Number(entry?.episodes || 0);
   const points = Number(entry?.points || 0);
   const offensiveRebounds = Number(entry?.offensive_rebounds || 0);
+  const defensiveRebounds = Number(entry?.defensive_rebounds || 0);
   const reboundChances = Number(entry?.rebound_chances || 0);
   return {
     attempts,
@@ -4698,8 +4788,10 @@ function buildEvalAggregateRow(entry) {
     turnovers: Number(entry?.turnovers || 0),
     points,
     offensiveRebounds,
+    defensiveRebounds,
     reboundChances,
     orbPct: reboundChances > 0 ? (offensiveRebounds / reboundChances) * 100 : 0,
+    drbPct: reboundChances > 0 ? (defensiveRebounds / reboundChances) * 100 : 0,
     episodes,
     ppp: episodes > 0 ? points / episodes : 0,
     unassisted: {
@@ -4753,6 +4845,20 @@ const offensePlayerStatsTable = computed(() => {
       ...row,
     };
   });
+});
+
+const defensePlayerStatsTable = computed(() => {
+  const stats = props.perPlayerEvalStats || {};
+  const defenseIds = defensePlayerIdsForStats.value;
+  if (!stats || defenseIds.length === 0) return [];
+  return defenseIds.map((pid) => {
+    const entry = stats[pid] || stats[String(pid)] || {};
+    const row = buildEvalAggregateRow(entry);
+    return {
+      playerId: pid,
+      ...row,
+    };
+  }).filter((row) => row.reboundChances > 0 || row.defensiveRebounds > 0);
 });
 
 const perIntentEvalStatsTable = computed(() => {
@@ -4996,6 +5102,7 @@ function applyEvaluationStats(
   let offensiveReboundCount = 0;
   let defensiveReboundCount = 0;
   const offensiveReboundsByPlayer = {};
+  const defensiveReboundsByPlayer = {};
   for (const row of episodeResults || []) {
     const results = row?.final_state?.last_action_results || {};
     const defLane = Array.isArray(results?.defensive_lane_violations)
@@ -5012,6 +5119,11 @@ function applyEvaluationStats(
         }
       } else if (rebound.defensive) {
         defensiveReboundCount += 1;
+        const winner = getReboundWinnerId(rebound);
+        if (winner !== null) {
+          const key = String(winner);
+          defensiveReboundsByPlayer[key] = Number(defensiveReboundsByPlayer[key] || 0) + 1;
+        }
       }
     }
     const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
@@ -5028,6 +5140,8 @@ function applyEvaluationStats(
     offensive: Number(offensiveReboundCount || 0),
     defensive: Number(defensiveReboundCount || 0),
     byPlayer: offensiveReboundsByPlayer,
+    byPlayerOffensive: offensiveReboundsByPlayer,
+    byPlayerDefensive: defensiveReboundsByPlayer,
   };
   // Defensive lane violation awards one point to offense.
   if (String(userTeamName || 'OFFENSE').toUpperCase() === 'OFFENSE') {
@@ -5108,16 +5222,24 @@ function applyEvaluationStats(
     const diagDefensiveRebounds = Number(
       rbDiag.defensive ?? nativeSummary.total_defensive_rebounds ?? next.rebounds?.defensive ?? 0
     );
-    const diagByPlayer = rbDiag.by_player_offensive || nativeSummary.offensive_rebounds_by_player || {};
-    const mergedByPlayer = { ...(next.rebounds?.byPlayer || {}) };
-    for (const [pid, count] of Object.entries(diagByPlayer || {})) {
+    const diagByPlayerOffensive = rbDiag.by_player_offensive || nativeSummary.offensive_rebounds_by_player || {};
+    const diagByPlayerDefensive = rbDiag.by_player_defensive || nativeSummary.defensive_rebounds_by_player || {};
+    const mergedByPlayerOffensive = { ...(next.rebounds?.byPlayerOffensive || next.rebounds?.byPlayer || {}) };
+    const mergedByPlayerDefensive = { ...(next.rebounds?.byPlayerDefensive || {}) };
+    for (const [pid, count] of Object.entries(diagByPlayerOffensive || {})) {
       const key = String(pid);
-      mergedByPlayer[key] = Math.max(Number(mergedByPlayer[key] || 0), Number(count || 0));
+      mergedByPlayerOffensive[key] = Math.max(Number(mergedByPlayerOffensive[key] || 0), Number(count || 0));
+    }
+    for (const [pid, count] of Object.entries(diagByPlayerDefensive || {})) {
+      const key = String(pid);
+      mergedByPlayerDefensive[key] = Math.max(Number(mergedByPlayerDefensive[key] || 0), Number(count || 0));
     }
     next.rebounds = {
       offensive: Math.max(Number(next.rebounds?.offensive || 0), Number(diagOffensiveRebounds || 0)),
       defensive: Math.max(Number(next.rebounds?.defensive || 0), Number(diagDefensiveRebounds || 0)),
-      byPlayer: mergedByPlayer,
+      byPlayer: mergedByPlayerOffensive,
+      byPlayerOffensive: mergedByPlayerOffensive,
+      byPlayerDefensive: mergedByPlayerDefensive,
     };
     const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
     const selectorStartSource = Object.keys(selectorStartCounts).length > 0
@@ -6697,6 +6819,7 @@ const tokenFeatureBaseLabels = [
 const tokenFeatureReboundLabels = [
   'dist_to_expected_rebound_target',
   'rebound_win_prob_if_current_shot_misses',
+  'rebound_skill',
 ];
 const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
 const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible', 'intent_age_norm'];
@@ -7414,6 +7537,27 @@ function offenseSkillDeltaLabel(idx) {
           </tbody>
         </table>
       </div>
+      <div v-if="defensePlayerStatsTable.length" class="per-player-stats">
+        <h4>Per-Player Defense Rebounding Stats (Eval)</h4>
+        <table class="per-player-table">
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>DRB</th>
+              <th>Chances</th>
+              <th>DRB%</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in defensePlayerStatsTable" :key="`def-reb-stat-${row.playerId}`">
+              <td>Player {{ row.playerId }}</td>
+              <td>{{ row.defensiveRebounds }}</td>
+              <td>{{ row.reboundChances }}</td>
+              <td>{{ row.drbPct.toFixed(1) }}%</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
       <div v-if="perIntentEvalStatsTable.length" class="per-player-stats">
         <h4>Per-Intent Offense Stats (Eval)</h4>
         <div class="status-note">
@@ -7482,11 +7626,11 @@ function offenseSkillDeltaLabel(idx) {
           </div>
           <div v-if="offensiveReboundPlayerRows.length" class="param-category">
             <h5>
-              ORB% by Player
+              ORB% by Offensive Player
               <span
                 class="category-help"
                 title="Per-player offensive rebound percentage: this player's offensive rebounds divided by all resolved rebound chances."
-                aria-label="ORB percent by player help"
+                aria-label="ORB percent by offensive player help"
                 tabindex="0"
               >?</span>
             </h5>
@@ -7498,6 +7642,26 @@ function offenseSkillDeltaLabel(idx) {
             >
               <span class="param-name">Player {{ row.playerId }}:</span>
               <span class="param-value">{{ row.count }}/{{ row.chances }} ({{ row.orbPct.toFixed(1) }}%)</span>
+            </div>
+          </div>
+          <div v-if="defensiveReboundPlayerRows.length" class="param-category">
+            <h5>
+              DRB% by Defensive Player
+              <span
+                class="category-help"
+                title="Per-player defensive rebound percentage: this player's defensive rebounds divided by all resolved rebound chances."
+                aria-label="DRB percent by defensive player help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in defensiveReboundPlayerRows"
+              :key="`drb-player-${row.playerId}`"
+              class="param-item"
+              data-tooltip="Player defensive rebounds divided by total rebound chances."
+            >
+              <span class="param-name">Player {{ row.playerId }}:</span>
+              <span class="param-value">{{ row.count }}/{{ row.chances }} ({{ row.drbPct.toFixed(1) }}%)</span>
             </div>
           </div>
           <div class="param-category">
@@ -9537,6 +9701,31 @@ function offenseSkillDeltaLabel(idx) {
           <div class="skills-actions">
             <button class="ghost-btn" @click="seedEvalConfigFromGameState(true)">
               Copy sampled skills
+            </button>
+          </div>
+        </div>
+
+        <div class="eval-row">
+          <label class="inline-label">
+            <input type="checkbox" :checked="evalConfigSafe.showReboundSkillsOnBoard" @change="setEvalShowReboundSkillsOnBoard($event.target.checked)" />
+            Show rebound skill badges on board
+          </label>
+        </div>
+
+        <div class="eval-skills">
+          <div class="skills-header rebound-skills-header">
+            <span>Player</span>
+            <span>Team</span>
+            <span>REB skill</span>
+          </div>
+          <div class="skills-row rebound-skills-row" v-for="(row, idx) in evalReboundSkillRows" :key="`eval-rebound-skill-${row.playerId}`">
+            <span class="skills-player">Player {{ row.playerId }}</span>
+            <span class="skills-player">{{ row.team }}</span>
+            <input type="number" step="0.1" :value="row.skill" @input="updateEvalReboundSkill(idx, $event.target.value)" />
+          </div>
+          <div class="skills-actions">
+            <button class="ghost-btn" @click="seedEvalConfigFromGameState(true)">
+              Copy sampled rebound skills
             </button>
           </div>
         </div>

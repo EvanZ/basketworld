@@ -30,12 +30,38 @@ _NUMPY_SAFE_ENCODER = {
     np.integer: int,
     np.floating: float,
     np.bool_: bool,
+    np.ndarray: lambda arr: arr.tolist(),
 }
+
+
+def _normalize_jsonable(value):
+    """Convert common scientific-Python containers before FastAPI encoding."""
+    if isinstance(value, np.ndarray):
+        return [_normalize_jsonable(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    value_module = getattr(type(value), "__module__", "")
+    if value_module.startswith(("jax", "jaxlib")) and hasattr(value, "tolist"):
+        return _normalize_jsonable(value.tolist())
+    if isinstance(value, dict):
+        normalized = {}
+        for key, item in value.items():
+            if isinstance(key, np.generic):
+                key = key.item()
+            if not isinstance(key, (str, int, float, bool, type(None))):
+                key = str(key)
+            normalized[key] = _normalize_jsonable(item)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_normalize_jsonable(item) for item in value]
+    return value
 
 
 def _to_jsonable(value):
     """Force NumPy-safe, JSON-serializable payloads for FastAPI responses."""
-    return jsonable_encoder(value, custom_encoder=_NUMPY_SAFE_ENCODER)
+    return jsonable_encoder(
+        _normalize_jsonable(value), custom_encoder=_NUMPY_SAFE_ENCODER
+    )
 
 
 def _clip_probability(value, *, default: float) -> float:

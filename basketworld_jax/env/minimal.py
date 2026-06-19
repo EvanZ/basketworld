@@ -22,7 +22,7 @@ PASS_ACTION_START = ActionType.PASS_E.value
 PASS_ACTION_END = ActionType.PASS_SE.value + 1
 ACTION_COUNT = len(ActionType)
 SQRT3 = float(np.sqrt(3.0))
-TOKEN_OBS_PLAYER_DIM = 17
+TOKEN_OBS_PLAYER_DIM = 18
 TOKEN_OBS_GLOBAL_DIM = 8
 TOKEN_OBS_ROLE_FLAG_DIM = 1
 TURNOVER_REASON_NONE = 0
@@ -184,6 +184,8 @@ class KernelStatic(NamedTuple):
     rebound_target_uniform_mix: Any
     rebound_winner_distance_weight: Any
     rebound_winner_temperature: Any
+    rebound_skill_std: Any
+    rebound_skill_weight: Any
     offensive_rebound_shot_clock_reset: Any
     rebound_terminal_reward_mode: Any
 
@@ -216,6 +218,7 @@ class KernelState(NamedTuple):
     layup_pct: Any
     three_pt_pct: Any
     dunk_pct: Any
+    rebound_skill: Any
 
 
 class StepBatchOutput(NamedTuple):
@@ -276,6 +279,32 @@ def _player_skill_arrays(env) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return layup, three, dunk
 
 
+def _player_rebound_skill_array(env) -> np.ndarray:
+    raw = (
+        getattr(env, "rebound_skill_by_player", None)
+        or getattr(env, "_rebound_skill_by_player", None)
+        or getattr(env, "player_rebound_skills", None)
+    )
+    if raw is None:
+        return np.zeros(env.n_players, dtype=np.float32)
+    if isinstance(raw, dict):
+        out = np.zeros(env.n_players, dtype=np.float32)
+        for pid, value in raw.items():
+            try:
+                idx = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < env.n_players:
+                out[idx] = float(value)
+        return out
+    arr = np.asarray(raw, dtype=np.float32).reshape(-1)
+    out = np.zeros(env.n_players, dtype=np.float32)
+    count = min(env.n_players, int(arr.shape[0]))
+    if count:
+        out[:count] = arr[:count]
+    return out
+
+
 def _lane_step_arrays(env) -> tuple[np.ndarray, np.ndarray]:
     offense = np.zeros(env.n_players, dtype=np.float32)
     defense = np.zeros(env.n_players, dtype=np.float32)
@@ -287,6 +316,7 @@ def _lane_step_arrays(env) -> tuple[np.ndarray, np.ndarray]:
 
 def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
     layup, three, dunk = _player_skill_arrays(env)
+    rebound_skill = _player_rebound_skill_array(env)
     offense_lane_steps, defense_lane_steps = _lane_step_arrays(env)
     assist_candidate = getattr(env, "_assist_candidate", None)
     return {
@@ -319,6 +349,7 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "layup_pct": layup,
         "three_pt_pct": three,
         "dunk_pct": dunk,
+        "rebound_skill": rebound_skill,
     }
 
 
@@ -445,6 +476,19 @@ def stack_state_snapshots(
         ),
         dunk_pct=xp.asarray(
             np.stack([np.asarray(item["dunk_pct"], dtype=np.float32) for item in snapshots], axis=0),
+            dtype=xp.float32,
+        ),
+        rebound_skill=xp.asarray(
+            np.stack(
+                [
+                    np.asarray(
+                        item.get("rebound_skill", np.zeros_like(item["dunk_pct"])),
+                        dtype=np.float32,
+                    )
+                    for item in snapshots
+                ],
+                axis=0,
+            ),
             dtype=xp.float32,
         ),
     )
@@ -875,6 +919,14 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(1.0e-6, float(getattr(env, "rebound_winner_temperature", 1.0))),
             dtype=xp.float32,
         ),
+        rebound_skill_std=xp.asarray(
+            max(0.0, float(getattr(env, "rebound_skill_std", 0.0))),
+            dtype=xp.float32,
+        ),
+        rebound_skill_weight=xp.asarray(
+            max(0.0, float(getattr(env, "rebound_skill_weight", 0.0))),
+            dtype=xp.float32,
+        ),
         offensive_rebound_shot_clock_reset=xp.asarray(
             max(1, int(getattr(env, "offensive_rebound_shot_clock_reset", 14))),
             dtype=xp.int32,
@@ -1288,8 +1340,12 @@ def build_rebound_observation_features_batch(
         axis=-1,
     ) / norm_den
 
+    effective_player_target_distances = (
+        player_target_distances
+        - (static.rebound_skill_weight * state.rebound_skill.astype(jnp.float32)[:, :, None])
+    )
     winner_logits = (
-        -static.rebound_winner_distance_weight * player_target_distances
+        -static.rebound_winner_distance_weight * effective_player_target_distances
     ) / static.rebound_winner_temperature
     winner_probs_by_target = _softmax(jnp.swapaxes(winner_logits, 1, 2), axis=-1)
     rebound_win_prob = jnp.sum(winner_probs_by_target * target_probs[:, :, None], axis=1)
@@ -1640,6 +1696,7 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
             steal_risks,
             rebound_features["dist_to_expected_target"],
             rebound_features["win_prob"],
+            state.rebound_skill.astype(jnp.float32),
             rebound_features["expected_target_q"][:, None],
             rebound_features["expected_target_r"][:, None],
             rebound_features["target_entropy"][:, None],
@@ -1716,6 +1773,7 @@ def build_token_observation_components_batch(
     layup = state.layup_pct.astype(jnp.float32) * skill_gate
     three = state.three_pt_pct.astype(jnp.float32) * skill_gate
     dunk = state.dunk_pct.astype(jnp.float32) * skill_gate
+    rebound_skill = state.rebound_skill.astype(jnp.float32)
 
     max_lane_steps = jnp.maximum(static.three_second_max_steps, jnp.asarray(1.0, dtype=jnp.float32))
     lane_steps = jnp.where(
@@ -1789,6 +1847,7 @@ def build_token_observation_components_batch(
             dist_to_nearest_team,
             rebound_features["dist_to_expected_target"],
             rebound_features["win_prob"],
+            rebound_skill,
         ],
         axis=-1,
     ).astype(jnp.float32)
@@ -2462,7 +2521,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1),
                 jnp.clip(sampled_rebound_target, 0, static.cell_distance_matrix.shape[1] - 1),
             ].astype(jnp.float32)
-            winner_logits = (-static.rebound_winner_distance_weight * rebound_distances) / static.rebound_winner_temperature
+            effective_rebound_distances = (
+                rebound_distances
+                - (static.rebound_skill_weight * final_state.rebound_skill.astype(jnp.float32))
+            )
+            winner_logits = (-static.rebound_winner_distance_weight * effective_rebound_distances) / static.rebound_winner_temperature
             sampled_rebound_winner = jax.random.categorical(rebound_winner_key, winner_logits).astype(jnp.int32)
             rebound_winner_is_offense = static.role_encoding[jnp.clip(sampled_rebound_winner, 0, static.role_encoding.shape[0] - 1)] > 0.0
             offensive_rebound = rebound_active & rebound_winner_is_offense
@@ -3033,7 +3096,8 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         offense_intent_key,
         defense_intent_key,
         intent_visible_key,
-    ) = jax.random.split(key, 10)
+        rebound_skill_key,
+    ) = jax.random.split(key, 11)
 
     shot_clock = jax.random.randint(
         shot_clock_key,
@@ -3072,6 +3136,15 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     three_pt_pct = three_pt_pct.at[static.offense_ids].set(three_samples)
     dunk_pct = jnp.full((n_players,), static.base_dunk_pct, dtype=jnp.float32)
     dunk_pct = dunk_pct.at[static.offense_ids].set(dunk_samples)
+    rebound_skill = (
+        jax.random.normal(rebound_skill_key, shape=(n_players,), dtype=jnp.float32)
+        * static.rebound_skill_std
+    )
+    rebound_skill = jnp.where(
+        static.rebound_skill_std > 0.0,
+        rebound_skill,
+        jnp.zeros((n_players,), dtype=jnp.float32),
+    )
 
     positions = _sample_reset_positions_single(static, positions_key, jax, jnp)
     holder_offset = jax.random.randint(holder_key, shape=(), minval=0, maxval=offense_count, dtype=jnp.int32)
@@ -3159,6 +3232,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         layup_pct=layup_pct,
         three_pt_pct=three_pt_pct,
         dunk_pct=dunk_pct,
+        rebound_skill=rebound_skill,
     )
 
 
@@ -3177,6 +3251,8 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_target_uniform_mix",
         "rebound_winner_distance_weight",
         "rebound_winner_temperature",
+        "rebound_skill_std",
+        "rebound_skill_weight",
         "offensive_rebound_shot_clock_reset",
     ):
         if hasattr(args, key):

@@ -55,6 +55,14 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  showReboundSkills: {
+    type: Boolean,
+    default: false,
+  },
+  reboundSkillOverrides: {
+    type: Object,
+    default: () => ({}),
+  },
   disableTransitions: {
     type: Boolean,
     default: false,
@@ -249,6 +257,17 @@ function getTurnoverOutcomeText(outcome) {
 
 function expectedValueLabelDy() {
   return props.minimalChrome ? '1.9em' : '-1.0em';
+}
+
+function reboundSkillLabel(playerId) {
+  if (!props.showReboundSkills) return '';
+  const overrides = props.reboundSkillOverrides || {};
+  const liveSkills = currentGameState.value?.player_rebound_skills || {};
+  const raw = overrides[String(playerId)] ?? overrides[playerId] ?? liveSkills[String(playerId)] ?? liveSkills[playerId];
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric)) return '';
+  const sign = numeric >= 0 ? '+' : '';
+  return `REB ${sign}${numeric.toFixed(1)}`;
 }
 
 function isPointerPassMode(gs) {
@@ -4318,6 +4337,16 @@ onBeforeUnmount(() => {
             >
               {{ Number(currentGameState.ep_by_player[player.id]).toFixed(2) }}
             </text>
+            <text
+              v-if="props.showReboundSkills && reboundSkillLabel(player.id) && draggedPlayerId !== player.id"
+              :x="player.x"
+              :y="player.y"
+              dy="2.35em"
+              text-anchor="middle"
+              class="rebound-skill-text"
+            >
+              {{ reboundSkillLabel(player.id) }}
+            </text>
             <!-- NOOP probability label (index 0) for the player -->
             <text
               v-if="isPolicyVisible(player.id) && getPolicyProbsForPlayer(player.id) && getPolicyProbsForPlayer(player.id)[0] !== undefined && draggedPlayerId !== player.id"
@@ -5557,6 +5586,17 @@ onBeforeUnmount(() => {
 .policy-pass-prob {
   fill: #f97316;
 }
+.rebound-skill-text {
+  fill: #7ef9ff;
+  font-size: 11px;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.85);
+  stroke-width: 3px;
+  text-shadow: 0 0 8px rgba(126, 249, 255, 0.85);
+  pointer-events: none;
+}
+
 .shot-prob-text {
   font-size: 1.5rem;
   font-weight: bold;

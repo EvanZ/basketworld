@@ -517,8 +517,8 @@ def _run_episode_batch_worker(args: tuple) -> dict:
                 user_team,
             )
             for rebound in _iter_rebound_entries(action_results):
-                _record_rebound_for_stats(per_player_stats, rebound, offense_ids)
-                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids)
+                _record_rebound_for_stats(per_player_stats, rebound, offense_ids, defense_ids)
+                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids, defense_ids)
 
             # Update role_flag for next step
             episode_rewards["offense"] += float(reward[offense_ids].sum())
@@ -592,6 +592,7 @@ def _init_player_stats(n_players: int) -> dict:
             "turnovers": 0,
             "points": 0.0,
             "offensive_rebounds": 0,
+            "defensive_rebounds": 0,
             "rebound_chances": 0,
             "episodes": 0,
             "steps": 0,
@@ -612,6 +613,7 @@ def _init_aggregate_stats() -> dict:
         "turnovers": 0,
         "points": 0.0,
         "offensive_rebounds": 0,
+        "defensive_rebounds": 0,
         "rebound_chances": 0,
         "episodes": 0,
         "steps": 0,
@@ -633,6 +635,7 @@ def _merge_aggregate_stats(dest: dict | None, src: dict | None) -> dict:
     dest["turnovers"] += int(src.get("turnovers", 0) or 0)
     dest["points"] += float(src.get("points", 0.0) or 0.0)
     dest["offensive_rebounds"] += int(src.get("offensive_rebounds", 0) or 0)
+    dest["defensive_rebounds"] += int(src.get("defensive_rebounds", 0) or 0)
     dest["rebound_chances"] += int(src.get("rebound_chances", 0) or 0)
     dest["episodes"] += int(src.get("episodes", 0) or 0)
     dest["steps"] += int(src.get("steps", 0) or 0)
@@ -721,6 +724,7 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
         dst_stats["turnovers"] += int(src_stats.get("turnovers", 0))
         dst_stats["points"] += float(src_stats.get("points", 0.0))
         dst_stats["offensive_rebounds"] += int(src_stats.get("offensive_rebounds", 0))
+        dst_stats["defensive_rebounds"] += int(src_stats.get("defensive_rebounds", 0))
         dst_stats["rebound_chances"] += int(src_stats.get("rebound_chances", 0))
         dst_stats["episodes"] += int(src_stats.get("episodes", 0))
         dst_stats["steps"] += int(src_stats.get("steps", 0))
@@ -1207,21 +1211,28 @@ def _iter_rebound_entries(action_results) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict) and entry.get("attempt", True) is not False]
 
 
-def _record_rebound_for_stats(stats: dict, rebound: dict, offense_ids: list[int] | tuple[int, ...]):
+def _record_rebound_for_stats(
+    stats: dict,
+    rebound: dict,
+    offense_ids: list[int] | tuple[int, ...],
+    defense_ids: list[int] | tuple[int, ...] = (),
+):
     if stats is None or not isinstance(rebound, dict):
         return
-    for pid_raw in offense_ids or []:
+    for pid_raw in list(offense_ids or []) + list(defense_ids or []):
         pid = int(pid_raw)
         if pid in stats:
             stats[pid]["rebound_chances"] = int(stats[pid].get("rebound_chances", 0)) + 1
-    if not bool(rebound.get("offensive", False)):
-        return
     winner_raw = rebound.get("winner", rebound.get("winner_player_id", rebound.get("player_id")))
     if winner_raw is None:
         return
     winner = int(winner_raw)
-    if winner in stats:
+    if winner not in stats:
+        return
+    if bool(rebound.get("offensive", False)):
         stats[winner]["offensive_rebounds"] = int(stats[winner].get("offensive_rebounds", 0)) + 1
+    elif bool(rebound.get("defensive", False)):
+        stats[winner]["defensive_rebounds"] = int(stats[winner].get("defensive_rebounds", 0)) + 1
 
 
 def _build_reset_options_for_custom_setup(custom_setup: dict | None, enforce_fixed_skills: bool = False) -> dict:
@@ -1235,6 +1246,8 @@ def _build_reset_options_for_custom_setup(custom_setup: dict | None, enforce_fix
     shooting_mode = custom_setup.get("shooting_mode") or "random"
     if enforce_fixed_skills and shooting_mode == "fixed" and custom_setup.get("offense_skills"):
         opts["offense_skills"] = copy.deepcopy(custom_setup["offense_skills"])
+    if custom_setup.get("rebound_skills") is not None:
+        opts["rebound_skills"] = [float(v) for v in custom_setup["rebound_skills"]]
     return opts
 
 
@@ -1423,8 +1436,8 @@ def _run_sequential_evaluation(
                 user_team,
             )
             for rebound in _iter_rebound_entries(action_results):
-                _record_rebound_for_stats(per_player_stats, rebound, offense_ids)
-                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids)
+                _record_rebound_for_stats(per_player_stats, rebound, offense_ids, defense_ids)
+                _record_rebound_for_stats(episode_player_stats, rebound, offense_ids, defense_ids)
 
             episode_rewards["offense"] += float(reward[offense_ids].sum())
             episode_rewards["defense"] += float(reward[defense_ids].sum())
@@ -1680,6 +1693,21 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
         normalized["ball_holder"] = bh
 
     # Validate fixed offense skills if requested
+    if setup.get("rebound_skills") is not None:
+        rebound_raw = setup.get("rebound_skills")
+        if not isinstance(rebound_raw, (list, tuple)) or len(rebound_raw) != base_env.n_players:
+            raise HTTPException(
+                status_code=400,
+                detail=f"rebound_skills must have {base_env.n_players} values.",
+            )
+        rebound_values: list[float] = []
+        for v in rebound_raw:
+            try:
+                rebound_values.append(float(v))
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"Invalid rebound skill value: {v}")
+        normalized["rebound_skills"] = rebound_values
+
     if shooting_mode == "fixed":
         offense_ids = getattr(base_env, "offense_ids", [])
         offense_count = len(offense_ids)
@@ -1752,6 +1780,7 @@ def run_evaluation(
             role_flag_offense=role_flag_offense,
             role_flag_defense=role_flag_defense,
             intent_selection_mode=intent_selection_mode,
+            custom_setup=custom_setup,
             progress_callback=progress_callback,
         )
 
