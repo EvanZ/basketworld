@@ -212,6 +212,8 @@ const playbookPlayerFilter = ref('all');
 const shotChartTarget = ref('team');
 const assistLinksByPair = ref({});
 const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const passLinksByPair = ref({});
+const completedPassLinksByPair = ref({});
 const potentialAssistLinksByPair = ref({});
 const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
 const sankeyFlowMode = ref('assisted');
@@ -492,6 +494,8 @@ const defaultEvalConfig = () => ({
   ballHolder: null,
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
+  reboundSkills: [],
+  showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
   startTemplateMode: 'checkpoint',
@@ -537,6 +541,21 @@ const boardPlacementPassProbs = computed(() => {
   if (isPassLabPlacementMode.value) return passLabBoardConfig.value.passProbs || {};
   if (isTemplatePlacementMode.value) return {};
   return placementPassPreview.value;
+});
+const boardReboundSkillOverrides = computed(() => {
+  if (!evalConfig.value.showReboundSkillsOnBoard) return {};
+  const values = Array.isArray(evalConfig.value.reboundSkills) ? evalConfig.value.reboundSkills : [];
+  if (!values.length || !gameState.value) return {};
+  const ids = [
+    ...(Array.isArray(gameState.value.offense_ids) ? gameState.value.offense_ids : []),
+    ...(Array.isArray(gameState.value.defense_ids) ? gameState.value.defense_ids : []),
+  ];
+  const out = {};
+  ids.forEach((pid, idx) => {
+    const numeric = Number(values[idx] ?? 0);
+    if (Number.isFinite(numeric)) out[String(pid)] = numeric;
+  });
+  return out;
 });
 const boardShowCoordinates = computed(() => isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
@@ -647,7 +666,10 @@ const boardEvalReboundOverlay = computed(() => {
   };
 });
 const hasAssistSankeyData = computed(
-  () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
+  () => hasPositiveLinkCount(assistLinksByPair.value)
+    || hasPositiveLinkCount(potentialAssistLinksByPair.value)
+    || hasPositiveLinkCount(passLinksByPair.value)
+    || hasPositiveLinkCount(completedPassLinksByPair.value),
 );
 const showShotChartSelector = computed(
   () => !isBoardEditingMode.value && hasShotChartData.value,
@@ -824,9 +846,12 @@ const boardShotChartLabelDisplay = computed(() => {
 });
 
 const selectedSankeyLinkMap = computed(() => {
-  const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
+  const rawFlowMode = String(sankeyFlowMode.value || 'assisted');
+  const flowMode = ['potential', 'pass_attempts', 'completed_passes'].includes(rawFlowMode) ? rawFlowMode : 'assisted';
   const typeMode = ASSIST_SHOT_TYPES.includes(sankeyShotType.value) ? sankeyShotType.value : 'all';
 
+  if (flowMode === 'pass_attempts') return passLinksByPair.value || {};
+  if (flowMode === 'completed_passes') return completedPassLinksByPair.value || {};
   if (flowMode === 'potential') {
     if (typeMode === 'all') return potentialAssistLinksByPair.value || {};
     return potentialAssistLinksByType.value?.[typeMode] || {};
@@ -838,7 +863,9 @@ const selectedSankeyLinkMap = computed(() => {
 const assistSankeyTitle = computed(() => {
   const flowLabel = sankeyFlowMode.value === 'potential'
     ? 'Potential Assist Flows (Missed)'
-    : 'Assist Flows (Made)';
+    : (sankeyFlowMode.value === 'pass_attempts'
+      ? 'Pass Attempt Flows'
+      : (sankeyFlowMode.value === 'completed_passes' ? 'Completed Pass Flows' : 'Assist Flows (Made)'));
   const typeLabel = sankeyShotType.value === 'all'
     ? 'All Shot Types'
     : (sankeyShotType.value === 'dunk'
@@ -846,9 +873,12 @@ const assistSankeyTitle = computed(() => {
       : (sankeyShotType.value === 'two' ? '2PT' : '3PT'));
   return `${flowLabel} • ${typeLabel}`;
 });
-const assistSankeyTotalLabel = computed(() =>
-  sankeyFlowMode.value === 'potential' ? 'Potential assists (missed)' : 'Assisted makes',
-);
+const assistSankeyTotalLabel = computed(() => {
+  if (sankeyFlowMode.value === 'potential') return 'Potential assists (missed)';
+  if (sankeyFlowMode.value === 'pass_attempts') return 'Pass attempts';
+  if (sankeyFlowMode.value === 'completed_passes') return 'Completed passes';
+  return 'Assisted makes';
+});
 
 const assistSankeyPlayerIds = computed(() => {
   const state = gameState.value;
@@ -864,7 +894,7 @@ const assistSankeyPlayerIds = computed(() => {
   }
 
   const fallback = new Set();
-  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value]) {
+  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value, passLinksByPair.value, completedPassLinksByPair.value]) {
     for (const key of Object.keys(rawMap || {})) {
       const parsed = parseAssistLinkKey(key);
       if (!parsed) continue;
@@ -975,6 +1005,8 @@ async function handleGameStarted(setupData) {
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
@@ -1056,6 +1088,8 @@ async function handleTemplateSandboxStarted(setupData = {}) {
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
@@ -1987,6 +2021,16 @@ function seedEvalConfigFromGameState(copySkills = true) {
     gameState.value.offense_shooting_pct_by_player ||
     null;
   const skills = { ...base.skills };
+  const liveReboundSkills = gameState.value.player_rebound_skills || {};
+  const allIds = [
+    ...(gameState.value.offense_ids || []),
+    ...(gameState.value.defense_ids || []),
+  ];
+  const reboundSkills = allIds.map((pid) => {
+    const value = liveReboundSkills?.[String(pid)] ?? liveReboundSkills?.[pid] ?? 0;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
   if (copySkills && sourceSkills) {
     skills.layup = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.layup?.[idx]));
     skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.three_pt?.[idx]));
@@ -1998,6 +2042,7 @@ function seedEvalConfigFromGameState(copySkills = true) {
     positions,
     ballHolder: gameState.value.ball_holder ?? evalConfig.value.ballHolder,
     skills: copySkills ? skills : (evalConfig.value?.skills || skills),
+    reboundSkills,
   };
 }
 
@@ -2113,6 +2158,14 @@ function buildCustomEvalSetup() {
       dunk: toProb('dunk'),
     };
   }
+  const reboundSkills = Array.isArray(evalConfig.value.reboundSkills) ? evalConfig.value.reboundSkills : [];
+  const totalPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+  if (reboundSkills.length) {
+    payload.rebound_skills = Array.from({ length: totalPlayers }, (_, idx) => {
+      const numeric = Number(reboundSkills[idx] ?? 0);
+      return Number.isFinite(numeric) ? numeric : 0;
+    });
+  }
   return payload;
 }
 
@@ -2140,6 +2193,8 @@ async function handleEvaluation() {
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
@@ -2227,6 +2282,8 @@ async function handleEvaluation() {
       const evalDiagnostics = response.eval_diagnostics || {};
       assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
       assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
+      passLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.pass_links);
+      completedPassLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.completed_pass_links);
       potentialAssistLinksByPair.value = normalizeAssistLinkMap(
         evalDiagnostics.potential_assist_links,
       );
@@ -2650,6 +2707,8 @@ async function handlePlayAgain() {
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
@@ -2696,6 +2755,8 @@ function clearEvaluationArtifacts() {
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   shotChartTarget.value = 'team';
@@ -2910,6 +2971,8 @@ onBeforeUnmount(() => {
             <select v-model="sankeyFlowMode">
               <option value="assisted">Assisted makes</option>
               <option value="potential">Potential assists (missed)</option>
+              <option value="pass_attempts">Pass attempts</option>
+              <option value="completed_passes">Completed passes</option>
             </select>
             <label>Type:</label>
             <select v-model="sankeyShotType">
@@ -2967,6 +3030,8 @@ onBeforeUnmount(() => {
           :selected-shot-cells="reboundHeatmapEnabled ? selectedReboundShotKeysDisplay : []"
           :hide-players="reboundHeatmapEnabled"
           :hide-clock-overlays="reboundHeatmapEnabled"
+          :show-rebound-skills="evalConfig.showReboundSkillsOnBoard"
+          :rebound-skill-overrides="boardReboundSkillOverrides"
           :rebound-target-overlay="boardReboundTargetOverlay"
           :placement-mode="isBoardEditingMode"
           :placement-editable="boardPlacementEditable"

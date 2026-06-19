@@ -210,6 +210,8 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_target_uniform_mix",
         "rebound_winner_distance_weight",
         "rebound_winner_temperature",
+        "rebound_skill_std",
+        "rebound_skill_weight",
         "offensive_rebound_shot_clock_reset",
         "rebound_terminal_reward_mode",
     }
@@ -306,6 +308,8 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_weight",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 )
@@ -772,6 +776,18 @@ def parse_args(argv=None):
         help="Temperature applied when sampling the rebound winner from distance logits.",
     )
     parser.add_argument(
+        "--rebound-skill-std",
+        type=float,
+        default=0.0,
+        help="Standard deviation for per-player rebound skill sampled at episode reset.",
+    )
+    parser.add_argument(
+        "--rebound-skill-weight",
+        type=float,
+        default=0.0,
+        help="Skill-to-distance offset weight used in rebound winner logits.",
+    )
+    parser.add_argument(
         "--offensive-rebound-shot-clock-reset",
         type=int,
         default=14,
@@ -912,6 +928,10 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-target-uniform-mix must be in [0, 1].")
     if float(getattr(args, "rebound_winner_distance_weight", 1.0)) < 0.0:
         raise SystemExit("--rebound-winner-distance-weight must be >= 0.")
+    if float(getattr(args, "rebound_skill_std", 0.0)) < 0.0:
+        raise SystemExit("--rebound-skill-std must be >= 0.")
+    if float(getattr(args, "rebound_skill_weight", 0.0)) < 0.0:
+        raise SystemExit("--rebound-skill-weight must be >= 0.")
     if int(getattr(args, "offensive_rebound_shot_clock_reset", 14)) < 1:
         raise SystemExit("--offensive-rebound-shot-clock-reset must be >= 1.")
     rebound_terminal_reward_mode = str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points")
@@ -1215,6 +1235,8 @@ def _checkpoint_trainer_config_from_args(
         "rebound_target_uniform_mix": float(getattr(args, "rebound_target_uniform_mix", 0.0)),
         "rebound_winner_distance_weight": float(getattr(args, "rebound_winner_distance_weight", 1.0)),
         "rebound_winner_temperature": float(getattr(args, "rebound_winner_temperature", 1.0)),
+        "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
         "offensive_rebound_shot_clock_reset": int(
             getattr(args, "offensive_rebound_shot_clock_reset", 14)
         ),
@@ -1868,6 +1890,8 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
             getattr(args, "intent_selector_multiselect_enabled", False)
         ),
         "jax/intent_selector_min_play_steps": int(getattr(args, "intent_selector_min_play_steps", 3)),
+        "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "jax/rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
         "jax/rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
         "jax/task_reward_scale_start": (
             ""

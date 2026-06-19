@@ -8,6 +8,7 @@ class CustomEvalSetup(BaseModel):
     ball_holder: int | None = None
     shooting_mode: Literal["random", "fixed"] = "random"
     offense_skills: dict[str, list[float]] | None = None
+    rebound_skills: list[float] | None = None
 
 
 class InitGameRequest(BaseModel):

@@ -43,8 +43,6 @@ def can_run_native_jax_evaluation(
     custom_setup: dict | None,
     randomize_offense_permutation: bool,
 ) -> bool:
-    if custom_setup:
-        return False
     if bool(randomize_offense_permutation):
         return False
     if not is_checkpoint_path(unified_policy_path):
@@ -117,6 +115,8 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_weight",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 }
@@ -128,6 +128,8 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_target_uniform_mix": 0.0,
     "rebound_winner_distance_weight": 1.0,
     "rebound_winner_temperature": 1.0,
+    "rebound_skill_std": 0.0,
+    "rebound_skill_weight": 0.0,
     "offensive_rebound_shot_clock_reset": 14,
     "rebound_terminal_reward_mode": "actual_points",
 }
@@ -139,6 +141,8 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_target_uniform_mix": "float",
     "rebound_winner_distance_weight": "float",
     "rebound_winner_temperature": "float",
+    "rebound_skill_std": "float",
+    "rebound_skill_weight": "float",
     "offensive_rebound_shot_clock_reset": "int",
     "rebound_terminal_reward_mode": "str",
 }
@@ -155,6 +159,99 @@ def _coerce_runtime_static_value(key: str, value: Any) -> Any:
     if kind == "str":
         return str(value)
     return value
+
+
+def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, jnp):
+    """Pack observations to the checkpoint's saved spec.
+
+    Newer runtime code may expose extra features. Older checkpoints unpack the
+    flat tensor by saved token/global dimensions, so passing the longer tensor
+    silently shifts globals/role flags. Trim only known additive feature tails.
+    """
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    if current_dim == expected_dim:
+        return flat_obs
+    if current_dim < expected_dim:
+        raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
+
+    if str(spec.model_type) == "attention":
+        token_count = int(spec.token_player_count)
+        token_dim = int(spec.token_dim)
+        global_dim = int(spec.global_dim)
+        trailing_dim = global_dim + 1
+        extra = current_dim - trailing_dim
+        if token_count <= 0 or extra % token_count != 0:
+            raise ValueError(
+                f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}."
+            )
+        current_token_dim = extra // token_count
+        if current_token_dim < token_dim:
+            raise ValueError(
+                f"Runtime token dim {current_token_dim} is smaller than checkpoint token dim {token_dim}."
+            )
+        players = flat_obs[:, : token_count * current_token_dim].reshape(
+            flat_obs.shape[0], token_count, current_token_dim
+        )[:, :, :token_dim]
+        global_start = token_count * current_token_dim
+        globals_vec = flat_obs[:, global_start : global_start + global_dim]
+        role_flag = flat_obs[:, global_start + global_dim : global_start + global_dim + 1]
+        return jnp.concatenate(
+            [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
+            axis=1,
+        ).astype(jnp.float32)
+
+    # Flat obs legacy compatibility for the rebound_skill feature, which was
+    # inserted immediately before the 4 rebound globals, role flag, and offense
+    # skill deltas.
+    n_players = int(static.role_encoding.shape[0])
+    offense_count = int(static.offense_ids.shape[0])
+    tail_dim = 4 + 1 + (3 * offense_count)
+    if current_dim - expected_dim == n_players and current_dim > (n_players + tail_dim):
+        remove_start = current_dim - tail_dim - n_players
+        return jnp.concatenate(
+            [flat_obs[:, :remove_start], flat_obs[:, remove_start + n_players :]],
+            axis=1,
+        ).astype(jnp.float32)
+
+    return flat_obs[:, :expected_dim].astype(jnp.float32)
+
+
+def _apply_native_custom_setup(static, state, custom_setup: dict | None, batch_size: int, jnp):
+    if not custom_setup:
+        return state
+    updates: dict[str, Any] = {}
+    if custom_setup.get("initial_positions") is not None:
+        positions = np.asarray(custom_setup.get("initial_positions"), dtype=np.int32)
+        positions = positions.reshape(int(static.role_encoding.shape[0]), 2)
+        updates["positions"] = jnp.asarray(
+            np.broadcast_to(positions[None, ...], (int(batch_size),) + positions.shape),
+            dtype=jnp.int32,
+        )
+    if custom_setup.get("ball_holder") is not None:
+        updates["ball_holder"] = jnp.full(
+            (int(batch_size),),
+            int(custom_setup.get("ball_holder")),
+            dtype=jnp.int32,
+        )
+    if (custom_setup.get("shooting_mode") or "random") == "fixed" and custom_setup.get("offense_skills"):
+        skills = custom_setup.get("offense_skills") or {}
+        offense_ids = np.asarray(static.offense_ids, dtype=np.int32)
+        for key, field_name in (("layup", "layup_pct"), ("three_pt", "three_pt_pct"), ("dunk", "dunk_pct")):
+            values = np.asarray(skills.get(key), dtype=np.float32).reshape(-1)
+            if values.size != offense_ids.size:
+                continue
+            current = np.asarray(getattr(state, field_name), dtype=np.float32).copy()
+            current[:, offense_ids] = values[None, :]
+            updates[field_name] = jnp.asarray(current, dtype=jnp.float32)
+    if custom_setup.get("rebound_skills") is not None:
+        rebound_values = np.asarray(custom_setup.get("rebound_skills"), dtype=np.float32).reshape(-1)
+        if rebound_values.size == int(static.role_encoding.shape[0]):
+            updates["rebound_skill"] = jnp.asarray(
+                np.broadcast_to(rebound_values[None, :], (int(batch_size), rebound_values.size)),
+                dtype=jnp.float32,
+            )
+    return state._replace(**updates) if updates else state
 
 
 def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
@@ -547,6 +644,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 model_type=spec.model_type,
             )
+            selector_obs = _adapt_policy_observation_to_spec(selector_obs, static, spec, jnp)
             policy_state, selector_trace = _maybe_apply_selector_segment_start(
                 state,
                 selector_obs,
@@ -563,6 +661,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 model_type=spec.model_type,
             )
+            offense_obs = _adapt_policy_observation_to_spec(offense_obs, static, spec, jnp)
             defense_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
@@ -570,6 +669,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 model_type=spec.model_type,
             )
+            defense_obs = _adapt_policy_observation_to_spec(defense_obs, static, spec, jnp)
             offense_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 policy_state,
@@ -649,6 +749,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "defensive_rebound": env_out.defensive_rebound.astype(jnp.int8),
                 "rebound_target_cell": env_out.rebound_target_cell.astype(jnp.int32),
                 "rebound_winner": env_out.rebound_winner.astype(jnp.int32),
+                "rebound_skill": policy_state.rebound_skill.astype(jnp.float32),
                 "intent_index": policy_state.intent_index.astype(jnp.int32),
                 "intent_active": policy_state.intent_active.astype(jnp.int8),
                 "intent_age": policy_state.intent_age.astype(jnp.int32),
@@ -724,6 +825,7 @@ def _init_player_stats(n_players: int) -> dict[int, dict[str, Any]]:
             "turnovers": 0,
             "points": 0.0,
             "offensive_rebounds": 0,
+            "defensive_rebounds": 0,
             "rebound_chances": 0,
             "episodes": 0,
             "steps": 0,
@@ -745,6 +847,7 @@ def _init_aggregate_stats() -> dict[str, Any]:
         "turnovers": 0,
         "points": 0.0,
         "offensive_rebounds": 0,
+        "defensive_rebounds": 0,
         "rebound_chances": 0,
         "episodes": 0,
         "steps": 0,
@@ -776,6 +879,11 @@ def _init_eval_diagnostics() -> dict[str, Any]:
         "potential_assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
         "pass_links": {},
         "completed_pass_links": {},
+        "initial_ball_holder_counts": {},
+        "pass_attempts_by_passer": {},
+        "completed_passes_by_passer": {},
+        "pass_attempts_by_receiver": {},
+        "completed_passes_by_receiver": {},
         "shot_attempts_by_player": {},
         "made_shots_by_player": {},
         "action_mix": {
@@ -809,6 +917,7 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "offensive": 0,
             "defensive": 0,
             "by_player_offensive": {},
+            "by_player_defensive": {},
         },
     }
 
@@ -819,7 +928,7 @@ def _merge_aggregate_stats(dest: dict[str, Any] | None, src: dict[str, Any] | No
     if not src:
         return dest
 
-    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "episodes", "steps", "offensive_rebounds", "rebound_chances"):
+    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "episodes", "steps", "offensive_rebounds", "defensive_rebounds", "rebound_chances"):
         dest[key] = int(dest.get(key, 0) or 0) + int(src.get(key, 0) or 0)
     dest["points"] = float(dest.get("points", 0.0) or 0.0) + float(src.get("points", 0.0) or 0.0)
 
@@ -1029,10 +1138,20 @@ def _record_pass_link_diagnostics(
         return
     if int(passer_id) not in user_team_ids_set or int(receiver_id) not in user_team_ids_set:
         return
+    passer_key = str(int(passer_id))
+    receiver_key = str(int(receiver_id))
+    attempts_by_passer = eval_diagnostics.setdefault("pass_attempts_by_passer", {})
+    attempts_by_passer[passer_key] = int(attempts_by_passer.get(passer_key, 0)) + 1
+    attempts_by_receiver = eval_diagnostics.setdefault("pass_attempts_by_receiver", {})
+    attempts_by_receiver[receiver_key] = int(attempts_by_receiver.get(receiver_key, 0)) + 1
     link_key = f"{int(passer_id)}->{int(receiver_id)}"
     pass_links = eval_diagnostics.setdefault("pass_links", {})
     pass_links[link_key] = int(pass_links.get(link_key, 0)) + 1
     if completed:
+        completed_by_passer = eval_diagnostics.setdefault("completed_passes_by_passer", {})
+        completed_by_passer[passer_key] = int(completed_by_passer.get(passer_key, 0)) + 1
+        completed_by_receiver = eval_diagnostics.setdefault("completed_passes_by_receiver", {})
+        completed_by_receiver[receiver_key] = int(completed_by_receiver.get(receiver_key, 0)) + 1
         completed_links = eval_diagnostics.setdefault("completed_pass_links", {})
         completed_links[link_key] = int(completed_links.get(link_key, 0)) + 1
 
@@ -1106,6 +1225,7 @@ def run_native_jax_evaluation(
     training_params: dict | None = None,
     eval_seed: int | None = None,
     intent_selection_mode: str = "learned_sample",
+    custom_setup: dict | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     jax, jnp = ensure_jax_available("basketworld_jax/eval/native.py")
@@ -1199,6 +1319,7 @@ def run_native_jax_evaluation(
         key, reset_key, eval_key = jax.random.split(key, 3)
         reset_keys = jax.random.split(reset_key, batch_size)
         initial_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+        initial_state = _apply_native_custom_setup(static, initial_state, custom_setup, batch_size, jnp)
         trace_device = runner(
             static,
             initial_state,
@@ -1225,6 +1346,11 @@ def run_native_jax_evaluation(
             offense_reward = float(stats["offense_rewards"][idx])
             defense_reward = float(stats["defense_rewards"][idx])
             user_reward = offense_reward if user_team == Team.OFFENSE else defense_reward
+            initial_holder = int(trace["ball_holder"][0, idx]) if int(horizon) > 0 else -1
+            if initial_holder >= 0:
+                initial_counts = eval_diagnostics.setdefault("initial_ball_holder_counts", {})
+                initial_key = str(initial_holder)
+                initial_counts[initial_key] = int(initial_counts.get(initial_key, 0)) + 1
             episode_player_stats = _init_player_stats(n_players)
             shots_payload: dict[str, dict[str, Any]] = {}
             turnovers_payload: list[dict[str, Any]] = []
@@ -1446,21 +1572,33 @@ def run_native_jax_evaluation(
                     rebound_target_cell = int(trace["rebound_target_cell"][t, idx])
                     rebound_diag = eval_diagnostics.setdefault(
                         "rebounds",
-                        {"attempts": 0, "offensive": 0, "defensive": 0, "by_player_offensive": {}},
+                        {
+                            "attempts": 0,
+                            "offensive": 0,
+                            "defensive": 0,
+                            "by_player_offensive": {},
+                            "by_player_defensive": {},
+                        },
                     )
                     rebound_diag["attempts"] = int(rebound_diag.get("attempts", 0)) + 1
                     rebound_diag["offensive"] = int(rebound_diag.get("offensive", 0)) + int(rebound_offensive)
                     rebound_diag["defensive"] = int(rebound_diag.get("defensive", 0)) + int(rebound_defensive)
                     for stats_target in (per_player_stats, episode_player_stats):
-                        for offense_pid in offense_ids:
-                            if offense_pid in stats_target:
-                                stats_target[offense_pid]["rebound_chances"] = int(stats_target[offense_pid].get("rebound_chances", 0)) + 1
-                        if rebound_offensive and rebound_winner in stats_target:
-                            stats_target[rebound_winner]["offensive_rebounds"] = int(
-                                stats_target[rebound_winner].get("offensive_rebounds", 0)
-                            ) + 1
-                    if rebound_offensive and rebound_winner >= 0:
-                        by_player = rebound_diag.setdefault("by_player_offensive", {})
+                        for pid in range(n_players):
+                            if pid in stats_target:
+                                stats_target[pid]["rebound_chances"] = int(stats_target[pid].get("rebound_chances", 0)) + 1
+                        if rebound_winner in stats_target:
+                            if rebound_offensive:
+                                stats_target[rebound_winner]["offensive_rebounds"] = int(
+                                    stats_target[rebound_winner].get("offensive_rebounds", 0)
+                                ) + 1
+                            elif rebound_defensive:
+                                stats_target[rebound_winner]["defensive_rebounds"] = int(
+                                    stats_target[rebound_winner].get("defensive_rebounds", 0)
+                                ) + 1
+                    if rebound_winner >= 0:
+                        bucket_name = "by_player_offensive" if rebound_offensive else "by_player_defensive"
+                        by_player = rebound_diag.setdefault(bucket_name, {})
                         rebound_key = str(int(rebound_winner))
                         by_player[rebound_key] = int(by_player.get(rebound_key, 0)) + 1
                     _record_rebound_heatmap_event(
@@ -1662,6 +1800,9 @@ def run_native_jax_evaluation(
         "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
         "offensive_rebounds_by_player": dict(
             (eval_diagnostics.get("rebounds") or {}).get("by_player_offensive", {}) or {}
+        ),
+        "defensive_rebounds_by_player": dict(
+            (eval_diagnostics.get("rebounds") or {}).get("by_player_defensive", {}) or {}
         ),
         "total_shot_attempts": int(total_shot_attempts),
         "total_shot_dunk_attempts": int(shot_type_attempts["dunk"]),

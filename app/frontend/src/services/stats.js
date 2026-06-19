@@ -23,6 +23,8 @@ export function getDefaultStats() {
       offensive: 0,
       defensive: 0,
       byPlayer: {},
+      byPlayerOffensive: {},
+      byPlayerDefensive: {},
     },
     violations: {
       defensiveLane: 0,
@@ -108,7 +110,9 @@ export function loadStats() {
       rebounds: {
         offensive: Number(parsed?.rebounds?.offensive) || 0,
         defensive: Number(parsed?.rebounds?.defensive) || 0,
-        byPlayer: normalizeNumberRecord(parsed?.rebounds?.byPlayer),
+        byPlayer: normalizeNumberRecord(parsed?.rebounds?.byPlayer || parsed?.rebounds?.byPlayerOffensive),
+        byPlayerOffensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerOffensive || parsed?.rebounds?.byPlayer),
+        byPlayerDefensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerDefensive),
       },
       violations: {
         defensiveLane: Number(parsed?.violations?.defensiveLane) || 0,
