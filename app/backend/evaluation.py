@@ -594,6 +594,8 @@ def _init_player_stats(n_players: int) -> dict:
             "offensive_rebounds": 0,
             "defensive_rebounds": 0,
             "rebound_chances": 0,
+            "rebound_target_distance_sum": 0.0,
+            "rebound_target_distance_count": 0,
             "episodes": 0,
             "steps": 0,
             "shot_chart": {},
@@ -615,6 +617,8 @@ def _init_aggregate_stats() -> dict:
         "offensive_rebounds": 0,
         "defensive_rebounds": 0,
         "rebound_chances": 0,
+        "rebound_target_distance_sum": 0.0,
+        "rebound_target_distance_count": 0,
         "episodes": 0,
         "steps": 0,
         "shot_chart": {},
@@ -637,6 +641,8 @@ def _merge_aggregate_stats(dest: dict | None, src: dict | None) -> dict:
     dest["offensive_rebounds"] += int(src.get("offensive_rebounds", 0) or 0)
     dest["defensive_rebounds"] += int(src.get("defensive_rebounds", 0) or 0)
     dest["rebound_chances"] += int(src.get("rebound_chances", 0) or 0)
+    dest["rebound_target_distance_sum"] += float(src.get("rebound_target_distance_sum", 0.0) or 0.0)
+    dest["rebound_target_distance_count"] += int(src.get("rebound_target_distance_count", 0) or 0)
     dest["episodes"] += int(src.get("episodes", 0) or 0)
     dest["steps"] += int(src.get("steps", 0) or 0)
 
@@ -710,7 +716,10 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
                 "turnovers": 0,
                 "points": 0.0,
                 "offensive_rebounds": 0,
+                "defensive_rebounds": 0,
                 "rebound_chances": 0,
+                "rebound_target_distance_sum": 0.0,
+                "rebound_target_distance_count": 0,
                 "episodes": 0,
                 "steps": 0,
                 "shot_chart": {},
@@ -726,6 +735,8 @@ def _merge_player_stats(dest: dict, src: dict) -> dict:
         dst_stats["offensive_rebounds"] += int(src_stats.get("offensive_rebounds", 0))
         dst_stats["defensive_rebounds"] += int(src_stats.get("defensive_rebounds", 0))
         dst_stats["rebound_chances"] += int(src_stats.get("rebound_chances", 0))
+        dst_stats["rebound_target_distance_sum"] += float(src_stats.get("rebound_target_distance_sum", 0.0) or 0.0)
+        dst_stats["rebound_target_distance_count"] += int(src_stats.get("rebound_target_distance_count", 0) or 0)
         dst_stats["episodes"] += int(src_stats.get("episodes", 0))
         dst_stats["steps"] += int(src_stats.get("steps", 0))
 

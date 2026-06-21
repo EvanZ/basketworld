@@ -78,6 +78,8 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_weight",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 }
@@ -200,6 +202,8 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "rebound_target_uniform_mix": float,
     "rebound_winner_distance_weight": float,
     "rebound_winner_temperature": float,
+    "rebound_skill_std": float,
+    "rebound_skill_weight": float,
     "offensive_rebound_shot_clock_reset": int,
     "rebound_terminal_reward_mode": str,
 }
@@ -222,6 +226,8 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
         names = (f"jax/env/{key}",)
         if key == "offensive_three_seconds":
             names = (f"jax/env/{key}", "jax/env/offensive_three_seconds_enabled")
+        elif key in {"rebound_skill_std", "rebound_skill_weight", "rebound_terminal_reward_mode"}:
+            names = (f"jax/env/{key}", f"jax/{key}")
         for name in names:
             if name not in mlflow_params:
                 continue

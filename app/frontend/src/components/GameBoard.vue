@@ -884,7 +884,11 @@ const reboundOverlayTitle = computed(() => {
   const explicitTitle = props.reboundTargetOverlay?.title;
   if (typeof explicitTitle === 'string' && explicitTitle.trim()) return explicitTitle.trim();
   const shot = props.reboundTargetOverlay?.shot || {};
-  const pid = shot.player_id ?? shot.playerId;
+  const isLiveRebound = props.reboundTargetOverlay?.source === 'live_rebound_step';
+  const winner = props.reboundTargetOverlay?.sampled_winner || {};
+  const pid = isLiveRebound
+    ? (winner.player_id ?? winner.playerId ?? shot.player_id ?? shot.playerId)
+    : (shot.player_id ?? shot.playerId);
   const shotType = shot.shot_type || shot.shotType || 'miss';
   const prefix = pid === undefined || pid === null ? 'Rebound target P' : `Rebound target P | P${pid}`;
   return `${prefix} ${shotType}`;

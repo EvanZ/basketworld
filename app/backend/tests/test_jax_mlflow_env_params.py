@@ -47,6 +47,8 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/phi_use_ball_handler_only": "false",
         "jax/env/start_template_library": "/tmp/templates.json",
         "jax/env/start_template_prob": "1.0",
+        "jax/env/rebound_skill_std": "0.75",
+        "jax/env/rebound_skill_weight": "1.25",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
@@ -82,6 +84,23 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["phi_use_ball_handler_only"] is False
     assert merged["start_template_library"] == "/tmp/templates.json"
     assert merged["start_template_prob"] == 1.0
+    assert merged["rebound_skill_std"] == 0.75
+    assert merged["rebound_skill_weight"] == 1.25
+
+
+def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():
+    merged = _overlay_jax_mlflow_env_params(
+        {},
+        {
+            "jax/rebound_skill_std": "0.5",
+            "jax/rebound_skill_weight": "1.5",
+            "jax/rebound_terminal_reward_mode": "last_shot_ep",
+        },
+    )
+
+    assert merged["rebound_skill_std"] == 0.5
+    assert merged["rebound_skill_weight"] == 1.5
+    assert merged["rebound_terminal_reward_mode"] == "last_shot_ep"
 
 
 def test_overlay_jax_mlflow_training_params_exposes_selector_config():

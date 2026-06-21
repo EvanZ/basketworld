@@ -25,6 +25,9 @@ export function getDefaultStats() {
       byPlayer: {},
       byPlayerOffensive: {},
       byPlayerDefensive: {},
+      targetDistanceSumOffense: 0,
+      targetDistanceSumDefense: 0,
+      targetDistanceCount: 0,
     },
     violations: {
       defensiveLane: 0,
@@ -113,6 +116,9 @@ export function loadStats() {
         byPlayer: normalizeNumberRecord(parsed?.rebounds?.byPlayer || parsed?.rebounds?.byPlayerOffensive),
         byPlayerOffensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerOffensive || parsed?.rebounds?.byPlayer),
         byPlayerDefensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerDefensive),
+        targetDistanceSumOffense: Number(parsed?.rebounds?.targetDistanceSumOffense) || 0,
+        targetDistanceSumDefense: Number(parsed?.rebounds?.targetDistanceSumDefense) || 0,
+        targetDistanceCount: Number(parsed?.rebounds?.targetDistanceCount) || 0,
       },
       violations: {
         defensiveLane: Number(parsed?.violations?.defensiveLane) || 0,

@@ -972,6 +972,10 @@ def get_full_game_state(
         "receiver_alignment_width": float(getattr(env, "receiver_alignment_width", 2.0)),
         "max_receiver_hazard": float(getattr(env, "max_receiver_hazard", 0.85)),
         "lane_weight": float(getattr(env, "lane_weight", 0.0)),
+        "rebound_winner_distance_weight": float(getattr(env, "rebound_winner_distance_weight", 1.0)),
+        "rebound_winner_temperature": float(getattr(env, "rebound_winner_temperature", 1.0)),
+        "rebound_skill_std": float(getattr(env, "rebound_skill_std", 0.0)),
+        "rebound_skill_weight": float(getattr(env, "rebound_skill_weight", 0.0)),
         "spawn_distance": int(env.spawn_distance or 3),
         "max_spawn_distance": (
             int(env.max_spawn_distance)

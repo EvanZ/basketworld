@@ -121,6 +121,25 @@ function buildDisplayActions(actionsTaken, actionsTakenMeta = null) {
   return mapped;
 }
 
+function appendReboundOutcomesToMoves(moves, actionResults) {
+  if (!moves || typeof moves !== 'object' || !actionResults || typeof actionResults !== 'object') {
+    return moves;
+  }
+  const rebounds = Array.isArray(actionResults.rebounds)
+    ? actionResults.rebounds
+    : (actionResults.rebound ? [actionResults.rebound] : []);
+  for (const rebound of rebounds) {
+    if (!rebound || rebound.attempt === false) continue;
+    const winner = Number(rebound.winner ?? rebound.winner_player_id ?? rebound.player_id);
+    if (!Number.isFinite(winner) || winner < 0) continue;
+    const label = rebound.offensive ? 'ORB' : (rebound.defensive ? 'DRB' : 'REB');
+    const key = `Player ${winner}`;
+    const existing = String(moves[key] || 'NOOP');
+    moves[key] = existing && existing !== 'NOOP' ? `${existing} + ${label}` : label;
+  }
+  return moves;
+}
+
 function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
   const mapped = {};
   if (!actionsTaken || typeof actionsTaken !== 'object') {
@@ -1195,7 +1214,7 @@ async function handleActionsSubmitted(actions) {
                 ...lastMove.moves,
                 ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
               };
-              lastMove.moves = newMoves;
+              lastMove.moves = appendReboundOutcomesToMoves(newMoves, response.state?.last_action_results);
           }
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {
@@ -1879,7 +1898,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
                 ...lastMove.moves,
                 ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
               };
-              lastMove.moves = newMoves;
+              lastMove.moves = appendReboundOutcomesToMoves(newMoves, response.state?.last_action_results);
           }
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {

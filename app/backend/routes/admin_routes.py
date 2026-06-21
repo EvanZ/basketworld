@@ -2500,6 +2500,10 @@ def _set_pressure_params_impl(
         "defender_pressure_distance",
         "defender_pressure_turnover_chance",
         "defender_pressure_decay_lambda",
+        "rebound_winner_distance_weight",
+        "rebound_winner_temperature",
+        "rebound_skill_std",
+        "rebound_skill_weight",
     }
     scoped_param_keys = {
         "all": set(all_param_keys),
@@ -2537,6 +2541,12 @@ def _set_pressure_params_impl(
             "defender_pressure_distance",
             "defender_pressure_turnover_chance",
             "defender_pressure_decay_lambda",
+        },
+        "rebounding": {
+            "rebound_winner_distance_weight",
+            "rebound_winner_temperature",
+            "rebound_skill_std",
+            "rebound_skill_weight",
         },
     }
     requested_scope = (
@@ -2643,6 +2653,22 @@ def _set_pressure_params_impl(
                 "defender_pressure_decay_lambda",
                 getattr(env, "defender_pressure_decay_lambda", 1.0),
             ),
+            "rebound_winner_distance_weight": _default_value(
+                "rebound_winner_distance_weight",
+                getattr(env, "rebound_winner_distance_weight", 1.0),
+            ),
+            "rebound_winner_temperature": _default_value(
+                "rebound_winner_temperature",
+                getattr(env, "rebound_winner_temperature", 1.0),
+            ),
+            "rebound_skill_std": _default_value(
+                "rebound_skill_std",
+                getattr(env, "rebound_skill_std", 0.0),
+            ),
+            "rebound_skill_weight": _default_value(
+                "rebound_skill_weight",
+                getattr(env, "rebound_skill_weight", 0.0),
+            ),
         }
         if active_scope:
             selected_keys = set(scoped_param_keys[active_scope])
@@ -2692,6 +2718,10 @@ def _set_pressure_params_impl(
             "defender_pressure_distance": req.defender_pressure_distance,
             "defender_pressure_turnover_chance": req.defender_pressure_turnover_chance,
             "defender_pressure_decay_lambda": req.defender_pressure_decay_lambda,
+            "rebound_winner_distance_weight": req.rebound_winner_distance_weight,
+            "rebound_winner_temperature": req.rebound_winner_temperature,
+            "rebound_skill_std": req.rebound_skill_std,
+            "rebound_skill_weight": req.rebound_skill_weight,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
         if active_scope and active_scope != "all":
@@ -2895,6 +2925,31 @@ def _set_pressure_params_impl(
             0.0,
         )
 
+    if "rebound_winner_distance_weight" in payload:
+        normalized["rebound_winner_distance_weight"] = _validate_min(
+            _as_float(payload["rebound_winner_distance_weight"], "rebound_winner_distance_weight"),
+            "rebound_winner_distance_weight",
+            0.0,
+        )
+    if "rebound_winner_temperature" in payload:
+        normalized["rebound_winner_temperature"] = _validate_min(
+            _as_float(payload["rebound_winner_temperature"], "rebound_winner_temperature"),
+            "rebound_winner_temperature",
+            1.0e-6,
+        )
+    if "rebound_skill_std" in payload:
+        normalized["rebound_skill_std"] = _validate_min(
+            _as_float(payload["rebound_skill_std"], "rebound_skill_std"),
+            "rebound_skill_std",
+            0.0,
+        )
+    if "rebound_skill_weight" in payload:
+        normalized["rebound_skill_weight"] = _validate_min(
+            _as_float(payload["rebound_skill_weight"], "rebound_skill_weight"),
+            "rebound_skill_weight",
+            0.0,
+        )
+
     try:
         for key, val in normalized.items():
             setattr(env, key, val)
@@ -2949,6 +3004,12 @@ def set_pass_interception_params(req: SetPressureParamsRequest):
 def set_defender_pressure_params(req: SetPressureParamsRequest):
     """Update only defender turnover-pressure parameters."""
     return _set_pressure_params_impl(req, forced_scope="defender_pressure")
+
+
+@router.post("/api/set_rebound_params")
+def set_rebound_params(req: SetPressureParamsRequest):
+    """Update only rebound winner-model parameters."""
+    return _set_pressure_params_impl(req, forced_scope="rebounding")
 
 
 @router.post("/api/swap_policies")

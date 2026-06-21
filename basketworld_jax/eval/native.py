@@ -711,6 +711,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             trace = {
                 "full_actions": full_actions.astype(jnp.int32),
                 "ball_holder": policy_state.ball_holder.astype(jnp.int32),
+                "next_ball_holder": env_out.state.ball_holder.astype(jnp.int32),
                 "positions": env_out.state.positions.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
@@ -823,10 +824,13 @@ def _init_player_stats(n_players: int) -> dict[int, dict[str, Any]]:
             "assists": 0,
             "potential_assists": 0,
             "turnovers": 0,
+            "steals": 0,
             "points": 0.0,
             "offensive_rebounds": 0,
             "defensive_rebounds": 0,
             "rebound_chances": 0,
+            "rebound_target_distance_sum": 0.0,
+            "rebound_target_distance_count": 0,
             "episodes": 0,
             "steps": 0,
             "shot_chart": {},
@@ -845,10 +849,13 @@ def _init_aggregate_stats() -> dict[str, Any]:
         "assists": 0,
         "potential_assists": 0,
         "turnovers": 0,
+        "steals": 0,
         "points": 0.0,
         "offensive_rebounds": 0,
         "defensive_rebounds": 0,
         "rebound_chances": 0,
+        "rebound_target_distance_sum": 0.0,
+        "rebound_target_distance_count": 0,
         "episodes": 0,
         "steps": 0,
         "shot_chart": {},
@@ -918,6 +925,9 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "defensive": 0,
             "by_player_offensive": {},
             "by_player_defensive": {},
+            "target_distance_sum_offense": 0.0,
+            "target_distance_sum_defense": 0.0,
+            "target_distance_count": 0,
         },
     }
 
@@ -928,9 +938,12 @@ def _merge_aggregate_stats(dest: dict[str, Any] | None, src: dict[str, Any] | No
     if not src:
         return dest
 
-    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "episodes", "steps", "offensive_rebounds", "defensive_rebounds", "rebound_chances"):
+    for key in ("shots", "makes", "assists", "potential_assists", "turnovers", "steals", "episodes", "steps", "offensive_rebounds", "defensive_rebounds", "rebound_chances", "rebound_target_distance_count"):
         dest[key] = int(dest.get(key, 0) or 0) + int(src.get(key, 0) or 0)
     dest["points"] = float(dest.get("points", 0.0) or 0.0) + float(src.get("points", 0.0) or 0.0)
+    dest["rebound_target_distance_sum"] = float(
+        dest.get("rebound_target_distance_sum", 0.0) or 0.0
+    ) + float(src.get("rebound_target_distance_sum", 0.0) or 0.0)
 
     for shot_type in ("dunk", "two", "three"):
         src_pair = (src.get("shot_types") or {}).get(shot_type, [0, 0])
@@ -1062,6 +1075,26 @@ def _record_shot_event(
             entry["assist_full_by_type"][shot_type] = int(entry["assist_full_by_type"].get(shot_type, 0)) + 1
         else:
             entry["unassisted"][shot_type] = int(entry["unassisted"].get(shot_type, 0)) + 1
+
+
+def _hex_distance_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    arr = np.asarray(a, dtype=np.int32)
+    target = np.asarray(b, dtype=np.int32)
+    dq = arr[..., 0] - int(target[0])
+    dr = arr[..., 1] - int(target[1])
+    return np.maximum(np.maximum(np.abs(dq), np.abs(dr)), np.abs(dq + dr)).astype(np.float32)
+
+
+def _mean_team_distance_to_target_np(
+    positions: np.ndarray,
+    team_ids: list[int],
+    target_coord: np.ndarray,
+) -> float | None:
+    valid_ids = [int(pid) for pid in team_ids if 0 <= int(pid) < int(positions.shape[0])]
+    if not valid_ids:
+        return None
+    distances = _hex_distance_np(positions[np.asarray(valid_ids, dtype=np.int32)], target_coord)
+    return float(np.mean(distances))
 
 
 def _record_rebound_heatmap_event(
@@ -1551,6 +1584,13 @@ def run_native_jax_evaluation(
                     if turnover_player >= 0:
                         if turnover_player in episode_player_stats:
                             episode_player_stats[turnover_player]["turnovers"] += 1
+                    if turnover_reason_code == int(TURNOVER_REASON_INTERCEPTED):
+                        steal_player = int(trace["next_ball_holder"][t, idx])
+                        if steal_player >= 0:
+                            if steal_player in per_player_stats:
+                                per_player_stats[steal_player]["steals"] += 1
+                            if steal_player in episode_player_stats:
+                                episode_player_stats[steal_player]["steals"] += 1
                     turnovers_payload.append(
                         {
                             "player_id": turnover_player if turnover_player >= 0 else None,
@@ -1578,15 +1618,51 @@ def run_native_jax_evaluation(
                             "defensive": 0,
                             "by_player_offensive": {},
                             "by_player_defensive": {},
+                            "target_distance_sum_offense": 0.0,
+                            "target_distance_sum_defense": 0.0,
+                            "target_distance_count": 0,
                         },
                     )
                     rebound_diag["attempts"] = int(rebound_diag.get("attempts", 0)) + 1
                     rebound_diag["offensive"] = int(rebound_diag.get("offensive", 0)) + int(rebound_offensive)
                     rebound_diag["defensive"] = int(rebound_diag.get("defensive", 0)) + int(rebound_defensive)
+                    rebound_positions = np.asarray(trace["positions"][t, idx], dtype=np.int32)
+                    offense_target_distance = None
+                    defense_target_distance = None
+                    player_target_distances = None
+                    target_idx = int(rebound_target_cell)
+                    if 0 <= target_idx < int(cell_coords_np.shape[0]):
+                        target_coord = cell_coords_np[target_idx]
+                        player_target_distances = _hex_distance_np(rebound_positions, target_coord)
+                        offense_target_distance = _mean_team_distance_to_target_np(
+                            rebound_positions,
+                            offense_ids,
+                            target_coord,
+                        )
+                        defense_target_distance = _mean_team_distance_to_target_np(
+                            rebound_positions,
+                            defense_ids,
+                            target_coord,
+                        )
+                    if offense_target_distance is not None and defense_target_distance is not None:
+                        rebound_diag["target_distance_sum_offense"] = float(
+                            rebound_diag.get("target_distance_sum_offense", 0.0) or 0.0
+                        ) + float(offense_target_distance)
+                        rebound_diag["target_distance_sum_defense"] = float(
+                            rebound_diag.get("target_distance_sum_defense", 0.0) or 0.0
+                        ) + float(defense_target_distance)
+                        rebound_diag["target_distance_count"] = int(rebound_diag.get("target_distance_count", 0) or 0) + 1
                     for stats_target in (per_player_stats, episode_player_stats):
                         for pid in range(n_players):
                             if pid in stats_target:
                                 stats_target[pid]["rebound_chances"] = int(stats_target[pid].get("rebound_chances", 0)) + 1
+                                if player_target_distances is not None and pid < int(player_target_distances.shape[0]):
+                                    stats_target[pid]["rebound_target_distance_sum"] = float(
+                                        stats_target[pid].get("rebound_target_distance_sum", 0.0) or 0.0
+                                    ) + float(player_target_distances[pid])
+                                    stats_target[pid]["rebound_target_distance_count"] = int(
+                                        stats_target[pid].get("rebound_target_distance_count", 0) or 0
+                                    ) + 1
                         if rebound_winner in stats_target:
                             if rebound_offensive:
                                 stats_target[rebound_winner]["offensive_rebounds"] = int(
@@ -1608,7 +1684,7 @@ def run_native_jax_evaluation(
                         target_cell=rebound_target_cell,
                         winner_id=rebound_winner,
                         offensive=rebound_offensive,
-                        positions=np.asarray(trace["positions"][t, idx], dtype=np.int32),
+                        positions=rebound_positions,
                         cell_coords=cell_coords_np,
                     )
                     rebounds_payload.append(
@@ -1619,6 +1695,8 @@ def run_native_jax_evaluation(
                             "winner": rebound_winner if rebound_winner >= 0 else None,
                             "winner_team": "OFFENSE" if rebound_offensive else ("DEFENSE" if rebound_defensive else None),
                             "target_cell_index": rebound_target_cell if rebound_target_cell >= 0 else None,
+                            "offense_avg_distance_to_target": offense_target_distance,
+                            "defense_avg_distance_to_target": defense_target_distance,
                         }
                     )
 
@@ -1767,6 +1845,8 @@ def run_native_jax_evaluation(
         selector_start_mean_raw_max_prob = 0.0
     selector_diag["episode_start_mean_raw_probs"] = selector_start_mean_raw_probs
     selector_diag["episode_start_mean_raw_max_prob"] = float(selector_start_mean_raw_max_prob)
+    rebound_diag_final = eval_diagnostics.get("rebounds") or {}
+    rebound_target_distance_count = int(rebound_diag_final.get("target_distance_count", 0) or 0)
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -1798,11 +1878,22 @@ def run_native_jax_evaluation(
         "total_rebound_attempts": int(_sum(all_rebound_attempts)),
         "total_offensive_rebounds": int(_sum(all_offensive_rebounds)),
         "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
+        "rebound_target_distance_count": rebound_target_distance_count,
+        "avg_offense_rebound_target_distance": (
+            float(rebound_diag_final.get("target_distance_sum_offense", 0.0) or 0.0) / rebound_target_distance_count
+            if rebound_target_distance_count > 0
+            else 0.0
+        ),
+        "avg_defense_rebound_target_distance": (
+            float(rebound_diag_final.get("target_distance_sum_defense", 0.0) or 0.0) / rebound_target_distance_count
+            if rebound_target_distance_count > 0
+            else 0.0
+        ),
         "offensive_rebounds_by_player": dict(
-            (eval_diagnostics.get("rebounds") or {}).get("by_player_offensive", {}) or {}
+            rebound_diag_final.get("by_player_offensive", {}) or {}
         ),
         "defensive_rebounds_by_player": dict(
-            (eval_diagnostics.get("rebounds") or {}).get("by_player_defensive", {}) or {}
+            rebound_diag_final.get("by_player_defensive", {}) or {}
         ),
         "total_shot_attempts": int(total_shot_attempts),
         "total_shot_dunk_attempts": int(shot_type_attempts["dunk"]),

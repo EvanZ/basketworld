@@ -80,6 +80,8 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
 
 
 def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
+    if not hasattr(spec, "flat_obs_dim"):
+        return flat_obs
     expected_dim = int(spec.flat_obs_dim)
     current_dim = int(flat_obs.shape[-1])
     if current_dim == expected_dim:

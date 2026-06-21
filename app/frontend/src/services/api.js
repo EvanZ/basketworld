@@ -745,6 +745,19 @@ export async function setDefenderPressureParams(payload = {}) {
   return response.json();
 }
 
+export async function setReboundParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_rebound_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update rebound parameters');
+  }
+  return response.json();
+}
+
 export async function getPlayableOptions() {
   const response = await fetch(`${API_BASE_URL}/api/playable/options`);
   if (!response.ok) {

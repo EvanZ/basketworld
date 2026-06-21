@@ -26,6 +26,7 @@ import {
   setShotPressureParams,
   setPassInterceptionParams,
   setDefenderPressureParams,
+  setReboundParams,
 } from '@/services/api';
 import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
 
@@ -625,6 +626,10 @@ const pressureParamsInput = ref({
   receiver_alignment_width: 2.0,
   max_receiver_hazard: 0.85,
   lane_weight: 0.0,
+  rebound_winner_distance_weight: 1.0,
+  rebound_winner_temperature: 1.0,
+  rebound_skill_std: 0.0,
+  rebound_skill_weight: 0.0,
   defender_pressure_distance: 1,
   defender_pressure_turnover_chance: 0.05,
   defender_pressure_decay_lambda: 1.0,
@@ -669,6 +674,25 @@ const PASS_INTERCEPTION_PARAM_KEYS = [
   'max_receiver_hazard',
   'lane_weight',
 ];
+const REBOUND_PARAM_KEYS = [
+  'rebound_winner_distance_weight',
+  'rebound_winner_temperature',
+  'rebound_skill_std',
+  'rebound_skill_weight',
+];
+
+const activePassInterceptionModel = computed(() =>
+  String(pressureParamsInput.value?.pass_interception_model || 'line').trim().toLowerCase()
+);
+const envPassUsesReactionModel = computed(() => (
+  ['reaction', 'speed', 'speed_based', 'speed-based'].includes(activePassInterceptionModel.value)
+));
+const envPassUsesLobAwareModel = computed(() => (
+  ['lob_aware', 'lob-aware', 'lob'].includes(activePassInterceptionModel.value)
+));
+const envPassUsesLineModel = computed(() => (
+  activePassInterceptionModel.value === 'line' || envPassUsesLobAwareModel.value
+));
 
 function isPressureSectionUpdating(section) {
   return (
@@ -806,6 +830,7 @@ watch(
 
 function syncPressureParamsInputs(state) {
   const src = state || {};
+  const reboundRuntime = src.rebound_runtime || {};
   const nextValues = {
     three_pt_extra_hex_decay: Number(src.three_pt_extra_hex_decay ?? 0.05),
     shot_pressure_enabled: Boolean(src.shot_pressure_enabled ?? true),
@@ -833,6 +858,10 @@ function syncPressureParamsInputs(state) {
     receiver_alignment_width: Number(src.receiver_alignment_width ?? 2.0),
     max_receiver_hazard: Number(src.max_receiver_hazard ?? 0.85),
     lane_weight: Number(src.lane_weight ?? 0.0),
+    rebound_winner_distance_weight: Number(src.rebound_winner_distance_weight ?? reboundRuntime.winner_distance_weight ?? 1.0),
+    rebound_winner_temperature: Number(src.rebound_winner_temperature ?? reboundRuntime.winner_temperature ?? 1.0),
+    rebound_skill_std: Number(src.rebound_skill_std ?? reboundRuntime.skill_std ?? 0.0),
+    rebound_skill_weight: Number(src.rebound_skill_weight ?? reboundRuntime.skill_weight ?? 0.0),
     defender_pressure_distance: Number(src.defender_pressure_distance ?? 1),
     defender_pressure_turnover_chance: Number(src.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(src.defender_pressure_decay_lambda ?? 1.0),
@@ -882,6 +911,14 @@ watch(
     props.gameState?.receiver_alignment_width,
     props.gameState?.max_receiver_hazard,
     props.gameState?.lane_weight,
+    props.gameState?.rebound_winner_distance_weight,
+    props.gameState?.rebound_winner_temperature,
+    props.gameState?.rebound_skill_std,
+    props.gameState?.rebound_skill_weight,
+    props.gameState?.rebound_runtime?.winner_distance_weight,
+    props.gameState?.rebound_runtime?.winner_temperature,
+    props.gameState?.rebound_runtime?.skill_std,
+    props.gameState?.rebound_runtime?.skill_weight,
     props.gameState?.defender_pressure_distance,
     props.gameState?.defender_pressure_turnover_chance,
     props.gameState?.defender_pressure_decay_lambda,
@@ -1425,6 +1462,21 @@ const offenseSkillRows = computed(() => {
     sampledThree: Number(sampleThree[idx] ?? three[idx] ?? 0),
     sampledDunk: Number(sampleDunk[idx] ?? dunk[idx] ?? 0),
   }));
+});
+
+const sampledReboundSkillRows = computed(() => {
+  if (!props.gameState?.player_rebound_skills) return [];
+  const liveSkills = props.gameState.player_rebound_skills || {};
+  const offense = new Set((props.gameState.offense_ids || []).map(Number));
+  return allPlayerIds.value.map((pid) => {
+    const raw = liveSkills?.[String(pid)] ?? liveSkills?.[pid] ?? 0;
+    const numeric = Number(raw);
+    return {
+      playerId: pid,
+      team: offense.has(Number(pid)) ? 'Offense' : 'Defense',
+      skill: Number.isFinite(numeric) ? numeric : 0,
+    };
+  });
 });
 
 function percentToProb(percent) {
@@ -3539,6 +3591,10 @@ function _normalizePressurePayload(input) {
     receiver_alignment_width: Number(input?.receiver_alignment_width ?? 2.0),
     max_receiver_hazard: Number(input?.max_receiver_hazard ?? 0.85),
     lane_weight: Number(input?.lane_weight ?? 0.0),
+    rebound_winner_distance_weight: Number(input?.rebound_winner_distance_weight ?? 1.0),
+    rebound_winner_temperature: Number(input?.rebound_winner_temperature ?? 1.0),
+    rebound_skill_std: Number(input?.rebound_skill_std ?? 0.0),
+    rebound_skill_weight: Number(input?.rebound_skill_weight ?? 0.0),
     defender_pressure_distance: Math.round(Number(input?.defender_pressure_distance ?? 1)),
     defender_pressure_turnover_chance: Number(input?.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(input?.defender_pressure_decay_lambda ?? 1.0),
@@ -3702,6 +3758,38 @@ async function resetPassInterceptionToMlflowDefaults() {
     'Failed to reset pass interception parameters',
     PASS_INTERCEPTION_PARAM_KEYS,
     'pass'
+  );
+}
+
+async function applyReboundParameterOverrides() {
+  const payload = _buildPressureSubsetPayload(REBOUND_PARAM_KEYS);
+  await _submitPressureParams(
+    setReboundParams,
+    payload,
+    'Failed to update rebound parameters',
+    REBOUND_PARAM_KEYS,
+    'rebound'
+  );
+}
+
+async function resetReboundParametersToMlflowDefaults() {
+  const payload = _buildSectionResetPayload(REBOUND_PARAM_KEYS);
+  if (Object.keys(payload).length > 0) {
+    await _submitPressureParams(
+      setReboundParams,
+      payload,
+      'Failed to reset rebound parameters',
+      REBOUND_PARAM_KEYS,
+      'rebound'
+    );
+    return;
+  }
+  await _submitPressureParams(
+    setReboundParams,
+    { reset_to_mlflow_defaults: true },
+    'Failed to reset rebound parameters',
+    REBOUND_PARAM_KEYS,
+    'rebound'
   );
 }
 
@@ -3974,21 +4062,33 @@ const reboundingRows = computed(() => {
     {
       label: 'Winner distance weight',
       value: formatConfigValue(valueFor('winner_distance_weight', 'rebound_winner_distance_weight')),
+      inputKey: 'rebound_winner_distance_weight',
+      inputMin: 0,
+      inputStep: 0.1,
       tooltip: 'Weight on player distance to the sampled rebound target when computing rebound winner probabilities.',
     },
     {
       label: 'Winner temperature',
       value: formatConfigValue(valueFor('winner_temperature', 'rebound_winner_temperature')),
+      inputKey: 'rebound_winner_temperature',
+      inputMin: 0.000001,
+      inputStep: 0.1,
       tooltip: 'Softmax temperature for sampling the player who wins the rebound.',
     },
     {
       label: 'Rebound skill std',
       value: formatConfigValue(valueFor('skill_std', 'rebound_skill_std')),
-      tooltip: 'Standard deviation used to sample each player\'s per-episode rebound skill. Zero disables variation.',
+      inputKey: 'rebound_skill_std',
+      inputMin: 0,
+      inputStep: 0.1,
+      tooltip: 'Standard deviation used to sample each player\'s per-episode rebound skill. Applies on reset. Zero disables variation.',
     },
     {
       label: 'Rebound skill weight',
       value: formatConfigValue(valueFor('skill_weight', 'rebound_skill_weight')),
+      inputKey: 'rebound_skill_weight',
+      inputMin: 0,
+      inputStep: 0.1,
       tooltip: 'Multiplier converting rebound skill into effective hex-distance offset in winner logits.',
     },
     {
@@ -4369,6 +4469,13 @@ const totalReboundChances = computed(() => (
   + Number(statsState.value?.rebounds?.defensive || 0)
 ));
 const overallOrbPct = computed(() => safeDiv(Number(statsState.value?.rebounds?.offensive || 0), totalReboundChances.value) * 100);
+const reboundTargetDistanceCount = computed(() => Number(statsState.value?.rebounds?.targetDistanceCount || 0));
+const avgOffenseReboundTargetDistance = computed(() => (
+  safeDiv(Number(statsState.value?.rebounds?.targetDistanceSumOffense || 0), reboundTargetDistanceCount.value)
+));
+const avgDefenseReboundTargetDistance = computed(() => (
+  safeDiv(Number(statsState.value?.rebounds?.targetDistanceSumDefense || 0), reboundTargetDistanceCount.value)
+));
 
 function ensureStatsDiagnosticFields(target) {
   if (!target || typeof target !== 'object') return;
@@ -4384,6 +4491,9 @@ function ensureStatsDiagnosticFields(target) {
   }
   target.rebounds.offensive = Number(target.rebounds.offensive || 0);
   target.rebounds.defensive = Number(target.rebounds.defensive || 0);
+  target.rebounds.targetDistanceSumOffense = Number(target.rebounds.targetDistanceSumOffense || 0);
+  target.rebounds.targetDistanceSumDefense = Number(target.rebounds.targetDistanceSumDefense || 0);
+  target.rebounds.targetDistanceCount = Number(target.rebounds.targetDistanceCount || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -4472,8 +4582,20 @@ function getReboundWinnerId(rebound) {
 function addReboundStats(target, results) {
   if (!target || typeof target !== 'object') return;
   if (!target.rebounds || typeof target.rebounds !== 'object') {
-    target.rebounds = { offensive: 0, defensive: 0, byPlayer: {}, byPlayerOffensive: {}, byPlayerDefensive: {} };
+    target.rebounds = {
+      offensive: 0,
+      defensive: 0,
+      byPlayer: {},
+      byPlayerOffensive: {},
+      byPlayerDefensive: {},
+      targetDistanceSumOffense: 0,
+      targetDistanceSumDefense: 0,
+      targetDistanceCount: 0,
+    };
   }
+  target.rebounds.targetDistanceSumOffense = Number(target.rebounds.targetDistanceSumOffense || 0);
+  target.rebounds.targetDistanceSumDefense = Number(target.rebounds.targetDistanceSumDefense || 0);
+  target.rebounds.targetDistanceCount = Number(target.rebounds.targetDistanceCount || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -4498,6 +4620,13 @@ function addReboundStats(target, results) {
         const key = String(winner);
         target.rebounds.byPlayerDefensive[key] = Number(target.rebounds.byPlayerDefensive[key] || 0) + 1;
       }
+    }
+    const offenseTargetDistance = Number(rebound.offense_avg_distance_to_target);
+    const defenseTargetDistance = Number(rebound.defense_avg_distance_to_target);
+    if (Number.isFinite(offenseTargetDistance) && Number.isFinite(defenseTargetDistance)) {
+      target.rebounds.targetDistanceSumOffense += offenseTargetDistance;
+      target.rebounds.targetDistanceSumDefense += defenseTargetDistance;
+      target.rebounds.targetDistanceCount += 1;
     }
   }
 }
@@ -4679,39 +4808,6 @@ const defensePlayerIdsForStats = computed(() => {
   return Array.isArray(defense) ? defense.map(Number).filter((pid) => Number.isFinite(pid)) : [];
 });
 
-function buildReboundPlayerRows(playerIds, byPlayer, pctKey) {
-  const ids = new Set();
-  playerIds.forEach((pid) => {
-    if (Number.isFinite(Number(pid))) ids.add(Number(pid));
-  });
-  Object.keys(byPlayer || {}).forEach((pid) => {
-    const numeric = Number(pid);
-    if (Number.isFinite(numeric)) ids.add(numeric);
-  });
-  const chances = totalReboundChances.value;
-  return Array.from(ids)
-    .sort((a, b) => a - b)
-    .map((playerId) => {
-      const count = Number(byPlayer?.[playerId] ?? byPlayer?.[String(playerId)] ?? 0);
-      return {
-        playerId,
-        count,
-        chances,
-        [pctKey]: chances > 0 ? (count / chances) * 100 : 0,
-      };
-    })
-    .filter((row) => row.chances > 0 || row.count > 0);
-}
-
-const offensiveReboundPlayerRows = computed(() => {
-  const byPlayer = statsState.value?.rebounds?.byPlayerOffensive || statsState.value?.rebounds?.byPlayer || {};
-  return buildReboundPlayerRows(offensePlayerIdsForStats.value, byPlayer, 'orbPct');
-});
-
-const defensiveReboundPlayerRows = computed(() => {
-  const byPlayer = statsState.value?.rebounds?.byPlayerDefensive || {};
-  return buildReboundPlayerRows(defensePlayerIdsForStats.value, byPlayer, 'drbPct');
-});
 
 function aggregatePlayerStats(entries) {
   const base = {
@@ -4720,10 +4816,13 @@ function aggregatePlayerStats(entries) {
     assists: 0,
     potential_assists: 0,
     turnovers: 0,
+    steals: 0,
     points: 0,
     offensive_rebounds: 0,
     defensive_rebounds: 0,
     rebound_chances: 0,
+    rebound_target_distance_sum: 0,
+    rebound_target_distance_count: 0,
     shot_types: { dunk: [0, 0], two: [0, 0], three: [0, 0] },
     shot_chart: {},
   };
@@ -4734,10 +4833,13 @@ function aggregatePlayerStats(entries) {
     base.assists += Number(entry.assists || 0);
     base.potential_assists += Number(entry.potential_assists || 0);
     base.turnovers += Number(entry.turnovers || 0);
+    base.steals += Number(entry.steals || 0);
     base.points += Number(entry.points || 0);
     base.offensive_rebounds += Number(entry.offensive_rebounds || 0);
     base.defensive_rebounds += Number(entry.defensive_rebounds || 0);
     base.rebound_chances = Math.max(base.rebound_chances, Number(entry.rebound_chances || 0));
+    base.rebound_target_distance_sum += Number(entry.rebound_target_distance_sum || 0);
+    base.rebound_target_distance_count += Number(entry.rebound_target_distance_count || 0);
     const st = entry.shot_types || {};
     ['dunk', 'two', 'three'].forEach((k) => {
       const vals = st[k] || [0, 0];
@@ -4776,6 +4878,8 @@ function buildEvalAggregateRow(entry) {
   const offensiveRebounds = Number(entry?.offensive_rebounds || 0);
   const defensiveRebounds = Number(entry?.defensive_rebounds || 0);
   const reboundChances = Number(entry?.rebound_chances || 0);
+  const reboundTargetDistanceSum = Number(entry?.rebound_target_distance_sum || 0);
+  const reboundTargetDistanceCount = Number(entry?.rebound_target_distance_count || 0);
   return {
     attempts,
     makes,
@@ -4786,10 +4890,16 @@ function buildEvalAggregateRow(entry) {
     assists: Number(entry?.assists || 0),
     potentialAssists: Number(entry?.potential_assists || 0),
     turnovers: Number(entry?.turnovers || 0),
+    steals: Number(entry?.steals || 0),
     points,
     offensiveRebounds,
     defensiveRebounds,
     reboundChances,
+    reboundTargetDistanceSum,
+    reboundTargetDistanceCount,
+    avgReboundTargetDistance: reboundTargetDistanceCount > 0
+      ? reboundTargetDistanceSum / reboundTargetDistanceCount
+      : null,
     orbPct: reboundChances > 0 ? (offensiveRebounds / reboundChances) * 100 : 0,
     drbPct: reboundChances > 0 ? (defensiveRebounds / reboundChances) * 100 : 0,
     episodes,
@@ -4858,7 +4968,7 @@ const defensePlayerStatsTable = computed(() => {
       playerId: pid,
       ...row,
     };
-  }).filter((row) => row.reboundChances > 0 || row.defensiveRebounds > 0);
+  }).filter((row) => row.reboundChances > 0 || row.defensiveRebounds > 0 || row.steals > 0);
 });
 
 const perIntentEvalStatsTable = computed(() => {
@@ -5101,6 +5211,9 @@ function applyEvaluationStats(
   let offensiveThreeCount = 0;
   let offensiveReboundCount = 0;
   let defensiveReboundCount = 0;
+  let reboundTargetDistanceSumOffense = 0;
+  let reboundTargetDistanceSumDefense = 0;
+  let reboundTargetDistanceCountLocal = 0;
   const offensiveReboundsByPlayer = {};
   const defensiveReboundsByPlayer = {};
   for (const row of episodeResults || []) {
@@ -5125,6 +5238,13 @@ function applyEvaluationStats(
           defensiveReboundsByPlayer[key] = Number(defensiveReboundsByPlayer[key] || 0) + 1;
         }
       }
+      const offenseTargetDistance = Number(rebound.offense_avg_distance_to_target);
+      const defenseTargetDistance = Number(rebound.defense_avg_distance_to_target);
+      if (Number.isFinite(offenseTargetDistance) && Number.isFinite(defenseTargetDistance)) {
+        reboundTargetDistanceSumOffense += offenseTargetDistance;
+        reboundTargetDistanceSumDefense += defenseTargetDistance;
+        reboundTargetDistanceCountLocal += 1;
+      }
     }
     const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
     offensiveThreeCount += turnovers.filter(
@@ -5142,6 +5262,9 @@ function applyEvaluationStats(
     byPlayer: offensiveReboundsByPlayer,
     byPlayerOffensive: offensiveReboundsByPlayer,
     byPlayerDefensive: defensiveReboundsByPlayer,
+    targetDistanceSumOffense: reboundTargetDistanceSumOffense,
+    targetDistanceSumDefense: reboundTargetDistanceSumDefense,
+    targetDistanceCount: reboundTargetDistanceCountLocal,
   };
   // Defensive lane violation awards one point to offense.
   if (String(userTeamName || 'OFFENSE').toUpperCase() === 'OFFENSE') {
@@ -5224,6 +5347,30 @@ function applyEvaluationStats(
     );
     const diagByPlayerOffensive = rbDiag.by_player_offensive || nativeSummary.offensive_rebounds_by_player || {};
     const diagByPlayerDefensive = rbDiag.by_player_defensive || nativeSummary.defensive_rebounds_by_player || {};
+    const rbTargetDistanceCount = Number(rbDiag.target_distance_count);
+    const nativeTargetDistanceCount = Number(nativeSummary.rebound_target_distance_count);
+    const currentTargetDistanceCount = Number(next.rebounds?.targetDistanceCount || 0);
+    const useNativeTargetDistance = Number.isFinite(nativeTargetDistanceCount) && nativeTargetDistanceCount > 0;
+    const useDiagTargetDistance = !useNativeTargetDistance
+      && Number.isFinite(rbTargetDistanceCount)
+      && rbTargetDistanceCount > 0;
+    const diagTargetDistanceCount = useNativeTargetDistance
+      ? nativeTargetDistanceCount
+      : (useDiagTargetDistance ? rbTargetDistanceCount : currentTargetDistanceCount);
+    const rbOffTargetDistanceSum = Number(rbDiag.target_distance_sum_offense);
+    const rbDefTargetDistanceSum = Number(rbDiag.target_distance_sum_defense);
+    const nativeOffTargetDistanceAvg = Number(nativeSummary.avg_offense_rebound_target_distance);
+    const nativeDefTargetDistanceAvg = Number(nativeSummary.avg_defense_rebound_target_distance);
+    const diagTargetDistanceSumOffense = useNativeTargetDistance
+      ? (Number.isFinite(nativeOffTargetDistanceAvg) ? nativeOffTargetDistanceAvg * nativeTargetDistanceCount : Number(next.rebounds?.targetDistanceSumOffense || 0))
+      : (useDiagTargetDistance && Number.isFinite(rbOffTargetDistanceSum)
+        ? rbOffTargetDistanceSum
+        : Number(next.rebounds?.targetDistanceSumOffense || 0));
+    const diagTargetDistanceSumDefense = useNativeTargetDistance
+      ? (Number.isFinite(nativeDefTargetDistanceAvg) ? nativeDefTargetDistanceAvg * nativeTargetDistanceCount : Number(next.rebounds?.targetDistanceSumDefense || 0))
+      : (useDiagTargetDistance && Number.isFinite(rbDefTargetDistanceSum)
+        ? rbDefTargetDistanceSum
+        : Number(next.rebounds?.targetDistanceSumDefense || 0));
     const mergedByPlayerOffensive = { ...(next.rebounds?.byPlayerOffensive || next.rebounds?.byPlayer || {}) };
     const mergedByPlayerDefensive = { ...(next.rebounds?.byPlayerDefensive || {}) };
     for (const [pid, count] of Object.entries(diagByPlayerOffensive || {})) {
@@ -5240,6 +5387,15 @@ function applyEvaluationStats(
       byPlayer: mergedByPlayerOffensive,
       byPlayerOffensive: mergedByPlayerOffensive,
       byPlayerDefensive: mergedByPlayerDefensive,
+      targetDistanceSumOffense: Number.isFinite(diagTargetDistanceSumOffense)
+        ? diagTargetDistanceSumOffense
+        : Number(next.rebounds?.targetDistanceSumOffense || 0),
+      targetDistanceSumDefense: Number.isFinite(diagTargetDistanceSumDefense)
+        ? diagTargetDistanceSumDefense
+        : Number(next.rebounds?.targetDistanceSumDefense || 0),
+      targetDistanceCount: Number.isFinite(diagTargetDistanceCount)
+        ? Math.max(Number(next.rebounds?.targetDistanceCount || 0), diagTargetDistanceCount)
+        : Number(next.rebounds?.targetDistanceCount || 0),
     };
     const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
     const selectorStartSource = Object.keys(selectorStartCounts).length > 0
@@ -7518,6 +7674,7 @@ function offenseSkillDeltaLabel(idx) {
               <th>Pot. Ast</th>
               <th>TOV</th>
               <th>ORB%</th>
+              <th>Avg target dist</th>
               <th>Points</th>
             </tr>
           </thead>
@@ -7532,28 +7689,33 @@ function offenseSkillDeltaLabel(idx) {
               <td>{{ row.potentialAssists }}</td>
               <td>{{ row.turnovers }}</td>
               <td>{{ row.offensiveRebounds }}/{{ row.reboundChances }} ({{ row.orbPct.toFixed(1) }}%)</td>
+              <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
               <td>{{ row.points.toFixed(1) }}</td>
             </tr>
           </tbody>
         </table>
       </div>
       <div v-if="defensePlayerStatsTable.length" class="per-player-stats">
-        <h4>Per-Player Defense Rebounding Stats (Eval)</h4>
+        <h4>Per-Player Defense Stats</h4>
         <table class="per-player-table">
           <thead>
             <tr>
               <th>Player</th>
+              <th>Steals</th>
               <th>DRB</th>
               <th>Chances</th>
               <th>DRB%</th>
+              <th>Avg target dist</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in defensePlayerStatsTable" :key="`def-reb-stat-${row.playerId}`">
               <td>Player {{ row.playerId }}</td>
+              <td>{{ row.steals }}</td>
               <td>{{ row.defensiveRebounds }}</td>
               <td>{{ row.reboundChances }}</td>
               <td>{{ row.drbPct.toFixed(1) }}%</td>
+              <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
             </tr>
           </tbody>
         </table>
@@ -7616,6 +7778,9 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Missed shots recovered by the offense, extending the possession."><span class="param-name">Offensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.offensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Missed shots recovered by the defense, ending the possession."><span class="param-name">Defensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.defensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offensive rebound percentage: offensive rebounds divided by all resolved rebound chances."><span class="param-name">ORB%:</span><span class="param-value">{{ overallOrbPct.toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Resolved rebound attempts with valid target-cell distance diagnostics."><span class="param-name">Rebound target dist samples:</span><span class="param-value">{{ reboundTargetDistanceCount }}</span></div>
+            <div class="param-item" data-tooltip="Average hex distance from offensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg OFF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgOffenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Average hex distance from defensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg DEF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgDefenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Shot clock expirations. These count as team turnovers but are not assigned to an individual offensive player."><span class="param-name">Shot clock violations:</span><span class="param-value">{{ shotClockViolationCount }}</span></div>
             <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
             <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
@@ -7623,46 +7788,6 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Points per possession proxy here: total points scored by user team divided by episodes."><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
             <div class="param-item" data-tooltip="Average total environment reward for the user team, including scoring reward plus any assist, violation, phi-shaping, or other configured reward terms. This is only expected to match PPP when those auxiliary terms are disabled and the terminal reward mode is PPP-compatible."><span class="param-name">Avg total reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
             <div class="param-item" data-tooltip="Average number of steps per episode."><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
-          </div>
-          <div v-if="offensiveReboundPlayerRows.length" class="param-category">
-            <h5>
-              ORB% by Offensive Player
-              <span
-                class="category-help"
-                title="Per-player offensive rebound percentage: this player's offensive rebounds divided by all resolved rebound chances."
-                aria-label="ORB percent by offensive player help"
-                tabindex="0"
-              >?</span>
-            </h5>
-            <div
-              v-for="row in offensiveReboundPlayerRows"
-              :key="`orb-player-${row.playerId}`"
-              class="param-item"
-              data-tooltip="Player offensive rebounds divided by total rebound chances."
-            >
-              <span class="param-name">Player {{ row.playerId }}:</span>
-              <span class="param-value">{{ row.count }}/{{ row.chances }} ({{ row.orbPct.toFixed(1) }}%)</span>
-            </div>
-          </div>
-          <div v-if="defensiveReboundPlayerRows.length" class="param-category">
-            <h5>
-              DRB% by Defensive Player
-              <span
-                class="category-help"
-                title="Per-player defensive rebound percentage: this player's defensive rebounds divided by all resolved rebound chances."
-                aria-label="DRB percent by defensive player help"
-                tabindex="0"
-              >?</span>
-            </h5>
-            <div
-              v-for="row in defensiveReboundPlayerRows"
-              :key="`drb-player-${row.playerId}`"
-              class="param-item"
-              data-tooltip="Player defensive rebounds divided by total rebound chances."
-            >
-              <span class="param-name">Player {{ row.playerId }}:</span>
-              <span class="param-value">{{ row.count }}/{{ row.chances }} ({{ row.drbPct.toFixed(1) }}%)</span>
-            </div>
           </div>
           <div class="param-category">
             <h5>
@@ -9762,7 +9887,34 @@ function offenseSkillDeltaLabel(idx) {
               :data-tooltip="row.tooltip"
             >
               <span class="param-name">{{ row.label }}:</span>
-              <span class="param-value">{{ row.value }}</span>
+              <input
+                v-if="row.inputKey"
+                class="env-param-input"
+                type="number"
+                :min="row.inputMin"
+                :step="row.inputStep"
+                :value="pressureParamsInput[row.inputKey]"
+                :disabled="pressureParamsUpdating"
+                @input="pressureParamsInput[row.inputKey] = Number($event.target.value)"
+              />
+              <span v-else class="param-value">{{ row.value }}</span>
+            </div>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                @click="resetReboundParametersToMlflowDefaults"
+                :disabled="isPressureSectionUpdating('rebound')"
+                title="Reset rebound winner parameters to MLflow defaults for this run"
+              >
+                Reset
+              </button>
+              <button
+                class="refresh-policies-btn"
+                @click="applyReboundParameterOverrides"
+                :disabled="isPressureSectionUpdating('rebound')"
+              >
+                {{ isPressureSectionUpdating('rebound') ? 'Saving...' : 'Apply' }}
+              </button>
             </div>
           </div>
           <div v-if="hasLoadedStartTemplates" class="param-category">
@@ -10081,6 +10233,26 @@ function offenseSkillDeltaLabel(idx) {
               </div>
             </div>
           </div>
+          <div class="param-category" v-if="sampledReboundSkillRows.length">
+            <h5>Sampled Rebounding Skills</h5>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header sampled-rebound-skills-row">
+                <span>Player</span>
+                <span>Team</span>
+                <span>REB skill</span>
+              </div>
+              <div
+                class="offense-skills-row sampled-rebound-skills-row"
+                v-for="row in sampledReboundSkillRows"
+                :key="`sampled-rebound-skill-${row.playerId}`"
+                data-tooltip="Current per-episode rebound skill sampled at reset. Positive values reduce effective distance to the rebound target when rebound skill weight is above zero."
+              >
+                <span class="skills-player">Player {{ row.playerId }}</span>
+                <span class="param-value">{{ row.team }}</span>
+                <span class="param-value">{{ row.skill >= 0 ? '+' : '' }}{{ row.skill.toFixed(2) }}</span>
+              </div>
+            </div>
+          </div>
           <div class="param-category">
             <h5>Defender Turnover Pressure</h5>
             <div class="param-item" data-tooltip="Maximum hex distance at which defenders can apply turnover pressure to the ball handler">
@@ -10149,86 +10321,86 @@ function offenseSkillDeltaLabel(idx) {
                 <option value="reaction">Reaction / speed</option>
               </select>
             </div>
-            <div class="param-section-label">Reaction model</div>
-            <div class="param-item" data-tooltip="Pass speed in board hexes per decision step. Higher values reduce flight time and lower receiver-side reaction risk.">
+            <div v-if="envPassUsesReactionModel" class="param-section-label">Reaction model</div>
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Pass speed in board hexes per decision step. Higher values reduce flight time and lower receiver-side reaction risk.">
               <span class="param-name">Pass speed:</span>
               <input class="env-param-input" type="number" min="0.1" step="0.1" v-model.number="pressureParamsInput.pass_speed" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Defender reaction delay before they can move toward the catch point.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Defender reaction delay before they can move toward the catch point.">
               <span class="param-name">Reaction time:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_reaction_time" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Defender closing speed after reaction time elapses, in board hexes per decision step.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Defender closing speed after reaction time elapses, in board hexes per decision step.">
               <span class="param-name">Defender speed:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_speed" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Extra catch-point radius a defender can contest without reaching the exact receiver hex.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Extra catch-point radius a defender can contest without reaching the exact receiver hex.">
               <span class="param-name">Reach radius:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.defender_reach_radius" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Sigmoid softness for converting defender reach surplus into receiver-side hazard.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Sigmoid softness for converting defender reach surplus into receiver-side hazard.">
               <span class="param-name">Reaction softness:</span>
               <input class="env-param-input" type="number" min="0.05" step="0.05" v-model.number="pressureParamsInput.reaction_softness" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Base noisy-or hazard from close defender pressure on the passer.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Base noisy-or hazard from close defender pressure on the passer.">
               <span class="param-name">Base passer risk:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_passer_risk" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Exponential decay rate for passer pressure as defenders move away from the passer.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Exponential decay rate for passer pressure as defenders move away from the passer.">
               <span class="param-name">Passer decay:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.passer_pressure_decay" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Base receiver-side hazard multiplier for each defender who can react into the catch window.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Base receiver-side hazard multiplier for each defender who can react into the catch window.">
               <span class="param-name">Base receiver risk:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_receiver_risk" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Minimum alignment multiplier for receiver pressure when a defender is not directly in the pass lane.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Minimum alignment multiplier for receiver pressure when a defender is not directly in the pass lane.">
               <span class="param-name">Alignment floor:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.receiver_alignment_min" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Perpendicular-distance width over which receiver alignment fades from direct-lane pressure toward the floor.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Perpendicular-distance width over which receiver alignment fades from direct-lane pressure toward the floor.">
               <span class="param-name">Alignment width:</span>
               <input class="env-param-input" type="number" min="0.1" step="0.1" v-model.number="pressureParamsInput.receiver_alignment_width" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Maximum per-defender receiver-side hazard before noisy-or aggregation.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Maximum per-defender receiver-side hazard before noisy-or aggregation.">
               <span class="param-name">Max receiver hazard:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.max_receiver_hazard" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Weight on the legacy line-interception term inside the reaction model. Zero disables the legacy lane blend.">
+            <div v-if="envPassUsesReactionModel" class="param-item" data-tooltip="Weight on the legacy line-interception term inside the reaction model. Zero disables the legacy lane blend.">
               <span class="param-name">Legacy lane weight:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.lane_weight" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-section-label">Legacy line model</div>
-            <div class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line.">
+            <div v-if="envPassUsesLineModel" class="param-section-label">Legacy line model</div>
+            <div v-if="envPassUsesLineModel" class="param-item" data-tooltip="Base probability that a defender intercepts a pass when directly on the pass line.">
               <span class="param-name">Base steal rate:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.base_steal_rate" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="How quickly steal probability drops as defender is further from pass line. Higher = faster decay.">
+            <div v-if="envPassUsesLineModel" class="param-item" data-tooltip="How quickly steal probability drops as defender is further from pass line. Higher = faster decay.">
               <span class="param-name">Perpendicular decay:</span>
               <input class="env-param-input" type="number" min="0" step="0.01" v-model.number="pressureParamsInput.steal_perp_decay" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="How pass distance affects interception chance. Longer passes are easier to intercept.">
+            <div v-if="envPassUsesLineModel" class="param-item" data-tooltip="How pass distance affects interception chance. Longer passes are easier to intercept.">
               <span class="param-name">Distance factor:</span>
               <input class="env-param-input" type="number" min="0" step="0.01" v-model.number="pressureParamsInput.steal_distance_factor" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver).">
+            <div v-if="envPassUsesLineModel" class="param-item" data-tooltip="Minimum weight for defender's position along pass line (0=near passer, 1=near receiver).">
               <span class="param-name">Position weight min:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.01" v-model.number="pressureParamsInput.steal_position_weight_min" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-section-label">Lob-aware terms</div>
-            <div class="param-item" data-tooltip="Lob-aware extra risk from defenders near the passer and aligned with the pass direction.">
+            <div v-if="envPassUsesLobAwareModel" class="param-section-label">Lob-aware terms</div>
+            <div v-if="envPassUsesLobAwareModel" class="param-item" data-tooltip="Lob-aware extra risk from defenders near the passer and aligned with the pass direction.">
               <span class="param-name">Passer pressure weight:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.pass_passer_pressure_weight" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Lob-aware extra risk from defenders near the receiver and aligned with the catch path.">
+            <div v-if="envPassUsesLobAwareModel" class="param-item" data-tooltip="Lob-aware extra risk from defenders near the receiver and aligned with the catch path.">
               <span class="param-name">Receiver pressure weight:</span>
               <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.pass_receiver_pressure_weight" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Multiplier applied to lane interception risk for lob-aware passes to near-rim receivers.">
+            <div v-if="envPassUsesLobAwareModel" class="param-item" data-tooltip="Multiplier applied to lane interception risk for lob-aware passes to near-rim receivers.">
               <span class="param-name">Lob lane multiplier:</span>
               <input class="env-param-input" type="number" min="0" max="1" step="0.05" v-model.number="pressureParamsInput.pass_lob_lane_multiplier" :disabled="pressureParamsUpdating" />
             </div>
-            <div class="param-item" data-tooltip="Receiver distance from the basket, in hexes, at or below which lob-aware lane-risk reduction applies.">
+            <div v-if="envPassUsesLobAwareModel" class="param-item" data-tooltip="Receiver distance from the basket, in hexes, at or below which lob-aware lane-risk reduction applies.">
               <span class="param-name">Lob receiver distance:</span>
               <input class="env-param-input" type="number" min="0" step="0.5" v-model.number="pressureParamsInput.pass_lob_receiver_distance" :disabled="pressureParamsUpdating" />
             </div>
@@ -12587,6 +12759,10 @@ function offenseSkillDeltaLabel(idx) {
   grid-template-columns: 0.9fr repeat(3, 1fr);
   gap: 0.5rem;
   align-items: center;
+}
+
+.offense-skills-row.sampled-rebound-skills-row {
+  grid-template-columns: 0.9fr 1fr 1fr;
 }
 
 .offense-skills-row.header {

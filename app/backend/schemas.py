@@ -235,6 +235,11 @@ class SetPressureParamsRequest(BaseModel):
     defender_pressure_distance: int | None = None
     defender_pressure_turnover_chance: float | None = None
     defender_pressure_decay_lambda: float | None = None
+    # Rebounding winner model
+    rebound_winner_distance_weight: float | None = None
+    rebound_winner_temperature: float | None = None
+    rebound_skill_std: float | None = None
+    rebound_skill_weight: float | None = None
 
 
 class PlayableStartRequest(BaseModel):
