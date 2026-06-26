@@ -213,6 +213,7 @@ def _build_rebound_transition_metrics(env_out, jnp) -> dict[str, Any]:
         "defensive_rebounds": env_out.defensive_rebound.astype(jnp.int8),
         "rebound_target_cells": env_out.rebound_target_cell.astype(jnp.int32),
         "rebound_winners": env_out.rebound_winner.astype(jnp.int32),
+        "rebound_global_contests": env_out.rebound_global_contest.astype(jnp.int8),
         "shot_clock_reset_14": env_out.shot_clock_reset_14.astype(jnp.int8),
     }
 
@@ -2670,6 +2671,7 @@ def summarize_training_step(
     rebound_attempts = float(np.asarray(rollout_out.trajectory.rebound_attempts, dtype=np.float32).sum())
     offensive_rebounds = float(np.asarray(rollout_out.trajectory.offensive_rebounds, dtype=np.float32).sum())
     defensive_rebounds = float(np.asarray(rollout_out.trajectory.defensive_rebounds, dtype=np.float32).sum())
+    rebound_global_contests = float(np.asarray(rollout_out.trajectory.rebound_global_contests, dtype=np.float32).sum())
     shot_clock_resets = float(np.asarray(rollout_out.trajectory.shot_clock_reset_14, dtype=np.float32).sum())
     summary.update(
         {
@@ -2678,6 +2680,8 @@ def summarize_training_step(
             "defensive_rebounds": int(defensive_rebounds),
             "offensive_rebound_rate": float(offensive_rebounds / max(1.0, rebound_attempts)),
             "defensive_rebound_rate": float(defensive_rebounds / max(1.0, rebound_attempts)),
+            "rebound_global_contest_count": int(rebound_global_contests),
+            "rebound_global_contest_rate": float(rebound_global_contests / max(1.0, rebound_attempts)),
             "shot_clock_reset_14_count": int(shot_clock_resets),
         }
     )
@@ -2777,6 +2781,7 @@ def serialize_eval_trace(
     defensive_rebounds = np.asarray(trace.defensive_rebounds)
     rebound_target_cells = np.asarray(trace.rebound_target_cells)
     rebound_winners = np.asarray(trace.rebound_winners)
+    rebound_global_contests = np.asarray(trace.rebound_global_contests)
     shot_clock_reset_14 = np.asarray(trace.shot_clock_reset_14)
     intent_index = np.asarray(trace.intent_index)
     intent_active = np.asarray(trace.intent_active)
@@ -2818,6 +2823,7 @@ def serialize_eval_trace(
         "defensive_rebounds": defensive_rebounds[:, env_index].astype(np.int8),
         "rebound_target_cells": rebound_target_cells[:, env_index].astype(np.int32),
         "rebound_winners": rebound_winners[:, env_index].astype(np.int32),
+        "rebound_global_contests": rebound_global_contests[:, env_index].astype(np.int8),
         "shot_clock_reset_14": shot_clock_reset_14[:, env_index].astype(np.int8),
         "intent_index": intent_index[:, env_index].astype(np.int32),
         "intent_active": intent_active[:, env_index].astype(np.int8),

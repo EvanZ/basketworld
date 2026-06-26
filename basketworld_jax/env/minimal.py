@@ -22,8 +22,8 @@ PASS_ACTION_START = ActionType.PASS_E.value
 PASS_ACTION_END = ActionType.PASS_SE.value + 1
 ACTION_COUNT = len(ActionType)
 SQRT3 = float(np.sqrt(3.0))
-TOKEN_OBS_PLAYER_DIM = 18
-TOKEN_OBS_GLOBAL_DIM = 8
+TOKEN_OBS_PLAYER_DIM = 17
+TOKEN_OBS_GLOBAL_DIM = 7
 TOKEN_OBS_ROLE_FLAG_DIM = 1
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -44,6 +44,16 @@ REBOUND_TERMINAL_REWARD_MODE_IDS = {
     "last_shot_ep_on_defensive_rebound": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP_ON_DEFENSIVE_REBOUND,
     "last_shot_ep": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP,
 }
+REBOUND_CONTEST_MODE_GLOBAL = 0
+REBOUND_CONTEST_MODE_LOCAL = 1
+REBOUND_CONTEST_MODE_IDS = {
+    "global": REBOUND_CONTEST_MODE_GLOBAL,
+    "global_contest": REBOUND_CONTEST_MODE_GLOBAL,
+    "global_softmax": REBOUND_CONTEST_MODE_GLOBAL,
+    "local": REBOUND_CONTEST_MODE_LOCAL,
+    "local_contest": REBOUND_CONTEST_MODE_LOCAL,
+}
+REBOUND_OBS_TOP_N_MAX = 8
 REBOUND_SHOT_TYPE_TO_JAX = {
     "dunk": SHOT_TYPE_DUNK,
     "finger_roll": SHOT_TYPE_TWO,
@@ -186,6 +196,9 @@ class KernelStatic(NamedTuple):
     rebound_winner_temperature: Any
     rebound_skill_std: Any
     rebound_skill_weight: Any
+    rebound_contest_mode: Any
+    rebound_contest_radius: Any
+    rebound_obs_top_n_targets: Any
     offensive_rebound_shot_clock_reset: Any
     rebound_terminal_reward_mode: Any
 
@@ -253,6 +266,7 @@ class StepBatchOutput(NamedTuple):
     defensive_rebound: Any
     rebound_target_cell: Any
     rebound_winner: Any
+    rebound_global_contest: Any
     shot_clock_reset_14: Any
     phi_r_shape: Any
     phi_prev: Any
@@ -927,6 +941,21 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(0.0, float(getattr(env, "rebound_skill_weight", 0.0))),
             dtype=xp.float32,
         ),
+        rebound_contest_mode=xp.asarray(
+            REBOUND_CONTEST_MODE_IDS.get(
+                str(getattr(env, "rebound_contest_mode", "global_contest") or "global_contest").strip().lower().replace("-", "_"),
+                REBOUND_CONTEST_MODE_GLOBAL,
+            ),
+            dtype=xp.int32,
+        ),
+        rebound_contest_radius=xp.asarray(
+            max(0, int(getattr(env, "rebound_contest_radius", 1))),
+            dtype=xp.int32,
+        ),
+        rebound_obs_top_n_targets=xp.asarray(
+            max(0, int(getattr(env, "rebound_obs_top_n_targets", 0))),
+            dtype=xp.int32,
+        ),
         offensive_rebound_shot_clock_reset=xp.asarray(
             max(1, int(getattr(env, "offensive_rebound_shot_clock_reset", 14))),
             dtype=xp.int32,
@@ -1245,6 +1274,28 @@ def build_offense_expected_points_batch(static: KernelStatic, state: KernelState
     return jnp.take(profile["expected_points"], static.offense_ids, axis=1)
 
 
+def _local_rebound_contest_mask_from_distances(
+    static: KernelStatic,
+    target_distances,
+    player_player_distances,
+    jnp,
+):
+    """Return local-contest eligibility for one target in one env row."""
+    initial_radius = jnp.maximum(jnp.asarray(0, dtype=jnp.int32), static.rebound_contest_radius.astype(jnp.int32))
+    target_distances_i32 = target_distances.astype(jnp.int32)
+
+    radius_eligible = target_distances_i32 <= initial_radius
+    found = jnp.any(radius_eligible)
+    eligible = jnp.where(
+        found,
+        radius_eligible,
+        jnp.ones_like(target_distances_i32, dtype=jnp.bool_),
+    )
+    radius_used = jnp.where(found, initial_radius, jnp.asarray(-1, dtype=jnp.int32))
+    fallback_global = ~found
+    return eligible.astype(jnp.bool_), radius_used, fallback_global
+
+
 def build_rebound_observation_features_batch(
     static: KernelStatic,
     state: KernelState,
@@ -1314,6 +1365,30 @@ def build_rebound_observation_features_batch(
     target_probs = _softmax(target_logits, axis=-1)
     target_probs = jnp.where(rebound_available[:, None], target_probs, jnp.zeros_like(target_probs))
 
+    import jax as _jax
+
+    def _truncate_to_top_n(probs):
+        max_top_n = min(REBOUND_OBS_TOP_N_MAX, probs.shape[-1])
+        top_values, top_indices = _jax.lax.top_k(probs, max_top_n)
+        top_n = jnp.clip(static.rebound_obs_top_n_targets.astype(jnp.int32), 1, max_top_n)
+        keep = jnp.arange(max_top_n, dtype=jnp.int32)[None, :] < top_n
+        kept_values = jnp.where(keep, top_values, jnp.zeros_like(top_values))
+        denom = jnp.maximum(jnp.sum(kept_values, axis=-1, keepdims=True), 1.0e-8)
+        kept_values = kept_values / denom
+        batch_indices = jnp.arange(probs.shape[0], dtype=jnp.int32)[:, None]
+        return jnp.zeros_like(probs).at[batch_indices, top_indices].add(kept_values)
+
+    use_obs_top_n = (
+        (static.rebound_obs_top_n_targets > 0)
+        & (static.rebound_obs_top_n_targets < target_probs.shape[-1])
+    )
+    target_probs = _jax.lax.cond(
+        use_obs_top_n,
+        _truncate_to_top_n,
+        lambda probs: probs,
+        target_probs,
+    )
+
     target_coords = static.cell_coords.astype(jnp.float32)
     expected_target_q = jnp.sum(target_probs * target_coords[None, :, 0], axis=-1)
     expected_target_r = jnp.sum(target_probs * target_coords[None, :, 1], axis=-1)
@@ -1324,44 +1399,21 @@ def build_rebound_observation_features_batch(
     max_entropy = jnp.log(jnp.asarray(float(static.cell_coords.shape[0]), dtype=jnp.float32))
     target_entropy_norm = jnp.where(max_entropy > 0.0, target_entropy / max_entropy, 0.0)
 
-    player_cell_idx, player_cell_found = _lookup_cell_indices(static.cell_coords, state.positions, jnp)
-    safe_player_cell_idx = jnp.where(
-        player_cell_found,
-        player_cell_idx.astype(jnp.int32),
-        jnp.asarray(0, dtype=jnp.int32),
-    )
-    target_indices = jnp.arange(static.cell_coords.shape[0], dtype=jnp.int32)
-    player_target_distances = static.cell_distance_matrix[
-        jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[..., None],
-        target_indices[None, None, :],
-    ].astype(jnp.float32)
-    expected_target_distance = jnp.sum(
-        player_target_distances * target_probs[:, None, :],
-        axis=-1,
-    ) / norm_den
-
-    effective_player_target_distances = (
-        player_target_distances
-        - (static.rebound_skill_weight * state.rebound_skill.astype(jnp.float32)[:, :, None])
-    )
-    winner_logits = (
-        -static.rebound_winner_distance_weight * effective_player_target_distances
-    ) / static.rebound_winner_temperature
-    winner_probs_by_target = _softmax(jnp.swapaxes(winner_logits, 1, 2), axis=-1)
-    rebound_win_prob = jnp.sum(winner_probs_by_target * target_probs[:, :, None], axis=1)
-    rebound_win_prob = jnp.where(rebound_available[:, None], rebound_win_prob, jnp.zeros_like(rebound_win_prob))
-    orb_prob = jnp.sum(
-        rebound_win_prob * (static.role_encoding[None, :] > 0.0).astype(jnp.float32),
-        axis=-1,
+    player_positions = state.positions.astype(jnp.float32)
+    dq = player_positions[..., 0] - expected_target_q[:, None]
+    dr = player_positions[..., 1] - expected_target_r[:, None]
+    dist_to_expected_target = (jnp.abs(dq) + jnp.abs(dq + dr) + jnp.abs(dr)) * 0.5 / norm_den
+    dist_to_expected_target = jnp.where(
+        rebound_available[:, None],
+        dist_to_expected_target,
+        jnp.zeros_like(dist_to_expected_target),
     )
 
     return {
         "expected_target_q": expected_target_q / norm_den,
         "expected_target_r": expected_target_r / norm_den,
         "target_entropy": target_entropy_norm,
-        "orb_prob": orb_prob,
-        "dist_to_expected_target": expected_target_distance,
-        "win_prob": rebound_win_prob,
+        "dist_to_expected_target": dist_to_expected_target,
     }
 
 
@@ -1695,12 +1747,10 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
             turnover_probs,
             steal_risks,
             rebound_features["dist_to_expected_target"],
-            rebound_features["win_prob"],
             state.rebound_skill.astype(jnp.float32),
             rebound_features["expected_target_q"][:, None],
             rebound_features["expected_target_r"][:, None],
             rebound_features["target_entropy"][:, None],
-            rebound_features["orb_prob"][:, None],
         ],
         axis=1,
     )
@@ -1846,7 +1896,6 @@ def build_token_observation_components_batch(
             dist_to_nearest_opp,
             dist_to_nearest_team,
             rebound_features["dist_to_expected_target"],
-            rebound_features["win_prob"],
             rebound_skill,
         ],
         axis=-1,
@@ -1861,7 +1910,6 @@ def build_token_observation_components_batch(
             rebound_features["expected_target_q"],
             rebound_features["expected_target_r"],
             rebound_features["target_entropy"],
-            rebound_features["orb_prob"],
         ],
         axis=-1,
     ).astype(jnp.float32)
@@ -2216,6 +2264,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             defensive_rebound=zero_flag,
             rebound_target_cell=no_player,
             rebound_winner=no_player,
+            rebound_global_contest=zero_flag,
             shot_clock_reset_14=zero_flag,
             phi_r_shape=zero_float,
             phi_prev=zero_float,
@@ -2297,6 +2346,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 defensive_rebound=zero_flag,
                 rebound_target_cell=no_player,
                 rebound_winner=no_player,
+                rebound_global_contest=zero_flag,
                 shot_clock_reset_14=zero_flag,
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
@@ -2525,7 +2575,28 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_distances
                 - (static.rebound_skill_weight * final_state.rebound_skill.astype(jnp.float32))
             )
-            winner_logits = (-static.rebound_winner_distance_weight * effective_rebound_distances) / static.rebound_winner_temperature
+            global_winner_logits = (-static.rebound_winner_distance_weight * effective_rebound_distances) / static.rebound_winner_temperature
+            player_player_distances = static.cell_distance_matrix[
+                jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[:, None],
+                jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[1] - 1)[None, :],
+            ].astype(jnp.int32)
+            local_eligible, _contest_radius_used, contest_fallback_global = _local_rebound_contest_mask_from_distances(
+                static,
+                rebound_distances.astype(jnp.int32),
+                player_player_distances,
+                jnp,
+            )
+            local_winner_logits = jnp.where(
+                local_eligible,
+                global_winner_logits,
+                jnp.asarray(-1.0e9, dtype=jnp.float32),
+            )
+            use_local_contest = (
+                (static.rebound_contest_mode == REBOUND_CONTEST_MODE_LOCAL)
+                & (~contest_fallback_global)
+            )
+            winner_logits = jnp.where(use_local_contest, local_winner_logits, global_winner_logits)
+            rebound_global_contest = rebound_active & (~use_local_contest)
             sampled_rebound_winner = jax.random.categorical(rebound_winner_key, winner_logits).astype(jnp.int32)
             rebound_winner_is_offense = static.role_encoding[jnp.clip(sampled_rebound_winner, 0, static.role_encoding.shape[0] - 1)] > 0.0
             offensive_rebound = rebound_active & rebound_winner_is_offense
@@ -2771,6 +2842,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 defensive_rebound=defensive_rebound.astype(jnp.int8),
                 rebound_target_cell=jnp.where(rebound_active, sampled_rebound_target.astype(jnp.int32), no_player),
                 rebound_winner=jnp.where(rebound_active, sampled_rebound_winner.astype(jnp.int32), no_player),
+                rebound_global_contest=rebound_global_contest.astype(jnp.int8),
                 shot_clock_reset_14=shot_clock_reset_14.astype(jnp.int8),
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
@@ -3253,6 +3325,9 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_weight",
+        "rebound_contest_mode",
+        "rebound_contest_radius",
+        "rebound_obs_top_n_targets",
         "offensive_rebound_shot_clock_reset",
     ):
         if hasattr(args, key):

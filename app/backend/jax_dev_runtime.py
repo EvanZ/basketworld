@@ -12,6 +12,7 @@ from basketworld.utils.start_templates import resolve_start_template
 from basketworld_jax.env.minimal import (
     ACTION_COUNT,
     PASS_ACTION_START,
+    REBOUND_CONTEST_MODE_LOCAL,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
     TURNOVER_REASON_DEFENDER_PRESSURE,
@@ -47,6 +48,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 }
@@ -61,6 +65,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
     "rebound_skill_weight": 0.0,
+    "rebound_contest_mode": "global_contest",
+    "rebound_contest_radius": 1,
+    "rebound_obs_top_n_targets": 0,
     "offensive_rebound_shot_clock_reset": 14,
     "rebound_terminal_reward_mode": "actual_points",
 }
@@ -74,9 +81,116 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
     "rebound_skill_weight": "float",
+    "rebound_contest_mode": "str",
+    "rebound_contest_radius": "int",
+    "rebound_obs_top_n_targets": "int",
     "offensive_rebound_shot_clock_reset": "int",
     "rebound_terminal_reward_mode": "str",
 }
+
+
+def _canonical_rebound_contest_mode(value: Any) -> str:
+    raw = str(value or "global_contest").strip().lower().replace("-", "_")
+    if raw in {"local", "local_contest"}:
+        return "local_contest"
+    return "global_contest"
+
+
+def _rebound_contest_mode_from_static(static: Any) -> str:
+    try:
+        mode_id = int(np.asarray(static.rebound_contest_mode).reshape(-1)[0])
+    except Exception:
+        return "global_contest"
+    return "local_contest" if mode_id == int(REBOUND_CONTEST_MODE_LOCAL) else "global_contest"
+
+
+def _int_from_static_field(static: Any, field_name: str, fallback: int) -> int:
+    try:
+        return int(np.asarray(getattr(static, field_name)).reshape(-1)[0])
+    except Exception:
+        return int(fallback)
+
+
+def _infer_attention_observation_dims(
+    current_dim: int,
+    *,
+    expected_dim: int,
+    token_count: int,
+    token_dim: int,
+    global_dim: int,
+) -> tuple[int, int] | None:
+    if token_count <= 0:
+        return None
+    max_token_dim = max(1, (int(current_dim) - 1) // int(token_count))
+    candidates: list[tuple[tuple[int, int, int], int, int]] = []
+    for current_token_dim in range(1, max_token_dim + 1):
+        current_global_dim = int(current_dim) - 1 - (int(token_count) * int(current_token_dim))
+        if current_global_dim < 0:
+            continue
+        if current_dim >= expected_dim:
+            if current_token_dim < token_dim or current_global_dim < global_dim:
+                continue
+            # Prefer interpreting extras as a small number of added globals, then
+            # added per-token fields. This handles 10*18+8+1 -> 10*17+7+1.
+            score = (current_global_dim - global_dim, current_token_dim - token_dim, -current_token_dim)
+        else:
+            if current_token_dim > token_dim or current_global_dim > global_dim:
+                continue
+            # When padding for older checkpoints, preserve as much current
+            # structure as possible.
+            score = (token_dim - current_token_dim, global_dim - current_global_dim, -current_token_dim)
+        candidates.append((score, current_token_dim, current_global_dim))
+    if not candidates:
+        return None
+    _score, current_token_dim, current_global_dim = min(candidates, key=lambda item: item[0])
+    return int(current_token_dim), int(current_global_dim)
+
+
+def _adapt_attention_observation_to_spec(flat_obs, spec, jnp):
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    token_count = int(spec.token_player_count)
+    token_dim = int(spec.token_dim)
+    global_dim = int(spec.global_dim)
+    dims = _infer_attention_observation_dims(
+        current_dim,
+        expected_dim=expected_dim,
+        token_count=token_count,
+        token_dim=token_dim,
+        global_dim=global_dim,
+    )
+    if dims is None:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+    current_token_dim, current_global_dim = dims
+    if current_token_dim <= 0 or current_global_dim < 0:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+
+    players = flat_obs[:, : token_count * current_token_dim].reshape(
+        flat_obs.shape[0], token_count, current_token_dim
+    )
+    if current_token_dim >= token_dim:
+        players = players[:, :, :token_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], token_count, token_dim - current_token_dim), dtype=flat_obs.dtype)
+        players = jnp.concatenate([players, pad], axis=-1)
+
+    global_start = token_count * current_token_dim
+    globals_vec = flat_obs[:, global_start : global_start + current_global_dim]
+    if current_global_dim >= global_dim:
+        globals_vec = globals_vec[:, :global_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], global_dim - current_global_dim), dtype=flat_obs.dtype)
+        globals_vec = jnp.concatenate([globals_vec, pad], axis=-1)
+
+    role_start = global_start + current_global_dim
+    role_flag = flat_obs[:, role_start : role_start + 1]
+    if role_flag.shape[-1] < 1:
+        role_flag = jnp.zeros((flat_obs.shape[0], 1), dtype=flat_obs.dtype)
+
+    return jnp.concatenate(
+        [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
+        axis=1,
+    ).astype(jnp.float32)
 
 
 def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
@@ -86,29 +200,10 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
     current_dim = int(flat_obs.shape[-1])
     if current_dim == expected_dim:
         return flat_obs
+    if str(spec.model_type) == "attention":
+        return _adapt_attention_observation_to_spec(flat_obs, spec, jnp)
     if current_dim < expected_dim:
         raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
-    if str(spec.model_type) == "attention":
-        token_count = int(spec.token_player_count)
-        token_dim = int(spec.token_dim)
-        global_dim = int(spec.global_dim)
-        trailing_dim = global_dim + 1
-        extra = current_dim - trailing_dim
-        if token_count <= 0 or extra % token_count != 0:
-            raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
-        current_token_dim = extra // token_count
-        if current_token_dim < token_dim:
-            raise ValueError(f"Runtime token dim {current_token_dim} is smaller than checkpoint token dim {token_dim}.")
-        players = flat_obs[:, : token_count * current_token_dim].reshape(
-            flat_obs.shape[0], token_count, current_token_dim
-        )[:, :, :token_dim]
-        global_start = token_count * current_token_dim
-        globals_vec = flat_obs[:, global_start : global_start + global_dim]
-        role_flag = flat_obs[:, global_start + global_dim : global_start + global_dim + 1]
-        return jnp.concatenate(
-            [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
-            axis=1,
-        ).astype(jnp.float32)
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
     tail_dim = 4 + 1 + (3 * offense_count)
@@ -1340,18 +1435,25 @@ class JaxDevRuntime:
         sampled_target_cell: int,
         winner: int,
         next_state: Any,
-    ) -> tuple[list[dict[str, Any]], float | None]:
+    ) -> tuple[list[dict[str, Any]], float | None, dict[str, Any]]:
         coords = np.asarray(self.jax.device_get(self.static.cell_coords), dtype=np.int32)
+        kernel_contest_mode = _rebound_contest_mode_from_static(self.static)
+        empty_info = {
+            "contest_mode": kernel_contest_mode,
+            "contest_radius_used": None,
+            "contest_fallback_global": False,
+        }
         if sampled_target_cell < 0 or sampled_target_cell >= int(coords.shape[0]):
-            return [], None
+            return [], None, empty_info
         positions = np.asarray(self.jax.device_get(_field0(next_state, "positions")), dtype=np.int32)
         player_cell_indices: list[int] = []
         for pos in positions:
             idx = self._cell_index_for_position(pos)
             player_cell_indices.append(0 if idx is None else int(idx))
+        safe_indices = np.clip(np.asarray(player_cell_indices, dtype=np.int32), 0, coords.shape[0] - 1)
         distance_matrix = np.asarray(self.jax.device_get(self.static.cell_distance_matrix), dtype=np.float64)
         distances = distance_matrix[
-            np.clip(np.asarray(player_cell_indices, dtype=np.int32), 0, distance_matrix.shape[0] - 1),
+            safe_indices,
             int(np.clip(sampled_target_cell, 0, distance_matrix.shape[1] - 1)),
         ]
         rebound_skill = np.asarray(self.jax.device_get(_field0(next_state, "rebound_skill")), dtype=np.float64)
@@ -1360,25 +1462,57 @@ class JaxDevRuntime:
         weight = float(np.asarray(self.jax.device_get(self.static.rebound_winner_distance_weight)))
         temp = float(np.asarray(self.jax.device_get(self.static.rebound_winner_temperature)))
         temp = max(1.0e-6, temp if np.isfinite(temp) else 1.0)
-        probs = self._softmax_np((-max(0.0, weight) * effective_distances) / temp)
+        global_logits = (-max(0.0, weight) * effective_distances) / temp
+
+        contest_mode = kernel_contest_mode
+        radius_used: int | None = None
+        fallback_global = False
+        eligible = np.ones_like(distances, dtype=bool)
+        logits = np.asarray(global_logits, dtype=np.float64)
+
+        if contest_mode == "local_contest":
+            initial_radius = max(0, _int_from_static_field(self.static, "rebound_contest_radius", 1))
+            radius_eligible = distances <= float(initial_radius)
+            if bool(np.any(radius_eligible)):
+                eligible = radius_eligible.astype(bool)
+                radius_used = int(initial_radius)
+                logits = np.where(eligible, global_logits, -1.0e9)
+            else:
+                fallback_global = True
+
+        probs = self._softmax_np(logits)
         rows = []
         offense_ids = set(int(pid) for pid in self.offense_ids)
         defense_ids = set(int(pid) for pid in self.defense_ids)
-        for pid, prob in enumerate(probs.tolist()):
+        if contest_mode == "local_contest" and not fallback_global:
+            row_indices = np.nonzero(eligible)[0].tolist()
+        else:
+            row_indices = list(range(int(probs.shape[0])))
+        for pid in row_indices:
+            prob = float(probs[int(pid)])
             team = "offense" if pid in offense_ids else ("defense" if pid in defense_ids else "unknown")
             rows.append({
                 "player_id": int(pid),
                 "team": team,
-                "conditional_prob": float(prob),
+                "conditional_prob": prob,
                 "distance_to_sampled_target": int(round(float(distances[pid]))),
                 "effective_distance_to_sampled_target": float(effective_distances[pid]),
                 "rebound_skill": float(rebound_skill[pid]),
+                "eligible": bool(eligible[pid]),
+                "contest_mode": contest_mode,
+                "contest_radius_used": radius_used,
+                "contest_fallback_global": bool(fallback_global),
             })
         rows.sort(key=lambda row: (-float(row["conditional_prob"]), int(row["player_id"])))
         winner_prob = None
         if 0 <= winner < probs.shape[0]:
             winner_prob = float(probs[int(winner)])
-        return rows, winner_prob
+        contest_info = {
+            "contest_mode": contest_mode,
+            "contest_radius_used": radius_used,
+            "contest_fallback_global": bool(fallback_global),
+        }
+        return rows, winner_prob, contest_info
 
     def _empty_action_results(self) -> dict[str, Any]:
         return {
@@ -1418,7 +1552,7 @@ class JaxDevRuntime:
                 "assist_full": assist_full,
                 "assist_passer_id": assist_passer if assist_passer >= 0 else None,
             }
-        if _as_bool(out.rebound_attempt[0]):
+        if _as_bool(getattr(out, "rebound_attempt", np.asarray([0]))[0]):
             winner = _as_int(out.rebound_winner[0])
             target_cell_idx = _as_int(out.rebound_target_cell[0])
             target = None
@@ -1439,7 +1573,7 @@ class JaxDevRuntime:
                 sampled_target_cell=target_cell_idx,
                 prev_positions=prev_positions,
             )
-            winner_probs, winner_prob = self._rebound_winner_probabilities_payload(
+            winner_probs, winner_prob, contest_info = self._rebound_winner_probabilities_payload(
                 sampled_target_cell=target_cell_idx,
                 winner=winner,
                 next_state=next_state,
@@ -1452,6 +1586,9 @@ class JaxDevRuntime:
                 "winner_team": winner_team,
                 "winner_conditional_prob": winner_prob,
                 "winner_probs": winner_probs,
+                "contest_mode": contest_info.get("contest_mode"),
+                "contest_radius_used": contest_info.get("contest_radius_used"),
+                "contest_fallback_global": contest_info.get("contest_fallback_global"),
                 "target_cell_index": target_cell_idx if target_cell_idx >= 0 else None,
                 "target": target,
                 "target_prob": target_prob,
@@ -2050,7 +2187,6 @@ class JaxDevRuntime:
             "expected_rebound_target_q",
             "expected_rebound_target_r",
             "target_entropy",
-            "orb_prob_if_current_shot_misses",
         ]
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
@@ -2131,6 +2267,9 @@ class JaxDevRuntime:
                 "winner_temperature": float(getattr(self.display_env, "rebound_winner_temperature", 1.0)),
                 "skill_std": float(getattr(self.display_env, "rebound_skill_std", 0.0)),
                 "skill_weight": float(getattr(self.display_env, "rebound_skill_weight", 0.0)),
+                "contest_mode": _rebound_contest_mode_from_static(self.static),
+                "contest_radius": _int_from_static_field(self.static, "rebound_contest_radius", 1),
+                "obs_top_n_targets": _int_from_static_field(self.static, "rebound_obs_top_n_targets", 0),
                 "offensive_rebound_shot_clock_reset": int(getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)),
                 "terminal_reward_mode": str(getattr(self.display_env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
                 "target_table_shape": [int(v) for v in self.static.rebound_target_probs.shape],

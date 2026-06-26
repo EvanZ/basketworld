@@ -117,6 +117,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 }
@@ -130,6 +133,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
     "rebound_skill_weight": 0.0,
+    "rebound_contest_mode": "global_contest",
+    "rebound_contest_radius": 1,
+    "rebound_obs_top_n_targets": 0,
     "offensive_rebound_shot_clock_reset": 14,
     "rebound_terminal_reward_mode": "actual_points",
 }
@@ -143,6 +149,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
     "rebound_skill_weight": "float",
+    "rebound_contest_mode": "str",
+    "rebound_contest_radius": "int",
+    "rebound_obs_top_n_targets": "int",
     "offensive_rebound_shot_clock_reset": "int",
     "rebound_terminal_reward_mode": "str",
 }
@@ -161,45 +170,106 @@ def _coerce_runtime_static_value(key: str, value: Any) -> Any:
     return value
 
 
+def _infer_attention_observation_dims(
+    current_dim: int,
+    *,
+    expected_dim: int,
+    token_count: int,
+    token_dim: int,
+    global_dim: int,
+) -> tuple[int, int] | None:
+    if token_count <= 0:
+        return None
+    max_token_dim = max(1, (int(current_dim) - 1) // int(token_count))
+    candidates: list[tuple[tuple[int, int, int], int, int]] = []
+    for current_token_dim in range(1, max_token_dim + 1):
+        current_global_dim = int(current_dim) - 1 - (int(token_count) * int(current_token_dim))
+        if current_global_dim < 0:
+            continue
+        if current_dim >= expected_dim:
+            if current_token_dim < token_dim or current_global_dim < global_dim:
+                continue
+            # Prefer interpreting extras as a small number of added globals, then
+            # added per-token fields. This handles 10*18+8+1 -> 10*17+7+1.
+            score = (current_global_dim - global_dim, current_token_dim - token_dim, -current_token_dim)
+        else:
+            if current_token_dim > token_dim or current_global_dim > global_dim:
+                continue
+            # When padding for older checkpoints, preserve as much current
+            # structure as possible.
+            score = (token_dim - current_token_dim, global_dim - current_global_dim, -current_token_dim)
+        candidates.append((score, current_token_dim, current_global_dim))
+    if not candidates:
+        return None
+    _score, current_token_dim, current_global_dim = min(candidates, key=lambda item: item[0])
+    return int(current_token_dim), int(current_global_dim)
+
+
+def _adapt_attention_observation_to_spec(flat_obs, spec, jnp):
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    token_count = int(spec.token_player_count)
+    token_dim = int(spec.token_dim)
+    global_dim = int(spec.global_dim)
+    dims = _infer_attention_observation_dims(
+        current_dim,
+        expected_dim=expected_dim,
+        token_count=token_count,
+        token_dim=token_dim,
+        global_dim=global_dim,
+    )
+    if dims is None:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+    current_token_dim, current_global_dim = dims
+    if current_token_dim <= 0 or current_global_dim < 0:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+
+    players = flat_obs[:, : token_count * current_token_dim].reshape(
+        flat_obs.shape[0], token_count, current_token_dim
+    )
+    if current_token_dim >= token_dim:
+        players = players[:, :, :token_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], token_count, token_dim - current_token_dim), dtype=flat_obs.dtype)
+        players = jnp.concatenate([players, pad], axis=-1)
+
+    global_start = token_count * current_token_dim
+    globals_vec = flat_obs[:, global_start : global_start + current_global_dim]
+    if current_global_dim >= global_dim:
+        globals_vec = globals_vec[:, :global_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], global_dim - current_global_dim), dtype=flat_obs.dtype)
+        globals_vec = jnp.concatenate([globals_vec, pad], axis=-1)
+
+    role_start = global_start + current_global_dim
+    role_flag = flat_obs[:, role_start : role_start + 1]
+    if role_flag.shape[-1] < 1:
+        role_flag = jnp.zeros((flat_obs.shape[0], 1), dtype=flat_obs.dtype)
+
+    return jnp.concatenate(
+        [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
+        axis=1,
+    ).astype(jnp.float32)
+
+
 def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, jnp):
     """Pack observations to the checkpoint's saved spec.
 
     Newer runtime code may expose extra features. Older checkpoints unpack the
     flat tensor by saved token/global dimensions, so passing the longer tensor
-    silently shifts globals/role flags. Trim only known additive feature tails.
+    silently shifts globals/role flags. Trim/pad additive attention features by
+    token/global group rather than blindly slicing the flat vector.
     """
     expected_dim = int(spec.flat_obs_dim)
     current_dim = int(flat_obs.shape[-1])
     if current_dim == expected_dim:
         return flat_obs
-    if current_dim < expected_dim:
-        raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
 
     if str(spec.model_type) == "attention":
-        token_count = int(spec.token_player_count)
-        token_dim = int(spec.token_dim)
-        global_dim = int(spec.global_dim)
-        trailing_dim = global_dim + 1
-        extra = current_dim - trailing_dim
-        if token_count <= 0 or extra % token_count != 0:
-            raise ValueError(
-                f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}."
-            )
-        current_token_dim = extra // token_count
-        if current_token_dim < token_dim:
-            raise ValueError(
-                f"Runtime token dim {current_token_dim} is smaller than checkpoint token dim {token_dim}."
-            )
-        players = flat_obs[:, : token_count * current_token_dim].reshape(
-            flat_obs.shape[0], token_count, current_token_dim
-        )[:, :, :token_dim]
-        global_start = token_count * current_token_dim
-        globals_vec = flat_obs[:, global_start : global_start + global_dim]
-        role_flag = flat_obs[:, global_start + global_dim : global_start + global_dim + 1]
-        return jnp.concatenate(
-            [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
-            axis=1,
-        ).astype(jnp.float32)
+        return _adapt_attention_observation_to_spec(flat_obs, spec, jnp)
+
+    if current_dim < expected_dim:
+        raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
 
     # Flat obs legacy compatibility for the rebound_skill feature, which was
     # inserted immediately before the 4 rebound globals, role flag, and offense
@@ -274,6 +344,12 @@ def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, 
             for key in _JAX_STATIC_ONLY_ENV_KEYS:
                 if key in source and source[key] not in (None, ""):
                     out[key] = _coerce_runtime_static_value(key, source[key])
+                    continue
+                if key == "rebound_contest_radius":
+                    for old_key in ("rebound_contest_initial_radius",):
+                        if old_key in source and source[old_key] not in (None, ""):
+                            out[key] = _coerce_runtime_static_value(key, source[old_key])
+                            break
     return out
 
 

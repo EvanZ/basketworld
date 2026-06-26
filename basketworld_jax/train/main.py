@@ -212,6 +212,9 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_weight",
+        "rebound_contest_mode",
+        "rebound_contest_radius",
+        "rebound_obs_top_n_targets",
         "offensive_rebound_shot_clock_reset",
         "rebound_terminal_reward_mode",
     }
@@ -310,6 +313,9 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
 )
@@ -688,6 +694,31 @@ def parse_args(argv=None):
         help="Resume train-loop state from a saved JAX checkpoint.",
     )
     parser.add_argument(
+        "--continue-artifact",
+        type=str,
+        default="",
+        help=(
+            "Optional checkpoint artifact path/name for --continue-run-id. "
+            "Defaults to the tagged/latest artifact, or the basename of "
+            "--resume-checkpoint when provided."
+        ),
+    )
+    parser.add_argument(
+        "--continue-opponent-pool-size",
+        type=int,
+        default=-1,
+        help=(
+            "Number of recent checkpoint artifacts from --continue-run-id to "
+            "seed into the opponent pool. -1 uses --opponent-pool-size; 0 disables seeding."
+        ),
+    )
+    parser.add_argument(
+        "--continue-cache-dir",
+        type=str,
+        default="artifacts/mlflow_checkpoints",
+        help="Persistent local cache directory for MLflow continuation checkpoint downloads.",
+    )
+    parser.add_argument(
         "--frozen-opponent-checkpoint",
         type=str,
         default="",
@@ -786,6 +817,25 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help="Skill-to-distance offset weight used in rebound winner logits.",
+    )
+    parser.add_argument(
+        "--rebound-contest-mode",
+        type=str,
+        default="global_contest",
+        choices=("global_contest", "local_contest"),
+        help="Rebound winner contest mode: global_contest uses all players; local_contest masks to players within rebound_contest_radius of the target.",
+    )
+    parser.add_argument(
+        "--rebound-contest-radius",
+        type=int,
+        default=1,
+        help="Fixed hex radius around the rebound target for local_contest eligibility.",
+    )
+    parser.add_argument(
+        "--rebound-obs-top-n-targets",
+        type=int,
+        default=0,
+        help="Observation-only top-N rebound target approximation. Zero keeps exact full-table observation features.",
     )
     parser.add_argument(
         "--offensive-rebound-shot-clock-reset",
@@ -932,6 +982,14 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-skill-std must be >= 0.")
     if float(getattr(args, "rebound_skill_weight", 0.0)) < 0.0:
         raise SystemExit("--rebound-skill-weight must be >= 0.")
+    rebound_contest_mode = str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest").strip().lower()
+    if rebound_contest_mode not in {"global_contest", "local_contest"}:
+        raise SystemExit("--rebound-contest-mode must be 'global_contest' or 'local_contest'.")
+    rebound_contest_radius = int(getattr(args, "rebound_contest_radius", 1))
+    if rebound_contest_radius < 0:
+        raise SystemExit("--rebound-contest-radius must be >= 0.")
+    if int(getattr(args, "rebound_obs_top_n_targets", 0)) < 0:
+        raise SystemExit("--rebound-obs-top-n-targets must be >= 0.")
     if int(getattr(args, "offensive_rebound_shot_clock_reset", 14)) < 1:
         raise SystemExit("--offensive-rebound-shot-clock-reset must be >= 1.")
     rebound_terminal_reward_mode = str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points")
@@ -1237,6 +1295,9 @@ def _checkpoint_trainer_config_from_args(
         "rebound_winner_temperature": float(getattr(args, "rebound_winner_temperature", 1.0)),
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
+        "rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
+        "rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
+        "rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
         "offensive_rebound_shot_clock_reset": int(
             getattr(args, "offensive_rebound_shot_clock_reset", 14)
         ),
@@ -1599,6 +1660,149 @@ def _resolve_mlflow_checkpoint_artifact(client, run_id: str, artifact_hint: str 
     return sorted(choices, key=_checkpoint_artifact_sort_key)[-1]
 
 
+def _continue_artifact_hint_from_args(args) -> str:
+    hint = str(getattr(args, "continue_artifact", "") or "").strip()
+    if hint:
+        return hint
+    resume_checkpoint = str(getattr(args, "resume_checkpoint", "") or "").strip()
+    if resume_checkpoint:
+        name = Path(resume_checkpoint).name
+        if _is_jax_checkpoint_artifact(name):
+            return f"models/{name}"
+    return ""
+
+
+def _numbered_mlflow_checkpoint_artifacts(client, run_id: str) -> list[str]:
+    artifacts = client.list_artifacts(run_id, "models")
+    choices = []
+    for item in artifacts:
+        path = str(item.path)
+        name = Path(path).name
+        if name.startswith("update_") or name.startswith("phase_a_update_"):
+            choices.append(path)
+    return sorted(choices, key=_checkpoint_artifact_sort_key)
+
+
+def _download_mlflow_checkpoint_artifact(
+    client,
+    *,
+    run_id: str,
+    artifact_path: str,
+    cache_dir: str,
+) -> Path:
+    cache_root = Path(cache_dir or "artifacts/mlflow_checkpoints").expanduser()
+    run_cache = cache_root / str(run_id)
+    run_cache.mkdir(parents=True, exist_ok=True)
+    return Path(client.download_artifacts(run_id, artifact_path, str(run_cache)))
+
+
+def _prepare_continuation_checkpoint(args) -> dict[str, Any] | None:
+    run_id = str(getattr(args, "continue_run_id", "") or "").strip()
+    if not run_id:
+        return None
+
+    import mlflow
+
+    setup_mlflow(verbose=False)
+    client = mlflow.tracking.MlflowClient()
+    artifact_path = _resolve_mlflow_checkpoint_artifact(
+        client,
+        run_id,
+        _continue_artifact_hint_from_args(args),
+    )
+    local_path = ""
+    if not str(getattr(args, "resume_checkpoint", "") or "").strip():
+        local_path = str(
+            _download_mlflow_checkpoint_artifact(
+                client,
+                run_id=run_id,
+                artifact_path=artifact_path,
+                cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
+            )
+        )
+    return {
+        "run_id": run_id,
+        "artifact_path": artifact_path,
+        "local_path": local_path,
+    }
+
+
+def _load_continuation_opponent_candidates(
+    args,
+    *,
+    jax,
+    spec: ActorCriticSpec,
+    resume_artifact_path: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    run_id = str(getattr(args, "continue_run_id", "") or "").strip()
+    if not run_id:
+        return [], None
+
+    seed_count = int(getattr(args, "continue_opponent_pool_size", -1))
+    if seed_count < 0:
+        seed_count = int(getattr(args, "opponent_pool_size", 10))
+    if seed_count <= 0:
+        return [], {
+            "run_id": run_id,
+            "seeded_count": 0,
+            "available_count": 0,
+            "artifacts": [],
+        }
+
+    import mlflow
+
+    setup_mlflow(verbose=False)
+    client = mlflow.tracking.MlflowClient()
+    boundary_artifact = _resolve_mlflow_checkpoint_artifact(
+        client,
+        run_id,
+        str(resume_artifact_path or "").strip() or _continue_artifact_hint_from_args(args),
+    )
+    choices = _numbered_mlflow_checkpoint_artifacts(client, run_id)
+    boundary_key = _checkpoint_artifact_sort_key(boundary_artifact)
+    eligible = [path for path in choices if _checkpoint_artifact_sort_key(path) <= boundary_key]
+    if not eligible and boundary_artifact in choices:
+        eligible = [boundary_artifact]
+    selected = eligible[-seed_count:]
+
+    candidates: list[dict[str, Any]] = []
+    expected_spec = asdict(spec)
+    for artifact_path in selected:
+        local_path = _download_mlflow_checkpoint_artifact(
+            client,
+            run_id=run_id,
+            artifact_path=artifact_path,
+            cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
+        )
+        payload = load_checkpoint(local_path)
+        if _normalize_policy_spec_dict(payload.get("policy_spec", {})) != expected_spec:
+            raise SystemExit(
+                f"Continuation opponent checkpoint {artifact_path!r} policy_spec does not match the current run."
+            )
+        candidates.append(
+            {
+                "params": jax.device_put(payload["params"]),
+                "info": {
+                    "source": "mlflow_continue",
+                    "run_id": run_id,
+                    "artifact_path": artifact_path,
+                    "checkpoint_path": str(local_path),
+                    "update_index": int(payload.get("update_index", 0)),
+                    "candidate_kind": "continued_pool",
+                },
+            }
+        )
+
+    return candidates, {
+        "run_id": run_id,
+        "boundary_artifact_path": boundary_artifact,
+        "seeded_count": int(len(candidates)),
+        "available_count": int(len(eligible)),
+        "requested_count": int(seed_count),
+        "artifacts": list(selected),
+    }
+
+
 def _load_frozen_opponent_payload(args) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     checkpoint_path = str(getattr(args, "frozen_opponent_checkpoint", "") or "").strip()
     run_id = str(getattr(args, "frozen_opponent_run_id", "") or "").strip()
@@ -1892,6 +2096,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/intent_selector_min_play_steps": int(getattr(args, "intent_selector_min_play_steps", 3)),
         "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "jax/rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
+        "jax/rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
+        "jax/rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
+        "jax/rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
         "jax/rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
         "jax/task_reward_scale_start": (
             ""
@@ -1922,6 +2129,10 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/checkpoint_schedule": str(getattr(args, "checkpoint_schedule", "fixed")),
         "jax/checkpoint_log_initial_updates": int(getattr(args, "checkpoint_log_initial_updates", 1)),
         "jax/checkpoint_log_ramp_updates": int(getattr(args, "checkpoint_log_ramp_updates", 0)),
+        "jax/continue_run_id": str(getattr(args, "continue_run_id", "") or ""),
+        "jax/continue_artifact": str(getattr(args, "continue_artifact", "") or ""),
+        "jax/continue_opponent_pool_size": int(getattr(args, "continue_opponent_pool_size", -1)),
+        "jax/continue_cache_dir": str(getattr(args, "continue_cache_dir", "") or ""),
         "jax/frozen_opponent_checkpoint": str(getattr(args, "frozen_opponent_checkpoint", "") or ""),
         "jax/frozen_opponent_run_id": str(getattr(args, "frozen_opponent_run_id", "") or ""),
         "jax/frozen_opponent_artifact": str(getattr(args, "frozen_opponent_artifact", "") or ""),
@@ -2929,6 +3140,11 @@ def run_training_loop(args) -> dict[str, Any]:
         initial_intent_disc_opt_state = None
     checkpoint_dir = str(args.checkpoint_dir).strip()
     resume_checkpoint = str(args.resume_checkpoint).strip()
+    continuation_checkpoint_info = _prepare_continuation_checkpoint(args)
+    if continuation_checkpoint_info is not None and not resume_checkpoint:
+        resume_checkpoint = str(continuation_checkpoint_info.get("local_path", "") or "").strip()
+    if continuation_checkpoint_info is not None and not resume_checkpoint:
+        raise SystemExit("--continue-run-id did not resolve a local resume checkpoint.")
     latest_checkpoint_path: str | None = None
     latest_checkpoint_artifact_path: str | None = None
     frozen_opponent_payload, frozen_opponent_info = _load_frozen_opponent_payload(args)
@@ -3057,6 +3273,47 @@ def run_training_loop(args) -> dict[str, Any]:
         train_history = []
         eval_trajectories = []
         last_metrics = None
+
+    continuation_pool_info = None
+    if str(getattr(args, "continue_run_id", "") or "").strip() and opponent_pool_enabled:
+        continuation_candidates, continuation_pool_info = _load_continuation_opponent_candidates(
+            args,
+            jax=jax,
+            spec=spec,
+            resume_artifact_path=(
+                str(continuation_checkpoint_info.get("artifact_path", "") or "")
+                if continuation_checkpoint_info is not None
+                else ""
+            ),
+        )
+        for candidate in continuation_candidates:
+            _add_opponent_candidate(
+                opponent_candidates,
+                params=candidate["params"],
+                info=dict(candidate["info"]),
+            )
+        if continuation_candidates:
+            if grouped_opponent_sampling_enabled:
+                grouped_opponent_params, active_opponent_info = _select_grouped_opponents_from_pool(
+                    opponent_candidates,
+                    args=args,
+                    rng=opponent_rng,
+                    jax=jax,
+                    jnp=jnp,
+                )
+                opponent_params = None
+            else:
+                opponent_params, active_opponent_info = _select_opponent_from_pool(
+                    opponent_candidates,
+                    args=args,
+                    rng=opponent_rng,
+                )
+                grouped_opponent_params = None
+            print(
+                "[continue] Seeded opponent pool with "
+                f"{len(continuation_candidates)} checkpoint(s) from MLflow run "
+                f"{continuation_pool_info.get('run_id') if continuation_pool_info else ''}."
+            )
 
     cumulative_episode_usage = _init_cumulative_episode_usage(last_metrics)
 
@@ -3584,6 +3841,19 @@ def run_training_loop(args) -> dict[str, Any]:
                                 defensive_lane_violations=eval_trace.defensive_lane_violations,
                             )
                         )
+                        eval_rebound_attempts = float(np.asarray(eval_trace.rebound_attempts, dtype=np.float32).sum())
+                        eval_offensive_rebounds = float(np.asarray(eval_trace.offensive_rebounds, dtype=np.float32).sum())
+                        eval_defensive_rebounds = float(np.asarray(eval_trace.defensive_rebounds, dtype=np.float32).sum())
+                        eval_rebound_global_contests = float(np.asarray(eval_trace.rebound_global_contests, dtype=np.float32).sum())
+                        eval_metrics.update({
+                            "rebound_attempts": int(eval_rebound_attempts),
+                            "offensive_rebounds": int(eval_offensive_rebounds),
+                            "defensive_rebounds": int(eval_defensive_rebounds),
+                            "offensive_rebound_rate": float(eval_offensive_rebounds / max(1.0, eval_rebound_attempts)),
+                            "defensive_rebound_rate": float(eval_defensive_rebounds / max(1.0, eval_rebound_attempts)),
+                            "rebound_global_contest_count": int(eval_rebound_global_contests),
+                            "rebound_global_contest_rate": float(eval_rebound_global_contests / max(1.0, eval_rebound_attempts)),
+                        })
                         eval_metrics.update(
                             summarize_shot_type_metrics(
                                 "all",
@@ -3820,6 +4090,8 @@ def run_training_loop(args) -> dict[str, Any]:
             "intent_sample_artifacts": intent_sample_artifacts,
             "active_opponent": active_opponent_info,
             "opponent_pool_size": len(opponent_candidates),
+            "continuation_checkpoint": continuation_checkpoint_info,
+            "continuation_opponent_pool": continuation_pool_info,
             "summary_artifact_path": TRAIN_LOOP_SUMMARY_ARTIFACT_PATH if mlflow is not None else None,
             "next_step": "run a longer learnability check and inspect eval trajectories for behavior changes",
         }

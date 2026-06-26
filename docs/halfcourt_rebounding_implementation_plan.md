@@ -72,14 +72,13 @@ P(winner=i) = softmax(score_i / winner_temperature)
   - [x] `expected_rebound_target_q`
   - [x] `expected_rebound_target_r`
   - [x] `target_entropy`
-  - [x] `orb_prob_if_current_shot_misses`
-- [x] Do not add `drb_prob_if_current_shot_misses`; it is exactly `1 - orb_prob_if_current_shot_misses`.
 - [x] Add rebound-derived per-player features to the JAX observation:
   - [x] `dist_to_expected_rebound_target`
-  - [x] `rebound_win_prob_if_current_shot_misses`
+  - [x] `rebound_skill`
+- [x] Remove `rebound_win_prob_if_current_shot_misses`, `orb_prob_if_current_shot_misses`, and `drb_prob_if_current_shot_misses` from policy observations.
 - [x] Gate these features to zero when rebounds are disabled, there is no valid ball holder, or the holder is not an offensive player.
 - [x] Compute features from the fitted target table before the random rebound target is sampled, so the model gets distributional context but not future outcome leakage.
-- [x] Update attention observation dimensions from `15` player features / `4` globals to `17` player features / `8` globals.
+- [x] Update attention observation dimensions from `15` player features / `4` globals to `17` player features / `7` globals.
 - [x] Update JAX train scaffold tests for the new observation dimensions.
 
 ## Offensive Rebound Continuation

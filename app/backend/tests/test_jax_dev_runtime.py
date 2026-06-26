@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from app.backend import state as backend_state
-from app.backend.jax_dev_runtime import JaxDevRuntime
+from app.backend.jax_dev_runtime import JaxDevRuntime, _adapt_policy_observation_to_spec
 from app.backend.routes import admin_routes
 from app.backend.routes import lifecycle_routes
 from app.backend.schemas import (
@@ -35,6 +35,38 @@ class _FakeSpec:
     attention_num_cls_tokens: int = 0
     num_intents: int = 8
     intent_selector_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class _FakeAttentionSpec:
+    model_type: str = "attention"
+    flat_obs_dim: int = (10 * 17) + 7 + 1
+    token_player_count: int = 10
+    token_dim: int = 17
+    global_dim: int = 7
+
+
+def test_jax_dev_runtime_adapts_attention_observation_with_extra_token_and_global_features():
+    spec = _FakeAttentionSpec()
+    current_token_dim = 18
+    current_global_dim = 8
+    token_count = int(spec.token_player_count)
+    current_dim = (token_count * current_token_dim) + current_global_dim + 1
+    flat = jnp.arange(current_dim, dtype=jnp.float32)[None, :]
+
+    adapted = np.asarray(_adapt_policy_observation_to_spec(flat, SimpleNamespace(), spec, jnp))
+
+    assert adapted.shape == (1, int(spec.flat_obs_dim))
+    current_players = np.asarray(flat[:, : token_count * current_token_dim]).reshape(1, token_count, current_token_dim)
+    expected_players = current_players[:, :, : int(spec.token_dim)].reshape(1, token_count * int(spec.token_dim))
+    np.testing.assert_allclose(adapted[:, : token_count * int(spec.token_dim)], expected_players)
+    adapted_global_start = token_count * int(spec.token_dim)
+    current_global_start = token_count * current_token_dim
+    np.testing.assert_allclose(
+        adapted[:, adapted_global_start : adapted_global_start + int(spec.global_dim)],
+        np.asarray(flat[:, current_global_start : current_global_start + int(spec.global_dim)]),
+    )
+    np.testing.assert_allclose(adapted[:, -1], np.asarray(flat[:, current_global_start + current_global_dim]))
 
 
 class _FakeRawJaxModel:

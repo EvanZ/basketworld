@@ -49,6 +49,9 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/start_template_prob": "1.0",
         "jax/env/rebound_skill_std": "0.75",
         "jax/env/rebound_skill_weight": "1.25",
+        "jax/env/rebound_contest_mode": "local_contest",
+        "jax/env/rebound_contest_radius": "1",
+        "jax/env/rebound_obs_top_n_targets": "3",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
@@ -86,6 +89,9 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["start_template_prob"] == 1.0
     assert merged["rebound_skill_std"] == 0.75
     assert merged["rebound_skill_weight"] == 1.25
+    assert merged["rebound_contest_mode"] == "local_contest"
+    assert merged["rebound_contest_radius"] == 1
+    assert merged["rebound_obs_top_n_targets"] == 3
 
 
 def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():
@@ -95,12 +101,18 @@ def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():
             "jax/rebound_skill_std": "0.5",
             "jax/rebound_skill_weight": "1.5",
             "jax/rebound_terminal_reward_mode": "last_shot_ep",
+            "jax/rebound_contest_mode": "local_contest",
+            "jax/rebound_contest_initial_radius": "2",
+            "jax/rebound_obs_top_n_targets": "2",
         },
     )
 
     assert merged["rebound_skill_std"] == 0.5
     assert merged["rebound_skill_weight"] == 1.5
     assert merged["rebound_terminal_reward_mode"] == "last_shot_ep"
+    assert merged["rebound_contest_mode"] == "local_contest"
+    assert merged["rebound_contest_radius"] == 2
+    assert merged["rebound_obs_top_n_targets"] == 2
 
 
 def test_overlay_jax_mlflow_training_params_exposes_selector_config():

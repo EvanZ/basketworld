@@ -2504,6 +2504,9 @@ def _set_pressure_params_impl(
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_weight",
+        "rebound_contest_mode",
+        "rebound_contest_radius",
+        "rebound_obs_top_n_targets",
     }
     scoped_param_keys = {
         "all": set(all_param_keys),
@@ -2547,6 +2550,9 @@ def _set_pressure_params_impl(
             "rebound_winner_temperature",
             "rebound_skill_std",
             "rebound_skill_weight",
+            "rebound_contest_mode",
+            "rebound_contest_radius",
+            "rebound_obs_top_n_targets",
         },
     }
     requested_scope = (
@@ -2669,6 +2675,18 @@ def _set_pressure_params_impl(
                 "rebound_skill_weight",
                 getattr(env, "rebound_skill_weight", 0.0),
             ),
+            "rebound_contest_mode": _default_value(
+                "rebound_contest_mode",
+                getattr(env, "rebound_contest_mode", "global_contest"),
+            ),
+            "rebound_contest_radius": _default_value(
+                "rebound_contest_radius",
+                getattr(env, "rebound_contest_radius", 1),
+            ),
+            "rebound_obs_top_n_targets": _default_value(
+                "rebound_obs_top_n_targets",
+                getattr(env, "rebound_obs_top_n_targets", 0),
+            ),
         }
         if active_scope:
             selected_keys = set(scoped_param_keys[active_scope])
@@ -2722,6 +2740,9 @@ def _set_pressure_params_impl(
             "rebound_winner_temperature": req.rebound_winner_temperature,
             "rebound_skill_std": req.rebound_skill_std,
             "rebound_skill_weight": req.rebound_skill_weight,
+            "rebound_contest_mode": req.rebound_contest_mode,
+            "rebound_contest_radius": req.rebound_contest_radius,
+            "rebound_obs_top_n_targets": req.rebound_obs_top_n_targets,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
         if active_scope and active_scope != "all":
@@ -2949,7 +2970,27 @@ def _set_pressure_params_impl(
             "rebound_skill_weight",
             0.0,
         )
-
+    if "rebound_contest_mode" in payload:
+        mode = str(payload["rebound_contest_mode"] or "global_contest").strip().lower().replace("-", "_")
+        if mode in {"global", "global_softmax"}:
+            mode = "global_contest"
+        elif mode in {"local", "local_contest"}:
+            mode = "local_contest"
+        else:
+            raise HTTPException(status_code=400, detail="rebound_contest_mode must be 'global_contest' or 'local_contest'.")
+        normalized["rebound_contest_mode"] = mode
+    if "rebound_contest_radius" in payload:
+        normalized["rebound_contest_radius"] = _validate_min(
+            _as_int(payload["rebound_contest_radius"], "rebound_contest_radius"),
+            "rebound_contest_radius",
+            0,
+        )
+    if "rebound_obs_top_n_targets" in payload:
+        normalized["rebound_obs_top_n_targets"] = _validate_min(
+            _as_int(payload["rebound_obs_top_n_targets"], "rebound_obs_top_n_targets"),
+            "rebound_obs_top_n_targets",
+            0,
+        )
     try:
         for key, val in normalized.items():
             setattr(env, key, val)

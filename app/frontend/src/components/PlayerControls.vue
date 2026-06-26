@@ -630,6 +630,8 @@ const pressureParamsInput = ref({
   rebound_winner_temperature: 1.0,
   rebound_skill_std: 0.0,
   rebound_skill_weight: 0.0,
+  rebound_contest_mode: 'global_contest',
+  rebound_contest_radius: 1,
   defender_pressure_distance: 1,
   defender_pressure_turnover_chance: 0.05,
   defender_pressure_decay_lambda: 1.0,
@@ -679,6 +681,8 @@ const REBOUND_PARAM_KEYS = [
   'rebound_winner_temperature',
   'rebound_skill_std',
   'rebound_skill_weight',
+  'rebound_contest_mode',
+  'rebound_contest_radius',
 ];
 
 const activePassInterceptionModel = computed(() =>
@@ -693,6 +697,10 @@ const envPassUsesLobAwareModel = computed(() => (
 const envPassUsesLineModel = computed(() => (
   activePassInterceptionModel.value === 'line' || envPassUsesLobAwareModel.value
 ));
+const activeReboundContestMode = computed(() =>
+  String(pressureParamsInput.value?.rebound_contest_mode || 'global_contest').trim().toLowerCase().replace('-', '_')
+);
+const reboundUsesLocalContest = computed(() => activeReboundContestMode.value === 'local_contest');
 
 function isPressureSectionUpdating(section) {
   return (
@@ -862,6 +870,8 @@ function syncPressureParamsInputs(state) {
     rebound_winner_temperature: Number(src.rebound_winner_temperature ?? reboundRuntime.winner_temperature ?? 1.0),
     rebound_skill_std: Number(src.rebound_skill_std ?? reboundRuntime.skill_std ?? 0.0),
     rebound_skill_weight: Number(src.rebound_skill_weight ?? reboundRuntime.skill_weight ?? 0.0),
+    rebound_contest_mode: String(src.rebound_contest_mode ?? reboundRuntime.contest_mode ?? 'global_contest'),
+    rebound_contest_radius: Math.round(Number(src.rebound_contest_radius ?? reboundRuntime.contest_radius ?? 1)),
     defender_pressure_distance: Number(src.defender_pressure_distance ?? 1),
     defender_pressure_turnover_chance: Number(src.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(src.defender_pressure_decay_lambda ?? 1.0),
@@ -915,10 +925,14 @@ watch(
     props.gameState?.rebound_winner_temperature,
     props.gameState?.rebound_skill_std,
     props.gameState?.rebound_skill_weight,
+    props.gameState?.rebound_contest_mode,
+    props.gameState?.rebound_contest_radius,
     props.gameState?.rebound_runtime?.winner_distance_weight,
     props.gameState?.rebound_runtime?.winner_temperature,
     props.gameState?.rebound_runtime?.skill_std,
     props.gameState?.rebound_runtime?.skill_weight,
+    props.gameState?.rebound_runtime?.contest_mode,
+    props.gameState?.rebound_runtime?.contest_radius,
     props.gameState?.defender_pressure_distance,
     props.gameState?.defender_pressure_turnover_chance,
     props.gameState?.defender_pressure_decay_lambda,
@@ -3595,6 +3609,8 @@ function _normalizePressurePayload(input) {
     rebound_winner_temperature: Number(input?.rebound_winner_temperature ?? 1.0),
     rebound_skill_std: Number(input?.rebound_skill_std ?? 0.0),
     rebound_skill_weight: Number(input?.rebound_skill_weight ?? 0.0),
+    rebound_contest_mode: String(input?.rebound_contest_mode || 'global_contest').trim().toLowerCase().replace('-', '_'),
+    rebound_contest_radius: Math.max(0, Math.round(Number(input?.rebound_contest_radius ?? 1))),
     defender_pressure_distance: Math.round(Number(input?.defender_pressure_distance ?? 1)),
     defender_pressure_turnover_chance: Number(input?.defender_pressure_turnover_chance ?? 0.05),
     defender_pressure_decay_lambda: Number(input?.defender_pressure_decay_lambda ?? 1.0),
@@ -3773,20 +3789,9 @@ async function applyReboundParameterOverrides() {
 }
 
 async function resetReboundParametersToMlflowDefaults() {
-  const payload = _buildSectionResetPayload(REBOUND_PARAM_KEYS);
-  if (Object.keys(payload).length > 0) {
-    await _submitPressureParams(
-      setReboundParams,
-      payload,
-      'Failed to reset rebound parameters',
-      REBOUND_PARAM_KEYS,
-      'rebound'
-    );
-    return;
-  }
   await _submitPressureParams(
     setReboundParams,
-    { reset_to_mlflow_defaults: true },
+    { reset_to_mlflow_defaults: true, reset_group: 'rebounding' },
     'Failed to reset rebound parameters',
     REBOUND_PARAM_KEYS,
     'rebound'
@@ -4091,6 +4096,31 @@ const reboundingRows = computed(() => {
       inputStep: 0.1,
       tooltip: 'Multiplier converting rebound skill into effective hex-distance offset in winner logits.',
     },
+    {
+      label: 'Contest mode',
+      value: valueFor('contest_mode', 'rebound_contest_mode') || 'global_contest',
+      inputKey: 'rebound_contest_mode',
+      inputType: 'select',
+      options: [
+        { value: 'global_contest', label: 'Global contest' },
+        { value: 'local_contest', label: 'Local contest' },
+      ],
+      tooltip: 'Winner sampling mode. Global contest uses all players; local contest masks to players within the configured target radius and falls back to global when nobody is close.',
+    },
+    ...(
+      reboundUsesLocalContest.value
+        ? [
+            {
+              label: 'Contest radius',
+              value: formatConfigValue(valueFor('contest_radius', 'rebound_contest_radius')),
+              inputKey: 'rebound_contest_radius',
+              inputMin: 0,
+              inputStep: 1,
+              tooltip: 'Fixed hex radius around the sampled rebound target. Players within this radius are eligible; if no players qualify, local contest falls back to global contest.',
+            },
+          ]
+        : []
+    ),
     {
       label: 'ORB clock reset',
       value: formatConfigValue(valueFor('offensive_rebound_shot_clock_reset', 'offensive_rebound_shot_clock_reset')),
@@ -6238,6 +6268,47 @@ function getDefenderPressureProbability(move, playerId) {
   return pressureInfo.total_pressure_prob;
 }
 
+function getShotResultInfo(move, playerId) {
+  const shots = move?.actionResults?.shots;
+  if (!shots || typeof shots !== 'object') return null;
+  const shot = shots[String(playerId)] ?? shots[Number(playerId)];
+  if (!shot || typeof shot !== 'object') return null;
+  const probability = Number(shot.probability ?? shot.shooter_fg_pct ?? shot.shot_probability_final);
+  if (!Number.isFinite(probability)) return null;
+  const shotType = shot.shot_type !== undefined ? Number(shot.shot_type) : null;
+  const isThree = shot.is_three === true || shot.is_three === 'true' || shotType === 3;
+  const isDunk = shotType === 1;
+  return {
+    probability,
+    label: isDunk ? 'DUNK' : (isThree ? '3PT' : '2PT'),
+    success: shot.success === true || shot.success === 'true' || shot.success === 1,
+  };
+}
+
+function getReboundContestProbability(move, playerId) {
+  const rebounds = Array.isArray(move?.actionResults?.rebounds)
+    ? move.actionResults.rebounds
+    : (move?.actionResults?.rebound ? [move.actionResults.rebound] : []);
+  const numericPlayerId = Number(playerId);
+  if (!Number.isFinite(numericPlayerId) || rebounds.length === 0) {
+    return null;
+  }
+  for (const rebound of rebounds) {
+    const rows = Array.isArray(rebound?.winner_probs) ? rebound.winner_probs : [];
+    const row = rows.find((candidate) => Number(candidate?.player_id) === numericPlayerId);
+    if (!row) continue;
+    const prob = Number(row.conditional_prob);
+    if (!Number.isFinite(prob) || prob <= 0) continue;
+    return {
+      prob,
+      eligible: row.eligible !== false && row.eligible !== 'false' && row.eligible !== 0,
+      contestMode: row.contest_mode || rebound.contest_mode || null,
+      fallbackGlobal: row.contest_fallback_global === true || row.contest_fallback_global === 'true',
+    };
+  }
+  return null;
+}
+
 function handleActionSelected(action) {
   if (props.disabled) return; // ignore clicks when disabled
   if (props.activePlayerId !== null) {
@@ -6974,7 +7045,6 @@ const tokenFeatureBaseLabels = [
 ];
 const tokenFeatureReboundLabels = [
   'dist_to_expected_rebound_target',
-  'rebound_win_prob_if_current_shot_misses',
   'rebound_skill',
 ];
 const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
@@ -8758,11 +8828,21 @@ function offenseSkillDeltaLabel(idx) {
                   <span v-if="move.mctsPlayers && move.mctsPlayers.includes(playerId)" class="mcts-icon" title="Selected via MCTS">🔍 </span>
                   {{ move.moves[`Player ${playerId}`] || 'NOOP' }}
                 </div>
+                <div v-if="getShotResultInfo(move, playerId)" class="shot-result-info">
+                  ({{ getShotResultInfo(move, playerId).label }} FG {{ (getShotResultInfo(move, playerId).probability * 100).toFixed(1) }}%)
+                </div>
                 <div v-if="getPassStealProbability(move, playerId) !== null" class="pass-steal-info">
                   ({{ (getPassStealProbability(move, playerId) * 100).toFixed(1) }}% steal risk)
                 </div>
                 <div v-if="getDefenderPressureProbability(move, playerId) !== null" class="defender-pressure-info">
                   ({{ (getDefenderPressureProbability(move, playerId) * 100).toFixed(1) }}% turnover risk)
+                </div>
+                <div
+                  v-if="getReboundContestProbability(move, playerId)"
+                  class="rebound-contest-prob-info"
+                  :title="`Rebound winner probability among qualified contesters${getReboundContestProbability(move, playerId).fallbackGlobal ? ' (global fallback)' : ''}`"
+                >
+                  ({{ (getReboundContestProbability(move, playerId).prob * 100).toFixed(1) }}% rebound)
                 </div>
               </td>
               <td class="value-cell">
@@ -9887,8 +9967,23 @@ function offenseSkillDeltaLabel(idx) {
               :data-tooltip="row.tooltip"
             >
               <span class="param-name">{{ row.label }}:</span>
+              <select
+                v-if="row.inputType === 'select'"
+                class="env-param-input"
+                :value="pressureParamsInput[row.inputKey]"
+                :disabled="pressureParamsUpdating"
+                @change="pressureParamsInput[row.inputKey] = $event.target.value"
+              >
+                <option
+                  v-for="option in row.options || []"
+                  :key="`${row.inputKey}-${option.value}`"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
               <input
-                v-if="row.inputKey"
+                v-else-if="row.inputKey"
                 class="env-param-input"
                 type="number"
                 :min="row.inputMin"
@@ -12372,6 +12467,22 @@ function offenseSkillDeltaLabel(idx) {
 
 .mcts-icon {
   color: var(--app-accent);
+}
+
+.shot-result-info {
+  margin-top: 0.15rem;
+  color: #7dd3fc;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(125, 211, 252, 0.35);
+}
+
+.rebound-contest-prob-info {
+  margin-top: 0.15rem;
+  color: #facc15;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(250, 204, 21, 0.35);
 }
 
 .pass-steal-info {

@@ -1495,6 +1495,35 @@ const reboundBallOutline = computed(() => {
   };
 });
 
+const localReboundContestEligiblePlayerIds = computed(() => {
+  if (!showReboundTargetOverlay.value || !hasReboundTargetOverlay.value) return new Set();
+  const rows = Array.isArray(props.reboundTargetOverlay?.winner_probs)
+    ? props.reboundTargetOverlay.winner_probs
+    : [];
+  const localRows = rows.filter((row) =>
+    String(row?.contest_mode || '').toLowerCase() === 'local_contest'
+  );
+  if (localRows.length === 0) return new Set();
+  const fellBackToGlobal = localRows.some((row) =>
+    row?.contest_fallback_global === true || row?.contest_fallback_global === 'true'
+  );
+  if (fellBackToGlobal) return new Set();
+
+  const ids = new Set();
+  for (const row of localRows) {
+    const eligible = row?.eligible === true || row?.eligible === 1 || row?.eligible === 'true';
+    if (!eligible) continue;
+    const playerId = Number(row?.player_id ?? row?.playerId);
+    if (Number.isFinite(playerId)) ids.add(playerId);
+  }
+  return ids;
+});
+
+function isLocalReboundContestEligiblePlayer(playerId) {
+  const numericId = Number(playerId);
+  return Number.isFinite(numericId) && localReboundContestEligiblePlayerIds.value.has(numericId);
+}
+
 // Action indicator configuration
 // Position angles for hex faces (pointy-top hex)
 // These are the angles from center to each hex face
@@ -4270,6 +4299,16 @@ onBeforeUnmount(() => {
             >
               <title>{{ formatShotPressureRingTitle(ballHandlerShotPressureRing) }}</title>
             </circle>
+            <circle
+              v-if="isLocalReboundContestEligiblePlayer(player.id) && draggedPlayerId !== player.id"
+              :cx="player.x"
+              :cy="player.y"
+              :r="HEX_RADIUS * 0.98"
+              class="rebound-contest-eligible-ring"
+              style="pointer-events: none;"
+            >
+              <title>Eligible for local rebound contest softmax</title>
+            </circle>
             <circle 
               :cx="draggedPlayerId === player.id ? draggedPlayerPos.x : player.x" 
               :cy="draggedPlayerId === player.id ? draggedPlayerPos.y : player.y" 
@@ -5601,6 +5640,15 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.rebound-contest-eligible-ring {
+  fill: rgba(163, 230, 53, 0.10);
+  stroke: #a3e635;
+  stroke-width: 2.1px;
+  stroke-dasharray: 3 4;
+  filter: drop-shadow(0 0 6px rgba(163, 230, 53, 0.88));
+  animation: rebound-contest-eligible-pulse 1.25s ease-in-out infinite;
+}
+
 .shot-prob-text {
   font-size: 1.5rem;
   font-weight: bold;
@@ -5623,8 +5671,10 @@ onBeforeUnmount(() => {
 .no-move-transitions .noop-prob-text,
 .no-move-transitions .ball-indicator,
 .no-move-transitions .shot-pressure-ring,
+.no-move-transitions .rebound-contest-eligible-ring,
 .no-move-transitions .action-indicator {
   transition: none !important;
+  animation: none !important;
 }
 
 .noop-prob-text {
@@ -5783,6 +5833,11 @@ onBeforeUnmount(() => {
 @keyframes rebound-winner-pulse {
   0%, 100% { opacity: 0.78; }
   50% { opacity: 1; }
+}
+
+@keyframes rebound-contest-eligible-pulse {
+  0%, 100% { opacity: 0.72; stroke-width: 1.8px; }
+  50% { opacity: 1; stroke-width: 2.8px; }
 }
 
 .shot-count-text {

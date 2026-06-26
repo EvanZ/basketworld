@@ -107,18 +107,22 @@ Global features:
 - `expected_rebound_target_q`
 - `expected_rebound_target_r`
 - `target_entropy`
-- `orb_prob_if_current_shot_misses`
 
 Per-player features:
 
 - `dist_to_expected_rebound_target`
-- `rebound_win_prob_if_current_shot_misses`
+- `rebound_skill`
 
-`drb_prob_if_current_shot_misses` is intentionally omitted because it is exactly
-`1 - orb_prob_if_current_shot_misses`. These features are zeroed when rebounds
-are disabled or when there is no valid offensive ball holder. They use the full
-target distribution, not the sampled future rebound target, so they provide
-learnable rebounding context without leaking the random outcome.
+`dist_to_expected_rebound_target` is the continuous hex distance from each
+player to the probability-weighted rebound target centroid. The older
+`rebound_win_prob_if_current_shot_misses` and
+`orb_prob_if_current_shot_misses` observation features were removed because
+they required computing winner probabilities inside the observation path and
+acted more like rebound-model oracle features than spatial context. These
+features are zeroed when rebounds are disabled or when there is no valid
+offensive ball holder. They use the target distribution, not the sampled future
+rebound target, so they provide learnable rebounding context without leaking the
+random outcome.
 
 The conditioned heatmap flow also works with the fitted table:
 

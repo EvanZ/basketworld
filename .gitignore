@@ -53,6 +53,7 @@ mlruns/
 models/
 mlruns/
 mlartifacts/
+artifacts/mlflow_checkpoints/
 .opponent_cache/
 checkpoints/phase_a_dev/*
 !basketworld_jax/models

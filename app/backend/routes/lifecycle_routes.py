@@ -80,8 +80,22 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
+}
+
+
+_REBOUND_RUNTIME_STICKY_ENV_KEYS = {
+    "rebound_winner_distance_weight",
+    "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
 }
 
 
@@ -204,6 +218,9 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "rebound_winner_temperature": float,
     "rebound_skill_std": float,
     "rebound_skill_weight": float,
+    "rebound_contest_mode": str,
+    "rebound_contest_radius": int,
+    "rebound_obs_top_n_targets": int,
     "offensive_rebound_shot_clock_reset": int,
     "rebound_terminal_reward_mode": str,
 }
@@ -226,7 +243,20 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
         names = (f"jax/env/{key}",)
         if key == "offensive_three_seconds":
             names = (f"jax/env/{key}", "jax/env/offensive_three_seconds_enabled")
-        elif key in {"rebound_skill_std", "rebound_skill_weight", "rebound_terminal_reward_mode"}:
+        elif key == "rebound_contest_radius":
+            names = (
+                "jax/env/rebound_contest_radius",
+                "jax/rebound_contest_radius",
+                "jax/env/rebound_contest_initial_radius",
+                "jax/rebound_contest_initial_radius",
+            )
+        elif key in {
+            "rebound_skill_std",
+            "rebound_skill_weight",
+            "rebound_contest_mode",
+            "rebound_obs_top_n_targets",
+            "rebound_terminal_reward_mode",
+        }:
             names = (f"jax/env/{key}", f"jax/{key}")
         for name in names:
             if name not in mlflow_params:
@@ -763,6 +793,15 @@ async def init_game(request: InitGameRequest):
     opponent_unified_policy_name = request.opponent_unified_policy_name
     if not run_id:
         raise HTTPException(status_code=400, detail="init_game requires run_id.")
+
+    previous_run_id = getattr(game_state, "run_id", None)
+    previous_unified_policy_key = getattr(game_state, "unified_policy_key", None)
+    previous_opponent_policy_key = getattr(game_state, "opponent_unified_policy_key", None)
+    previous_env_optional_params = copy.deepcopy(getattr(game_state, "env_optional_params", None) or {})
+    previous_runtime_env = getattr(getattr(game_state, "jax_runtime", None), "display_env", None)
+    if previous_runtime_env is None:
+        previous_runtime_env = getattr(game_state, "env", None)
+
     previous_start_template_library = copy.deepcopy(
         getattr(game_state, "mlflow_start_template_library", None)
     )
@@ -887,8 +926,24 @@ async def init_game(request: InitGameRequest):
         if request.dunk_pct is not None:
             optional_params["dunk_pct"] = request.dunk_pct
 
-        game_state.unified_policy_key = os.path.basename(unified_path)
-        game_state.opponent_unified_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        mlflow_default_env_optional_params = copy.deepcopy(optional_params)
+
+        target_unified_policy_key = os.path.basename(unified_path)
+        target_opponent_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        same_loaded_policy = (
+            str(previous_run_id or "") == run_id
+            and previous_unified_policy_key == target_unified_policy_key
+            and previous_opponent_policy_key == target_opponent_policy_key
+        )
+        if same_loaded_policy:
+            for key in _REBOUND_RUNTIME_STICKY_ENV_KEYS:
+                if previous_runtime_env is not None and hasattr(previous_runtime_env, key):
+                    optional_params[key] = copy.deepcopy(getattr(previous_runtime_env, key))
+                elif key in previous_env_optional_params:
+                    optional_params[key] = copy.deepcopy(previous_env_optional_params[key])
+
+        game_state.unified_policy_key = target_unified_policy_key
+        game_state.opponent_unified_policy_key = target_opponent_policy_key
         game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
         game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
         game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
@@ -969,8 +1024,12 @@ async def init_game(request: InitGameRequest):
         game_state.prev_obs = None
 
         game_state.env_required_params = copy.deepcopy(required_params)
-        game_state.env_optional_params = copy.deepcopy(env_optional_params)
-        game_state.mlflow_env_optional_defaults = copy.deepcopy(env_optional_params)
+        active_env_optional_params = copy.deepcopy(env_optional_params)
+        for key in _JAX_RUNTIME_STATIC_ENV_KEYS:
+            if key in optional_params:
+                active_env_optional_params[key] = copy.deepcopy(optional_params[key])
+        game_state.env_optional_params = active_env_optional_params
+        game_state.mlflow_env_optional_defaults = copy.deepcopy(mlflow_default_env_optional_params)
         game_state.unified_policy_path = unified_path
         game_state.opponent_policy_path = opponent_unified_path
 

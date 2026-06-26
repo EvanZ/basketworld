@@ -71,6 +71,7 @@ class TrajectoryBatch(NamedTuple):
     defensive_rebounds: Any
     rebound_target_cells: Any
     rebound_winners: Any
+    rebound_global_contests: Any
     shot_clock_reset_14: Any
     intent_index: Any
     intent_active: Any
@@ -164,6 +165,7 @@ class EvalTrace(NamedTuple):
     defensive_rebounds: Any
     rebound_target_cells: Any
     rebound_winners: Any
+    rebound_global_contests: Any
     shot_clock_reset_14: Any
     intent_index: Any
     intent_active: Any

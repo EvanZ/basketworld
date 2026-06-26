@@ -240,6 +240,9 @@ class SetPressureParamsRequest(BaseModel):
     rebound_winner_temperature: float | None = None
     rebound_skill_std: float | None = None
     rebound_skill_weight: float | None = None
+    rebound_contest_mode: str | None = None
+    rebound_contest_radius: int | None = None
+    rebound_obs_top_n_targets: int | None = None
 
 
 class PlayableStartRequest(BaseModel):
