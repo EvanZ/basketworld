@@ -71,6 +71,10 @@ const props = defineProps({
     type: Number,
     default: 1,
   },
+  reboundProgress: {
+    type: Number,
+    default: null,
+  },
   passAnimationStyle: {
     type: String,
     default: 'projectile',
@@ -770,6 +774,15 @@ function actionResultsHaveRebound(results) {
   return Boolean(Array.isArray(results.rebounds) && results.rebounds.length > 0);
 }
 
+function actionResultsHaveShotForPlayer(results, playerId) {
+  const shots = results?.shots;
+  if (!shots || typeof shots !== 'object') return false;
+  const pid = Number(playerId);
+  if (!Number.isFinite(pid)) return false;
+  return Object.prototype.hasOwnProperty.call(shots, String(pid))
+    || Object.prototype.hasOwnProperty.call(shots, pid);
+}
+
 const isLiveReboundStepOverlay = computed(() =>
   props.reboundTargetOverlay?.source === 'live_rebound_step'
 );
@@ -783,7 +796,10 @@ const shouldDelayLiveReboundOverlay = computed(() => (
 const reboundOverlayRevealProgress = computed(() => {
   if (!shouldDelayLiveReboundOverlay.value) return 1;
   if (props.disableTransitions) {
-    return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
+    const progress = props.reboundProgress === null || props.reboundProgress === undefined
+      ? props.moveProgress
+      : props.reboundProgress;
+    return Math.max(0, Math.min(1, Number(progress ?? 1)));
   }
   if (!shotFlash.value) return 1;
   return shotFlashProgress.value;
@@ -809,8 +825,12 @@ const reboundTargetCells = computed(() => {
         return null;
       }
       const count = Number(cell?.count ?? cell?.total ?? 0);
+      const chanceCount = Number(cell?.chance_count ?? cell?.chanceCount);
       const offensiveCount = Number(cell?.offensive_count ?? cell?.offensiveCount ?? 0);
       const orbPctRaw = Number(cell?.orb_pct ?? cell?.orbPct);
+      const reboundRateLabel = typeof cell?.rebound_rate_label === 'string'
+        ? cell.rebound_rate_label
+        : (typeof cell?.reboundRateLabel === 'string' ? cell.reboundRateLabel : '');
       return {
         key: `${q},${r}`,
         q,
@@ -818,8 +838,10 @@ const reboundTargetCells = computed(() => {
         index: Number.isFinite(index) ? index : null,
         prob,
         count: Number.isFinite(count) ? count : 0,
+        chanceCount: Number.isFinite(chanceCount) ? chanceCount : null,
         offensiveCount: Number.isFinite(offensiveCount) ? offensiveCount : 0,
         orbPct: Number.isFinite(orbPctRaw) ? orbPctRaw : null,
+        reboundRateLabel,
       };
     })
     .filter(Boolean);
@@ -932,10 +954,18 @@ function reboundTargetPctLabel(prob) {
 
 function reboundTargetCountLabel(pt) {
   const count = Number(pt?.count || 0);
-  return count > 0 ? `n=${Math.round(count)}` : "";
+  const chanceCount = Number(pt?.chanceCount);
+  if (count <= 0) return "";
+  if (Number.isFinite(chanceCount) && chanceCount > 0) {
+    return `n=${Math.round(count)}/${Math.round(chanceCount)}`;
+  }
+  return `n=${Math.round(count)}`;
 }
 
-function reboundTargetOrbLabel(pt) {
+function reboundTargetReboundRateLabel(pt) {
+  if (typeof pt?.reboundRateLabel === 'string' && pt.reboundRateLabel.trim()) {
+    return pt.reboundRateLabel.trim();
+  }
   if (pt?.orbPct === null || pt?.orbPct === undefined) return "";
   const pct = Number(pt.orbPct) * 100;
   if (!Number.isFinite(pct)) return "";
@@ -1563,6 +1593,10 @@ function getActionIndicator(playerId, playerX, playerY, hasBall) {
   const rawAction = props.selectedActions[playerId];
   const action = typeof rawAction === 'string' ? rawAction : null;
   if (!action || action === 'NOOP') return null;
+
+  if (action === 'SHOOT' && actionResultsHaveShotForPlayer(currentActionResults.value, playerId)) {
+    return null;
+  }
   
   const indicatorRadius = HEX_RADIUS * 0.55; // Distance from player center to indicator
 
@@ -4588,7 +4622,7 @@ onBeforeUnmount(() => {
           >
             <tspan :x="pt.x" dy="0">{{ reboundTargetPctLabel(pt.prob) }}</tspan>
             <tspan v-if="reboundTargetCountLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetCountLabel(pt) }}</tspan>
-            <tspan v-if="reboundTargetOrbLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetOrbLabel(pt) }}</tspan>
+            <tspan v-if="reboundTargetReboundRateLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetReboundRateLabel(pt) }}</tspan>
           </text>
         </g>
 

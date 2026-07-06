@@ -975,6 +975,9 @@ def get_full_game_state(
         "rebound_winner_distance_weight": float(getattr(env, "rebound_winner_distance_weight", 1.0)),
         "rebound_winner_temperature": float(getattr(env, "rebound_winner_temperature", 1.0)),
         "rebound_skill_std": float(getattr(env, "rebound_skill_std", 0.0)),
+        "rebound_skill_sampling_mode": str(getattr(env, "rebound_skill_sampling_mode", "gaussian") or "gaussian"),
+        "rebound_skill_high": float(getattr(env, "rebound_skill_high", 1.0)),
+        "rebound_skill_low": float(getattr(env, "rebound_skill_low", -0.25)),
         "rebound_skill_weight": float(getattr(env, "rebound_skill_weight", 0.0)),
         "spawn_distance": int(env.spawn_distance or 3),
         "max_spawn_distance": (

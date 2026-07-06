@@ -211,6 +211,9 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_winner_distance_weight",
         "rebound_winner_temperature",
         "rebound_skill_std",
+        "rebound_skill_sampling_mode",
+        "rebound_skill_high",
+        "rebound_skill_low",
         "rebound_skill_weight",
         "rebound_contest_mode",
         "rebound_contest_radius",
@@ -312,6 +315,9 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
     "rebound_skill_weight",
     "rebound_contest_mode",
     "rebound_contest_radius",
@@ -694,6 +700,22 @@ def parse_args(argv=None):
         help="Resume train-loop state from a saved JAX checkpoint.",
     )
     parser.add_argument(
+        "--resume-reset-env-state",
+        action="store_true",
+        help=(
+            "When resuming, restore model/optimizer/RNG/update state but reset transient "
+            "batched env rows. This is enabled automatically for --continue-run-id."
+        ),
+    )
+    parser.add_argument(
+        "--resume-reset-intent-discriminator-state",
+        action="store_true",
+        help=(
+            "When resuming, reset the auxiliary intent discriminator params, optimizer, "
+            "and bonus normalization stats. This is enabled automatically for --continue-run-id."
+        ),
+    )
+    parser.add_argument(
         "--continue-artifact",
         type=str,
         default="",
@@ -811,6 +833,25 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help="Standard deviation for per-player rebound skill sampled at episode reset.",
+    )
+    parser.add_argument(
+        "--rebound-skill-sampling-mode",
+        type=str,
+        default="gaussian",
+        choices=("gaussian", "one_high_per_team"),
+        help="How per-episode rebound skills are sampled. one_high_per_team picks one high-skill player per team and assigns low skill to teammates.",
+    )
+    parser.add_argument(
+        "--rebound-skill-high",
+        type=float,
+        default=1.0,
+        help="High rebound skill assigned to each team's specialist when rebound-skill-sampling-mode is one_high_per_team.",
+    )
+    parser.add_argument(
+        "--rebound-skill-low",
+        type=float,
+        default=-0.25,
+        help="Teammate rebound skill assigned when rebound-skill-sampling-mode is one_high_per_team.",
     )
     parser.add_argument(
         "--rebound-skill-weight",
@@ -980,6 +1021,9 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-winner-distance-weight must be >= 0.")
     if float(getattr(args, "rebound_skill_std", 0.0)) < 0.0:
         raise SystemExit("--rebound-skill-std must be >= 0.")
+    rebound_skill_sampling_mode = str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian").strip().lower()
+    if rebound_skill_sampling_mode not in {"gaussian", "one_high_per_team"}:
+        raise SystemExit("--rebound-skill-sampling-mode must be 'gaussian' or 'one_high_per_team'.")
     if float(getattr(args, "rebound_skill_weight", 0.0)) < 0.0:
         raise SystemExit("--rebound-skill-weight must be >= 0.")
     rebound_contest_mode = str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest").strip().lower()
@@ -1127,6 +1171,21 @@ def _jax_env_config_from_args(args) -> dict[str, Any]:
         for key in JAX_ENV_MLFLOW_PARAM_KEYS
         if hasattr(args, key)
     }
+
+
+_RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
+    "rebound_skill_sampling_mode": "gaussian",
+    "rebound_skill_high": 1.0,
+    "rebound_skill_low": -0.25,
+}
+
+
+def _compatible_env_config_for_resume(actual: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+    out = dict(actual or {})
+    for key in _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS:
+        if key not in out and key in expected:
+            out[key] = expected[key]
+    return out
 
 
 def build_trainer_config(args) -> TrainerConfig:
@@ -1294,6 +1353,9 @@ def _checkpoint_trainer_config_from_args(
         "rebound_winner_distance_weight": float(getattr(args, "rebound_winner_distance_weight", 1.0)),
         "rebound_winner_temperature": float(getattr(args, "rebound_winner_temperature", 1.0)),
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "rebound_skill_sampling_mode": str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian"),
+        "rebound_skill_high": float(getattr(args, "rebound_skill_high", 1.0)),
+        "rebound_skill_low": float(getattr(args, "rebound_skill_low", -0.25)),
         "rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
         "rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
         "rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
@@ -1456,8 +1518,14 @@ def _validate_resume_checkpoint_payload(
     }
     if dict(payload.get("frozen_config", {})) != expected_frozen:
         raise SystemExit("Resume checkpoint frozen_config does not match the current JAX run.")
-    if "env_config" in payload and dict(payload.get("env_config", {})) != _jax_env_config_from_args(args):
-        raise SystemExit("Resume checkpoint env_config does not match the current JAX run.")
+    if "env_config" in payload:
+        expected_env_config = _jax_env_config_from_args(args)
+        actual_env_config = _compatible_env_config_for_resume(
+            dict(payload.get("env_config", {})),
+            expected_env_config,
+        )
+        if actual_env_config != expected_env_config:
+            raise SystemExit("Resume checkpoint env_config does not match the current JAX run.")
     if bool(getattr(args, "intent_diversity_enabled", False)):
         if "intent_discriminator_state" not in payload:
             raise SystemExit("Resume checkpoint does not contain JAX intent discriminator state.")
@@ -2095,6 +2163,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         ),
         "jax/intent_selector_min_play_steps": int(getattr(args, "intent_selector_min_play_steps", 3)),
         "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "jax/rebound_skill_sampling_mode": str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian"),
+        "jax/rebound_skill_high": float(getattr(args, "rebound_skill_high", 1.0)),
+        "jax/rebound_skill_low": float(getattr(args, "rebound_skill_low", -0.25)),
         "jax/rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
         "jax/rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
         "jax/rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
@@ -2129,6 +2200,14 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/checkpoint_schedule": str(getattr(args, "checkpoint_schedule", "fixed")),
         "jax/checkpoint_log_initial_updates": int(getattr(args, "checkpoint_log_initial_updates", 1)),
         "jax/checkpoint_log_ramp_updates": int(getattr(args, "checkpoint_log_ramp_updates", 0)),
+        "jax/resume_reset_env_state": bool(
+            getattr(args, "resume_reset_env_state", False)
+            or str(getattr(args, "continue_run_id", "") or "").strip()
+        ),
+        "jax/resume_reset_intent_discriminator_state": bool(
+            getattr(args, "resume_reset_intent_discriminator_state", False)
+            or str(getattr(args, "continue_run_id", "") or "").strip()
+        ),
         "jax/continue_run_id": str(getattr(args, "continue_run_id", "") or ""),
         "jax/continue_artifact": str(getattr(args, "continue_artifact", "") or ""),
         "jax/continue_opponent_pool_size": int(getattr(args, "continue_opponent_pool_size", -1)),
@@ -3224,9 +3303,17 @@ def run_training_loop(args) -> dict[str, Any]:
             )
         else:
             selector_opt_state = None
+        reset_resume_intent_disc = bool(
+            getattr(args, "resume_reset_intent_discriminator_state", False)
+        ) or (continuation_checkpoint_info is not None)
         if intent_disc_enabled:
             restored_disc = dict(checkpoint_payload.get("intent_discriminator_state", {}) or {})
-            if restored_disc.get("params") is not None and restored_disc.get("opt_state") is not None:
+            if reset_resume_intent_disc:
+                intent_disc_params = initial_intent_disc_params
+                intent_disc_opt_state = initial_intent_disc_opt_state
+                intent_bonus_stats = init_bonus_stats()
+                print("[resume] Reset auxiliary intent discriminator state for continuation.")
+            elif restored_disc.get("params") is not None and restored_disc.get("opt_state") is not None:
                 intent_disc_params = jax.device_put(
                     _restore_like_template(restored_disc["params"], initial_intent_disc_params)
                 )
@@ -3242,23 +3329,35 @@ def run_training_loop(args) -> dict[str, Any]:
             intent_disc_params = None
             intent_disc_opt_state = None
             intent_bonus_stats = init_bonus_stats()
-        restored_current_state = checkpoint_payload["current_state"]
-        restored_eval_initial_state = checkpoint_payload["eval_initial_state"]
-        if not isinstance(restored_current_state, dict) or not isinstance(restored_eval_initial_state, dict):
-            raise SystemExit("Resume checkpoint does not contain mixed-role JAX train state.")
-        current_states = {
-            role: jax.device_put(
-                _restore_like_template(restored_current_state[role], current_states[role])
+        reset_resume_env_state = bool(getattr(args, "resume_reset_env_state", False)) or (
+            continuation_checkpoint_info is not None
+        )
+        if reset_resume_env_state:
+            print(
+                "[resume] Reset transient JAX env state and RNG; restored policy, "
+                f"optimizer, and update index from {resume_checkpoint}."
             )
-            for role in TRAINING_ROLES
-        }
-        eval_initial_states = {
-            role: jax.device_put(
-                _restore_like_template(restored_eval_initial_state[role], eval_initial_states[role])
-            )
-            for role in TRAINING_ROLES
-        }
-        base_key = jax.device_put(checkpoint_payload["base_key"])
+        else:
+            restored_current_state = checkpoint_payload["current_state"]
+            restored_eval_initial_state = checkpoint_payload["eval_initial_state"]
+            if not isinstance(restored_current_state, dict) or not isinstance(restored_eval_initial_state, dict):
+                raise SystemExit("Resume checkpoint does not contain mixed-role JAX train state.")
+            current_states = {
+                role: jax.device_put(
+                    _restore_like_template(restored_current_state[role], current_states[role])
+                )
+                for role in TRAINING_ROLES
+            }
+            eval_initial_states = {
+                role: jax.device_put(
+                    _restore_like_template(restored_eval_initial_state[role], eval_initial_states[role])
+                )
+                for role in TRAINING_ROLES
+            }
+        if reset_resume_env_state:
+            base_key = jax.device_put(jax.random.fold_in(base_key, completed_updates))
+        else:
+            base_key = jax.device_put(checkpoint_payload["base_key"])
         train_history = []
         eval_trajectories = list(checkpoint_payload.get("eval_trajectories", []))
         last_metrics = checkpoint_payload.get("last_metrics")
@@ -4058,6 +4157,14 @@ def run_training_loop(args) -> dict[str, Any]:
             "script": "basketworld_jax/train/main.py",
             "status": "train_loop",
             "resumed_from_checkpoint": resume_checkpoint or None,
+            "resume_reset_env_state": bool(
+                getattr(args, "resume_reset_env_state", False)
+                or continuation_checkpoint_info is not None
+            ),
+            "resume_reset_intent_discriminator_state": bool(
+                getattr(args, "resume_reset_intent_discriminator_state", False)
+                or continuation_checkpoint_info is not None
+            ),
             "trainer_config": _checkpoint_trainer_config_from_args(
                 trainer_config,
                 args,

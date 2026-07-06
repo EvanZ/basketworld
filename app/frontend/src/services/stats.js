@@ -80,6 +80,12 @@ export function getDefaultStats() {
       sampleCounts: {},
       argmaxCounts: {},
     },
+    reboundDiagnostics: {
+      globalContestRate: 0,
+      totalGlobalContests: 0,
+      eligibility: {},
+      resolvedParams: {},
+    },
   };
 }
 
@@ -172,6 +178,16 @@ export function loadStats() {
           : [],
         sampleCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.sampleCounts),
         argmaxCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.argmaxCounts),
+      },
+      reboundDiagnostics: {
+        globalContestRate: Number(parsed?.reboundDiagnostics?.globalContestRate) || 0,
+        totalGlobalContests: Number(parsed?.reboundDiagnostics?.totalGlobalContests) || 0,
+        eligibility: (parsed?.reboundDiagnostics?.eligibility && typeof parsed.reboundDiagnostics.eligibility === 'object')
+          ? { ...parsed.reboundDiagnostics.eligibility }
+          : {},
+        resolvedParams: (parsed?.reboundDiagnostics?.resolvedParams && typeof parsed.reboundDiagnostics.resolvedParams === 'object')
+          ? { ...parsed.reboundDiagnostics.resolvedParams }
+          : {},
       },
     };
   } catch (e) {

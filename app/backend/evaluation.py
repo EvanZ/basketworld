@@ -1964,15 +1964,22 @@ def pass_steal_preview(env, positions: list[tuple[int, int]], ball_holder: int):
             }
 
         steal_probs = base_env.calculate_pass_steal_probabilities(ball_holder)
+        _actions, policy_probs = _predict_policy_actions(
+            game_state.unified_policy,
+            dummy_obs,
+            base_env,
+            deterministic=False,
+            strategy=IllegalActionStrategy.SAMPLE_PROB,
+        )
+        serializable_policy_probs = None
+        if policy_probs is not None:
+            serializable_policy_probs = [
+                [float(x) for x in np.asarray(prob_vec, dtype=np.float32).reshape(-1)]
+                for prob_vec in policy_probs
+            ]
         return {
             "steal_probabilities": {int(k): float(v) for k, v in steal_probs.items()},
-            "policy_probabilities": _predict_policy_actions(
-                game_state.unified_policy,
-                dummy_obs,
-                base_env,
-                deterministic=False,
-                strategy=IllegalActionStrategy.SAMPLE_PROB,
-            )[1],
+            "policy_probabilities": serializable_policy_probs,
         }
     finally:
         base_env.positions = orig_positions

@@ -14,6 +14,7 @@ from basketworld_jax.env.minimal import (
     MOVE_ACTION_START,
     PASS_ACTION_END,
     PASS_ACTION_START,
+    REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
     TURNOVER_REASON_DEFENDER_PRESSURE,
@@ -116,6 +117,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
     "rebound_skill_weight",
     "rebound_contest_mode",
     "rebound_contest_radius",
@@ -132,6 +136,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_winner_distance_weight": 1.0,
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
+    "rebound_skill_sampling_mode": "gaussian",
+    "rebound_skill_high": 1.0,
+    "rebound_skill_low": -0.25,
     "rebound_skill_weight": 0.0,
     "rebound_contest_mode": "global_contest",
     "rebound_contest_radius": 1,
@@ -148,6 +155,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_winner_distance_weight": "float",
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
+    "rebound_skill_sampling_mode": "str",
+    "rebound_skill_high": "float",
+    "rebound_skill_low": "float",
     "rebound_skill_weight": "float",
     "rebound_contest_mode": "str",
     "rebound_contest_radius": "int",
@@ -271,16 +281,22 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, j
     if current_dim < expected_dim:
         raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
 
-    # Flat obs legacy compatibility for the rebound_skill feature, which was
-    # inserted immediately before the 4 rebound globals, role flag, and offense
-    # skill deltas.
+    # Flat obs legacy compatibility for additive per-player rebound features
+    # inserted immediately before rebound globals, role flag, and offense skill deltas.
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
     tail_dim = 4 + 1 + (3 * offense_count)
-    if current_dim - expected_dim == n_players and current_dim > (n_players + tail_dim):
-        remove_start = current_dim - tail_dim - n_players
+    extra_dim = current_dim - expected_dim
+    if (
+        n_players > 0
+        and extra_dim > 0
+        and extra_dim % n_players == 0
+        and extra_dim <= (2 * n_players)
+        and current_dim > (extra_dim + tail_dim)
+    ):
+        remove_start = current_dim - tail_dim - extra_dim
         return jnp.concatenate(
-            [flat_obs[:, :remove_start], flat_obs[:, remove_start + n_players :]],
+            [flat_obs[:, :remove_start], flat_obs[:, remove_start + extra_dim :]],
             axis=1,
         ).astype(jnp.float32)
 
@@ -317,10 +333,17 @@ def _apply_native_custom_setup(static, state, custom_setup: dict | None, batch_s
     if custom_setup.get("rebound_skills") is not None:
         rebound_values = np.asarray(custom_setup.get("rebound_skills"), dtype=np.float32).reshape(-1)
         if rebound_values.size == int(static.role_encoding.shape[0]):
-            updates["rebound_skill"] = jnp.asarray(
-                np.broadcast_to(rebound_values[None, :], (int(batch_size), rebound_values.size)),
-                dtype=jnp.float32,
-            )
+            broadcast_values = np.broadcast_to(rebound_values[None, :], (int(batch_size), rebound_values.size))
+            try:
+                skill_sampling_mode_id = int(np.asarray(static.rebound_skill_sampling_mode).reshape(-1)[0])
+            except Exception:
+                skill_sampling_mode_id = 0
+            if skill_sampling_mode_id == int(REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM):
+                specialist_values = (broadcast_values > 0.0).astype(np.float32)
+            else:
+                specialist_values = np.zeros_like(broadcast_values, dtype=np.float32)
+            updates["rebound_skill"] = jnp.asarray(broadcast_values, dtype=jnp.float32)
+            updates["rebound_skill_specialist"] = jnp.asarray(specialist_values, dtype=jnp.float32)
     return state._replace(**updates) if updates else state
 
 
@@ -826,7 +849,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "defensive_rebound": env_out.defensive_rebound.astype(jnp.int8),
                 "rebound_target_cell": env_out.rebound_target_cell.astype(jnp.int32),
                 "rebound_winner": env_out.rebound_winner.astype(jnp.int32),
+                "rebound_global_contest": env_out.rebound_global_contest.astype(jnp.int8),
                 "rebound_skill": policy_state.rebound_skill.astype(jnp.float32),
+                "rebound_skill_specialist": policy_state.rebound_skill_specialist.astype(jnp.float32),
                 "intent_index": policy_state.intent_index.astype(jnp.int32),
                 "intent_active": policy_state.intent_active.astype(jnp.int8),
                 "intent_age": policy_state.intent_age.astype(jnp.int32),
@@ -877,6 +902,7 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "rebound_attempts": np.asarray(trace["rebound_attempt"])[:, :take].sum(axis=0),
         "offensive_rebounds": np.asarray(trace["offensive_rebound"])[:, :take].sum(axis=0),
         "defensive_rebounds": np.asarray(trace["defensive_rebound"])[:, :take].sum(axis=0),
+        "rebound_global_contests": np.asarray(trace["rebound_global_contest"])[:, :take].sum(axis=0),
     }
 
 
@@ -907,6 +933,10 @@ def _init_player_stats(n_players: int) -> dict[int, dict[str, Any]]:
             "rebound_chances": 0,
             "rebound_target_distance_sum": 0.0,
             "rebound_target_distance_count": 0,
+            "rebound_win_probability_sum": 0.0,
+            "rebound_win_probability_count": 0,
+            "rebound_skill_sum": 0.0,
+            "rebound_skill_count": 0,
             "episodes": 0,
             "steps": 0,
             "shot_chart": {},
@@ -1183,6 +1213,7 @@ def _record_rebound_heatmap_event(
     offensive: bool,
     positions: np.ndarray,
     cell_coords: np.ndarray,
+    eligible_mask: np.ndarray | None = None,
 ) -> None:
     source_key = f"{int(shot_q)},{int(shot_r)}"
     bucket = rebound_accumulator.setdefault(
@@ -1193,11 +1224,22 @@ def _record_rebound_heatmap_event(
             "target_offensive": {},
             "rebounders": {},
             "rebounder_offensive": {},
+            "targets_by_player": {},
+            "target_offensive_by_player": {},
+            "rebounders_by_player": {},
+            "rebounder_offensive_by_player": {},
+            "target_chances_by_player": {},
+            "rebounder_chances_by_player": {},
         },
     )
     bucket["total"] = int(bucket.get("total", 0)) + 1
 
+    winner = int(winner_id)
+    winner_valid = 0 <= winner < int(positions.shape[0])
+    winner_player_key = str(winner)
+
     target_idx = int(target_cell)
+    target_key = None
     if 0 <= target_idx < int(cell_coords.shape[0]):
         target_coord = cell_coords[target_idx]
         target_key = f"{int(target_coord[0])},{int(target_coord[1])}"
@@ -1206,16 +1248,46 @@ def _record_rebound_heatmap_event(
         if bool(offensive):
             target_offensive = bucket.setdefault("target_offensive", {})
             target_offensive[target_key] = int(target_offensive.get(target_key, 0)) + 1
+        if winner_valid:
+            targets_by_player = bucket.setdefault("targets_by_player", {})
+            player_targets = targets_by_player.setdefault(winner_player_key, {})
+            player_targets[target_key] = int(player_targets.get(target_key, 0)) + 1
+            if bool(offensive):
+                target_offensive_by_player = bucket.setdefault("target_offensive_by_player", {})
+                player_target_offensive = target_offensive_by_player.setdefault(winner_player_key, {})
+                player_target_offensive[target_key] = int(player_target_offensive.get(target_key, 0)) + 1
 
-    winner = int(winner_id)
-    if 0 <= winner < int(positions.shape[0]):
+    if eligible_mask is not None:
+        eligible_arr = np.asarray(eligible_mask, dtype=bool).reshape(-1)
+        max_players = min(int(positions.shape[0]), int(eligible_arr.shape[0]))
+        target_chances_by_player = bucket.setdefault("target_chances_by_player", {})
+        rebounder_chances_by_player = bucket.setdefault("rebounder_chances_by_player", {})
+        for player_id in range(max_players):
+            if not bool(eligible_arr[player_id]):
+                continue
+            player_key = str(int(player_id))
+            if target_key is not None:
+                player_target_chances = target_chances_by_player.setdefault(player_key, {})
+                player_target_chances[target_key] = int(player_target_chances.get(target_key, 0)) + 1
+            player_pos = positions[player_id]
+            player_pos_key = f"{int(player_pos[0])},{int(player_pos[1])}"
+            player_rebounder_chances = rebounder_chances_by_player.setdefault(player_key, {})
+            player_rebounder_chances[player_pos_key] = int(player_rebounder_chances.get(player_pos_key, 0)) + 1
+
+    if winner_valid:
         winner_pos = positions[winner]
         winner_key = f"{int(winner_pos[0])},{int(winner_pos[1])}"
         rebounders = bucket.setdefault("rebounders", {})
         rebounders[winner_key] = int(rebounders.get(winner_key, 0)) + 1
+        rebounders_by_player = bucket.setdefault("rebounders_by_player", {})
+        player_rebounders = rebounders_by_player.setdefault(winner_player_key, {})
+        player_rebounders[winner_key] = int(player_rebounders.get(winner_key, 0)) + 1
         if bool(offensive):
             rebounder_offensive = bucket.setdefault("rebounder_offensive", {})
             rebounder_offensive[winner_key] = int(rebounder_offensive.get(winner_key, 0)) + 1
+            rebounder_offensive_by_player = bucket.setdefault("rebounder_offensive_by_player", {})
+            player_rebounder_offensive = rebounder_offensive_by_player.setdefault(winner_player_key, {})
+            player_rebounder_offensive[winner_key] = int(player_rebounder_offensive.get(winner_key, 0)) + 1
 
 
 def _record_shot_diagnostics(
@@ -1401,6 +1473,38 @@ def run_native_jax_evaluation(
     shot_accumulator: dict[str, list[int]] = {}
     rebound_accumulator: dict[str, Any] = {}
     cell_coords_np = np.asarray(jax.device_get(static.cell_coords), dtype=np.int32)
+    eval_rebound_contest_mode = str(
+        getattr(env, "rebound_contest_mode", "global_contest") or "global_contest"
+    ).strip().lower().replace("-", "_").replace(" ", "_")
+    if eval_rebound_contest_mode not in {"local_contest", "local"}:
+        eval_rebound_contest_mode = "global_contest"
+    else:
+        eval_rebound_contest_mode = "local_contest"
+    eval_rebound_contest_radius = max(0, int(getattr(env, "rebound_contest_radius", 1)))
+
+    def _static_float_for_eval(name: str, default: float) -> float:
+        try:
+            arr = np.asarray(jax.device_get(getattr(static, name)))
+            if arr.size == 0:
+                return float(default)
+            return float(arr.reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    eval_rebound_winner_distance_weight = max(
+        0.0,
+        _static_float_for_eval("rebound_winner_distance_weight", 1.0),
+    )
+    eval_rebound_winner_temperature = max(
+        1.0e-6,
+        _static_float_for_eval("rebound_winner_temperature", 1.0),
+    )
+    eval_rebound_skill_weight = max(
+        0.0,
+        _static_float_for_eval("rebound_skill_weight", 0.0),
+    )
+    offense_ids_np = np.asarray(offense_ids, dtype=np.int32)
+    defense_ids_np = np.asarray(defense_ids, dtype=np.int32)
     per_player_stats = _init_player_stats(n_players)
     per_intent_stats: dict[str, dict[str, Any]] = {}
     eval_diagnostics = _init_eval_diagnostics()
@@ -1417,6 +1521,7 @@ def run_native_jax_evaluation(
     all_rebound_attempts: list[float] = []
     all_offensive_rebounds: list[float] = []
     all_defensive_rebounds: list[float] = []
+    all_rebound_global_contests: list[float] = []
 
     start = perf_counter()
     completed_episodes = 0
@@ -1697,6 +1802,23 @@ def run_native_jax_evaluation(
                             "target_distance_sum_offense": 0.0,
                             "target_distance_sum_defense": 0.0,
                             "target_distance_count": 0,
+                            "eligibility": {
+                                "attempts": 0,
+                                "local_attempts": 0,
+                                "global_attempts": 0,
+                                "fallback_global_attempts": 0,
+                                "local_mixed_attempts": 0,
+                                "local_offense_only_attempts": 0,
+                                "local_defense_only_attempts": 0,
+                                "eligible_players_sum": 0,
+                                "eligible_offense_sum": 0,
+                                "eligible_defense_sum": 0,
+                                "eligible_skill_sum": 0.0,
+                                "eligible_offense_skill_sum": 0.0,
+                                "eligible_defense_skill_sum": 0.0,
+                                "offensive_rebounds": 0,
+                                "defensive_rebounds": 0,
+                            },
                         },
                     )
                     rebound_diag["attempts"] = int(rebound_diag.get("attempts", 0)) + 1
@@ -1706,6 +1828,9 @@ def run_native_jax_evaluation(
                     offense_target_distance = None
                     defense_target_distance = None
                     player_target_distances = None
+                    eligible_mask_for_chances = None
+                    winner_probabilities_for_chances = None
+                    rebound_skills_for_chances = None
                     target_idx = int(rebound_target_cell)
                     if 0 <= target_idx < int(cell_coords_np.shape[0]):
                         target_coord = cell_coords_np[target_idx]
@@ -1728,11 +1853,127 @@ def run_native_jax_evaluation(
                             rebound_diag.get("target_distance_sum_defense", 0.0) or 0.0
                         ) + float(defense_target_distance)
                         rebound_diag["target_distance_count"] = int(rebound_diag.get("target_distance_count", 0) or 0) + 1
+                    if player_target_distances is not None:
+                        eligibility_diag = rebound_diag.setdefault("eligibility", {})
+                        eligibility_diag["attempts"] = int(eligibility_diag.get("attempts", 0) or 0) + 1
+                        local_candidate_mask = player_target_distances <= float(eval_rebound_contest_radius)
+                        local_found = bool(np.any(local_candidate_mask))
+                        use_local_contest = eval_rebound_contest_mode == "local_contest" and local_found
+                        if use_local_contest:
+                            eligible_mask = np.asarray(local_candidate_mask, dtype=bool)
+                            eligibility_diag["local_attempts"] = int(eligibility_diag.get("local_attempts", 0) or 0) + 1
+                        else:
+                            eligible_mask = np.ones((n_players,), dtype=bool)
+                            eligibility_diag["global_attempts"] = int(eligibility_diag.get("global_attempts", 0) or 0) + 1
+                            if eval_rebound_contest_mode == "local_contest":
+                                eligibility_diag["fallback_global_attempts"] = int(
+                                    eligibility_diag.get("fallback_global_attempts", 0) or 0
+                                ) + 1
+                        offense_eligible = int(np.sum(eligible_mask[offense_ids_np])) if offense_ids_np.size else 0
+                        defense_eligible = int(np.sum(eligible_mask[defense_ids_np])) if defense_ids_np.size else 0
+                        rebound_skills = np.asarray(trace["rebound_skill"][t, idx], dtype=np.float32)
+                        rebound_skills_for_chances = rebound_skills
+                        eligible_skill_sum = float(np.sum(rebound_skills[eligible_mask])) if rebound_skills.size else 0.0
+                        eligible_offense_skill_sum = (
+                            float(np.sum(rebound_skills[offense_ids_np][eligible_mask[offense_ids_np]]))
+                            if rebound_skills.size and offense_ids_np.size
+                            else 0.0
+                        )
+                        eligible_defense_skill_sum = (
+                            float(np.sum(rebound_skills[defense_ids_np][eligible_mask[defense_ids_np]]))
+                            if rebound_skills.size and defense_ids_np.size
+                            else 0.0
+                        )
+                        eligibility_diag["eligible_players_sum"] = int(
+                            eligibility_diag.get("eligible_players_sum", 0) or 0
+                        ) + int(np.sum(eligible_mask))
+                        eligibility_diag["eligible_offense_sum"] = int(
+                            eligibility_diag.get("eligible_offense_sum", 0) or 0
+                        ) + offense_eligible
+                        eligibility_diag["eligible_defense_sum"] = int(
+                            eligibility_diag.get("eligible_defense_sum", 0) or 0
+                        ) + defense_eligible
+                        eligibility_diag["eligible_skill_sum"] = float(
+                            eligibility_diag.get("eligible_skill_sum", 0.0) or 0.0
+                        ) + eligible_skill_sum
+                        eligibility_diag["eligible_offense_skill_sum"] = float(
+                            eligibility_diag.get("eligible_offense_skill_sum", 0.0) or 0.0
+                        ) + eligible_offense_skill_sum
+                        eligibility_diag["eligible_defense_skill_sum"] = float(
+                            eligibility_diag.get("eligible_defense_skill_sum", 0.0) or 0.0
+                        ) + eligible_defense_skill_sum
+                        eligibility_diag["offensive_rebounds"] = int(
+                            eligibility_diag.get("offensive_rebounds", 0) or 0
+                        ) + int(rebound_offensive)
+                        eligibility_diag["defensive_rebounds"] = int(
+                            eligibility_diag.get("defensive_rebounds", 0) or 0
+                        ) + int(rebound_defensive)
+                        eligible_mask_for_chances = eligible_mask
+                        if rebound_skills.size and np.any(eligible_mask):
+                            effective_distances = (
+                                player_target_distances.astype(np.float32)
+                                - (eval_rebound_skill_weight * rebound_skills.astype(np.float32))
+                            )
+                            logits = (
+                                -eval_rebound_winner_distance_weight * effective_distances
+                            ) / eval_rebound_winner_temperature
+                            eligible_logits = logits[eligible_mask]
+                            eligible_logits = eligible_logits - float(np.max(eligible_logits))
+                            eligible_exp = np.exp(eligible_logits)
+                            denom = float(np.sum(eligible_exp))
+                            winner_probs = np.zeros((n_players,), dtype=np.float32)
+                            if denom > 0.0 and np.isfinite(denom):
+                                winner_probs[eligible_mask] = eligible_exp / denom
+                            winner_probabilities_for_chances = winner_probs
+                        if use_local_contest:
+                            if offense_eligible > 0 and defense_eligible > 0:
+                                eligibility_diag["local_mixed_attempts"] = int(
+                                    eligibility_diag.get("local_mixed_attempts", 0) or 0
+                                ) + 1
+                            elif offense_eligible > 0:
+                                eligibility_diag["local_offense_only_attempts"] = int(
+                                    eligibility_diag.get("local_offense_only_attempts", 0) or 0
+                                ) + 1
+                            elif defense_eligible > 0:
+                                eligibility_diag["local_defense_only_attempts"] = int(
+                                    eligibility_diag.get("local_defense_only_attempts", 0) or 0
+                                ) + 1
                     for stats_target in (per_player_stats, episode_player_stats):
                         for pid in range(n_players):
                             if pid in stats_target:
-                                stats_target[pid]["rebound_chances"] = int(stats_target[pid].get("rebound_chances", 0)) + 1
-                                if player_target_distances is not None and pid < int(player_target_distances.shape[0]):
+                                if (
+                                    eligible_mask_for_chances is not None
+                                    and pid < int(eligible_mask_for_chances.shape[0])
+                                    and bool(eligible_mask_for_chances[pid])
+                                ):
+                                    stats_target[pid]["rebound_chances"] = int(stats_target[pid].get("rebound_chances", 0)) + 1
+                                    if (
+                                        winner_probabilities_for_chances is not None
+                                        and pid < int(winner_probabilities_for_chances.shape[0])
+                                    ):
+                                        stats_target[pid]["rebound_win_probability_sum"] = float(
+                                            stats_target[pid].get("rebound_win_probability_sum", 0.0) or 0.0
+                                        ) + float(winner_probabilities_for_chances[pid])
+                                        stats_target[pid]["rebound_win_probability_count"] = int(
+                                            stats_target[pid].get("rebound_win_probability_count", 0) or 0
+                                        ) + 1
+                                    if (
+                                        rebound_skills_for_chances is not None
+                                        and pid < int(rebound_skills_for_chances.shape[0])
+                                    ):
+                                        stats_target[pid]["rebound_skill_sum"] = float(
+                                            stats_target[pid].get("rebound_skill_sum", 0.0) or 0.0
+                                        ) + float(rebound_skills_for_chances[pid])
+                                        stats_target[pid]["rebound_skill_count"] = int(
+                                            stats_target[pid].get("rebound_skill_count", 0) or 0
+                                        ) + 1
+                                if (
+                                    player_target_distances is not None
+                                    and eligible_mask_for_chances is not None
+                                    and pid < int(player_target_distances.shape[0])
+                                    and pid < int(eligible_mask_for_chances.shape[0])
+                                    and bool(eligible_mask_for_chances[pid])
+                                ):
                                     stats_target[pid]["rebound_target_distance_sum"] = float(
                                         stats_target[pid].get("rebound_target_distance_sum", 0.0) or 0.0
                                     ) + float(player_target_distances[pid])
@@ -1762,6 +2003,7 @@ def run_native_jax_evaluation(
                         offensive=rebound_offensive,
                         positions=rebound_positions,
                         cell_coords=cell_coords_np,
+                        eligible_mask=eligible_mask_for_chances,
                     )
                     rebounds_payload.append(
                         {
@@ -1873,6 +2115,7 @@ def run_native_jax_evaluation(
         all_rebound_attempts.extend([float(v) for v in stats["rebound_attempts"].tolist()])
         all_offensive_rebounds.extend([float(v) for v in stats["offensive_rebounds"].tolist()])
         all_defensive_rebounds.extend([float(v) for v in stats["defensive_rebounds"].tolist()])
+        all_rebound_global_contests.extend([float(v) for v in stats["rebound_global_contests"].tolist()])
         completed_episodes += take
         if progress_callback is not None:
             progress_callback(completed_episodes, int(num_episodes))
@@ -1922,7 +2165,62 @@ def run_native_jax_evaluation(
     selector_diag["episode_start_mean_raw_probs"] = selector_start_mean_raw_probs
     selector_diag["episode_start_mean_raw_max_prob"] = float(selector_start_mean_raw_max_prob)
     rebound_diag_final = eval_diagnostics.get("rebounds") or {}
+    rebound_eligibility = dict(rebound_diag_final.get("eligibility", {}) or {})
     rebound_target_distance_count = int(rebound_diag_final.get("target_distance_count", 0) or 0)
+    total_rebound_attempts = _sum(all_rebound_attempts)
+    total_rebound_global_contests = _sum(all_rebound_global_contests)
+
+    def _static_scalar(name: str, default: Any) -> Any:
+        try:
+            arr = np.asarray(jax.device_get(getattr(static, name)))
+            if arr.size == 0:
+                return default
+            return arr.reshape(-1)[0].item()
+        except Exception:
+            return default
+
+    resolved_rebound_contest_mode_id = int(_static_scalar("rebound_contest_mode", 0))
+    resolved_rebound_skill_sampling_mode_id = int(_static_scalar("rebound_skill_sampling_mode", 0))
+    custom_rebound_skill_values: list[float] = []
+    if custom_setup and custom_setup.get("rebound_skills") is not None:
+        try:
+            custom_rebound_skill_values = [
+                float(v)
+                for v in np.asarray(custom_setup.get("rebound_skills"), dtype=np.float32).reshape(-1).tolist()
+            ]
+        except Exception:
+            custom_rebound_skill_values = []
+    static_offense_ids = np.asarray(jax.device_get(static.offense_ids), dtype=np.int32).reshape(-1)
+    static_defense_ids = np.asarray(jax.device_get(static.defense_ids), dtype=np.int32).reshape(-1)
+    static_role_encoding = np.asarray(jax.device_get(static.role_encoding), dtype=np.float32).reshape(-1)
+    resolved_rebound_params = {
+        "enable_rebounds": bool(int(_static_scalar("enable_rebounds", 0))),
+        "offense_player_count": int(static_offense_ids.size),
+        "defense_player_count": int(static_defense_ids.size),
+        "positive_role_count": int((static_role_encoding > 0.0).sum()),
+        "negative_role_count": int((static_role_encoding < 0.0).sum()),
+        "rebound_target_temperature": float(_static_scalar("rebound_target_temperature", 1.0)),
+        "rebound_target_uniform_mix": float(_static_scalar("rebound_target_uniform_mix", 0.0)),
+        "rebound_winner_distance_weight": float(_static_scalar("rebound_winner_distance_weight", 1.0)),
+        "rebound_winner_temperature": float(_static_scalar("rebound_winner_temperature", 1.0)),
+        "rebound_skill_std": float(_static_scalar("rebound_skill_std", 0.0)),
+        "rebound_skill_sampling_mode": (
+            "one_high_per_team"
+            if resolved_rebound_skill_sampling_mode_id == REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM
+            else "gaussian"
+        ),
+        "rebound_skill_sampling_mode_id": int(resolved_rebound_skill_sampling_mode_id),
+        "rebound_skill_high": float(_static_scalar("rebound_skill_high", 1.0)),
+        "rebound_skill_low": float(_static_scalar("rebound_skill_low", -0.25)),
+        "rebound_skill_weight": float(_static_scalar("rebound_skill_weight", 0.0)),
+        "custom_rebound_skills_applied": bool(custom_rebound_skill_values),
+        "custom_rebound_skill_values": custom_rebound_skill_values,
+        "custom_rebound_skill_positive_count": int(sum(1 for value in custom_rebound_skill_values if value > 0.0)),
+        "custom_rebound_skill_sum": float(sum(custom_rebound_skill_values)) if custom_rebound_skill_values else 0.0,
+        "rebound_contest_mode": "local_contest" if resolved_rebound_contest_mode_id == 1 else "global_contest",
+        "rebound_contest_mode_id": int(resolved_rebound_contest_mode_id),
+        "rebound_contest_radius": int(_static_scalar("rebound_contest_radius", 1)),
+    }
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -1951,9 +2249,15 @@ def run_native_jax_evaluation(
         "defensive_rebounds_per_episode": _mean(all_defensive_rebounds),
         "total_offense_points": _sum(all_offense_points),
         "total_defense_points": _sum(all_defense_points),
-        "total_rebound_attempts": int(_sum(all_rebound_attempts)),
+        "total_rebound_attempts": int(total_rebound_attempts),
         "total_offensive_rebounds": int(_sum(all_offensive_rebounds)),
         "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
+        "total_rebound_global_contests": int(total_rebound_global_contests),
+        "rebound_global_contest_rate": (
+            float(total_rebound_global_contests / total_rebound_attempts) if total_rebound_attempts > 0 else 0.0
+        ),
+        "rebound_eligibility": rebound_eligibility,
+        "resolved_rebound_params": resolved_rebound_params,
         "rebound_target_distance_count": rebound_target_distance_count,
         "avg_offense_rebound_target_distance": (
             float(rebound_diag_final.get("target_distance_sum_offense", 0.0) or 0.0) / rebound_target_distance_count

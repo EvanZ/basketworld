@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from basketworld_jax.env.minimal import (
     REBOUND_CONTEST_MODE_LOCAL,
+    REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     TOKEN_OBS_GLOBAL_DIM,
     TOKEN_OBS_PLAYER_DIM,
     _local_rebound_contest_mask_from_distances,
@@ -16,6 +17,7 @@ from basketworld_jax.env.minimal import (
     sample_state_batch,
 )
 from basketworld_jax.train.main import parse_args
+from basketworld_jax.eval.native import _apply_native_custom_setup
 
 
 def _sample_static_state(extra_args=None):
@@ -42,13 +44,14 @@ def test_rebound_skill_reset_defaults_to_zero_and_obs_slots_exist():
     state = reset_batch_minimal(static, jnp.asarray(jax.random.split(jax.random.PRNGKey(0), 2)), jax, jnp)
 
     assert np.allclose(np.asarray(state.rebound_skill), 0.0)
+    assert np.allclose(np.asarray(state.rebound_skill_specialist), 0.0)
     players, globals_vec, role = build_token_observation_components_batch(
         static,
         state,
         static.training_role_flag,
         jnp,
     )
-    assert players.shape[-1] == TOKEN_OBS_PLAYER_DIM == 17
+    assert players.shape[-1] == TOKEN_OBS_PLAYER_DIM == 18
     assert globals_vec.shape[-1] == TOKEN_OBS_GLOBAL_DIM == 7
 
 
@@ -57,6 +60,56 @@ def test_rebound_skill_std_samples_nonzero_values():
     state = reset_batch_minimal(static, jnp.asarray(jax.random.split(jax.random.PRNGKey(1), 8)), jax, jnp)
 
     assert not np.allclose(np.asarray(state.rebound_skill), 0.0)
+    assert np.allclose(np.asarray(state.rebound_skill_specialist), 0.0)
+
+
+def test_one_high_per_team_rebound_skill_sampling_disables_gaussian_noise():
+    static, _ = _sample_static_state([
+        "--rebound-skill-std",
+        "99.0",
+        "--rebound-skill-sampling-mode",
+        "one_high_per_team",
+        "--rebound-skill-high",
+        "1.0",
+        "--rebound-skill-low",
+        "-0.25",
+    ])
+    state = reset_batch_minimal(static, jnp.asarray(jax.random.split(jax.random.PRNGKey(7), 16)), jax, jnp)
+
+    skills = np.asarray(state.rebound_skill)
+    specialists = np.asarray(state.rebound_skill_specialist)
+    offense_ids = np.asarray(static.offense_ids, dtype=np.int32)
+    defense_ids = np.asarray(static.defense_ids, dtype=np.int32)
+    for row_skills, row_specialists in zip(skills, specialists):
+        assert np.count_nonzero(np.isclose(row_skills[offense_ids], 1.0)) == 1
+        assert np.count_nonzero(np.isclose(row_skills[defense_ids], 1.0)) == 1
+        assert np.count_nonzero(np.isclose(row_specialists[offense_ids], 1.0)) == 1
+        assert np.count_nonzero(np.isclose(row_specialists[defense_ids], 1.0)) == 1
+        assert np.allclose(row_skills[row_specialists == 0.0], -0.25)
+
+
+
+def test_custom_eval_rebound_specialist_respects_sampling_mode():
+    static, _ = _sample_static_state()
+    keys = jnp.asarray(jax.random.split(jax.random.PRNGKey(17), 2))
+    state = reset_batch_minimal(static, keys, jax, jnp)
+    batch_size = int(state.rebound_skill.shape[0])
+    n_players = int(static.role_encoding.shape[0])
+    values = np.linspace(-0.5, 1.0, n_players, dtype=np.float32)
+    custom_setup = {"rebound_skills": values.tolist()}
+
+    gaussian_state = _apply_native_custom_setup(static, state, custom_setup, batch_size, jnp)
+    assert np.asarray(gaussian_state.rebound_skill)[0].tolist() == pytest.approx(values.tolist())
+    assert np.allclose(np.asarray(gaussian_state.rebound_skill_specialist), 0.0)
+
+    one_high_static = static._replace(
+        rebound_skill_sampling_mode=jnp.asarray(REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM, dtype=jnp.int32),
+    )
+    one_high_state = _apply_native_custom_setup(one_high_static, state, custom_setup, batch_size, jnp)
+    assert np.asarray(one_high_state.rebound_skill)[0].tolist() == pytest.approx(values.tolist())
+    assert np.asarray(one_high_state.rebound_skill_specialist)[0].tolist() == pytest.approx(
+        (values > 0.0).astype(np.float32).tolist()
+    )
 
 
 def test_rebound_features_emit_centroid_and_player_distance_to_centroid():
@@ -96,11 +149,15 @@ def test_rebound_features_emit_centroid_and_player_distance_to_centroid():
     assert distances[0] == pytest.approx(float(distance_matrix[holder_idx, target_idx]) / norm_den, abs=1.0e-6)
 
 
-def test_rebound_skill_is_last_token_player_feature():
+def test_rebound_skill_and_specialist_are_last_token_player_features():
     static, state = _sample_static_state()
     n_players = int(static.role_encoding.shape[0])
     skills = np.linspace(-1.0, 1.0, n_players, dtype=np.float32)
-    state = state._replace(rebound_skill=jnp.asarray([skills], dtype=jnp.float32))
+    specialists = (skills > 0.0).astype(np.float32)
+    state = state._replace(
+        rebound_skill=jnp.asarray([skills], dtype=jnp.float32),
+        rebound_skill_specialist=jnp.asarray([specialists], dtype=jnp.float32),
+    )
 
     players, _globals_vec, _role = build_token_observation_components_batch(
         static,
@@ -109,7 +166,8 @@ def test_rebound_skill_is_last_token_player_feature():
         jnp,
     )
 
-    assert np.asarray(players)[0, :, -1].tolist() == pytest.approx(skills.tolist())
+    assert np.asarray(players)[0, :, -2].tolist() == pytest.approx(skills.tolist())
+    assert np.asarray(players)[0, :, -1].tolist() == pytest.approx(specialists.tolist())
 
 
 def test_local_rebound_contest_uses_fixed_target_radius_only():

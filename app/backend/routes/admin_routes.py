@@ -2503,6 +2503,9 @@ def _set_pressure_params_impl(
         "rebound_winner_distance_weight",
         "rebound_winner_temperature",
         "rebound_skill_std",
+        "rebound_skill_sampling_mode",
+        "rebound_skill_high",
+        "rebound_skill_low",
         "rebound_skill_weight",
         "rebound_contest_mode",
         "rebound_contest_radius",
@@ -2549,6 +2552,9 @@ def _set_pressure_params_impl(
             "rebound_winner_distance_weight",
             "rebound_winner_temperature",
             "rebound_skill_std",
+            "rebound_skill_sampling_mode",
+            "rebound_skill_high",
+            "rebound_skill_low",
             "rebound_skill_weight",
             "rebound_contest_mode",
             "rebound_contest_radius",
@@ -2671,6 +2677,18 @@ def _set_pressure_params_impl(
                 "rebound_skill_std",
                 getattr(env, "rebound_skill_std", 0.0),
             ),
+            "rebound_skill_sampling_mode": _default_value(
+                "rebound_skill_sampling_mode",
+                getattr(env, "rebound_skill_sampling_mode", "gaussian"),
+            ),
+            "rebound_skill_high": _default_value(
+                "rebound_skill_high",
+                getattr(env, "rebound_skill_high", 1.0),
+            ),
+            "rebound_skill_low": _default_value(
+                "rebound_skill_low",
+                getattr(env, "rebound_skill_low", -0.25),
+            ),
             "rebound_skill_weight": _default_value(
                 "rebound_skill_weight",
                 getattr(env, "rebound_skill_weight", 0.0),
@@ -2739,6 +2757,9 @@ def _set_pressure_params_impl(
             "rebound_winner_distance_weight": req.rebound_winner_distance_weight,
             "rebound_winner_temperature": req.rebound_winner_temperature,
             "rebound_skill_std": req.rebound_skill_std,
+            "rebound_skill_sampling_mode": req.rebound_skill_sampling_mode,
+            "rebound_skill_high": req.rebound_skill_high,
+            "rebound_skill_low": req.rebound_skill_low,
             "rebound_skill_weight": req.rebound_skill_weight,
             "rebound_contest_mode": req.rebound_contest_mode,
             "rebound_contest_radius": req.rebound_contest_radius,
@@ -2964,6 +2985,19 @@ def _set_pressure_params_impl(
             "rebound_skill_std",
             0.0,
         )
+    if "rebound_skill_sampling_mode" in payload:
+        mode = str(payload["rebound_skill_sampling_mode"] or "gaussian").strip().lower().replace("-", "_")
+        if mode in {"normal", "gaussian"}:
+            mode = "gaussian"
+        elif mode in {"one_high", "one_high_per_team", "specialist", "specialist_per_team"}:
+            mode = "one_high_per_team"
+        else:
+            raise HTTPException(status_code=400, detail="rebound_skill_sampling_mode must be 'gaussian' or 'one_high_per_team'.")
+        normalized["rebound_skill_sampling_mode"] = mode
+    if "rebound_skill_high" in payload:
+        normalized["rebound_skill_high"] = _as_float(payload["rebound_skill_high"], "rebound_skill_high")
+    if "rebound_skill_low" in payload:
+        normalized["rebound_skill_low"] = _as_float(payload["rebound_skill_low"], "rebound_skill_low")
     if "rebound_skill_weight" in payload:
         normalized["rebound_skill_weight"] = _validate_min(
             _as_float(payload["rebound_skill_weight"], "rebound_skill_weight"),

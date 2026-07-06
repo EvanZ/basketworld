@@ -13,6 +13,7 @@ from basketworld_jax.env.minimal import (
     ACTION_COUNT,
     PASS_ACTION_START,
     REBOUND_CONTEST_MODE_LOCAL,
+    REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
     TURNOVER_REASON_DEFENDER_PRESSURE,
@@ -47,6 +48,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_winner_distance_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
     "rebound_skill_weight",
     "rebound_contest_mode",
     "rebound_contest_radius",
@@ -64,6 +68,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_winner_distance_weight": 1.0,
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
+    "rebound_skill_sampling_mode": "gaussian",
+    "rebound_skill_high": 1.0,
+    "rebound_skill_low": -0.25,
     "rebound_skill_weight": 0.0,
     "rebound_contest_mode": "global_contest",
     "rebound_contest_radius": 1,
@@ -80,6 +87,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_winner_distance_weight": "float",
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
+    "rebound_skill_sampling_mode": "str",
+    "rebound_skill_high": "float",
+    "rebound_skill_low": "float",
     "rebound_skill_weight": "float",
     "rebound_contest_mode": "str",
     "rebound_contest_radius": "int",
@@ -102,6 +112,21 @@ def _rebound_contest_mode_from_static(static: Any) -> str:
     except Exception:
         return "global_contest"
     return "local_contest" if mode_id == int(REBOUND_CONTEST_MODE_LOCAL) else "global_contest"
+
+
+def _rebound_skill_sampling_mode_from_static(static: Any) -> str:
+    try:
+        mode_id = int(np.asarray(static.rebound_skill_sampling_mode).reshape(-1)[0])
+    except Exception:
+        return "gaussian"
+    return "one_high_per_team" if mode_id == int(REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM) else "gaussian"
+
+
+def _float_from_static_field(static: Any, field_name: str, fallback: float) -> float:
+    try:
+        return float(np.asarray(getattr(static, field_name)).reshape(-1)[0])
+    except Exception:
+        return float(fallback)
 
 
 def _int_from_static_field(static: Any, field_name: str, fallback: int) -> int:
@@ -207,9 +232,16 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
     tail_dim = 4 + 1 + (3 * offense_count)
-    if current_dim - expected_dim == n_players and current_dim > (n_players + tail_dim):
-        remove_start = current_dim - tail_dim - n_players
-        return jnp.concatenate([flat_obs[:, :remove_start], flat_obs[:, remove_start + n_players :]], axis=1).astype(jnp.float32)
+    extra_dim = current_dim - expected_dim
+    if (
+        n_players > 0
+        and extra_dim > 0
+        and extra_dim % n_players == 0
+        and extra_dim <= (2 * n_players)
+        and current_dim > (extra_dim + tail_dim)
+    ):
+        remove_start = current_dim - tail_dim - extra_dim
+        return jnp.concatenate([flat_obs[:, :remove_start], flat_obs[:, remove_start + extra_dim :]], axis=1).astype(jnp.float32)
     return flat_obs[:, :expected_dim].astype(jnp.float32)
 
 
@@ -2176,7 +2208,15 @@ class JaxDevRuntime:
         shot_value = np.asarray(self.jax.device_get(profile["shot_value"][0]), dtype=np.float32)
         play_map = self._play_name_map(game_state)
         rebound_skill = np.asarray(self.jax.device_get(_field0(self.state, "rebound_skill")), dtype=np.float32)
+        rebound_skill_specialist = np.asarray(
+            self.jax.device_get(_field0(self.state, "rebound_skill_specialist")),
+            dtype=np.float32,
+        )
         player_rebound_skills = {str(pid): float(rebound_skill[int(pid)]) for pid in range(int(rebound_skill.shape[0]))}
+        player_rebound_skill_specialists = {
+            str(pid): bool(rebound_skill_specialist[int(pid)] > 0.0)
+            for pid in range(int(rebound_skill_specialist.shape[0]))
+        }
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
         globals_labels = [
@@ -2226,6 +2266,7 @@ class JaxDevRuntime:
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
             "player_rebound_skills": player_rebound_skills,
+            "player_rebound_skill_specialists": player_rebound_skill_specialists,
             "offense_ids": self.offense_ids,
             "defense_ids": self.defense_ids,
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
@@ -2266,6 +2307,9 @@ class JaxDevRuntime:
                 "winner_distance_weight": float(getattr(self.display_env, "rebound_winner_distance_weight", 1.0)),
                 "winner_temperature": float(getattr(self.display_env, "rebound_winner_temperature", 1.0)),
                 "skill_std": float(getattr(self.display_env, "rebound_skill_std", 0.0)),
+                "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(self.static),
+                "skill_high": _float_from_static_field(self.static, "rebound_skill_high", 1.0),
+                "skill_low": _float_from_static_field(self.static, "rebound_skill_low", -0.25),
                 "skill_weight": float(getattr(self.display_env, "rebound_skill_weight", 0.0)),
                 "contest_mode": _rebound_contest_mode_from_static(self.static),
                 "contest_radius": _int_from_static_field(self.static, "rebound_contest_radius", 1),

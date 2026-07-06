@@ -72,9 +72,83 @@ def _clip_probability(value, *, default: float) -> float:
     return float(max(0.0, min(1.0, numeric)))
 
 
+_EVAL_ENV_OVERRIDE_KEYS = {
+    "rebound_winner_distance_weight",
+    "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
+    "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+}
+
+
+def _coerce_eval_env_override(key: str, value):
+    if key == "rebound_contest_mode":
+        raw_value = value
+        if isinstance(raw_value, dict):
+            raw_value = raw_value.get("value", raw_value.get("mode", raw_value.get("label")))
+        if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            return "local_contest" if int(raw_value) == 1 else "global_contest"
+        mode = str(raw_value or "global_contest").strip().lower().replace("-", "_").replace(" ", "_")
+        if mode in {"0", "global", "global_contest", "global_softmax"}:
+            return "global_contest"
+        if mode in {"1", "local", "local_contest"}:
+            return "local_contest"
+        raise HTTPException(
+            status_code=400,
+            detail="rebound_contest_mode must be 'global_contest' or 'local_contest'.",
+        )
+    if key == "rebound_skill_sampling_mode":
+        raw_value = value
+        if isinstance(raw_value, dict):
+            raw_value = raw_value.get("value", raw_value.get("mode", raw_value.get("label")))
+        mode = str(raw_value or "gaussian").strip().lower().replace("-", "_").replace(" ", "_")
+        if mode in {"gaussian", "normal"}:
+            return "gaussian"
+        if mode in {"one_high", "one_high_per_team", "specialist", "specialist_per_team"}:
+            return "one_high_per_team"
+        raise HTTPException(
+            status_code=400,
+            detail="rebound_skill_sampling_mode must be 'gaussian' or 'one_high_per_team'.",
+        )
+    if key == "rebound_contest_radius":
+        try:
+            return max(0, int(value))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be an integer.")
+    if key in {"rebound_skill_high", "rebound_skill_low"}:
+        try:
+            return float(value)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be numeric.")
+    minimum = 1.0e-6 if key == "rebound_winner_temperature" else 0.0
+    try:
+        return max(minimum, float(value))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{key} must be numeric.")
+
+
+def _request_eval_env_overrides(request: EvaluationRequest) -> dict:
+    raw = getattr(request, "env_overrides", None) or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized = {}
+    for key, value in raw.items():
+        if key not in _EVAL_ENV_OVERRIDE_KEYS or value is None:
+            continue
+        normalized[key] = _coerce_eval_env_override(key, value)
+    return normalized
+
+
 def _build_evaluation_optional_params(request: EvaluationRequest) -> tuple[dict, dict]:
-    """Apply eval-only start-template overrides without mutating session metadata."""
+    """Apply eval-only overrides without mutating session metadata."""
     optional_params = copy.deepcopy(game_state.env_optional_params or {})
+    eval_env_overrides = _request_eval_env_overrides(request)
+    if eval_env_overrides:
+        optional_params.update(eval_env_overrides)
     template_library = copy.deepcopy(
         getattr(game_state, "mlflow_start_template_library", None)
     )
@@ -86,6 +160,7 @@ def _build_evaluation_optional_params(request: EvaluationRequest) -> tuple[dict,
         "start_template_mode": mode,
         "start_template_library_available": bool(template_library),
         "start_template_source": getattr(game_state, "start_template_library_source", None),
+        "env_overrides": copy.deepcopy(eval_env_overrides),
     }
 
     if mode == "disabled":
@@ -179,6 +254,17 @@ def run_evaluation(request: EvaluationRequest):
     player_deterministic = request.player_deterministic
     opponent_deterministic = request.opponent_deterministic
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
+    if custom_setup.get("rebound_skills") is not None:
+        rebound_skill_values = [float(v) for v in custom_setup.get("rebound_skills") or []]
+        print(
+            "[Evaluation] Custom rebound skills received: "
+            f"count={len(rebound_skill_values)} "
+            f"positive={sum(1 for value in rebound_skill_values if value > 0.0)} "
+            f"sum={sum(rebound_skill_values):.3f} "
+            f"values={rebound_skill_values}"
+        )
+    else:
+        print("[Evaluation] Custom rebound skills received: none")
     randomize_offense_perm = bool(getattr(request, "randomize_offense_permutation", False))
     intent_selection_mode = str(getattr(request, "intent_selection_mode", "learned_sample") or "learned_sample")
     eval_optional_params, eval_template_diagnostics = _build_evaluation_optional_params(request)

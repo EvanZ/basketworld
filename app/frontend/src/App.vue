@@ -38,6 +38,18 @@ function normalizeReboundCountMap(rawMap) {
   return out;
 }
 
+function normalizeReboundPlayerCountMaps(rawMaps) {
+  const out = {};
+  if (!rawMaps || typeof rawMaps !== 'object') return out;
+  for (const [rawPlayerId, rawMap] of Object.entries(rawMaps)) {
+    const playerId = String(rawPlayerId || '').trim();
+    if (!playerId) continue;
+    const normalized = normalizeReboundCountMap(rawMap);
+    if (Object.keys(normalized).length > 0) out[playerId] = normalized;
+  }
+  return out;
+}
+
 function normalizeReboundAccumulator(acc) {
   const result = {};
   if (!acc || typeof acc !== 'object') return result;
@@ -51,6 +63,12 @@ function normalizeReboundAccumulator(acc) {
     const targetOffensive = normalizeReboundCountMap(rawBucket.target_offensive || rawBucket.targets_offensive || {});
     const rebounders = normalizeReboundCountMap(rawBucket.rebounders || rawBucket.winners || {});
     const rebounderOffensive = normalizeReboundCountMap(rawBucket.rebounder_offensive || rawBucket.rebounders_offensive || {});
+    const targetsByPlayer = normalizeReboundPlayerCountMaps(rawBucket.targets_by_player || rawBucket.targetsByPlayer || {});
+    const targetOffensiveByPlayer = normalizeReboundPlayerCountMaps(rawBucket.target_offensive_by_player || rawBucket.targets_offensive_by_player || rawBucket.targetOffensiveByPlayer || {});
+    const reboundersByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounders_by_player || rawBucket.winners_by_player || rawBucket.reboundersByPlayer || {});
+    const rebounderOffensiveByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounder_offensive_by_player || rawBucket.rebounders_offensive_by_player || rawBucket.rebounderOffensiveByPlayer || {});
+    const targetChancesByPlayer = normalizeReboundPlayerCountMaps(rawBucket.target_chances_by_player || rawBucket.targetChancesByPlayer || {});
+    const rebounderChancesByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounder_chances_by_player || rawBucket.rebounderChancesByPlayer || {});
     const totalRaw = Number(rawBucket.total || 0);
     const total = Number.isFinite(totalRaw) && totalRaw > 0
       ? totalRaw
@@ -59,7 +77,19 @@ function normalizeReboundAccumulator(acc) {
         Object.values(rebounders).reduce((sum, val) => sum + Number(val || 0), 0),
       );
     if (total <= 0) continue;
-    result[`${q},${r}`] = { total, targets, targetOffensive, rebounders, rebounderOffensive };
+    result[`${q},${r}`] = {
+      total,
+      targets,
+      targetOffensive,
+      rebounders,
+      rebounderOffensive,
+      targetsByPlayer,
+      targetOffensiveByPlayer,
+      reboundersByPlayer,
+      rebounderOffensiveByPlayer,
+      targetChancesByPlayer,
+      rebounderChancesByPlayer,
+    };
   }
   return result;
 }
@@ -218,6 +248,7 @@ const shotAccumulator = ref({});
 const reboundAccumulator = ref({});
 const reboundHeatmapEnabled = ref(false);
 const reboundHeatmapKind = ref('targets');
+const reboundHeatmapPlayer = ref('all');
 const selectedReboundShotKey = ref('');
 const selectedReboundShotKeys = ref([]);
 const isReboundMultiSelecting = ref(false);
@@ -514,6 +545,7 @@ const defaultEvalConfig = () => ({
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
   reboundSkills: [],
+  reboundSkillsPinned: false,
   showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
@@ -521,6 +553,7 @@ const defaultEvalConfig = () => ({
   startTemplateProb: 1.0,
   startTemplateJitterScale: 0.0,
   startTemplateMirrorProb: 0.0,
+  envOverrides: {},
 });
 const defaultTemplateAuthoringConfig = () => ({
   positions: [],
@@ -579,6 +612,23 @@ const boardReboundSkillOverrides = computed(() => {
 const boardShowCoordinates = computed(() => isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const activeControlsTab = ref('controls');
+const reboundHeatmapPlayerOptions = computed(() => {
+  const opts = [{ label: 'All players', value: 'all' }];
+  const offenseIds = Array.isArray(gameState.value?.offense_ids) ? gameState.value.offense_ids : [];
+  const defenseIds = Array.isArray(gameState.value?.defense_ids) ? gameState.value.defense_ids : [];
+  offenseIds.forEach((pid, idx) => opts.push({ label: `O${idx} Player ${pid}`, value: String(pid) }));
+  defenseIds.forEach((pid, idx) => opts.push({ label: `D${idx} Player ${pid}`, value: String(pid) }));
+  return opts;
+});
+const reboundHeatmapSelectedPlayerLabel = computed(() => {
+  const selected = String(reboundHeatmapPlayer.value || 'all');
+  const found = reboundHeatmapPlayerOptions.value.find((opt) => opt.value === selected);
+  return found?.label || 'All players';
+});
+watch(reboundHeatmapPlayerOptions, (options) => {
+  const selected = String(reboundHeatmapPlayer.value || 'all');
+  if (!options.some((opt) => opt.value === selected)) reboundHeatmapPlayer.value = 'all';
+});
 const shotChartOptions = computed(() => {
   const opts = [{ label: 'Team', value: 'team' }];
   const offenseIds = gameState.value?.offense_ids || [];
@@ -638,11 +688,30 @@ function addReboundCounts(target, source) {
     target[key] = (target[key] || 0) + count;
   }
 }
+function addReboundPlayerCounts(target, source) {
+  for (const [playerId, sourceMap] of Object.entries(source || {})) {
+    if (!target[playerId]) target[playerId] = {};
+    addReboundCounts(target[playerId], sourceMap);
+    if (Object.keys(target[playerId]).length === 0) delete target[playerId];
+  }
+}
 const selectedReboundHeatmapBucket = computed(() => {
   const keys = selectedReboundShotKeysDisplay.value.filter((key) => reboundAccumulator.value?.[key]);
   if (keys.length === 0) return null;
   if (keys.length === 1) return reboundAccumulator.value[keys[0]];
-  const bucket = { total: 0, targets: {}, targetOffensive: {}, rebounders: {}, rebounderOffensive: {} };
+  const bucket = {
+    total: 0,
+    targets: {},
+    targetOffensive: {},
+    rebounders: {},
+    rebounderOffensive: {},
+    targetsByPlayer: {},
+    targetOffensiveByPlayer: {},
+    reboundersByPlayer: {},
+    rebounderOffensiveByPlayer: {},
+    targetChancesByPlayer: {},
+    rebounderChancesByPlayer: {},
+  };
   for (const key of keys) {
     const src = reboundAccumulator.value[key] || {};
     bucket.total += Number(src.total || 0);
@@ -650,6 +719,12 @@ const selectedReboundHeatmapBucket = computed(() => {
     addReboundCounts(bucket.targetOffensive, src.targetOffensive);
     addReboundCounts(bucket.rebounders, src.rebounders);
     addReboundCounts(bucket.rebounderOffensive, src.rebounderOffensive);
+    addReboundPlayerCounts(bucket.targetsByPlayer, src.targetsByPlayer);
+    addReboundPlayerCounts(bucket.targetOffensiveByPlayer, src.targetOffensiveByPlayer);
+    addReboundPlayerCounts(bucket.reboundersByPlayer, src.reboundersByPlayer);
+    addReboundPlayerCounts(bucket.rebounderOffensiveByPlayer, src.rebounderOffensiveByPlayer);
+    addReboundPlayerCounts(bucket.targetChancesByPlayer, src.targetChancesByPlayer);
+    addReboundPlayerCounts(bucket.rebounderChancesByPlayer, src.rebounderChancesByPlayer);
   }
   return bucket;
 });
@@ -658,9 +733,27 @@ const boardEvalReboundOverlay = computed(() => {
   const bucket = selectedReboundHeatmapBucket.value;
   if (!bucket) return null;
   const mapName = reboundHeatmapKind.value === 'rebounders' ? 'rebounders' : 'targets';
-  const rawMap = bucket[mapName] || {};
-  const offensiveMap = mapName === 'rebounders' ? (bucket.rebounderOffensive || {}) : (bucket.targetOffensive || {});
+  const selectedPlayer = String(reboundHeatmapPlayer.value || 'all');
+  const hasPlayerFilter = selectedPlayer !== 'all';
+  const aggregateMap = bucket[mapName] || {};
+  const rawMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.reboundersByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetsByPlayer?.[selectedPlayer] || {}))
+    : aggregateMap;
+  const chanceMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.rebounderChancesByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetChancesByPlayer?.[selectedPlayer] || {}))
+    : {};
+  const offensiveMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.rebounderOffensiveByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetOffensiveByPlayer?.[selectedPlayer] || {}))
+    : (mapName === 'rebounders' ? (bucket.rebounderOffensive || {}) : (bucket.targetOffensive || {}));
   const total = Object.values(rawMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const chanceTotal = Object.values(chanceMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const aggregateTotal = Object.values(aggregateMap).reduce((sum, val) => sum + Number(val || 0), 0);
   const offensiveTotal = Object.values(offensiveMap).reduce((sum, val) => sum + Number(val || 0), 0);
   if (total <= 0) return null;
   const targetCells = Object.entries(rawMap)
@@ -671,15 +764,30 @@ const boardEvalReboundOverlay = computed(() => {
       const c = Number(count || 0);
       if (!Number.isFinite(q) || !Number.isFinite(r) || c <= 0) return null;
       const offensiveCount = Number(offensiveMap[key] || 0);
-      return { q, r, prob: c / total, count: c, offensive_count: offensiveCount, orb_pct: c > 0 ? offensiveCount / c : 0 };
+      const chanceCount = Number(chanceMap[key] || 0);
+      return {
+        q,
+        r,
+        prob: c / total,
+        count: c,
+        chance_count: hasPlayerFilter ? chanceCount : null,
+        offensive_count: offensiveCount,
+        orb_pct: hasPlayerFilter ? null : (c > 0 ? offensiveCount / c : 0),
+        rebound_rate_label: hasPlayerFilter && chanceCount > 0
+          ? `REB ${(c / chanceCount * 100).toFixed(0)}%`
+          : null,
+      };
     })
     .filter(Boolean);
   const kindLabel = mapName === 'rebounders' ? 'rebounder location' : 'catch target';
+  const playerLabel = hasPlayerFilter ? ` | ${reboundHeatmapSelectedPlayerLabel.value}` : '';
   return {
     available: true,
     source: 'eval_rebound_heatmap',
-    title: `Eval rebounds from ${selectedReboundShotLabel.value} | ${kindLabel}`,
-    summary: `Total ORB ${((offensiveTotal / total) * 100).toFixed(1)}% (${Math.round(offensiveTotal)}/${Math.round(total)})`,
+    title: `Eval rebounds from ${selectedReboundShotLabel.value} | ${kindLabel}${playerLabel}`,
+    summary: hasPlayerFilter
+      ? `${reboundHeatmapSelectedPlayerLabel.value} REB ${chanceTotal > 0 ? ((total / chanceTotal) * 100).toFixed(1) : '0.0'}% (${Math.round(total)}/${Math.round(chanceTotal)})`
+      : `Total ORB ${((offensiveTotal / total) * 100).toFixed(1)}% (${Math.round(offensiveTotal)}/${Math.round(total)})`,
     target_cells: targetCells,
     shot: { player_id: null, shot_type: kindLabel },
   };
@@ -951,10 +1059,13 @@ const assistSankeyLinks = computed(() => {
 });
 
 const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
+const REBOUND_STEP_DURATION_MS = 3000;
+const REBOUND_CAPTURE_OFFSETS_MS = [0, 180, 360, 540, 720, 960, 1200, 1500, 1800, 2100, 2400, 2700, 3000];
 const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
 const moveTransitionMs = computed(() => Math.max(120, gifStepDurationMs.value || BASE_STEP_DURATION_MS));
 const disableTransitionsForCapture = ref(false);
 const moveProgressForCapture = ref(1);
+const reboundProgressForCapture = ref(1);
 const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
@@ -2050,6 +2161,10 @@ function seedEvalConfigFromGameState(copySkills = true) {
     const numeric = Number(value);
     return Number.isFinite(numeric) ? numeric : 0;
   });
+  const existingReboundSkills = Array.isArray(evalConfig.value?.reboundSkills)
+    ? evalConfig.value.reboundSkills
+    : [];
+  const preservePinnedReboundSkills = Boolean(evalConfig.value?.reboundSkillsPinned);
   if (copySkills && sourceSkills) {
     skills.layup = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.layup?.[idx]));
     skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.three_pt?.[idx]));
@@ -2061,7 +2176,10 @@ function seedEvalConfigFromGameState(copySkills = true) {
     positions,
     ballHolder: gameState.value.ball_holder ?? evalConfig.value.ballHolder,
     skills: copySkills ? skills : (evalConfig.value?.skills || skills),
-    reboundSkills,
+    reboundSkills: preservePinnedReboundSkills && existingReboundSkills.length
+      ? existingReboundSkills
+      : reboundSkills,
+    reboundSkillsPinned: preservePinnedReboundSkills,
   };
 }
 
@@ -2178,12 +2296,20 @@ function buildCustomEvalSetup() {
     };
   }
   const reboundSkills = Array.isArray(evalConfig.value.reboundSkills) ? evalConfig.value.reboundSkills : [];
+  const allReboundSkillIds = [
+    ...(gameState.value.offense_ids || []),
+    ...(gameState.value.defense_ids || []),
+  ].map((pid) => Number(pid));
   const totalPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
   if (reboundSkills.length) {
-    payload.rebound_skills = Array.from({ length: totalPlayers }, (_, idx) => {
+    const skillsByPlayerId = Array.from({ length: totalPlayers }, () => 0);
+    allReboundSkillIds.forEach((pid, idx) => {
       const numeric = Number(reboundSkills[idx] ?? 0);
-      return Number.isFinite(numeric) ? numeric : 0;
+      if (Number.isInteger(pid) && pid >= 0 && pid < totalPlayers && Number.isFinite(numeric)) {
+        skillsByPlayerId[pid] = numeric;
+      }
     });
+    payload.rebound_skills = skillsByPlayerId;
   }
   return payload;
 }
@@ -2263,6 +2389,7 @@ async function handleEvaluation() {
         jitterScale: Number(evalConfig.value.startTemplateJitterScale ?? 0.0),
         mirrorProb: Number(evalConfig.value.startTemplateMirrorProb ?? 0.0),
       },
+      evalConfig.value.envOverrides || null,
     );
     
   if (response.status === 'success' && Array.isArray(response.results)) {
@@ -2391,33 +2518,57 @@ const liveButtonsDisabled = computed(() =>
   templateSandboxMode.value || activeControlsTab.value === 'eval' || activeControlsTab.value === 'template'
 );
 
-function stateHasAnimatedFlash(state) {
+function animatedFlashKindsForState(state) {
   const results = state?.last_action_results;
-  if (!results) return false;
+  if (!results) return { hasShot: false, hasPass: false, hasRebound: false };
 
-  const hasShot = results.shots && Object.keys(results.shots).length > 0;
+  const hasShot = Boolean(results.shots && Object.keys(results.shots).length > 0);
   const hasRebound = Array.isArray(results.rebounds) && results.rebounds.length > 0;
-  const hasPass =
+  const hasPass = Boolean(
     results.passes &&
     Object.values(results.passes).some(
       (passRes) =>
         passRes &&
         passRes.success &&
         Number.isFinite(Number(passRes.target))
-    );
+    ),
+  );
 
-  return Boolean(hasShot || hasPass || hasRebound);
+  return { hasShot, hasPass, hasRebound };
+}
+
+function stateHasAnimatedFlash(state) {
+  const kinds = animatedFlashKindsForState(state);
+  return Boolean(kinds.hasShot || kinds.hasPass || kinds.hasRebound);
 }
 
 function captureOffsetsForState(state) {
-  const hasFlash = stateHasAnimatedFlash(state);
+  const { hasShot, hasPass, hasRebound } = animatedFlashKindsForState(state);
   const moveEnd = moveTransitionMs.value;
-  if (hasFlash) {
+  if (hasRebound) {
+    const reboundEnd = Math.max(moveEnd, REBOUND_STEP_DURATION_MS);
+    const merged = [...REBOUND_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, reboundEnd];
+    return Array.from(new Set(merged)).sort((a, b) => a - b);
+  }
+  if (hasShot || hasPass) {
     const merged = [...FLASH_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
     return Array.from(new Set(merged)).sort((a, b) => a - b);
   }
   const merged = [...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
   return Array.from(new Set(merged)).sort((a, b) => a - b);
+}
+
+function gifPlaybackDurationForState(state) {
+  const { hasRebound } = animatedFlashKindsForState(state);
+  const baseDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+  return hasRebound ? Math.max(baseDurationMs, REBOUND_STEP_DURATION_MS) : baseDurationMs;
+}
+
+function reboundProgressForStateOffset(state, offsetMs) {
+  const { hasRebound } = animatedFlashKindsForState(state);
+  if (!hasRebound) return 1;
+  const durationMs = gifPlaybackDurationForState(state);
+  return durationMs > 0 ? Math.min(1, offsetMs / durationMs) : 1;
 }
 
 function interpolateState(prevState, currState, t) {
@@ -2445,6 +2596,7 @@ async function handleSaveEpisode() {
   try {
     disableTransitionsForCapture.value = true;
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
     await nextTick();
     // Check if we have episode states to render. Prefer the longest history so
     // self-play possessions that continue after offensive rebounds are not truncated
@@ -2488,7 +2640,7 @@ async function handleSaveEpisode() {
         await new Promise(resolve => setTimeout(resolve, 60));
 
         const offsets = captureOffsetsForState(states[i]);
-        const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+        const stepDurationMs = gifPlaybackDurationForState(states[i]);
         const frameDurationMs = stepDurationMs / offsets.length;
 
         let lastOffset = 0;
@@ -2500,9 +2652,12 @@ async function handleSaveEpisode() {
           }
 
           const prevState = i > 0 ? states[i - 1] : states[i];
-          const t = moveTransitionMs.value > 0 ? Math.min(1, offset / moveTransitionMs.value) : 1;
-          moveProgressForCapture.value = t;
-          const interpState = interpolateState(prevState, states[i], t);
+          const moveDurationMs = moveTransitionMs.value;
+          const moveT = moveDurationMs > 0 ? Math.min(1, offset / moveDurationMs) : 1;
+          const reboundT = reboundProgressForStateOffset(states[i], offset);
+          moveProgressForCapture.value = moveT;
+          reboundProgressForCapture.value = reboundT;
+          const interpState = interpolateState(prevState, states[i], moveT);
           const tempHistory = [...states.slice(0, i), interpState];
           gameHistory.value = tempHistory;
           // eslint-disable-next-line no-await-in-loop
@@ -2533,6 +2688,7 @@ async function handleSaveEpisode() {
       gameHistory.value = replayStates.value.slice(0, savedStepIndex + 1);
     }
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
     
     if (frames.length === 0) {
       alert('Failed to generate any frames');
@@ -2556,6 +2712,7 @@ async function handleSaveEpisode() {
   } finally {
     disableTransitionsForCapture.value = false;
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
   }
 }
 
@@ -2975,6 +3132,11 @@ onBeforeUnmount(() => {
               <option value="targets">Catch target</option>
               <option value="rebounders">Rebounder location</option>
             </select>
+            <select v-model="reboundHeatmapPlayer" :disabled="!reboundHeatmapEnabled">
+              <option v-for="opt in reboundHeatmapPlayerOptions" :key="`rebound-player-${opt.value}`" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
             <button
               v-if="reboundHeatmapEnabled && selectedReboundShotKeysDisplay.length > 0"
               class="small-action-button"
@@ -3065,6 +3227,7 @@ onBeforeUnmount(() => {
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
+          :rebound-progress="reboundProgressForCapture"
           :disable-backend-value-fetches="boardDisableBackendValueFetches"
           :allow-position-drag="!isPlaybookBoardPreviewActive"
           :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"

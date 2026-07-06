@@ -124,6 +124,7 @@ class EvaluationRequest(BaseModel):
     start_template_prob: float | None = None
     start_template_jitter_scale: float | None = None
     start_template_mirror_prob: float | None = None
+    env_overrides: dict[str, object] | None = None
 
 
 class SaveEpisodeRequest(BaseModel):
@@ -239,6 +240,9 @@ class SetPressureParamsRequest(BaseModel):
     rebound_winner_distance_weight: float | None = None
     rebound_winner_temperature: float | None = None
     rebound_skill_std: float | None = None
+    rebound_skill_sampling_mode: str | None = None
+    rebound_skill_high: float | None = None
+    rebound_skill_low: float | None = None
     rebound_skill_weight: float | None = None
     rebound_contest_mode: str | None = None
     rebound_contest_radius: int | None = None

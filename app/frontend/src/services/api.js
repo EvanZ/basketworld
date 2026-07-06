@@ -444,6 +444,7 @@ export async function runEvaluation(
   randomizeOffensePermutation = false,
   intentSelectionMode = 'learned_sample',
   startTemplateOptions = null,
+  envOverrides = null,
 ) {
   const templateOptions = startTemplateOptions || {};
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
@@ -460,6 +461,7 @@ export async function runEvaluation(
       start_template_prob: templateOptions.prob ?? null,
       start_template_jitter_scale: templateOptions.jitterScale ?? null,
       start_template_mirror_prob: templateOptions.mirrorProb ?? null,
+      env_overrides: envOverrides && typeof envOverrides === 'object' ? envOverrides : null,
     }),
   });
   if (!response.ok) {
