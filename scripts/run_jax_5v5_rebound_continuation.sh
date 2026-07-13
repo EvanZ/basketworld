@@ -117,6 +117,8 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   0.0 \
   --rebound-winner-distance-weight \
   1.0 \
+  --rebound-basket-position-weight \
+  0.0 \
   --rebound-winner-temperature \
   1.0 \
   --rebound-skill-std \

@@ -74,6 +74,7 @@ def _clip_probability(value, *, default: float) -> float:
 
 _EVAL_ENV_OVERRIDE_KEYS = {
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -264,7 +265,11 @@ def run_evaluation(request: EvaluationRequest):
             f"values={rebound_skill_values}"
         )
     else:
-        print("[Evaluation] Custom rebound skills received: none")
+        sampling = custom_setup.get("rebound_skill_sampling") if isinstance(custom_setup, dict) else None
+        if sampling:
+            print(f"[Evaluation] Custom rebound skill sampling received: {sampling}")
+        else:
+            print("[Evaluation] Custom rebound skills received: none")
     randomize_offense_perm = bool(getattr(request, "randomize_offense_permutation", False))
     intent_selection_mode = str(getattr(request, "intent_selection_mode", "learned_sample") or "learned_sample")
     eval_optional_params, eval_template_diagnostics = _build_evaluation_optional_params(request)
@@ -346,6 +351,19 @@ def run_evaluation(request: EvaluationRequest):
         per_intent_stats = raw_results.get("per_intent_stats", {}) or {}
         eval_diagnostics = raw_results.get("eval_diagnostics", {}) or {}
         eval_diagnostics["start_template_eval"] = eval_template_diagnostics
+        try:
+            native_summary = eval_diagnostics.get("jax_native_summary") or {}
+            value_diag = native_summary.get("value_diagnostics") or eval_diagnostics.get("value_diagnostics") or {}
+            print(
+                "[Evaluation] Value diagnostics response: "
+                f"native={bool(native_summary)} "
+                f"samples={int(value_diag.get('sample_count', 0) or 0)} "
+                f"Vo={float(value_diag.get('offense_value_mean', 0.0) or 0.0):.3f} "
+                f"Vd={float(value_diag.get('defense_value_mean', 0.0) or 0.0):.3f} "
+                f"Vo+Vd={float(value_diag.get('value_sum_mean', 0.0) or 0.0):.3f}"
+            )
+        except Exception:
+            pass
         raw_shots = raw_results.get("shot_accumulator")
         if isinstance(raw_shots, dict):
             shot_accumulator = raw_shots

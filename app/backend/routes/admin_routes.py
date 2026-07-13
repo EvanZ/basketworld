@@ -48,6 +48,7 @@ from app.backend.schemas import (
     ReplayCounterfactualRequest,
     SaveStartTemplateLibraryRequest,
     SetBallHolderRequest,
+    SetCurrentReboundSkillsRequest,
     SetIntentStateRequest,
     SetOffenseSkillsRequest,
     SetPassLogitBiasRequest,
@@ -1820,6 +1821,39 @@ def restore_counterfactual_snapshot_route():
         raise HTTPException(status_code=500, detail=f"Failed to restore snapshot: {e}")
 
 
+@router.post("/api/set_current_rebound_skills")
+def set_current_rebound_skills_route(req: SetCurrentReboundSkillsRequest):
+    """Override current live JAX rebound skills without resetting the episode."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is None:
+        raise HTTPException(status_code=400, detail="Current rebound skill overrides require a JAX runtime.")
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    try:
+        applied = jax_runtime.set_current_rebound_skills(
+            list(req.rebound_skills or []),
+            rebound_skill_specialists=(
+                list(req.rebound_skill_specialists)
+                if req.rebound_skill_specialists is not None
+                else None
+            ),
+            game_state=game_state,
+        )
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {
+            "status": "success",
+            "applied": applied,
+            "state": updated_state,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set current rebound skills: {e}")
+
+
 @router.post("/api/replay_counterfactual_snapshot")
 def replay_counterfactual_snapshot_route(req: ReplayCounterfactualRequest):
     """Autoplay deterministically from the current branch state after snapshot-based edits."""
@@ -2501,6 +2535,7 @@ def _set_pressure_params_impl(
         "defender_pressure_turnover_chance",
         "defender_pressure_decay_lambda",
         "rebound_winner_distance_weight",
+        "rebound_basket_position_weight",
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_sampling_mode",
@@ -2550,6 +2585,7 @@ def _set_pressure_params_impl(
         },
         "rebounding": {
             "rebound_winner_distance_weight",
+            "rebound_basket_position_weight",
             "rebound_winner_temperature",
             "rebound_skill_std",
             "rebound_skill_sampling_mode",
@@ -2669,6 +2705,10 @@ def _set_pressure_params_impl(
                 "rebound_winner_distance_weight",
                 getattr(env, "rebound_winner_distance_weight", 1.0),
             ),
+            "rebound_basket_position_weight": _default_value(
+                "rebound_basket_position_weight",
+                getattr(env, "rebound_basket_position_weight", 0.0),
+            ),
             "rebound_winner_temperature": _default_value(
                 "rebound_winner_temperature",
                 getattr(env, "rebound_winner_temperature", 1.0),
@@ -2755,6 +2795,7 @@ def _set_pressure_params_impl(
             "defender_pressure_turnover_chance": req.defender_pressure_turnover_chance,
             "defender_pressure_decay_lambda": req.defender_pressure_decay_lambda,
             "rebound_winner_distance_weight": req.rebound_winner_distance_weight,
+            "rebound_basket_position_weight": req.rebound_basket_position_weight,
             "rebound_winner_temperature": req.rebound_winner_temperature,
             "rebound_skill_std": req.rebound_skill_std,
             "rebound_skill_sampling_mode": req.rebound_skill_sampling_mode,
@@ -2971,6 +3012,12 @@ def _set_pressure_params_impl(
         normalized["rebound_winner_distance_weight"] = _validate_min(
             _as_float(payload["rebound_winner_distance_weight"], "rebound_winner_distance_weight"),
             "rebound_winner_distance_weight",
+            0.0,
+        )
+    if "rebound_basket_position_weight" in payload:
+        normalized["rebound_basket_position_weight"] = _validate_min(
+            _as_float(payload["rebound_basket_position_weight"], "rebound_basket_position_weight"),
+            "rebound_basket_position_weight",
             0.0,
         )
     if "rebound_winner_temperature" in payload:

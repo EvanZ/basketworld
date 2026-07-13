@@ -602,6 +602,24 @@ export async function replayCounterfactualSnapshot(payload = {}) {
   return response.json();
 }
 
+export async function setCurrentReboundSkills(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_current_rebound_skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      rebound_skills: Array.isArray(payload.rebound_skills) ? payload.rebound_skills : [],
+      rebound_skill_specialists: Array.isArray(payload.rebound_skill_specialists)
+        ? payload.rebound_skill_specialists
+        : undefined,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set current rebound skills');
+  }
+  return response.json();
+}
+
 export async function runPlaybookAnalysis(payload = {}) {
   const response = await fetch(`${API_BASE_URL}/api/playbook_analysis`, {
     method: 'POST',

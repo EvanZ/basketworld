@@ -203,6 +203,7 @@ class KernelStatic(NamedTuple):
     rebound_target_temperature: Any
     rebound_target_uniform_mix: Any
     rebound_winner_distance_weight: Any
+    rebound_basket_position_weight: Any
     rebound_winner_temperature: Any
     rebound_skill_std: Any
     rebound_skill_sampling_mode: Any
@@ -272,6 +273,7 @@ class StepBatchOutput(NamedTuple):
     assist_passer: Any
     turnover_player: Any
     turnover_reason: Any
+    steal_player: Any
     offensive_three_seconds: Any
     defensive_lane_violation: Any
     defensive_lane_violation_player: Any
@@ -984,6 +986,10 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(0.0, float(getattr(env, "rebound_winner_distance_weight", 1.0))),
             dtype=xp.float32,
         ),
+        rebound_basket_position_weight=xp.asarray(
+            max(0.0, float(getattr(env, "rebound_basket_position_weight", 0.0))),
+            dtype=xp.float32,
+        ),
         rebound_winner_temperature=xp.asarray(
             max(1.0e-6, float(getattr(env, "rebound_winner_temperature", 1.0))),
             dtype=xp.float32,
@@ -1608,7 +1614,7 @@ def build_turnover_probabilities_batch(static: KernelStatic, state: KernelState,
     return jnp.where(ball_holder_offense_mask, total_turnover[:, None], out)
 
 
-def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelState, jnp):
+def build_pass_steal_contributions_batch(static: KernelStatic, state: KernelState, jnp):
     batch_size = state.positions.shape[0]
     offense_count = static.offense_ids.shape[0]
     passer_pos = _safe_ball_holder_positions(state, jnp)
@@ -1730,7 +1736,17 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
         jnp.clip(steal_contrib, 0.0, 1.0),
         0.0,
     )
+    return steal_contrib
+
+
+def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelState, jnp):
+    batch_size = state.positions.shape[0]
+    offense_count = static.offense_ids.shape[0]
+    steal_contrib = build_pass_steal_contributions_batch(static, state, jnp)
     total_steal = 1.0 - jnp.prod(1.0 - steal_contrib, axis=-1)
+    ball_holder_offense_mask = state.ball_holder[:, None] == static.offense_ids[None, :]
+    has_offense_holder = jnp.any(ball_holder_offense_mask, axis=1)
+    valid_receivers = has_offense_holder[:, None] & (~ball_holder_offense_mask)
     return jnp.where(valid_receivers, total_steal, jnp.zeros((batch_size, offense_count), dtype=jnp.float32))
 
 
@@ -2119,6 +2135,11 @@ def _pass_steal_probs_single(static: KernelStatic, state: KernelState, jnp):
     return build_pass_steal_probabilities_batch(static, batched_state, jnp)[0]
 
 
+def _pass_steal_contribs_single(static: KernelStatic, state: KernelState, jnp):
+    batched_state = _single_state_to_batched(state, jnp)
+    return build_pass_steal_contributions_batch(static, batched_state, jnp)[0]
+
+
 def _pressure_turnover_probs_single(static: KernelStatic, state: KernelState, jnp):
     batched_state = _single_state_to_batched(state, jnp)
     offense_probs = build_turnover_probabilities_batch(static, batched_state, jnp)[0]
@@ -2329,6 +2350,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             assist_passer=no_player,
             turnover_player=no_player,
             turnover_reason=no_reason,
+            steal_player=no_player,
             offensive_three_seconds=zero_flag,
             defensive_lane_violation=zero_flag,
             defensive_lane_violation_player=no_player,
@@ -2411,6 +2433,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=no_player,
                 turnover_player=jnp.where(next_state.ball_holder >= 0, pressure_turnover_player, no_player),
                 turnover_reason=jnp.asarray(TURNOVER_REASON_DEFENDER_PRESSURE, dtype=jnp.int32),
+                steal_player=no_player,
                 offensive_three_seconds=zero_flag,
                 defensive_lane_violation=zero_flag,
                 defensive_lane_violation_player=no_player,
@@ -2479,17 +2502,34 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     jnp.asarray(False),
                     no_reason,
                     no_player,
+                    no_player,
                 )
 
             def _do_pass(_):
                 slot_idx = holder_action - PASS_ACTION_START
                 receiver = static.pointer_pass_target_ids[safe_holder, jnp.clip(slot_idx, 0, 5)]
-                pass_probs = _pass_steal_probs_single(static, shot_clock_state, jnp)
+                interceptor_key = jax.random.fold_in(pass_key, 1)
+                steal_contribs = _pass_steal_contribs_single(static, shot_clock_state, jnp)
+                pass_probs = 1.0 - jnp.prod(1.0 - steal_contribs, axis=-1)
                 pass_draw = jax.random.uniform(pass_key)
                 receiver_safe = jnp.clip(receiver, 0, pass_probs.shape[0] - 1)
                 steal_prob = jnp.where(receiver >= 0, pass_probs[receiver_safe], 0.0)
                 theft = (receiver < 0) | (pass_draw < steal_prob)
-                steal_holder = _turnover_to_defense_single(static, shot_clock_state.positions, safe_holder, jnp)
+                receiver_steal_contribs = jnp.where(
+                    receiver >= 0,
+                    steal_contribs[receiver_safe],
+                    jnp.zeros_like(steal_contribs[receiver_safe]),
+                )
+                has_interceptor_weight = jnp.sum(receiver_steal_contribs) > 0.0
+                interceptor_logits = jnp.where(
+                    receiver_steal_contribs > 0.0,
+                    jnp.log(jnp.maximum(receiver_steal_contribs, 1.0e-8)),
+                    jnp.asarray(-1.0e9, dtype=jnp.float32),
+                )
+                sampled_interceptor_idx = jax.random.categorical(interceptor_key, interceptor_logits).astype(jnp.int32)
+                sampled_steal_holder = static.defense_ids[jnp.clip(sampled_interceptor_idx, 0, static.defense_ids.shape[0] - 1)]
+                fallback_steal_holder = _turnover_to_defense_single(static, shot_clock_state.positions, safe_holder, jnp)
+                steal_holder = jnp.where(has_interceptor_weight, sampled_steal_holder, fallback_steal_holder)
                 new_holder = jnp.where(theft, steal_holder, receiver)
                 new_assist_active = jnp.where(theft, jnp.asarray(0, dtype=jnp.int8), jnp.asarray(1, dtype=jnp.int8))
                 new_assist_passer = jnp.where(theft, jnp.asarray(-1, dtype=jnp.int32), safe_holder)
@@ -2519,6 +2559,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     ~theft,
                     turnover_reason,
                     receiver.astype(jnp.int32),
+                    jnp.where((receiver >= 0) & theft, steal_holder.astype(jnp.int32), no_player),
                 )
 
             (
@@ -2536,6 +2577,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 pass_success,
                 action_turnover_reason,
                 pass_receiver,
+                action_steal_player,
             ) = jax.lax.cond(
                 is_shot,
                 _do_shot,
@@ -2556,6 +2598,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                         jnp.asarray(False),
                         jnp.asarray(False),
                         no_reason,
+                        no_player,
                         no_player,
                     ),
                     operand=None,
@@ -2644,11 +2687,24 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1),
                 jnp.clip(sampled_rebound_target, 0, static.cell_distance_matrix.shape[1] - 1),
             ].astype(jnp.float32)
+            target_basket_distance = static.basket_distance_by_cell[
+                jnp.clip(sampled_rebound_target, 0, static.basket_distance_by_cell.shape[0] - 1)
+            ].astype(jnp.float32)
+            player_basket_distances = static.basket_distance_by_cell[
+                jnp.clip(safe_player_cell_idx, 0, static.basket_distance_by_cell.shape[0] - 1)
+            ].astype(jnp.float32)
+            basket_position_penalty = jnp.maximum(
+                jnp.asarray(0.0, dtype=jnp.float32),
+                player_basket_distances - target_basket_distance,
+            )
             effective_rebound_distances = (
                 rebound_distances
                 - (static.rebound_skill_weight * final_state.rebound_skill.astype(jnp.float32))
             )
-            global_winner_logits = (-static.rebound_winner_distance_weight * effective_rebound_distances) / static.rebound_winner_temperature
+            global_winner_logits = (
+                (-static.rebound_winner_distance_weight * effective_rebound_distances)
+                - (static.rebound_basket_position_weight * basket_position_penalty)
+            ) / static.rebound_winner_temperature
             player_player_distances = static.cell_distance_matrix[
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[:, None],
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[1] - 1)[None, :],
@@ -2907,6 +2963,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=event_assist_passer,
                 turnover_player=turnover_player,
                 turnover_reason=turnover_reason,
+                steal_player=jnp.where(
+                    turnover_event.astype(jnp.bool_)
+                    & (turnover_reason == jnp.asarray(TURNOVER_REASON_INTERCEPTED, dtype=jnp.int32)),
+                    action_steal_player.astype(jnp.int32),
+                    no_player,
+                ),
                 offensive_three_seconds=offensive_three_seconds_turnover.astype(jnp.int8),
                 defensive_lane_violation=defensive_lane_violation.astype(jnp.int8),
                 defensive_lane_violation_player=defensive_lane_violation_player,
@@ -3451,6 +3513,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_target_temperature",
         "rebound_target_uniform_mix",
         "rebound_winner_distance_weight",
+        "rebound_basket_position_weight",
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_sampling_mode",

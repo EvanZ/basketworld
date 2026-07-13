@@ -52,3 +52,35 @@ def test_pass_steal_preview_uses_unwrapped_env_for_position_validation(monkeypat
 
     assert "steal_probabilities" in result
     assert "policy_probabilities" in result
+
+def test_validate_custom_eval_setup_accepts_constrained_rebound_skill_sampling():
+    env = HexagonBasketballEnv(
+        players=5,
+        allow_dunks=True,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+        training_team=Team.OFFENSE,
+    )
+    env.reset(seed=789)
+
+    normalized = backend_evaluation.validate_custom_eval_setup(
+        {
+            "shooting_mode": "random",
+            "rebound_skill_sampling": {
+                "mode": "constrained_gaussian",
+                "std": 0.75,
+                "target_edge": 1.25,
+                "tolerance": 0.2,
+                "max_attempts": 2500,
+            },
+        },
+        env,
+    )
+
+    assert normalized["rebound_skill_sampling"] == {
+        "mode": "constrained_gaussian",
+        "std": 0.75,
+        "target_edge": 1.25,
+        "tolerance": 0.2,
+        "max_attempts": 2500,
+    }

@@ -1719,6 +1719,33 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
                 raise HTTPException(status_code=400, detail=f"Invalid rebound skill value: {v}")
         normalized["rebound_skills"] = rebound_values
 
+    if setup.get("rebound_skill_sampling") is not None and normalized.get("rebound_skills") is None:
+        raw_sampling = setup.get("rebound_skill_sampling")
+        sampling = raw_sampling.dict() if hasattr(raw_sampling, "dict") else dict(raw_sampling)
+        mode = str(sampling.get("mode") or "constrained_gaussian")
+        if mode != "constrained_gaussian":
+            raise HTTPException(status_code=400, detail=f"Invalid rebound_skill_sampling.mode: {mode}")
+        try:
+            std = float(sampling.get("std", 1.0))
+            target_edge = float(sampling.get("target_edge", 0.0))
+            tolerance = float(sampling.get("tolerance", 0.25))
+            max_attempts = int(sampling.get("max_attempts", 5000))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid rebound_skill_sampling value: {exc}")
+        if std <= 0.0:
+            raise HTTPException(status_code=400, detail="rebound_skill_sampling.std must be > 0.")
+        if tolerance < 0.0:
+            raise HTTPException(status_code=400, detail="rebound_skill_sampling.tolerance must be >= 0.")
+        if max_attempts < 1:
+            raise HTTPException(status_code=400, detail="rebound_skill_sampling.max_attempts must be >= 1.")
+        normalized["rebound_skill_sampling"] = {
+            "mode": mode,
+            "std": std,
+            "target_edge": target_edge,
+            "tolerance": tolerance,
+            "max_attempts": max_attempts,
+        }
+
     if shooting_mode == "fixed":
         offense_ids = getattr(base_env, "offense_ids", [])
         offense_count = len(offense_ids)

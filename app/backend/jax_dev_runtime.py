@@ -46,6 +46,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_target_temperature",
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -66,6 +67,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_target_temperature": 1.0,
     "rebound_target_uniform_mix": 0.0,
     "rebound_winner_distance_weight": 1.0,
+    "rebound_basket_position_weight": 0.0,
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
     "rebound_skill_sampling_mode": "gaussian",
@@ -85,6 +87,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_target_temperature": "float",
     "rebound_target_uniform_mix": "float",
     "rebound_winner_distance_weight": "float",
+    "rebound_basket_position_weight": "float",
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
     "rebound_skill_sampling_mode": "str",
@@ -557,6 +560,59 @@ class JaxDevRuntime:
             game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
             game_state.prev_obs = None
             self._capture_turn_start(game_state)
+
+    def set_current_rebound_skills(
+        self,
+        rebound_skills: list[float],
+        *,
+        rebound_skill_specialists: list[bool] | None = None,
+        game_state: Any | None = None,
+    ) -> dict[str, Any]:
+        """Override current-state rebound skills without resetting or advancing RNG."""
+        if self.state is None:
+            raise RuntimeError("JAX runtime is not initialized.")
+        values = np.asarray(rebound_skills, dtype=np.float32).reshape(-1)
+        if values.size != int(self.n_players):
+            raise ValueError(f"Expected {self.n_players} rebound skill values, got {values.size}.")
+
+        current_skill = np.asarray(getattr(self.state, "rebound_skill"), dtype=np.float32)
+        if current_skill.ndim != 2:
+            raise RuntimeError("Unexpected rebound_skill state shape.")
+        batch_size = int(current_skill.shape[0])
+        skill_batch = np.broadcast_to(values[None, :], (batch_size, values.size)).astype(np.float32)
+
+        if rebound_skill_specialists is None:
+            if _rebound_skill_sampling_mode_from_static(self.static) == "one_high_per_team":
+                specialist_values = (values > 0.0).astype(np.float32)
+            else:
+                specialist_values = np.zeros_like(values, dtype=np.float32)
+        else:
+            specialist_values = np.asarray(rebound_skill_specialists, dtype=np.float32).reshape(-1)
+            if specialist_values.size != int(self.n_players):
+                raise ValueError(
+                    f"Expected {self.n_players} rebound skill specialist values, got {specialist_values.size}."
+                )
+            specialist_values = np.where(specialist_values > 0.0, 1.0, 0.0).astype(np.float32)
+        specialist_batch = np.broadcast_to(
+            specialist_values[None, :],
+            (batch_size, specialist_values.size),
+        ).astype(np.float32)
+
+        self.state = self.state._replace(
+            rebound_skill=self.jnp.asarray(skill_batch, dtype=self.jnp.float32),
+            rebound_skill_specialist=self.jnp.asarray(specialist_batch, dtype=self.jnp.float32),
+        )
+        self._last_policy_probs = None
+        self._clear_attention_payload_cache()
+        self._sync_display_env()
+        if game_state is not None:
+            game_state.env = self.display_env
+            game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+            game_state.prev_obs = None
+        return {
+            "rebound_skills": [float(v) for v in values.tolist()],
+            "rebound_skill_specialists": [bool(v > 0.0) for v in specialist_values.tolist()],
+        }
 
     def refresh_static_from_display_env(self) -> None:
         """Refresh immutable JAX kernel config after live display-env edits."""
@@ -1491,10 +1547,23 @@ class JaxDevRuntime:
         rebound_skill = np.asarray(self.jax.device_get(_field0(next_state, "rebound_skill")), dtype=np.float64)
         skill_weight = float(np.asarray(self.jax.device_get(self.static.rebound_skill_weight)))
         effective_distances = distances - (max(0.0, skill_weight) * rebound_skill)
+        basket_distances_by_cell = np.asarray(
+            self.jax.device_get(self.static.basket_distance_by_cell),
+            dtype=np.float64,
+        )
+        target_basket_distance = float(
+            basket_distances_by_cell[int(np.clip(sampled_target_cell, 0, len(coords) - 1))]
+        )
+        player_basket_distances = basket_distances_by_cell[safe_indices]
+        basket_position_penalties = np.maximum(0.0, player_basket_distances - target_basket_distance)
         weight = float(np.asarray(self.jax.device_get(self.static.rebound_winner_distance_weight)))
+        basket_weight = float(np.asarray(self.jax.device_get(self.static.rebound_basket_position_weight)))
         temp = float(np.asarray(self.jax.device_get(self.static.rebound_winner_temperature)))
         temp = max(1.0e-6, temp if np.isfinite(temp) else 1.0)
-        global_logits = (-max(0.0, weight) * effective_distances) / temp
+        global_logits = (
+            (-max(0.0, weight) * effective_distances)
+            - (max(0.0, basket_weight) * basket_position_penalties)
+        ) / temp
 
         contest_mode = kernel_contest_mode
         radius_used: int | None = None
@@ -1529,6 +1598,9 @@ class JaxDevRuntime:
                 "conditional_prob": prob,
                 "distance_to_sampled_target": int(round(float(distances[pid]))),
                 "effective_distance_to_sampled_target": float(effective_distances[pid]),
+                "distance_to_basket": float(player_basket_distances[pid]),
+                "target_distance_to_basket": float(target_basket_distance),
+                "basket_position_penalty": float(basket_position_penalties[pid]),
                 "rebound_skill": float(rebound_skill[pid]),
                 "eligible": bool(eligible[pid]),
                 "contest_mode": contest_mode,
@@ -2305,6 +2377,7 @@ class JaxDevRuntime:
                 "target_temperature": float(getattr(self.display_env, "rebound_target_temperature", 1.0)),
                 "target_uniform_mix": float(getattr(self.display_env, "rebound_target_uniform_mix", 0.0)),
                 "winner_distance_weight": float(getattr(self.display_env, "rebound_winner_distance_weight", 1.0)),
+                "basket_position_weight": _float_from_static_field(self.static, "rebound_basket_position_weight", 0.0),
                 "winner_temperature": float(getattr(self.display_env, "rebound_winner_temperature", 1.0)),
                 "skill_std": float(getattr(self.display_env, "rebound_skill_std", 0.0)),
                 "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(self.static),

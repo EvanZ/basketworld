@@ -77,6 +77,7 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "rebound_target_temperature",
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -93,6 +94,7 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
 
 _REBOUND_RUNTIME_STICKY_ENV_KEYS = {
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -221,6 +223,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "rebound_target_temperature": float,
     "rebound_target_uniform_mix": float,
     "rebound_winner_distance_weight": float,
+    "rebound_basket_position_weight": float,
     "rebound_winner_temperature": float,
     "rebound_skill_std": float,
     "rebound_skill_sampling_mode": str,
@@ -265,6 +268,7 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
             "rebound_skill_high",
             "rebound_skill_low",
             "rebound_skill_weight",
+            "rebound_basket_position_weight",
             "rebound_contest_mode",
             "rebound_obs_top_n_targets",
             "rebound_terminal_reward_mode",

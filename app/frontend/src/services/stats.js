@@ -86,6 +86,23 @@ export function getDefaultStats() {
       eligibility: {},
       resolvedParams: {},
     },
+    valueDiagnostics: {
+      discount_gamma: 0,
+      sample_count: 0,
+      completed_episode_count: 0,
+      offense_value_mean: 0,
+      defense_value_mean: 0,
+      value_sum_mean: 0,
+      value_sum_abs_mean: 0,
+      offense_return_mean: 0,
+      defense_return_mean: 0,
+      return_sum_mean: 0,
+      return_sum_abs_mean: 0,
+      offense_value_bias_mean: 0,
+      defense_value_bias_mean: 0,
+      offense_value_mae: 0,
+      defense_value_mae: 0,
+    },
   };
 }
 
@@ -189,6 +206,9 @@ export function loadStats() {
           ? { ...parsed.reboundDiagnostics.resolvedParams }
           : {},
       },
+      valueDiagnostics: (parsed?.valueDiagnostics && typeof parsed.valueDiagnostics === 'object')
+        ? { ...parsed.valueDiagnostics }
+        : getDefaultStats().valueDiagnostics,
     };
   } catch (e) {
     // Corrupt storage; reset

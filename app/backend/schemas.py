@@ -3,12 +3,21 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 
+class ReboundSkillSamplingSetup(BaseModel):
+    mode: Literal["constrained_gaussian"] = "constrained_gaussian"
+    std: float = 1.0
+    target_edge: float = 0.0
+    tolerance: float = 0.25
+    max_attempts: int = 5000
+
+
 class CustomEvalSetup(BaseModel):
     initial_positions: list[tuple[int, int]] | None = None
     ball_holder: int | None = None
     shooting_mode: Literal["random", "fixed"] = "random"
     offense_skills: dict[str, list[float]] | None = None
     rebound_skills: list[float] | None = None
+    rebound_skill_sampling: ReboundSkillSamplingSetup | None = None
 
 
 class InitGameRequest(BaseModel):
@@ -169,6 +178,11 @@ class ReplayCounterfactualRequest(BaseModel):
     max_steps: int = 256
 
 
+class SetCurrentReboundSkillsRequest(BaseModel):
+    rebound_skills: List[float]
+    rebound_skill_specialists: List[bool] | None = None
+
+
 class PlaybookAnalysisRequest(BaseModel):
     intent_indices: List[int]
     num_rollouts: int = 16
@@ -238,6 +252,7 @@ class SetPressureParamsRequest(BaseModel):
     defender_pressure_decay_lambda: float | None = None
     # Rebounding winner model
     rebound_winner_distance_weight: float | None = None
+    rebound_basket_position_weight: float | None = None
     rebound_winner_temperature: float | None = None
     rebound_skill_std: float | None = None
     rebound_skill_sampling_mode: str | None = None

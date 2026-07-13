@@ -209,6 +209,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_target_temperature",
         "rebound_target_uniform_mix",
         "rebound_winner_distance_weight",
+        "rebound_basket_position_weight",
         "rebound_winner_temperature",
         "rebound_skill_std",
         "rebound_skill_sampling_mode",
@@ -313,6 +314,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_target_temperature",
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -787,8 +789,39 @@ def parse_args(argv=None):
         help=(
             "Probability that a frozen opponent episode uses deterministic argmax "
             "actions instead of sampled actions. The choice is held fixed until "
-            "that env row resets."
+            "that env row resets. Used as a constant fallback when no schedule "
+            "start/end is provided."
         ),
+    )
+    parser.add_argument(
+        "--opponent-deterministic-episode-prob-start",
+        type=float,
+        default=None,
+        help=(
+            "Optional starting probability for a linear schedule controlling "
+            "frozen-opponent deterministic argmax episodes."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-deterministic-episode-prob-end",
+        type=float,
+        default=None,
+        help=(
+            "Optional ending probability for a linear schedule controlling "
+            "frozen-opponent deterministic argmax episodes."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-deterministic-episode-prob-warmup-updates",
+        type=int,
+        default=0,
+        help="Updates to hold the deterministic-opponent schedule at the start value.",
+    )
+    parser.add_argument(
+        "--opponent-deterministic-episode-prob-ramp-updates",
+        type=int,
+        default=1,
+        help="Updates over which to linearly ramp deterministic-opponent probability.",
     )
     parser.add_argument(
         "--enable-rebounds",
@@ -821,6 +854,15 @@ def parse_args(argv=None):
         type=float,
         default=1.0,
         help="Distance penalty weight for choosing the rebound winner from the target cell.",
+    )
+    parser.add_argument(
+        "--rebound-basket-position-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty weight for rebounders farther from the basket than the sampled "
+            "rebound target. Zero preserves distance-only winner logits."
+        ),
     )
     parser.add_argument(
         "--rebound-winner-temperature",
@@ -999,11 +1041,23 @@ def validate_train_args(args) -> None:
         raise SystemExit("--num-intents must be >= 1.")
     if int(getattr(args, "intent_commitment_steps", 4)) < 1:
         raise SystemExit("--intent-commitment-steps must be >= 1.")
-    opponent_deterministic_episode_prob = float(
-        getattr(args, "opponent_deterministic_episode_prob", 0.0)
-    )
-    if opponent_deterministic_episode_prob < 0.0 or opponent_deterministic_episode_prob > 1.0:
-        raise SystemExit("--opponent-deterministic-episode-prob must be in [0, 1].")
+    for key in (
+        "opponent_deterministic_episode_prob",
+        "opponent_deterministic_episode_prob_start",
+        "opponent_deterministic_episode_prob_end",
+    ):
+        raw_value = getattr(args, key, None)
+        if raw_value is None:
+            continue
+        value = float(raw_value)
+        if value < 0.0 or value > 1.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be in [0, 1].")
+    for key in (
+        "opponent_deterministic_episode_prob_warmup_updates",
+        "opponent_deterministic_episode_prob_ramp_updates",
+    ):
+        if int(getattr(args, key, 0)) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
     if bool(getattr(args, "enable_rebounds", False)):
         rebound_table_model_dir = str(getattr(args, "rebound_table_model_dir", "") or "").strip()
         if not rebound_table_model_dir:
@@ -1019,6 +1073,8 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-target-uniform-mix must be in [0, 1].")
     if float(getattr(args, "rebound_winner_distance_weight", 1.0)) < 0.0:
         raise SystemExit("--rebound-winner-distance-weight must be >= 0.")
+    if float(getattr(args, "rebound_basket_position_weight", 0.0)) < 0.0:
+        raise SystemExit("--rebound-basket-position-weight must be >= 0.")
     if float(getattr(args, "rebound_skill_std", 0.0)) < 0.0:
         raise SystemExit("--rebound-skill-std must be >= 0.")
     rebound_skill_sampling_mode = str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian").strip().lower()
@@ -1346,11 +1402,28 @@ def _checkpoint_trainer_config_from_args(
         "opponent_deterministic_episode_prob": float(
             getattr(args, "opponent_deterministic_episode_prob", 0.0)
         ),
+        "opponent_deterministic_episode_prob_start": (
+            None
+            if getattr(args, "opponent_deterministic_episode_prob_start", None) is None
+            else float(getattr(args, "opponent_deterministic_episode_prob_start"))
+        ),
+        "opponent_deterministic_episode_prob_end": (
+            None
+            if getattr(args, "opponent_deterministic_episode_prob_end", None) is None
+            else float(getattr(args, "opponent_deterministic_episode_prob_end"))
+        ),
+        "opponent_deterministic_episode_prob_warmup_updates": int(
+            getattr(args, "opponent_deterministic_episode_prob_warmup_updates", 0)
+        ),
+        "opponent_deterministic_episode_prob_ramp_updates": int(
+            getattr(args, "opponent_deterministic_episode_prob_ramp_updates", 1)
+        ),
         "enable_rebounds": bool(getattr(args, "enable_rebounds", False)),
         "rebound_table_model_dir": str(getattr(args, "rebound_table_model_dir", "") or ""),
         "rebound_target_temperature": float(getattr(args, "rebound_target_temperature", 1.0)),
         "rebound_target_uniform_mix": float(getattr(args, "rebound_target_uniform_mix", 0.0)),
         "rebound_winner_distance_weight": float(getattr(args, "rebound_winner_distance_weight", 1.0)),
+        "rebound_basket_position_weight": float(getattr(args, "rebound_basket_position_weight", 0.0)),
         "rebound_winner_temperature": float(getattr(args, "rebound_winner_temperature", 1.0)),
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "rebound_skill_sampling_mode": str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian"),
@@ -2167,6 +2240,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rebound_skill_high": float(getattr(args, "rebound_skill_high", 1.0)),
         "jax/rebound_skill_low": float(getattr(args, "rebound_skill_low", -0.25)),
         "jax/rebound_skill_weight": float(getattr(args, "rebound_skill_weight", 0.0)),
+        "jax/rebound_basket_position_weight": float(getattr(args, "rebound_basket_position_weight", 0.0)),
         "jax/rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
         "jax/rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
         "jax/rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
@@ -2221,6 +2295,22 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/opponent_pool_exploration": float(getattr(args, "opponent_pool_exploration", 0.0)),
         "jax/opponent_deterministic_episode_prob": float(
             getattr(args, "opponent_deterministic_episode_prob", 0.0)
+        ),
+        "jax/opponent_deterministic_episode_prob_start": (
+            None
+            if getattr(args, "opponent_deterministic_episode_prob_start", None) is None
+            else float(getattr(args, "opponent_deterministic_episode_prob_start"))
+        ),
+        "jax/opponent_deterministic_episode_prob_end": (
+            None
+            if getattr(args, "opponent_deterministic_episode_prob_end", None) is None
+            else float(getattr(args, "opponent_deterministic_episode_prob_end"))
+        ),
+        "jax/opponent_deterministic_episode_prob_warmup_updates": int(
+            getattr(args, "opponent_deterministic_episode_prob_warmup_updates", 0)
+        ),
+        "jax/opponent_deterministic_episode_prob_ramp_updates": int(
+            getattr(args, "opponent_deterministic_episode_prob_ramp_updates", 1)
         ),
         "jax/grouped_opponent_sampling": _uses_grouped_opponent_sampling(args),
         "jax/opponent_group_count": int(getattr(args, "opponent_group_count", 8)),
@@ -2447,6 +2537,92 @@ def _safe_metric_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if float(denominator) > 0.0 else 0.0
 
 
+def _masked_value_diagnostics(values, returns, mask) -> dict[str, float]:
+    values_np = np.asarray(values, dtype=np.float32).reshape(-1)
+    returns_np = np.asarray(returns, dtype=np.float32).reshape(-1)
+    mask_np = np.asarray(mask, dtype=np.float32).reshape(-1)
+    empty = {
+        "sample_count": 0.0,
+        "value_mean": 0.0,
+        "return_mean": 0.0,
+        "value_bias_mean": 0.0,
+        "value_mae": 0.0,
+        "value_rmse": 0.0,
+        "explained_variance": 0.0,
+    }
+    if values_np.size != returns_np.size or values_np.size != mask_np.size:
+        return dict(empty)
+    weight_sum = float(mask_np.sum())
+    if weight_sum <= 0.0:
+        return dict(empty)
+    error = values_np - returns_np
+    value_mean = float((values_np * mask_np).sum() / weight_sum)
+    return_mean = float((returns_np * mask_np).sum() / weight_sum)
+    value_bias_mean = float((error * mask_np).sum() / weight_sum)
+    value_mae = float((np.abs(error) * mask_np).sum() / weight_sum)
+    value_rmse = float(np.sqrt((np.square(error) * mask_np).sum() / weight_sum))
+    centered_returns = returns_np - return_mean
+    return_var = float((np.square(centered_returns) * mask_np).sum() / weight_sum)
+    error_var = float((np.square(error) * mask_np).sum() / weight_sum)
+    explained_variance = float(1.0 - (error_var / return_var)) if return_var > 1.0e-8 else 0.0
+    return {
+        "sample_count": weight_sum,
+        "value_mean": value_mean,
+        "return_mean": return_mean,
+        "value_bias_mean": value_bias_mean,
+        "value_mae": value_mae,
+        "value_rmse": value_rmse,
+        "explained_variance": explained_variance,
+    }
+
+
+def _summarize_combined_value_diagnostics(metrics: dict[str, Any]) -> dict[str, float]:
+    offense_samples = _metric_float(metrics, "offense_value_sample_count")
+    defense_samples = _metric_float(metrics, "defense_value_sample_count")
+    total_samples = offense_samples + defense_samples
+    if total_samples <= 0.0:
+        return {
+            "value_sample_count": 0.0,
+            "value_bias_mean": 0.0,
+            "value_mae": 0.0,
+            "value_rmse": 0.0,
+            "value_explained_variance_mean": 0.0,
+            "independent_role_value_sum_mean": 0.0,
+            "independent_role_value_sum_abs_mean": 0.0,
+            "independent_role_return_sum_mean": 0.0,
+            "independent_role_return_sum_abs_mean": 0.0,
+        }
+    offense_bias = _metric_float(metrics, "offense_value_bias_mean")
+    defense_bias = _metric_float(metrics, "defense_value_bias_mean")
+    offense_mae = _metric_float(metrics, "offense_value_mae")
+    defense_mae = _metric_float(metrics, "defense_value_mae")
+    offense_rmse_sq = _metric_float(metrics, "offense_value_rmse") ** 2
+    defense_rmse_sq = _metric_float(metrics, "defense_value_rmse") ** 2
+    offense_ev = _metric_float(metrics, "offense_value_explained_variance")
+    defense_ev = _metric_float(metrics, "defense_value_explained_variance")
+    offense_value_mean = _metric_float(metrics, "offense_value_mean")
+    defense_value_mean = _metric_float(metrics, "defense_value_mean")
+    offense_return_mean = _metric_float(metrics, "offense_return_mean")
+    defense_return_mean = _metric_float(metrics, "defense_return_mean")
+    independent_value_sum = offense_value_mean + defense_value_mean
+    independent_return_sum = offense_return_mean + defense_return_mean
+    return {
+        "value_sample_count": total_samples,
+        "value_bias_mean": ((offense_bias * offense_samples) + (defense_bias * defense_samples)) / total_samples,
+        "value_mae": ((offense_mae * offense_samples) + (defense_mae * defense_samples)) / total_samples,
+        "value_rmse": float(
+            np.sqrt(((offense_rmse_sq * offense_samples) + (defense_rmse_sq * defense_samples)) / total_samples)
+        ),
+        "value_explained_variance_mean": (
+            (offense_ev * offense_samples) + (defense_ev * defense_samples)
+        ) / total_samples,
+        "independent_role_value_sum_mean": independent_value_sum,
+        "independent_role_value_sum_abs_mean": abs(independent_value_sum),
+        "independent_role_return_sum_mean": independent_return_sum,
+        "independent_role_return_sum_abs_mean": abs(independent_return_sum),
+    }
+
+
 _CUMULATIVE_EPISODE_USAGE_KEYS = (
     "active_step_count",
     "ppo_used_active_step_count",
@@ -2669,6 +2845,30 @@ def _build_reward_component_arrays(rollout, static, task_reward_scale: float, jn
         "phi_reward": phi_reward,
         "intent_bonus": jnp.zeros_like(task_reward, dtype=jnp.float32),
     }
+
+
+def _opponent_deterministic_episode_prob_for_update(args, update_index: int) -> float:
+    start_raw = getattr(args, "opponent_deterministic_episode_prob_start", None)
+    end_raw = getattr(args, "opponent_deterministic_episode_prob_end", None)
+    base = float(getattr(args, "opponent_deterministic_episode_prob", 0.0))
+    if start_raw is None and end_raw is None:
+        return base
+    start = base if start_raw is None else float(start_raw)
+    end = start if end_raw is None else float(end_raw)
+    return _linear_update_schedule(
+        update_index,
+        start=start,
+        end=end,
+        warmup_updates=int(getattr(args, "opponent_deterministic_episode_prob_warmup_updates", 0)),
+        ramp_updates=int(getattr(args, "opponent_deterministic_episode_prob_ramp_updates", 1)),
+    )
+
+
+def _opponent_deterministic_episode_prob_is_scheduled(args) -> bool:
+    return (
+        getattr(args, "opponent_deterministic_episode_prob_start", None) is not None
+        or getattr(args, "opponent_deterministic_episode_prob_end", None) is not None
+    )
 
 
 def _selector_schedules_for_update(args, update_index: int) -> tuple[float, float]:
@@ -2974,6 +3174,24 @@ def _summarize_role_rollout_metrics(
             jax,
             jnp,
         )
+        role_ppo_batch = build_ppo_batch(rollout, trainer_config, jax, jnp)
+        values_shape = np.asarray(rollout.trajectory.values).shape
+        value_diag = _masked_value_diagnostics(
+            rollout.trajectory.values,
+            np.asarray(role_ppo_batch.returns, dtype=np.float32).reshape(values_shape),
+            training_mask,
+        )
+        metrics.update(
+            {
+                f"{role}_value_sample_count": value_diag["sample_count"],
+                f"{role}_value_mean": value_diag["value_mean"],
+                f"{role}_return_mean": value_diag["return_mean"],
+                f"{role}_value_bias_mean": value_diag["value_bias_mean"],
+                f"{role}_value_mae": value_diag["value_mae"],
+                f"{role}_value_rmse": value_diag["value_rmse"],
+                f"{role}_value_explained_variance": value_diag["explained_variance"],
+            }
+        )
         metrics.update(
             summarize_ppo_eligible_episode_metrics(
                 f"{role}_ppo_eligible",
@@ -3083,6 +3301,19 @@ def _print_checkpoint_summary(
         ("entropy_bonus", metrics.get("entropy_bonus")),
         ("policy_loss", metrics.get("policy_loss")),
         ("value_loss", metrics.get("value_loss")),
+        ("value_sample_count", metrics.get("value_sample_count")),
+        ("offense_value_bias_mean", metrics.get("offense_value_bias_mean")),
+        ("defense_value_bias_mean", metrics.get("defense_value_bias_mean")),
+        ("value_bias_mean", metrics.get("value_bias_mean")),
+        ("offense_value_mae", metrics.get("offense_value_mae")),
+        ("defense_value_mae", metrics.get("defense_value_mae")),
+        ("offense_value_explained_variance", metrics.get("offense_value_explained_variance")),
+        ("defense_value_explained_variance", metrics.get("defense_value_explained_variance")),
+        ("value_explained_variance_mean", metrics.get("value_explained_variance_mean")),
+        ("independent_role_value_sum_mean", metrics.get("independent_role_value_sum_mean")),
+        ("independent_role_value_sum_abs_mean", metrics.get("independent_role_value_sum_abs_mean")),
+        ("independent_role_return_sum_mean", metrics.get("independent_role_return_sum_mean")),
+        ("independent_role_return_sum_abs_mean", metrics.get("independent_role_return_sum_abs_mean")),
         ("total_loss", metrics.get("total_loss")),
         ("grad_norm", metrics.get("grad_norm")),
         ("mean_reward", metrics.get("mean_reward")),
@@ -3098,6 +3329,7 @@ def _print_checkpoint_summary(
         ("opponent_source", metrics.get("opponent_source")),
         ("opponent_group_count", metrics.get("opponent_group_count")),
         ("opponent_unique_update_count", metrics.get("opponent_unique_update_count")),
+        ("opponent_deterministic_episode_prob", metrics.get("opponent_deterministic_episode_prob")),
         ("opponent_deterministic_episode_rate", metrics.get("opponent_deterministic_episode_rate")),
         ("task_reward_scale", metrics.get("task_reward_scale")),
         ("intent_disc_active_count", metrics.get("intent_disc_active_count")),
@@ -3454,6 +3686,10 @@ def run_training_loop(args) -> dict[str, Any]:
                 for role in TRAINING_ROLES
             }
             selector_alpha, selector_eps = _selector_schedules_for_update(args, update_idx)
+            opponent_deterministic_episode_prob = _opponent_deterministic_episode_prob_for_update(
+                args,
+                update_idx,
+            )
             selector_multiselect_enabled = bool(
                 getattr(args, "intent_selector_multiselect_enabled", False)
             )
@@ -3476,7 +3712,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_multiselect_enabled,
                         selector_min_play_steps,
                         single_episode_rollout,
-                        float(getattr(args, "opponent_deterministic_episode_prob", 0.0)),
+                        float(opponent_deterministic_episode_prob),
                     )
                 elif opponent_params is None:
                     role_rollouts[role] = rollout_runner(
@@ -3504,7 +3740,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         selector_multiselect_enabled,
                         selector_min_play_steps,
                         single_episode_rollout,
-                        float(getattr(args, "opponent_deterministic_episode_prob", 0.0)),
+                        float(opponent_deterministic_episode_prob),
                     )
             block_until_ready_tree(role_rollouts)
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
@@ -3768,6 +4004,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         intent_bonus_rewards=role_components["intent_bonus"],
                     )
                 )
+            last_metrics.update(_summarize_combined_value_diagnostics(last_metrics))
             if bool(getattr(args, "intent_selector_enabled", False)):
                 last_metrics.update(
                     summarize_selector_metrics(
@@ -3783,6 +4020,12 @@ def run_training_loop(args) -> dict[str, Any]:
             last_metrics["task_reward_scale_is_scheduled"] = float(
                 getattr(args, "task_reward_scale_start", None) is not None
                 or getattr(args, "task_reward_scale_end", None) is not None
+            )
+            last_metrics["opponent_deterministic_episode_prob"] = float(
+                opponent_deterministic_episode_prob
+            )
+            last_metrics["opponent_deterministic_episode_prob_is_scheduled"] = float(
+                _opponent_deterministic_episode_prob_is_scheduled(args)
             )
             last_metrics["phi_beta"] = float(phi_beta)
             last_metrics["phi_beta_is_scheduled"] = float(

@@ -23,6 +23,7 @@ import {
   captureCounterfactualSnapshot,
   restoreCounterfactualSnapshot,
   replayCounterfactualSnapshot,
+  setCurrentReboundSkills,
   setShotPressureParams,
   setPassInterceptionParams,
   setDefenderPressureParams,
@@ -357,6 +358,53 @@ function coerceTrainingBool(value, fallback = false) {
 const trainingParamsForUi = computed(() => normalizeTrainingParamsForUi(props.gameState?.training_params || {}));
 const paramCounts = computed(() => trainingParamsForUi.value?.param_counts || null);
 const selectorTrainingParams = computed(() => trainingParamsForUi.value || {});
+function formatProbabilityPercent(value, digits = 1) {
+  if (value === null || value === undefined || value === '') return 'N/A';
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  const pct = Math.abs(numeric) <= 1 ? numeric * 100 : numeric;
+  return `${pct.toFixed(digits)}%`;
+}
+const opponentDeterministicEpisodeSummary = computed(() => {
+  const params = trainingParamsForUi.value || {};
+  const start = params.opponent_deterministic_episode_prob_start;
+  const end = params.opponent_deterministic_episode_prob_end;
+  const base = params.opponent_deterministic_episode_prob;
+  if (start !== null && start !== undefined && start !== '') {
+    if (end !== null && end !== undefined && end !== '' && Number(end) !== Number(start)) {
+      return `${formatProbabilityPercent(start)} → ${formatProbabilityPercent(end)}`;
+    }
+    return formatProbabilityPercent(start);
+  }
+  if (base !== null && base !== undefined && base !== '') {
+    return formatProbabilityPercent(base);
+  }
+  if (params.deterministic_opponent !== null && params.deterministic_opponent !== undefined && params.deterministic_opponent !== '') {
+    return coerceTrainingBool(params.deterministic_opponent, false) ? '100.0%' : '0.0%';
+  }
+  return 'N/A';
+});
+const opponentDeterministicEpisodeObservedSummary = computed(() => {
+  const params = trainingParamsForUi.value || {};
+  return formatProbabilityPercent(params.opponent_deterministic_episode_rate);
+});
+const opponentDeterministicEpisodeIsScheduled = computed(() => {
+  const params = trainingParamsForUi.value || {};
+  return (
+    params.opponent_deterministic_episode_prob_start !== null
+    && params.opponent_deterministic_episode_prob_start !== undefined
+    && params.opponent_deterministic_episode_prob_start !== ''
+  ) || (
+    params.opponent_deterministic_episode_prob_end !== null
+    && params.opponent_deterministic_episode_prob_end !== undefined
+    && params.opponent_deterministic_episode_prob_end !== ''
+  );
+});
+const opponentDeterministicEpisodeScheduleSummary = computed(() => (
+  opponentDeterministicEpisodeIsScheduled.value
+    ? formatScheduleWindow(trainingParamsForUi.value || {}, 'opponent_deterministic_episode_prob')
+    : ''
+));
 const selectorEnabled = computed(() =>
   coerceTrainingBool(selectorTrainingParams.value?.intent_selector_enabled, false)
 );
@@ -562,6 +610,9 @@ const offenseSkillInputs = ref({ layup: [], three_pt: [], dunk: [] });
 const offenseSkillSampled = ref({ layup: [], three_pt: [], dunk: [] });
 const skillsUpdating = ref(false);
 const skillsError = ref(null);
+const reboundSkillInputs = ref([]);
+const reboundSkillUpdating = ref(false);
+const reboundSkillError = ref(null);
 const passStrategyUpdating = ref(false);
 const passStrategyError = ref(null);
 const passLogitBiasInput = ref(0);
@@ -627,6 +678,7 @@ const pressureParamsInput = ref({
   max_receiver_hazard: 0.85,
   lane_weight: 0.0,
   rebound_winner_distance_weight: 1.0,
+  rebound_basket_position_weight: 0.0,
   rebound_winner_temperature: 1.0,
   rebound_skill_std: 0.0,
   rebound_skill_sampling_mode: 'gaussian',
@@ -681,6 +733,7 @@ const PASS_INTERCEPTION_PARAM_KEYS = [
 ];
 const REBOUND_PARAM_KEYS = [
   'rebound_winner_distance_weight',
+  'rebound_basket_position_weight',
   'rebound_winner_temperature',
   'rebound_skill_std',
   'rebound_skill_sampling_mode',
@@ -827,6 +880,15 @@ function fillOffenseSkills(targetRef, sourceSkills) {
   };
 }
 
+function fillReboundSkillInputsFromGameState() {
+  const liveSkills = props.gameState?.player_rebound_skills || {};
+  reboundSkillInputs.value = allPlayerIds.value.map((pid) => {
+    const raw = liveSkills?.[String(pid)] ?? liveSkills?.[pid] ?? 0;
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+}
+
 watch(() => props.gameState?.offense_shooting_pct_by_player, (skills) => {
   fillOffenseSkills(offenseSkillInputs, skills);
 }, { immediate: true, deep: true });
@@ -907,6 +969,7 @@ function syncPressureParamsInputs(state) {
     max_receiver_hazard: Number(src.max_receiver_hazard ?? 0.85),
     lane_weight: Number(src.lane_weight ?? 0.0),
     rebound_winner_distance_weight: Number(src.rebound_winner_distance_weight ?? reboundRuntime.winner_distance_weight ?? 1.0),
+    rebound_basket_position_weight: Number(src.rebound_basket_position_weight ?? reboundRuntime.basket_position_weight ?? 0.0),
     rebound_winner_temperature: Number(src.rebound_winner_temperature ?? reboundRuntime.winner_temperature ?? 1.0),
     rebound_skill_std: Number(src.rebound_skill_std ?? reboundRuntime.skill_std ?? 0.0),
     rebound_skill_sampling_mode: normalizeReboundSkillSamplingModeValue(src.rebound_skill_sampling_mode ?? reboundRuntime.skill_sampling_mode ?? 'gaussian'),
@@ -965,6 +1028,7 @@ watch(
     props.gameState?.max_receiver_hazard,
     props.gameState?.lane_weight,
     props.gameState?.rebound_winner_distance_weight,
+    props.gameState?.rebound_basket_position_weight,
     props.gameState?.rebound_winner_temperature,
     props.gameState?.rebound_skill_std,
     props.gameState?.rebound_skill_sampling_mode,
@@ -974,6 +1038,7 @@ watch(
     props.gameState?.rebound_contest_mode,
     props.gameState?.rebound_contest_radius,
     props.gameState?.rebound_runtime?.winner_distance_weight,
+    props.gameState?.rebound_runtime?.basket_position_weight,
     props.gameState?.rebound_runtime?.winner_temperature,
     props.gameState?.rebound_runtime?.skill_std,
     props.gameState?.rebound_runtime?.skill_sampling_mode,
@@ -1532,8 +1597,9 @@ const sampledReboundSkillRows = computed(() => {
   const liveSkills = props.gameState.player_rebound_skills || {};
   const liveSpecialists = props.gameState.player_rebound_skill_specialists || {};
   const offense = new Set((props.gameState.offense_ids || []).map(Number));
-  return allPlayerIds.value.map((pid) => {
-    const raw = liveSkills?.[String(pid)] ?? liveSkills?.[pid] ?? 0;
+  return allPlayerIds.value.map((pid, idx) => {
+    const fallback = liveSkills?.[String(pid)] ?? liveSkills?.[pid] ?? 0;
+    const raw = reboundSkillInputs.value?.[idx] ?? fallback;
     const numeric = Number(raw);
     const specialist = Boolean(liveSpecialists?.[String(pid)] ?? liveSpecialists?.[pid] ?? false);
     return {
@@ -1552,6 +1618,15 @@ function percentToProb(percent) {
   return clamped / 100;
 }
 
+const reboundSkillSampler = ref({
+  std: 1.0,
+  targetEdge: 0.0,
+  tolerance: 0.25,
+  maxAttempts: 5000,
+});
+const reboundSkillSamplerStatus = ref('');
+const reboundSkillSamplerError = ref('');
+
 const defaultEvalConfig = () => ({
   mode: 'default',
   placementEditing: false,
@@ -1561,6 +1636,13 @@ const defaultEvalConfig = () => ({
   skills: { layup: [], three_pt: [], dunk: [] },
   reboundSkills: [],
   reboundSkillsPinned: false,
+  reboundSkillSampling: {
+    mode: 'model',
+    std: 1.0,
+    targetEdge: 0.0,
+    tolerance: 0.25,
+    maxAttempts: 5000,
+  },
   showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
@@ -2075,11 +2157,27 @@ const evalConfigSafe = computed(() => {
     ...base,
     ...incoming,
     skills: { ...base.skills, ...(incoming.skills || {}) },
+    reboundSkillSampling: { ...base.reboundSkillSampling, ...(incoming.reboundSkillSampling || {}) },
     reboundSkills: Array.isArray(incoming.reboundSkills) ? incoming.reboundSkills : base.reboundSkills,
     reboundSkillsPinned: Boolean(incoming.reboundSkillsPinned ?? base.reboundSkillsPinned),
     showReboundSkillsOnBoard: Boolean(incoming.showReboundSkillsOnBoard ?? base.showReboundSkillsOnBoard),
   };
 });
+
+watch(
+  () => evalConfigSafe.value.reboundSkillSampling,
+  (sampling) => {
+    const current = reboundSkillSampler.value || {};
+    reboundSkillSampler.value = {
+      mode: String(sampling?.mode ?? current.mode ?? 'model'),
+      std: Number(sampling?.std ?? current.std ?? 1.0),
+      targetEdge: Number(sampling?.targetEdge ?? current.targetEdge ?? 0.0),
+      tolerance: Number(sampling?.tolerance ?? current.tolerance ?? 0.25),
+      maxAttempts: Math.max(1, Math.floor(Number(sampling?.maxAttempts ?? current.maxAttempts ?? 5000))),
+    };
+  },
+  { immediate: true, deep: true },
+);
 
 const envOptionalParamsForUi = computed(() =>
   normalizeTrainingParamsForUi({
@@ -3052,15 +3150,133 @@ function copySampledReboundSkillsFromGameState() {
   emitEvalConfigUpdate({ reboundSkills: nextSkills, reboundSkillsPinned: true, mode: 'custom' });
 }
 
+function normalizedReboundSkillSamplingPatch(patch = {}) {
+  const base = evalConfigSafe.value?.reboundSkillSampling || {};
+  const current = reboundSkillSampler.value || {};
+  return {
+    mode: String(patch.mode ?? base.mode ?? current.mode ?? 'model'),
+    std: Number(patch.std ?? current.std ?? base.std ?? 1.0),
+    targetEdge: Number(patch.targetEdge ?? current.targetEdge ?? base.targetEdge ?? 0.0),
+    tolerance: Number(patch.tolerance ?? current.tolerance ?? base.tolerance ?? 0.25),
+    maxAttempts: Math.max(1, Math.floor(Number(patch.maxAttempts ?? current.maxAttempts ?? base.maxAttempts ?? 5000))),
+  };
+}
+
+function updateReboundSkillSampler(key, value) {
+  const numeric = Number(value);
+  const current = reboundSkillSampler.value || {};
+  let safe = Number.isFinite(numeric) ? numeric : Number(current[key] ?? 0);
+  if (key === 'std') safe = Math.max(0, safe);
+  if (key === 'tolerance') safe = Math.max(0, safe);
+  if (key === 'maxAttempts') safe = Math.max(1, Math.floor(safe));
+  const next = normalizedReboundSkillSamplingPatch({ [key]: safe });
+  reboundSkillSampler.value = next;
+  emitEvalConfigUpdate({ reboundSkillSampling: next });
+}
+
+function setEvalReboundSkillSamplingMode(mode) {
+  const normalized = mode === 'constrained_gaussian' ? 'constrained_gaussian' : 'model';
+  const next = normalizedReboundSkillSamplingPatch({ mode: normalized });
+  reboundSkillSampler.value = next;
+  emitEvalConfigUpdate({ reboundSkillSampling: next });
+}
+
+function gaussianRandom() {
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function reboundTeamSkillEdge(skills) {
+  const offense = new Set((props.gameState?.offense_ids || []).map(Number));
+  const defense = new Set((props.gameState?.defense_ids || []).map(Number));
+  let offenseSum = 0;
+  let defenseSum = 0;
+  for (let idx = 0; idx < allPlayerIds.value.length; idx += 1) {
+    const pid = Number(allPlayerIds.value[idx]);
+    const value = Number(skills[idx] ?? 0);
+    const safe = Number.isFinite(value) ? value : 0;
+    if (offense.has(pid)) offenseSum += safe;
+    else if (defense.has(pid)) defenseSum += safe;
+  }
+  return { offenseSum, defenseSum, edge: offenseSum - defenseSum };
+}
+
+function sampleReboundSkillsForTeamEdge() {
+  const totalPlayers = allPlayerIds.value.length;
+  if (!totalPlayers) {
+    return { ok: false, error: 'No players available.', status: '' };
+  }
+
+  const cfg = reboundSkillSampler.value || {};
+  const std = Number(cfg.std);
+  const targetEdge = Number(cfg.targetEdge);
+  const tolerance = Number(cfg.tolerance);
+  const maxAttempts = Math.max(1, Math.floor(Number(cfg.maxAttempts) || 1));
+  if (!Number.isFinite(std) || std <= 0) {
+    return { ok: false, error: 'Sample std must be > 0.', status: '' };
+  }
+  if (!Number.isFinite(targetEdge) || !Number.isFinite(tolerance) || tolerance < 0) {
+    return { ok: false, error: 'Target edge and tolerance must be finite numbers.', status: '' };
+  }
+
+  let best = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const skills = Array.from({ length: totalPlayers }, () => gaussianRandom() * std);
+    const sums = reboundTeamSkillEdge(skills);
+    const error = Math.abs(sums.edge - targetEdge);
+    if (!best || error < best.error) {
+      best = { skills, sums, attempt, error };
+    }
+    if (error <= tolerance) {
+      return {
+        ok: true,
+        skills: skills.map((value) => Number(value.toFixed(3))),
+        status: `Accepted attempt ${attempt}: edge=${sums.edge.toFixed(3)} (O ${sums.offenseSum.toFixed(3)} / D ${sums.defenseSum.toFixed(3)})`,
+        error: '',
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error: `No draw landed within tolerance after ${maxAttempts} attempts; current skills were not changed.`,
+    status: best
+      ? `Closest edge=${best.sums.edge.toFixed(3)} (target ${targetEdge.toFixed(3)}, error ${best.error.toFixed(3)})`
+      : '',
+  };
+}
+
+function sampleEvalReboundSkillsByTeamEdge() {
+  const result = sampleReboundSkillsForTeamEdge();
+  reboundSkillSamplerError.value = result.error || '';
+  reboundSkillSamplerStatus.value = result.status || '';
+  if (!result.ok) return;
+  emitEvalConfigUpdate({ reboundSkills: result.skills, reboundSkillsPinned: true, mode: 'custom' });
+}
+
+function sampleCurrentReboundSkillInputsByTeamEdge() {
+  const result = sampleReboundSkillsForTeamEdge();
+  reboundSkillSamplerError.value = result.error || '';
+  reboundSkillSamplerStatus.value = result.status || '';
+  if (!result.ok) return;
+  reboundSkillInputs.value = result.skills;
+  reboundSkillError.value = null;
+}
+
 function setEvalShowReboundSkillsOnBoard(value) {
   emitEvalConfigUpdate({ showReboundSkillsOnBoard: Boolean(value) });
 }
 
 function handleEvalRunClick() {
+  const reboundSkillSampling = normalizedReboundSkillSamplingPatch();
   emit('eval-run', {
     numEpisodes: evalEpisodesInput.value,
     config: {
       ...evalConfigSafe.value,
+      reboundSkillSampling,
       envOverrides: _buildPressureSubsetPayload(REBOUND_PARAM_KEYS),
     },
   });
@@ -3345,6 +3561,40 @@ async function handleReplayCounterfactualSnapshot() {
     counterfactualSnapshotError.value = err?.message || 'Failed to replay current state';
   } finally {
     counterfactualSnapshotUpdating.value = false;
+  }
+}
+
+function currentReboundSkillInputValues() {
+  const totalPlayers = allPlayerIds.value.length;
+  return Array.from({ length: totalPlayers }, (_, idx) => {
+    const numeric = Number(reboundSkillInputs.value?.[idx] ?? 0);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+}
+
+function resetReboundSkillInputsToCurrent() {
+  fillReboundSkillInputsFromGameState();
+  reboundSkillError.value = null;
+}
+
+async function applyReboundSkillOverrides() {
+  if (!props.gameState || !allPlayerIds.value.length) return;
+  reboundSkillUpdating.value = true;
+  reboundSkillError.value = null;
+  try {
+    const res = await setCurrentReboundSkills({
+      rebound_skills: currentReboundSkillInputValues(),
+    });
+    if (res?.status === 'success' && res.state) {
+      emit('state-updated', res.state);
+    } else {
+      throw new Error(res?.detail || 'Failed to apply rebound skills');
+    }
+  } catch (err) {
+    console.error('[PlayerControls] Failed to apply rebound skills', err);
+    reboundSkillError.value = err?.message || 'Failed to apply rebound skills';
+  } finally {
+    reboundSkillUpdating.value = false;
   }
 }
 
@@ -3680,6 +3930,7 @@ function _normalizePressurePayload(input) {
     max_receiver_hazard: Number(input?.max_receiver_hazard ?? 0.85),
     lane_weight: Number(input?.lane_weight ?? 0.0),
     rebound_winner_distance_weight: Number(input?.rebound_winner_distance_weight ?? 1.0),
+    rebound_basket_position_weight: Number(input?.rebound_basket_position_weight ?? 0.0),
     rebound_winner_temperature: Number(input?.rebound_winner_temperature ?? 1.0),
     rebound_skill_std: Number(input?.rebound_skill_std ?? 0.0),
     rebound_skill_sampling_mode: normalizeReboundSkillSamplingModeValue(input?.rebound_skill_sampling_mode),
@@ -4148,6 +4399,14 @@ const reboundingRows = computed(() => {
       inputMin: 0,
       inputStep: 0.1,
       tooltip: 'Weight on player distance to the sampled rebound target when computing rebound winner probabilities.',
+    },
+    {
+      label: 'Basket position weight',
+      value: formatConfigValue(valueFor('basket_position_weight', 'rebound_basket_position_weight')),
+      inputKey: 'rebound_basket_position_weight',
+      inputMin: 0,
+      inputStep: 0.1,
+      tooltip: 'Extra penalty for rebounders farther from the basket than the sampled rebound target. Zero preserves existing winner logits.',
     },
     {
       label: 'Winner temperature',
@@ -4623,6 +4882,26 @@ const reboundLocalMixedRate = computed(() => safeDiv(Number(reboundEligibilityDi
 const reboundLocalOffenseOnlyRate = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.local_offense_only_attempts || 0), reboundEligibilityAttempts.value) * 100);
 const reboundLocalDefenseOnlyRate = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.local_defense_only_attempts || 0), reboundEligibilityAttempts.value) * 100);
 const reboundTargetDistanceCount = computed(() => Number(statsState.value?.rebounds?.targetDistanceCount || 0));
+const valueDiag = computed(() => statsState.value?.valueDiagnostics || {});
+const valueDiagSampleCount = computed(() => Number(valueDiag.value?.sample_count || 0));
+const valueDiagSource = computed(() => (valueDiagSampleCount.value > 0 ? 'native JAX eval' : 'unavailable'));
+const valueDiagRows = computed(() => [
+  { key: 'source', label: 'Source', value: valueDiagSource.value },
+  { key: 'sample_count', label: 'Value samples', value: String(valueDiagSampleCount.value) },
+  { key: 'completed_episode_count', label: 'Completed episodes', value: String(Number(valueDiag.value?.completed_episode_count || 0)) },
+  { key: 'discount_gamma', label: 'Gamma', value: formatDebugNumber(valueDiag.value?.discount_gamma, 3) },
+  { key: 'offense_value_mean', label: 'Mean Vo', value: formatDebugNumber(valueDiag.value?.offense_value_mean, 3) },
+  { key: 'defense_value_mean', label: 'Mean Vd', value: formatDebugNumber(valueDiag.value?.defense_value_mean, 3) },
+  { key: 'value_sum_mean', label: 'Mean Vo+Vd', value: formatDebugNumber(valueDiag.value?.value_sum_mean, 3) },
+  { key: 'value_sum_abs_mean', label: 'Mean |Vo+Vd|', value: formatDebugNumber(valueDiag.value?.value_sum_abs_mean, 3) },
+  { key: 'offense_return_mean', label: 'Mean OFF return', value: formatDebugNumber(valueDiag.value?.offense_return_mean, 3) },
+  { key: 'defense_return_mean', label: 'Mean DEF return', value: formatDebugNumber(valueDiag.value?.defense_return_mean, 3) },
+  { key: 'return_sum_mean', label: 'Mean return sum', value: formatDebugNumber(valueDiag.value?.return_sum_mean, 3) },
+  { key: 'offense_value_bias_mean', label: 'OFF value bias', value: formatDebugNumber(valueDiag.value?.offense_value_bias_mean, 3) },
+  { key: 'defense_value_bias_mean', label: 'DEF value bias', value: formatDebugNumber(valueDiag.value?.defense_value_bias_mean, 3) },
+  { key: 'offense_value_mae', label: 'OFF value MAE', value: formatDebugNumber(valueDiag.value?.offense_value_mae, 3) },
+  { key: 'defense_value_mae', label: 'DEF value MAE', value: formatDebugNumber(valueDiag.value?.defense_value_mae, 3) },
+]);
 const avgOffenseReboundTargetDistance = computed(() => (
   safeDiv(Number(statsState.value?.rebounds?.targetDistanceSumOffense || 0), reboundTargetDistanceCount.value)
 ));
@@ -4717,6 +4996,10 @@ function ensureStatsDiagnosticFields(target) {
     target.reboundDiagnostics.resolvedParams
     && typeof target.reboundDiagnostics.resolvedParams === "object"
   ) ? target.reboundDiagnostics.resolvedParams : {};
+  target.valueDiagnostics = (
+    target.valueDiagnostics
+    && typeof target.valueDiagnostics === "object"
+  ) ? target.valueDiagnostics : {};
 }
 
 ensureStatsDiagnosticFields(statsState.value);
@@ -5621,6 +5904,15 @@ function applyEvaluationStats(
         && typeof nativeSummary.resolved_rebound_params === 'object'
       ) ? { ...nativeSummary.resolved_rebound_params } : {},
     };
+    const rawValueDiagnostics = (
+      nativeSummary.value_diagnostics
+      && typeof nativeSummary.value_diagnostics === 'object'
+    ) ? nativeSummary.value_diagnostics : (
+      evalDiagnostics.value_diagnostics
+      && typeof evalDiagnostics.value_diagnostics === 'object'
+    ) ? evalDiagnostics.value_diagnostics : {};
+    next.valueDiagnostics = { ...rawValueDiagnostics };
+    console.info('[Stats] Value diagnostics', next.valueDiagnostics);
 
     const rbRaw = evalDiagnostics.reward_breakdown || {};
     next.rewardBreakdown = {
@@ -5738,6 +6030,11 @@ async function copyStatsMarkdown() {
       '| --- | --- |',
       table(intentRows.length ? intentRows : [['(none)', '0']]),
       '',
+      '## Value Diagnostics',
+      '| Metric | Value |',
+      '| --- | --- |',
+      table(valueDiagRows.value.map((row) => [row.label, row.value])),
+      '',
       '## Reward Decomposition',
       '| Component | Value |',
       '| --- | --- |',
@@ -5797,6 +6094,16 @@ const allPlayerIds = computed(() => {
   }
   return [...(props.gameState.offense_ids || []), ...(props.gameState.defense_ids || [])];
 });
+
+watch(
+  [() => props.gameState?.player_rebound_skills, allPlayerIds],
+  () => {
+    if (!reboundSkillUpdating.value) {
+      fillReboundSkillInputsFromGameState();
+    }
+  },
+  { immediate: true, deep: true },
+);
 
 const controlsTabPlayerIds = computed(() => {
   if (props.showOpponentActions) {
@@ -6016,7 +6323,7 @@ const hasSelectorIntentPreferences = computed(() =>
 const policyRowsByPlayer = computed(() => {
   if (!props.gameState || !policyProbabilities.value) return [];
 
-  return userControlledPlayerIds.value.map((pid) => {
+  return controlsTabPlayerIds.value.map((pid) => {
     const probs =
       policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
     const mask = props.gameState?.action_mask?.[pid];
@@ -6731,7 +7038,7 @@ function toggleUseMcts(val) {
 }
 
 // Watch for AI mode or deterministic mode changes to pre-select actions
-watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterministic], ([newAiMode, newDeterministic, newOpponentDeterministic]) => {
+watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterministic, () => props.showOpponentActions], ([newAiMode, newDeterministic, newOpponentDeterministic]) => {
   // If parent is driving selections (self-play), don't override
   if (props.externalSelections) return;
   
@@ -6751,8 +7058,8 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
           const isUserPlayer = userControlledPlayerIds.value.includes(playerId);
           const useDeterministic = isUserPlayer ? newDeterministic : newOpponentDeterministic;
           
-          if (policyProbabilities.value && policyProbabilities.value[playerId]) {
-            const probs = policyProbabilities.value[playerId];
+          if (policyProbabilities.value && (policyProbabilities.value[playerId] || policyProbabilities.value[String(playerId)])) {
+            const probs = policyProbabilities.value[playerId] || policyProbabilities.value[String(playerId)];
             
             if (useDeterministic) {
               // Deterministic: mimic policy.predict(..., deterministic=True) → argmax of policy distribution
@@ -6808,7 +7115,7 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
 });
 
 // Re-sample probabilistic actions whenever policy probabilities update
-watch(() => policyProbabilities.value, () => {
+watch([() => policyProbabilities.value, () => props.showOpponentActions], () => {
   if (props.externalSelections) return;
   try {
     if (!(props.aiMode && policyProbabilities.value)) {
@@ -6820,7 +7127,7 @@ watch(() => policyProbabilities.value, () => {
 
     for (const playerId of allIds) {
       const legalActions = getLegalActions(playerId);
-      const playerProbs = policyProbabilities.value?.[playerId];
+      const playerProbs = policyProbabilities.value?.[playerId] ?? policyProbabilities.value?.[String(playerId)];
       if (!playerProbs || legalActions.length === 0) continue;
 
       // Build list of legal (index, prob)
@@ -8028,6 +8335,26 @@ function offenseSkillDeltaLabel(idx) {
           </div>
           <div class="param-category">
             <h5>
+              Value Diagnostics
+              <span
+                class="category-help"
+                title="Native JAX eval critic calibration. Returns are discounted with checkpoint gamma and computed only for episodes completed within the eval horizon. Bias is predicted value minus realized discounted return."
+                aria-label="Value diagnostics help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in valueDiagRows"
+              :key="`value-diagnostic-${row.key}`"
+              class="param-item"
+              data-tooltip="Critic value diagnostic from native JAX eval. OFF/DEF return are realized discounted returns; value bias is prediction minus return."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+          </div>
+          <div class="param-category">
+            <h5>
               Rebound Eval Diagnostics
               <span
                 class="category-help"
@@ -8039,6 +8366,7 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Percentage of rebound attempts that used global contest winner sampling."><span class="param-name">Global contest rate:</span><span class="param-value">{{ reboundGlobalContestRate.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Contest mode resolved by the compiled JAX static config."><span class="param-name">Contest mode:</span><span class="param-value">{{ reboundResolvedParams.rebound_contest_mode || 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Rebound winner softmax temperature resolved by the compiled JAX static config."><span class="param-name">Winner temp:</span><span class="param-value">{{ Number(reboundResolvedParams.rebound_winner_temperature ?? 0).toFixed(3) }}</span></div>
+            <div class="param-item" data-tooltip="Basket-position penalty weight resolved by the compiled JAX static config."><span class="param-name">Basket pos weight:</span><span class="param-value">{{ Number(reboundResolvedParams.rebound_basket_position_weight ?? 0).toFixed(3) }}</span></div>
             <div class="param-item" data-tooltip="Rebound skill weight resolved by the compiled JAX static config."><span class="param-name">Skill weight:</span><span class="param-value">{{ Number(reboundResolvedParams.rebound_skill_weight ?? 0).toFixed(3) }}</span></div>
             <div class="param-item" data-tooltip="Whether native eval received explicit custom rebound_skills. If this is No, eval is using reset-time sampled skills."><span class="param-name">Custom skills applied:</span><span class="param-value">{{ reboundResolvedParams.custom_rebound_skills_applied ? 'Yes' : 'No' }}</span></div>
             <div class="param-item" data-tooltip="Positive custom rebound skills received by native eval, plus total custom skill sum."><span class="param-name">Custom skill +count/sum:</span><span class="param-value">{{ reboundResolvedParams.custom_rebound_skill_positive_count ?? 0 }}/{{ Number(reboundResolvedParams.custom_rebound_skill_sum ?? 0).toFixed(2) }}</span></div>
@@ -9928,6 +10256,43 @@ function offenseSkillDeltaLabel(idx) {
       </div>
 
       <div class="eval-row">
+        <label>Rebound skill sampling</label>
+        <select
+          :value="evalConfigSafe.reboundSkillSampling?.mode || 'model'"
+          :disabled="props.isEvaluating"
+          @change="setEvalReboundSkillSamplingMode($event.target.value)"
+        >
+          <option value="model">Model/default per reset</option>
+          <option value="constrained_gaussian">Constrained Gaussian per reset</option>
+        </select>
+        <span class="status-note">
+          Pinned custom rebound skills override this setting.
+        </span>
+      </div>
+
+      <div v-if="(evalConfigSafe.reboundSkillSampling?.mode || 'model') === 'constrained_gaussian'" class="eval-skills">
+        <div class="rebound-sampler" data-tooltip="Native eval samples fresh iid Gaussian rebound skills on each reset until sum(offense)-sum(defense) lands in this edge bucket.">
+          <div class="rebound-sampler-title">Per-reset constrained Gaussian</div>
+          <label>
+            <span>Std</span>
+            <input type="number" min="0" step="0.05" :value="reboundSkillSampler.std" @input="updateReboundSkillSampler('std', $event.target.value)" />
+          </label>
+          <label>
+            <span>Target edge</span>
+            <input type="number" step="0.1" :value="reboundSkillSampler.targetEdge" @input="updateReboundSkillSampler('targetEdge', $event.target.value)" />
+          </label>
+          <label>
+            <span>Tolerance</span>
+            <input type="number" min="0" step="0.05" :value="reboundSkillSampler.tolerance" @input="updateReboundSkillSampler('tolerance', $event.target.value)" />
+          </label>
+          <label>
+            <span>Max tries</span>
+            <input type="number" min="1" step="100" :value="reboundSkillSampler.maxAttempts" @input="updateReboundSkillSampler('maxAttempts', $event.target.value)" />
+          </label>
+        </div>
+      </div>
+
+      <div class="eval-row">
         <label>Intent selection</label>
         <select
           :value="evalConfigSafe.intentSelectionMode"
@@ -10108,6 +10473,30 @@ function offenseSkillDeltaLabel(idx) {
         </div>
 
         <div class="eval-skills">
+          <div class="rebound-sampler" data-tooltip="Draw iid Gaussian rebound skills until the lineup skill edge sum(offense)-sum(defense) lands in the requested bucket. This pins eval rebound skills and does not change training/reset sampling.">
+            <div class="rebound-sampler-title">Constrained Gaussian sampler</div>
+            <label>
+              <span>Std</span>
+              <input type="number" min="0" step="0.05" :value="reboundSkillSampler.std" @input="updateReboundSkillSampler('std', $event.target.value)" />
+            </label>
+            <label>
+              <span>Target edge</span>
+              <input type="number" step="0.1" :value="reboundSkillSampler.targetEdge" @input="updateReboundSkillSampler('targetEdge', $event.target.value)" />
+            </label>
+            <label>
+              <span>Tolerance</span>
+              <input type="number" min="0" step="0.05" :value="reboundSkillSampler.tolerance" @input="updateReboundSkillSampler('tolerance', $event.target.value)" />
+            </label>
+            <label>
+              <span>Max tries</span>
+              <input type="number" min="1" step="100" :value="reboundSkillSampler.maxAttempts" @input="updateReboundSkillSampler('maxAttempts', $event.target.value)" />
+            </label>
+            <button class="ghost-btn" @click="sampleEvalReboundSkillsByTeamEdge">
+              Sample bucket
+            </button>
+          </div>
+          <div class="rebound-sampler-status" v-if="reboundSkillSamplerStatus">{{ reboundSkillSamplerStatus }}</div>
+          <div class="rebound-sampler-error" v-if="reboundSkillSamplerError">{{ reboundSkillSamplerError }}</div>
           <div class="skills-header rebound-skills-header">
             <span>Player</span>
             <span>Team</span>
@@ -10519,8 +10908,32 @@ function offenseSkillDeltaLabel(idx) {
             </div>
           </div>
           <div class="param-category" v-if="sampledReboundSkillRows.length">
-            <h5>Sampled Rebounding Skills</h5>
+            <h5>Current Rebounding Skills</h5>
             <div class="offense-skills-editor">
+              <div class="rebound-sampler" data-tooltip="Draw iid Gaussian rebound skills until the lineup skill edge sum(offense)-sum(defense) lands in the requested bucket. This fills the live skill inputs; click Apply to write them into the current JAX state.">
+                <div class="rebound-sampler-title">Constrained Gaussian sampler</div>
+                <label>
+                  <span>Std</span>
+                  <input type="number" min="0" step="0.05" :value="reboundSkillSampler.std" @input="updateReboundSkillSampler('std', $event.target.value)" />
+                </label>
+                <label>
+                  <span>Target edge</span>
+                  <input type="number" step="0.1" :value="reboundSkillSampler.targetEdge" @input="updateReboundSkillSampler('targetEdge', $event.target.value)" />
+                </label>
+                <label>
+                  <span>Tolerance</span>
+                  <input type="number" min="0" step="0.05" :value="reboundSkillSampler.tolerance" @input="updateReboundSkillSampler('tolerance', $event.target.value)" />
+                </label>
+                <label>
+                  <span>Max tries</span>
+                  <input type="number" min="1" step="100" :value="reboundSkillSampler.maxAttempts" @input="updateReboundSkillSampler('maxAttempts', $event.target.value)" />
+                </label>
+                <button class="ghost-btn" @click="sampleCurrentReboundSkillInputsByTeamEdge">
+                  Sample inputs
+                </button>
+              </div>
+              <div class="rebound-sampler-status" v-if="reboundSkillSamplerStatus">{{ reboundSkillSamplerStatus }}</div>
+              <div class="rebound-sampler-error" v-if="reboundSkillSamplerError">{{ reboundSkillSamplerError }}</div>
               <div class="offense-skills-row header sampled-rebound-skills-row">
                 <span>Player</span>
                 <span>Team</span>
@@ -10529,14 +10942,40 @@ function offenseSkillDeltaLabel(idx) {
               </div>
               <div
                 class="offense-skills-row sampled-rebound-skills-row"
-                v-for="row in sampledReboundSkillRows"
+                v-for="(row, idx) in sampledReboundSkillRows"
                 :key="`sampled-rebound-skill-${row.playerId}`"
-                data-tooltip="Current per-episode rebound skill sampled at reset. Positive values reduce effective distance to the rebound target when rebound skill weight is above zero."
+                data-tooltip="Current per-episode rebound skill. Positive values reduce effective distance to the rebound target when rebound skill weight is above zero. Apply writes these values into the live JAX state without resetting."
               >
                 <span class="skills-player">Player {{ row.playerId }}</span>
                 <span class="param-value">{{ row.team }}</span>
-                <span class="param-value">{{ row.skill >= 0 ? '+' : '' }}{{ row.skill.toFixed(2) }}</span>
+                <input
+                  class="env-param-input"
+                  type="number"
+                  step="0.1"
+                  v-model.number="reboundSkillInputs[idx]"
+                  :disabled="reboundSkillUpdating"
+                />
                 <span class="param-value">{{ row.specialist ? 'Yes' : 'No' }}</span>
+              </div>
+              <div class="offense-skill-actions">
+                <button
+                  class="refresh-policies-btn"
+                  @click="resetReboundSkillInputsToCurrent"
+                  :disabled="reboundSkillUpdating || !sampledReboundSkillRows.length"
+                  title="Copy the current live rebound skills back into the inputs"
+                >
+                  Reset
+                </button>
+                <button
+                  class="refresh-policies-btn"
+                  @click="applyReboundSkillOverrides"
+                  :disabled="reboundSkillUpdating || !sampledReboundSkillRows.length"
+                >
+                  {{ reboundSkillUpdating ? 'Saving...' : 'Apply' }}
+                </button>
+              </div>
+              <div class="policy-status error" v-if="reboundSkillError">
+                {{ reboundSkillError }}
               </div>
             </div>
           </div>
@@ -11533,9 +11972,17 @@ function offenseSkillDeltaLabel(idx) {
 
           <div class="param-category">
             <h5>Self-Play & Opponents</h5>
-            <div class="param-item" data-tooltip="Whether opponent uses deterministic action selection during training.">
-              <span class="param-name">Deterministic opponent:</span>
-              <span class="param-value">{{ props.gameState.training_params.deterministic_opponent ? '✓ Yes' : '✗ No' }}</span>
+            <div class="param-item" data-tooltip="Probability that each frozen-opponent training episode used deterministic argmax action selection. This replaces the old yes/no flag for scheduled or mixed opponent determinism.">
+              <span class="param-name">Opponent argmax episodes:</span>
+              <span class="param-value">{{ opponentDeterministicEpisodeSummary }}</span>
+            </div>
+            <div class="param-item" v-if="opponentDeterministicEpisodeIsScheduled" data-tooltip="Warmup/ramp window for the deterministic-opponent episode probability schedule.">
+              <span class="param-name">Argmax schedule:</span>
+              <span class="param-value">{{ opponentDeterministicEpisodeScheduleSummary }}</span>
+            </div>
+            <div class="param-item" v-if="opponentDeterministicEpisodeObservedSummary !== 'N/A'" data-tooltip="Observed fraction of active training episodes that sampled deterministic opponent behavior, logged by the JAX rollout metrics/checkpoint metadata.">
+              <span class="param-name">Observed argmax rate:</span>
+              <span class="param-value">{{ opponentDeterministicEpisodeObservedSummary }}</span>
             </div>
             <div class="param-item" data-tooltip="Whether each parallel env samples different opponents (prevents forgetting).">
               <span class="param-name">Per-env opponent sampling:</span>
@@ -13536,6 +13983,54 @@ function offenseSkillDeltaLabel(idx) {
   display: flex;
   justify-content: flex-end;
   margin-top: 0.25rem;
+}
+.rebound-skills-header,
+.rebound-skills-row {
+  grid-template-columns: 1.2fr 1fr 1fr;
+}
+.rebound-sampler {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.5rem;
+  align-items: end;
+  padding: 0.55rem;
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 10px;
+  background: rgba(8, 47, 73, 0.18);
+}
+.rebound-sampler-title {
+  grid-column: 1 / -1;
+  color: #38bdf8;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.rebound-sampler label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+.rebound-sampler input {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.78);
+  color: #e2e8f0;
+}
+.rebound-sampler-status,
+.rebound-sampler-error {
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+.rebound-sampler-status {
+  color: #67e8f9;
+}
+.rebound-sampler-error {
+  color: #fca5a5;
 }
 .template-player-grid {
   gap: 0.55rem;

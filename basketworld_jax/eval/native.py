@@ -115,6 +115,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_target_temperature",
     "rebound_target_uniform_mix",
     "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
     "rebound_winner_temperature",
     "rebound_skill_std",
     "rebound_skill_sampling_mode",
@@ -134,6 +135,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_target_temperature": 1.0,
     "rebound_target_uniform_mix": 0.0,
     "rebound_winner_distance_weight": 1.0,
+    "rebound_basket_position_weight": 0.0,
     "rebound_winner_temperature": 1.0,
     "rebound_skill_std": 0.0,
     "rebound_skill_sampling_mode": "gaussian",
@@ -153,6 +155,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_target_temperature": "float",
     "rebound_target_uniform_mix": "float",
     "rebound_winner_distance_weight": "float",
+    "rebound_basket_position_weight": "float",
     "rebound_winner_temperature": "float",
     "rebound_skill_std": "float",
     "rebound_skill_sampling_mode": "str",
@@ -303,7 +306,54 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, j
     return flat_obs[:, :expected_dim].astype(jnp.float32)
 
 
-def _apply_native_custom_setup(static, state, custom_setup: dict | None, batch_size: int, jnp):
+def _sample_constrained_rebound_skills_for_eval(
+    static,
+    sampling: dict[str, Any],
+    batch_size: int,
+    rng: np.random.Generator,
+) -> np.ndarray | None:
+    if not isinstance(sampling, dict):
+        return None
+    if str(sampling.get("mode") or "constrained_gaussian") != "constrained_gaussian":
+        return None
+    n_players = int(static.role_encoding.shape[0])
+    if n_players <= 0:
+        return None
+    offense_ids = np.asarray(static.offense_ids, dtype=np.int32).reshape(-1)
+    defense_ids = np.asarray(static.defense_ids, dtype=np.int32).reshape(-1)
+    std = max(1.0e-8, float(sampling.get("std", 1.0)))
+    target_edge = float(sampling.get("target_edge", 0.0))
+    tolerance = max(0.0, float(sampling.get("tolerance", 0.25)))
+    max_attempts = max(1, int(sampling.get("max_attempts", 5000)))
+
+    out = np.zeros((int(batch_size), n_players), dtype=np.float32)
+    for row in range(int(batch_size)):
+        best_values = None
+        best_error = np.inf
+        for _attempt in range(max_attempts):
+            values = rng.normal(loc=0.0, scale=std, size=n_players).astype(np.float32)
+            offense_sum = float(np.sum(values[offense_ids])) if offense_ids.size else 0.0
+            defense_sum = float(np.sum(values[defense_ids])) if defense_ids.size else 0.0
+            error = abs((offense_sum - defense_sum) - target_edge)
+            if error < best_error:
+                best_error = error
+                best_values = values
+            if error <= tolerance:
+                best_values = values
+                break
+        if best_values is not None:
+            out[row] = best_values
+    return out
+
+
+def _apply_native_custom_setup(
+    static,
+    state,
+    custom_setup: dict | None,
+    batch_size: int,
+    jnp,
+    rng_seed: int | None = None,
+):
     if not custom_setup:
         return state
     updates: dict[str, Any] = {}
@@ -344,6 +394,17 @@ def _apply_native_custom_setup(static, state, custom_setup: dict | None, batch_s
                 specialist_values = np.zeros_like(broadcast_values, dtype=np.float32)
             updates["rebound_skill"] = jnp.asarray(broadcast_values, dtype=jnp.float32)
             updates["rebound_skill_specialist"] = jnp.asarray(specialist_values, dtype=jnp.float32)
+    elif custom_setup.get("rebound_skill_sampling") is not None:
+        rng = np.random.default_rng(rng_seed)
+        sampled_values = _sample_constrained_rebound_skills_for_eval(
+            static,
+            custom_setup.get("rebound_skill_sampling") or {},
+            int(batch_size),
+            rng,
+        )
+        if sampled_values is not None and sampled_values.shape == (int(batch_size), int(static.role_encoding.shape[0])):
+            updates["rebound_skill"] = jnp.asarray(sampled_values, dtype=jnp.float32)
+            updates["rebound_skill_specialist"] = jnp.zeros_like(updates["rebound_skill"], dtype=jnp.float32)
     return state._replace(**updates) if updates else state
 
 
@@ -583,7 +644,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
         offense_ids = static.offense_ids.astype(jnp.int32)
         defense_ids = static.defense_ids.astype(jnp.int32)
 
-        def _team_actions(params, flat_obs, action_mask, intent_context, key, deterministic: bool):
+        def _team_policy_step(params, flat_obs, action_mask, intent_context, key, deterministic: bool):
             forward_out = actor_critic_forward(
                 params,
                 flat_obs,
@@ -599,12 +660,14 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             if deterministic:
-                return masked_out["deterministic_actions"]
-            return jax.random.categorical(
-                key,
-                masked_out["masked_logits"],
-                axis=-1,
-            ).astype(jnp.int32)
+                actions = masked_out["deterministic_actions"]
+            else:
+                actions = jax.random.categorical(
+                    key,
+                    masked_out["masked_logits"],
+                    axis=-1,
+                ).astype(jnp.int32)
+            return actions, forward_out["values"].astype(jnp.float32)
 
         def _zero_selector_trace(state):
             batch_shape = state.intent_index.shape
@@ -781,7 +844,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 role_flag_defense,
                 jnp,
             )
-            offense_actions = _team_actions(
+            offense_actions, offense_values = _team_policy_step(
                 offense_params,
                 offense_obs,
                 offense_mask,
@@ -789,7 +852,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 offense_key,
                 offense_deterministic,
             )
-            defense_actions = _team_actions(
+            defense_actions, defense_values = _team_policy_step(
                 defense_params,
                 defense_obs,
                 defense_mask,
@@ -814,6 +877,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "positions": env_out.state.positions.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
+                "active": (~policy_state.episode_ended.astype(jnp.bool_)).astype(jnp.int8),
+                "offense_values": offense_values,
+                "defense_values": defense_values,
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
                 "defense_rewards": jnp.sum(env_out.rewards[:, defense_ids], axis=1),
                 "offense_score_delta": (
@@ -841,6 +907,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "assist_passer": env_out.assist_passer.astype(jnp.int32),
                 "turnover_player": env_out.turnover_player.astype(jnp.int32),
                 "turnover_reason": env_out.turnover_reason.astype(jnp.int32),
+                "steal_player": env_out.steal_player.astype(jnp.int32),
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
                 "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
                 "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
@@ -903,6 +970,118 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "offensive_rebounds": np.asarray(trace["offensive_rebound"])[:, :take].sum(axis=0),
         "defensive_rebounds": np.asarray(trace["defensive_rebound"])[:, :take].sum(axis=0),
         "rebound_global_contests": np.asarray(trace["rebound_global_contest"])[:, :take].sum(axis=0),
+    }
+
+
+def _empty_value_diagnostics() -> dict[str, float | int]:
+    return {
+        "sample_count": 0,
+        "completed_episode_count": 0,
+        "offense_value_sum": 0.0,
+        "defense_value_sum": 0.0,
+        "value_sum_sum": 0.0,
+        "value_sum_abs_sum": 0.0,
+        "offense_return_sum": 0.0,
+        "defense_return_sum": 0.0,
+        "return_sum_sum": 0.0,
+        "return_sum_abs_sum": 0.0,
+        "offense_error_sum": 0.0,
+        "defense_error_sum": 0.0,
+        "offense_abs_error_sum": 0.0,
+        "defense_abs_error_sum": 0.0,
+    }
+
+
+def _merge_value_diagnostics(dest: dict[str, float | int], src: dict[str, float | int]) -> None:
+    for key, value in src.items():
+        if key.endswith("_count") or key == "sample_count":
+            dest[key] = int(dest.get(key, 0) or 0) + int(value or 0)
+        else:
+            dest[key] = float(dest.get(key, 0.0) or 0.0) + float(value or 0.0)
+
+
+def _trace_values_array(trace: dict[str, np.ndarray], key: str, take: int) -> np.ndarray:
+    arr = np.asarray(trace[key])[:, :take].astype(np.float64)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    return arr
+
+
+def _discounted_returns(rewards: np.ndarray, done: np.ndarray, gamma: float) -> np.ndarray:
+    rewards = np.asarray(rewards, dtype=np.float64)
+    done = np.asarray(done, dtype=bool)
+    returns = np.zeros_like(rewards, dtype=np.float64)
+    carry = np.zeros((rewards.shape[1],), dtype=np.float64)
+    for t in range(rewards.shape[0] - 1, -1, -1):
+        carry = rewards[t] + float(gamma) * carry * (~done[t]).astype(np.float64)
+        returns[t] = carry
+    return returns
+
+
+def _value_diagnostics_from_trace(
+    trace: dict[str, np.ndarray],
+    *,
+    take: int,
+    gamma: float,
+) -> dict[str, float | int]:
+    active = np.asarray(trace["active"])[:, :take].astype(bool)
+    done = np.asarray(trace["done"])[:, :take].astype(bool)
+    completed = (np.max(np.asarray(trace["terminal_episode_steps"])[:, :take], axis=0) > 0)
+    mask = active & completed.reshape((1, -1))
+    if not np.any(mask):
+        return _empty_value_diagnostics()
+
+    offense_values = _trace_values_array(trace, "offense_values", take)
+    defense_values = _trace_values_array(trace, "defense_values", take)
+    offense_rewards = np.asarray(trace["offense_rewards"])[:, :take].astype(np.float64) * active
+    defense_rewards = np.asarray(trace["defense_rewards"])[:, :take].astype(np.float64) * active
+    offense_returns = _discounted_returns(offense_rewards, done, gamma)
+    defense_returns = _discounted_returns(defense_rewards, done, gamma)
+
+    offense_error = offense_values - offense_returns
+    defense_error = defense_values - defense_returns
+    value_sum = offense_values + defense_values
+    return_sum = offense_returns + defense_returns
+    return {
+        "sample_count": int(mask.sum()),
+        "completed_episode_count": int(completed.sum()),
+        "offense_value_sum": float(offense_values[mask].sum()),
+        "defense_value_sum": float(defense_values[mask].sum()),
+        "value_sum_sum": float(value_sum[mask].sum()),
+        "value_sum_abs_sum": float(np.abs(value_sum[mask]).sum()),
+        "offense_return_sum": float(offense_returns[mask].sum()),
+        "defense_return_sum": float(defense_returns[mask].sum()),
+        "return_sum_sum": float(return_sum[mask].sum()),
+        "return_sum_abs_sum": float(np.abs(return_sum[mask]).sum()),
+        "offense_error_sum": float(offense_error[mask].sum()),
+        "defense_error_sum": float(defense_error[mask].sum()),
+        "offense_abs_error_sum": float(np.abs(offense_error[mask]).sum()),
+        "defense_abs_error_sum": float(np.abs(defense_error[mask]).sum()),
+    }
+
+
+def _finalize_value_diagnostics(accum: dict[str, float | int], *, gamma: float) -> dict[str, float | int]:
+    count = int(accum.get("sample_count", 0) or 0)
+
+    def mean(key: str) -> float:
+        return float(accum.get(key, 0.0) or 0.0) / float(count) if count > 0 else 0.0
+
+    return {
+        "discount_gamma": float(gamma),
+        "sample_count": count,
+        "completed_episode_count": int(accum.get("completed_episode_count", 0) or 0),
+        "offense_value_mean": mean("offense_value_sum"),
+        "defense_value_mean": mean("defense_value_sum"),
+        "value_sum_mean": mean("value_sum_sum"),
+        "value_sum_abs_mean": mean("value_sum_abs_sum"),
+        "offense_return_mean": mean("offense_return_sum"),
+        "defense_return_mean": mean("defense_return_sum"),
+        "return_sum_mean": mean("return_sum_sum"),
+        "return_sum_abs_mean": mean("return_sum_abs_sum"),
+        "offense_value_bias_mean": mean("offense_error_sum"),
+        "defense_value_bias_mean": mean("defense_error_sum"),
+        "offense_value_mae": mean("offense_abs_error_sum"),
+        "defense_value_mae": mean("defense_abs_error_sum"),
     }
 
 
@@ -1449,10 +1628,13 @@ def run_native_jax_evaluation(
     for key, value in static_params.items():
         setattr(env, key, value)
     static = build_kernel_static_from_env(env, jnp)
+    trainer_config = dict(unified_payload.get("trainer_config", {}) or {})
     horizon = _native_eval_horizon(env, training_params, unified_payload)
-    configured_batch_size = int(
-        dict(unified_payload.get("trainer_config", {})).get("kernel_batch_size", 4096)
+    value_discount_gamma = max(
+        0.0,
+        _coerce_float(_param(training_params or {}, "gamma", trainer_config.get("gamma", 0.99)), 0.99),
     )
+    configured_batch_size = int(trainer_config.get("kernel_batch_size", 4096))
     batch_size = max(1, min(int(num_episodes), configured_batch_size))
     runner = _build_native_eval_runner(jax, jnp, spec)
 
@@ -1473,6 +1655,7 @@ def run_native_jax_evaluation(
     shot_accumulator: dict[str, list[int]] = {}
     rebound_accumulator: dict[str, Any] = {}
     cell_coords_np = np.asarray(jax.device_get(static.cell_coords), dtype=np.int32)
+    basket_position_np = np.asarray(jax.device_get(static.basket_position), dtype=np.int32)
     eval_rebound_contest_mode = str(
         getattr(env, "rebound_contest_mode", "global_contest") or "global_contest"
     ).strip().lower().replace("-", "_").replace(" ", "_")
@@ -1494,6 +1677,10 @@ def run_native_jax_evaluation(
     eval_rebound_winner_distance_weight = max(
         0.0,
         _static_float_for_eval("rebound_winner_distance_weight", 1.0),
+    )
+    eval_rebound_basket_position_weight = max(
+        0.0,
+        _static_float_for_eval("rebound_basket_position_weight", 0.0),
     )
     eval_rebound_winner_temperature = max(
         1.0e-6,
@@ -1522,6 +1709,7 @@ def run_native_jax_evaluation(
     all_offensive_rebounds: list[float] = []
     all_defensive_rebounds: list[float] = []
     all_rebound_global_contests: list[float] = []
+    value_diagnostics_accum = _empty_value_diagnostics()
 
     start = perf_counter()
     completed_episodes = 0
@@ -1533,7 +1721,16 @@ def run_native_jax_evaluation(
         key, reset_key, eval_key = jax.random.split(key, 3)
         reset_keys = jax.random.split(reset_key, batch_size)
         initial_state = reset_batch_minimal(static, reset_keys, jax, jnp)
-        initial_state = _apply_native_custom_setup(static, initial_state, custom_setup, batch_size, jnp)
+        reset_seed_parts = np.asarray(jax.device_get(reset_key), dtype=np.uint32).reshape(-1)
+        custom_setup_seed = int(reset_seed_parts[0]) ^ (int(reset_seed_parts[-1]) << 1)
+        initial_state = _apply_native_custom_setup(
+            static,
+            initial_state,
+            custom_setup,
+            batch_size,
+            jnp,
+            rng_seed=custom_setup_seed,
+        )
         trace_device = runner(
             static,
             initial_state,
@@ -1553,6 +1750,10 @@ def run_native_jax_evaluation(
         )
         trace = jax.device_get(trace_device)
         stats = _episode_stats_from_trace(trace, take=take, horizon=horizon)
+        _merge_value_diagnostics(
+            value_diagnostics_accum,
+            _value_diagnostics_from_trace(trace, take=take, gamma=value_discount_gamma),
+        )
         for idx in range(take):
             episode_num = completed_episodes + idx + 1
             step_count = int(stats["steps"][idx])
@@ -1766,7 +1967,9 @@ def run_native_jax_evaluation(
                         if turnover_player in episode_player_stats:
                             episode_player_stats[turnover_player]["turnovers"] += 1
                     if turnover_reason_code == int(TURNOVER_REASON_INTERCEPTED):
-                        steal_player = int(trace["next_ball_holder"][t, idx])
+                        steal_player = int(trace.get("steal_player", trace["next_ball_holder"])[t, idx])
+                        if steal_player < 0:
+                            steal_player = int(trace["next_ball_holder"][t, idx])
                         if steal_player >= 0:
                             if steal_player in per_player_stats:
                                 per_player_stats[steal_player]["steals"] += 1
@@ -1910,12 +2113,27 @@ def run_native_jax_evaluation(
                         ) + int(rebound_defensive)
                         eligible_mask_for_chances = eligible_mask
                         if rebound_skills.size and np.any(eligible_mask):
+                            player_basket_distances = _hex_distance_np(
+                                rebound_positions,
+                                basket_position_np,
+                            ).astype(np.float32)
+                            target_basket_distance = float(
+                                _hex_distance_np(
+                                    np.asarray(target_coord, dtype=np.int32).reshape(1, 2),
+                                    basket_position_np,
+                                )[0]
+                            )
+                            basket_position_penalties = np.maximum(
+                                0.0,
+                                player_basket_distances - target_basket_distance,
+                            ).astype(np.float32)
                             effective_distances = (
                                 player_target_distances.astype(np.float32)
                                 - (eval_rebound_skill_weight * rebound_skills.astype(np.float32))
                             )
                             logits = (
-                                -eval_rebound_winner_distance_weight * effective_distances
+                                (-eval_rebound_winner_distance_weight * effective_distances)
+                                - (eval_rebound_basket_position_weight * basket_position_penalties)
                             ) / eval_rebound_winner_temperature
                             eligible_logits = logits[eligible_mask]
                             eligible_logits = eligible_logits - float(np.max(eligible_logits))
@@ -2169,6 +2387,10 @@ def run_native_jax_evaluation(
     rebound_target_distance_count = int(rebound_diag_final.get("target_distance_count", 0) or 0)
     total_rebound_attempts = _sum(all_rebound_attempts)
     total_rebound_global_contests = _sum(all_rebound_global_contests)
+    value_diagnostics = _finalize_value_diagnostics(
+        value_diagnostics_accum,
+        gamma=value_discount_gamma,
+    )
 
     def _static_scalar(name: str, default: Any) -> Any:
         try:
@@ -2190,6 +2412,9 @@ def run_native_jax_evaluation(
             ]
         except Exception:
             custom_rebound_skill_values = []
+    custom_rebound_skill_sampling = (custom_setup or {}).get("rebound_skill_sampling") if custom_setup else None
+    if not isinstance(custom_rebound_skill_sampling, dict):
+        custom_rebound_skill_sampling = {}
     static_offense_ids = np.asarray(jax.device_get(static.offense_ids), dtype=np.int32).reshape(-1)
     static_defense_ids = np.asarray(jax.device_get(static.defense_ids), dtype=np.int32).reshape(-1)
     static_role_encoding = np.asarray(jax.device_get(static.role_encoding), dtype=np.float32).reshape(-1)
@@ -2202,6 +2427,7 @@ def run_native_jax_evaluation(
         "rebound_target_temperature": float(_static_scalar("rebound_target_temperature", 1.0)),
         "rebound_target_uniform_mix": float(_static_scalar("rebound_target_uniform_mix", 0.0)),
         "rebound_winner_distance_weight": float(_static_scalar("rebound_winner_distance_weight", 1.0)),
+        "rebound_basket_position_weight": float(_static_scalar("rebound_basket_position_weight", 0.0)),
         "rebound_winner_temperature": float(_static_scalar("rebound_winner_temperature", 1.0)),
         "rebound_skill_std": float(_static_scalar("rebound_skill_std", 0.0)),
         "rebound_skill_sampling_mode": (
@@ -2217,10 +2443,26 @@ def run_native_jax_evaluation(
         "custom_rebound_skill_values": custom_rebound_skill_values,
         "custom_rebound_skill_positive_count": int(sum(1 for value in custom_rebound_skill_values if value > 0.0)),
         "custom_rebound_skill_sum": float(sum(custom_rebound_skill_values)) if custom_rebound_skill_values else 0.0,
+        "custom_rebound_skill_sampling_applied": bool(custom_rebound_skill_sampling) and not bool(custom_rebound_skill_values),
+        "custom_rebound_skill_sampling_mode": str(custom_rebound_skill_sampling.get("mode", "") or ""),
+        "custom_rebound_skill_sampling_std": float(custom_rebound_skill_sampling.get("std", 0.0) or 0.0),
+        "custom_rebound_skill_sampling_target_edge": float(custom_rebound_skill_sampling.get("target_edge", 0.0) or 0.0),
+        "custom_rebound_skill_sampling_tolerance": float(custom_rebound_skill_sampling.get("tolerance", 0.0) or 0.0),
+        "custom_rebound_skill_sampling_max_attempts": int(custom_rebound_skill_sampling.get("max_attempts", 0) or 0),
         "rebound_contest_mode": "local_contest" if resolved_rebound_contest_mode_id == 1 else "global_contest",
         "rebound_contest_mode_id": int(resolved_rebound_contest_mode_id),
         "rebound_contest_radius": int(_static_scalar("rebound_contest_radius", 1)),
     }
+    print(
+        "[Evaluation] Value diagnostics: "
+        f"samples={int(value_diagnostics.get('sample_count', 0) or 0)} "
+        f"episodes={int(value_diagnostics.get('completed_episode_count', 0) or 0)} "
+        f"Vo={float(value_diagnostics.get('offense_value_mean', 0.0) or 0.0):.3f} "
+        f"Vd={float(value_diagnostics.get('defense_value_mean', 0.0) or 0.0):.3f} "
+        f"Vo+Vd={float(value_diagnostics.get('value_sum_mean', 0.0) or 0.0):.3f} "
+        f"Ro={float(value_diagnostics.get('offense_return_mean', 0.0) or 0.0):.3f} "
+        f"Rd={float(value_diagnostics.get('defense_return_mean', 0.0) or 0.0):.3f}"
+    )
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -2258,6 +2500,7 @@ def run_native_jax_evaluation(
         ),
         "rebound_eligibility": rebound_eligibility,
         "resolved_rebound_params": resolved_rebound_params,
+        "value_diagnostics": value_diagnostics,
         "rebound_target_distance_count": rebound_target_distance_count,
         "avg_offense_rebound_target_distance": (
             float(rebound_diag_final.get("target_distance_sum_offense", 0.0) or 0.0) / rebound_target_distance_count
@@ -2332,6 +2575,7 @@ def run_native_jax_evaluation(
         "per_intent_stats": per_intent_stats,
         "eval_diagnostics": {
             **eval_diagnostics,
+            "value_diagnostics": value_diagnostics,
             "jax_native_summary": summary,
         },
     }

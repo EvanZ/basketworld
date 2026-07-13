@@ -546,6 +546,13 @@ const defaultEvalConfig = () => ({
   skills: { layup: [], three_pt: [], dunk: [] },
   reboundSkills: [],
   reboundSkillsPinned: false,
+  reboundSkillSampling: {
+    mode: 'model',
+    std: 1.0,
+    targetEdge: 0.0,
+    tolerance: 0.25,
+    maxAttempts: 5000,
+  },
   showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
@@ -2069,6 +2076,11 @@ function handleEvalConfigChanged(nextConfig) {
       ...(current.skills || {}),
       ...(nextConfig?.skills || {}),
     },
+    reboundSkillSampling: {
+      ...base.reboundSkillSampling,
+      ...(current.reboundSkillSampling || {}),
+      ...(nextConfig?.reboundSkillSampling || {}),
+    },
   };
   if (merged.mode !== 'custom') {
     merged.placementEditing = false;
@@ -2258,9 +2270,13 @@ function handleBoardPlacementUpdate(payload) {
 }
 
 function buildCustomEvalSetup() {
-  if (!gameState.value || evalConfig.value.mode !== 'custom') return null;
-  const usePinnedPlacement = !!evalConfig.value.placementEditing;
-  const shootingMode = evalConfig.value.shootingMode || 'random';
+  if (!gameState.value) return null;
+  const reboundSkillSampling = evalConfig.value.reboundSkillSampling || {};
+  const useConstrainedReboundSampling = String(reboundSkillSampling.mode || 'model') === 'constrained_gaussian';
+  const isCustomMode = evalConfig.value.mode === 'custom';
+  if (!isCustomMode && !useConstrainedReboundSampling) return null;
+  const usePinnedPlacement = isCustomMode && !!evalConfig.value.placementEditing;
+  const shootingMode = isCustomMode ? (evalConfig.value.shootingMode || 'random') : 'random';
   const payload = {
     shooting_mode: shootingMode,
   };
@@ -2301,7 +2317,8 @@ function buildCustomEvalSetup() {
     ...(gameState.value.defense_ids || []),
   ].map((pid) => Number(pid));
   const totalPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
-  if (reboundSkills.length) {
+  const usePinnedReboundSkills = isCustomMode && Boolean(evalConfig.value.reboundSkillsPinned) && reboundSkills.length;
+  if (usePinnedReboundSkills) {
     const skillsByPlayerId = Array.from({ length: totalPlayers }, () => 0);
     allReboundSkillIds.forEach((pid, idx) => {
       const numeric = Number(reboundSkills[idx] ?? 0);
@@ -2310,6 +2327,14 @@ function buildCustomEvalSetup() {
       }
     });
     payload.rebound_skills = skillsByPlayerId;
+  } else if (useConstrainedReboundSampling) {
+    payload.rebound_skill_sampling = {
+      mode: 'constrained_gaussian',
+      std: Math.max(0, Number(reboundSkillSampling.std ?? 1.0)),
+      target_edge: Number(reboundSkillSampling.targetEdge ?? 0.0),
+      tolerance: Math.max(0, Number(reboundSkillSampling.tolerance ?? 0.25)),
+      max_attempts: Math.max(1, Math.floor(Number(reboundSkillSampling.maxAttempts ?? 5000))),
+    };
   }
   return payload;
 }
@@ -2367,12 +2392,10 @@ async function handleEvaluation() {
     console.log(`[App] Starting evaluation: ${numEpisodes} episodes, playerDeterministic=${playerDeterministic.value}, opponentDeterministic=${opponentDeterministic.value}`);
     
     let customSetup = null;
-    if (evalConfig.value.mode === 'custom') {
-      try {
-        customSetup = buildCustomEvalSetup();
-      } catch (setupErr) {
-        throw new Error(setupErr.message || 'Invalid custom eval setup');
-      }
+    try {
+      customSetup = buildCustomEvalSetup();
+    } catch (setupErr) {
+      throw new Error(setupErr.message || 'Invalid custom eval setup');
     }
     
     // Run evaluation on backend (this will block until all episodes complete)
