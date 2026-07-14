@@ -311,6 +311,7 @@ def run_evaluation(request: EvaluationRequest):
     start_time = time.time()
     shot_accumulator: dict[str, list[int]] = {}
     rebound_accumulator: dict[str, dict] = {}
+    positioning_accumulator: dict[str, dict] = {}
 
     PARALLEL_THRESHOLD = 1000
     num_workers = None
@@ -362,6 +363,14 @@ def run_evaluation(request: EvaluationRequest):
                 f"Vd={float(value_diag.get('defense_value_mean', 0.0) or 0.0):.3f} "
                 f"Vo+Vd={float(value_diag.get('value_sum_mean', 0.0) or 0.0):.3f}"
             )
+            print(
+                "[Evaluation] Post-ORB continuation: "
+                f"samples={int(native_summary.get('post_orb_sample_count', 0) or 0)} "
+                f"points={float(native_summary.get('post_orb_points_total', 0.0) or 0.0):.1f} "
+                f"avg={float(native_summary.get('post_orb_points_per_sample', 0.0) or 0.0):.3f} "
+                f"value_samples={int(native_summary.get('post_orb_value_sample_count', 0) or 0)} "
+                f"consensus_value={float(native_summary.get('post_orb_consensus_value_per_sample', 0.0) or 0.0):.3f}"
+            )
         except Exception:
             pass
         raw_shots = raw_results.get("shot_accumulator")
@@ -370,6 +379,9 @@ def run_evaluation(request: EvaluationRequest):
         raw_rebounds = raw_results.get("rebound_accumulator")
         if isinstance(raw_rebounds, dict):
             rebound_accumulator = raw_rebounds
+        raw_positioning = raw_results.get("positioning_accumulator")
+        if isinstance(raw_positioning, dict):
+            positioning_accumulator = raw_positioning
         episode_payload = raw_results.get("results", [])
     else:
         per_player_stats = {}
@@ -439,6 +451,7 @@ def run_evaluation(request: EvaluationRequest):
         "current_state": current_game_state,
         "shot_accumulator": shot_accumulator,
         "rebound_accumulator": rebound_accumulator,
+        "positioning_accumulator": positioning_accumulator,
         "per_player_stats": per_player_stats,
         "per_intent_stats": per_intent_stats,
         "eval_diagnostics": eval_diagnostics,

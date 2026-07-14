@@ -1213,6 +1213,12 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "target_distance_sum_offense": 0.0,
             "target_distance_sum_defense": 0.0,
             "target_distance_count": 0,
+            "post_orb_samples": 0,
+            "post_orb_points_sum": 0.0,
+            "post_orb_value_samples": 0,
+            "post_orb_consensus_value_sum": 0.0,
+            "post_orb_offense_value_sum": 0.0,
+            "post_orb_defense_value_sum": 0.0,
         },
     }
 
@@ -1469,6 +1475,55 @@ def _record_rebound_heatmap_event(
             player_rebounder_offensive[winner_key] = int(player_rebounder_offensive.get(winner_key, 0)) + 1
 
 
+def _increment_position_count(counts: dict[str, int], positions: np.ndarray, player_id: int) -> None:
+    pid = int(player_id)
+    if pid < 0 or pid >= int(positions.shape[0]):
+        return
+    pos = positions[pid]
+    if np.asarray(pos).shape[0] < 2:
+        return
+    key = f"{int(pos[0])},{int(pos[1])}"
+    counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _record_positioning_heatmap_event(
+    *,
+    positioning_accumulator: dict[str, Any],
+    shot_q: int,
+    shot_r: int,
+    shooter_id: int,
+    positions: np.ndarray,
+    offense_ids: list[int],
+    defense_ids: list[int],
+) -> None:
+    source_key = f"{int(shot_q)},{int(shot_r)}"
+    bucket = positioning_accumulator.setdefault(
+        source_key,
+        {
+            "total": 0,
+            "offense": {},
+            "offense_non_shooter": {},
+            "defense": {},
+            "shooter": {},
+        },
+    )
+    bucket["total"] = int(bucket.get("total", 0)) + 1
+    offense_counts = bucket.setdefault("offense", {})
+    offense_non_shooter_counts = bucket.setdefault("offense_non_shooter", {})
+    defense_counts = bucket.setdefault("defense", {})
+    shooter_counts = bucket.setdefault("shooter", {})
+    shooter = int(shooter_id)
+    for raw_pid in offense_ids:
+        pid = int(raw_pid)
+        _increment_position_count(offense_counts, positions, pid)
+        if pid == shooter:
+            _increment_position_count(shooter_counts, positions, pid)
+        else:
+            _increment_position_count(offense_non_shooter_counts, positions, pid)
+    for raw_pid in defense_ids:
+        _increment_position_count(defense_counts, positions, int(raw_pid))
+
+
 def _record_shot_diagnostics(
     eval_diagnostics: dict[str, Any],
     *,
@@ -1654,6 +1709,7 @@ def run_native_jax_evaluation(
     results: list[dict[str, Any]] = []
     shot_accumulator: dict[str, list[int]] = {}
     rebound_accumulator: dict[str, Any] = {}
+    positioning_accumulator: dict[str, Any] = {}
     cell_coords_np = np.asarray(jax.device_get(static.cell_coords), dtype=np.int32)
     basket_position_np = np.asarray(jax.device_get(static.basket_position), dtype=np.int32)
     eval_rebound_contest_mode = str(
@@ -1938,6 +1994,15 @@ def run_native_jax_evaluation(
                     episode_shot_pair = episode_shots.setdefault(loc, [0, 0])
                     episode_shot_pair[0] += 1
                     episode_shot_pair[1] += int(shot_success)
+                    _record_positioning_heatmap_event(
+                        positioning_accumulator=positioning_accumulator,
+                        shot_q=q,
+                        shot_r=r,
+                        shooter_id=shooter_id,
+                        positions=np.asarray(trace["positions"][t, idx], dtype=np.int32),
+                        offense_ids=offense_ids,
+                        defense_ids=defense_ids,
+                    )
                     shots_payload[str(shooter_id)] = {
                         "success": shot_success,
                         "distance": float(trace["shot_distance"][t, idx]),
@@ -2005,6 +2070,12 @@ def run_native_jax_evaluation(
                             "target_distance_sum_offense": 0.0,
                             "target_distance_sum_defense": 0.0,
                             "target_distance_count": 0,
+                            "post_orb_samples": 0,
+                            "post_orb_points_sum": 0.0,
+                            "post_orb_value_samples": 0,
+                            "post_orb_consensus_value_sum": 0.0,
+                            "post_orb_offense_value_sum": 0.0,
+                            "post_orb_defense_value_sum": 0.0,
                             "eligibility": {
                                 "attempts": 0,
                                 "local_attempts": 0,
@@ -2019,6 +2090,17 @@ def run_native_jax_evaluation(
                                 "eligible_skill_sum": 0.0,
                                 "eligible_offense_skill_sum": 0.0,
                                 "eligible_defense_skill_sum": 0.0,
+                                "eligible_offense_target_logit_sum": 0.0,
+                                "eligible_defense_target_logit_sum": 0.0,
+                                "eligible_offense_basket_logit_sum": 0.0,
+                                "eligible_defense_basket_logit_sum": 0.0,
+                                "eligible_offense_skill_logit_sum": 0.0,
+                                "eligible_defense_skill_logit_sum": 0.0,
+                                "eligible_offense_total_logit_sum": 0.0,
+                                "eligible_defense_total_logit_sum": 0.0,
+                                "winner_prob_attempts": 0,
+                                "offense_winner_prob_sum": 0.0,
+                                "defense_winner_prob_sum": 0.0,
                                 "offensive_rebounds": 0,
                                 "defensive_rebounds": 0,
                             },
@@ -2127,14 +2209,42 @@ def run_native_jax_evaluation(
                                 0.0,
                                 player_basket_distances - target_basket_distance,
                             ).astype(np.float32)
-                            effective_distances = (
-                                player_target_distances.astype(np.float32)
-                                - (eval_rebound_skill_weight * rebound_skills.astype(np.float32))
-                            )
-                            logits = (
-                                (-eval_rebound_winner_distance_weight * effective_distances)
-                                - (eval_rebound_basket_position_weight * basket_position_penalties)
+                            target_logit_terms = (
+                                -eval_rebound_winner_distance_weight * player_target_distances.astype(np.float32)
                             ) / eval_rebound_winner_temperature
+                            basket_logit_terms = (
+                                -eval_rebound_basket_position_weight * basket_position_penalties
+                            ) / eval_rebound_winner_temperature
+                            skill_logit_terms = (
+                                eval_rebound_winner_distance_weight
+                                * eval_rebound_skill_weight
+                                * rebound_skills.astype(np.float32)
+                            ) / eval_rebound_winner_temperature
+                            logits = target_logit_terms + basket_logit_terms + skill_logit_terms
+                            offense_eligible_mask = np.zeros((n_players,), dtype=bool)
+                            defense_eligible_mask = np.zeros((n_players,), dtype=bool)
+                            if offense_ids_np.size:
+                                offense_eligible_mask[offense_ids_np] = eligible_mask[offense_ids_np]
+                            if defense_ids_np.size:
+                                defense_eligible_mask[defense_ids_np] = eligible_mask[defense_ids_np]
+                            for role_name, role_mask in (
+                                ("offense", offense_eligible_mask),
+                                ("defense", defense_eligible_mask),
+                            ):
+                                if not np.any(role_mask):
+                                    continue
+                                eligibility_diag[f"eligible_{role_name}_target_logit_sum"] = float(
+                                    eligibility_diag.get(f"eligible_{role_name}_target_logit_sum", 0.0) or 0.0
+                                ) + float(np.sum(target_logit_terms[role_mask]))
+                                eligibility_diag[f"eligible_{role_name}_basket_logit_sum"] = float(
+                                    eligibility_diag.get(f"eligible_{role_name}_basket_logit_sum", 0.0) or 0.0
+                                ) + float(np.sum(basket_logit_terms[role_mask]))
+                                eligibility_diag[f"eligible_{role_name}_skill_logit_sum"] = float(
+                                    eligibility_diag.get(f"eligible_{role_name}_skill_logit_sum", 0.0) or 0.0
+                                ) + float(np.sum(skill_logit_terms[role_mask]))
+                                eligibility_diag[f"eligible_{role_name}_total_logit_sum"] = float(
+                                    eligibility_diag.get(f"eligible_{role_name}_total_logit_sum", 0.0) or 0.0
+                                ) + float(np.sum(logits[role_mask]))
                             eligible_logits = logits[eligible_mask]
                             eligible_logits = eligible_logits - float(np.max(eligible_logits))
                             eligible_exp = np.exp(eligible_logits)
@@ -2142,6 +2252,21 @@ def run_native_jax_evaluation(
                             winner_probs = np.zeros((n_players,), dtype=np.float32)
                             if denom > 0.0 and np.isfinite(denom):
                                 winner_probs[eligible_mask] = eligible_exp / denom
+                                valid_offense_ids = offense_ids_np[
+                                    (offense_ids_np >= 0) & (offense_ids_np < int(winner_probs.shape[0]))
+                                ]
+                                valid_defense_ids = defense_ids_np[
+                                    (defense_ids_np >= 0) & (defense_ids_np < int(winner_probs.shape[0]))
+                                ]
+                                eligibility_diag["winner_prob_attempts"] = int(
+                                    eligibility_diag.get("winner_prob_attempts", 0) or 0
+                                ) + 1
+                                eligibility_diag["offense_winner_prob_sum"] = float(
+                                    eligibility_diag.get("offense_winner_prob_sum", 0.0) or 0.0
+                                ) + float(np.sum(winner_probs[valid_offense_ids]))
+                                eligibility_diag["defense_winner_prob_sum"] = float(
+                                    eligibility_diag.get("defense_winner_prob_sum", 0.0) or 0.0
+                                ) + float(np.sum(winner_probs[valid_defense_ids]))
                             winner_probabilities_for_chances = winner_probs
                         if use_local_contest:
                             if offense_eligible > 0 and defense_eligible > 0:
@@ -2245,8 +2370,54 @@ def run_native_jax_evaluation(
             shot_values = np.asarray(trace["shot_value"])[:active_steps, idx].astype(np.float32)
             shot_expected_points = np.asarray(trace["shot_expected_points"])[:active_steps, idx]
             defensive_rebound_flags = np.asarray(trace["defensive_rebound"])[:active_steps, idx].astype(bool)
+            offensive_rebound_flags = np.asarray(trace["offensive_rebound"])[:active_steps, idx].astype(bool)
             potential_flags = np.asarray(trace["potential_assist"])[:active_steps, idx].astype(bool)
             assist_flags = np.asarray(trace["assists"])[:active_steps, idx].astype(bool)
+            full_shot_success_flags = np.asarray(trace["shot_success"])[:, idx].astype(bool)
+            full_shot_values = np.asarray(trace["shot_value"])[:, idx].astype(np.float32)
+            full_offensive_rebound_flags = np.asarray(trace["offensive_rebound"])[:, idx].astype(bool)
+            scored_points_for_post_orb = full_shot_values * full_shot_success_flags.astype(np.float32)
+            post_orb_indices = np.flatnonzero(full_offensive_rebound_flags)
+            if post_orb_indices.size > 0:
+                post_orb_points_sum = float(
+                    sum(float(scored_points_for_post_orb[int(orb_t) + 1 :].sum()) for orb_t in post_orb_indices)
+                )
+                rebound_diag = eval_diagnostics.setdefault("rebounds", {})
+                rebound_diag["post_orb_samples"] = int(rebound_diag.get("post_orb_samples", 0) or 0) + int(
+                    post_orb_indices.size
+                )
+                rebound_diag["post_orb_points_sum"] = float(
+                    rebound_diag.get("post_orb_points_sum", 0.0) or 0.0
+                ) + post_orb_points_sum
+
+                full_active_flags = np.asarray(trace["active"])[:, idx].astype(bool)
+                full_offense_values = np.asarray(trace["offense_values"])[:, idx].astype(np.float32)
+                full_defense_values = np.asarray(trace["defense_values"])[:, idx].astype(np.float32)
+                if full_offense_values.ndim == 2 and full_offense_values.shape[-1] == 1:
+                    full_offense_values = full_offense_values[:, 0]
+                if full_defense_values.ndim == 2 and full_defense_values.shape[-1] == 1:
+                    full_defense_values = full_defense_values[:, 0]
+                post_orb_value_indices = post_orb_indices + 1
+                valid_value_mask = (post_orb_value_indices < full_offense_values.shape[0]) & (
+                    full_active_flags[np.minimum(post_orb_value_indices, full_active_flags.shape[0] - 1)]
+                )
+                post_orb_value_indices = post_orb_value_indices[valid_value_mask]
+                if post_orb_value_indices.size > 0:
+                    post_orb_offense_values = full_offense_values[post_orb_value_indices].astype(np.float64)
+                    post_orb_defense_values = full_defense_values[post_orb_value_indices].astype(np.float64)
+                    post_orb_consensus_values = 0.5 * (post_orb_offense_values - post_orb_defense_values)
+                    rebound_diag["post_orb_value_samples"] = int(
+                        rebound_diag.get("post_orb_value_samples", 0) or 0
+                    ) + int(post_orb_value_indices.size)
+                    rebound_diag["post_orb_consensus_value_sum"] = float(
+                        rebound_diag.get("post_orb_consensus_value_sum", 0.0) or 0.0
+                    ) + float(np.sum(post_orb_consensus_values))
+                    rebound_diag["post_orb_offense_value_sum"] = float(
+                        rebound_diag.get("post_orb_offense_value_sum", 0.0) or 0.0
+                    ) + float(np.sum(post_orb_offense_values))
+                    rebound_diag["post_orb_defense_value_sum"] = float(
+                        rebound_diag.get("post_orb_defense_value_sum", 0.0) or 0.0
+                    ) + float(np.sum(post_orb_defense_values))
             if bool(getattr(env, "enable_rebounds", False)):
                 rebound_reward_mode = str(
                     getattr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"
@@ -2385,6 +2556,14 @@ def run_native_jax_evaluation(
     rebound_diag_final = eval_diagnostics.get("rebounds") or {}
     rebound_eligibility = dict(rebound_diag_final.get("eligibility", {}) or {})
     rebound_target_distance_count = int(rebound_diag_final.get("target_distance_count", 0) or 0)
+    post_orb_samples = int(rebound_diag_final.get("post_orb_samples", 0) or 0)
+    post_orb_points_sum = float(rebound_diag_final.get("post_orb_points_sum", 0.0) or 0.0)
+    post_orb_value_samples = int(rebound_diag_final.get("post_orb_value_samples", 0) or 0)
+    post_orb_consensus_value_sum = float(
+        rebound_diag_final.get("post_orb_consensus_value_sum", 0.0) or 0.0
+    )
+    post_orb_offense_value_sum = float(rebound_diag_final.get("post_orb_offense_value_sum", 0.0) or 0.0)
+    post_orb_defense_value_sum = float(rebound_diag_final.get("post_orb_defense_value_sum", 0.0) or 0.0)
     total_rebound_attempts = _sum(all_rebound_attempts)
     total_rebound_global_contests = _sum(all_rebound_global_contests)
     value_diagnostics = _finalize_value_diagnostics(
@@ -2494,6 +2673,28 @@ def run_native_jax_evaluation(
         "total_rebound_attempts": int(total_rebound_attempts),
         "total_offensive_rebounds": int(_sum(all_offensive_rebounds)),
         "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
+        "post_orb_sample_count": int(post_orb_samples),
+        "post_orb_points_total": float(post_orb_points_sum),
+        "post_orb_points_per_sample": (
+            float(post_orb_points_sum / post_orb_samples) if post_orb_samples > 0 else 0.0
+        ),
+        "post_orb_value_sample_count": int(post_orb_value_samples),
+        "post_orb_consensus_value_total": float(post_orb_consensus_value_sum),
+        "post_orb_consensus_value_per_sample": (
+            float(post_orb_consensus_value_sum / post_orb_value_samples)
+            if post_orb_value_samples > 0
+            else 0.0
+        ),
+        "post_orb_offense_value_per_sample": (
+            float(post_orb_offense_value_sum / post_orb_value_samples)
+            if post_orb_value_samples > 0
+            else 0.0
+        ),
+        "post_orb_defense_value_per_sample": (
+            float(post_orb_defense_value_sum / post_orb_value_samples)
+            if post_orb_value_samples > 0
+            else 0.0
+        ),
         "total_rebound_global_contests": int(total_rebound_global_contests),
         "rebound_global_contest_rate": (
             float(total_rebound_global_contests / total_rebound_attempts) if total_rebound_attempts > 0 else 0.0
@@ -2571,6 +2772,7 @@ def run_native_jax_evaluation(
         "results": results,
         "shot_accumulator": shot_accumulator,
         "rebound_accumulator": rebound_accumulator,
+        "positioning_accumulator": positioning_accumulator,
         "per_player_stats": per_player_stats,
         "per_intent_stats": per_intent_stats,
         "eval_diagnostics": {

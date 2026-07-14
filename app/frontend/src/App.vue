@@ -94,6 +94,38 @@ function normalizeReboundAccumulator(acc) {
   return result;
 }
 
+function normalizePositioningAccumulator(acc) {
+  const result = {};
+  if (!acc || typeof acc !== 'object') return result;
+  for (const [rawKey, rawBucket] of Object.entries(acc)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !rawBucket || typeof rawBucket !== 'object') continue;
+    const offense = normalizeReboundCountMap(rawBucket.offense || rawBucket.offense_all || rawBucket.offenseAll || {});
+    const offenseNonShooter = normalizeReboundCountMap(rawBucket.offense_non_shooter || rawBucket.offenseNonShooter || {});
+    const defense = normalizeReboundCountMap(rawBucket.defense || {});
+    const shooter = normalizeReboundCountMap(rawBucket.shooter || {});
+    const totalRaw = Number(rawBucket.total || 0);
+    const total = Number.isFinite(totalRaw) && totalRaw > 0
+      ? totalRaw
+      : Math.max(
+        Object.values(shooter).reduce((sum, val) => sum + Number(val || 0), 0),
+        0,
+      );
+    if (total <= 0) continue;
+    result[`${q},${r}`] = {
+      total,
+      offense,
+      offenseNonShooter,
+      defense,
+      shooter,
+    };
+  }
+  return result;
+}
+
 function probToPercent(prob) {
   const num = Number(prob ?? 0);
   if (Number.isNaN(num)) return 0;
@@ -246,7 +278,10 @@ const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
 const reboundAccumulator = ref({});
+const positioningAccumulator = ref({});
 const reboundHeatmapEnabled = ref(false);
+const positioningHeatmapEnabled = ref(false);
+const positioningHeatmapKind = ref('offense_non_shooter');
 const reboundHeatmapKind = ref('targets');
 const reboundHeatmapPlayer = ref('all');
 const selectedReboundShotKey = ref('');
@@ -616,7 +651,12 @@ const boardReboundSkillOverrides = computed(() => {
   });
   return out;
 });
-const boardShowCoordinates = computed(() => isTemplatePlacementMode.value || isPassLabPlacementMode.value);
+const boardShowCoordinates = computed(() => (
+  isTemplatePlacementMode.value
+  || isPassLabPlacementMode.value
+  || sourceHeatmapEnabled.value
+  || Boolean(boardReboundTargetOverlay.value)
+));
 const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const activeControlsTab = ref('controls');
 const reboundHeatmapPlayerOptions = computed(() => {
@@ -635,6 +675,18 @@ const reboundHeatmapSelectedPlayerLabel = computed(() => {
 watch(reboundHeatmapPlayerOptions, (options) => {
   const selected = String(reboundHeatmapPlayer.value || 'all');
   if (!options.some((opt) => opt.value === selected)) reboundHeatmapPlayer.value = 'all';
+});
+watch(reboundHeatmapEnabled, (enabled) => {
+  if (enabled && positioningHeatmapEnabled.value) {
+    positioningHeatmapEnabled.value = false;
+    clearSelectedReboundShot();
+  }
+});
+watch(positioningHeatmapEnabled, (enabled) => {
+  if (enabled && reboundHeatmapEnabled.value) {
+    reboundHeatmapEnabled.value = false;
+    clearSelectedReboundShot();
+  }
 });
 const shotChartOptions = computed(() => {
   const opts = [{ label: 'Team', value: 'team' }];
@@ -671,9 +723,31 @@ const hasReboundHeatmapData = computed(
 const showReboundHeatmapSelector = computed(
   () => !isBoardEditingMode.value && hasReboundHeatmapData.value,
 );
+const hasPositioningHeatmapData = computed(
+  () => !!positioningAccumulator.value && Object.keys(positioningAccumulator.value).length > 0,
+);
+const showPositioningHeatmapSelector = computed(
+  () => !isBoardEditingMode.value && hasPositioningHeatmapData.value,
+);
+const positioningAdvantageMode = computed(() => (
+  positioningHeatmapEnabled.value && String(positioningHeatmapKind.value || '') === 'source_advantage'
+));
+const sourceHeatmapNeedsSelection = computed(() => (
+  reboundHeatmapEnabled.value
+  || (positioningHeatmapEnabled.value && !positioningAdvantageMode.value)
+));
+const sourceHeatmapEnabled = computed(() => sourceHeatmapNeedsSelection.value || positioningAdvantageMode.value);
 const reboundHeatmapSourceAccumulator = computed(() => {
   const out = {};
   for (const [key, bucket] of Object.entries(reboundAccumulator.value || {})) {
+    const total = Number(bucket?.total || 0);
+    if (total > 0) out[key] = [total, 0];
+  }
+  return out;
+});
+const positioningHeatmapSourceAccumulator = computed(() => {
+  const out = {};
+  for (const [key, bucket] of Object.entries(positioningAccumulator.value || {})) {
     const total = Number(bucket?.total || 0);
     if (total > 0) out[key] = [total, 0];
   }
@@ -799,6 +873,173 @@ const boardEvalReboundOverlay = computed(() => {
     shot: { player_id: null, shot_type: kindLabel },
   };
 });
+function sumCountMap(map) {
+  return Object.values(map || {}).reduce((sum, val) => sum + Number(val || 0), 0);
+}
+
+const selectedPositioningHeatmapBucket = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value.filter((key) => positioningAccumulator.value?.[key]);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) return positioningAccumulator.value[keys[0]];
+  const bucket = {
+    total: 0,
+    offense: {},
+    offenseNonShooter: {},
+    defense: {},
+    shooter: {},
+  };
+  for (const key of keys) {
+    const src = positioningAccumulator.value[key] || {};
+    bucket.total += Number(src.total || 0);
+    addReboundCounts(bucket.offense, src.offense);
+    addReboundCounts(bucket.offenseNonShooter, src.offenseNonShooter);
+    addReboundCounts(bucket.defense, src.defense);
+    addReboundCounts(bucket.shooter, src.shooter);
+  }
+  return bucket;
+});
+
+function buildPositioningAdvantageCells() {
+  const targetCells = [];
+  let sourceCount = 0;
+  let weightedAdvantageSum = 0;
+  let shotWeightSum = 0;
+
+  for (const [sourceKey, positionBucket] of Object.entries(positioningAccumulator.value || {})) {
+    const [qStr, rStr] = String(sourceKey || '').split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r)) continue;
+
+    const reboundBucket = reboundAccumulator.value?.[sourceKey];
+    const targetMap = reboundBucket?.targets || {};
+    const targetTotal = sumCountMap(targetMap);
+    if (targetTotal <= 0) continue;
+
+    const offenseMap = positionBucket?.offenseNonShooter || {};
+    const defenseMap = positionBucket?.defense || {};
+    const offenseTotal = sumCountMap(offenseMap);
+    const defenseTotal = sumCountMap(defenseMap);
+    if (offenseTotal <= 0 || defenseTotal <= 0) continue;
+
+    let advantage = 0;
+    for (const [targetKey, rawCount] of Object.entries(targetMap)) {
+      const targetCount = Number(rawCount || 0);
+      if (!Number.isFinite(targetCount) || targetCount <= 0) continue;
+      const targetProb = targetCount / targetTotal;
+      const offenseProb = Number(offenseMap[targetKey] || 0) / offenseTotal;
+      const defenseProb = Number(defenseMap[targetKey] || 0) / defenseTotal;
+      advantage += targetProb * (offenseProb - defenseProb);
+    }
+
+    const shotCount = Number(positionBucket?.total || 0);
+    if (!Number.isFinite(advantage) || Math.abs(advantage) <= 0) continue;
+    if (shotCount > 0) {
+      weightedAdvantageSum += advantage * shotCount;
+      shotWeightSum += shotCount;
+    }
+    sourceCount += 1;
+    targetCells.push({
+      q,
+      r,
+      prob: Math.abs(advantage),
+      signed_prob: advantage,
+      count: Number.isFinite(shotCount) && shotCount > 0 ? shotCount : null,
+      label: `${advantage >= 0 ? '+' : ''}${(advantage * 100).toFixed(1)}%`,
+    });
+  }
+
+  return {
+    targetCells,
+    sourceCount,
+    meanAdvantage: shotWeightSum > 0 ? weightedAdvantageSum / shotWeightSum : 0,
+  };
+}
+
+const boardEvalPositioningOverlay = computed(() => {
+  if (!positioningHeatmapEnabled.value) return null;
+  const kind = String(positioningHeatmapKind.value || 'offense_non_shooter');
+
+  if (kind === 'source_advantage') {
+    const { targetCells, sourceCount, meanAdvantage } = buildPositioningAdvantageCells();
+    if (targetCells.length === 0) return null;
+    return {
+      available: true,
+      source: 'eval_positioning_advantage_heatmap',
+      color_mode: 'diverging',
+      title: 'Eval shot-source rebound positioning advantage',
+      summary: `Target-weighted O-D near rebound targets | ${sourceCount} shot sources | mean ${meanAdvantage >= 0 ? '+' : ''}${(meanAdvantage * 100).toFixed(1)}%`,
+      target_cells: targetCells,
+      shot: { player_id: null, shot_type: 'positioning advantage' },
+    };
+  }
+
+  if (isReboundMultiSelecting.value || selectedReboundShotKeysDisplay.value.length === 0) return null;
+  const bucket = selectedPositioningHeatmapBucket.value;
+  if (!bucket) return null;
+  const offenseMap = bucket.offenseNonShooter || {};
+  const defenseMap = bucket.defense || {};
+  const totalShots = Number(bucket.total || 0);
+  let targetCells = [];
+  let titleKind = 'offense non-shooter density';
+  let summary = '';
+
+  if (kind === 'offense_minus_defense') {
+    const offenseTotal = sumCountMap(offenseMap);
+    const defenseTotal = sumCountMap(defenseMap);
+    const keys = new Set([...Object.keys(offenseMap), ...Object.keys(defenseMap)]);
+    targetCells = [...keys].map((key) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      if (!Number.isFinite(q) || !Number.isFinite(r)) return null;
+      const offenseProb = offenseTotal > 0 ? Number(offenseMap[key] || 0) / offenseTotal : 0;
+      const defenseProb = defenseTotal > 0 ? Number(defenseMap[key] || 0) / defenseTotal : 0;
+      const diff = offenseProb - defenseProb;
+      if (Math.abs(diff) <= 0) return null;
+      return {
+        q,
+        r,
+        prob: Math.abs(diff),
+        signed_prob: diff,
+        count: null,
+        label: `${diff >= 0 ? '+' : ''}${(diff * 100).toFixed(1)}%`,
+      };
+    }).filter(Boolean);
+    titleKind = 'offense - defense density';
+    summary = `O samples ${Math.round(offenseTotal)} | D samples ${Math.round(defenseTotal)} | ${Math.round(totalShots)} shots`;
+  } else {
+    const rawMap = kind === 'defense' ? defenseMap : offenseMap;
+    const total = sumCountMap(rawMap);
+    titleKind = kind === 'defense' ? 'defense density' : 'offense non-shooter density';
+    summary = `${Math.round(total)} player-position samples from ${Math.round(totalShots)} shots`;
+    targetCells = Object.entries(rawMap).map(([key, count]) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      const c = Number(count || 0);
+      if (!Number.isFinite(q) || !Number.isFinite(r) || c <= 0 || total <= 0) return null;
+      return {
+        q,
+        r,
+        prob: c / total,
+        count: c,
+      };
+    }).filter(Boolean);
+  }
+
+  if (targetCells.length === 0) return null;
+  return {
+    available: true,
+    source: 'eval_positioning_heatmap',
+    color_mode: kind === 'offense_minus_defense' ? 'diverging' : 'density',
+    title: `Eval positioning from ${selectedReboundShotLabel.value} | ${titleKind}`,
+    summary,
+    target_cells: targetCells,
+    shot: { player_id: null, shot_type: titleKind },
+  };
+});
+
 const hasAssistSankeyData = computed(
   () => hasPositiveLinkCount(assistLinksByPair.value)
     || hasPositiveLinkCount(potentialAssistLinksByPair.value)
@@ -956,6 +1197,7 @@ const liveReboundTargetOverlay = computed(() => buildReboundTargetOverlayFromSta
 
 const boardReboundTargetOverlay = computed(() => {
   if (isPlaybookBoardPreviewActive.value || isBoardEditingMode.value) return null;
+  if (boardEvalPositioningOverlay.value) return boardEvalPositioningOverlay.value;
   if (boardEvalReboundOverlay.value) return boardEvalReboundOverlay.value;
   // Eval shot charts should not be hidden by a stale live rebound overlay from the current board state.
   if (hasShotChartData.value && !reboundPreviewEnabled.value) return null;
@@ -967,6 +1209,9 @@ const boardShotAccumulatorDisplay = computed(() => {
   if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) {
     return reboundHeatmapSourceAccumulator.value;
   }
+  if (positioningHeatmapEnabled.value && !positioningAdvantageMode.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) {
+    return positioningHeatmapSourceAccumulator.value;
+  }
   return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
     ? {}
     : shotAccumulatorForBoard.value;
@@ -976,6 +1221,7 @@ const initialControlsTab = computed(() =>
 );
 const boardShotChartLabelDisplay = computed(() => {
   if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) return 'Select shot source for rebound heatmap';
+  if (positioningHeatmapEnabled.value && !positioningAdvantageMode.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) return 'Select shot source for positioning heatmap';
   return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value) ? '' : boardShotChartLabel.value;
 });
 
@@ -1136,6 +1382,7 @@ async function handleGameStarted(setupData) {
   moveHistory.value = [];
   shotAccumulator.value = {};
   reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
   selectedReboundShotKey.value = '';
   selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
@@ -1219,6 +1466,7 @@ async function handleTemplateSandboxStarted(setupData = {}) {
   moveHistory.value = [];
   shotAccumulator.value = {};
   reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
   selectedReboundShotKey.value = '';
   selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
@@ -1467,8 +1715,9 @@ function syncSelectedReboundShotKey() {
 
 function handleReboundShotSelected(key, meta = {}) {
   const normalized = String(key || '').trim();
-  if (!reboundHeatmapEnabled.value || !normalized) return;
-  if (!reboundAccumulator.value?.[normalized]) return;
+  if (!sourceHeatmapNeedsSelection.value || !normalized) return;
+  const sourceMap = positioningHeatmapEnabled.value ? positioningAccumulator.value : reboundAccumulator.value;
+  if (!sourceMap?.[normalized]) return;
   const current = Array.isArray(selectedReboundShotKeys.value) ? [...selectedReboundShotKeys.value] : [];
   if (meta?.shiftKey) {
     const idx = current.indexOf(normalized);
@@ -2359,6 +2608,7 @@ async function handleEvaluation() {
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
   reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
   selectedReboundShotKey.value = '';
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
@@ -2447,7 +2697,9 @@ async function handleEvaluation() {
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
       reboundAccumulator.value = normalizeReboundAccumulator(response.rebound_accumulator || {});
-      if (!reboundAccumulator.value[selectedReboundShotKey.value]) selectedReboundShotKey.value = '';
+      positioningAccumulator.value = normalizePositioningAccumulator(response.positioning_accumulator || {});
+      const selectedSourceMap = positioningHeatmapEnabled.value ? positioningAccumulator.value : reboundAccumulator.value;
+      if (!selectedSourceMap[selectedReboundShotKey.value]) selectedReboundShotKey.value = '';
       const evalDiagnostics = response.eval_diagnostics || {};
       assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
       assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
@@ -2902,6 +3154,7 @@ async function handlePlayAgain() {
   policyProbs.value = null;
   shotAccumulator.value = {};
   reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
   selectedReboundShotKey.value = '';
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
@@ -2950,6 +3203,7 @@ async function handlePlayAgain() {
 function clearEvaluationArtifacts() {
   shotAccumulator.value = {};
   reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
   selectedReboundShotKey.value = '';
   selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
@@ -3018,7 +3272,7 @@ function startEvaluationProgressPolling(expectedTotal) {
 
 // --- Global keyboard shortcuts ---
 function onKeydown(e) {
-  if (e.key === 'Shift' && reboundHeatmapEnabled.value) isReboundMultiSelecting.value = true;
+  if (e.key === 'Shift' && sourceHeatmapNeedsSelection.value) isReboundMultiSelecting.value = true;
   const tag = (e.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') return; // avoid typing conflicts
   const key = e.key?.toLowerCase();
@@ -3137,10 +3391,10 @@ onBeforeUnmount(() => {
       <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
       <div class="top-row">
       <div class="board-area">
-        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector || showReboundHeatmapSelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
+        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector || showReboundHeatmapSelector || showPositioningHeatmapSelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
           <template v-if="activeControlsTab !== 'playbook' && showShotChartSelector">
             <label>Shot chart:</label>
-            <select v-model="shotChartTarget" :disabled="reboundHeatmapEnabled">
+            <select v-model="shotChartTarget" :disabled="sourceHeatmapEnabled">
               <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
                 {{ opt.label }}
               </option>
@@ -3169,6 +3423,27 @@ onBeforeUnmount(() => {
               Change source ({{ selectedReboundShotLabel }})
             </button>
             <span v-else-if="reboundHeatmapEnabled" class="status-note">Click a shot hex, or hold Shift and click multiple</span>
+          </template>
+          <template v-if="activeControlsTab !== 'playbook' && showPositioningHeatmapSelector">
+            <label class="inline-check">
+              <input type="checkbox" v-model="positioningHeatmapEnabled" />
+              <span>Positioning mode</span>
+            </label>
+            <select v-model="positioningHeatmapKind" :disabled="!positioningHeatmapEnabled">
+              <option value="offense_non_shooter">Offense non-shooters</option>
+              <option value="defense">Defense</option>
+              <option value="offense_minus_defense">Offense - defense</option>
+              <option value="source_advantage">Shot-source advantage</option>
+            </select>
+            <button
+              v-if="positioningHeatmapEnabled && !positioningAdvantageMode && selectedReboundShotKeysDisplay.length > 0"
+              class="small-action-button"
+              type="button"
+              @click="clearSelectedReboundShot"
+            >
+              Change source ({{ selectedReboundShotLabel }})
+            </button>
+            <span v-else-if="positioningHeatmapEnabled && !positioningAdvantageMode" class="status-note">Click a shot hex, or hold Shift and click multiple</span>
           </template>
           <template v-if="activeControlsTab !== 'playbook' && showSankeySelector">
             <label>Sankey:</label>
@@ -3229,11 +3504,11 @@ onBeforeUnmount(() => {
           :selected-actions="boardSelectedActionsDisplay"
           :shot-accumulator="boardShotAccumulatorDisplay"
           :shot-chart-label="boardShotChartLabelDisplay"
-          :shot-cells-clickable="reboundHeatmapEnabled && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
-          :shot-chart-count-only="reboundHeatmapEnabled && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
-          :selected-shot-cells="reboundHeatmapEnabled ? selectedReboundShotKeysDisplay : []"
-          :hide-players="reboundHeatmapEnabled"
-          :hide-clock-overlays="reboundHeatmapEnabled"
+          :shot-cells-clickable="sourceHeatmapNeedsSelection && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :shot-chart-count-only="sourceHeatmapNeedsSelection && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :selected-shot-cells="sourceHeatmapNeedsSelection ? selectedReboundShotKeysDisplay : []"
+          :hide-players="sourceHeatmapEnabled"
+          :hide-clock-overlays="sourceHeatmapEnabled"
           :show-rebound-skills="evalConfig.showReboundSkillsOnBoard"
           :rebound-skill-overrides="boardReboundSkillOverrides"
           :rebound-target-overlay="boardReboundTargetOverlay"

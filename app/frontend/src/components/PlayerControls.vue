@@ -4878,10 +4878,54 @@ const reboundAvgEligibleDefense = computed(() => safeDiv(Number(reboundEligibili
 const reboundAvgEligibleSkill = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.eligible_skill_sum || 0), Number(reboundEligibilityDiag.value?.eligible_players_sum || 0)));
 const reboundAvgEligibleOffenseSkill = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.eligible_offense_skill_sum || 0), Number(reboundEligibilityDiag.value?.eligible_offense_sum || 0)));
 const reboundAvgEligibleDefenseSkill = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.eligible_defense_skill_sum || 0), Number(reboundEligibilityDiag.value?.eligible_defense_sum || 0)));
+function reboundEligibleAverageForRole(role, key) {
+  const prefix = role === 'defense' ? 'eligible_defense' : 'eligible_offense';
+  const denom = Number(reboundEligibilityDiag.value?.[`${prefix}_sum`] || 0);
+  return safeDiv(Number(reboundEligibilityDiag.value?.[`${prefix}_${key}_sum`] || 0), denom);
+}
+const reboundEligibleLogitRows = computed(() => [
+  {
+    key: 'target',
+    label: 'Target dist logit',
+    offense: reboundEligibleAverageForRole('offense', 'target_logit'),
+    defense: reboundEligibleAverageForRole('defense', 'target_logit'),
+  },
+  {
+    key: 'basket',
+    label: 'Basket pos logit',
+    offense: reboundEligibleAverageForRole('offense', 'basket_logit'),
+    defense: reboundEligibleAverageForRole('defense', 'basket_logit'),
+  },
+  {
+    key: 'skill',
+    label: 'Skill logit',
+    offense: reboundEligibleAverageForRole('offense', 'skill_logit'),
+    defense: reboundEligibleAverageForRole('defense', 'skill_logit'),
+  },
+  {
+    key: 'total',
+    label: 'Total logit',
+    offense: reboundEligibleAverageForRole('offense', 'total_logit'),
+    defense: reboundEligibleAverageForRole('defense', 'total_logit'),
+  },
+]);
+const reboundWinnerProbAttempts = computed(() => Number(reboundEligibilityDiag.value?.winner_prob_attempts || 0));
+const reboundAvgOffenseWinnerProb = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.offense_winner_prob_sum || 0), reboundWinnerProbAttempts.value) * 100);
+const reboundAvgDefenseWinnerProb = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.defense_winner_prob_sum || 0), reboundWinnerProbAttempts.value) * 100);
 const reboundLocalMixedRate = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.local_mixed_attempts || 0), reboundEligibilityAttempts.value) * 100);
 const reboundLocalOffenseOnlyRate = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.local_offense_only_attempts || 0), reboundEligibilityAttempts.value) * 100);
 const reboundLocalDefenseOnlyRate = computed(() => safeDiv(Number(reboundEligibilityDiag.value?.local_defense_only_attempts || 0), reboundEligibilityAttempts.value) * 100);
 const reboundTargetDistanceCount = computed(() => Number(statsState.value?.rebounds?.targetDistanceCount || 0));
+const postOrbSampleCount = computed(() => Number(statsState.value?.rebounds?.postOrbSamples || 0));
+const postOrbPoints = computed(() => Number(statsState.value?.rebounds?.postOrbPoints || 0));
+const avgPostOrbPoints = computed(() => safeDiv(postOrbPoints.value, postOrbSampleCount.value));
+const postOrbValueSampleCount = computed(() => Number(statsState.value?.rebounds?.postOrbValueSamples || 0));
+const postOrbConsensusValue = computed(() => Number(statsState.value?.rebounds?.postOrbConsensusValue || 0));
+const avgPostOrbConsensusValue = computed(() => safeDiv(postOrbConsensusValue.value, postOrbValueSampleCount.value));
+const postOrbOffenseValue = computed(() => Number(statsState.value?.rebounds?.postOrbOffenseValue || 0));
+const avgPostOrbOffenseValue = computed(() => safeDiv(postOrbOffenseValue.value, postOrbValueSampleCount.value));
+const postOrbDefenseValue = computed(() => Number(statsState.value?.rebounds?.postOrbDefenseValue || 0));
+const avgPostOrbDefenseValue = computed(() => safeDiv(postOrbDefenseValue.value, postOrbValueSampleCount.value));
 const valueDiag = computed(() => statsState.value?.valueDiagnostics || {});
 const valueDiagSampleCount = computed(() => Number(valueDiag.value?.sample_count || 0));
 const valueDiagSource = computed(() => (valueDiagSampleCount.value > 0 ? 'native JAX eval' : 'unavailable'));
@@ -4926,6 +4970,12 @@ function ensureStatsDiagnosticFields(target) {
   target.rebounds.targetDistanceSumOffense = Number(target.rebounds.targetDistanceSumOffense || 0);
   target.rebounds.targetDistanceSumDefense = Number(target.rebounds.targetDistanceSumDefense || 0);
   target.rebounds.targetDistanceCount = Number(target.rebounds.targetDistanceCount || 0);
+  target.rebounds.postOrbSamples = Number(target.rebounds.postOrbSamples || 0);
+  target.rebounds.postOrbPoints = Number(target.rebounds.postOrbPoints || 0);
+  target.rebounds.postOrbValueSamples = Number(target.rebounds.postOrbValueSamples || 0);
+  target.rebounds.postOrbConsensusValue = Number(target.rebounds.postOrbConsensusValue || 0);
+  target.rebounds.postOrbOffenseValue = Number(target.rebounds.postOrbOffenseValue || 0);
+  target.rebounds.postOrbDefenseValue = Number(target.rebounds.postOrbDefenseValue || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -5040,11 +5090,23 @@ function addReboundStats(target, results) {
       targetDistanceSumOffense: 0,
       targetDistanceSumDefense: 0,
       targetDistanceCount: 0,
+      postOrbSamples: 0,
+      postOrbPoints: 0,
+      postOrbValueSamples: 0,
+      postOrbConsensusValue: 0,
+      postOrbOffenseValue: 0,
+      postOrbDefenseValue: 0,
     };
   }
   target.rebounds.targetDistanceSumOffense = Number(target.rebounds.targetDistanceSumOffense || 0);
   target.rebounds.targetDistanceSumDefense = Number(target.rebounds.targetDistanceSumDefense || 0);
   target.rebounds.targetDistanceCount = Number(target.rebounds.targetDistanceCount || 0);
+  target.rebounds.postOrbSamples = Number(target.rebounds.postOrbSamples || 0);
+  target.rebounds.postOrbPoints = Number(target.rebounds.postOrbPoints || 0);
+  target.rebounds.postOrbValueSamples = Number(target.rebounds.postOrbValueSamples || 0);
+  target.rebounds.postOrbConsensusValue = Number(target.rebounds.postOrbConsensusValue || 0);
+  target.rebounds.postOrbOffenseValue = Number(target.rebounds.postOrbOffenseValue || 0);
+  target.rebounds.postOrbDefenseValue = Number(target.rebounds.postOrbDefenseValue || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -5820,6 +5882,32 @@ function applyEvaluationStats(
     const rbDefTargetDistanceSum = Number(rbDiag.target_distance_sum_defense);
     const nativeOffTargetDistanceAvg = Number(nativeSummary.avg_offense_rebound_target_distance);
     const nativeDefTargetDistanceAvg = Number(nativeSummary.avg_defense_rebound_target_distance);
+    const nativePostOrbSamples = Number(nativeSummary.post_orb_sample_count);
+    const nativePostOrbPoints = Number(nativeSummary.post_orb_points_total);
+    const rbPostOrbSamples = Number(rbDiag.post_orb_samples);
+    const rbPostOrbPoints = Number(rbDiag.post_orb_points_sum);
+    const diagPostOrbSamples = Number.isFinite(nativePostOrbSamples) && nativePostOrbSamples > 0
+      ? nativePostOrbSamples
+      : (Number.isFinite(rbPostOrbSamples) ? rbPostOrbSamples : Number(next.rebounds?.postOrbSamples || 0));
+    const diagPostOrbPoints = Number.isFinite(nativePostOrbPoints)
+      ? nativePostOrbPoints
+      : (Number.isFinite(rbPostOrbPoints) ? rbPostOrbPoints : Number(next.rebounds?.postOrbPoints || 0));
+    const nativePostOrbValueSamples = Number(nativeSummary.post_orb_value_sample_count);
+    const nativePostOrbConsensusValue = Number(nativeSummary.post_orb_consensus_value_total);
+    const nativePostOrbOffenseValueAvg = Number(nativeSummary.post_orb_offense_value_per_sample);
+    const nativePostOrbDefenseValueAvg = Number(nativeSummary.post_orb_defense_value_per_sample);
+    const diagPostOrbValueSamples = Number.isFinite(nativePostOrbValueSamples) && nativePostOrbValueSamples > 0
+      ? nativePostOrbValueSamples
+      : Number(next.rebounds?.postOrbValueSamples || 0);
+    const diagPostOrbConsensusValue = Number.isFinite(nativePostOrbConsensusValue)
+      ? nativePostOrbConsensusValue
+      : Number(next.rebounds?.postOrbConsensusValue || 0);
+    const diagPostOrbOffenseValue = Number.isFinite(nativePostOrbOffenseValueAvg) && diagPostOrbValueSamples > 0
+      ? nativePostOrbOffenseValueAvg * diagPostOrbValueSamples
+      : Number(next.rebounds?.postOrbOffenseValue || 0);
+    const diagPostOrbDefenseValue = Number.isFinite(nativePostOrbDefenseValueAvg) && diagPostOrbValueSamples > 0
+      ? nativePostOrbDefenseValueAvg * diagPostOrbValueSamples
+      : Number(next.rebounds?.postOrbDefenseValue || 0);
     const diagTargetDistanceSumOffense = useNativeTargetDistance
       ? (Number.isFinite(nativeOffTargetDistanceAvg) ? nativeOffTargetDistanceAvg * nativeTargetDistanceCount : Number(next.rebounds?.targetDistanceSumOffense || 0))
       : (useDiagTargetDistance && Number.isFinite(rbOffTargetDistanceSum)
@@ -5855,6 +5943,24 @@ function applyEvaluationStats(
       targetDistanceCount: Number.isFinite(diagTargetDistanceCount)
         ? Math.max(Number(next.rebounds?.targetDistanceCount || 0), diagTargetDistanceCount)
         : Number(next.rebounds?.targetDistanceCount || 0),
+      postOrbSamples: Number.isFinite(diagPostOrbSamples)
+        ? Math.max(Number(next.rebounds?.postOrbSamples || 0), diagPostOrbSamples)
+        : Number(next.rebounds?.postOrbSamples || 0),
+      postOrbPoints: Number.isFinite(diagPostOrbPoints)
+        ? diagPostOrbPoints
+        : Number(next.rebounds?.postOrbPoints || 0),
+      postOrbValueSamples: Number.isFinite(diagPostOrbValueSamples)
+        ? Math.max(Number(next.rebounds?.postOrbValueSamples || 0), diagPostOrbValueSamples)
+        : Number(next.rebounds?.postOrbValueSamples || 0),
+      postOrbConsensusValue: Number.isFinite(diagPostOrbConsensusValue)
+        ? diagPostOrbConsensusValue
+        : Number(next.rebounds?.postOrbConsensusValue || 0),
+      postOrbOffenseValue: Number.isFinite(diagPostOrbOffenseValue)
+        ? diagPostOrbOffenseValue
+        : Number(next.rebounds?.postOrbOffenseValue || 0),
+      postOrbDefenseValue: Number.isFinite(diagPostOrbDefenseValue)
+        ? diagPostOrbDefenseValue
+        : Number(next.rebounds?.postOrbDefenseValue || 0),
     };
     const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
     const selectorStartSource = Object.keys(selectorStartCounts).length > 0
@@ -5955,6 +6061,8 @@ async function copyStatsMarkdown() {
       ['Offensive rebounds', String(s.rebounds?.offensive || 0)],
       ['Defensive rebounds', String(s.rebounds?.defensive || 0)],
       ['ORB%', overallOrbPct.value.toFixed(1) + '%'],
+      ['Post-ORB points/sample', `${avgPostOrbPoints.value.toFixed(2)} (${postOrbPoints.value.toFixed(0)}/${postOrbSampleCount.value})`],
+      ['Post-ORB value/sample', `${avgPostOrbConsensusValue.value.toFixed(2)} (${postOrbConsensusValue.value.toFixed(1)}/${postOrbValueSampleCount.value})`],
       ['Shot clock violations', String(shotClockViolationCount.value)],
       ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
       ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
@@ -8322,6 +8430,8 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Missed shots recovered by the offense, extending the possession."><span class="param-name">Offensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.offensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Missed shots recovered by the defense, ending the possession."><span class="param-name">Defensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.defensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offensive rebound percentage: offensive rebounds divided by all resolved rebound chances."><span class="param-name">ORB%:</span><span class="param-value">{{ overallOrbPct.toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Empirical continuation value after offensive rebounds: future points scored later in the same possession, averaged across offensive rebound continuation states. Multiple offensive rebounds in one possession each count as a separate continuation sample."><span class="param-name">Post-ORB points/sample:</span><span class="param-value">{{ postOrbSampleCount > 0 ? `${avgPostOrbPoints.toFixed(2)} (${postOrbPoints.toFixed(0)}/${postOrbSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic-implied continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). This can be compared with empirical post-ORB points/sample."><span class="param-name">Post-ORB value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Resolved rebound attempts with valid target-cell distance diagnostics."><span class="param-name">Rebound target dist samples:</span><span class="param-value">{{ reboundTargetDistanceCount }}</span></div>
             <div class="param-item" data-tooltip="Average hex distance from offensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg OFF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgOffenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Average hex distance from defensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg DEF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgDefenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
@@ -8373,6 +8483,19 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Offense/defense player counts in the compiled JAX static config."><span class="param-name">Role counts:</span><span class="param-value">{{ reboundResolvedParams.offense_player_count ?? 'N/A' }}/{{ reboundResolvedParams.defense_player_count ?? 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Average number of players eligible for the rebound winner softmax. In global contest this should match total players; in local contest it should be smaller unless falling back."><span class="param-name">Avg eligible players:</span><span class="param-value">{{ reboundAvgEligiblePlayers.toFixed(2) }} (O {{ reboundAvgEligibleOffense.toFixed(2) }} / D {{ reboundAvgEligibleDefense.toFixed(2) }})</span></div>
             <div class="param-item" data-tooltip="Average rebound skill among players eligible for the rebound winner softmax, split by team. This indicates whether better rebounders are being positioned near sampled target cells."><span class="param-name">Avg eligible skill:</span><span class="param-value">{{ reboundAvgEligibleSkill.toFixed(2) }} (O {{ reboundAvgEligibleOffenseSkill.toFixed(2) }} / D {{ reboundAvgEligibleDefenseSkill.toFixed(2) }})</span></div>
+            <div
+              v-for="row in reboundEligibleLogitRows"
+              :key="`rebound-logit-${row.key}`"
+              class="param-item"
+              data-tooltip="Average eligible-player contribution to rebound winner logits. More positive is better for winning the softmax; target and basket terms are usually negative while skill is positive or negative depending on sampled skill."
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">O {{ row.offense.toFixed(3) }} / D {{ row.defense.toFixed(3) }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Average team-level softmax mass over rebound attempts. This is the model-implied expected ORB/DRB split before sampling."><span class="param-name">Softmax win mass:</span><span class="param-value">O {{ reboundAvgOffenseWinnerProb.toFixed(1) }}% / D {{ reboundAvgDefenseWinnerProb.toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Empirical continuation value after offensive rebounds: future points scored later in the same possession, averaged across offensive rebound continuation states. Multiple offensive rebounds in one possession each count as a separate continuation sample."><span class="param-name">Post-ORB points/sample:</span><span class="param-value">{{ postOrbSampleCount > 0 ? `${avgPostOrbPoints.toFixed(2)} (${postOrbPoints.toFixed(0)}/${postOrbSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic-implied continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). Parentheses show total consensus value divided by post-ORB value samples."><span class="param-name">Post-ORB value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Post-ORB raw critic values at the first decision state after offensive rebounds. These are useful for diagnosing whether Vo and Vd agree about continuation value."><span class="param-name">Post-ORB Vo/Vd:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbOffenseValue.toFixed(2)} / ${avgPostOrbDefenseValue.toFixed(2)}` : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where both teams had at least one eligible player, divided by rebound attempts."><span class="param-name">Local mixed rate:</span><span class="param-value">{{ reboundLocalMixedRate.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where only offensive players were eligible, divided by rebound attempts."><span class="param-name">Local offense-only:</span><span class="param-value">{{ reboundLocalOffenseOnlyRate.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where only defensive players were eligible, divided by rebound attempts."><span class="param-name">Local defense-only:</span><span class="param-value">{{ reboundLocalDefenseOnlyRate.toFixed(1) }}%</span></div>

@@ -828,6 +828,8 @@ const reboundTargetCells = computed(() => {
       const chanceCount = Number(cell?.chance_count ?? cell?.chanceCount);
       const offensiveCount = Number(cell?.offensive_count ?? cell?.offensiveCount ?? 0);
       const orbPctRaw = Number(cell?.orb_pct ?? cell?.orbPct);
+      const signedProbRaw = Number(cell?.signed_prob ?? cell?.signedProb);
+      const explicitLabel = typeof cell?.label === 'string' ? cell.label : '';
       const reboundRateLabel = typeof cell?.rebound_rate_label === 'string'
         ? cell.rebound_rate_label
         : (typeof cell?.reboundRateLabel === 'string' ? cell.reboundRateLabel : '');
@@ -841,6 +843,8 @@ const reboundTargetCells = computed(() => {
         chanceCount: Number.isFinite(chanceCount) ? chanceCount : null,
         offensiveCount: Number.isFinite(offensiveCount) ? offensiveCount : 0,
         orbPct: Number.isFinite(orbPctRaw) ? orbPctRaw : null,
+        signedProb: Number.isFinite(signedProbRaw) ? signedProbRaw : null,
+        label: explicitLabel,
         reboundRateLabel,
       };
     })
@@ -922,10 +926,25 @@ const reboundOverlaySummary = computed(() => {
   return typeof summary === 'string' ? summary.trim() : '';
 });
 
-function reboundTargetFill(prob) {
+function reboundTargetFill(input) {
+  const pt = input && typeof input === 'object' ? input : null;
+  const prob = pt ? Number(pt.prob || 0) : Number(input || 0);
   const denom = Math.max(1e-9, maxReboundTargetProb.value);
-  const t = Math.max(0, Math.min(1, Number(prob || 0) / denom));
+  const t = Math.max(0, Math.min(1, prob / denom));
   const alpha = 0.10 + 0.72 * Math.sqrt(t);
+  const signedProb = Number(pt?.signedProb);
+  if (Number.isFinite(signedProb)) {
+    if (signedProb >= 0) {
+      const r = Math.round(30 + (251 - 30) * t);
+      const g = Math.round(64 + (146 - 64) * t);
+      const b = Math.round(175 + (60 - 175) * t);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    const r = Math.round(15 + (56 - 15) * t);
+    const g = Math.round(118 + (189 - 118) * t);
+    const b = Math.round(110 + (248 - 110) * t);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
   const r = Math.round(14 + (251 - 14) * t);
   const g = Math.round(165 + (191 - 165) * t);
   const b = Math.round(233 + (36 - 233) * t);
@@ -938,6 +957,12 @@ function reboundTargetStroke(pt) {
   }
   const denom = Math.max(1e-9, maxReboundTargetProb.value);
   const t = Math.max(0, Math.min(1, Number(pt?.prob || 0) / denom));
+  const signedProb = Number(pt?.signedProb);
+  if (Number.isFinite(signedProb)) {
+    return signedProb >= 0
+      ? `rgba(251, 146, 60, ${0.36 + 0.5 * t})`
+      : `rgba(56, 189, 248, ${0.36 + 0.5 * t})`;
+  }
   return `rgba(103, 232, 249, ${0.28 + 0.5 * t})`;
 }
 
@@ -945,8 +970,11 @@ function reboundTargetStrokeWidth(pt) {
   return pt?.key === sampledReboundTargetKey.value ? 2.4 : 1.1;
 }
 
-function reboundTargetPctLabel(prob) {
-  const pct = Number(prob || 0) * 100;
+function reboundTargetPctLabel(input) {
+  const pt = input && typeof input === 'object' ? input : null;
+  if (typeof pt?.label === 'string' && pt.label.trim()) return pt.label.trim();
+  const prob = pt ? Number(pt.prob || 0) : Number(input || 0);
+  const pct = prob * 100;
   if (pct >= 10) return `${pct.toFixed(0)}%`;
   if (pct >= 1) return `${pct.toFixed(1)}%`;
   return `${pct.toFixed(2)}%`;
@@ -4025,8 +4053,8 @@ onBeforeUnmount(() => {
           v-for="hex in courtHexPolygons"
           :key="`coord-${hex.key}`"
           :x="hex.x"
-          :y="hex.y"
-          dy=".35em"
+          :y="hex.y + HEX_RADIUS * 0.58"
+          dy="0"
           text-anchor="middle"
           class="court-coordinate-label"
         >
@@ -4607,7 +4635,7 @@ onBeforeUnmount(() => {
             v-for="pt in reboundTargetOverlayPoints"
             :key="`rebound-target-poly-${pt.key}`"
             :points="hexPointsFor(pt.x, pt.y, HEX_RADIUS)"
-            :fill="reboundTargetFill(pt.prob)"
+            :fill="reboundTargetFill(pt)"
             :stroke="reboundTargetStroke(pt)"
             :stroke-width="reboundTargetStrokeWidth(pt)"
             :class="['rebound-target-cell', { sampled: pt.key === sampledReboundTargetKey }]"
@@ -4620,7 +4648,7 @@ onBeforeUnmount(() => {
             text-anchor="middle"
             class="rebound-target-text"
           >
-            <tspan :x="pt.x" dy="0">{{ reboundTargetPctLabel(pt.prob) }}</tspan>
+            <tspan :x="pt.x" dy="0">{{ reboundTargetPctLabel(pt) }}</tspan>
             <tspan v-if="reboundTargetCountLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetCountLabel(pt) }}</tspan>
             <tspan v-if="reboundTargetReboundRateLabel(pt)" :x="pt.x" dy="0.95em">{{ reboundTargetReboundRateLabel(pt) }}</tspan>
           </text>
@@ -5354,9 +5382,9 @@ onBeforeUnmount(() => {
   stroke: rgba(15, 23, 42, 0.95);
 }
 .court-coordinate-label {
-  fill: rgba(226, 232, 240, 0.78);
+  fill: rgba(226, 232, 240, 0.72);
   font-family: 'JetBrains Mono', 'Courier New', monospace;
-  font-size: 0.34rem;
+  font-size: 0.31rem;
   pointer-events: none;
   user-select: none;
 }
