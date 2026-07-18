@@ -215,6 +215,9 @@ class KernelStatic(NamedTuple):
     rebound_obs_top_n_targets: Any
     offensive_rebound_shot_clock_reset: Any
     rebound_terminal_reward_mode: Any
+    enable_rebound_reward_redistribution: Any
+    offensive_rebound_reward_advance: Any
+    rebound_reward_once_per_possession: Any
 
 
 class KernelState(NamedTuple):
@@ -247,6 +250,7 @@ class KernelState(NamedTuple):
     dunk_pct: Any
     rebound_skill: Any
     rebound_skill_specialist: Any
+    rebound_reward_advance_paid: Any
 
 
 class StepBatchOutput(NamedTuple):
@@ -284,6 +288,8 @@ class StepBatchOutput(NamedTuple):
     rebound_winner: Any
     rebound_global_contest: Any
     shot_clock_reset_14: Any
+    rebound_reward_advance: Any
+    rebound_reward_settlement: Any
     phi_r_shape: Any
     phi_prev: Any
     phi_next: Any
@@ -405,6 +411,9 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         ),
         "layup_pct": layup,
         "three_pt_pct": three,
+        "rebound_reward_advance_paid": float(
+            getattr(env, "_rebound_reward_advance_paid", 0.0) or 0.0
+        ),
         "dunk_pct": dunk,
         "rebound_skill": rebound_skill,
         "rebound_skill_specialist": rebound_skill_specialist,
@@ -559,6 +568,13 @@ def stack_state_snapshots(
                     for item in snapshots
                 ],
                 axis=0,
+            ),
+            dtype=xp.float32,
+        ),
+        rebound_reward_advance_paid=xp.asarray(
+            np.asarray(
+                [float(item.get("rebound_reward_advance_paid", 0.0)) for item in snapshots],
+                dtype=np.float32,
             ),
             dtype=xp.float32,
         ),
@@ -1042,6 +1058,18 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
                 REBOUND_TERMINAL_REWARD_ACTUAL_POINTS,
             ),
             dtype=xp.int32,
+        ),
+        enable_rebound_reward_redistribution=xp.asarray(
+            1 if bool(getattr(env, "enable_rebound_reward_redistribution", False)) else 0,
+            dtype=xp.int8,
+        ),
+        offensive_rebound_reward_advance=xp.asarray(
+            max(0.0, float(getattr(env, "offensive_rebound_reward_advance", 0.4))),
+            dtype=xp.float32,
+        ),
+        rebound_reward_once_per_possession=xp.asarray(
+            1 if bool(getattr(env, "rebound_reward_once_per_possession", True)) else 0,
+            dtype=xp.int8,
         ),
     )
 
@@ -2120,6 +2148,11 @@ def build_aggregated_reward_batch(static: KernelStatic, rewards, jnp):
     return jnp.sum(scaled, axis=1) * static.task_reward_scale
 
 
+def _offense_team_reward_vector_single(static: KernelStatic, offense_value, jnp):
+    per_player = offense_value.astype(jnp.float32) / static.offense_ids.shape[0]
+    return jnp.where(static.role_encoding > 0.0, per_player, -per_player)
+
+
 def _turnover_to_defense_single(static: KernelStatic, positions, from_player, jnp):
     from_pos = positions[from_player]
     offense_turnover = static.role_encoding[from_player] > 0.0
@@ -2361,6 +2394,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             rebound_winner=no_player,
             rebound_global_contest=zero_flag,
             shot_clock_reset_14=zero_flag,
+            rebound_reward_advance=zero_float,
+            rebound_reward_settlement=zero_float,
             phi_r_shape=zero_float,
             phi_prev=zero_float,
             phi_next=zero_float,
@@ -2389,10 +2424,20 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
 
         def _pressure_done(_):
             pressure_turnover_player = jnp.clip(next_state.ball_holder, 0, next_state.positions.shape[0] - 1)
+            redistribution_enabled = static.enable_rebound_reward_redistribution.astype(jnp.bool_)
+            pressure_reward_settlement = jnp.where(
+                redistribution_enabled,
+                -next_state.rebound_reward_advance_paid.astype(jnp.float32),
+                zero_float,
+            )
+            pressure_base_rewards = _offense_team_reward_vector_single(
+                static, pressure_reward_settlement, jnp
+            )
             pressure_state = _replace_state(
                 next_state,
                 ball_holder=pressure_holder,
                 episode_ended=jnp.asarray(1, dtype=next_state.episode_ended.dtype),
+                rebound_reward_advance_paid=zero_float,
             )
             (
                 pressure_state,
@@ -2405,7 +2450,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 static,
                 state,
                 pressure_state,
-                zero_rewards,
+                pressure_base_rewards,
                 jnp.asarray(True),
                 jnp,
             )
@@ -2444,6 +2489,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_winner=no_player,
                 rebound_global_contest=zero_flag,
                 shot_clock_reset_14=zero_flag,
+                rebound_reward_advance=zero_float,
+                rebound_reward_settlement=pressure_reward_settlement,
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
@@ -2750,6 +2797,25 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     final_state.defense_lane_steps,
                 ),
             )
+            redistribution_enabled = static.enable_rebound_reward_redistribution.astype(jnp.bool_)
+            advance_available = (
+                (~static.rebound_reward_once_per_possession.astype(jnp.bool_))
+                | (final_state.rebound_reward_advance_paid <= 0.0)
+            )
+            rebound_reward_advance = jnp.where(
+                redistribution_enabled & offensive_rebound & advance_available,
+                static.offensive_rebound_reward_advance.astype(jnp.float32),
+                zero_float,
+            )
+            final_state = _replace_state(
+                final_state,
+                rebound_reward_advance_paid=(
+                    final_state.rebound_reward_advance_paid + rebound_reward_advance
+                ),
+            )
+            rewards = rewards + _offense_team_reward_vector_single(
+                static, rebound_reward_advance, jnp
+            )
 
             per_team_pass = static.pass_reward / static.offense_ids.shape[0]
             offense_mask = static.role_encoding > 0.0
@@ -2918,6 +2984,20 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 final_state,
                 episode_ended=done.astype(final_state.episode_ended.dtype),
             )
+            rebound_reward_settlement = jnp.where(
+                redistribution_enabled & done,
+                -final_state.rebound_reward_advance_paid.astype(jnp.float32),
+                zero_float,
+            )
+            rewards = rewards + _offense_team_reward_vector_single(
+                static, rebound_reward_settlement, jnp
+            )
+            final_state = _replace_state(
+                final_state,
+                rebound_reward_advance_paid=jnp.where(
+                    done, zero_float, final_state.rebound_reward_advance_paid
+                ),
+            )
             (
                 final_state,
                 rewards,
@@ -2979,6 +3059,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_winner=jnp.where(rebound_active, sampled_rebound_winner.astype(jnp.int32), no_player),
                 rebound_global_contest=rebound_global_contest.astype(jnp.int8),
                 shot_clock_reset_14=shot_clock_reset_14.astype(jnp.int8),
+                rebound_reward_advance=rebound_reward_advance,
+                rebound_reward_settlement=rebound_reward_settlement,
                 phi_r_shape=phi_r_shape,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
@@ -3496,6 +3578,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         dunk_pct=dunk_pct,
         rebound_skill=rebound_skill,
         rebound_skill_specialist=rebound_skill_specialist,
+        rebound_reward_advance_paid=jnp.asarray(0.0, dtype=jnp.float32),
     )
 
 
@@ -3524,6 +3607,9 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_contest_radius",
         "rebound_obs_top_n_targets",
         "offensive_rebound_shot_clock_reset",
+        "enable_rebound_reward_redistribution",
+        "offensive_rebound_reward_advance",
+        "rebound_reward_once_per_possession",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

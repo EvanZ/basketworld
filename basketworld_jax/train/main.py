@@ -221,6 +221,9 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_obs_top_n_targets",
         "offensive_rebound_shot_clock_reset",
         "rebound_terminal_reward_mode",
+        "enable_rebound_reward_redistribution",
+        "offensive_rebound_reward_advance",
+        "rebound_reward_once_per_possession",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -326,6 +329,9 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
 )
 
 
@@ -929,6 +935,29 @@ def parse_args(argv=None):
             "is lower than this value."
         ),
     )
+    parser.add_argument(
+        "--enable-rebound-reward-redistribution",
+        action="store_true",
+        help=(
+            "Advance part of the offense's eventual possession reward at an offensive "
+            "rebound, then settle the same amount at possession end."
+        ),
+    )
+    parser.add_argument(
+        "--offensive-rebound-reward-advance",
+        type=float,
+        default=0.4,
+        help="Offense reward advanced at a qualifying offensive rebound.",
+    )
+    parser.add_argument(
+        "--rebound-reward-once-per-possession",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Advance rebound reward only on the first offensive rebound in a possession. "
+            "Use --no-rebound-reward-once-per-possession to advance it on every ORB."
+        ),
+    )
     args = parser.parse_args(argv_list)
     if bool(getattr(args, "use_set_obs", False)):
         args.policy_model = "attention"
@@ -1092,6 +1121,12 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-obs-top-n-targets must be >= 0.")
     if int(getattr(args, "offensive_rebound_shot_clock_reset", 14)) < 1:
         raise SystemExit("--offensive-rebound-shot-clock-reset must be >= 1.")
+    if float(getattr(args, "offensive_rebound_reward_advance", 0.4)) < 0.0:
+        raise SystemExit("--offensive-rebound-reward-advance must be >= 0.")
+    if bool(getattr(args, "enable_rebound_reward_redistribution", False)) and not bool(
+        getattr(args, "enable_rebounds", False)
+    ):
+        raise SystemExit("--enable-rebound-reward-redistribution requires --enable-rebounds.")
     rebound_terminal_reward_mode = str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points")
     if rebound_terminal_reward_mode not in {"actual_points", "last_shot_ep_on_defensive_rebound", "last_shot_ep"}:
         raise SystemExit(
@@ -1233,6 +1268,9 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "rebound_skill_sampling_mode": "gaussian",
     "rebound_skill_high": 1.0,
     "rebound_skill_low": -0.25,
+    "enable_rebound_reward_redistribution": False,
+    "offensive_rebound_reward_advance": 0.4,
+    "rebound_reward_once_per_possession": True,
 }
 
 
@@ -1437,6 +1475,15 @@ def _checkpoint_trainer_config_from_args(
             getattr(args, "offensive_rebound_shot_clock_reset", 14)
         ),
         "rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+        "enable_rebound_reward_redistribution": bool(
+            getattr(args, "enable_rebound_reward_redistribution", False)
+        ),
+        "offensive_rebound_reward_advance": float(
+            getattr(args, "offensive_rebound_reward_advance", 0.4)
+        ),
+        "rebound_reward_once_per_possession": bool(
+            getattr(args, "rebound_reward_once_per_possession", True)
+        ),
     }
     config.update({key: to_builtin(value) for key, value in selector_fields.items()})
     return config
@@ -2245,6 +2292,15 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
         "jax/rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
         "jax/rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+        "jax/enable_rebound_reward_redistribution": bool(
+            getattr(args, "enable_rebound_reward_redistribution", False)
+        ),
+        "jax/offensive_rebound_reward_advance": float(
+            getattr(args, "offensive_rebound_reward_advance", 0.4)
+        ),
+        "jax/rebound_reward_once_per_possession": bool(
+            getattr(args, "rebound_reward_once_per_possession", True)
+        ),
         "jax/task_reward_scale_start": (
             ""
             if getattr(args, "task_reward_scale_start", None) is None
@@ -3060,6 +3116,14 @@ def _summarize_role_rollout_metrics(
     opponent_reward_mean = -learner_reward_mean
     offense_points_total = _active_sum(offense_score_delta)
     defense_points_total = _active_sum(defense_score_delta)
+    rebound_reward_advances = np.asarray(
+        rollout.trajectory.rebound_reward_advances, dtype=np.float32
+    )
+    rebound_reward_settlements = np.asarray(
+        rollout.trajectory.rebound_reward_settlements, dtype=np.float32
+    )
+    rebound_reward_advance_total = _active_sum(rebound_reward_advances)
+    rebound_reward_settlement_total = _active_sum(rebound_reward_settlements)
     if role == "offense":
         learner_points_total = offense_points_total
         opponent_points_total = defense_points_total
@@ -3091,6 +3155,14 @@ def _summarize_role_rollout_metrics(
         ),
         f"{role}_learner_points_total": learner_points_total,
         f"{role}_opponent_points_total": opponent_points_total,
+        f"{role}_rebound_reward_advance_count": int(
+            _active_sum(rebound_reward_advances > 0.0)
+        ),
+        f"{role}_rebound_reward_advance_total": rebound_reward_advance_total,
+        f"{role}_rebound_reward_settlement_total": rebound_reward_settlement_total,
+        f"{role}_rebound_reward_net_total": (
+            rebound_reward_advance_total + rebound_reward_settlement_total
+        ),
         f"{role}_learner_points_per_completed_episode": _safe_metric_ratio(
             learner_points_total,
             completed_episodes,

@@ -73,6 +73,8 @@ class TrajectoryBatch(NamedTuple):
     rebound_winners: Any
     rebound_global_contests: Any
     shot_clock_reset_14: Any
+    rebound_reward_advances: Any
+    rebound_reward_settlements: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any
@@ -167,6 +169,8 @@ class EvalTrace(NamedTuple):
     rebound_winners: Any
     rebound_global_contests: Any
     shot_clock_reset_14: Any
+    rebound_reward_advances: Any
+    rebound_reward_settlements: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any

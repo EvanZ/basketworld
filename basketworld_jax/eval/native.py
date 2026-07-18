@@ -127,6 +127,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -147,6 +150,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_obs_top_n_targets": 0,
     "offensive_rebound_shot_clock_reset": 14,
     "rebound_terminal_reward_mode": "actual_points",
+    "enable_rebound_reward_redistribution": False,
+    "offensive_rebound_reward_advance": 0.4,
+    "rebound_reward_once_per_possession": True,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -167,6 +173,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_obs_top_n_targets": "int",
     "offensive_rebound_shot_clock_reset": "int",
     "rebound_terminal_reward_mode": "str",
+    "enable_rebound_reward_redistribution": "bool",
+    "offensive_rebound_reward_advance": "float",
+    "rebound_reward_once_per_possession": "bool",
 }
 
 

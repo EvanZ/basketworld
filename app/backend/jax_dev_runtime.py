@@ -58,6 +58,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
 }
 
 
@@ -79,6 +82,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_obs_top_n_targets": 0,
     "offensive_rebound_shot_clock_reset": 14,
     "rebound_terminal_reward_mode": "actual_points",
+    "enable_rebound_reward_redistribution": False,
+    "offensive_rebound_reward_advance": 0.4,
+    "rebound_reward_once_per_possession": True,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -99,6 +105,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_obs_top_n_targets": "int",
     "offensive_rebound_shot_clock_reset": "int",
     "rebound_terminal_reward_mode": "str",
+    "enable_rebound_reward_redistribution": "bool",
+    "offensive_rebound_reward_advance": "float",
+    "rebound_reward_once_per_possession": "bool",
 }
 
 
@@ -2389,6 +2398,9 @@ class JaxDevRuntime:
                 "obs_top_n_targets": _int_from_static_field(self.static, "rebound_obs_top_n_targets", 0),
                 "offensive_rebound_shot_clock_reset": int(getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)),
                 "terminal_reward_mode": str(getattr(self.display_env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+                "reward_redistribution_enabled": _as_bool(self.static.enable_rebound_reward_redistribution),
+                "offensive_rebound_reward_advance": _float_from_static_field(self.static, "offensive_rebound_reward_advance", 0.4),
+                "reward_once_per_possession": _as_bool(self.static.rebound_reward_once_per_possession),
                 "target_table_shape": [int(v) for v in self.static.rebound_target_probs.shape],
             },
             "defender_pressure_distance": int(self.display_env.defender_pressure_distance or 1),

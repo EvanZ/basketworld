@@ -215,6 +215,8 @@ def _build_rebound_transition_metrics(env_out, jnp) -> dict[str, Any]:
         "rebound_winners": env_out.rebound_winner.astype(jnp.int32),
         "rebound_global_contests": env_out.rebound_global_contest.astype(jnp.int8),
         "shot_clock_reset_14": env_out.shot_clock_reset_14.astype(jnp.int8),
+        "rebound_reward_advances": env_out.rebound_reward_advance.astype(jnp.float32),
+        "rebound_reward_settlements": env_out.rebound_reward_settlement.astype(jnp.float32),
     }
 
 
@@ -2673,6 +2675,15 @@ def summarize_training_step(
     defensive_rebounds = float(np.asarray(rollout_out.trajectory.defensive_rebounds, dtype=np.float32).sum())
     rebound_global_contests = float(np.asarray(rollout_out.trajectory.rebound_global_contests, dtype=np.float32).sum())
     shot_clock_resets = float(np.asarray(rollout_out.trajectory.shot_clock_reset_14, dtype=np.float32).sum())
+    rebound_reward_advances = float(
+        np.asarray(rollout_out.trajectory.rebound_reward_advances, dtype=np.float32).sum()
+    )
+    rebound_reward_settlements = float(
+        np.asarray(rollout_out.trajectory.rebound_reward_settlements, dtype=np.float32).sum()
+    )
+    rebound_reward_advance_count = int(
+        (np.asarray(rollout_out.trajectory.rebound_reward_advances, dtype=np.float32) > 0.0).sum()
+    )
     summary.update(
         {
             "rebound_attempts": int(rebound_attempts),
@@ -2683,6 +2694,10 @@ def summarize_training_step(
             "rebound_global_contest_count": int(rebound_global_contests),
             "rebound_global_contest_rate": float(rebound_global_contests / max(1.0, rebound_attempts)),
             "shot_clock_reset_14_count": int(shot_clock_resets),
+            "rebound_reward_advance_count": rebound_reward_advance_count,
+            "rebound_reward_advance_total": rebound_reward_advances,
+            "rebound_reward_settlement_total": rebound_reward_settlements,
+            "rebound_reward_net_total": rebound_reward_advances + rebound_reward_settlements,
         }
     )
     summary.update(

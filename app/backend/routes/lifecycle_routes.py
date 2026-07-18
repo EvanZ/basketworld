@@ -89,6 +89,9 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "rebound_obs_top_n_targets",
     "offensive_rebound_shot_clock_reset",
     "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
 }
 
 
@@ -104,6 +107,9 @@ _REBOUND_RUNTIME_STICKY_ENV_KEYS = {
     "rebound_contest_mode",
     "rebound_contest_radius",
     "rebound_obs_top_n_targets",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
 }
 
 
@@ -235,6 +241,9 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "rebound_obs_top_n_targets": int,
     "offensive_rebound_shot_clock_reset": int,
     "rebound_terminal_reward_mode": str,
+    "enable_rebound_reward_redistribution": _str_to_bool,
+    "offensive_rebound_reward_advance": float,
+    "rebound_reward_once_per_possession": _str_to_bool,
 }
 
 
@@ -272,6 +281,9 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
             "rebound_contest_mode",
             "rebound_obs_top_n_targets",
             "rebound_terminal_reward_mode",
+            "enable_rebound_reward_redistribution",
+            "offensive_rebound_reward_advance",
+            "rebound_reward_once_per_possession",
         }:
             names = (f"jax/env/{key}", f"jax/{key}")
         for name in names:

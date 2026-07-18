@@ -1128,7 +1128,7 @@ def test_train_scaffold_emits_rollout_trajectory_shapes():
     result = run_train_scaffold(args)
 
     spec = result["trajectory_spec"]
-    flat_obs_dim = 106
+    flat_obs_dim = 112
     assert spec["trajectory_flat_obs_shape"] == [4, 4, flat_obs_dim]
     assert spec["trajectory_policy_intent_index_shape"] == [4, 4]
     assert spec["trajectory_policy_intent_gate_shape"] == [4, 4]

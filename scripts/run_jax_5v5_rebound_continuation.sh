@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PYTHON_BIN="${PYTHON_BIN:-$ROOT/app/backend/.env/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT/.env/bin/python}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 exec "$PYTHON_BIN" -m basketworld_jax.train.main \
-  --continue-run-id \
-  2e3fab43df564588af036049fb375daf \
-  --continue-artifact \
-  models/update_0030000 \
-  --continue-opponent-pool-size \
-  25 \
-  --continue-cache-dir \
-  "$ROOT"/artifacts/mlflow_checkpoints \
   --run-train-loop \
   --ppo-completed-episodes-only \
   --pass-mode \
@@ -63,9 +60,9 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --shot-pressure-arc-degrees \
   300 \
   --defender-pressure-distance \
-  2 \
+  1 \
   --defender-pressure-turnover-chance \
-  0.02 \
+  0.025 \
   --defender-pressure-decay-lambda \
   2 \
   --base-steal-rate \
@@ -118,13 +115,13 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --rebound-winner-distance-weight \
   1.0 \
   --rebound-basket-position-weight \
-  0.0 \
+  1.0 \
   --rebound-winner-temperature \
   1.0 \
   --rebound-skill-std \
   1 \
   --rebound-skill-sampling-mode \
-  one_high_per_team \
+  gaussian \
   --rebound-skill-high \
   1.0 \
   --rebound-skill-low \
@@ -134,17 +131,21 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --rebound-contest-mode \
   local_contest \
   --rebound-contest-radius \
-  2 \
+  1 \
   --offensive-rebound-shot-clock-reset \
   14 \
   --rebound-terminal-reward-mode \
   actual_points \
+  --enable-rebound-reward-redistribution \
+  --offensive-rebound-reward-advance \
+  0.4 \
+  --rebound-reward-once-per-possession \
   --kernel-batch-size \
   512 \
   --num-updates \
-  60000 \
+  30000 \
   --log-every-updates \
-  1 \
+  10 \
   --eval-every-updates \
   0 \
   --eval-horizon \
@@ -153,9 +154,9 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   1 \
   --log-mlflow \
   --ent-coef-start \
-  0.3 \
+  1 \
   --ent-coef-end \
-  0.01 \
+  0.03 \
   --ent-schedule \
   exp \
   --checkpoint-every-updates \
@@ -176,7 +177,15 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --opponent-pool-exploration \
   0.30 \
   --opponent-deterministic-episode-prob \
-  0.50 \
+  0.20 \
+  --opponent-deterministic-episode-prob-start \
+  0.20 \
+  --opponent-deterministic-episode-prob-end \
+  0.80 \
+  --opponent-deterministic-episode-prob-warmup-updates \
+  0 \
+  --opponent-deterministic-episode-prob-ramp-updates \
+  15000 \
   --policy-update-epochs \
   1 \
   --ppo-minibatches \
@@ -228,7 +237,7 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --violation-reward \
   2.0 \
   --learning-rate \
-  1e-3 \
+  3e-4 \
   --rollout-horizon \
   64 \
   --policy-model \
@@ -351,4 +360,4 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --mlflow-experiment-name \
   dev \
   --mlflow-run-name \
-  '(cont) local contest | rebound skill + lower pass risk | reaction pass model | rebound features | 5-on-5'
+  'rebound redistribution | disable rebound-aware phi | rebound basket position weight 1 | rebound contest radius 1 | rebound skill + lower pass risk | reaction pass model | rebound features | 5-on-5'
