@@ -565,6 +565,107 @@ def _linear_eval_schedule(
     return float(start + progress * (end - start))
 
 
+def _task_reward_scale_for_eval(
+    training_params: dict[str, Any] | None,
+    payload: dict[str, Any],
+) -> float:
+    params: dict[str, Any] = {}
+    params.update(dict(payload.get("env_config", {}) or {}))
+    params.update(dict(payload.get("trainer_config", {}) or {}))
+    params.update(dict(training_params or {}))
+    update_index = int(payload.get("update_index", 0) or 0)
+
+    def _optional_float(value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    start_raw = _optional_float(_param(params, "task_reward_scale_start", None))
+    end_raw = _optional_float(_param(params, "task_reward_scale_end", None))
+    if start_raw is None and end_raw is None:
+        return 1.0
+    start = 1.0 if start_raw is None else float(start_raw)
+    end = start if end_raw is None else float(end_raw)
+    warmup_updates = _coerce_int(
+        _param(params, "task_reward_scale_warmup_updates", -1),
+        -1,
+    )
+    ramp_updates = _coerce_int(
+        _param(params, "task_reward_scale_ramp_updates", -1),
+        -1,
+    )
+    if warmup_updates >= 0 or ramp_updates >= 0:
+        position = int(update_index)
+        warmup = max(0, warmup_updates)
+        ramp = max(0, ramp_updates)
+    else:
+        kernel_batch_size = max(
+            1,
+            _coerce_int(_param(params, "kernel_batch_size", 1), 1),
+        )
+        rollout_horizon = max(
+            1,
+            _coerce_int(_param(params, "rollout_horizon", 1), 1),
+        )
+        position = max(0, int(update_index) - 1) * kernel_batch_size * rollout_horizon * 2
+        warmup = max(
+            0,
+            _coerce_int(_param(params, "task_reward_scale_warmup_steps", 0), 0),
+        )
+        ramp = max(
+            0,
+            _coerce_int(_param(params, "task_reward_scale_ramp_steps", 1), 1),
+        )
+    if position < warmup:
+        return float(start)
+    if ramp <= 0:
+        return float(end)
+    progress = min(1.0, max(0.0, (position - warmup) / float(ramp)))
+    return float(start + progress * (end - start))
+
+
+def _phi_beta_for_eval(
+    training_params: dict[str, Any] | None,
+    payload: dict[str, Any],
+    *,
+    default: float,
+) -> float:
+    params: dict[str, Any] = {}
+    params.update(dict(payload.get("env_config", {}) or {}))
+    params.update(dict(payload.get("trainer_config", {}) or {}))
+    params.update(dict(training_params or {}))
+    enabled = _coerce_bool(_param(params, "enable_phi_shaping", default > 0.0), default > 0.0)
+    if not enabled:
+        return 0.0
+
+    def _optional_float(value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    start_raw = _optional_float(_param(params, "phi_beta_start", None))
+    end_raw = _optional_float(_param(params, "phi_beta_end", None))
+    if start_raw is None and end_raw is None:
+        return max(0.0, float(default))
+    start = max(0.0, 0.0 if start_raw is None else float(start_raw))
+    end = max(0.0, start if end_raw is None else float(end_raw))
+    update_index = int(payload.get("update_index", 0) or 0)
+    warmup = max(0, _coerce_int(_param(params, "phi_beta_warmup_updates", 0), 0))
+    ramp = max(0, _coerce_int(_param(params, "phi_beta_ramp_updates", 1), 1))
+    if update_index < warmup:
+        return float(start)
+    if ramp <= 0:
+        return float(end)
+    progress = min(1.0, max(0.0, (update_index - warmup) / float(ramp)))
+    return float(start + progress * (end - start))
+
+
 def _selector_eval_settings(
     *,
     payload: dict[str, Any],
@@ -1027,6 +1128,92 @@ def _discounted_returns(rewards: np.ndarray, done: np.ndarray, gamma: float) -> 
     return returns
 
 
+def _post_orb_continuation_diagnostics_from_trace(
+    trace: dict[str, np.ndarray],
+    *,
+    env_index: int,
+    gamma: float,
+) -> dict[str, float | int]:
+    result: dict[str, float | int] = {
+        "post_orb_samples": 0,
+        "post_orb_points_sum": 0.0,
+        "post_orb_value_samples": 0,
+        "post_orb_consensus_value_sum": 0.0,
+        "post_orb_offense_value_sum": 0.0,
+        "post_orb_defense_value_sum": 0.0,
+        "post_orb_shaped_return_samples": 0,
+        "post_orb_consensus_shaped_return_sum": 0.0,
+        "post_orb_offense_shaped_return_sum": 0.0,
+        "post_orb_defense_shaped_return_sum": 0.0,
+    }
+    active = np.asarray(trace["active"])[:, env_index].astype(bool)
+    terminal_steps = np.asarray(trace["terminal_episode_steps"])[:, env_index]
+    if not bool(np.any(terminal_steps > 0)):
+        return result
+
+    offensive_rebounds = np.asarray(trace["offensive_rebound"])[:, env_index].astype(bool)
+    orb_indices = np.flatnonzero(offensive_rebounds & active)
+    value_indices = orb_indices + 1
+    valid = value_indices < active.shape[0]
+    if np.any(valid):
+        clipped_indices = np.minimum(value_indices, active.shape[0] - 1)
+        valid &= active[clipped_indices]
+    orb_indices = orb_indices[valid]
+    value_indices = value_indices[valid]
+    if value_indices.size == 0:
+        return result
+
+    def _scalar_trace(key: str) -> np.ndarray:
+        values = np.asarray(trace[key])[:, env_index].astype(np.float64)
+        if values.ndim == 2 and values.shape[-1] == 1:
+            values = values[:, 0]
+        return values
+
+    scored_points = (
+        _scalar_trace("shot_value")
+        * _scalar_trace("shot_success").astype(bool).astype(np.float64)
+    )
+    points_sum = float(
+        sum(float(scored_points[int(orb_t) + 1 :].sum()) for orb_t in orb_indices)
+    )
+    offense_values = _scalar_trace("offense_values")[value_indices]
+    defense_values = _scalar_trace("defense_values")[value_indices]
+    consensus_values = 0.5 * (offense_values - defense_values)
+
+    done = np.asarray(trace["done"])[:, env_index].astype(bool)[:, None]
+    offense_reward_key = (
+        "offense_training_rewards"
+        if "offense_training_rewards" in trace
+        else "offense_rewards"
+    )
+    defense_reward_key = (
+        "defense_training_rewards"
+        if "defense_training_rewards" in trace
+        else "defense_rewards"
+    )
+    offense_rewards = _scalar_trace(offense_reward_key)[:, None]
+    defense_rewards = _scalar_trace(defense_reward_key)[:, None]
+    offense_returns = _discounted_returns(offense_rewards, done, gamma)[:, 0][value_indices]
+    defense_returns = _discounted_returns(defense_rewards, done, gamma)[:, 0][value_indices]
+    consensus_returns = 0.5 * (offense_returns - defense_returns)
+    sample_count = int(value_indices.size)
+    result.update(
+        {
+            "post_orb_samples": sample_count,
+            "post_orb_points_sum": points_sum,
+            "post_orb_value_samples": sample_count,
+            "post_orb_consensus_value_sum": float(consensus_values.sum()),
+            "post_orb_offense_value_sum": float(offense_values.sum()),
+            "post_orb_defense_value_sum": float(defense_values.sum()),
+            "post_orb_shaped_return_samples": sample_count,
+            "post_orb_consensus_shaped_return_sum": float(consensus_returns.sum()),
+            "post_orb_offense_shaped_return_sum": float(offense_returns.sum()),
+            "post_orb_defense_shaped_return_sum": float(defense_returns.sum()),
+        }
+    )
+    return result
+
+
 def _value_diagnostics_from_trace(
     trace: dict[str, np.ndarray],
     *,
@@ -1042,8 +1229,12 @@ def _value_diagnostics_from_trace(
 
     offense_values = _trace_values_array(trace, "offense_values", take)
     defense_values = _trace_values_array(trace, "defense_values", take)
-    offense_rewards = np.asarray(trace["offense_rewards"])[:, :take].astype(np.float64) * active
-    defense_rewards = np.asarray(trace["defense_rewards"])[:, :take].astype(np.float64) * active
+    offense_rewards = np.asarray(
+        trace.get("offense_training_rewards", trace["offense_rewards"])
+    )[:, :take].astype(np.float64) * active
+    defense_rewards = np.asarray(
+        trace.get("defense_training_rewards", trace["defense_rewards"])
+    )[:, :take].astype(np.float64) * active
     offense_returns = _discounted_returns(offense_rewards, done, gamma)
     defense_returns = _discounted_returns(defense_rewards, done, gamma)
 
@@ -1228,6 +1419,10 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "post_orb_consensus_value_sum": 0.0,
             "post_orb_offense_value_sum": 0.0,
             "post_orb_defense_value_sum": 0.0,
+            "post_orb_shaped_return_samples": 0,
+            "post_orb_consensus_shaped_return_sum": 0.0,
+            "post_orb_offense_shaped_return_sum": 0.0,
+            "post_orb_defense_shaped_return_sum": 0.0,
         },
     }
 
@@ -1692,7 +1887,26 @@ def run_native_jax_evaluation(
     for key, value in static_params.items():
         setattr(env, key, value)
     static = build_kernel_static_from_env(env, jnp)
+    base_phi_beta = float(
+        np.asarray(jax.device_get(static.phi_beta), dtype=np.float32).reshape(-1)[0]
+    )
+    eval_phi_beta = _phi_beta_for_eval(
+        training_params,
+        unified_payload,
+        default=base_phi_beta,
+    )
+    static = static._replace(phi_beta=jnp.asarray(eval_phi_beta, dtype=jnp.float32))
     trainer_config = dict(unified_payload.get("trainer_config", {}) or {})
+    scheduled_task_reward_scale = _task_reward_scale_for_eval(
+        training_params,
+        unified_payload,
+    )
+    static_task_reward_scale = float(
+        np.asarray(jax.device_get(static.task_reward_scale), dtype=np.float32).reshape(-1)[0]
+    )
+    eval_task_reward_scale = float(
+        static_task_reward_scale * scheduled_task_reward_scale
+    )
     horizon = _native_eval_horizon(env, training_params, unified_payload)
     value_discount_gamma = max(
         0.0,
@@ -1813,7 +2027,15 @@ def run_native_jax_evaluation(
             int(selector_settings["min_play_steps"]),
             int(selector_settings["mode_code"]),
         )
-        trace = jax.device_get(trace_device)
+        trace = dict(jax.device_get(trace_device))
+        trace["offense_training_rewards"] = (
+            np.asarray(trace["offense_rewards"], dtype=np.float32)
+            * np.float32(eval_task_reward_scale)
+        )
+        trace["defense_training_rewards"] = (
+            np.asarray(trace["defense_rewards"], dtype=np.float32)
+            * np.float32(eval_task_reward_scale)
+        )
         stats = _episode_stats_from_trace(trace, take=take, horizon=horizon)
         _merge_value_diagnostics(
             value_diagnostics_accum,
@@ -2085,6 +2307,10 @@ def run_native_jax_evaluation(
                             "post_orb_consensus_value_sum": 0.0,
                             "post_orb_offense_value_sum": 0.0,
                             "post_orb_defense_value_sum": 0.0,
+                            "post_orb_shaped_return_samples": 0,
+                            "post_orb_consensus_shaped_return_sum": 0.0,
+                            "post_orb_offense_shaped_return_sum": 0.0,
+                            "post_orb_defense_shaped_return_sum": 0.0,
                             "eligibility": {
                                 "attempts": 0,
                                 "local_attempts": 0,
@@ -2382,51 +2608,17 @@ def run_native_jax_evaluation(
             offensive_rebound_flags = np.asarray(trace["offensive_rebound"])[:active_steps, idx].astype(bool)
             potential_flags = np.asarray(trace["potential_assist"])[:active_steps, idx].astype(bool)
             assist_flags = np.asarray(trace["assists"])[:active_steps, idx].astype(bool)
-            full_shot_success_flags = np.asarray(trace["shot_success"])[:, idx].astype(bool)
-            full_shot_values = np.asarray(trace["shot_value"])[:, idx].astype(np.float32)
-            full_offensive_rebound_flags = np.asarray(trace["offensive_rebound"])[:, idx].astype(bool)
-            scored_points_for_post_orb = full_shot_values * full_shot_success_flags.astype(np.float32)
-            post_orb_indices = np.flatnonzero(full_offensive_rebound_flags)
-            if post_orb_indices.size > 0:
-                post_orb_points_sum = float(
-                    sum(float(scored_points_for_post_orb[int(orb_t) + 1 :].sum()) for orb_t in post_orb_indices)
-                )
+            post_orb_diagnostics = _post_orb_continuation_diagnostics_from_trace(
+                trace,
+                env_index=idx,
+                gamma=value_discount_gamma,
+            )
+            if int(post_orb_diagnostics["post_orb_samples"]) > 0:
                 rebound_diag = eval_diagnostics.setdefault("rebounds", {})
-                rebound_diag["post_orb_samples"] = int(rebound_diag.get("post_orb_samples", 0) or 0) + int(
-                    post_orb_indices.size
-                )
-                rebound_diag["post_orb_points_sum"] = float(
-                    rebound_diag.get("post_orb_points_sum", 0.0) or 0.0
-                ) + post_orb_points_sum
-
-                full_active_flags = np.asarray(trace["active"])[:, idx].astype(bool)
-                full_offense_values = np.asarray(trace["offense_values"])[:, idx].astype(np.float32)
-                full_defense_values = np.asarray(trace["defense_values"])[:, idx].astype(np.float32)
-                if full_offense_values.ndim == 2 and full_offense_values.shape[-1] == 1:
-                    full_offense_values = full_offense_values[:, 0]
-                if full_defense_values.ndim == 2 and full_defense_values.shape[-1] == 1:
-                    full_defense_values = full_defense_values[:, 0]
-                post_orb_value_indices = post_orb_indices + 1
-                valid_value_mask = (post_orb_value_indices < full_offense_values.shape[0]) & (
-                    full_active_flags[np.minimum(post_orb_value_indices, full_active_flags.shape[0] - 1)]
-                )
-                post_orb_value_indices = post_orb_value_indices[valid_value_mask]
-                if post_orb_value_indices.size > 0:
-                    post_orb_offense_values = full_offense_values[post_orb_value_indices].astype(np.float64)
-                    post_orb_defense_values = full_defense_values[post_orb_value_indices].astype(np.float64)
-                    post_orb_consensus_values = 0.5 * (post_orb_offense_values - post_orb_defense_values)
-                    rebound_diag["post_orb_value_samples"] = int(
-                        rebound_diag.get("post_orb_value_samples", 0) or 0
-                    ) + int(post_orb_value_indices.size)
-                    rebound_diag["post_orb_consensus_value_sum"] = float(
-                        rebound_diag.get("post_orb_consensus_value_sum", 0.0) or 0.0
-                    ) + float(np.sum(post_orb_consensus_values))
-                    rebound_diag["post_orb_offense_value_sum"] = float(
-                        rebound_diag.get("post_orb_offense_value_sum", 0.0) or 0.0
-                    ) + float(np.sum(post_orb_offense_values))
-                    rebound_diag["post_orb_defense_value_sum"] = float(
-                        rebound_diag.get("post_orb_defense_value_sum", 0.0) or 0.0
-                    ) + float(np.sum(post_orb_defense_values))
+                for key_name, value in post_orb_diagnostics.items():
+                    rebound_diag[key_name] = (
+                        rebound_diag.get(key_name, 0) or 0
+                    ) + value
             if bool(getattr(env, "enable_rebounds", False)):
                 rebound_reward_mode = str(
                     getattr(env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"
@@ -2573,12 +2765,27 @@ def run_native_jax_evaluation(
     )
     post_orb_offense_value_sum = float(rebound_diag_final.get("post_orb_offense_value_sum", 0.0) or 0.0)
     post_orb_defense_value_sum = float(rebound_diag_final.get("post_orb_defense_value_sum", 0.0) or 0.0)
+    post_orb_shaped_return_samples = int(
+        rebound_diag_final.get("post_orb_shaped_return_samples", 0) or 0
+    )
+    post_orb_consensus_shaped_return_sum = float(
+        rebound_diag_final.get("post_orb_consensus_shaped_return_sum", 0.0) or 0.0
+    )
+    post_orb_offense_shaped_return_sum = float(
+        rebound_diag_final.get("post_orb_offense_shaped_return_sum", 0.0) or 0.0
+    )
+    post_orb_defense_shaped_return_sum = float(
+        rebound_diag_final.get("post_orb_defense_shaped_return_sum", 0.0) or 0.0
+    )
     total_rebound_attempts = _sum(all_rebound_attempts)
     total_rebound_global_contests = _sum(all_rebound_global_contests)
     value_diagnostics = _finalize_value_diagnostics(
         value_diagnostics_accum,
         gamma=value_discount_gamma,
     )
+    value_diagnostics["task_reward_scale"] = float(eval_task_reward_scale)
+    value_diagnostics["phi_beta"] = float(eval_phi_beta)
+    value_diagnostics["includes_training_intent_bonus"] = False
 
     def _static_scalar(name: str, default: Any) -> Any:
         try:
@@ -2704,6 +2911,36 @@ def run_native_jax_evaluation(
             if post_orb_value_samples > 0
             else 0.0
         ),
+        "post_orb_shaped_return_sample_count": int(post_orb_shaped_return_samples),
+        "post_orb_consensus_shaped_return_total": float(
+            post_orb_consensus_shaped_return_sum
+        ),
+        "post_orb_consensus_shaped_return_per_sample": (
+            float(post_orb_consensus_shaped_return_sum / post_orb_shaped_return_samples)
+            if post_orb_shaped_return_samples > 0
+            else 0.0
+        ),
+        "post_orb_offense_shaped_return_per_sample": (
+            float(post_orb_offense_shaped_return_sum / post_orb_shaped_return_samples)
+            if post_orb_shaped_return_samples > 0
+            else 0.0
+        ),
+        "post_orb_defense_shaped_return_per_sample": (
+            float(post_orb_defense_shaped_return_sum / post_orb_shaped_return_samples)
+            if post_orb_shaped_return_samples > 0
+            else 0.0
+        ),
+        "post_orb_critic_minus_shaped_return_per_sample": (
+            float(
+                (post_orb_consensus_value_sum / post_orb_value_samples)
+                - (post_orb_consensus_shaped_return_sum / post_orb_shaped_return_samples)
+            )
+            if post_orb_value_samples > 0 and post_orb_shaped_return_samples > 0
+            else 0.0
+        ),
+        "post_orb_task_reward_scale": float(eval_task_reward_scale),
+        "post_orb_phi_beta": float(eval_phi_beta),
+        "post_orb_shaped_return_includes_training_intent_bonus": False,
         "total_rebound_global_contests": int(total_rebound_global_contests),
         "rebound_global_contest_rate": (
             float(total_rebound_global_contests / total_rebound_attempts) if total_rebound_attempts > 0 else 0.0

@@ -150,6 +150,12 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   0 \
   --eval-horizon \
   32 \
+  --eval-deploy-every-updates \
+  100 \
+  --eval-deploy-batches \
+  20 \
+  --eval-deploy-horizon \
+  128 \
   --max-eval-dumps \
   1 \
   --log-mlflow \

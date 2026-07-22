@@ -81,6 +81,7 @@ from basketworld_jax.train.runtime import (
     benchmark_compiled_rollout,
     benchmark_update_runner,
     block_until_ready_tree,
+    build_compiled_deploy_eval_runner,
     build_compiled_eval_runner,
     build_compiled_frozen_opponent_eval_runner,
     build_compiled_frozen_opponent_rollout_runner,
@@ -92,9 +93,11 @@ from basketworld_jax.train.runtime import (
     build_jitted_selector_update_runner,
     concatenate_rollout_outputs,
     serialize_eval_trace,
+    summarize_deploy_eval_outputs,
     summarize_episode_events,
     summarize_intent_metrics,
     summarize_lane_violation_metrics,
+    summarize_learner_rebound_metrics,
     summarize_ppo_eligible_episode_metrics,
     summarize_ppo_eligible_reward_component_metrics,
     summarize_reward_by_intent_metrics,
@@ -628,6 +631,33 @@ def parse_args(argv=None):
         help="Deterministic eval rollout horizon.",
     )
     parser.add_argument(
+        "--eval-deploy-every-updates",
+        type=int,
+        default=0,
+        help=(
+            "How often to run fixed-seed same-policy argmax-vs-argmax deploy eval. "
+            "Set <=0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--eval-deploy-batches",
+        type=int,
+        default=20,
+        help="Number of kernel-sized batches per deploy evaluation event.",
+    )
+    parser.add_argument(
+        "--eval-deploy-horizon",
+        type=int,
+        default=128,
+        help="Maximum episode steps for deploy evaluation.",
+    )
+    parser.add_argument(
+        "--eval-deploy-seed",
+        type=int,
+        default=2000000,
+        help="Fixed root seed reused for every deploy evaluation event.",
+    )
+    parser.add_argument(
         "--max-eval-dumps",
         type=int,
         default=4,
@@ -990,6 +1020,11 @@ def validate_train_args(args) -> None:
     ppo_minibatches = int(getattr(args, "ppo_minibatches", 1))
     if ppo_minibatches < 1:
         raise SystemExit("--ppo-minibatches must be >= 1.")
+    for key in ("eval_deploy_every_updates", "eval_deploy_batches", "eval_deploy_seed"):
+        if int(getattr(args, key, 0)) < 0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
+    if int(getattr(args, "eval_deploy_horizon", 128)) < 1:
+        raise SystemExit("--eval-deploy-horizon must be >= 1.")
     role_multiplier = len(TRAINING_ROLES) if bool(getattr(args, "run_train_loop", False)) else 1
     ppo_sample_count = (
         int(getattr(args, "kernel_batch_size"))
@@ -1370,6 +1405,10 @@ def _checkpoint_trainer_config_from_args(
         for key, value in asdict(trainer_config).items()
     }
     selector_fields = {
+        "eval_deploy_every_updates": int(getattr(args, "eval_deploy_every_updates", 0)),
+        "eval_deploy_batches": int(getattr(args, "eval_deploy_batches", 20)),
+        "eval_deploy_horizon": int(getattr(args, "eval_deploy_horizon", 128)),
+        "eval_deploy_seed": int(getattr(args, "eval_deploy_seed", 2000000)),
         "enable_intent_learning": bool(getattr(args, "enable_intent_learning", False)),
         "enable_defense_intent_learning": bool(
             getattr(args, "enable_defense_intent_learning", False)
@@ -2204,6 +2243,11 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/log_every_updates": int(args.log_every_updates),
         "jax/eval_every_updates": int(args.eval_every_updates),
         "jax/eval_horizon": int(args.eval_horizon),
+        "jax/eval_deploy_every_updates": int(args.eval_deploy_every_updates),
+        "jax/eval_deploy_batches": int(args.eval_deploy_batches),
+        "jax/eval_deploy_horizon": int(args.eval_deploy_horizon),
+        "jax/eval_deploy_seed": int(args.eval_deploy_seed),
+        "jax/eval_deploy_episode_count": int(args.eval_deploy_batches) * int(args.kernel_batch_size),
         "jax/mlflow_metric_profile": str(getattr(args, "mlflow_metric_profile", "core")),
         "jax/learning_rate": float(trainer_config.learning_rate),
         "jax/gamma": float(trainer_config.gamma),
@@ -2408,6 +2452,24 @@ def _log_mlflow_metrics(mlflow, metrics: dict[str, Any], *, step: int, prefix: s
 
 def _keep_core_train_metric(key: str) -> bool:
     """Keep one canonical MLflow path for metrics that are generated as aliases."""
+    legacy_pooled_rebound_metrics = {
+        "rebound_attempts",
+        "offensive_rebounds",
+        "defensive_rebounds",
+        "offensive_rebound_rate",
+        "defensive_rebound_rate",
+        "rebound_global_contest_count",
+        "rebound_global_contest_rate",
+        "rebound_local_offense_only_rate",
+        "rebound_local_defense_only_rate",
+    }
+    if (
+        key in legacy_pooled_rebound_metrics
+        or key.startswith("rebound_avg_")
+        or key.startswith("rebound_softmax_win_rate_")
+    ):
+        return False
+
     # Combined rollout aliases duplicate the role-specific learner/opponent views
     # after offense and defense rollouts are concatenated.
     if key.startswith(("all_shot_", "learner_shot_", "opponent_shot_")):
@@ -2536,16 +2598,20 @@ def _build_train_loop_summary_payload(result: dict[str, Any]) -> dict[str, Any]:
     """Build a compact MLflow run summary without per-update trace payloads."""
     train_history = result.get("train_history")
     eval_trajectories = result.get("eval_trajectories")
+    deploy_eval_history = result.get("deploy_eval_history")
     summary = {
         key: value
         for key, value in result.items()
-        if key not in {"train_history", "eval_trajectories"}
+        if key not in {"train_history", "eval_trajectories", "deploy_eval_history"}
     }
     summary["train_history_count"] = (
         len(train_history) if isinstance(train_history, list) else 0
     )
     summary["eval_trajectory_count"] = (
         len(eval_trajectories) if isinstance(eval_trajectories, list) else 0
+    )
+    summary["deploy_eval_history_count"] = (
+        len(deploy_eval_history) if isinstance(deploy_eval_history, list) else 0
     )
     return summary
 
@@ -3482,6 +3548,7 @@ def run_training_loop(args) -> dict[str, Any]:
     spec = _build_policy_spec(args, static, flat_obs_np, action_masks_np)
     trainer_config = build_trainer_config(args)
     rollout_runner = build_compiled_rollout_runner(jax, jnp, spec)
+    deploy_eval_runner = build_compiled_deploy_eval_runner(jax, jnp, spec)
     eval_runner = build_compiled_eval_runner(jax, jnp, spec)
     frozen_rollout_runner = build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec)
     frozen_eval_runner = build_compiled_frozen_opponent_eval_runner(jax, jnp, spec)
@@ -3663,6 +3730,7 @@ def run_training_loop(args) -> dict[str, Any]:
         else:
             base_key = jax.device_put(checkpoint_payload["base_key"])
         train_history = []
+        deploy_eval_history = []
         eval_trajectories = list(checkpoint_payload.get("eval_trajectories", []))
         last_metrics = checkpoint_payload.get("last_metrics")
     else:
@@ -3674,6 +3742,7 @@ def run_training_loop(args) -> dict[str, Any]:
         intent_disc_opt_state = initial_intent_disc_opt_state
         intent_bonus_stats = init_bonus_stats()
         train_history = []
+        deploy_eval_history = []
         eval_trajectories = []
         last_metrics = None
 
@@ -3738,8 +3807,21 @@ def run_training_loop(args) -> dict[str, Any]:
             num_updates=int(args.num_updates),
             eval_every_updates=int(args.eval_every_updates),
         )
+        expected_deploy_evals = (
+            _remaining_eval_count(
+                start_update=completed_updates,
+                num_updates=int(args.num_updates),
+                eval_every_updates=int(args.eval_deploy_every_updates),
+            )
+            if int(args.eval_deploy_batches) > 0
+            else 0
+        )
         progress = build_progress(
-            total=(int(args.num_updates) - completed_updates) + expected_evals,
+            total=(
+                (int(args.num_updates) - completed_updates)
+                + expected_evals
+                + expected_deploy_evals
+            ),
             desc="jax_train:loop",
             disable=bool(args.no_progress),
             unit="event",
@@ -4048,6 +4130,16 @@ def run_training_loop(args) -> dict[str, Any]:
                 policy_update_epochs=int(args.policy_update_epochs),
                 ppo_minibatches=int(args.ppo_minibatches),
             )
+            last_metrics.update(
+                summarize_learner_rebound_metrics(
+                    role_rollouts["offense"],
+                    role_rollouts["defense"],
+                    include_opponent_mode_split=(
+                        grouped_opponent_params is not None
+                        or opponent_params is not None
+                    ),
+                )
+            )
             for role in TRAINING_ROLES:
                 last_metrics.update(
                     _summarize_role_rollout_metrics(
@@ -4326,6 +4418,72 @@ def run_training_loop(args) -> dict[str, Any]:
                 progress.update(1)
                 progress.set_postfix_str(f"eval:{update_idx}", refresh=False)
 
+            should_deploy_eval = (
+                int(args.eval_deploy_every_updates) > 0
+                and int(args.eval_deploy_batches) > 0
+                and (
+                    update_idx == int(args.num_updates)
+                    or update_idx % int(args.eval_deploy_every_updates) == 0
+                )
+            )
+            if should_deploy_eval:
+                deploy_outputs = []
+                deploy_seed_key = jax.random.PRNGKey(int(args.eval_deploy_seed))
+                for deploy_batch_index in range(int(args.eval_deploy_batches)):
+                    reset_key = jax.random.fold_in(
+                        deploy_seed_key,
+                        (2 * deploy_batch_index),
+                    )
+                    deploy_rollout_key = jax.random.fold_in(
+                        deploy_seed_key,
+                        (2 * deploy_batch_index) + 1,
+                    )
+                    deploy_reset_keys = jax.random.split(
+                        reset_key,
+                        int(args.kernel_batch_size),
+                    )
+                    deploy_initial_state = reset_batch_minimal(
+                        active_statics["offense"],
+                        deploy_reset_keys,
+                        jax,
+                        jnp,
+                    )
+                    deploy_output = deploy_eval_runner(
+                        active_statics["offense"],
+                        deploy_initial_state,
+                        params,
+                        deploy_rollout_key,
+                        int(args.eval_deploy_horizon),
+                        selector_multiselect_enabled,
+                        selector_min_play_steps,
+                    )
+                    block_until_ready_tree(deploy_output)
+                    deploy_outputs.append(deploy_output)
+                deploy_metrics = summarize_deploy_eval_outputs(
+                    deploy_outputs,
+                    batch_size=int(args.kernel_batch_size),
+                )
+                deploy_metrics.update(
+                    {
+                        "update_index": int(update_idx),
+                        "horizon": int(args.eval_deploy_horizon),
+                        "seed": int(args.eval_deploy_seed),
+                        "action_argmax_offense": 1,
+                        "action_argmax_defense": 1,
+                        "same_policy_both_sides": 1,
+                    }
+                )
+                deploy_eval_history.append(deploy_metrics)
+                if mlflow is not None:
+                    _log_mlflow_metrics(
+                        mlflow,
+                        deploy_metrics,
+                        step=update_idx,
+                        prefix="jax/eval_deploy",
+                    )
+                progress.update(1)
+                progress.set_postfix_str(f"deploy_eval:{update_idx}", refresh=False)
+
             checkpoint_enabled = bool(checkpoint_dir) or mlflow is not None
             should_checkpoint = checkpoint_enabled and (
                 update_idx == int(args.num_updates)
@@ -4496,6 +4654,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 for role, ids in training_player_ids_by_role.items()
             },
             "train_history": train_history,
+            "deploy_eval_history": deploy_eval_history,
             "eval_trajectories": eval_trajectories,
             "final_metrics": last_metrics,
             "latest_checkpoint_path": latest_checkpoint_path,

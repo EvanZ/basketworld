@@ -294,6 +294,94 @@ class StepBatchOutput(NamedTuple):
     phi_prev: Any
     phi_next: Any
     phi_beta: Any
+    rebound_diagnostics: Any
+
+
+class ReboundDiagnosticTotals(NamedTuple):
+    attempts: Any
+    eligible_players: Any
+    eligible_offense_players: Any
+    eligible_defense_players: Any
+    eligible_skill: Any
+    eligible_offense_skill: Any
+    eligible_defense_skill: Any
+    offense_target_logit: Any
+    defense_target_logit: Any
+    offense_basket_logit: Any
+    defense_basket_logit: Any
+    offense_skill_logit: Any
+    defense_skill_logit: Any
+    offense_total_logit: Any
+    defense_total_logit: Any
+    winner_prob_attempts: Any
+    offense_winner_prob: Any
+    defense_winner_prob: Any
+    local_offense_only: Any
+    local_defense_only: Any
+
+
+def zero_rebound_diagnostic_totals_like(value, jnp) -> ReboundDiagnosticTotals:
+    zero = jnp.zeros_like(value, dtype=jnp.float32)
+    return ReboundDiagnosticTotals(*([zero] * len(ReboundDiagnosticTotals._fields)))
+
+
+def build_rebound_diagnostics(
+    *,
+    rebound_active,
+    role_encoding,
+    rebound_skill,
+    rebound_distances,
+    basket_position_penalty,
+    distance_weight,
+    basket_weight,
+    skill_weight,
+    temperature,
+    global_winner_logits,
+    winner_logits,
+    use_local_contest,
+    local_eligible,
+    jax,
+    jnp,
+) -> ReboundDiagnosticTotals:
+    active = rebound_active.astype(jnp.float32)
+    offense_mask = role_encoding > 0.0
+    defense_mask = ~offense_mask
+    eligible = jnp.where(use_local_contest, local_eligible, jnp.ones_like(local_eligible, dtype=jnp.bool_))
+    eligible_offense = eligible & offense_mask
+    eligible_defense = eligible & defense_mask
+    eligible_float = eligible.astype(jnp.float32)
+    eligible_offense_float = eligible_offense.astype(jnp.float32)
+    eligible_defense_float = eligible_defense.astype(jnp.float32)
+    target_logit = (-distance_weight * rebound_distances.astype(jnp.float32)) / temperature
+    basket_logit = (-basket_weight * basket_position_penalty.astype(jnp.float32)) / temperature
+    skill_logit = (
+        distance_weight
+        * skill_weight
+        * rebound_skill.astype(jnp.float32)
+    ) / temperature
+    winner_probs = jax.nn.softmax(winner_logits)
+    return ReboundDiagnosticTotals(
+        attempts=active,
+        eligible_players=active * jnp.sum(eligible_float),
+        eligible_offense_players=active * jnp.sum(eligible_offense_float),
+        eligible_defense_players=active * jnp.sum(eligible_defense_float),
+        eligible_skill=active * jnp.sum(rebound_skill.astype(jnp.float32) * eligible_float),
+        eligible_offense_skill=active * jnp.sum(rebound_skill.astype(jnp.float32) * eligible_offense_float),
+        eligible_defense_skill=active * jnp.sum(rebound_skill.astype(jnp.float32) * eligible_defense_float),
+        offense_target_logit=active * jnp.sum(target_logit * eligible_offense_float),
+        defense_target_logit=active * jnp.sum(target_logit * eligible_defense_float),
+        offense_basket_logit=active * jnp.sum(basket_logit * eligible_offense_float),
+        defense_basket_logit=active * jnp.sum(basket_logit * eligible_defense_float),
+        offense_skill_logit=active * jnp.sum(skill_logit * eligible_offense_float),
+        defense_skill_logit=active * jnp.sum(skill_logit * eligible_defense_float),
+        offense_total_logit=active * jnp.sum(global_winner_logits * eligible_offense_float),
+        defense_total_logit=active * jnp.sum(global_winner_logits * eligible_defense_float),
+        winner_prob_attempts=active,
+        offense_winner_prob=active * jnp.sum(winner_probs * offense_mask.astype(jnp.float32)),
+        defense_winner_prob=active * jnp.sum(winner_probs * defense_mask.astype(jnp.float32)),
+        local_offense_only=active * (use_local_contest & (jnp.sum(eligible_offense_float) > 0.0) & (jnp.sum(eligible_defense_float) <= 0.0)).astype(jnp.float32),
+        local_defense_only=active * (use_local_contest & (jnp.sum(eligible_defense_float) > 0.0) & (jnp.sum(eligible_offense_float) <= 0.0)).astype(jnp.float32),
+    )
 
 
 def _player_skill_arrays(env) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -2357,6 +2445,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
     zero_float = jnp.asarray(0.0, dtype=jnp.float32)
     no_player = jnp.asarray(-1, dtype=jnp.int32)
     no_reason = jnp.asarray(TURNOVER_REASON_NONE, dtype=jnp.int32)
+    zero_rebound_diagnostics = zero_rebound_diagnostic_totals_like(zero_float, jnp)
 
     def _already_done(_):
         return StepBatchOutput(
@@ -2400,6 +2489,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             phi_prev=zero_float,
             phi_next=zero_float,
             phi_beta=zero_float,
+            rebound_diagnostics=zero_rebound_diagnostics,
         )
 
     def _run_active(_):
@@ -2495,6 +2585,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
                 phi_beta=phi_beta,
+                rebound_diagnostics=zero_rebound_diagnostics,
             )
 
         def _normal_step(_):
@@ -2773,6 +2864,23 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
             winner_logits = jnp.where(use_local_contest, local_winner_logits, global_winner_logits)
             rebound_global_contest = rebound_active & (~use_local_contest)
+            rebound_diagnostics = build_rebound_diagnostics(
+                rebound_active=rebound_active,
+                role_encoding=static.role_encoding,
+                rebound_skill=final_state.rebound_skill,
+                rebound_distances=rebound_distances,
+                basket_position_penalty=basket_position_penalty,
+                distance_weight=static.rebound_winner_distance_weight,
+                basket_weight=static.rebound_basket_position_weight,
+                skill_weight=static.rebound_skill_weight,
+                temperature=static.rebound_winner_temperature,
+                global_winner_logits=global_winner_logits,
+                winner_logits=winner_logits,
+                use_local_contest=use_local_contest,
+                local_eligible=local_eligible,
+                jax=jax,
+                jnp=jnp,
+            )
             sampled_rebound_winner = jax.random.categorical(rebound_winner_key, winner_logits).astype(jnp.int32)
             rebound_winner_is_offense = static.role_encoding[jnp.clip(sampled_rebound_winner, 0, static.role_encoding.shape[0] - 1)] > 0.0
             offensive_rebound = rebound_active & rebound_winner_is_offense
@@ -3065,6 +3173,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
                 phi_beta=phi_beta,
+                rebound_diagnostics=rebound_diagnostics,
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)

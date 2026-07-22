@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import numpy as np
 
@@ -9,12 +11,18 @@ from basketworld_jax.env import (
     TOKEN_OBS_PLAYER_DIM,
     TOKEN_OBS_ROLE_FLAG_DIM,
 )
+from basketworld_jax.env.minimal import (
+    ReboundDiagnosticTotals,
+    build_rebound_diagnostics,
+)
 from basketworld_jax.intent.discriminator import (
     IntentDiscriminatorSpec,
     build_intent_step_features_from_rollout,
 )
 from basketworld_jax.models import ActorCriticSpec
 from basketworld_jax.train.types import (
+    DeployEvalOutput,
+    DeployEvalTotals,
     RolloutOutput,
     SelectorBatch,
     TrainerConfig,
@@ -44,6 +52,9 @@ from basketworld_jax.train.runtime import (
     _mask_selector_update_grads,
     _merge_selector_update_params,
     _selector_segment_application_masks,
+    summarize_deploy_eval_outputs,
+    summarize_learner_rebound_metrics,
+    summarize_rebound_diagnostics,
     summarize_ppo_eligible_episode_metrics,
     summarize_reward_by_intent_metrics,
 )
@@ -54,6 +65,18 @@ def test_trainer_parser_defaults_match_frozen_scope():
 
     for key, expected in TRAIN_FROZEN_VALUES.items():
         assert getattr(args, key) == expected
+
+    assert args.eval_deploy_every_updates == 0
+    assert args.eval_deploy_batches == 20
+    assert args.eval_deploy_horizon == 128
+    assert args.eval_deploy_seed == 2_000_000
+
+
+def test_deploy_eval_args_reject_invalid_values():
+    with pytest.raises(SystemExit, match="--eval-deploy-batches must be >= 0"):
+        validate_train_args(parse_args(["--eval-deploy-batches", "-1"]))
+    with pytest.raises(SystemExit, match="--eval-deploy-horizon must be >= 1"):
+        validate_train_args(parse_args(["--eval-deploy-horizon", "0"]))
 
 
 def test_fixed_checkpoint_schedule_preserves_modulo_cadence():
@@ -257,6 +280,420 @@ def test_jax_phi_beta_update_schedule():
     )
     validate_train_args(disabled)
     assert _phi_beta_for_update(disabled, 6) == pytest.approx(0.0)
+
+
+def test_rebound_diagnostics_match_kernel_components():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    role_encoding = jnp.asarray([1.0, 1.0, -1.0, -1.0], dtype=jnp.float32)
+    rebound_skill = jnp.asarray([0.2, 0.4, 0.6, 0.8], dtype=jnp.float32)
+    rebound_distances = jnp.asarray([1.0, 3.0, 2.0, 4.0], dtype=jnp.float32)
+    basket_position_penalty = jnp.asarray([0.5, 0.0, 1.0, 2.0], dtype=jnp.float32)
+    distance_weight = jnp.asarray(2.0, dtype=jnp.float32)
+    basket_weight = jnp.asarray(0.5, dtype=jnp.float32)
+    skill_weight = jnp.asarray(3.0, dtype=jnp.float32)
+    temperature = jnp.asarray(2.0, dtype=jnp.float32)
+    target_logit = (-distance_weight * rebound_distances) / temperature
+    basket_logit = (-basket_weight * basket_position_penalty) / temperature
+    skill_logit = (distance_weight * skill_weight * rebound_skill) / temperature
+    total_logit = target_logit + basket_logit + skill_logit
+    local_eligible = jnp.asarray([True, False, False, True])
+    winner_logits = jnp.where(local_eligible, total_logit, -1.0e9)
+
+    diagnostics = build_rebound_diagnostics(
+        rebound_active=jnp.asarray(True),
+        role_encoding=role_encoding,
+        rebound_skill=rebound_skill,
+        rebound_distances=rebound_distances,
+        basket_position_penalty=basket_position_penalty,
+        distance_weight=distance_weight,
+        basket_weight=basket_weight,
+        skill_weight=skill_weight,
+        temperature=temperature,
+        global_winner_logits=total_logit,
+        winner_logits=winner_logits,
+        use_local_contest=jnp.asarray(True),
+        local_eligible=local_eligible,
+        jax=jax,
+        jnp=jnp,
+    )
+
+    assert float(diagnostics.attempts) == pytest.approx(1.0)
+    assert float(diagnostics.eligible_offense_players) == pytest.approx(1.0)
+    assert float(diagnostics.eligible_defense_players) == pytest.approx(1.0)
+    assert float(diagnostics.offense_target_logit) == pytest.approx(float(target_logit[0]))
+    assert float(diagnostics.defense_basket_logit) == pytest.approx(float(basket_logit[3]))
+    assert float(diagnostics.offense_skill_logit) == pytest.approx(float(skill_logit[0]))
+    assert float(diagnostics.defense_total_logit) == pytest.approx(float(total_logit[3]))
+    assert float(diagnostics.offense_winner_prob + diagnostics.defense_winner_prob) == pytest.approx(1.0)
+    assert float(diagnostics.local_offense_only) == pytest.approx(0.0)
+    assert float(diagnostics.local_defense_only) == pytest.approx(0.0)
+
+
+def test_summarize_rebound_diagnostics_normalizes_like_eval_tab():
+    totals = ReboundDiagnosticTotals(
+        attempts=np.asarray(2.0, dtype=np.float32),
+        eligible_players=np.asarray(10.0, dtype=np.float32),
+        eligible_offense_players=np.asarray(4.0, dtype=np.float32),
+        eligible_defense_players=np.asarray(6.0, dtype=np.float32),
+        eligible_skill=np.asarray(5.0, dtype=np.float32),
+        eligible_offense_skill=np.asarray(3.0, dtype=np.float32),
+        eligible_defense_skill=np.asarray(2.0, dtype=np.float32),
+        offense_target_logit=np.asarray(-8.0, dtype=np.float32),
+        defense_target_logit=np.asarray(-18.0, dtype=np.float32),
+        offense_basket_logit=np.asarray(-2.0, dtype=np.float32),
+        defense_basket_logit=np.asarray(-3.0, dtype=np.float32),
+        offense_skill_logit=np.asarray(4.0, dtype=np.float32),
+        defense_skill_logit=np.asarray(9.0, dtype=np.float32),
+        offense_total_logit=np.asarray(-6.0, dtype=np.float32),
+        defense_total_logit=np.asarray(-12.0, dtype=np.float32),
+        winner_prob_attempts=np.asarray(2.0, dtype=np.float32),
+        offense_winner_prob=np.asarray(1.25, dtype=np.float32),
+        defense_winner_prob=np.asarray(0.75, dtype=np.float32),
+        local_offense_only=np.asarray(1.0, dtype=np.float32),
+        local_defense_only=np.asarray(0.0, dtype=np.float32),
+    )
+
+    summary = summarize_rebound_diagnostics(totals)
+
+    assert summary["rebound_avg_eligible_players"] == pytest.approx(5.0)
+    assert summary["rebound_avg_eligible_players_offense"] == pytest.approx(2.0)
+    assert summary["rebound_avg_eligible_skill_offense"] == pytest.approx(0.75)
+    assert summary["rebound_avg_target_logit_defense"] == pytest.approx(-3.0)
+    assert summary["rebound_avg_total_logit_offense"] == pytest.approx(-1.5)
+    assert summary["rebound_softmax_win_rate_offense"] == pytest.approx(0.625)
+    assert summary["rebound_local_offense_only_rate"] == pytest.approx(0.5)
+
+
+def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
+    zero_totals = {field: 0.0 for field in DeployEvalTotals._fields}
+    zero_totals.update(
+        active_steps=12.0,
+        completed_episode_steps=7.0,
+        pass_attempts=4.0,
+        completed_passes=3.0,
+        assists=1.0,
+        turnovers=2.0,
+        turnover_intercepted=1.0,
+        shot_attempts=5.0,
+        shot_makes=2.0,
+        shot_twos=3.0,
+        shot_threes=2.0,
+        rebound_attempts=4.0,
+        offensive_rebounds=1.0,
+        defensive_rebounds=3.0,
+        rebound_global_contests=2.0,
+    )
+    diagnostics = {field: 0.0 for field in ReboundDiagnosticTotals._fields}
+    diagnostics.update(
+        attempts=4.0,
+        eligible_players=16.0,
+        eligible_offense_players=8.0,
+        eligible_defense_players=8.0,
+        winner_prob_attempts=4.0,
+        offense_winner_prob=1.5,
+        defense_winner_prob=2.5,
+    )
+    output = DeployEvalOutput(
+        final_state=SimpleNamespace(
+            episode_ended=np.asarray([True, False]),
+            offense_score=np.asarray([2.0, 1.0]),
+            defense_score=np.asarray([0.0, 0.0]),
+        ),
+        totals=DeployEvalTotals(
+            **{
+                field: np.asarray(value, dtype=np.float32)
+                for field, value in zero_totals.items()
+            }
+        ),
+        rebound_diagnostic_totals=ReboundDiagnosticTotals(
+            **{
+                field: np.asarray(value, dtype=np.float32)
+                for field, value in diagnostics.items()
+            }
+        ),
+    )
+
+    summary = summarize_deploy_eval_outputs([output], batch_size=2)
+
+    assert summary["episode_count"] == 2
+    assert summary["completed_episode_count"] == 1
+    assert summary["truncated_episode_count"] == 1
+    assert summary["pass_completion_rate"] == pytest.approx(0.75)
+    assert summary["shot_make_rate"] == pytest.approx(0.4)
+    assert summary["offensive_rebound_rate"] == pytest.approx(0.25)
+    assert summary["defensive_rebound_rate"] == pytest.approx(0.75)
+    assert summary["rebound_softmax_win_rate_defense"] == pytest.approx(0.625)
+    assert summary["rebound_softmax_empirical_gap_defense"] == pytest.approx(0.125)
+    assert summary["turnover_intercepted_share"] == pytest.approx(0.5)
+
+
+def test_summarize_rebound_diagnostics_handles_missing_or_zero_totals():
+    assert all(value == 0.0 for value in summarize_rebound_diagnostics(None).values())
+    zero_summary = summarize_rebound_diagnostics(
+        ReboundDiagnosticTotals(*([np.asarray(0.0, dtype=np.float32)] * len(ReboundDiagnosticTotals._fields)))
+    )
+    assert all(value == 0.0 for value in zero_summary.values())
+
+
+def test_summarize_learner_rebound_metrics_excludes_opponent_contributions():
+    def _totals(**overrides):
+        values = {field: 0.0 for field in ReboundDiagnosticTotals._fields}
+        values.update(overrides)
+        return ReboundDiagnosticTotals(
+            **{
+                field: np.asarray(values[field], dtype=np.float32)
+                for field in ReboundDiagnosticTotals._fields
+            }
+        )
+
+    def _rollout(totals, *, attempts, offensive, defensive, global_contests):
+        return SimpleNamespace(
+            rebound_diagnostic_totals=totals,
+            trajectory=SimpleNamespace(
+                rebound_attempts=np.asarray(attempts, dtype=np.float32),
+                offensive_rebounds=np.asarray(offensive, dtype=np.float32),
+                defensive_rebounds=np.asarray(defensive, dtype=np.float32),
+                rebound_global_contests=np.asarray(global_contests, dtype=np.float32),
+            ),
+        )
+
+    offense_rollout = _rollout(
+        _totals(
+            attempts=4.0,
+            eligible_offense_players=8.0,
+            eligible_defense_players=400.0,
+            eligible_offense_skill=6.0,
+            eligible_defense_skill=40_000.0,
+            offense_target_logit=-16.0,
+            defense_target_logit=-90_000.0,
+            offense_basket_logit=-4.0,
+            defense_basket_logit=-80_000.0,
+            offense_skill_logit=2.0,
+            defense_skill_logit=70_000.0,
+            offense_total_logit=-18.0,
+            defense_total_logit=-100_000.0,
+            winner_prob_attempts=4.0,
+            offense_winner_prob=3.0,
+            defense_winner_prob=1.0,
+            local_offense_only=1.0,
+            local_defense_only=2.0,
+        ),
+        attempts=[4.0],
+        offensive=[4.0],
+        defensive=[0.0],
+        global_contests=[2.0],
+    )
+    defense_rollout = _rollout(
+        _totals(
+            attempts=5.0,
+            eligible_offense_players=500.0,
+            eligible_defense_players=10.0,
+            eligible_offense_skill=50_000.0,
+            eligible_defense_skill=5.0,
+            offense_target_logit=-90_000.0,
+            defense_target_logit=-30.0,
+            offense_basket_logit=-80_000.0,
+            defense_basket_logit=-10.0,
+            offense_skill_logit=70_000.0,
+            defense_skill_logit=2.0,
+            offense_total_logit=-100_000.0,
+            defense_total_logit=-38.0,
+            winner_prob_attempts=5.0,
+            offense_winner_prob=2.0,
+            defense_winner_prob=3.0,
+            local_offense_only=1.0,
+            local_defense_only=2.0,
+        ),
+        attempts=[5.0],
+        offensive=[1.0],
+        defensive=[4.0],
+        global_contests=[1.0],
+    )
+
+    summary = summarize_learner_rebound_metrics(
+        offense_rollout,
+        defense_rollout,
+    )
+
+    assert summary["rebound_learner_offense_attempts"] == 4
+    assert summary["rebound_learner_defense_attempts"] == 5
+    assert summary["rebound_learner_offensive_rebounds"] == 4
+    assert summary["rebound_learner_defensive_rebounds"] == 4
+    assert summary["rebound_learner_offensive_rebound_rate"] == pytest.approx(1.0)
+    assert summary["rebound_learner_defensive_rebound_rate"] == pytest.approx(0.8)
+    assert summary["rebound_learner_avg_eligible_players_offense"] == pytest.approx(2.0)
+    assert summary["rebound_learner_avg_eligible_players_defense"] == pytest.approx(2.0)
+    assert summary["rebound_learner_avg_eligible_skill_offense"] == pytest.approx(0.75)
+    assert summary["rebound_learner_avg_eligible_skill_defense"] == pytest.approx(0.5)
+    assert summary["rebound_learner_avg_target_logit_offense"] == pytest.approx(-2.0)
+    assert summary["rebound_learner_avg_target_logit_defense"] == pytest.approx(-3.0)
+    assert summary["rebound_learner_avg_basket_logit_offense"] == pytest.approx(-0.5)
+    assert summary["rebound_learner_avg_basket_logit_defense"] == pytest.approx(-1.0)
+    assert summary["rebound_learner_avg_skill_logit_offense"] == pytest.approx(0.25)
+    assert summary["rebound_learner_avg_skill_logit_defense"] == pytest.approx(0.2)
+    assert summary["rebound_learner_avg_total_logit_offense"] == pytest.approx(-2.25)
+    assert summary["rebound_learner_avg_total_logit_defense"] == pytest.approx(-3.8)
+    assert summary["rebound_learner_softmax_win_rate_offense"] == pytest.approx(0.75)
+    assert summary["rebound_learner_softmax_win_rate_defense"] == pytest.approx(0.6)
+    assert summary["rebound_learner_win_rate_gap_offense"] == pytest.approx(0.25)
+    assert summary["rebound_learner_win_rate_gap_defense"] == pytest.approx(0.2)
+    assert summary["rebound_global_contest_rate_offense"] == pytest.approx(0.5)
+    assert summary["rebound_global_contest_rate_defense"] == pytest.approx(0.2)
+    assert summary["rebound_local_learner_only_rate_offense"] == pytest.approx(0.25)
+    assert summary["rebound_local_learner_only_rate_defense"] == pytest.approx(0.4)
+    assert summary["rebound_local_opponent_only_rate_offense"] == pytest.approx(0.5)
+    assert summary["rebound_local_opponent_only_rate_defense"] == pytest.approx(0.2)
+
+    empty_rollout = _rollout(
+        None,
+        attempts=[0.0],
+        offensive=[0.0],
+        defensive=[0.0],
+        global_contests=[0.0],
+    )
+    empty_summary = summarize_learner_rebound_metrics(
+        empty_rollout,
+        empty_rollout,
+    )
+    assert all(value == 0 for value in empty_summary.values())
+
+
+def test_summarize_learner_rebound_metrics_splits_opponent_action_mode():
+    def _totals(**overrides):
+        values = {field: 0.0 for field in ReboundDiagnosticTotals._fields}
+        values.update(overrides)
+        return ReboundDiagnosticTotals(
+            **{
+                field: np.asarray(values[field], dtype=np.float32)
+                for field in ReboundDiagnosticTotals._fields
+            }
+        )
+
+    def _rollout(*, attempts, offensive, defensive, deterministic, argmax, sampled):
+        return SimpleNamespace(
+            rebound_diagnostic_totals=_totals(),
+            rebound_diagnostic_argmax_totals=argmax,
+            rebound_diagnostic_sampled_totals=sampled,
+            trajectory=SimpleNamespace(
+                rebound_attempts=np.asarray(attempts, dtype=np.float32),
+                offensive_rebounds=np.asarray(offensive, dtype=np.float32),
+                defensive_rebounds=np.asarray(defensive, dtype=np.float32),
+                rebound_global_contests=np.zeros_like(attempts, dtype=np.float32),
+                opponent_deterministic_episode=np.asarray(deterministic, dtype=np.float32),
+            ),
+        )
+
+    offense_rollout = _rollout(
+        attempts=[1.0, 1.0, 1.0, 0.0],
+        offensive=[1.0, 0.0, 1.0, 0.0],
+        defensive=[0.0, 1.0, 0.0, 0.0],
+        deterministic=[1.0, 1.0, 0.0, 0.0],
+        argmax=_totals(
+            attempts=2.0,
+            eligible_offense_players=4.0,
+            offense_target_logit=-8.0,
+            offense_basket_logit=-2.0,
+            offense_skill_logit=2.0,
+            offense_total_logit=-8.0,
+            winner_prob_attempts=2.0,
+            offense_winner_prob=1.2,
+        ),
+        sampled=_totals(
+            attempts=1.0,
+            eligible_offense_players=3.0,
+            offense_target_logit=-3.0,
+            offense_basket_logit=-1.5,
+            offense_skill_logit=0.75,
+            offense_total_logit=-3.75,
+            winner_prob_attempts=1.0,
+            offense_winner_prob=0.8,
+        ),
+    )
+    defense_rollout = _rollout(
+        attempts=[1.0, 1.0, 0.0],
+        offensive=[0.0, 1.0, 0.0],
+        defensive=[1.0, 0.0, 0.0],
+        deterministic=[0.0, 0.0, 0.0],
+        argmax=_totals(),
+        sampled=_totals(
+            attempts=2.0,
+            eligible_defense_players=6.0,
+            defense_target_logit=-12.0,
+            defense_basket_logit=-3.0,
+            defense_skill_logit=1.5,
+            defense_total_logit=-13.5,
+            winner_prob_attempts=2.0,
+            defense_winner_prob=1.2,
+        ),
+    )
+
+    summary = summarize_learner_rebound_metrics(
+        offense_rollout,
+        defense_rollout,
+        include_opponent_mode_split=True,
+    )
+
+    assert summary["rebound_learner_offense_attempts_vs_argmax"] == 2
+    assert summary["rebound_learner_offense_attempts_vs_sampled"] == 1
+    assert summary["rebound_learner_defense_attempts_vs_argmax"] == 0
+    assert summary["rebound_learner_defense_attempts_vs_sampled"] == 2
+    assert summary["rebound_learner_offensive_rebounds_vs_argmax"] == 1
+    assert summary["rebound_learner_offensive_rebound_rate_vs_argmax"] == pytest.approx(0.5)
+    assert summary["rebound_learner_avg_eligible_players_offense_vs_argmax"] == pytest.approx(2.0)
+    assert summary["rebound_learner_avg_total_logit_offense_vs_argmax"] == pytest.approx(-2.0)
+    assert summary["rebound_learner_softmax_win_rate_offense_vs_argmax"] == pytest.approx(0.6)
+    assert summary["rebound_learner_win_rate_gap_offense_vs_argmax"] == pytest.approx(-0.1)
+    assert summary["rebound_learner_offensive_rebound_rate_vs_sampled"] == pytest.approx(1.0)
+    assert summary["rebound_learner_avg_total_logit_offense_vs_sampled"] == pytest.approx(-1.25)
+    assert summary["rebound_learner_defensive_rebounds_vs_sampled"] == 1
+    assert summary["rebound_learner_defensive_rebound_rate_vs_sampled"] == pytest.approx(0.5)
+    assert summary["rebound_learner_avg_eligible_players_defense_vs_sampled"] == pytest.approx(3.0)
+    assert summary["rebound_learner_avg_total_logit_defense_vs_sampled"] == pytest.approx(-2.25)
+    assert summary["rebound_learner_softmax_win_rate_defense_vs_sampled"] == pytest.approx(0.6)
+    assert summary["rebound_learner_win_rate_gap_defense_vs_sampled"] == pytest.approx(-0.1)
+    assert "rebound_learner_defensive_rebound_rate_vs_argmax" not in summary
+    assert "rebound_learner_avg_total_logit_defense_vs_argmax" not in summary
+    assert "rebound_learner_avg_eligible_skill_offense_vs_argmax" not in summary
+
+    aggregate_only = summarize_learner_rebound_metrics(
+        offense_rollout,
+        defense_rollout,
+    )
+    assert not any("_vs_argmax" in key or "_vs_sampled" in key for key in aggregate_only)
+
+
+def test_mlflow_core_profile_keeps_learner_rebound_metrics_only():
+    metrics = {
+        "rebound_learner_avg_eligible_players_offense": 2.0,
+        "rebound_learner_avg_total_logit_defense": -3.8,
+        "rebound_learner_offensive_rebound_rate": 0.4,
+        "rebound_learner_defensive_rebound_rate": 0.7,
+        "rebound_learner_softmax_win_rate_defense": 0.65,
+        "rebound_learner_avg_total_logit_offense_vs_argmax": -2.0,
+        "rebound_local_opponent_only_rate_defense": 0.1,
+        "rebound_avg_eligible_players": 5.0,
+        "rebound_avg_target_logit_offense": -1.0,
+        "rebound_softmax_win_rate_defense": 0.4,
+        "rebound_local_defense_only_rate": 0.1,
+        "offensive_rebound_rate": 0.5,
+        "defensive_rebound_rate": 0.5,
+        "rebound_global_contest_rate": 0.3,
+    }
+
+    filtered = _filter_mlflow_train_metrics(metrics, profile="core")
+
+    assert set(filtered) == {
+        "rebound_learner_avg_eligible_players_offense",
+        "rebound_learner_avg_total_logit_defense",
+        "rebound_learner_offensive_rebound_rate",
+        "rebound_learner_defensive_rebound_rate",
+        "rebound_learner_softmax_win_rate_defense",
+        "rebound_learner_avg_total_logit_offense_vs_argmax",
+        "rebound_local_opponent_only_rate_defense",
+    }
+    assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
 
 
 def test_intent_discriminator_uses_training_mask_for_active_samples():
@@ -1246,6 +1683,12 @@ def test_train_loop_emits_history_and_eval_dumps():
             "1",
             "--eval-horizon",
             "4",
+            "--eval-deploy-every-updates",
+            "1",
+            "--eval-deploy-batches",
+            "1",
+            "--eval-deploy-horizon",
+            "4",
             "--max-eval-dumps",
             "2",
             "--no-progress",
@@ -1259,6 +1702,19 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert set(result["training_player_ids"]) == {"offense", "defense"}
     assert len(result["train_history"]) == 2
     assert len(result["eval_trajectories"]) == 2
+    assert len(result["deploy_eval_history"]) == 2
+    deploy_metrics = result["deploy_eval_history"][-1]
+    assert deploy_metrics["batch_count"] == 1
+    assert deploy_metrics["batch_size"] == 4
+    assert deploy_metrics["episode_count"] == 4
+    assert (
+        deploy_metrics["completed_episode_count"]
+        + deploy_metrics["truncated_episode_count"]
+        == 4
+    )
+    assert deploy_metrics["same_policy_both_sides"] == 1
+    assert "rebound_softmax_win_rate_offense" in deploy_metrics
+    assert "defensive_rebound_rate" in deploy_metrics
     assert result["final_metrics"]["update_index"] == 2
     assert "mean_reward" in result["final_metrics"]
     assert "offense_mean_reward" in result["final_metrics"]
@@ -1411,6 +1867,12 @@ def test_train_loop_runs_intent_selector_segment_start_metrics():
             "1",
             "--eval-every-updates",
             "0",
+            "--eval-deploy-every-updates",
+            "1",
+            "--eval-deploy-batches",
+            "1",
+            "--eval-deploy-horizon",
+            "5",
             "--no-progress",
         ]
     )
@@ -1436,6 +1898,9 @@ def test_train_loop_runs_intent_selector_segment_start_metrics():
     assert "selector_train_clip_fraction" in metrics
     assert "selector_train_usage_by_intent/0" in metrics
     assert "selector_usage_by_intent/0" in metrics
+    deploy_metrics = result["deploy_eval_history"][0]
+    assert deploy_metrics["selector_applied_count"] > 0
+    assert deploy_metrics["selector_boundary_episode_start_count"] > 0
 
 
 def test_train_loop_skips_empty_selector_update_during_warmup():
@@ -1682,6 +2147,13 @@ def test_train_loop_accepts_frozen_opponent_checkpoint(tmp_path):
     assert result["final_metrics"]["update_index"] == 1
     assert "offense_mean_reward" in result["final_metrics"]
     assert "defense_mean_reward" in result["final_metrics"]
+    metrics = result["final_metrics"]
+    assert metrics["rebound_learner_offense_attempts_vs_argmax"] == 0
+    assert metrics["rebound_learner_defense_attempts_vs_argmax"] == 0
+    assert "rebound_learner_offense_attempts_vs_sampled" in metrics
+    assert "rebound_learner_defense_attempts_vs_sampled" in metrics
+    assert "rebound_learner_offensive_rebound_rate_vs_argmax" not in metrics
+    assert "rebound_learner_defensive_rebound_rate_vs_argmax" not in metrics
 
 
 def test_train_loop_samples_newly_saved_opponents_from_pool(tmp_path):

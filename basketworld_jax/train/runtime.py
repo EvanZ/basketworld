@@ -24,12 +24,14 @@ from basketworld_jax.env import (
     step_batch_minimal,
 )
 from basketworld_jax.env.minimal import (
+    ReboundDiagnosticTotals,
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
     TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
     TURNOVER_REASON_SHOT_CLOCK,
+    zero_rebound_diagnostic_totals_like,
 )
 from basketworld_jax.models import (
     ActorCriticSpec,
@@ -39,6 +41,8 @@ from basketworld_jax.models import (
 )
 from basketworld_jax.optim import build_adam_transform, global_norm, optimizer_update
 from basketworld_jax.train.types import (
+    DeployEvalOutput,
+    DeployEvalTotals,
     EvalTrace,
     PPOBatch,
     RolloutOutput,
@@ -129,6 +133,18 @@ def _concatenate_namedtuple_batch(items, jnp, *, axis: int):
 def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> RolloutOutput:
     if not rollouts:
         raise ValueError("At least one rollout output is required.")
+    rebound_diagnostic_totals = _sum_rebound_diagnostic_totals(
+        [rollout.rebound_diagnostic_totals for rollout in rollouts],
+        jnp,
+    )
+    rebound_diagnostic_argmax_totals = _sum_rebound_diagnostic_totals(
+        [rollout.rebound_diagnostic_argmax_totals for rollout in rollouts],
+        jnp,
+    )
+    rebound_diagnostic_sampled_totals = _sum_rebound_diagnostic_totals(
+        [rollout.rebound_diagnostic_sampled_totals for rollout in rollouts],
+        jnp,
+    )
     return RolloutOutput(
         trajectory=_concatenate_namedtuple_batch(
             [rollout.trajectory for rollout in rollouts],
@@ -156,7 +172,323 @@ def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> Rollo
             [rollout.final_action_mask for rollout in rollouts],
             axis=0,
         ),
+        rebound_diagnostic_totals=rebound_diagnostic_totals,
+        rebound_diagnostic_argmax_totals=rebound_diagnostic_argmax_totals,
+        rebound_diagnostic_sampled_totals=rebound_diagnostic_sampled_totals,
     )
+
+
+def _sum_rebound_diagnostic_totals(totals: Sequence[Any], jnp):
+    present = [total for total in totals if total is not None]
+    if not present:
+        return None
+    return ReboundDiagnosticTotals(
+        *(
+            sum(getattr(total, field) for total in present)
+            for field in ReboundDiagnosticTotals._fields
+        )
+    )
+
+
+def _accumulate_rebound_diagnostic_totals(total, step_diagnostics, active_step, jnp):
+    active = active_step.astype(jnp.float32)
+    return ReboundDiagnosticTotals(
+        *(
+            getattr(total, field) + jnp.sum(getattr(step_diagnostics, field) * active)
+            for field in ReboundDiagnosticTotals._fields
+        )
+    )
+
+
+def summarize_rebound_diagnostics(totals) -> dict[str, float]:
+    summary = {
+        "rebound_avg_eligible_players": 0.0,
+        "rebound_avg_eligible_players_offense": 0.0,
+        "rebound_avg_eligible_players_defense": 0.0,
+        "rebound_avg_eligible_skill": 0.0,
+        "rebound_avg_eligible_skill_offense": 0.0,
+        "rebound_avg_eligible_skill_defense": 0.0,
+        "rebound_avg_target_logit_offense": 0.0,
+        "rebound_avg_target_logit_defense": 0.0,
+        "rebound_avg_basket_logit_offense": 0.0,
+        "rebound_avg_basket_logit_defense": 0.0,
+        "rebound_avg_skill_logit_offense": 0.0,
+        "rebound_avg_skill_logit_defense": 0.0,
+        "rebound_avg_total_logit_offense": 0.0,
+        "rebound_avg_total_logit_defense": 0.0,
+        "rebound_softmax_win_rate_offense": 0.0,
+        "rebound_softmax_win_rate_defense": 0.0,
+        "rebound_local_offense_only_rate": 0.0,
+        "rebound_local_defense_only_rate": 0.0,
+    }
+    if totals is None:
+        return summary
+
+    values = {
+        field: float(np.asarray(getattr(totals, field), dtype=np.float32))
+        for field in ReboundDiagnosticTotals._fields
+    }
+
+    def _ratio(num: str, denom: str) -> float:
+        denominator = values[denom]
+        if denominator <= 0.0:
+            return 0.0
+        return float(values[num] / denominator)
+
+    summary.update(
+        {
+            "rebound_avg_eligible_players": _ratio("eligible_players", "attempts"),
+            "rebound_avg_eligible_players_offense": _ratio("eligible_offense_players", "attempts"),
+            "rebound_avg_eligible_players_defense": _ratio("eligible_defense_players", "attempts"),
+            "rebound_avg_eligible_skill": _ratio("eligible_skill", "eligible_players"),
+            "rebound_avg_eligible_skill_offense": _ratio(
+                "eligible_offense_skill",
+                "eligible_offense_players",
+            ),
+            "rebound_avg_eligible_skill_defense": _ratio(
+                "eligible_defense_skill",
+                "eligible_defense_players",
+            ),
+            "rebound_avg_target_logit_offense": _ratio("offense_target_logit", "eligible_offense_players"),
+            "rebound_avg_target_logit_defense": _ratio("defense_target_logit", "eligible_defense_players"),
+            "rebound_avg_basket_logit_offense": _ratio("offense_basket_logit", "eligible_offense_players"),
+            "rebound_avg_basket_logit_defense": _ratio("defense_basket_logit", "eligible_defense_players"),
+            "rebound_avg_skill_logit_offense": _ratio("offense_skill_logit", "eligible_offense_players"),
+            "rebound_avg_skill_logit_defense": _ratio("defense_skill_logit", "eligible_defense_players"),
+            "rebound_avg_total_logit_offense": _ratio("offense_total_logit", "eligible_offense_players"),
+            "rebound_avg_total_logit_defense": _ratio("defense_total_logit", "eligible_defense_players"),
+            "rebound_softmax_win_rate_offense": _ratio("offense_winner_prob", "winner_prob_attempts"),
+            "rebound_softmax_win_rate_defense": _ratio("defense_winner_prob", "winner_prob_attempts"),
+            "rebound_local_offense_only_rate": _ratio("local_offense_only", "attempts"),
+            "rebound_local_defense_only_rate": _ratio("local_defense_only", "attempts"),
+        }
+    )
+    return summary
+
+
+def summarize_learner_rebound_metrics(
+    offense_rollout: RolloutOutput,
+    defense_rollout: RolloutOutput,
+    *,
+    include_opponent_mode_split: bool = False,
+) -> dict[str, float | int]:
+    """Summarize only the learner-controlled side of each role rollout.
+
+    The offense rollout has the learner on offense, while the defense rollout
+    has the learner on defense. Opponent values remain relevant inside the
+    winner softmax and local-contest eligibility, but they are never included
+    in learner skill, logit, eligibility, or empirical win-rate numerators.
+    """
+
+    offense_diag = summarize_rebound_diagnostics(
+        offense_rollout.rebound_diagnostic_totals
+    )
+    defense_diag = summarize_rebound_diagnostics(
+        defense_rollout.rebound_diagnostic_totals
+    )
+
+    def _trajectory_total(
+        rollout: RolloutOutput,
+        field: str,
+        mask: np.ndarray | None = None,
+    ) -> float:
+        values = np.asarray(
+            getattr(rollout.trajectory, field),
+            dtype=np.float32,
+        )
+        if mask is not None:
+            values = values * mask
+        return float(values.sum())
+
+    def _rate(numerator: float, denominator: float) -> float:
+        if denominator <= 0.0:
+            return 0.0
+        return float(numerator / denominator)
+
+    offense_attempts = _trajectory_total(offense_rollout, "rebound_attempts")
+    defense_attempts = _trajectory_total(defense_rollout, "rebound_attempts")
+    learner_offensive_rebounds = _trajectory_total(
+        offense_rollout,
+        "offensive_rebounds",
+    )
+    learner_defensive_rebounds = _trajectory_total(
+        defense_rollout,
+        "defensive_rebounds",
+    )
+    offense_global_contests = _trajectory_total(
+        offense_rollout,
+        "rebound_global_contests",
+    )
+    defense_global_contests = _trajectory_total(
+        defense_rollout,
+        "rebound_global_contests",
+    )
+    learner_offensive_rebound_rate = _rate(
+        learner_offensive_rebounds,
+        offense_attempts,
+    )
+    learner_defensive_rebound_rate = _rate(
+        learner_defensive_rebounds,
+        defense_attempts,
+    )
+    learner_softmax_win_rate_offense = offense_diag[
+        "rebound_softmax_win_rate_offense"
+    ]
+    learner_softmax_win_rate_defense = defense_diag[
+        "rebound_softmax_win_rate_defense"
+    ]
+
+    metrics: dict[str, float | int] = {
+        "rebound_learner_offense_attempts": int(offense_attempts),
+        "rebound_learner_defense_attempts": int(defense_attempts),
+        "rebound_learner_offensive_rebounds": int(learner_offensive_rebounds),
+        "rebound_learner_defensive_rebounds": int(learner_defensive_rebounds),
+        "rebound_learner_offensive_rebound_rate": learner_offensive_rebound_rate,
+        "rebound_learner_defensive_rebound_rate": learner_defensive_rebound_rate,
+        "rebound_learner_avg_eligible_players_offense": offense_diag[
+            "rebound_avg_eligible_players_offense"
+        ],
+        "rebound_learner_avg_eligible_players_defense": defense_diag[
+            "rebound_avg_eligible_players_defense"
+        ],
+        "rebound_learner_avg_eligible_skill_offense": offense_diag[
+            "rebound_avg_eligible_skill_offense"
+        ],
+        "rebound_learner_avg_eligible_skill_defense": defense_diag[
+            "rebound_avg_eligible_skill_defense"
+        ],
+        "rebound_learner_avg_target_logit_offense": offense_diag[
+            "rebound_avg_target_logit_offense"
+        ],
+        "rebound_learner_avg_target_logit_defense": defense_diag[
+            "rebound_avg_target_logit_defense"
+        ],
+        "rebound_learner_avg_basket_logit_offense": offense_diag[
+            "rebound_avg_basket_logit_offense"
+        ],
+        "rebound_learner_avg_basket_logit_defense": defense_diag[
+            "rebound_avg_basket_logit_defense"
+        ],
+        "rebound_learner_avg_skill_logit_offense": offense_diag[
+            "rebound_avg_skill_logit_offense"
+        ],
+        "rebound_learner_avg_skill_logit_defense": defense_diag[
+            "rebound_avg_skill_logit_defense"
+        ],
+        "rebound_learner_avg_total_logit_offense": offense_diag[
+            "rebound_avg_total_logit_offense"
+        ],
+        "rebound_learner_avg_total_logit_defense": defense_diag[
+            "rebound_avg_total_logit_defense"
+        ],
+        "rebound_learner_softmax_win_rate_offense": learner_softmax_win_rate_offense,
+        "rebound_learner_softmax_win_rate_defense": learner_softmax_win_rate_defense,
+        "rebound_learner_win_rate_gap_offense": (
+            learner_offensive_rebound_rate - learner_softmax_win_rate_offense
+        ),
+        "rebound_learner_win_rate_gap_defense": (
+            learner_defensive_rebound_rate - learner_softmax_win_rate_defense
+        ),
+        "rebound_global_contest_rate_offense": _rate(
+            offense_global_contests,
+            offense_attempts,
+        ),
+        "rebound_global_contest_rate_defense": _rate(
+            defense_global_contests,
+            defense_attempts,
+        ),
+        "rebound_local_learner_only_rate_offense": offense_diag[
+            "rebound_local_offense_only_rate"
+        ],
+        "rebound_local_learner_only_rate_defense": defense_diag[
+            "rebound_local_defense_only_rate"
+        ],
+        "rebound_local_opponent_only_rate_offense": offense_diag[
+            "rebound_local_defense_only_rate"
+        ],
+        "rebound_local_opponent_only_rate_defense": defense_diag[
+            "rebound_local_offense_only_rate"
+        ],
+    }
+    if not include_opponent_mode_split:
+        return metrics
+
+    def _append_opponent_mode_metrics(
+        rollout: RolloutOutput,
+        diagnostic_totals,
+        *,
+        deterministic: bool,
+        side: str,
+        mode: str,
+    ) -> None:
+        deterministic_steps = np.asarray(
+            rollout.trajectory.opponent_deterministic_episode,
+            dtype=np.float32,
+        ) > 0.5
+        mode_mask = deterministic_steps if deterministic else ~deterministic_steps
+        attempts = _trajectory_total(rollout, "rebound_attempts", mode_mask)
+        metrics[f"rebound_learner_{side}_attempts_vs_{mode}"] = int(attempts)
+        if attempts <= 0.0:
+            return
+
+        diagnostic_summary = summarize_rebound_diagnostics(diagnostic_totals)
+        if side == "offense":
+            rebound_field = "offensive_rebounds"
+            rebound_name = "offensive_rebounds"
+            rate_name = "offensive_rebound_rate"
+        else:
+            rebound_field = "defensive_rebounds"
+            rebound_name = "defensive_rebounds"
+            rate_name = "defensive_rebound_rate"
+        rebounds = _trajectory_total(rollout, rebound_field, mode_mask)
+        empirical_rate = _rate(rebounds, attempts)
+        softmax_rate = diagnostic_summary[f"rebound_softmax_win_rate_{side}"]
+
+        metrics.update(
+            {
+                f"rebound_learner_{rebound_name}_vs_{mode}": int(rebounds),
+                f"rebound_learner_{rate_name}_vs_{mode}": empirical_rate,
+                f"rebound_learner_avg_eligible_players_{side}_vs_{mode}": diagnostic_summary[
+                    f"rebound_avg_eligible_players_{side}"
+                ],
+                f"rebound_learner_avg_target_logit_{side}_vs_{mode}": diagnostic_summary[
+                    f"rebound_avg_target_logit_{side}"
+                ],
+                f"rebound_learner_avg_basket_logit_{side}_vs_{mode}": diagnostic_summary[
+                    f"rebound_avg_basket_logit_{side}"
+                ],
+                f"rebound_learner_avg_skill_logit_{side}_vs_{mode}": diagnostic_summary[
+                    f"rebound_avg_skill_logit_{side}"
+                ],
+                f"rebound_learner_avg_total_logit_{side}_vs_{mode}": diagnostic_summary[
+                    f"rebound_avg_total_logit_{side}"
+                ],
+                f"rebound_learner_softmax_win_rate_{side}_vs_{mode}": softmax_rate,
+                f"rebound_learner_win_rate_gap_{side}_vs_{mode}": (
+                    empirical_rate - softmax_rate
+                ),
+            }
+        )
+
+    for deterministic, mode, totals_field in (
+        (True, "argmax", "rebound_diagnostic_argmax_totals"),
+        (False, "sampled", "rebound_diagnostic_sampled_totals"),
+    ):
+        _append_opponent_mode_metrics(
+            offense_rollout,
+            getattr(offense_rollout, totals_field, None),
+            deterministic=deterministic,
+            side="offense",
+            mode=mode,
+        )
+        _append_opponent_mode_metrics(
+            defense_rollout,
+            getattr(defense_rollout, totals_field, None),
+            deterministic=deterministic,
+            side="defense",
+            mode=mode,
+        )
+    return metrics
 
 
 def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
@@ -431,6 +763,116 @@ def _maybe_apply_selector_segment_start(
     return jax.lax.cond(should_run, _enabled, _disabled, operand=None)
 
 
+def _maybe_apply_deterministic_selector_segment_start(
+    static,
+    state,
+    params,
+    flat_obs,
+    selector_multiselect_enabled,
+    completed_pass_boundary,
+    selector_min_play_steps,
+    jax,
+    jnp,
+    spec: ActorCriticSpec,
+):
+    metrics = _zero_selector_transition_metrics(state, jnp)
+    if not bool(spec.intent_selector_enabled):
+        return state, metrics
+
+    should_run = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & (static.training_role_flag > 0.0)
+    )
+
+    def _disabled(_):
+        return state, metrics
+
+    def _enabled(_):
+        batch_size = int(state.intent_index.shape[0])
+        neutral_context = {
+            "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
+            "intent_gate": jnp.zeros((batch_size,), dtype=jnp.float32),
+        }
+        selector_out = actor_critic_forward(
+            params,
+            flat_obs,
+            spec,
+            jnp,
+            intent_context=neutral_context,
+        )
+        logits = selector_out["selector_logits"]
+        probs = jax.nn.softmax(logits, axis=-1)
+        chosen_intent = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        chosen_log_prob = jnp.log(
+            jnp.maximum(
+                jnp.take_along_axis(probs, chosen_intent[:, None], axis=-1)[:, 0],
+                1.0e-8,
+            )
+        )
+        entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1.0e-8)), axis=-1)
+        active_episode = ~state.episode_ended.astype(jnp.bool_)
+        (
+            episode_start,
+            commitment_timeout,
+            completed_pass,
+            used,
+            applied,
+            fallback_used,
+        ) = _selector_segment_application_masks(
+            state,
+            alpha_used=active_episode,
+            multiselect_enabled=jnp.asarray(selector_multiselect_enabled).astype(jnp.bool_),
+            completed_pass_boundary=completed_pass_boundary,
+            selector_min_play_steps=selector_min_play_steps,
+            jnp=jnp,
+        )
+        selected_state = set_offense_intent_state_batch(
+            static,
+            state,
+            chosen_intent,
+            jnp.ones((batch_size,), dtype=jnp.int8),
+            jnp,
+        )
+        next_state = _where_state(applied, selected_state, state, jnp)
+        return next_state, {
+            "selector_used": used.astype(jnp.int8),
+            "selector_applied": applied.astype(jnp.int8),
+            "selector_fallback_used": fallback_used.astype(jnp.int8),
+            "selector_boundary_episode_start": (applied & episode_start).astype(jnp.int8),
+            "selector_boundary_commitment_timeout": (applied & commitment_timeout).astype(jnp.int8),
+            "selector_boundary_completed_pass": (
+                applied & completed_pass & (~commitment_timeout)
+            ).astype(jnp.int8),
+            "selector_intent_index": jnp.where(
+                used,
+                chosen_intent,
+                jnp.asarray(-1, dtype=jnp.int32),
+            ),
+            "selector_old_log_prob": jnp.where(
+                used,
+                chosen_log_prob,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            "selector_value": jnp.where(
+                used,
+                selector_out["selector_values"],
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            "selector_entropy": jnp.where(
+                used,
+                entropy,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            "selector_max_prob": jnp.where(
+                used,
+                jnp.max(probs, axis=-1),
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+        }
+
+    return jax.lax.cond(should_run, _enabled, _disabled, operand=None)
+
+
 def _compute_final_selector_values(params, flat_obs, spec: ActorCriticSpec, jnp):
     if not bool(spec.intent_selector_enabled):
         return jnp.zeros((flat_obs.shape[0],), dtype=jnp.float32)
@@ -472,7 +914,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
         n_players = int(static.role_encoding.shape[0])
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary = carry
+            state, key, completed_pass_boundary, rebound_diagnostic_totals = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key = jax.random.split(key, 6)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
@@ -622,15 +1064,30 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 )
                 & (~env_out.done.astype(jnp.bool_))
             )
-            return (next_state, key, next_completed_pass_boundary), transition
+            next_rebound_diagnostic_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_totals,
+                env_out.rebound_diagnostics,
+                active_step,
+                jnp,
+            )
+            return (next_state, key, next_completed_pass_boundary, next_rebound_diagnostic_totals), transition
 
         initial_completed_pass_boundary = jnp.zeros(
             (int(initial_state.positions.shape[0]),),
             dtype=jnp.bool_,
         )
-        (final_state, _, _), trajectory = jax.lax.scan(
+        initial_rebound_diagnostic_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        (final_state, _, _, rebound_diagnostic_totals), trajectory = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key, initial_completed_pass_boundary),
+            (
+                initial_state,
+                rollout_key,
+                initial_completed_pass_boundary,
+                initial_rebound_diagnostic_totals,
+            ),
             xs=None,
             length=int(horizon),
         )
@@ -663,6 +1120,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            rebound_diagnostic_totals=rebound_diagnostic_totals,
         )
 
     return jax.jit(_runner, static_argnums=(4,))
@@ -693,7 +1151,15 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         )
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary, opponent_deterministic_episode = carry
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                opponent_deterministic_episode,
+                rebound_diagnostic_totals,
+                rebound_diagnostic_argmax_totals,
+                rebound_diagnostic_sampled_totals,
+            ) = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key, opponent_det_key = jax.random.split(key, 7)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
@@ -879,11 +1345,32 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 )
                 & (~env_out.done.astype(jnp.bool_))
             )
+            next_rebound_diagnostic_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_totals,
+                env_out.rebound_diagnostics,
+                active_step,
+                jnp,
+            )
+            next_rebound_diagnostic_argmax_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_argmax_totals,
+                env_out.rebound_diagnostics,
+                active_step & opponent_deterministic_episode,
+                jnp,
+            )
+            next_rebound_diagnostic_sampled_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_sampled_totals,
+                env_out.rebound_diagnostics,
+                active_step & (~opponent_deterministic_episode),
+                jnp,
+            )
             return (
                 next_state,
                 key,
                 next_completed_pass_boundary,
                 next_opponent_deterministic_episode,
+                next_rebound_diagnostic_totals,
+                next_rebound_diagnostic_argmax_totals,
+                next_rebound_diagnostic_sampled_totals,
             ), transition
 
         scan_key, opponent_det_init_key = jax.random.split(rollout_key)
@@ -896,13 +1383,36 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             opponent_deterministic_episode_prob,
             (batch_size,),
         )
-        (final_state, _, _, _), trajectory = jax.lax.scan(
+        initial_rebound_diagnostic_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        initial_rebound_diagnostic_argmax_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        initial_rebound_diagnostic_sampled_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        (
+            final_state,
+            _,
+            _,
+            _,
+            rebound_diagnostic_totals,
+            rebound_diagnostic_argmax_totals,
+            rebound_diagnostic_sampled_totals,
+        ), trajectory = jax.lax.scan(
             _scan_step,
             (
                 initial_state,
                 scan_key,
                 initial_completed_pass_boundary,
                 initial_opponent_deterministic_episode,
+                initial_rebound_diagnostic_totals,
+                initial_rebound_diagnostic_argmax_totals,
+                initial_rebound_diagnostic_sampled_totals,
             ),
             xs=None,
             length=int(horizon),
@@ -936,6 +1446,9 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            rebound_diagnostic_totals=rebound_diagnostic_totals,
+            rebound_diagnostic_argmax_totals=rebound_diagnostic_argmax_totals,
+            rebound_diagnostic_sampled_totals=rebound_diagnostic_sampled_totals,
         )
 
     return jax.jit(_runner, static_argnums=(5,))
@@ -1020,10 +1533,18 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     batch_size,
                     int(spec.training_player_count),
                 ),
-            )
+        )
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary, opponent_deterministic_episode = carry
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                opponent_deterministic_episode,
+                rebound_diagnostic_totals,
+                rebound_diagnostic_argmax_totals,
+                rebound_diagnostic_sampled_totals,
+            ) = carry
             key, selector_key, policy_key, opponent_key, env_key, reset_key, opponent_det_key = jax.random.split(key, 7)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
@@ -1205,11 +1726,32 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 )
                 & (~env_out.done.astype(jnp.bool_))
             )
+            next_rebound_diagnostic_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_totals,
+                env_out.rebound_diagnostics,
+                active_step,
+                jnp,
+            )
+            next_rebound_diagnostic_argmax_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_argmax_totals,
+                env_out.rebound_diagnostics,
+                active_step & opponent_deterministic_episode,
+                jnp,
+            )
+            next_rebound_diagnostic_sampled_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_diagnostic_sampled_totals,
+                env_out.rebound_diagnostics,
+                active_step & (~opponent_deterministic_episode),
+                jnp,
+            )
             return (
                 next_state,
                 key,
                 next_completed_pass_boundary,
                 next_opponent_deterministic_episode,
+                next_rebound_diagnostic_totals,
+                next_rebound_diagnostic_argmax_totals,
+                next_rebound_diagnostic_sampled_totals,
             ), transition
 
         scan_key, opponent_det_init_key = jax.random.split(rollout_key)
@@ -1222,13 +1764,36 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             opponent_deterministic_episode_prob,
             (batch_size,),
         )
-        (final_state, _, _, _), trajectory = jax.lax.scan(
+        initial_rebound_diagnostic_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        initial_rebound_diagnostic_argmax_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        initial_rebound_diagnostic_sampled_totals = zero_rebound_diagnostic_totals_like(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp,
+        )
+        (
+            final_state,
+            _,
+            _,
+            _,
+            rebound_diagnostic_totals,
+            rebound_diagnostic_argmax_totals,
+            rebound_diagnostic_sampled_totals,
+        ), trajectory = jax.lax.scan(
             _scan_step,
             (
                 initial_state,
                 scan_key,
                 initial_completed_pass_boundary,
                 initial_opponent_deterministic_episode,
+                initial_rebound_diagnostic_totals,
+                initial_rebound_diagnostic_argmax_totals,
+                initial_rebound_diagnostic_sampled_totals,
             ),
             xs=None,
             length=int(horizon),
@@ -1262,6 +1827,9 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            rebound_diagnostic_totals=rebound_diagnostic_totals,
+            rebound_diagnostic_argmax_totals=rebound_diagnostic_argmax_totals,
+            rebound_diagnostic_sampled_totals=rebound_diagnostic_sampled_totals,
         )
 
     return jax.jit(_runner, static_argnums=(5, 6))
@@ -1622,6 +2190,380 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
         return final_state, trace
 
     return jax.jit(_runner, static_argnums=(5, 6))
+
+
+def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
+    """Build fixed-seed, same-policy, argmax-vs-argmax deploy evaluation."""
+
+    def _runner(
+        static,
+        initial_state,
+        params,
+        rollout_key,
+        horizon: int,
+        selector_multiselect_enabled: bool,
+        selector_min_play_steps: int,
+    ):
+        offense_ids, defense_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        initial_totals = DeployEvalTotals(
+            *([zero] * len(DeployEvalTotals._fields))
+        )
+        initial_rebound_totals = zero_rebound_diagnostic_totals_like(zero, jnp)
+        initial_boundary = jnp.zeros(
+            initial_state.episode_ended.shape,
+            dtype=jnp.bool_,
+        )
+
+        def _scan_step(carry, _):
+            state, key, completed_boundary, totals, rebound_totals = carry
+            key, env_key = jax.random.split(key, 2)
+            active_step = ~state.episode_ended.astype(jnp.bool_)
+            selector_obs = build_policy_observation_batch(
+                static,
+                state,
+                jnp,
+                model_type=spec.model_type,
+            )
+            state, selector_metrics = _maybe_apply_deterministic_selector_segment_start(
+                static,
+                state,
+                params,
+                selector_obs,
+                selector_multiselect_enabled,
+                completed_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            offense_action_mask = full_action_mask[:, offense_ids, :]
+            defense_action_mask = full_action_mask[:, defense_ids, :]
+            offense_obs = build_policy_observation_batch(
+                static,
+                state,
+                jnp,
+                model_type=spec.model_type,
+            )
+            defense_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                -static.training_role_flag,
+                jnp,
+                model_type=spec.model_type,
+            )
+            offense_forward = actor_critic_forward(
+                params,
+                offense_obs,
+                spec,
+                jnp,
+                intent_context=build_policy_intent_context_batch(static, state, jnp),
+            )
+            defense_forward = actor_critic_forward(
+                params,
+                defense_obs,
+                spec,
+                jnp,
+                intent_context=build_policy_intent_context_batch_with_role_flag(
+                    static,
+                    state,
+                    -static.training_role_flag,
+                    jnp,
+                ),
+            )
+            offense_masked = apply_action_mask(
+                offense_forward["flat_policy_logits"],
+                offense_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            defense_masked = apply_action_mask(
+                defense_forward["flat_policy_logits"],
+                defense_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            full_actions = assemble_full_actions_jax(
+                offense_masked["deterministic_actions"],
+                defense_masked["deterministic_actions"],
+                offense_ids,
+                defense_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+
+            def _active_sum(value):
+                value = jnp.asarray(value, dtype=jnp.float32)
+                return jnp.sum(jnp.where(active_step, value, jnp.zeros_like(value)))
+
+            step_totals = DeployEvalTotals(
+                active_steps=jnp.sum(active_step.astype(jnp.float32)),
+                completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
+                offense_reward=_active_sum(jnp.sum(env_out.rewards[:, offense_ids], axis=1)),
+                defense_reward=_active_sum(jnp.sum(env_out.rewards[:, defense_ids], axis=1)),
+                pass_attempts=_active_sum(env_out.pass_attempt),
+                completed_passes=_active_sum(env_out.completed_pass),
+                assists=_active_sum(env_out.assist),
+                turnovers=_active_sum(env_out.turnover),
+                turnover_pass_out_of_bounds=_active_sum(
+                    turnover_metrics["turnover_pass_out_of_bounds"]
+                ),
+                turnover_intercepted=_active_sum(turnover_metrics["turnover_intercepted"]),
+                turnover_defender_pressure=_active_sum(
+                    turnover_metrics["turnover_defender_pressure"]
+                ),
+                turnover_move_out_of_bounds=_active_sum(
+                    turnover_metrics["turnover_move_out_of_bounds"]
+                ),
+                turnover_shot_clock=_active_sum(turnover_metrics["turnover_shot_clock"]),
+                turnover_offensive_three_seconds=_active_sum(
+                    turnover_metrics["turnover_offensive_three_seconds"]
+                ),
+                shot_attempts=_active_sum(shot_metrics["shot_attempts"]),
+                shot_makes=_active_sum(shot_metrics["shot_makes"]),
+                shot_dunks=_active_sum(shot_metrics["shot_dunks"]),
+                shot_twos=_active_sum(shot_metrics["shot_twos"]),
+                shot_threes=_active_sum(shot_metrics["shot_threes"]),
+                rebound_attempts=_active_sum(env_out.rebound_attempt),
+                offensive_rebounds=_active_sum(env_out.offensive_rebound),
+                defensive_rebounds=_active_sum(env_out.defensive_rebound),
+                rebound_global_contests=_active_sum(env_out.rebound_global_contest),
+                shot_clock_reset_14=_active_sum(env_out.shot_clock_reset_14),
+                rebound_reward_advance_count=_active_sum(
+                    jnp.abs(env_out.rebound_reward_advance) > 0.0
+                ),
+                rebound_reward_advance_total=_active_sum(env_out.rebound_reward_advance),
+                rebound_reward_settlement_total=_active_sum(
+                    env_out.rebound_reward_settlement
+                ),
+                offensive_three_seconds=_active_sum(env_out.offensive_three_seconds),
+                defensive_lane_violations=_active_sum(env_out.defensive_lane_violation),
+                selector_applied=_active_sum(selector_metrics["selector_applied"]),
+                selector_boundary_episode_start=_active_sum(
+                    selector_metrics["selector_boundary_episode_start"]
+                ),
+                selector_boundary_commitment_timeout=_active_sum(
+                    selector_metrics["selector_boundary_commitment_timeout"]
+                ),
+                selector_boundary_completed_pass=_active_sum(
+                    selector_metrics["selector_boundary_completed_pass"]
+                ),
+            )
+            next_totals = DeployEvalTotals(
+                *(
+                    getattr(totals, field) + getattr(step_totals, field)
+                    for field in DeployEvalTotals._fields
+                )
+            )
+            next_rebound_totals = _accumulate_rebound_diagnostic_totals(
+                rebound_totals,
+                env_out.rebound_diagnostics,
+                active_step,
+                jnp,
+            )
+            next_completed_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & (
+                    env_out.completed_pass.astype(jnp.bool_)
+                    | env_out.offensive_rebound.astype(jnp.bool_)
+                )
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_boundary,
+                next_totals,
+                next_rebound_totals,
+            ), None
+
+        (final_state, _, _, totals, rebound_totals), _ = jax.lax.scan(
+            _scan_step,
+            (
+                initial_state,
+                rollout_key,
+                initial_boundary,
+                initial_totals,
+                initial_rebound_totals,
+            ),
+            xs=None,
+            length=int(horizon),
+        )
+        return DeployEvalOutput(
+            final_state=final_state,
+            totals=totals,
+            rebound_diagnostic_totals=rebound_totals,
+        )
+
+    return jax.jit(_runner, static_argnums=(4, 5, 6))
+
+
+def summarize_deploy_eval_outputs(
+    outputs: Sequence[DeployEvalOutput],
+    *,
+    batch_size: int,
+) -> dict[str, float | int]:
+    if not outputs:
+        raise ValueError("At least one deploy eval output is required.")
+
+    totals = {
+        field: float(
+            sum(
+                float(np.asarray(getattr(output.totals, field), dtype=np.float64))
+                for output in outputs
+            )
+        )
+        for field in DeployEvalTotals._fields
+    }
+    rebound_totals = ReboundDiagnosticTotals(
+        *(
+            sum(
+                float(
+                    np.asarray(
+                        getattr(output.rebound_diagnostic_totals, field),
+                        dtype=np.float64,
+                    )
+                )
+                for output in outputs
+            )
+            for field in ReboundDiagnosticTotals._fields
+        )
+    )
+    episode_count = int(len(outputs) * int(batch_size))
+    completed_episode_count = int(
+        sum(
+            int(np.asarray(output.final_state.episode_ended, dtype=np.int32).sum())
+            for output in outputs
+        )
+    )
+    offense_score = float(
+        sum(
+            float(np.asarray(output.final_state.offense_score, dtype=np.float64).sum())
+            for output in outputs
+        )
+    )
+    defense_score = float(
+        sum(
+            float(np.asarray(output.final_state.defense_score, dtype=np.float64).sum())
+            for output in outputs
+        )
+    )
+
+    def _rate(numerator: float, denominator: float) -> float:
+        return float(numerator / denominator) if denominator > 0.0 else 0.0
+
+    def _per_episode(value: float) -> float:
+        return _rate(value, float(episode_count))
+
+    rebound_attempts = totals["rebound_attempts"]
+    offensive_rebound_rate = _rate(totals["offensive_rebounds"], rebound_attempts)
+    defensive_rebound_rate = _rate(totals["defensive_rebounds"], rebound_attempts)
+    shot_attempts = totals["shot_attempts"]
+    pass_attempts = totals["pass_attempts"]
+    turnovers = totals["turnovers"]
+    metrics: dict[str, float | int] = {
+        "batch_count": int(len(outputs)),
+        "batch_size": int(batch_size),
+        "episode_count": episode_count,
+        "completed_episode_count": completed_episode_count,
+        "truncated_episode_count": int(episode_count - completed_episode_count),
+        "completion_rate": _rate(completed_episode_count, episode_count),
+        "active_step_count": int(totals["active_steps"]),
+        "mean_steps_per_episode": _per_episode(totals["active_steps"]),
+        "mean_completed_episode_length": _rate(
+            totals["completed_episode_steps"],
+            completed_episode_count,
+        ),
+        "mean_offense_reward_per_episode": _per_episode(totals["offense_reward"]),
+        "mean_defense_reward_per_episode": _per_episode(totals["defense_reward"]),
+        "mean_offense_score": _per_episode(offense_score),
+        "mean_defense_score": _per_episode(defense_score),
+        "mean_score_margin": _per_episode(offense_score - defense_score),
+        "pass_attempts": int(pass_attempts),
+        "completed_passes": int(totals["completed_passes"]),
+        "assists": int(totals["assists"]),
+        "pass_completion_rate": _rate(totals["completed_passes"], pass_attempts),
+        "assist_per_completed_pass_rate": _rate(
+            totals["assists"], totals["completed_passes"]
+        ),
+        "passes_per_episode": _per_episode(pass_attempts),
+        "completed_passes_per_episode": _per_episode(totals["completed_passes"]),
+        "assists_per_episode": _per_episode(totals["assists"]),
+        "turnovers": int(turnovers),
+        "turnovers_per_episode": _per_episode(turnovers),
+        "shot_attempts": int(shot_attempts),
+        "shot_makes": int(totals["shot_makes"]),
+        "shot_make_rate": _rate(totals["shot_makes"], shot_attempts),
+        "shot_dunk_attempts": int(totals["shot_dunks"]),
+        "shot_two_attempts": int(totals["shot_twos"]),
+        "shot_three_attempts": int(totals["shot_threes"]),
+        "shot_dunk_share": _rate(totals["shot_dunks"], shot_attempts),
+        "shot_two_share": _rate(totals["shot_twos"], shot_attempts),
+        "shot_three_share": _rate(totals["shot_threes"], shot_attempts),
+        "shots_per_episode": _per_episode(shot_attempts),
+        "rebound_attempts": int(rebound_attempts),
+        "offensive_rebounds": int(totals["offensive_rebounds"]),
+        "defensive_rebounds": int(totals["defensive_rebounds"]),
+        "offensive_rebound_rate": offensive_rebound_rate,
+        "defensive_rebound_rate": defensive_rebound_rate,
+        "rebound_global_contest_count": int(totals["rebound_global_contests"]),
+        "rebound_global_contest_rate": _rate(
+            totals["rebound_global_contests"], rebound_attempts
+        ),
+        "shot_clock_reset_14_count": int(totals["shot_clock_reset_14"]),
+        "rebound_reward_advance_count": int(totals["rebound_reward_advance_count"]),
+        "rebound_reward_advance_total": totals["rebound_reward_advance_total"],
+        "rebound_reward_settlement_total": totals["rebound_reward_settlement_total"],
+        "offensive_three_seconds": int(totals["offensive_three_seconds"]),
+        "defensive_lane_violations": int(totals["defensive_lane_violations"]),
+        "selector_applied_count": int(totals["selector_applied"]),
+        "selector_applied_per_episode": _per_episode(totals["selector_applied"]),
+        "selector_boundary_episode_start_count": int(
+            totals["selector_boundary_episode_start"]
+        ),
+        "selector_boundary_commitment_timeout_count": int(
+            totals["selector_boundary_commitment_timeout"]
+        ),
+        "selector_boundary_completed_pass_count": int(
+            totals["selector_boundary_completed_pass"]
+        ),
+    }
+    reason_fields = {
+        "pass_out_of_bounds": "turnover_pass_out_of_bounds",
+        "intercepted": "turnover_intercepted",
+        "defender_pressure": "turnover_defender_pressure",
+        "move_out_of_bounds": "turnover_move_out_of_bounds",
+        "shot_clock": "turnover_shot_clock",
+        "offensive_three_seconds": "turnover_offensive_three_seconds",
+    }
+    for reason, field in reason_fields.items():
+        metrics[f"turnover_{reason}_count"] = int(totals[field])
+        metrics[f"turnover_{reason}_share"] = _rate(totals[field], turnovers)
+
+    metrics.update(summarize_rebound_diagnostics(rebound_totals))
+    metrics["rebound_softmax_empirical_gap_offense"] = float(
+        offensive_rebound_rate - metrics["rebound_softmax_win_rate_offense"]
+    )
+    metrics["rebound_softmax_empirical_gap_defense"] = float(
+        defensive_rebound_rate - metrics["rebound_softmax_win_rate_defense"]
+    )
+    return metrics
 
 
 def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_config: TrainerConfig):

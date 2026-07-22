@@ -4926,6 +4926,14 @@ const postOrbOffenseValue = computed(() => Number(statsState.value?.rebounds?.po
 const avgPostOrbOffenseValue = computed(() => safeDiv(postOrbOffenseValue.value, postOrbValueSampleCount.value));
 const postOrbDefenseValue = computed(() => Number(statsState.value?.rebounds?.postOrbDefenseValue || 0));
 const avgPostOrbDefenseValue = computed(() => safeDiv(postOrbDefenseValue.value, postOrbValueSampleCount.value));
+const postOrbShapedReturnSampleCount = computed(() => Number(statsState.value?.rebounds?.postOrbShapedReturnSamples || 0));
+const postOrbConsensusShapedReturn = computed(() => Number(statsState.value?.rebounds?.postOrbConsensusShapedReturn || 0));
+const avgPostOrbConsensusShapedReturn = computed(() => safeDiv(postOrbConsensusShapedReturn.value, postOrbShapedReturnSampleCount.value));
+const postOrbOffenseShapedReturn = computed(() => Number(statsState.value?.rebounds?.postOrbOffenseShapedReturn || 0));
+const avgPostOrbOffenseShapedReturn = computed(() => safeDiv(postOrbOffenseShapedReturn.value, postOrbShapedReturnSampleCount.value));
+const postOrbDefenseShapedReturn = computed(() => Number(statsState.value?.rebounds?.postOrbDefenseShapedReturn || 0));
+const avgPostOrbDefenseShapedReturn = computed(() => safeDiv(postOrbDefenseShapedReturn.value, postOrbShapedReturnSampleCount.value));
+const postOrbCriticReturnGap = computed(() => avgPostOrbConsensusValue.value - avgPostOrbConsensusShapedReturn.value);
 const valueDiag = computed(() => statsState.value?.valueDiagnostics || {});
 const valueDiagSampleCount = computed(() => Number(valueDiag.value?.sample_count || 0));
 const valueDiagSource = computed(() => (valueDiagSampleCount.value > 0 ? 'native JAX eval' : 'unavailable'));
@@ -4934,6 +4942,9 @@ const valueDiagRows = computed(() => [
   { key: 'sample_count', label: 'Value samples', value: String(valueDiagSampleCount.value) },
   { key: 'completed_episode_count', label: 'Completed episodes', value: String(Number(valueDiag.value?.completed_episode_count || 0)) },
   { key: 'discount_gamma', label: 'Gamma', value: formatDebugNumber(valueDiag.value?.discount_gamma, 3) },
+  { key: 'task_reward_scale', label: 'Task reward scale', value: formatDebugNumber(valueDiag.value?.task_reward_scale, 3) },
+  { key: 'phi_beta', label: 'Phi beta', value: formatDebugNumber(valueDiag.value?.phi_beta, 3) },
+  { key: 'includes_training_intent_bonus', label: 'Eval return includes intent bonus', value: valueDiag.value?.includes_training_intent_bonus ? 'Yes' : 'No' },
   { key: 'offense_value_mean', label: 'Mean Vo', value: formatDebugNumber(valueDiag.value?.offense_value_mean, 3) },
   { key: 'defense_value_mean', label: 'Mean Vd', value: formatDebugNumber(valueDiag.value?.defense_value_mean, 3) },
   { key: 'value_sum_mean', label: 'Mean Vo+Vd', value: formatDebugNumber(valueDiag.value?.value_sum_mean, 3) },
@@ -4976,6 +4987,10 @@ function ensureStatsDiagnosticFields(target) {
   target.rebounds.postOrbConsensusValue = Number(target.rebounds.postOrbConsensusValue || 0);
   target.rebounds.postOrbOffenseValue = Number(target.rebounds.postOrbOffenseValue || 0);
   target.rebounds.postOrbDefenseValue = Number(target.rebounds.postOrbDefenseValue || 0);
+  target.rebounds.postOrbShapedReturnSamples = Number(target.rebounds.postOrbShapedReturnSamples || 0);
+  target.rebounds.postOrbConsensusShapedReturn = Number(target.rebounds.postOrbConsensusShapedReturn || 0);
+  target.rebounds.postOrbOffenseShapedReturn = Number(target.rebounds.postOrbOffenseShapedReturn || 0);
+  target.rebounds.postOrbDefenseShapedReturn = Number(target.rebounds.postOrbDefenseShapedReturn || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -5096,6 +5111,10 @@ function addReboundStats(target, results) {
       postOrbConsensusValue: 0,
       postOrbOffenseValue: 0,
       postOrbDefenseValue: 0,
+      postOrbShapedReturnSamples: 0,
+      postOrbConsensusShapedReturn: 0,
+      postOrbOffenseShapedReturn: 0,
+      postOrbDefenseShapedReturn: 0,
     };
   }
   target.rebounds.targetDistanceSumOffense = Number(target.rebounds.targetDistanceSumOffense || 0);
@@ -5107,6 +5126,10 @@ function addReboundStats(target, results) {
   target.rebounds.postOrbConsensusValue = Number(target.rebounds.postOrbConsensusValue || 0);
   target.rebounds.postOrbOffenseValue = Number(target.rebounds.postOrbOffenseValue || 0);
   target.rebounds.postOrbDefenseValue = Number(target.rebounds.postOrbDefenseValue || 0);
+  target.rebounds.postOrbShapedReturnSamples = Number(target.rebounds.postOrbShapedReturnSamples || 0);
+  target.rebounds.postOrbConsensusShapedReturn = Number(target.rebounds.postOrbConsensusShapedReturn || 0);
+  target.rebounds.postOrbOffenseShapedReturn = Number(target.rebounds.postOrbOffenseShapedReturn || 0);
+  target.rebounds.postOrbDefenseShapedReturn = Number(target.rebounds.postOrbDefenseShapedReturn || 0);
   if (!target.rebounds.byPlayer || typeof target.rebounds.byPlayer !== 'object') {
     target.rebounds.byPlayer = {};
   }
@@ -5908,6 +5931,38 @@ function applyEvaluationStats(
     const diagPostOrbDefenseValue = Number.isFinite(nativePostOrbDefenseValueAvg) && diagPostOrbValueSamples > 0
       ? nativePostOrbDefenseValueAvg * diagPostOrbValueSamples
       : Number(next.rebounds?.postOrbDefenseValue || 0);
+    const nativePostOrbShapedReturnSamples = Number(nativeSummary.post_orb_shaped_return_sample_count);
+    const nativePostOrbConsensusShapedReturn = Number(nativeSummary.post_orb_consensus_shaped_return_total);
+    const nativePostOrbOffenseShapedReturnAvg = Number(nativeSummary.post_orb_offense_shaped_return_per_sample);
+    const nativePostOrbDefenseShapedReturnAvg = Number(nativeSummary.post_orb_defense_shaped_return_per_sample);
+    const rbPostOrbShapedReturnSamples = Number(rbDiag.post_orb_shaped_return_samples);
+    const rbPostOrbConsensusShapedReturn = Number(rbDiag.post_orb_consensus_shaped_return_sum);
+    const rbPostOrbOffenseShapedReturn = Number(rbDiag.post_orb_offense_shaped_return_sum);
+    const rbPostOrbDefenseShapedReturn = Number(rbDiag.post_orb_defense_shaped_return_sum);
+    const diagPostOrbShapedReturnSamples = Number.isFinite(nativePostOrbShapedReturnSamples)
+      && nativePostOrbShapedReturnSamples > 0
+      ? nativePostOrbShapedReturnSamples
+      : (Number.isFinite(rbPostOrbShapedReturnSamples)
+        ? rbPostOrbShapedReturnSamples
+        : Number(next.rebounds?.postOrbShapedReturnSamples || 0));
+    const diagPostOrbConsensusShapedReturn = Number.isFinite(nativePostOrbConsensusShapedReturn)
+      && diagPostOrbShapedReturnSamples > 0
+      ? nativePostOrbConsensusShapedReturn
+      : (Number.isFinite(rbPostOrbConsensusShapedReturn)
+        ? rbPostOrbConsensusShapedReturn
+        : Number(next.rebounds?.postOrbConsensusShapedReturn || 0));
+    const diagPostOrbOffenseShapedReturn = Number.isFinite(nativePostOrbOffenseShapedReturnAvg)
+      && diagPostOrbShapedReturnSamples > 0
+      ? nativePostOrbOffenseShapedReturnAvg * diagPostOrbShapedReturnSamples
+      : (Number.isFinite(rbPostOrbOffenseShapedReturn)
+        ? rbPostOrbOffenseShapedReturn
+        : Number(next.rebounds?.postOrbOffenseShapedReturn || 0));
+    const diagPostOrbDefenseShapedReturn = Number.isFinite(nativePostOrbDefenseShapedReturnAvg)
+      && diagPostOrbShapedReturnSamples > 0
+      ? nativePostOrbDefenseShapedReturnAvg * diagPostOrbShapedReturnSamples
+      : (Number.isFinite(rbPostOrbDefenseShapedReturn)
+        ? rbPostOrbDefenseShapedReturn
+        : Number(next.rebounds?.postOrbDefenseShapedReturn || 0));
     const diagTargetDistanceSumOffense = useNativeTargetDistance
       ? (Number.isFinite(nativeOffTargetDistanceAvg) ? nativeOffTargetDistanceAvg * nativeTargetDistanceCount : Number(next.rebounds?.targetDistanceSumOffense || 0))
       : (useDiagTargetDistance && Number.isFinite(rbOffTargetDistanceSum)
@@ -5961,6 +6016,18 @@ function applyEvaluationStats(
       postOrbDefenseValue: Number.isFinite(diagPostOrbDefenseValue)
         ? diagPostOrbDefenseValue
         : Number(next.rebounds?.postOrbDefenseValue || 0),
+      postOrbShapedReturnSamples: Number.isFinite(diagPostOrbShapedReturnSamples)
+        ? Math.max(Number(next.rebounds?.postOrbShapedReturnSamples || 0), diagPostOrbShapedReturnSamples)
+        : Number(next.rebounds?.postOrbShapedReturnSamples || 0),
+      postOrbConsensusShapedReturn: Number.isFinite(diagPostOrbConsensusShapedReturn)
+        ? diagPostOrbConsensusShapedReturn
+        : Number(next.rebounds?.postOrbConsensusShapedReturn || 0),
+      postOrbOffenseShapedReturn: Number.isFinite(diagPostOrbOffenseShapedReturn)
+        ? diagPostOrbOffenseShapedReturn
+        : Number(next.rebounds?.postOrbOffenseShapedReturn || 0),
+      postOrbDefenseShapedReturn: Number.isFinite(diagPostOrbDefenseShapedReturn)
+        ? diagPostOrbDefenseShapedReturn
+        : Number(next.rebounds?.postOrbDefenseShapedReturn || 0),
     };
     const selectorStartCounts = selectorDiagRaw.episode_start_selection_counts || {};
     const selectorStartSource = Object.keys(selectorStartCounts).length > 0
@@ -6062,7 +6129,9 @@ async function copyStatsMarkdown() {
       ['Defensive rebounds', String(s.rebounds?.defensive || 0)],
       ['ORB%', overallOrbPct.value.toFixed(1) + '%'],
       ['Post-ORB points/sample', `${avgPostOrbPoints.value.toFixed(2)} (${postOrbPoints.value.toFixed(0)}/${postOrbSampleCount.value})`],
-      ['Post-ORB value/sample', `${avgPostOrbConsensusValue.value.toFixed(2)} (${postOrbConsensusValue.value.toFixed(1)}/${postOrbValueSampleCount.value})`],
+      ['Post-ORB shaped return/sample', `${avgPostOrbConsensusShapedReturn.value.toFixed(2)} (${postOrbConsensusShapedReturn.value.toFixed(1)}/${postOrbShapedReturnSampleCount.value})`],
+      ['Post-ORB critic value/sample', `${avgPostOrbConsensusValue.value.toFixed(2)} (${postOrbConsensusValue.value.toFixed(1)}/${postOrbValueSampleCount.value})`],
+      ['Post-ORB critic-return gap', postOrbCriticReturnGap.value.toFixed(2)],
       ['Shot clock violations', String(shotClockViolationCount.value)],
       ['Total violations', String((s.violations?.defensiveLane || 0) + (s.violations?.offensiveThreeSeconds || 0))],
       ['Illegal defense violations', String(s.violations?.defensiveLane || 0)],
@@ -8431,7 +8500,9 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Missed shots recovered by the defense, ending the possession."><span class="param-name">Defensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.defensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offensive rebound percentage: offensive rebounds divided by all resolved rebound chances."><span class="param-name">ORB%:</span><span class="param-value">{{ overallOrbPct.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Empirical continuation value after offensive rebounds: future points scored later in the same possession, averaged across offensive rebound continuation states. Multiple offensive rebounds in one possession each count as a separate continuation sample."><span class="param-name">Post-ORB points/sample:</span><span class="param-value">{{ postOrbSampleCount > 0 ? `${avgPostOrbPoints.toFixed(2)} (${postOrbPoints.toFixed(0)}/${postOrbSampleCount})` : 'N/A' }}</span></div>
-            <div class="param-item" data-tooltip="Critic-implied continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). This can be compared with empirical post-ORB points/sample."><span class="param-name">Post-ORB value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Realized discounted continuation return from the first decision state after an offensive rebound. It uses the shaped environment reward stream and current task-reward scale, including rebound settlement and phi shaping; training-only intent bonuses are excluded."><span class="param-name">Post-ORB shaped return/sample:</span><span class="param-value">{{ postOrbShapedReturnSampleCount > 0 ? `${avgPostOrbConsensusShapedReturn.toFixed(2)} (${postOrbConsensusShapedReturn.toFixed(1)}/${postOrbShapedReturnSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic-implied shaped continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). Compare this with post-ORB shaped return, not raw points."><span class="param-name">Post-ORB critic value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic consensus value minus realized shaped environment return. Values near zero indicate calibration to the environment reward stream; training-only intent bonuses can create a residual."><span class="param-name">Post-ORB critic-return gap:</span><span class="param-value">{{ postOrbValueSampleCount > 0 && postOrbShapedReturnSampleCount > 0 ? postOrbCriticReturnGap.toFixed(2) : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Resolved rebound attempts with valid target-cell distance diagnostics."><span class="param-name">Rebound target dist samples:</span><span class="param-value">{{ reboundTargetDistanceCount }}</span></div>
             <div class="param-item" data-tooltip="Average hex distance from offensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg OFF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgOffenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Average hex distance from defensive players to the sampled rebound target cell, averaged over rebound attempts. This uses the target cell, not the winning rebounder's cell."><span class="param-name">Avg DEF dist to rebound target:</span><span class="param-value">{{ reboundTargetDistanceCount > 0 ? avgDefenseReboundTargetDistance.toFixed(2) : 'N/A' }}</span></div>
@@ -8494,8 +8565,11 @@ function offenseSkillDeltaLabel(idx) {
             </div>
             <div class="param-item" data-tooltip="Average team-level softmax mass over rebound attempts. This is the model-implied expected ORB/DRB split before sampling."><span class="param-name">Softmax win mass:</span><span class="param-value">O {{ reboundAvgOffenseWinnerProb.toFixed(1) }}% / D {{ reboundAvgDefenseWinnerProb.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Empirical continuation value after offensive rebounds: future points scored later in the same possession, averaged across offensive rebound continuation states. Multiple offensive rebounds in one possession each count as a separate continuation sample."><span class="param-name">Post-ORB points/sample:</span><span class="param-value">{{ postOrbSampleCount > 0 ? `${avgPostOrbPoints.toFixed(2)} (${postOrbPoints.toFixed(0)}/${postOrbSampleCount})` : 'N/A' }}</span></div>
-            <div class="param-item" data-tooltip="Critic-implied continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). Parentheses show total consensus value divided by post-ORB value samples."><span class="param-name">Post-ORB value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
-            <div class="param-item" data-tooltip="Post-ORB raw critic values at the first decision state after offensive rebounds. These are useful for diagnosing whether Vo and Vd agree about continuation value."><span class="param-name">Post-ORB Vo/Vd:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbOffenseValue.toFixed(2)} / ${avgPostOrbDefenseValue.toFixed(2)}` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Realized discounted continuation return from the first decision state after an offensive rebound. It uses the shaped environment reward stream and current task-reward scale, including rebound settlement and phi shaping; training-only intent bonuses are excluded."><span class="param-name">Post-ORB shaped return/sample:</span><span class="param-value">{{ postOrbShapedReturnSampleCount > 0 ? `${avgPostOrbConsensusShapedReturn.toFixed(2)} (${postOrbConsensusShapedReturn.toFixed(1)}/${postOrbShapedReturnSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic-implied shaped continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). Compare this with post-ORB shaped return, not raw points."><span class="param-name">Post-ORB critic value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Critic consensus value minus realized shaped environment return. Values near zero indicate calibration to the environment reward stream; training-only intent bonuses can create a residual."><span class="param-name">Post-ORB critic-return gap:</span><span class="param-value">{{ postOrbValueSampleCount > 0 && postOrbShapedReturnSampleCount > 0 ? postOrbCriticReturnGap.toFixed(2) : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Post-ORB realized offense and defense shaped environment returns from the same continuation states. These should be approximately zero-sum."><span class="param-name">Post-ORB Ro/Rd:</span><span class="param-value">{{ postOrbShapedReturnSampleCount > 0 ? `${avgPostOrbOffenseShapedReturn.toFixed(2)} / ${avgPostOrbDefenseShapedReturn.toFixed(2)}` : 'N/A' }}</span></div>
+            <div class="param-item" data-tooltip="Post-ORB raw critic values at the first decision state after offensive rebounds. Compare Vo with Ro and Vd with Rd; the offense critic may additionally reflect its training-only intent bonus."><span class="param-name">Post-ORB Vo/Vd:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbOffenseValue.toFixed(2)} / ${avgPostOrbDefenseValue.toFixed(2)}` : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where both teams had at least one eligible player, divided by rebound attempts."><span class="param-name">Local mixed rate:</span><span class="param-value">{{ reboundLocalMixedRate.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where only offensive players were eligible, divided by rebound attempts."><span class="param-name">Local offense-only:</span><span class="param-value">{{ reboundLocalOffenseOnlyRate.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Local-contest rebound attempts where only defensive players were eligible, divided by rebound attempts."><span class="param-name">Local defense-only:</span><span class="param-value">{{ reboundLocalDefenseOnlyRate.toFixed(1) }}%</span></div>

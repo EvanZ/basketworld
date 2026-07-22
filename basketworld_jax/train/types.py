@@ -109,6 +109,9 @@ class RolloutOutput(NamedTuple):
     final_selector_values: Any
     final_flat_obs: Any
     final_action_mask: Any
+    rebound_diagnostic_totals: Any = None
+    rebound_diagnostic_argmax_totals: Any = None
+    rebound_diagnostic_sampled_totals: Any = None
 
 
 class PPOBatch(NamedTuple):
@@ -185,6 +188,48 @@ class EvalTrace(NamedTuple):
     terminal_episode_steps: Any
     offense_score: Any
     defense_score: Any
+
+
+class DeployEvalTotals(NamedTuple):
+    active_steps: Any
+    completed_episode_steps: Any
+    offense_reward: Any
+    defense_reward: Any
+    pass_attempts: Any
+    completed_passes: Any
+    assists: Any
+    turnovers: Any
+    turnover_pass_out_of_bounds: Any
+    turnover_intercepted: Any
+    turnover_defender_pressure: Any
+    turnover_move_out_of_bounds: Any
+    turnover_shot_clock: Any
+    turnover_offensive_three_seconds: Any
+    shot_attempts: Any
+    shot_makes: Any
+    shot_dunks: Any
+    shot_twos: Any
+    shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_global_contests: Any
+    shot_clock_reset_14: Any
+    rebound_reward_advance_count: Any
+    rebound_reward_advance_total: Any
+    rebound_reward_settlement_total: Any
+    offensive_three_seconds: Any
+    defensive_lane_violations: Any
+    selector_applied: Any
+    selector_boundary_episode_start: Any
+    selector_boundary_commitment_timeout: Any
+    selector_boundary_completed_pass: Any
+
+
+class DeployEvalOutput(NamedTuple):
+    final_state: Any
+    totals: DeployEvalTotals
+    rebound_diagnostic_totals: Any
 
 
 def compute_gae_and_returns(rewards, values, dones, bootstrap_values, *, gamma: float, gae_lambda: float, jax, jnp):
