@@ -97,6 +97,7 @@ prompts/
 
 .vscode/
 .DS_Store
+/site/
 
 app/backend/episodes/
 # keep social preview asset in repo
