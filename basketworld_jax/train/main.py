@@ -35,8 +35,7 @@ from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.env import (
     PASS_ACTION_END,
     PASS_ACTION_START,
-    TOKEN_OBS_GLOBAL_DIM,
-    TOKEN_OBS_PLAYER_DIM,
+    token_observation_dims,
     build_action_masks_batch,
     build_policy_intent_context_batch,
     build_policy_observation_batch,
@@ -957,6 +956,26 @@ def parse_args(argv=None):
         help="Observation-only top-N rebound target approximation. Zero keeps exact full-table observation features.",
     )
     parser.add_argument(
+        "--rebound-win-prob-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add each player's conditional rebound-win probability and the global "
+            "conditional offensive-rebound probability to policy observations. "
+            "Disabled by default to preserve the current observation schema."
+        ),
+    )
+    parser.add_argument(
+        "--rebound-target-observation-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Expose expected rebound-target coordinates, target entropy, each player\x27s "
+            "distance to the expected target, and the rebound-specialist marker. "
+            "Disable for the skill-only rebound-observation ablation."
+        ),
+    )
+    parser.add_argument(
         "--offensive-rebound-shot-clock-reset",
         type=int,
         default=14,
@@ -987,6 +1006,27 @@ def parse_args(argv=None):
             "Advance rebound reward only on the first offensive rebound in a possession. "
             "Use --no-rebound-reward-once-per-possession to advance it on every ORB."
         ),
+    )
+    parser.add_argument(
+        "--rebound-critic-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable an auxiliary rebound-outcome critic and a masked PPO positioning "
+            "loss on actual rebound events; ordinary environment rewards are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--rebound-critic-policy-coef",
+        type=float,
+        default=0.05,
+        help="Weight for the masked rebound-positioning PPO auxiliary loss.",
+    )
+    parser.add_argument(
+        "--rebound-critic-value-coef",
+        type=float,
+        default=0.5,
+        help="Weight for the rebound-outcome critic regression loss.",
     )
     args = parser.parse_args(argv_list)
     if bool(getattr(args, "use_set_obs", False)):
@@ -1162,6 +1202,13 @@ def validate_train_args(args) -> None:
         getattr(args, "enable_rebounds", False)
     ):
         raise SystemExit("--enable-rebound-reward-redistribution requires --enable-rebounds.")
+    if bool(getattr(args, "rebound_critic_enabled", False)) and not bool(
+        getattr(args, "enable_rebounds", False)
+    ):
+        raise SystemExit("--rebound-critic-enabled requires --enable-rebounds.")
+    for key in ("rebound_critic_policy_coef", "rebound_critic_value_coef"):
+        if float(getattr(args, key, 0.0)) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
     rebound_terminal_reward_mode = str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points")
     if rebound_terminal_reward_mode not in {"actual_points", "last_shot_ep_on_defensive_rebound", "last_shot_ep"}:
         raise SystemExit(
@@ -1332,6 +1379,16 @@ def build_trainer_config(args) -> TrainerConfig:
         ppo_minibatches=int(args.ppo_minibatches),
         single_episode_rollouts=bool(getattr(args, "single_episode_rollouts", False)),
         ppo_completed_episodes_only=bool(getattr(args, "ppo_completed_episodes_only", False)),
+        rebound_critic_policy_coef=(
+            float(getattr(args, "rebound_critic_policy_coef", 0.0))
+            if bool(getattr(args, "rebound_critic_enabled", False))
+            else 0.0
+        ),
+        rebound_critic_value_coef=(
+            float(getattr(args, "rebound_critic_value_coef", 0.0))
+            if bool(getattr(args, "rebound_critic_enabled", False))
+            else 0.0
+        ),
     )
 
 
@@ -1510,6 +1567,12 @@ def _checkpoint_trainer_config_from_args(
         "rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
         "rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
         "rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
+        "rebound_win_prob_features": bool(
+            getattr(args, "rebound_win_prob_features", False)
+        ),
+        "rebound_target_observation_features": bool(
+            getattr(args, "rebound_target_observation_features", True)
+        ),
         "offensive_rebound_shot_clock_reset": int(
             getattr(args, "offensive_rebound_shot_clock_reset", 14)
         ),
@@ -1534,6 +1597,14 @@ def _policy_model_type(args) -> str:
 
 def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: np.ndarray) -> ActorCriticSpec:
     model_type = _policy_model_type(args)
+    rebound_win_prob_features = bool(getattr(args, "rebound_win_prob_features", False))
+    rebound_target_observation_features = bool(
+        getattr(args, "rebound_target_observation_features", True)
+    )
+    token_dim, global_dim = token_observation_dims(
+        rebound_win_prob_features,
+        rebound_target_observation_features,
+    )
     return build_actor_critic_spec(
         flat_obs_np,
         action_masks_np,
@@ -1544,8 +1615,8 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
             if model_type == "attention"
             else 0
         ),
-        token_dim=TOKEN_OBS_PLAYER_DIM if model_type == "attention" else 0,
-        global_dim=TOKEN_OBS_GLOBAL_DIM if model_type == "attention" else 0,
+        token_dim=token_dim if model_type == "attention" else 0,
+        global_dim=global_dim if model_type == "attention" else 0,
         attention_embed_dim=int(getattr(args, "attention_embed_dim", 64)),
         attention_num_heads=int(getattr(args, "attention_num_heads", 4)),
         attention_token_mlp_dim=int(getattr(args, "attention_token_mlp_dim", 64)),
@@ -1565,6 +1636,9 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
         num_intents=int(getattr(args, "num_intents", 8)),
         intent_selector_enabled=bool(getattr(args, "intent_selector_enabled", False)),
         intent_selector_hidden_dim=int(getattr(args, "intent_selector_hidden_dim", 64)),
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
+        rebound_critic_enabled=bool(getattr(args, "rebound_critic_enabled", False)),
     )
 
 
@@ -2335,6 +2409,12 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rebound_contest_mode": str(getattr(args, "rebound_contest_mode", "global_contest") or "global_contest"),
         "jax/rebound_contest_radius": int(getattr(args, "rebound_contest_radius", 1)),
         "jax/rebound_obs_top_n_targets": int(getattr(args, "rebound_obs_top_n_targets", 0)),
+        "jax/rebound_win_prob_features": bool(
+            getattr(args, "rebound_win_prob_features", False)
+        ),
+        "jax/rebound_target_observation_features": bool(
+            getattr(args, "rebound_target_observation_features", True)
+        ),
         "jax/rebound_terminal_reward_mode": str(getattr(args, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
         "jax/enable_rebound_reward_redistribution": bool(
             getattr(args, "enable_rebound_reward_redistribution", False)
@@ -2345,6 +2425,9 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rebound_reward_once_per_possession": bool(
             getattr(args, "rebound_reward_once_per_possession", True)
         ),
+        "jax/rebound_critic_enabled": bool(getattr(args, "rebound_critic_enabled", False)),
+        "jax/rebound_critic_policy_coef": float(trainer_config.rebound_critic_policy_coef),
+        "jax/rebound_critic_value_coef": float(trainer_config.rebound_critic_value_coef),
         "jax/task_reward_scale_start": (
             ""
             if getattr(args, "task_reward_scale_start", None) is None
@@ -3029,6 +3112,10 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
         rollout.trajectory.selector_boundary_completed_pass,
         dtype=bool,
     )
+    selector_boundary_offensive_rebound = np.asarray(
+        rollout.trajectory.selector_boundary_offensive_rebound,
+        dtype=bool,
+    )
     selector_intent_index = np.asarray(rollout.trajectory.selector_intent_index, dtype=np.int32)
     selector_entropy = np.asarray(rollout.trajectory.selector_entropy, dtype=np.float32)
     selector_max_prob = np.asarray(rollout.trajectory.selector_max_prob, dtype=np.float32)
@@ -3056,6 +3143,13 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
         "selector_boundary_completed_pass_count": int(selector_boundary_completed_pass.sum()),
         "selector_boundary_completed_pass_rate": _safe_metric_ratio(
             int(selector_boundary_completed_pass.sum()),
+            int(selector_applied.sum()),
+        ),
+        "selector_boundary_offensive_rebound_count": int(
+            selector_boundary_offensive_rebound.sum()
+        ),
+        "selector_boundary_offensive_rebound_rate": _safe_metric_ratio(
+            int(selector_boundary_offensive_rebound.sum()),
             int(selector_applied.sum()),
         ),
     }
@@ -3487,6 +3581,7 @@ def _print_checkpoint_summary(
         ("selector_fallback_count", metrics.get("selector_fallback_count")),
         ("selector_boundary_commitment_timeout_count", metrics.get("selector_boundary_commitment_timeout_count")),
         ("selector_boundary_completed_pass_count", metrics.get("selector_boundary_completed_pass_count")),
+        ("selector_boundary_offensive_rebound_count", metrics.get("selector_boundary_offensive_rebound_count")),
         ("selector_entropy", metrics.get("selector_entropy")),
         ("selector_max_prob", metrics.get("selector_max_prob")),
         ("selector_train_sample_count", metrics.get("selector_train_sample_count")),
@@ -3541,6 +3636,10 @@ def run_training_loop(args) -> dict[str, Any]:
         current_states["offense"],
         jnp,
         model_type=_policy_model_type(args),
+        rebound_win_prob_features=bool(getattr(args, "rebound_win_prob_features", False)),
+        rebound_target_observation_features=bool(
+            getattr(args, "rebound_target_observation_features", True)
+        ),
     )
     action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
@@ -4693,6 +4792,10 @@ def run_train_scaffold(args) -> dict[str, Any]:
         state,
         jnp,
         model_type=_policy_model_type(args),
+        rebound_win_prob_features=bool(getattr(args, "rebound_win_prob_features", False)),
+        rebound_target_observation_features=bool(
+            getattr(args, "rebound_target_observation_features", True)
+        ),
     )
     policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
     action_masks = build_action_masks_batch(static, state, jnp)[:, training_player_ids_jnp, :]

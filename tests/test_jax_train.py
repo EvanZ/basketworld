@@ -70,6 +70,23 @@ def test_trainer_parser_defaults_match_frozen_scope():
     assert args.eval_deploy_batches == 20
     assert args.eval_deploy_horizon == 128
     assert args.eval_deploy_seed == 2_000_000
+    assert args.rebound_win_prob_features is False
+    assert args.rebound_target_observation_features is True
+
+    assert args.rebound_critic_enabled is False
+    assert args.rebound_critic_policy_coef == 0.05
+    assert args.rebound_critic_value_coef == 0.5
+
+    critic_args = parse_args(["--rebound-critic-enabled"])
+    assert critic_args.rebound_critic_enabled is True
+    enabled_args = parse_args(["--rebound-win-prob-features"])
+    assert enabled_args.rebound_win_prob_features is True
+
+    explicitly_disabled_args = parse_args(["--no-rebound-win-prob-features"])
+    assert explicitly_disabled_args.rebound_win_prob_features is False
+
+    skill_only_args = parse_args(["--no-rebound-target-observation-features"])
+    assert skill_only_args.rebound_target_observation_features is False
 
 
 def test_deploy_eval_args_reject_invalid_values():
@@ -1236,6 +1253,7 @@ def test_multiselect_boundaries_do_not_apply_random_fallback_intents():
         _episode_start,
         commitment_timeout,
         completed_pass,
+        offensive_rebound,
         used,
         applied,
         fallback_used,
@@ -1244,15 +1262,51 @@ def test_multiselect_boundaries_do_not_apply_random_fallback_intents():
         alpha_used=jnp.asarray([False, False]),
         multiselect_enabled=jnp.asarray(True),
         completed_pass_boundary=jnp.asarray([False, True]),
+        offensive_rebound_boundary=jnp.asarray([False, False]),
         selector_min_play_steps=4,
         jnp=jnp,
     )
 
     np.testing.assert_array_equal(np.asarray(commitment_timeout), [True, False])
     np.testing.assert_array_equal(np.asarray(completed_pass), [False, True])
+    np.testing.assert_array_equal(np.asarray(offensive_rebound), [False, False])
     np.testing.assert_array_equal(np.asarray(used), [False, False])
     np.testing.assert_array_equal(np.asarray(applied), [False, False])
     np.testing.assert_array_equal(np.asarray(fallback_used), [False, False])
+
+
+def test_multiselect_classifies_offensive_rebound_boundary_separately():
+    jnp = pytest.importorskip("jax.numpy")
+
+    class State:
+        intent_active = jnp.asarray([1], dtype=jnp.int8)
+        intent_age = jnp.asarray([6], dtype=jnp.int32)
+        intent_commitment_remaining = jnp.asarray([2], dtype=jnp.int32)
+
+    (
+        _episode_start,
+        commitment_timeout,
+        completed_pass,
+        offensive_rebound,
+        used,
+        applied,
+        fallback_used,
+    ) = _selector_segment_application_masks(
+        State,
+        alpha_used=jnp.asarray([True]),
+        multiselect_enabled=jnp.asarray(True),
+        completed_pass_boundary=jnp.asarray([False]),
+        offensive_rebound_boundary=jnp.asarray([True]),
+        selector_min_play_steps=4,
+        jnp=jnp,
+    )
+
+    np.testing.assert_array_equal(np.asarray(commitment_timeout), [False])
+    np.testing.assert_array_equal(np.asarray(completed_pass), [False])
+    np.testing.assert_array_equal(np.asarray(offensive_rebound), [True])
+    np.testing.assert_array_equal(np.asarray(used), [True])
+    np.testing.assert_array_equal(np.asarray(applied), [True])
+    np.testing.assert_array_equal(np.asarray(fallback_used), [False])
 
 
 def test_build_trainer_config_uses_training_args():
@@ -1487,6 +1541,8 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "200",
             "--phi-blend-weight",
             "0.5",
+            "--rebound-win-prob-features",
+            "--no-rebound-target-observation-features",
         ]
     )
     validate_train_args(args)
@@ -1542,6 +1598,8 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/ent_coef_start"] == 0.02
     assert recorder.params["jax/ent_coef_end"] == 0.003
     assert recorder.params["jax/ent_schedule"] == "exp"
+    assert recorder.params["jax/rebound_win_prob_features"] is True
+    assert recorder.params["jax/rebound_target_observation_features"] is False
     assert recorder.params["jax/mlflow_metric_profile"] == "core"
 
 
@@ -1624,6 +1682,7 @@ def test_train_scaffold_supports_attention_policy_model():
             "--intent-embedding-enabled",
             "--intent-embedding-dim",
             "6",
+            "--rebound-win-prob-features",
             "--enable-intent-learning",
             "true",
             "--enable-defense-intent-learning",
@@ -1647,15 +1706,21 @@ def test_train_scaffold_supports_attention_policy_model():
     assert result["policy_spec"]["model_type"] == "attention"
     assert result["policy_spec"]["action_head_mode"] == "pointer_targeted"
     assert result["policy_spec"]["token_player_count"] == 6
-    assert result["policy_spec"]["token_dim"] == TOKEN_OBS_PLAYER_DIM
-    assert result["policy_spec"]["global_dim"] == TOKEN_OBS_GLOBAL_DIM
+    assert result["policy_spec"]["token_dim"] == TOKEN_OBS_PLAYER_DIM + 1
+    assert result["policy_spec"]["global_dim"] == TOKEN_OBS_GLOBAL_DIM + 1
+    assert result["policy_spec"]["rebound_win_prob_features"] is True
     assert result["policy_spec"]["attention_pi_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_vf_head_hidden_dims"] == (8, 8)
     assert result["policy_spec"]["attention_head_activation"] == "relu"
     assert result["policy_spec"]["intent_embedding_enabled"] is True
     assert result["policy_spec"]["intent_embedding_dim"] == 6
     assert result["trainer_config"]["ppo_minibatches"] == 2
-    token_obs_dim = (6 * TOKEN_OBS_PLAYER_DIM) + TOKEN_OBS_GLOBAL_DIM + TOKEN_OBS_ROLE_FLAG_DIM
+    token_obs_dim = (
+        (6 * (TOKEN_OBS_PLAYER_DIM + 1))
+        + TOKEN_OBS_GLOBAL_DIM
+        + 1
+        + TOKEN_OBS_ROLE_FLAG_DIM
+    )
     assert result["trajectory_spec"]["flat_obs_shape"] == [2, token_obs_dim]
     assert result["trajectory_spec"]["trajectory_flat_obs_shape"] == [2, 2, token_obs_dim]
     assert result["ppo_update_final_metrics"]["total_loss"] != 0.0

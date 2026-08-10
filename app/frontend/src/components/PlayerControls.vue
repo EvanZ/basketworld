@@ -4617,6 +4617,7 @@ const liveSelectorDebugSummary = computed(() => {
     commitmentSteps: debug.commitment_steps ?? 'N/A',
     eligibleBoundary: debug.eligible_boundary_reason || 'None',
     lastCompletedPassBoundary: debug.last_completed_pass_boundary === true ? 'Yes' : 'No',
+    lastOffensiveReboundBoundary: debug.last_offensive_rebound_boundary === true ? 'Yes' : 'No',
     completedPassMinStepsMet: debug.completed_pass_min_steps_met === true ? 'Yes' : debug.completed_pass_min_steps_met === false ? 'No' : 'N/A',
     completedPassMinStepsRemaining: debug.completed_pass_min_steps_remaining ?? 'N/A',
     lastTransitionSource: debug.last_transition_source || 'N/A',
@@ -7689,6 +7690,7 @@ const tokenFeatureReboundLabels = [
   'dist_to_expected_rebound_target',
   'rebound_skill',
   'rebound_skill_specialist',
+  'rebound_win_probability',
 ];
 const tokenGlobalBaseLabels = ['shot_clock', 'pressure_exposure', 'hoop_q_norm', 'hoop_r_norm'];
 const tokenGlobalIntentLabels = ['intent_index_norm', 'intent_active', 'intent_visible', 'intent_age_norm'];
@@ -7704,6 +7706,12 @@ const tokenFeatureLabels = computed(() => {
     return Math.max(acc, row.length);
   }, 0);
   if (maxLen <= 0) return tokenFeatureBaseLabels;
+  const provided = obsTokens.value?.players_labels;
+  if (Array.isArray(provided) && provided.length > 0) {
+    const labels = provided.slice(0, maxLen);
+    while (labels.length < maxLen) labels.push(`feature_`);
+    return labels;
+  }
   const labels = [...tokenFeatureBaseLabels];
   if (maxLen > labels.length) {
     const reboundTake = Math.min(tokenFeatureReboundLabels.length, maxLen - labels.length);
@@ -7723,7 +7731,21 @@ const tokenGlobals = computed(() => {
 const tokenGlobalLabels = computed(() => {
   const provided = obsTokens.value?.globals_labels;
   if (Array.isArray(provided) && provided.length > 0) {
-    return provided;
+    const labels = provided.slice(0, tokenGlobals.value.length);
+    const hasReboundWinProbability = tokenPlayers.value.some(
+      (row) => Array.isArray(row) && row.length > 18
+    );
+    if (
+      hasReboundWinProbability
+      && tokenGlobals.value.length > 7
+      && labels.length === 7
+    ) {
+      labels.push('offensive_rebound_probability');
+    }
+    while (labels.length < tokenGlobals.value.length) {
+      labels.push('global_' + labels.length);
+    }
+    return labels;
   }
   const labels = [...tokenGlobalBaseLabels];
   const extras = Math.max(0, tokenGlobals.value.length - labels.length);
@@ -7731,7 +7753,7 @@ const tokenGlobalLabels = computed(() => {
     const intentTake = Math.min(tokenGlobalIntentLabels.length, extras);
     labels.push(...tokenGlobalIntentLabels.slice(0, intentTake));
     for (let idx = intentTake; idx < extras; idx += 1) {
-      labels.push(`global_${tokenGlobalBaseLabels.length + idx}`);
+      labels.push('global_' + (tokenGlobalBaseLabels.length + idx));
     }
   }
   return labels;
@@ -9036,6 +9058,10 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Whether the previous executed step completed a pass and can be considered for pass-boundary reselection.">
               <span class="param-name">Completed-pass boundary:</span>
               <span class="param-value">{{ liveSelectorDebugSummary.lastCompletedPassBoundary }}</span>
+            </div>
+            <div class="param-item" data-tooltip="Whether the previous executed step produced an offensive rebound and can trigger play reselection after the minimum play age.">
+              <span class="param-name">Offensive-rebound boundary:</span>
+              <span class="param-value">{{ liveSelectorDebugSummary.lastOffensiveReboundBoundary }}</span>
             </div>
             <div class="param-item" data-tooltip="Whether that completed-pass boundary has reached the configured minimum play age and can trigger selector reselection now.">
               <span class="param-name">Pass min met:</span>

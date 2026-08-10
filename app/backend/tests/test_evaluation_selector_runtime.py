@@ -2,7 +2,30 @@ import numpy as np
 import torch
 
 import app.backend.evaluation as backend_evaluation
+from app.backend.selector_runtime import selector_segment_boundary_reason
 from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv, Team
+
+
+
+def test_selector_runtime_classifies_offensive_rebound_boundary():
+    info = {
+        "action_results": {
+            "rebounds": [{"offensive": True, "winner": 2}],
+        }
+    }
+
+    assert (
+        selector_segment_boundary_reason(
+            {
+                "intent_selector_multiselect_enabled": True,
+                "intent_selector_min_play_steps": 3,
+            },
+            segment_length=3,
+            info=info,
+            intent_commitment_steps=8,
+        )
+        == "offensive_rebound"
+    )
 
 
 class _DummySelectorPolicy:

@@ -14,6 +14,7 @@ from basketworld_jax.env.minimal import (
     build_shot_profile_batch,
     build_token_observation_components_batch,
     reset_batch_minimal,
+    token_observation_dims,
     sample_state_batch,
 )
 from basketworld_jax.train.main import parse_args
@@ -53,6 +54,103 @@ def test_rebound_skill_reset_defaults_to_zero_and_obs_slots_exist():
     )
     assert players.shape[-1] == TOKEN_OBS_PLAYER_DIM == 18
     assert globals_vec.shape[-1] == TOKEN_OBS_GLOBAL_DIM == 7
+
+
+def test_skill_only_rebound_observation_schema_keeps_only_skill():
+    static, _ = _sample_static_state()
+    state = reset_batch_minimal(
+        static,
+        jnp.asarray(jax.random.split(jax.random.PRNGKey(3), 1)),
+        jax,
+        jnp,
+    )
+    state = state._replace(rebound_skill=jnp.full_like(state.rebound_skill, 0.37))
+
+    players, globals_vec, _role = build_token_observation_components_batch(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+        rebound_target_observation_features=False,
+    )
+
+    assert token_observation_dims(False, False) == (16, 4)
+    assert players.shape[-1] == 16
+    assert globals_vec.shape[-1] == 4
+    assert np.allclose(np.asarray(players)[..., 15], np.asarray(state.rebound_skill))
+
+
+def test_rebound_win_probability_features_are_opt_in_and_match_local_contest():
+    static, state = _sample_static_state([
+        "--rebound-contest-mode",
+        "local_contest",
+        "--rebound-contest-radius",
+        "0",
+    ])
+    coords = np.asarray(static.cell_coords, dtype=np.int32)
+    distance_matrix = np.asarray(static.cell_distance_matrix, dtype=np.int32)
+    holder_idx = int(np.asarray(static.offense_ids)[0])
+    other_cell_idx = int(np.where(distance_matrix[0] > 2)[0][0])
+    n_players = int(static.role_encoding.shape[0])
+
+    rebound_probs = _single_target_rebound_probs(static, 0, 0)
+    positions = np.repeat(coords[other_cell_idx][None, None, :], n_players, axis=1)
+    positions[:, holder_idx, :] = coords[0]
+    static = static._replace(
+        enable_rebounds=jnp.asarray(1, dtype=jnp.int8),
+        rebound_target_probs=jnp.asarray(rebound_probs, dtype=jnp.float32),
+        rebound_target_uniform_mix=jnp.asarray(0.0, dtype=jnp.float32),
+        rebound_target_temperature=jnp.asarray(1.0, dtype=jnp.float32),
+        rebound_contest_mode=jnp.asarray(REBOUND_CONTEST_MODE_LOCAL, dtype=jnp.int32),
+        rebound_contest_radius=jnp.asarray(0, dtype=jnp.int32),
+    )
+    state = state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        ball_holder=jnp.asarray([holder_idx], dtype=jnp.int32),
+        rebound_skill=jnp.zeros((1, n_players), dtype=jnp.float32),
+    )
+    shot_profile = build_shot_profile_batch(static, state, jnp)
+
+    default_features = build_rebound_observation_features_batch(
+        static,
+        state,
+        shot_profile,
+        jnp,
+    )
+    assert "win_prob" not in default_features
+    assert "orb_prob" not in default_features
+
+    features = build_rebound_observation_features_batch(
+        static,
+        state,
+        shot_profile,
+        jnp,
+        include_win_prob_features=True,
+    )
+    win_prob = np.asarray(features["win_prob"])[0]
+    offense_ids = np.asarray(static.offense_ids, dtype=np.int32)
+
+    assert win_prob.sum() == pytest.approx(1.0, abs=1.0e-6)
+    assert win_prob[holder_idx] == pytest.approx(1.0, abs=1.0e-6)
+    assert float(np.asarray(features["orb_prob"])[0]) == pytest.approx(
+        float(win_prob[offense_ids].sum()),
+        abs=1.0e-6,
+    )
+
+    players, globals_vec, _role = build_token_observation_components_batch(
+        static,
+        state,
+        static.training_role_flag,
+        jnp,
+        rebound_win_prob_features=True,
+    )
+    assert players.shape[-1] == TOKEN_OBS_PLAYER_DIM + 1
+    assert globals_vec.shape[-1] == TOKEN_OBS_GLOBAL_DIM + 1
+    assert np.asarray(players)[0, :, -1].tolist() == pytest.approx(win_prob.tolist())
+    assert float(np.asarray(globals_vec)[0, -1]) == pytest.approx(
+        float(np.asarray(features["orb_prob"])[0]),
+        abs=1.0e-6,
+    )
 
 
 def test_rebound_skill_std_samples_nonzero_values():

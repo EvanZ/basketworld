@@ -128,6 +128,11 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   -0.25 \
   --rebound-skill-weight \
   1 \
+  --no-rebound-critic-enabled \
+  --rebound-critic-policy-coef \
+  0.05 \
+  --rebound-critic-value-coef \
+  0.5 \
   --rebound-contest-mode \
   local_contest \
   --rebound-contest-radius \
@@ -138,12 +143,8 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   actual_points \
   --kernel-batch-size \
   512 \
-  --continue-run-id \
-  998ae6eb3e4b4195a601c556bac16ba1 \
-  --continue-artifact \
-  models/update_0030000 \
   --num-updates \
-  40000 \
+  30000 \
   --log-every-updates \
   10 \
   --eval-every-updates \
@@ -160,7 +161,7 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   1 \
   --log-mlflow \
   --ent-coef-start \
-  0.03 \
+  1 \
   --ent-coef-end \
   0.03 \
   --ent-schedule \
@@ -366,4 +367,4 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --mlflow-experiment-name \
   dev \
   --mlflow-run-name \
-  '10k fixed-entropy continuation of successful baseline | eval deploy | offense intents | no defense intents | no rebound redistribution | rebound basket position weight 1 | rebound contest radius 2 | rebound skill + lower pass risk | reaction pass model | rebound features | 5-on-5'
+  'baseline rebound observations | rebound critic aux 0.05/0.5 | eval deploy | offense intents | no defense intents | no rebound redistribution | rebound basket position weight 1 | rebound contest radius 2 | rebound skill + lower pass risk | reaction pass model | 5-on-5'

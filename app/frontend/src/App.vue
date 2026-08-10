@@ -469,6 +469,8 @@ const currentSelections = ref(null);
 // Track user-selected actions for display on game board
 const userSelections = ref({});
 const isSelfPlaying = ref(false);
+const selfPlayStarting = ref(false);
+const selfPlayLoadingMessage = ref('');
 const canReplay = ref(false);
 const isReplaying = ref(false);
 const isReplayPaused = ref(false);
@@ -2057,27 +2059,37 @@ function handleTemplateSelfPlay(options = {}) {
   }
   handleSelfPlay(null, options || {});
 }
-
-// New function for self-play mode (runs full episode)
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
-  if (!gameState.value || !aiMode.value) return;
+  if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
   const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
-  // Start deterministic self-play on backend: snapshot seed and initial state
+  selfPlayStarting.value = true;
+  selfPlayLoadingMessage.value = 'Starting self-play…';
+  error.value = null;
+  await nextTick();
+
+  // Snapshot the backend state before beginning the first visible self-play step.
   try {
     const res = await startSelfPlay(startTemplateOptions);
-    if (res && res.status === 'success' && res.state) {
-      // Reset UI to backend's reset state so trajectories align
-      gameState.value = res.state;
-      gameHistory.value = [res.state];
-      moveHistory.value = [];
-      currentSelections.value = null;
+    if (!res || res.status !== 'success' || !res.state) {
+      throw new Error(res?.message || 'Failed to start self-play.');
     }
-  } catch (e) {
-    console.error('[App] Failed to start self-play on backend:', e);
+    gameState.value = res.state;
+    gameHistory.value = [res.state];
+    moveHistory.value = [];
+    currentSelections.value = null;
+    selfPlayLoadingMessage.value = 'Preparing first self-play step…';
+  } catch (err) {
+    error.value = err.message;
+    console.error('[App] Failed to start self-play on backend:', err);
+    selfPlayStarting.value = false;
+    selfPlayLoadingMessage.value = '';
+    return;
   }
+
   isSelfPlaying.value = true;
   currentSelections.value = null;
-  
+  let firstSelfPlayStep = true;
+
   // Run full episode with AI controlling all players
   while (gameState.value && !gameState.value.done) {
     try {
@@ -2246,6 +2258,11 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
+        if (firstSelfPlayStep) {
+          firstSelfPlayStep = false;
+          selfPlayStarting.value = false;
+          selfPlayLoadingMessage.value = '';
+        }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -2308,6 +2325,8 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     }
   }
   // Self-play finished
+  selfPlayStarting.value = false;
+  selfPlayLoadingMessage.value = '';
   isSelfPlaying.value = false;
   currentSelections.value = null;
   canReplay.value = true;
@@ -3606,9 +3625,9 @@ onBeforeUnmount(() => {
           <button 
             @click="handleSelfPlayButton" 
             class="action-button self-play-button"
-            :disabled="!aiMode || gameState.done || liveButtonsDisabled"
+            :disabled="!aiMode || gameState.done || liveButtonsDisabled || selfPlayStarting || isSelfPlaying"
           >
-            Self-Play
+            {{ selfPlayStarting ? 'Preparing…' : 'Self-Play' }}
           </button>
           
           <button 
@@ -3627,6 +3646,15 @@ onBeforeUnmount(() => {
           >
             New Game
           </button>
+        </div>
+        <div
+          v-if="selfPlayStarting"
+          class="self-play-loading"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="self-play-spinner" aria-hidden="true"></span>
+          <span>{{ selfPlayLoadingMessage }}</span>
         </div>
 
 
@@ -3997,6 +4025,28 @@ header {
   display: flex;
   gap: 0.6rem;
   justify-content: center;
+}
+
+.self-play-loading {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 0.55rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.self-play-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid rgba(56, 189, 248, 0.25);
+  border-top-color: var(--app-accent);
+  border-radius: 50%;
+  animation: self-play-spin 0.75s linear infinite;
+}
+
+@keyframes self-play-spin {
+  to { transform: rotate(360deg); }
 }
 
 .save-episode-row {

@@ -789,6 +789,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "selector_boundary_episode_start": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_commitment_timeout": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_completed_pass": jnp.zeros(batch_shape, dtype=jnp.int8),
+                "selector_boundary_offensive_rebound": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_intent_index": jnp.full(batch_shape, -1, dtype=jnp.int32),
                 "selector_raw_probs": jnp.zeros(
                     (batch_size, int(spec.num_intents)),
@@ -808,7 +809,13 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     replaced.append(jnp.where(mask.reshape(expand_shape), selected_value, fallback_value))
             return type(fallback_state)(*replaced)
 
-        def _maybe_apply_selector_segment_start(state, selector_obs, selector_key, completed_pass_boundary):
+        def _maybe_apply_selector_segment_start(
+            state,
+            selector_obs,
+            selector_key,
+            completed_pass_boundary,
+            offensive_rebound_boundary,
+        ):
             metrics = _zero_selector_trace(state)
             if not bool(selector_enabled) or not bool(spec.intent_selector_enabled):
                 return state, metrics
@@ -867,9 +874,15 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 & jnp.asarray(completed_pass_boundary).astype(jnp.bool_)
                 & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
             )
+            offensive_rebound = (
+                multiselect_enabled
+                & active
+                & jnp.asarray(offensive_rebound_boundary).astype(jnp.bool_)
+                & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
+            )
             eligible = (
                 static.enable_intent_learning.astype(jnp.bool_)
-                & (episode_start | commitment_timeout | completed_pass)
+                & (episode_start | commitment_timeout | completed_pass | offensive_rebound)
             )
             selected_state = set_offense_intent_state_batch(
                 static,
@@ -887,6 +900,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "selector_boundary_commitment_timeout": (eligible & commitment_timeout).astype(jnp.int8),
                 "selector_boundary_completed_pass": (
                     eligible & completed_pass & (~commitment_timeout)
+                ).astype(jnp.int8),
+                "selector_boundary_offensive_rebound": (
+                    eligible & offensive_rebound & (~commitment_timeout)
                 ).astype(jnp.int8),
                 "selector_intent_index": jnp.where(eligible, chosen_intent, jnp.asarray(-1, dtype=jnp.int32)),
                 "selector_raw_probs": jnp.where(
@@ -907,7 +923,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             }
 
         def _scan_step(carry, _):
-            state, key, completed_pass_boundary = carry
+            state, key, completed_pass_boundary, offensive_rebound_boundary = carry
             key, selector_key, offense_key, defense_key, env_key = jax.random.split(key, 5)
             selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -915,6 +931,8 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 role_flag_offense,
                 jnp,
                 model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
             )
             selector_obs = _adapt_policy_observation_to_spec(selector_obs, static, spec, jnp)
             policy_state, selector_trace = _maybe_apply_selector_segment_start(
@@ -922,6 +940,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 selector_obs,
                 selector_key,
                 completed_pass_boundary,
+                offensive_rebound_boundary,
             )
             full_action_mask = build_action_masks_batch(static, policy_state, jnp)
             offense_mask = full_action_mask[:, offense_ids, :]
@@ -932,6 +951,8 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 role_flag_offense,
                 jnp,
                 model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
             )
             offense_obs = _adapt_policy_observation_to_spec(offense_obs, static, spec, jnp)
             defense_obs = build_policy_observation_batch_with_role_flag(
@@ -940,6 +961,8 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 role_flag_defense,
                 jnp,
                 model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
             )
             defense_obs = _adapt_policy_observation_to_spec(defense_obs, static, spec, jnp)
             offense_intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -1044,15 +1067,32 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 env_out.completed_pass.astype(jnp.bool_)
                 & (~env_out.done.astype(jnp.bool_))
             )
-            return (env_out.state, key, next_completed_pass_boundary), trace
+            next_offensive_rebound_boundary = (
+                env_out.offensive_rebound.astype(jnp.bool_)
+                & (~env_out.done.astype(jnp.bool_))
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_pass_boundary,
+                next_offensive_rebound_boundary,
+            ), trace
 
         initial_completed_pass_boundary = jnp.zeros(
             (int(initial_state.positions.shape[0]),),
             dtype=jnp.bool_,
         )
-        (_, _, _), trace = jax.lax.scan(
+        initial_offensive_rebound_boundary = jnp.zeros_like(
+            initial_completed_pass_boundary
+        )
+        (_, _, _, _), trace = jax.lax.scan(
             _scan_step,
-            (initial_state, eval_key, initial_completed_pass_boundary),
+            (
+                initial_state,
+                eval_key,
+                initial_completed_pass_boundary,
+                initial_offensive_rebound_boundary,
+            ),
             xs=None,
             length=int(horizon),
         )
@@ -2110,6 +2150,11 @@ def run_native_jax_evaluation(
             selector_diag["boundary_completed_pass_count"] = int(
                 selector_diag.get("boundary_completed_pass_count", 0)
             ) + int(np.asarray(trace["selector_boundary_completed_pass"])[:active_steps, idx].sum())
+            selector_diag["boundary_offensive_rebound_count"] = int(
+                selector_diag.get("boundary_offensive_rebound_count", 0)
+            ) + int(
+                np.asarray(trace["selector_boundary_offensive_rebound"])[:active_steps, idx].sum()
+            )
             selector_counts = selector_diag.setdefault("selection_counts", {})
             selector_start_counts = selector_diag.setdefault("episode_start_selection_counts", {})
             selector_intents = np.asarray(trace["selector_intent_index"])[:active_steps, idx]
@@ -3009,6 +3054,9 @@ def run_native_jax_evaluation(
         ),
         "selector_boundary_completed_pass_count": int(
             selector_diag.get("boundary_completed_pass_count", 0) or 0
+        ),
+        "selector_boundary_offensive_rebound_count": int(
+            selector_diag.get("boundary_offensive_rebound_count", 0) or 0
         ),
         "selector_episode_start_raw_prob_count": int(selector_start_raw_count),
         "selector_episode_start_mean_raw_probs": selector_start_mean_raw_probs,

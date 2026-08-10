@@ -1200,7 +1200,12 @@ def _run_jax_playbook_batch(
                     ).astype(jnp.int32)
 
                 def _scan_step(carry, _):
-                    state_in, key_in, last_completed_pass_boundary = carry
+                    (
+                        state_in,
+                        key_in,
+                        last_completed_pass_boundary,
+                        last_offensive_rebound_boundary,
+                    ) = carry
                     (
                         key_next,
                         selector_key,
@@ -1228,13 +1233,24 @@ def _run_jax_playbook_batch(
                             & last_completed_pass_boundary.astype(jnp.bool_)
                             & (age >= int(selector_min_play_steps_arg))
                         )
-                        selector_boundary = timeout_boundary | completed_pass_boundary
+                        offensive_rebound_boundary = (
+                            active
+                            & last_offensive_rebound_boundary.astype(jnp.bool_)
+                            & (age >= int(selector_min_play_steps_arg))
+                        )
+                        selector_boundary = (
+                            timeout_boundary
+                            | completed_pass_boundary
+                            | offensive_rebound_boundary
+                        )
                         selector_obs = build_policy_observation_batch_with_role_flag(
                             static_arg,
                             state_in,
                             role_flag_offense_arg,
                             jnp,
                             model_type=spec.model_type,
+                            rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                         )
                         neutral_context = {
                             "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -1299,6 +1315,8 @@ def _run_jax_playbook_batch(
                         role_flag_offense_arg,
                         jnp,
                         model_type=spec.model_type,
+                        rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                     )
                     defense_obs = build_policy_observation_batch_with_role_flag(
                         static_arg,
@@ -1306,6 +1324,8 @@ def _run_jax_playbook_batch(
                         role_flag_defense_arg,
                         jnp,
                         model_type=spec.model_type,
+                        rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                     )
                     offense_context = build_policy_intent_context_batch_with_role_flag(
                         static_arg,
@@ -1372,13 +1392,22 @@ def _run_jax_playbook_batch(
                     next_completed_pass_boundary = (
                         out.completed_pass.astype(jnp.bool_) & ~out.done.astype(jnp.bool_)
                     )
-                    return (out.state, key_next, next_completed_pass_boundary), trace
+                    next_offensive_rebound_boundary = (
+                        out.offensive_rebound.astype(jnp.bool_) & ~out.done.astype(jnp.bool_)
+                    )
+                    return (
+                        out.state,
+                        key_next,
+                        next_completed_pass_boundary,
+                        next_offensive_rebound_boundary,
+                    ), trace
 
-                (_, _, _), trace_out = jax.lax.scan(
+                (_, _, _, _), trace_out = jax.lax.scan(
                     _scan_step,
                     (
                         state_arg,
                         eval_key_arg,
+                        jnp.zeros((state_arg.positions.shape[0],), dtype=jnp.bool_),
                         jnp.zeros((state_arg.positions.shape[0],), dtype=jnp.bool_),
                     ),
                     xs=None,

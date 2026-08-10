@@ -25,6 +25,28 @@ SQRT3 = float(np.sqrt(3.0))
 TOKEN_OBS_PLAYER_DIM = 18
 TOKEN_OBS_GLOBAL_DIM = 7
 TOKEN_OBS_ROLE_FLAG_DIM = 1
+TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM = 1
+TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM = 1
+TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM = 2
+TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM = 3
+
+
+def token_observation_dims(
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+) -> tuple[int, int]:
+    """Return player/global token dimensions for the selected observation schema."""
+    player_dim = TOKEN_OBS_PLAYER_DIM
+    global_dim = TOKEN_OBS_GLOBAL_DIM
+    if not bool(rebound_target_observation_features):
+        player_dim -= TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM
+        global_dim -= TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM
+    if bool(rebound_win_prob_features):
+        return (
+            player_dim + TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM,
+            global_dim + TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM,
+        )
+    return player_dim, global_dim
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
 TURNOVER_REASON_INTERCEPTED = 2
@@ -1493,6 +1515,8 @@ def build_rebound_observation_features_batch(
     state: KernelState,
     shot_profile,
     jnp,
+    *,
+    include_win_prob_features: bool = False,
 ) -> dict[str, Any]:
     """Table-derived rebound features for the current ball holder's shot.
 
@@ -1601,12 +1625,74 @@ def build_rebound_observation_features_batch(
         jnp.zeros_like(dist_to_expected_target),
     )
 
-    return {
+    features = {
         "expected_target_q": expected_target_q / norm_den,
         "expected_target_r": expected_target_r / norm_den,
         "target_entropy": target_entropy_norm,
         "dist_to_expected_target": dist_to_expected_target,
     }
+    if include_win_prob_features:
+        player_cell_idx, player_cell_found = _lookup_cell_indices(
+            static.cell_coords,
+            state.positions,
+            jnp,
+        )
+        safe_player_cell_idx = jnp.where(
+            player_cell_found,
+            player_cell_idx.astype(jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        target_indices = jnp.arange(static.cell_coords.shape[0], dtype=jnp.int32)
+        rebound_distances = static.cell_distance_matrix[
+            jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[..., None],
+            target_indices[None, None, :],
+        ].astype(jnp.float32)
+        target_basket_distances = static.basket_distance_by_cell[target_indices].astype(jnp.float32)
+        player_basket_distances = static.basket_distance_by_cell[
+            jnp.clip(safe_player_cell_idx, 0, static.basket_distance_by_cell.shape[0] - 1)
+        ].astype(jnp.float32)
+        basket_position_penalty = jnp.maximum(
+            jnp.asarray(0.0, dtype=jnp.float32),
+            player_basket_distances[..., None] - target_basket_distances[None, None, :],
+        )
+        effective_rebound_distances = rebound_distances - (
+            static.rebound_skill_weight
+            * state.rebound_skill.astype(jnp.float32)[..., None]
+        )
+        global_winner_logits = (
+            (-static.rebound_winner_distance_weight * effective_rebound_distances)
+            - (static.rebound_basket_position_weight * basket_position_penalty)
+        ) / static.rebound_winner_temperature
+
+        radius = jnp.maximum(
+            jnp.asarray(0, dtype=jnp.int32),
+            static.rebound_contest_radius.astype(jnp.int32),
+        )
+        local_eligible = rebound_distances.astype(jnp.int32) <= radius
+        local_has_eligible = jnp.any(local_eligible, axis=1)
+        use_local_contest = (
+            (static.rebound_contest_mode == REBOUND_CONTEST_MODE_LOCAL)
+            & local_has_eligible
+        )
+        winner_logits = jnp.where(
+            use_local_contest[:, None, :],
+            jnp.where(
+                local_eligible,
+                global_winner_logits,
+                jnp.asarray(-1.0e9, dtype=jnp.float32),
+            ),
+            global_winner_logits,
+        )
+        winner_probs_by_target = _softmax(winner_logits, axis=1)
+        win_prob = jnp.sum(
+            winner_probs_by_target * target_probs[:, None, :],
+            axis=-1,
+        )
+        offense_mask = (static.role_encoding > 0.0).astype(jnp.float32)
+        orb_prob = jnp.sum(win_prob * offense_mask[None, :], axis=-1)
+        features["win_prob"] = win_prob.astype(jnp.float32)
+        features["orb_prob"] = orb_prob.astype(jnp.float32)
+    return features
 
 
 def _phi_shot_quality_single(static: KernelStatic, state: KernelState, jnp):
@@ -1866,7 +1952,14 @@ def build_pass_steal_probabilities_batch(static: KernelStatic, state: KernelStat
     return jnp.where(valid_receivers, total_steal, jnp.zeros((batch_size, offense_count), dtype=jnp.float32))
 
 
-def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp):
+def build_observation_vector_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+):
     batch_size = state.positions.shape[0]
     n_players = state.positions.shape[1]
     norm_den = static.court_norm_den
@@ -1927,12 +2020,17 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
     ).astype(jnp.float32)
     shot_profile = build_shot_profile_batch(static, state, jnp)
     ep_values = jnp.take(shot_profile["expected_points"], static.offense_ids, axis=1)
-    rebound_features = build_rebound_observation_features_batch(static, state, shot_profile, jnp)
+    rebound_features = build_rebound_observation_features_batch(
+        static,
+        state,
+        shot_profile,
+        jnp,
+        include_win_prob_features=rebound_win_prob_features,
+    )
     turnover_probs = build_turnover_probabilities_batch(static, state, jnp)
     steal_risks = build_pass_steal_probabilities_batch(static, state, jnp)
 
-    return jnp.concatenate(
-        [
+    observation_parts = [
             positions_norm,
             ball_holder_one_hot,
             shot_clock,
@@ -1948,15 +2046,27 @@ def build_observation_vector_batch(static: KernelStatic, state: KernelState, jnp
             ep_values,
             turnover_probs,
             steal_risks,
-            rebound_features["dist_to_expected_target"],
-            state.rebound_skill.astype(jnp.float32),
-            state.rebound_skill_specialist.astype(jnp.float32),
-            rebound_features["expected_target_q"][:, None],
-            rebound_features["expected_target_r"][:, None],
-            rebound_features["target_entropy"][:, None],
-        ],
-        axis=1,
-    )
+        ]
+    if rebound_target_observation_features:
+        observation_parts.append(rebound_features["dist_to_expected_target"])
+    observation_parts.append(state.rebound_skill.astype(jnp.float32))
+    if rebound_target_observation_features:
+        observation_parts.extend(
+            [
+                state.rebound_skill_specialist.astype(jnp.float32),
+                rebound_features["expected_target_q"][:, None],
+                rebound_features["expected_target_r"][:, None],
+                rebound_features["target_entropy"][:, None],
+            ]
+        )
+    if rebound_win_prob_features:
+        observation_parts.extend(
+            [
+                rebound_features["win_prob"],
+                rebound_features["orb_prob"][:, None],
+            ]
+        )
+    return jnp.concatenate(observation_parts, axis=1)
 
 
 def build_offense_skill_deltas_batch(static: KernelStatic, state: KernelState, jnp):
@@ -1967,12 +2077,26 @@ def build_offense_skill_deltas_batch(static: KernelStatic, state: KernelState, j
     return stacked.reshape(stacked.shape[0], -1).astype(jnp.float32)
 
 
-def build_flat_observation_batch_with_role_flag(static: KernelStatic, state: KernelState, role_flag_value, jnp):
+def build_flat_observation_batch_with_role_flag(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+):
     batch_size = state.positions.shape[0]
     role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
     return jnp.concatenate(
         [
-            build_observation_vector_batch(static, state, jnp),
+            build_observation_vector_batch(
+                static,
+                state,
+                jnp,
+                rebound_win_prob_features=rebound_win_prob_features,
+                rebound_target_observation_features=rebound_target_observation_features,
+            ),
             role_flag,
             build_offense_skill_deltas_batch(static, state, jnp),
         ],
@@ -1980,12 +2104,21 @@ def build_flat_observation_batch_with_role_flag(static: KernelStatic, state: Ker
     ).astype(jnp.float32)
 
 
-def build_flat_observation_batch(static: KernelStatic, state: KernelState, jnp):
+def build_flat_observation_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+):
     return build_flat_observation_batch_with_role_flag(
         static,
         state,
         static.training_role_flag,
         jnp,
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
     )
 
 
@@ -2010,6 +2143,9 @@ def build_token_observation_components_batch(
     state: KernelState,
     role_flag_value,
     jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
 ):
     """Build set-observation components matching the production token layout."""
     batch_size, n_players, _ = state.positions.shape
@@ -2052,7 +2188,13 @@ def build_token_observation_components_batch(
         axis=1,
     )[:, 0, :]
 
-    rebound_features = build_rebound_observation_features_batch(static, state, shot_profile, jnp)
+    rebound_features = build_rebound_observation_features_batch(
+        static,
+        state,
+        shot_profile,
+        jnp,
+        include_win_prob_features=rebound_win_prob_features,
+    )
     turnover_probs = _scatter_offense_features(
         static,
         build_turnover_probabilities_batch(static, state, jnp),
@@ -2082,42 +2224,50 @@ def build_token_observation_components_batch(
     dist_to_nearest_opp = _nearest_masked_distance(all_distances, opponent_mask, jnp) / norm_den
     dist_to_nearest_team = _nearest_masked_distance(all_distances, same_team_mask & not_self_mask, jnp) / norm_den
 
-    players = jnp.stack(
-        [
-            positions_norm[..., 0],
-            positions_norm[..., 1],
-            role_encoding,
-            has_ball,
-            layup,
-            three,
-            dunk,
-            lane_steps_norm,
-            expected_points,
-            turnover_probs,
-            steal_risks,
-            dist_to_ball,
-            dist_to_best_ep,
-            dist_to_nearest_opp,
-            dist_to_nearest_team,
-            rebound_features["dist_to_expected_target"],
-            rebound_skill,
-            rebound_skill_specialist,
-        ],
-        axis=-1,
-    ).astype(jnp.float32)
-    globals_vec = jnp.stack(
-        [
-            state.shot_clock.astype(jnp.float32)
-            / jnp.maximum(static.shot_clock_max.astype(jnp.float32), 1.0),
-            state.pressure_exposure.astype(jnp.float32),
-            jnp.full((batch_size,), static.basket_position[0].astype(jnp.float32) / norm_den, dtype=jnp.float32),
-            jnp.full((batch_size,), static.basket_position[1].astype(jnp.float32) / norm_den, dtype=jnp.float32),
-            rebound_features["expected_target_q"],
-            rebound_features["expected_target_r"],
-            rebound_features["target_entropy"],
-        ],
-        axis=-1,
-    ).astype(jnp.float32)
+    player_features = [
+        positions_norm[..., 0],
+        positions_norm[..., 1],
+        role_encoding,
+        has_ball,
+        layup,
+        three,
+        dunk,
+        lane_steps_norm,
+        expected_points,
+        turnover_probs,
+        steal_risks,
+        dist_to_ball,
+        dist_to_best_ep,
+        dist_to_nearest_opp,
+        dist_to_nearest_team,
+    ]
+    if rebound_target_observation_features:
+        player_features.append(rebound_features["dist_to_expected_target"])
+    player_features.append(rebound_skill)
+    if rebound_target_observation_features:
+        player_features.append(rebound_skill_specialist)
+    if rebound_win_prob_features:
+        player_features.append(rebound_features["win_prob"])
+    players = jnp.stack(player_features, axis=-1).astype(jnp.float32)
+
+    global_features = [
+        state.shot_clock.astype(jnp.float32)
+        / jnp.maximum(static.shot_clock_max.astype(jnp.float32), 1.0),
+        state.pressure_exposure.astype(jnp.float32),
+        jnp.full((batch_size,), static.basket_position[0].astype(jnp.float32) / norm_den, dtype=jnp.float32),
+        jnp.full((batch_size,), static.basket_position[1].astype(jnp.float32) / norm_den, dtype=jnp.float32),
+    ]
+    if rebound_target_observation_features:
+        global_features.extend(
+            [
+                rebound_features["expected_target_q"],
+                rebound_features["expected_target_r"],
+                rebound_features["target_entropy"],
+            ]
+        )
+    if rebound_win_prob_features:
+        global_features.append(rebound_features["orb_prob"])
+    globals_vec = jnp.stack(global_features, axis=-1).astype(jnp.float32)
     role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
     return players, globals_vec, role_flag
 
@@ -2127,12 +2277,17 @@ def build_token_observation_batch_with_role_flag(
     state: KernelState,
     role_flag_value,
     jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
 ):
     players, globals_vec, role_flag = build_token_observation_components_batch(
         static,
         state,
         role_flag_value,
         jnp,
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
     )
     return jnp.concatenate(
         [
@@ -2144,12 +2299,21 @@ def build_token_observation_batch_with_role_flag(
     ).astype(jnp.float32)
 
 
-def build_token_observation_batch(static: KernelStatic, state: KernelState, jnp):
+def build_token_observation_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+    *,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+):
     return build_token_observation_batch_with_role_flag(
         static,
         state,
         static.training_role_flag,
         jnp,
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
     )
 
 
@@ -2160,6 +2324,8 @@ def build_policy_observation_batch_with_role_flag(
     jnp,
     *,
     model_type: str,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
 ):
     if str(model_type) == "attention":
         return build_token_observation_batch_with_role_flag(
@@ -2167,12 +2333,16 @@ def build_policy_observation_batch_with_role_flag(
             state,
             role_flag_value,
             jnp,
+            rebound_win_prob_features=rebound_win_prob_features,
+            rebound_target_observation_features=rebound_target_observation_features,
         )
     return build_flat_observation_batch_with_role_flag(
         static,
         state,
         role_flag_value,
         jnp,
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
     )
 
 
@@ -2182,6 +2352,8 @@ def build_policy_observation_batch(
     jnp,
     *,
     model_type: str,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
 ):
     return build_policy_observation_batch_with_role_flag(
         static,
@@ -2189,6 +2361,8 @@ def build_policy_observation_batch(
         static.training_role_flag,
         jnp,
         model_type=model_type,
+        rebound_win_prob_features=rebound_win_prob_features,
+        rebound_target_observation_features=rebound_target_observation_features,
     )
 
 

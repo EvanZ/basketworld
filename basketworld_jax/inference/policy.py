@@ -191,6 +191,8 @@ class JAXInferenceModel:
             state,
             self.jnp,
             model_type=self.spec.model_type,
+            rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
         )
         full_action_mask = build_action_masks_batch(static, state, self.jnp)
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
@@ -217,6 +219,8 @@ class JAXInferenceModel:
             state,
             self.jnp,
             model_type=self.spec.model_type,
+            rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
         )
         return np.asarray(self.jax.device_get(flat_obs[0]), dtype=np.float32)
 
@@ -231,19 +235,39 @@ class JAXInferenceModel:
             state,
             static.training_role_flag,
             self.jnp,
+            rebound_win_prob_features=bool(
+                getattr(self.spec, "rebound_win_prob_features", False)
+            ),
+            rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
         )
+        rebound_target_observation_features = bool(
+            getattr(self.spec, "rebound_target_observation_features", True)
+        )
+        player_labels = [
+            "q_norm", "r_norm", "role", "has_ball", "layup_pct", "three_pt_pct",
+            "dunk_pct", "lane_steps_norm", "expected_points", "turnover_probability",
+            "pass_steal_probability", "distance_to_ball", "distance_to_best_ep_player",
+            "distance_to_nearest_opponent", "distance_to_nearest_teammate",
+        ]
+        if rebound_target_observation_features:
+            player_labels.append("distance_to_expected_rebound_target")
+        player_labels.append("rebound_skill")
+        if rebound_target_observation_features:
+            player_labels.append("rebound_skill_specialist")
+        if bool(getattr(self.spec, "rebound_win_prob_features", False)):
+            player_labels.append("rebound_win_probability")
+        global_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
+        if rebound_target_observation_features:
+            global_labels.extend(
+                ["expected_rebound_target_q", "expected_rebound_target_r", "target_entropy"]
+            )
+        if bool(getattr(self.spec, "rebound_win_prob_features", False)):
+            global_labels.append("offensive_rebound_probability")
         return {
             "players": np.asarray(self.jax.device_get(players[0]), dtype=np.float32),
+            "players_labels": player_labels,
             "globals": np.asarray(self.jax.device_get(globals_vec[0]), dtype=np.float32),
-            "globals_labels": [
-                "shot_clock_norm",
-                "pressure_exposure",
-                "hoop_q_norm",
-                "hoop_r_norm",
-                "expected_rebound_target_q",
-                "expected_rebound_target_r",
-                "target_entropy",
-            ],
+            "globals_labels": global_labels,
         }
 
     def predict(self, obs=None, deterministic: bool = False):
@@ -297,6 +321,8 @@ class JAXInferenceModel:
             state,
             self.jnp,
             model_type=self.spec.model_type,
+            rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
         )
         selector_out = self._selector_runner(self.params, flat_obs)
         logits = np.asarray(

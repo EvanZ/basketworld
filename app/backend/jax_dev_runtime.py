@@ -458,6 +458,7 @@ class JaxDevRuntime:
             "defense": None,
         }
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition: dict[str, Any] | None = None
 
     def _apply_jax_static_env_attrs(self) -> None:
@@ -520,6 +521,9 @@ class JaxDevRuntime:
             "last_attention_payload": copy.deepcopy(self._last_attention_payload),
             "last_attention_payloads": copy.deepcopy(self._last_attention_payloads),
             "last_completed_pass_boundary": bool(self._last_completed_pass_boundary),
+            "last_offensive_rebound_boundary": bool(
+                self._last_offensive_rebound_boundary
+            ),
             "last_selector_transition": copy.deepcopy(self._last_selector_transition),
         }
 
@@ -561,7 +565,12 @@ class JaxDevRuntime:
                 "offense": copy.deepcopy(self._last_attention_payload),
                 "defense": None,
             }
-        self._last_completed_pass_boundary = bool(snapshot.get("last_completed_pass_boundary", False))
+        self._last_completed_pass_boundary = bool(
+            snapshot.get("last_completed_pass_boundary", False)
+        )
+        self._last_offensive_rebound_boundary = bool(
+            snapshot.get("last_offensive_rebound_boundary", False)
+        )
         self._last_selector_transition = copy.deepcopy(snapshot.get("last_selector_transition"))
         self._sync_display_env()
         if game_state is not None:
@@ -689,6 +698,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         return {"start_template": template_metadata} if template_metadata else {}
@@ -770,6 +780,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         self.display_env.training_team = user_team
@@ -853,6 +864,8 @@ class JaxDevRuntime:
             role_flag,
             self.jnp,
             model_type=str(self.raw_model.spec.model_type),
+            rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
         obs = _adapt_policy_observation_to_spec(obs, self.static, self.raw_model.spec, self.jnp)
         players, globals_vec, _ = build_token_observation_components_batch(
@@ -860,6 +873,10 @@ class JaxDevRuntime:
             self.state,
             role_flag,
             self.jnp,
+            rebound_win_prob_features=bool(
+                getattr(self.raw_model.spec, "rebound_win_prob_features", False)
+            ),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
         skills = self.jnp.stack(
             [
@@ -898,6 +915,8 @@ class JaxDevRuntime:
             role_flag,
             self.jnp,
             model_type=str(raw.spec.model_type),
+            rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
         )
         flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, raw.spec, self.jnp)
         full_action_mask = build_action_masks_batch(self.static, self.state, self.jnp)
@@ -1060,7 +1079,12 @@ class JaxDevRuntime:
         self.last_action_results = self._action_results_from_step(prev_state, out)
         if self.last_action_results.get("rebounds"):
             self.episode_rebounds.extend(copy.deepcopy(self.last_action_results["rebounds"]))
-        self._last_completed_pass_boundary = bool(_as_bool(out.completed_pass[0]) and not _as_bool(out.done[0]))
+        self._last_completed_pass_boundary = bool(
+            _as_bool(out.completed_pass[0]) and not _as_bool(out.done[0])
+        )
+        self._last_offensive_rebound_boundary = bool(
+            _as_bool(out.offensive_rebound[0]) and not _as_bool(out.done[0])
+        )
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
@@ -1170,6 +1194,7 @@ class JaxDevRuntime:
         if meta is not None and "source" not in meta:
             meta["source"] = getattr(game_state, "start_template_library_source", None)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         game_state.replay_seed = seed
         game_state.replay_initial_positions = [tuple(pos) for pos in self.positions]
@@ -1221,6 +1246,7 @@ class JaxDevRuntime:
             )
         self.state = self.state._replace(**state_updates)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -1254,6 +1280,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -1329,6 +1356,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -2017,6 +2045,8 @@ class JaxDevRuntime:
             self.role_flag_offense,
             self.jnp,
             model_type=str(self.raw_model.spec.model_type),
+            rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
         flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, self.raw_model.spec, self.jnp)
         batch_size = flat_obs.shape[0]
@@ -2113,6 +2143,8 @@ class JaxDevRuntime:
         )
         if bool(self._last_completed_pass_boundary) and age >= min_play_steps:
             return "completed_pass"
+        if bool(self._last_offensive_rebound_boundary) and age >= min_play_steps:
+            return "offensive_rebound"
         return None
 
     def _maybe_apply_selector_boundary(self, game_state: Any) -> dict[str, Any] | None:
@@ -2134,6 +2166,7 @@ class JaxDevRuntime:
         game_state.selector_segment_index = int(getattr(game_state, "selector_segment_index", 0) or 0) + 1
         game_state.selector_last_boundary_reason = str(reason)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = {
             "reason": str(reason),
             "previous_intent_index": int(previous_intent),
@@ -2161,6 +2194,7 @@ class JaxDevRuntime:
         )
         intent_age = _as_int(_field0(self.state, "intent_age"))
         last_completed_pass_boundary = bool(self._last_completed_pass_boundary)
+        last_offensive_rebound_boundary = bool(self._last_offensive_rebound_boundary)
         completed_pass_min_steps_remaining = max(0, int(min_play_steps) - int(intent_age))
         completed_pass_min_steps_met = (
             last_completed_pass_boundary and completed_pass_min_steps_remaining == 0
@@ -2200,6 +2234,7 @@ class JaxDevRuntime:
             "commitment_steps": int(max(1, _as_int(self.static.intent_commitment_steps))),
             "eligible_boundary_reason": self._selector_boundary_reason(game_state),
             "last_completed_pass_boundary": bool(last_completed_pass_boundary),
+            "last_offensive_rebound_boundary": bool(last_offensive_rebound_boundary),
             "completed_pass_min_steps_met": bool(completed_pass_min_steps_met),
             "completed_pass_min_steps_remaining": int(completed_pass_min_steps_remaining),
             "last_transition": last_transition,
@@ -2300,15 +2335,29 @@ class JaxDevRuntime:
         }
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
-        globals_labels = [
-            "shot_clock_norm",
-            "pressure_exposure",
-            "hoop_q_norm",
-            "hoop_r_norm",
-            "expected_rebound_target_q",
-            "expected_rebound_target_r",
-            "target_entropy",
+        rebound_target_observation_features = bool(
+            getattr(self.raw_model.spec, "rebound_target_observation_features", True)
+        )
+        player_labels = [
+            "q_norm", "r_norm", "role", "has_ball", "layup_pct", "three_pt_pct",
+            "dunk_pct", "lane_steps_norm", "expected_points", "turnover_probability",
+            "pass_steal_probability", "distance_to_ball", "distance_to_best_ep_player",
+            "distance_to_nearest_opponent", "distance_to_nearest_teammate",
         ]
+        if rebound_target_observation_features:
+            player_labels.append("distance_to_expected_rebound_target")
+        player_labels.append("rebound_skill")
+        if rebound_target_observation_features:
+            player_labels.append("rebound_skill_specialist")
+        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
+            player_labels.append("rebound_win_probability")
+        globals_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
+        if rebound_target_observation_features:
+            globals_labels.extend(
+                ["expected_rebound_target_q", "expected_rebound_target_r", "target_entropy"]
+            )
+        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
+            globals_labels.append("offensive_rebound_probability")
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
 
@@ -2338,6 +2387,7 @@ class JaxDevRuntime:
             "obs": np.asarray(obs_dict["obs"], dtype=np.float32).reshape(-1).tolist(),
             "obs_tokens": {
                 "players": np.asarray(obs_dict["players"], dtype=np.float32).tolist(),
+                "players_labels": player_labels,
                 "globals": np.asarray(obs_dict["globals"], dtype=np.float32).tolist(),
                 "globals_labels": globals_labels,
                 "attention": attention_payload,

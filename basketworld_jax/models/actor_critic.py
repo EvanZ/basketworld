@@ -40,6 +40,9 @@ class ActorCriticSpec:
     num_intents: int = 8
     intent_selector_enabled: bool = False
     intent_selector_hidden_dim: int = 64
+    rebound_win_prob_features: bool = False
+    rebound_target_observation_features: bool = True
+    rebound_critic_enabled: bool = False
 
 
 def build_actor_critic_spec(
@@ -66,6 +69,9 @@ def build_actor_critic_spec(
     num_intents: int = 8,
     intent_selector_enabled: bool = False,
     intent_selector_hidden_dim: int = 64,
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+    rebound_critic_enabled: bool = False,
 ) -> ActorCriticSpec:
     if flat_obs_batch.ndim != 2:
         raise ValueError(
@@ -150,6 +156,9 @@ def build_actor_critic_spec(
         num_intents=int(num_intents),
         intent_selector_enabled=bool(intent_selector_enabled),
         intent_selector_hidden_dim=int(intent_selector_hidden_dim),
+        rebound_win_prob_features=bool(rebound_win_prob_features),
+        rebound_target_observation_features=bool(rebound_target_observation_features),
+        rebound_critic_enabled=bool(rebound_critic_enabled),
     )
 
 
@@ -215,7 +224,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
 
     class ActorCriticModule(nn.Module):
         @nn.compact
-        def _mlp_forward(self, flat_obs):
+        def _mlp_forward(self, flat_obs, include_rebound_critic=False):
             hidden = flat_obs.astype(jnp.float32)
             for hidden_dim in spec.hidden_dims:
                 hidden = nn.Dense(
@@ -237,6 +246,15 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 bias_init=bias_init,
                 name="value_head",
             )(hidden)[..., 0]
+            if bool(spec.rebound_critic_enabled) and bool(include_rebound_critic):
+                rebound_values = nn.Dense(
+                    1,
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    name="rebound_value_head",
+                )(hidden)[..., 0]
+            else:
+                rebound_values = jnp.zeros_like(values)
             return {
                 "hidden": hidden,
                 "flat_policy_logits": flat_policy_logits,
@@ -245,6 +263,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                     dtype=jnp.float32,
                 ),
                 "values": values,
+                "rebound_values": rebound_values,
                 "selector_logits": jnp.zeros(
                     (flat_obs.shape[0], int(spec.num_intents)),
                     dtype=jnp.float32,
@@ -480,7 +499,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             return jnp.where(has_valid, slot_logits, fallback)
 
         @nn.compact
-        def _attention_forward(self, flat_obs, intent_context=None):
+        def _attention_forward(self, flat_obs, intent_context=None, include_rebound_critic=False):
             players, globals_vec, role_flag = self._unpack_token_observation(flat_obs)
             globals_expanded = jnp.broadcast_to(
                 globals_vec[:, None, :],
@@ -626,6 +645,24 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 name="value_head_defense",
             )(defense_value_input)[..., 0]
             values = jnp.where(role_flag[:, 0] > 0.0, values_offense, values_defense)
+            if bool(spec.rebound_critic_enabled) and bool(include_rebound_critic):
+                rebound_values_offense = nn.Dense(
+                    1,
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    name="rebound_value_head_offense",
+                )(offense_value_input)[..., 0]
+                rebound_values_defense = nn.Dense(
+                    1,
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    name="rebound_value_head_defense",
+                )(defense_value_input)[..., 0]
+                rebound_values = jnp.where(
+                    role_flag[:, 0] > 0.0, rebound_values_offense, rebound_values_defense
+                )
+            else:
+                rebound_values = jnp.zeros_like(values)
             if bool(spec.intent_selector_enabled):
                 selector_hidden = nn.Dense(
                     int(spec.intent_selector_hidden_dim),
@@ -666,14 +703,15 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 "pass_target_logits": pass_target_logits,
                 "attention_weights": attention_weights,
                 "values": values,
+                "rebound_values": rebound_values,
                 "selector_logits": selector_logits,
                 "selector_values": selector_values,
             }
 
-        def __call__(self, flat_obs, intent_context=None):
+        def __call__(self, flat_obs, intent_context=None, include_rebound_critic=False):
             if str(spec.model_type) == "attention":
-                return self._attention_forward(flat_obs, intent_context)
-            return self._mlp_forward(flat_obs)
+                return self._attention_forward(flat_obs, intent_context, include_rebound_critic)
+            return self._mlp_forward(flat_obs, include_rebound_critic)
 
     return ActorCriticModule()
 
@@ -683,16 +721,29 @@ def init_actor_critic_params(jax, jnp, spec: ActorCriticSpec, *, seed: int):
 
     module = build_actor_critic_module(spec)
     sample_flat_obs = jnp.zeros((1, int(spec.flat_obs_dim)), dtype=jnp.float32)
-    variables = module.init(jax.random.PRNGKey(int(seed)), sample_flat_obs)
+    variables = module.init(
+        jax.random.PRNGKey(int(seed)),
+        sample_flat_obs,
+        include_rebound_critic=bool(spec.rebound_critic_enabled),
+    )
     return unfreeze(variables["params"])
 
 
-def actor_critic_forward(params, flat_obs, spec: ActorCriticSpec, jnp, *, intent_context=None):
+def actor_critic_forward(
+    params,
+    flat_obs,
+    spec: ActorCriticSpec,
+    jnp,
+    *,
+    intent_context=None,
+    include_rebound_critic: bool = False,
+):
     module = build_actor_critic_module(spec)
     return module.apply(
         {"params": params},
         flat_obs.astype(jnp.float32),
         intent_context,
+        include_rebound_critic,
     )
 
 
@@ -751,6 +802,7 @@ def run_actor_critic(
     jnp,
     *,
     intent_context=None,
+    include_rebound_critic: bool = False,
 ):
     forward_out = actor_critic_forward(
         params,
@@ -758,6 +810,7 @@ def run_actor_critic(
         spec,
         jnp,
         intent_context=intent_context,
+        include_rebound_critic=include_rebound_critic,
     )
     mask_out = apply_action_mask(
         forward_out["flat_policy_logits"],

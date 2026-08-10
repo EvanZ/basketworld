@@ -35,6 +35,7 @@ class _FakeSpec:
     attention_num_cls_tokens: int = 0
     num_intents: int = 8
     intent_selector_enabled: bool = False
+    rebound_win_prob_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,25 @@ def _make_runtime(
     if reset_seed is not None:
         runtime.reset(seed=reset_seed)
     return runtime
+
+
+def test_jax_dev_runtime_labels_rebound_win_probability_observation_features():
+    runtime = _make_runtime()
+    runtime.raw_model.spec = _FakeSpec(rebound_win_prob_features=True)
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    state = runtime.get_full_game_state(game_state, include_policy_probs=False)
+    obs_tokens = state["obs_tokens"]
+
+    assert len(obs_tokens["globals"]) == 8
+    assert len(obs_tokens["globals_labels"]) == len(obs_tokens["globals"])
+    assert obs_tokens["globals_labels"][-1] == "offensive_rebound_probability"
+    assert len(obs_tokens["players"][0]) == 19
 
 
 def test_state_snapshot_dispatches_to_jax_runtime(monkeypatch):
@@ -897,6 +917,41 @@ def test_jax_dev_runtime_self_play_reselects_after_completed_pass_boundary(monke
     assert body["selector_transition"]["intent_index"] == 6
     assert body["state"]["intent_index_current"] == 6
     assert body["state"]["selector_last_boundary_reason"] == "completed_pass"
+
+
+def test_jax_dev_runtime_self_play_reselects_after_offensive_rebound_boundary(monkeypatch):
+    runtime, game_state = _make_selector_runtime_and_state()
+    runtime.set_offense_intent_state(
+        active=True,
+        intent_index=2,
+        intent_age=3,
+        intent_commitment_remaining=2,
+        game_state=game_state,
+    )
+    runtime._last_offensive_rebound_boundary = True
+    monkeypatch.setattr(
+        runtime,
+        "_sample_selector_intent",
+        lambda _game_state: {
+            "intent_index": 7,
+            "used_selector": True,
+            "alpha": 1.0,
+            "eps": 0.0,
+            "value": 0.5,
+        },
+    )
+    monkeypatch.setattr(runtime, "_selector_preferences", lambda _game_state: None)
+
+    body = runtime.step(
+        ActionRequest(actions={}, player_deterministic=True, opponent_deterministic=True),
+        game_state,
+    )
+
+    assert body["status"] == "success"
+    assert body["selector_transition"]["reason"] == "offensive_rebound"
+    assert body["selector_transition"]["intent_index"] == 7
+    assert body["state"]["intent_index_current"] == 7
+    assert body["state"]["selector_last_boundary_reason"] == "offensive_rebound"
 
 
 def test_jax_dev_runtime_unseeded_resets_advance_rng_key():
