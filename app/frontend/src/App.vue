@@ -220,6 +220,7 @@ function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
+const showGhostTrails = ref(true);
 const policyProbs = ref(null);   // For AI suggestions
 const templateSandboxMode = ref(false);
 
@@ -319,7 +320,7 @@ const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
 const REBOUND_REASON_LABELS = {
   disabled: 'Disabled',
   game_not_initialized: 'Game not initialized',
-  episode_not_done: 'Waiting for a completed episode',
+  ball_holder_unavailable: 'No current ball holder is available',
   terminal_not_missed_shot: 'Last terminal event was not a missed shot',
   last_terminal_shot_was_made: 'Last terminal shot was made',
   fitted_table_missing: 'Fitted rebound table not found',
@@ -1324,22 +1325,19 @@ const reboundProgressForCapture = ref(1);
 const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
-// Watch for when episodes end to stop auto-play behavior
+// Watch for game-state changes; keep the live rebound preview aligned with the current holder.
 watch(gameState, async (newState, oldState) => {
     syncPolicyProbsFromState(newState);
-    if (!newState || !newState.done) {
-        if (reboundPreview.value?.available || reboundPreviewError.value) {
-            clearReboundPreview();
-        }
+    if (!newState) {
+        clearReboundPreview();
+    } else if (reboundPreviewEnabled.value) {
+        await refreshReboundPreview();
     }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
         // Allow replay after any completed episode (manual or self-play)
         canReplay.value = true;
-        if (reboundPreviewEnabled.value) {
-            await refreshReboundPreview();
-        }
         // Automatically load episode for manual stepping (with small delay and error handling)
         setTimeout(async () => {
             try {
@@ -1361,7 +1359,7 @@ watch(reboundPreviewEnabled, async (enabled) => {
 });
 
 watch(reboundPreviewParams, async () => {
-  if (reboundPreviewEnabled.value && gameState.value?.done) {
+  if (reboundPreviewEnabled.value && gameState.value) {
     await refreshReboundPreview();
   }
 }, { deep: true });
@@ -3401,6 +3399,15 @@ onBeforeUnmount(() => {
             <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Show Opponent Actions</span>
           </button>
+          <button
+            class="toggle-btn"
+            type="button"
+            :aria-pressed="showGhostTrails"
+            @click="showGhostTrails = !showGhostTrails"
+          >
+            <font-awesome-icon :icon="showGhostTrails ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+            <span class="toggle-label">Ghost Trails</span>
+          </button>
         </div>
 
       </div>
@@ -3516,6 +3523,8 @@ onBeforeUnmount(() => {
           :key="boardRenderKey"
           ref="gameBoardRef"
           :game-history="boardGameHistory" 
+          :show-ghost-trails="showGhostTrails"
+          :show-episode-outcome="activeControlsTab !== 'stats'"
           :playbook-overlay="boardPlaybookOverlay"
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="boardPolicyProbabilities"
@@ -3531,6 +3540,8 @@ onBeforeUnmount(() => {
           :show-rebound-skills="evalConfig.showReboundSkillsOnBoard"
           :rebound-skill-overrides="boardReboundSkillOverrides"
           :rebound-target-overlay="boardReboundTargetOverlay"
+          :hide-pass-rays="reboundPreviewEnabled"
+          :show-rebound-preview-shot-trajectory="reboundPreviewEnabled"
           :placement-mode="isBoardEditingMode"
           :placement-editable="boardPlacementEditable"
           :placement-positions="boardPlacementPositions"
@@ -3663,7 +3674,7 @@ onBeforeUnmount(() => {
           <div class="rebound-preview-header">
             <label class="inline-check rebound-preview-toggle">
               <input type="checkbox" v-model="reboundPreviewEnabled" />
-              <span>Rebound preview after missed terminal shot</span>
+              <span>Rebound preview for current ball holder</span>
             </label>
             <button
               v-if="reboundPreviewEnabled"
@@ -3697,7 +3708,7 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="reboundPreviewEnabled && reboundPreview?.available" class="rebound-preview-summary">
             <div class="rebound-preview-meta">
-              <span>Shot: {{ reboundPlayerLabel(reboundPreview.shot) }} {{ reboundPreview.shot?.shot_type }}</span>
+              <span>{{ reboundPreview.shot?.source === 'terminal_missed_shot' ? 'Missed shot' : 'Preview shot' }}: {{ reboundPlayerLabel(reboundPreview.shot) }} {{ reboundPreview.shot?.shot_type }}</span>
               <span>Target: {{ reboundPreview.sampled_target?.q }},{{ reboundPreview.sampled_target?.r }} ({{ reboundPct(reboundPreview.sampled_target?.prob) }})</span>
               <span>Winner: {{ reboundPlayerLabel(reboundPreview.sampled_winner) }} {{ reboundPct(reboundPreview.sampled_winner?.conditional_prob) }}</span>
             </div>

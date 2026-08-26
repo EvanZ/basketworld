@@ -77,6 +77,24 @@ def test_trainer_parser_defaults_match_frozen_scope():
     assert args.rebound_critic_policy_coef == 0.05
     assert args.rebound_critic_value_coef == 0.5
 
+    assert args.rebound_counterfactual_positioning_enabled is False
+    assert args.rebound_counterfactual_positioning_coef == 0.02
+
+    counterfactual_args = parse_args(["--rebound-counterfactual-positioning-enabled"])
+    assert counterfactual_args.rebound_counterfactual_positioning_enabled is True
+
+    assert args.continue_preserve_env_state is False
+    assert args.continue_preserve_intent_discriminator_state is False
+    stateful_continuation_args = parse_args(
+        [
+            "--continue-run-id",
+            "source-run",
+            "--continue-preserve-env-state",
+            "--continue-preserve-intent-discriminator-state",
+        ]
+    )
+    assert stateful_continuation_args.continue_preserve_env_state is True
+    assert stateful_continuation_args.continue_preserve_intent_discriminator_state is True
     critic_args = parse_args(["--rebound-critic-enabled"])
     assert critic_args.rebound_critic_enabled is True
     enabled_args = parse_args(["--rebound-win-prob-features"])

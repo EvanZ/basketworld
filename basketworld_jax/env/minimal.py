@@ -234,6 +234,7 @@ class KernelStatic(NamedTuple):
     rebound_skill_weight: Any
     rebound_contest_mode: Any
     rebound_contest_radius: Any
+    rebound_counterfactual_positioning_enabled: Any
     rebound_obs_top_n_targets: Any
     offensive_rebound_shot_clock_reset: Any
     rebound_terminal_reward_mode: Any
@@ -308,6 +309,8 @@ class StepBatchOutput(NamedTuple):
     defensive_rebound: Any
     rebound_target_cell: Any
     rebound_winner: Any
+    rebound_counterfactual_advantages: Any
+    rebound_counterfactual_mask: Any
     rebound_global_contest: Any
     shot_clock_reset_14: Any
     rebound_reward_advance: Any
@@ -1154,6 +1157,10 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(0, int(getattr(env, "rebound_contest_radius", 1))),
             dtype=xp.int32,
         ),
+        rebound_counterfactual_positioning_enabled=xp.asarray(
+            1 if bool(getattr(env, "rebound_counterfactual_positioning_enabled", False)) else 0,
+            dtype=xp.int8,
+        ),
         rebound_obs_top_n_targets=xp.asarray(
             max(0, int(getattr(env, "rebound_obs_top_n_targets", 0))),
             dtype=xp.int32,
@@ -1509,6 +1516,72 @@ def _local_rebound_contest_mask_from_distances(
     fallback_global = ~found
     return eligible.astype(jnp.bool_), radius_used, fallback_global
 
+
+
+def _rebound_winner_logits_for_positions(
+    static: KernelStatic,
+    positions,
+    rebound_skill,
+    sampled_rebound_target,
+    jnp,
+):
+    """Return rebound logits and local eligibility for one or more position scenarios."""
+    player_cell_idx, player_cell_found = _lookup_cell_indices(static.cell_coords, positions, jnp)
+    safe_player_cell_idx = jnp.where(
+        player_cell_found,
+        player_cell_idx.astype(jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    rebound_distances = static.cell_distance_matrix[
+        jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1),
+        jnp.clip(sampled_rebound_target, 0, static.cell_distance_matrix.shape[1] - 1),
+    ].astype(jnp.float32)
+    target_basket_distance = static.basket_distance_by_cell[
+        jnp.clip(sampled_rebound_target, 0, static.basket_distance_by_cell.shape[0] - 1)
+    ].astype(jnp.float32)
+    player_basket_distances = static.basket_distance_by_cell[
+        jnp.clip(safe_player_cell_idx, 0, static.basket_distance_by_cell.shape[0] - 1)
+    ].astype(jnp.float32)
+    basket_position_penalty = jnp.maximum(
+        jnp.asarray(0.0, dtype=jnp.float32),
+        player_basket_distances - target_basket_distance,
+    )
+    effective_rebound_distances = rebound_distances - (
+        static.rebound_skill_weight * rebound_skill.astype(jnp.float32)
+    )
+    global_winner_logits = (
+        (-static.rebound_winner_distance_weight * effective_rebound_distances)
+        - (static.rebound_basket_position_weight * basket_position_penalty)
+    ) / static.rebound_winner_temperature
+    radius = jnp.maximum(
+        jnp.asarray(0, dtype=jnp.int32),
+        static.rebound_contest_radius.astype(jnp.int32),
+    )
+    radius_eligible = rebound_distances.astype(jnp.int32) <= radius
+    found_eligible = jnp.any(radius_eligible, axis=-1)
+    local_eligible = jnp.where(
+        found_eligible[..., None],
+        radius_eligible,
+        jnp.ones_like(radius_eligible, dtype=jnp.bool_),
+    )
+    use_local_contest = (
+        (static.rebound_contest_mode == REBOUND_CONTEST_MODE_LOCAL)
+        & found_eligible
+    )
+    winner_logits = jnp.where(
+        use_local_contest[..., None],
+        jnp.where(
+            local_eligible,
+            global_winner_logits,
+            jnp.asarray(-1.0e9, dtype=jnp.float32),
+        ),
+        global_winner_logits,
+    )
+    return (
+        winner_logits,
+        local_eligible.astype(jnp.bool_),
+        use_local_contest.astype(jnp.bool_),
+    )
 
 def build_rebound_observation_features_batch(
     static: KernelStatic,
@@ -2653,6 +2726,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             rebound_attempt=zero_flag,
             offensive_rebound=zero_flag,
             defensive_rebound=zero_flag,
+            rebound_counterfactual_advantages=jnp.zeros((state.positions.shape[0],), dtype=jnp.float32),
+            rebound_counterfactual_mask=jnp.zeros((state.positions.shape[0],), dtype=jnp.int8),
             rebound_target_cell=no_player,
             rebound_winner=no_player,
             rebound_global_contest=zero_flag,
@@ -2749,6 +2824,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_attempt=zero_flag,
                 offensive_rebound=zero_flag,
                 defensive_rebound=zero_flag,
+                rebound_counterfactual_advantages=jnp.zeros((state.positions.shape[0],), dtype=jnp.float32),
+                rebound_counterfactual_mask=jnp.zeros((state.positions.shape[0],), dtype=jnp.int8),
                 rebound_target_cell=no_player,
                 rebound_winner=no_player,
                 rebound_global_contest=zero_flag,
@@ -3038,6 +3115,81 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
             winner_logits = jnp.where(use_local_contest, local_winner_logits, global_winner_logits)
             rebound_global_contest = rebound_active & (~use_local_contest)
+            def _counterfactual_positioning_signal(_):
+                n_players = final_state.positions.shape[0]
+                actual_winner_probs = jax.nn.softmax(winner_logits, axis=-1)
+                offense_mask = (static.role_encoding > 0.0).astype(jnp.float32)
+                actual_offense_mass = jnp.sum(actual_winner_probs * offense_mask)
+                actual_team_mass = jnp.where(
+                    static.role_encoding > 0.0,
+                    actual_offense_mass,
+                    1.0 - actual_offense_mass,
+                )
+                counterfactual_positions = jnp.broadcast_to(
+                    final_state.positions[None, :, :],
+                    (n_players, n_players, final_state.positions.shape[-1]),
+                )
+                counterfactual_positions = jnp.where(
+                    jnp.eye(n_players, dtype=jnp.bool_)[:, :, None],
+                    jnp.broadcast_to(
+                        shot_clock_state.positions[None, :, :],
+                        counterfactual_positions.shape,
+                    ),
+                    counterfactual_positions,
+                )
+                counterfactual_logits, _counterfactual_local_eligible, _counterfactual_use_local = (
+                    _rebound_winner_logits_for_positions(
+                        static,
+                        counterfactual_positions,
+                        final_state.rebound_skill,
+                        sampled_rebound_target,
+                        jnp,
+                    )
+                )
+                counterfactual_winner_probs = jax.nn.softmax(counterfactual_logits, axis=-1)
+                counterfactual_offense_mass = jnp.sum(
+                    counterfactual_winner_probs * offense_mask[None, :],
+                    axis=-1,
+                )
+                counterfactual_team_mass = jnp.where(
+                    static.role_encoding > 0.0,
+                    counterfactual_offense_mass,
+                    1.0 - counterfactual_offense_mass,
+                )
+                moved = jnp.any(
+                    final_state.positions != shot_clock_state.positions,
+                    axis=-1,
+                )
+                eligible_for_credit = jnp.where(
+                    use_local_contest,
+                    local_eligible,
+                    jnp.ones_like(local_eligible, dtype=jnp.bool_),
+                )
+                signal_mask = (
+                    rebound_active
+                    & moved
+                    & eligible_for_credit
+                ).astype(jnp.int8)
+                return (
+                    (actual_team_mass - counterfactual_team_mass).astype(jnp.float32),
+                    signal_mask,
+                )
+
+            def _no_counterfactual_positioning_signal(_):
+                return (
+                    jnp.zeros((final_state.positions.shape[0],), dtype=jnp.float32),
+                    jnp.zeros((final_state.positions.shape[0],), dtype=jnp.int8),
+                )
+
+            (
+                rebound_counterfactual_advantages,
+                rebound_counterfactual_mask,
+            ) = jax.lax.cond(
+                static.rebound_counterfactual_positioning_enabled.astype(jnp.bool_),
+                _counterfactual_positioning_signal,
+                _no_counterfactual_positioning_signal,
+                operand=None,
+            )
             rebound_diagnostics = build_rebound_diagnostics(
                 rebound_active=rebound_active,
                 role_encoding=static.role_encoding,
@@ -3337,6 +3489,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_attempt=rebound_active.astype(jnp.int8),
                 offensive_rebound=offensive_rebound.astype(jnp.int8),
                 defensive_rebound=defensive_rebound.astype(jnp.int8),
+                rebound_counterfactual_advantages=rebound_counterfactual_advantages,
+                rebound_counterfactual_mask=rebound_counterfactual_mask,
                 rebound_target_cell=jnp.where(rebound_active, sampled_rebound_target.astype(jnp.int32), no_player),
                 rebound_winner=jnp.where(rebound_active, sampled_rebound_winner.astype(jnp.int32), no_player),
                 rebound_global_contest=rebound_global_contest.astype(jnp.int8),
@@ -3893,6 +4047,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "enable_rebound_reward_redistribution",
         "offensive_rebound_reward_advance",
         "rebound_reward_once_per_possession",
+        "rebound_counterfactual_positioning_enabled",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

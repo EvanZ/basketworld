@@ -4868,6 +4868,7 @@ const totalReboundChances = computed(() => (
   + Number(statsState.value?.rebounds?.defensive || 0)
 ));
 const overallOrbPct = computed(() => safeDiv(Number(statsState.value?.rebounds?.offensive || 0), totalReboundChances.value) * 100);
+const overallDrbPct = computed(() => safeDiv(Number(statsState.value?.rebounds?.defensive || 0), totalReboundChances.value) * 100);
 const reboundDiag = computed(() => statsState.value?.reboundDiagnostics || {});
 const reboundResolvedParams = computed(() => reboundDiag.value?.resolvedParams || {});
 const reboundEligibilityDiag = computed(() => reboundDiag.value?.eligibility || {});
@@ -6128,6 +6129,7 @@ async function copyStatsMarkdown() {
       ['Total turnovers', String(s.turnovers)],
       ['Offensive rebounds', String(s.rebounds?.offensive || 0)],
       ['Defensive rebounds', String(s.rebounds?.defensive || 0)],
+      ['DRB%', overallDrbPct.value.toFixed(1) + '%'],
       ['ORB%', overallOrbPct.value.toFixed(1) + '%'],
       ['Post-ORB points/sample', `${avgPostOrbPoints.value.toFixed(2)} (${postOrbPoints.value.toFixed(0)}/${postOrbSampleCount.value})`],
       ['Post-ORB shaped return/sample', `${avgPostOrbConsensusShapedReturn.value.toFixed(2)} (${postOrbConsensusShapedReturn.value.toFixed(1)}/${postOrbShapedReturnSampleCount.value})`],
@@ -8408,7 +8410,10 @@ function offenseSkillDeltaLabel(idx) {
               <th>Assists</th>
               <th>Pot. Ast</th>
               <th>TOV</th>
-              <th title="Offensive rebounds divided by softmax-eligible rebound chances.">ORB / eligible</th>
+              <th>ORB</th>
+              <th title="This player's offensive rebounds divided by all resolved rebound chances; unlike ORBE%, it is not conditioned on eligibility.">ORB%</th>
+              <th title="Times this offensive player was eligible for the rebound winner softmax.">Eligible chances</th>
+              <th title="Offensive rebounds divided by softmax-eligible rebound chances; this is a player eligibility rate, not team ORB%.">ORBE%</th>
               <th title="Average distance to the sampled rebound target when this player was eligible for the rebound softmax.">Avg eligible dist</th>
               <th title="Average rebound skill for this player on eligible rebound chances.">Avg skill</th>
               <th title="Average winner probability assigned by the rebound softmax when this player was eligible.">Avg win P</th>
@@ -8425,7 +8430,10 @@ function offenseSkillDeltaLabel(idx) {
               <td>{{ row.assists }}</td>
               <td>{{ row.potentialAssists }}</td>
               <td>{{ row.turnovers }}</td>
-              <td>{{ row.offensiveRebounds }}/{{ row.reboundChances }} ({{ row.orbPct.toFixed(1) }}%)</td>
+              <td>{{ row.offensiveRebounds }}</td>
+              <td>{{ (safeDiv(row.offensiveRebounds, totalReboundChances) * 100).toFixed(1) }}%</td>
+              <td>{{ row.reboundChances }}</td>
+              <td>{{ row.orbPct.toFixed(1) }}%</td>
               <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
               <td>{{ row.avgEligibleReboundSkill !== null ? row.avgEligibleReboundSkill.toFixed(2) : 'N/A' }}</td>
               <td>{{ row.avgReboundWinProb !== null ? row.avgReboundWinProb.toFixed(1) + '%' : 'N/A' }}</td>
@@ -8442,8 +8450,9 @@ function offenseSkillDeltaLabel(idx) {
               <th>Player</th>
               <th>Steals</th>
               <th>DRB</th>
+              <th title="This player's defensive rebounds divided by all resolved rebound chances; unlike DRBE%, it is not conditioned on eligibility.">DRB%</th>
               <th title="Times this defender was eligible for the rebound winner softmax.">Eligible chances</th>
-              <th title="Defensive rebounds divided by softmax-eligible rebound chances.">DRB%</th>
+              <th title="Defensive rebounds divided by softmax-eligible rebound chances; this is a player eligibility rate, not team DRB%.">DRBE%</th>
               <th title="Average distance to the sampled rebound target when this player was eligible for the rebound softmax.">Avg eligible dist</th>
               <th title="Average rebound skill for this player on eligible rebound chances.">Avg skill</th>
               <th title="Average winner probability assigned by the rebound softmax when this player was eligible.">Avg win P</th>
@@ -8454,6 +8463,7 @@ function offenseSkillDeltaLabel(idx) {
               <td>Player {{ row.playerId }}</td>
               <td>{{ row.steals }}</td>
               <td>{{ row.defensiveRebounds }}</td>
+              <td>{{ (safeDiv(row.defensiveRebounds, totalReboundChances) * 100).toFixed(1) }}%</td>
               <td>{{ row.reboundChances }}</td>
               <td>{{ row.drbPct.toFixed(1) }}%</td>
               <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
@@ -8521,6 +8531,7 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Missed shots recovered by the offense, extending the possession."><span class="param-name">Offensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.offensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Missed shots recovered by the defense, ending the possession."><span class="param-name">Defensive rebounds:</span><span class="param-value">{{ statsState.rebounds?.defensive || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offensive rebound percentage: offensive rebounds divided by all resolved rebound chances."><span class="param-name">ORB%:</span><span class="param-value">{{ overallOrbPct.toFixed(1) }}%</span></div>
+            <div class="param-item" data-tooltip="Defensive rebound percentage: defensive rebounds divided by all resolved rebound chances."><span class="param-name">DRB%:</span><span class="param-value">{{ overallDrbPct.toFixed(1) }}%</span></div>
             <div class="param-item" data-tooltip="Empirical continuation value after offensive rebounds: future points scored later in the same possession, averaged across offensive rebound continuation states. Multiple offensive rebounds in one possession each count as a separate continuation sample."><span class="param-name">Post-ORB points/sample:</span><span class="param-value">{{ postOrbSampleCount > 0 ? `${avgPostOrbPoints.toFixed(2)} (${postOrbPoints.toFixed(0)}/${postOrbSampleCount})` : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Realized discounted continuation return from the first decision state after an offensive rebound. It uses the shaped environment reward stream and current task-reward scale, including rebound settlement and phi shaping; training-only intent bonuses are excluded."><span class="param-name">Post-ORB shaped return/sample:</span><span class="param-value">{{ postOrbShapedReturnSampleCount > 0 ? `${avgPostOrbConsensusShapedReturn.toFixed(2)} (${postOrbConsensusShapedReturn.toFixed(1)}/${postOrbShapedReturnSampleCount})` : 'N/A' }}</span></div>
             <div class="param-item" data-tooltip="Critic-implied shaped continuation value at the first decision state after offensive rebounds, averaged as 0.5 * (Vo - Vd). Compare this with post-ORB shaped return, not raw points."><span class="param-name">Post-ORB critic value/sample:</span><span class="param-value">{{ postOrbValueSampleCount > 0 ? `${avgPostOrbConsensusValue.toFixed(2)} (${postOrbConsensusValue.toFixed(1)}/${postOrbValueSampleCount})` : 'N/A' }}</span></div>

@@ -21,6 +21,7 @@ class TrainerConfig:
     ppo_completed_episodes_only: bool = False
     rebound_critic_policy_coef: float = 0.0
     rebound_critic_value_coef: float = 0.0
+    rebound_counterfactual_positioning_coef: float = 0.0
 
 
 class TrajectoryBatch(NamedTuple):
@@ -39,6 +40,8 @@ class TrajectoryBatch(NamedTuple):
     rebound_aux_targets: Any
     rebound_aux_mask: Any
     rebound_positioning_mask: Any
+    rebound_counterfactual_advantages: Any
+    rebound_counterfactual_mask: Any
     rewards: Any
     dones: Any
     phi_r_shape: Any
@@ -136,6 +139,9 @@ class PPOBatch(NamedTuple):
     rebound_aux_targets: Any
     rebound_aux_mask: Any
     rebound_positioning_mask: Any
+    rebound_counterfactual_advantages: Any
+    rebound_counterfactual_raw_advantages: Any
+    rebound_counterfactual_mask: Any
     active_mask: Any
     loss_weights: Any
     loss_denominator: Any
@@ -365,6 +371,30 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         normalized_rebound_advantages,
         jnp.zeros_like(normalized_rebound_advantages),
     )
+    rebound_counterfactual_mask = (
+        rollout.trajectory.rebound_counterfactual_mask.astype(jnp.float32)
+        * active_mask[..., None].astype(jnp.float32)
+    )
+    rebound_counterfactual_raw_advantages = (
+        rollout.trajectory.rebound_counterfactual_advantages.astype(jnp.float32)
+    )
+    rebound_counterfactual_denominator = jnp.maximum(
+        jnp.sum(rebound_counterfactual_mask), 1.0
+    )
+    rebound_counterfactual_rms = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(
+                jnp.square(rebound_counterfactual_raw_advantages)
+                * rebound_counterfactual_mask
+            ) / rebound_counterfactual_denominator,
+            1.0e-8,
+        )
+    )
+    normalized_rebound_counterfactual_advantages = jnp.where(
+        rebound_counterfactual_mask.astype(jnp.bool_),
+        rebound_counterfactual_raw_advantages / rebound_counterfactual_rms,
+        jnp.zeros_like(rebound_counterfactual_raw_advantages),
+    )
     return PPOBatch(
         flat_obs=rollout.trajectory.flat_obs.reshape(
             -1,
@@ -398,6 +428,22 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         ).reshape(
             -1,
             int(rollout.trajectory.rebound_positioning_mask.shape[-1]),
+        ),
+        rebound_counterfactual_advantages=(
+            normalized_rebound_counterfactual_advantages.reshape(
+                -1,
+                int(rollout.trajectory.rebound_counterfactual_advantages.shape[-1]),
+            )
+        ),
+        rebound_counterfactual_raw_advantages=(
+            rebound_counterfactual_raw_advantages.reshape(
+                -1,
+                int(rollout.trajectory.rebound_counterfactual_advantages.shape[-1]),
+            )
+        ),
+        rebound_counterfactual_mask=rebound_counterfactual_mask.reshape(
+            -1,
+            int(rollout.trajectory.rebound_counterfactual_mask.shape[-1]),
         ),
         active_mask=flat_active_mask,
         loss_weights=flat_loss_weights,

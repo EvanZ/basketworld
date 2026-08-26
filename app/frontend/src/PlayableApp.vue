@@ -37,6 +37,7 @@ const selectedPeriodLengthMinutes = ref(5);
 
 const gameState = ref(null);
 const gameHistory = ref([]);
+const showGhostTrails = ref(true);
 const activePlayerId = ref(null);
 const boardSelections = ref({});
 const controlsRef = ref(null);
@@ -2322,6 +2323,13 @@ onBeforeUnmount(() => {
           Rules & Physics
         </button>
         <button
+          :disabled="!hasGame"
+          :aria-pressed="showGhostTrails"
+          @click="showGhostTrails = !showGhostTrails"
+        >
+          {{ showGhostTrails ? 'Hide Ghost Trails' : 'Show Ghost Trails' }}
+        </button>
+        <button
           v-if="isDevBuild && hasGame && !isGameOver"
           :disabled="actionLoading || transitionRunning"
           @click="forceGameOverPreview = !forceGameOverPreview"
@@ -2400,6 +2408,7 @@ onBeforeUnmount(() => {
           <div class="board-stage">
             <GameBoard
               :game-history="gameHistory"
+              :show-ghost-trails="showGhostTrails"
               :active-player-id="activePlayerId"
               :player-display-names="playerDisplayNames"
               :player-jersey-numbers="playerJerseyNumbers"

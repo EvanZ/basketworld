@@ -24,7 +24,7 @@ _DEFAULT_TABLE_MODEL_DIR = (
 
 
 def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
-    """Compute a read-only rebound preview for the current terminal missed shot."""
+    """Compute a read-only rebound preview from the live ball holder or a terminal miss."""
     if request is not None and not bool(getattr(request, "enabled", True)):
         return _unavailable("disabled")
 
@@ -32,7 +32,7 @@ def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
     if not state_payload:
         return _unavailable("game_not_initialized")
 
-    shot = _latest_terminal_missed_shot(state_payload, game_state)
+    shot = _preview_shot(state_payload, game_state)
     if not shot.get("available"):
         return _unavailable(str(shot.get("reason") or "terminal_not_missed_shot"))
 
@@ -62,11 +62,12 @@ def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
     target_index = int(rng.choice(len(court.cells), p=target_probs))
     params = _params_from_request(request)
     position_indices = np.asarray([court.cell_index[tuple(pos)] for pos in positions], dtype=np.int32)
-    conditional_probs = _winner_probs_for_target(
+    conditional_probs, contest_info = _winner_probs_for_target(
         court,
         position_indices,
         target_index,
         params,
+        state_payload,
     )
     winner_slot = int(rng.choice(len(positions), p=conditional_probs))
     winner_id = int(winner_slot)
@@ -75,12 +76,14 @@ def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
     for idx, target_prob in enumerate(target_probs):
         if float(target_prob) <= 0.0:
             continue
-        marginal_probs += float(target_prob) * _winner_probs_for_target(
+        target_winner_probs, _ = _winner_probs_for_target(
             court,
             position_indices,
             idx,
             params,
+            state_payload,
         )
+        marginal_probs += float(target_prob) * target_winner_probs
     marginal_probs = marginal_probs / max(1e-12, float(marginal_probs.sum()))
 
     target_cells = [
@@ -102,6 +105,7 @@ def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
         marginal_probs,
         conditional_probs,
         target_index,
+        contest_info,
     )
 
     return {
@@ -118,6 +122,7 @@ def compute_rebound_preview(game_state: Any, request: Any) -> dict[str, Any]:
             "shot_type": str(shot_type),
             "probability": _optional_float(shot.get("probability")),
             "expected_points": _optional_float(shot.get("expected_points")),
+            "source": str(shot.get("source") or "current_ball_holder"),
         },
         "target_cells": target_cells,
         "sampled_target": sampled_target,
@@ -148,6 +153,7 @@ def _current_state_payload(game_state: Any) -> dict[str, Any]:
     env = env_view(env_obj)
     return {
         "positions": [(int(q), int(r)) for q, r in env.positions],
+        "ball_holder": int(env.ball_holder) if env.ball_holder is not None else None,
         "last_action_results": getattr(env, "last_action_results", {}) or {},
         "offense_ids": [int(pid) for pid in (env.offense_ids or [])],
         "defense_ids": [int(pid) for pid in (env.defense_ids or [])],
@@ -164,9 +170,19 @@ def _current_state_payload(game_state: Any) -> dict[str, Any]:
     }
 
 
-def _latest_terminal_missed_shot(state_payload: dict[str, Any], game_state: Any) -> dict[str, Any]:
+def _preview_shot(state_payload: dict[str, Any], game_state: Any) -> dict[str, Any]:
+    """Use a real terminal miss when present, otherwise preview the current holder's shot."""
     if not bool(state_payload.get("done")):
-        return {"available": False, "reason": "episode_not_done"}
+        ball_holder = state_payload.get("ball_holder")
+        if ball_holder is None or int(ball_holder) < 0:
+            return {"available": False, "reason": "ball_holder_unavailable"}
+        return {
+            "available": True,
+            "source": "current_ball_holder",
+            "player_id": int(ball_holder),
+            "probability": state_payload.get("ball_handler_shot_probability"),
+        }
+
     results = state_payload.get("last_action_results") or {}
     shots = results.get("shots") if isinstance(results, dict) else None
     if isinstance(shots, dict) and shots:
@@ -184,6 +200,7 @@ def _latest_terminal_missed_shot(state_payload: dict[str, Any], game_state: Any)
         if missed:
             missed.sort(key=lambda row: int(row.get("player_id", 0)))
             missed[0]["available"] = True
+            missed[0]["source"] = "terminal_missed_shot"
             return missed[0]
         if made:
             return {"available": False, "reason": "last_terminal_shot_was_made"}
@@ -193,6 +210,7 @@ def _latest_terminal_missed_shot(state_payload: dict[str, Any], game_state: Any)
         last = dict(shot_log[-1])
         if not bool(last.get("success", False)) and last.get("player_id") is not None:
             last["available"] = True
+            last["source"] = "terminal_missed_shot"
             return last
         return {"available": False, "reason": "last_terminal_shot_was_made"}
     return {"available": False, "reason": "terminal_not_missed_shot"}
@@ -311,16 +329,82 @@ def _adjust_target_distribution(probs: np.ndarray, request: Any) -> np.ndarray:
         return np.ones_like(adjusted, dtype=np.float64) / float(adjusted.size)
     return adjusted / total
 
-
 def _winner_probs_for_target(
+
     court: Court,
     position_indices: np.ndarray,
     target_index: int,
     params: ReboundParams,
-) -> np.ndarray:
-    dist_to_target = court.hex_distance_lut[position_indices, int(target_index)].astype(np.float64)
-    scores = -params.target_distance_weight * dist_to_target
-    return _softmax(scores / max(1e-6, params.winner_temperature))
+    state_payload: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Mirror the JAX winner logits, including local-contest eligibility."""
+    distances = court.hex_distance_lut[position_indices, int(target_index)].astype(np.float64)
+    runtime = state_payload.get("rebound_runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+
+    def nonnegative(name: str, default: float) -> float:
+        try:
+            value = float(runtime.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+        return max(0.0, value) if np.isfinite(value) else float(default)
+
+    skills = np.zeros(len(position_indices), dtype=np.float64)
+    raw_skills = state_payload.get("player_rebound_skills")
+    if isinstance(raw_skills, dict):
+        for pid in range(len(skills)):
+            try:
+                skills[pid] = float(raw_skills.get(str(pid), raw_skills.get(pid, 0.0)))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(raw_skills, (list, tuple, np.ndarray)):
+        for pid, value in enumerate(raw_skills[: len(skills)]):
+            try:
+                skills[pid] = float(value)
+            except (TypeError, ValueError):
+                continue
+    skills = np.where(np.isfinite(skills), skills, 0.0)
+
+    distance_weight = max(0.0, float(params.target_distance_weight))
+    skill_weight = nonnegative("skill_weight", 0.0)
+    basket_weight = nonnegative("basket_position_weight", 0.0)
+    target_basket_distance = float(court.hex_distance_lut[int(target_index), int(court.basket_index)])
+    player_basket_distances = court.hex_distance_lut[position_indices, int(court.basket_index)].astype(np.float64)
+    basket_penalties = np.maximum(0.0, player_basket_distances - target_basket_distance)
+    effective_distances = distances - (skill_weight * skills)
+    logits = (
+        (-distance_weight * effective_distances)
+        - (basket_weight * basket_penalties)
+    ) / max(1.0e-6, float(params.winner_temperature))
+
+    raw_mode = str(runtime.get("contest_mode", "global_contest")).strip().lower().replace("-", "_")
+    contest_mode = "local_contest" if raw_mode in {"local", "local_contest"} else "global_contest"
+    eligible = np.ones_like(distances, dtype=bool)
+    radius_used: int | None = None
+    fallback_global = False
+    if contest_mode == "local_contest":
+        try:
+            radius = max(0, int(runtime.get("contest_radius", 1)))
+        except (TypeError, ValueError):
+            radius = 1
+        radius_eligible = distances <= float(radius)
+        if bool(np.any(radius_eligible)):
+            eligible = radius_eligible
+            radius_used = radius
+            logits = np.where(eligible, logits, -1.0e9)
+        else:
+            fallback_global = True
+
+    return _softmax(logits), {
+        "contest_mode": contest_mode,
+        "contest_radius_used": radius_used,
+        "contest_fallback_global": fallback_global,
+        "eligible": eligible,
+        "distances": distances,
+        "effective_distances": effective_distances,
+        "basket_penalties": basket_penalties,
+        "skills": skills,
+    }
 
 
 def _winner_rows(
@@ -331,11 +415,19 @@ def _winner_rows(
     marginal_probs: np.ndarray,
     conditional_probs: np.ndarray,
     target_index: int,
+    contest_info: dict[str, Any],
 ) -> list[dict[str, Any]]:
     offense_ids = {int(pid) for pid in (state_payload.get("offense_ids") or [])}
     defense_ids = {int(pid) for pid in (state_payload.get("defense_ids") or [])}
+    eligible = np.asarray(contest_info["eligible"], dtype=bool)
+    include_only_eligible = (
+        contest_info["contest_mode"] == "local_contest"
+        and not bool(contest_info["contest_fallback_global"])
+    )
     rows: list[dict[str, Any]] = []
     for pid, pos in enumerate(positions):
+        if include_only_eligible and not bool(eligible[pid]):
+            continue
         team = "offense" if pid in offense_ids else ("defense" if pid in defense_ids else "unknown")
         rows.append(
             {
@@ -345,7 +437,14 @@ def _winner_rows(
                 "r": int(pos[1]),
                 "prob": float(marginal_probs[pid]),
                 "conditional_prob": float(conditional_probs[pid]),
-                "distance_to_sampled_target": int(court.hex_distance_lut[int(position_indices[pid]), int(target_index)]),
+                "distance_to_sampled_target": int(contest_info["distances"][pid]),
+                "effective_distance_to_sampled_target": float(contest_info["effective_distances"][pid]),
+                "basket_position_penalty": float(contest_info["basket_penalties"][pid]),
+                "rebound_skill": float(contest_info["skills"][pid]),
+                "eligible": bool(eligible[pid]),
+                "contest_mode": contest_info["contest_mode"],
+                "contest_radius_used": contest_info["contest_radius_used"],
+                "contest_fallback_global": bool(contest_info["contest_fallback_global"]),
             }
         )
     rows.sort(key=lambda row: (-float(row["conditional_prob"]), int(row["player_id"])))

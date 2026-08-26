@@ -587,6 +587,30 @@ def _build_rebound_auxiliary_transition(
         "rebound_positioning_mask": positioning_mask,
     }
 
+def _build_rebound_counterfactual_transition(
+    env_out,
+    training_ids,
+    active_step,
+    jnp,
+) -> dict[str, Any]:
+    """Select learner-specific rebound positioning advantages from an env transition."""
+    advantages = jnp.take(
+        env_out.rebound_counterfactual_advantages.astype(jnp.float32),
+        training_ids,
+        axis=1,
+    )
+    mask = jnp.take(
+        env_out.rebound_counterfactual_mask.astype(jnp.float32),
+        training_ids,
+        axis=1,
+    )
+    mask = mask * active_step[:, None].astype(jnp.float32)
+    return {
+        "rebound_counterfactual_advantages": advantages * mask,
+        "rebound_counterfactual_mask": mask,
+    }
+
+
 def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     turnover = env_out.turnover.astype(jnp.int8)
     turnover_bool = turnover.astype(jnp.bool_)
@@ -1057,6 +1081,12 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 active_step,
                 jnp,
             )
+            rebound_counterfactual = _build_rebound_counterfactual_transition(
+                env_out,
+                training_ids,
+                active_step,
+                jnp,
+            )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
@@ -1082,6 +1112,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
                 **rebound_auxiliary,
+                **rebound_counterfactual,
                 rewards=masked_reward,
                 dones=masked_done,
                 phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
@@ -1364,6 +1395,12 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 active_step,
                 jnp,
             )
+            rebound_counterfactual = _build_rebound_counterfactual_transition(
+                env_out,
+                training_ids,
+                active_step,
+                jnp,
+            )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
@@ -1392,6 +1429,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 ),
                 selected_log_probs=policy_out["selected_log_probs"],
                 **rebound_auxiliary,
+                **rebound_counterfactual,
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
@@ -1766,6 +1804,12 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 active_step,
                 jnp,
             )
+            rebound_counterfactual = _build_rebound_counterfactual_transition(
+                env_out,
+                training_ids,
+                active_step,
+                jnp,
+            )
             rebound_metrics = _mask_rebound_transition_metrics(
                 _build_rebound_transition_metrics(env_out, jnp),
                 active_step,
@@ -1798,6 +1842,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     0.0,
                 ),
                 **rebound_auxiliary,
+                **rebound_counterfactual,
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
                 rewards=masked_reward,
@@ -2750,6 +2795,10 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         trainer_config.rebound_critic_value_coef,
         dtype=jnp.float32,
     )
+    rebound_counterfactual_positioning_coef = jnp.asarray(
+        trainer_config.rebound_counterfactual_positioning_coef,
+        dtype=jnp.float32,
+    )
     epochs = int(trainer_config.policy_update_epochs)
     configured_minibatches = max(1, int(getattr(trainer_config, "ppo_minibatches", 1)))
     transform = build_adam_transform(
@@ -2843,12 +2892,39 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             )
             / rebound_aux_denominator
         )
+        rebound_counterfactual_mask = batch.rebound_counterfactual_mask.astype(jnp.float32)
+        rebound_counterfactual_denominator = jnp.maximum(
+            jnp.sum(rebound_counterfactual_mask), 1.0
+        )
+        rebound_counterfactual_log_ratio = (
+            new_selected_log_probs - batch.old_selected_log_probs
+        )
+        rebound_counterfactual_ratio = jnp.exp(rebound_counterfactual_log_ratio)
+        rebound_counterfactual_clipped_ratio = jnp.clip(
+            rebound_counterfactual_ratio,
+            1.0 - clip_range,
+            1.0 + clip_range,
+        )
+        rebound_counterfactual_policy_loss = -(
+            jnp.sum(
+                jnp.minimum(
+                    rebound_counterfactual_ratio * batch.rebound_counterfactual_advantages,
+                    rebound_counterfactual_clipped_ratio * batch.rebound_counterfactual_advantages,
+                )
+                * rebound_counterfactual_mask
+            )
+            / rebound_counterfactual_denominator
+        )
         total_loss = (
             policy_loss
             + (value_coef * value_loss)
             - (entropy_coef * entropy_bonus)
             + (rebound_critic_policy_coef * rebound_policy_loss)
             + (rebound_critic_value_coef * rebound_value_loss)
+            + (
+                rebound_counterfactual_positioning_coef
+                * rebound_counterfactual_policy_loss
+            )
         )
         metrics = {
             "total_loss": total_loss,
@@ -2881,6 +2957,38 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "rebound_aux_approx_kl": (
                 jnp.sum(((rebound_ratio - 1.0) - rebound_log_ratio) * rebound_aux_mask)
                 / rebound_aux_denominator
+            ),
+            "rebound_counterfactual_positioning_coef": rebound_counterfactual_positioning_coef,
+            "rebound_counterfactual_policy_loss": rebound_counterfactual_policy_loss,
+            "rebound_counterfactual_player_count": jnp.sum(rebound_counterfactual_mask),
+            "rebound_counterfactual_raw_advantage_mean": (
+                jnp.sum(
+                    batch.rebound_counterfactual_raw_advantages
+                    * rebound_counterfactual_mask
+                ) / rebound_counterfactual_denominator
+            ),
+            "rebound_counterfactual_raw_advantage_abs_mean": (
+                jnp.sum(
+                    jnp.abs(batch.rebound_counterfactual_raw_advantages)
+                    * rebound_counterfactual_mask
+                ) / rebound_counterfactual_denominator
+            ),
+            "rebound_counterfactual_normalized_advantage_mean": (
+                jnp.sum(
+                    batch.rebound_counterfactual_advantages * rebound_counterfactual_mask
+                ) / rebound_counterfactual_denominator
+            ),
+            "rebound_counterfactual_normalized_advantage_abs_mean": (
+                jnp.sum(
+                    jnp.abs(batch.rebound_counterfactual_advantages)
+                    * rebound_counterfactual_mask
+                ) / rebound_counterfactual_denominator
+            ),
+            "rebound_counterfactual_approx_kl": (
+                jnp.sum(
+                    ((rebound_counterfactual_ratio - 1.0) - rebound_counterfactual_log_ratio)
+                    * rebound_counterfactual_mask
+                ) / rebound_counterfactual_denominator
             ),
         }
         return total_loss, metrics

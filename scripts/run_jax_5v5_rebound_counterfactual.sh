@@ -12,11 +12,6 @@ cd "$ROOT"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.env/bin/python}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-# Continue the exact skill-only ablation from its last published checkpoint.
-CONTINUATION_RUN_ID="4617a90aa85b43a6b0ac1992adb7da02"
-CONTINUATION_ARTIFACT="models/update_0021408"
-CONTINUATION_TOTAL_UPDATES=31408
-
 exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --run-train-loop \
   --ppo-completed-episodes-only \
@@ -133,8 +128,10 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   -0.25 \
   --rebound-skill-weight \
   1 \
-  --no-rebound-target-observation-features \
-  --no-rebound-win-prob-features \
+  --no-rebound-critic-enabled \
+  --rebound-counterfactual-positioning-enabled \
+  --rebound-counterfactual-positioning-coef \
+  0.02 \
   --rebound-contest-mode \
   local_contest \
   --rebound-contest-radius \
@@ -145,14 +142,8 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   actual_points \
   --kernel-batch-size \
   512 \
-  --continue-run-id \
-  "$CONTINUATION_RUN_ID" \
-  --continue-artifact \
-  "$CONTINUATION_ARTIFACT" \
-  --continue-preserve-env-state \
-  --continue-preserve-intent-discriminator-state \
   --num-updates \
-  "$CONTINUATION_TOTAL_UPDATES" \
+  30000 \
   --log-every-updates \
   10 \
   --eval-every-updates \
@@ -375,4 +366,4 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --mlflow-experiment-name \
   dev \
   --mlflow-run-name \
-  'stateful 10k continuation of skill-only rebound-observation baseline | eval deploy | offense intents | no defense intents | no rebound redistribution | rebound basket position weight 1 | rebound contest radius 2 | rebound skill only | reaction pass model | 5-on-5'
+  'baseline rebound observations | counterfactual rebound positioning aux 0.02 | no rebound critic heads | eval deploy | offense intents | no defense intents | no rebound redistribution | rebound basket position weight 1 | rebound contest radius 2 | rebound skill + lower pass risk | reaction pass model | 5-on-5'

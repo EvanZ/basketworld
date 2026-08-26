@@ -1870,7 +1870,7 @@ def mcts_advise(request: MCTSAdviseRequest):
 
 @router.post("/api/rebound_preview")
 def rebound_preview(request: ReboundPreviewRequest | None = None):
-    """Read-only rebound target/winner preview for terminal missed shots."""
+    """Read-only rebound target/winner preview for the live holder or a terminal miss."""
     request = request or ReboundPreviewRequest()
     try:
         return jsonable_encoder(compute_rebound_preview(game_state, request))

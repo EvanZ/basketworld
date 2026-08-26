@@ -226,6 +226,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "enable_rebound_reward_redistribution",
         "offensive_rebound_reward_advance",
         "rebound_reward_once_per_possession",
+        "rebound_counterfactual_positioning_enabled",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -334,6 +335,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "enable_rebound_reward_redistribution",
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
+    "rebound_counterfactual_positioning_enabled",
 )
 
 
@@ -741,7 +743,8 @@ def parse_args(argv=None):
         action="store_true",
         help=(
             "When resuming, restore model/optimizer/RNG/update state but reset transient "
-            "batched env rows. This is enabled automatically for --continue-run-id."
+            "batched env rows. This is the default for --continue-run-id unless "
+            "--continue-preserve-env-state is supplied."
         ),
     )
     parser.add_argument(
@@ -749,7 +752,24 @@ def parse_args(argv=None):
         action="store_true",
         help=(
             "When resuming, reset the auxiliary intent discriminator params, optimizer, "
-            "and bonus normalization stats. This is enabled automatically for --continue-run-id."
+            "and bonus normalization stats. This is the default for --continue-run-id unless "
+            "--continue-preserve-intent-discriminator-state is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--continue-preserve-env-state",
+        action="store_true",
+        help=(
+            "With --continue-run-id, restore the checkpoint's batched env rows and RNG "
+            "instead of the default reset."
+        ),
+    )
+    parser.add_argument(
+        "--continue-preserve-intent-discriminator-state",
+        action="store_true",
+        help=(
+            "With --continue-run-id, restore the checkpoint's auxiliary intent "
+            "discriminator params, optimizer, and bonus stats instead of the default reset."
         ),
     )
     parser.add_argument(
@@ -1028,6 +1048,21 @@ def parse_args(argv=None):
         default=0.5,
         help="Weight for the rebound-outcome critic regression loss.",
     )
+    parser.add_argument(
+        "--rebound-counterfactual-positioning-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add an auxiliary PPO positioning loss on rebound events using each "
+            "mover's counterfactual team softmax-mass gain versus its pre-move cell."
+        ),
+    )
+    parser.add_argument(
+        "--rebound-counterfactual-positioning-coef",
+        type=float,
+        default=0.02,
+        help="Weight for the per-player rebound counterfactual PPO auxiliary loss.",
+    )
     args = parser.parse_args(argv_list)
     if bool(getattr(args, "use_set_obs", False)):
         args.policy_model = "attention"
@@ -1206,6 +1241,14 @@ def validate_train_args(args) -> None:
         getattr(args, "enable_rebounds", False)
     ):
         raise SystemExit("--rebound-critic-enabled requires --enable-rebounds.")
+    if bool(getattr(args, "rebound_counterfactual_positioning_enabled", False)) and not bool(
+        getattr(args, "enable_rebounds", False)
+    ):
+        raise SystemExit(
+            "--rebound-counterfactual-positioning-enabled requires --enable-rebounds."
+        )
+    if float(getattr(args, "rebound_counterfactual_positioning_coef", 0.0)) < 0.0:
+        raise SystemExit("--rebound-counterfactual-positioning-coef must be >= 0.")
     for key in ("rebound_critic_policy_coef", "rebound_critic_value_coef"):
         if float(getattr(args, key, 0.0)) < 0.0:
             raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
@@ -1353,6 +1396,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "enable_rebound_reward_redistribution": False,
     "offensive_rebound_reward_advance": 0.4,
     "rebound_reward_once_per_possession": True,
+    "rebound_counterfactual_positioning_enabled": False,
 }
 
 
@@ -1387,6 +1431,11 @@ def build_trainer_config(args) -> TrainerConfig:
         rebound_critic_value_coef=(
             float(getattr(args, "rebound_critic_value_coef", 0.0))
             if bool(getattr(args, "rebound_critic_enabled", False))
+            else 0.0
+        ),
+        rebound_counterfactual_positioning_coef=(
+            float(getattr(args, "rebound_counterfactual_positioning_coef", 0.0))
+            if bool(getattr(args, "rebound_counterfactual_positioning_enabled", False))
             else 0.0
         ),
     )
@@ -1585,6 +1634,9 @@ def _checkpoint_trainer_config_from_args(
         ),
         "rebound_reward_once_per_possession": bool(
             getattr(args, "rebound_reward_once_per_possession", True)
+        ),
+        "rebound_counterfactual_positioning_enabled": bool(
+            getattr(args, "rebound_counterfactual_positioning_enabled", False)
         ),
     }
     config.update({key: to_builtin(value) for key, value in selector_fields.items()})
@@ -2428,6 +2480,12 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/rebound_critic_enabled": bool(getattr(args, "rebound_critic_enabled", False)),
         "jax/rebound_critic_policy_coef": float(trainer_config.rebound_critic_policy_coef),
         "jax/rebound_critic_value_coef": float(trainer_config.rebound_critic_value_coef),
+        "jax/rebound_counterfactual_positioning_enabled": bool(
+            getattr(args, "rebound_counterfactual_positioning_enabled", False)
+        ),
+        "jax/rebound_counterfactual_positioning_coef": float(
+            trainer_config.rebound_counterfactual_positioning_coef
+        ),
         "jax/task_reward_scale_start": (
             ""
             if getattr(args, "task_reward_scale_start", None) is None
@@ -2459,11 +2517,25 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/checkpoint_log_ramp_updates": int(getattr(args, "checkpoint_log_ramp_updates", 0)),
         "jax/resume_reset_env_state": bool(
             getattr(args, "resume_reset_env_state", False)
-            or str(getattr(args, "continue_run_id", "") or "").strip()
+            or (
+                str(getattr(args, "continue_run_id", "") or "").strip()
+                and not bool(getattr(args, "continue_preserve_env_state", False))
+            )
         ),
         "jax/resume_reset_intent_discriminator_state": bool(
             getattr(args, "resume_reset_intent_discriminator_state", False)
-            or str(getattr(args, "continue_run_id", "") or "").strip()
+            or (
+                str(getattr(args, "continue_run_id", "") or "").strip()
+                and not bool(
+                    getattr(args, "continue_preserve_intent_discriminator_state", False)
+                )
+            )
+        ),
+        "jax/continue_preserve_env_state": bool(
+            getattr(args, "continue_preserve_env_state", False)
+        ),
+        "jax/continue_preserve_intent_discriminator_state": bool(
+            getattr(args, "continue_preserve_intent_discriminator_state", False)
         ),
         "jax/continue_run_id": str(getattr(args, "continue_run_id", "") or ""),
         "jax/continue_artifact": str(getattr(args, "continue_artifact", "") or ""),
@@ -3773,9 +3845,14 @@ def run_training_loop(args) -> dict[str, Any]:
             )
         else:
             selector_opt_state = None
+        continuation_preserves_intent_disc = bool(
+            getattr(args, "continue_preserve_intent_discriminator_state", False)
+        )
         reset_resume_intent_disc = bool(
             getattr(args, "resume_reset_intent_discriminator_state", False)
-        ) or (continuation_checkpoint_info is not None)
+        ) or (
+            continuation_checkpoint_info is not None and not continuation_preserves_intent_disc
+        )
         if intent_disc_enabled:
             restored_disc = dict(checkpoint_payload.get("intent_discriminator_state", {}) or {})
             if reset_resume_intent_disc:
@@ -3791,6 +3868,8 @@ def run_training_loop(args) -> dict[str, Any]:
                     _restore_like_template(restored_disc["opt_state"], initial_intent_disc_opt_state)
                 )
                 intent_bonus_stats = dict(restored_disc.get("bonus_stats", {}) or init_bonus_stats())
+                if continuation_checkpoint_info is not None and continuation_preserves_intent_disc:
+                    print("[resume] Preserved auxiliary intent discriminator state for continuation.")
             else:
                 intent_disc_params = initial_intent_disc_params
                 intent_disc_opt_state = initial_intent_disc_opt_state
@@ -3799,8 +3878,11 @@ def run_training_loop(args) -> dict[str, Any]:
             intent_disc_params = None
             intent_disc_opt_state = None
             intent_bonus_stats = init_bonus_stats()
+        continuation_preserves_env_state = bool(
+            getattr(args, "continue_preserve_env_state", False)
+        )
         reset_resume_env_state = bool(getattr(args, "resume_reset_env_state", False)) or (
-            continuation_checkpoint_info is not None
+            continuation_checkpoint_info is not None and not continuation_preserves_env_state
         )
         if reset_resume_env_state:
             print(
@@ -3824,6 +3906,8 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 for role in TRAINING_ROLES
             }
+            if continuation_checkpoint_info is not None and continuation_preserves_env_state:
+                print("[resume] Preserved checkpoint transient JAX env state and RNG for continuation.")
         if reset_resume_env_state:
             base_key = jax.device_put(jax.random.fold_in(base_key, completed_updates))
         else:
@@ -4731,11 +4815,19 @@ def run_training_loop(args) -> dict[str, Any]:
             "resumed_from_checkpoint": resume_checkpoint or None,
             "resume_reset_env_state": bool(
                 getattr(args, "resume_reset_env_state", False)
-                or continuation_checkpoint_info is not None
+                or (
+                    continuation_checkpoint_info is not None
+                    and not bool(getattr(args, "continue_preserve_env_state", False))
+                )
             ),
             "resume_reset_intent_discriminator_state": bool(
                 getattr(args, "resume_reset_intent_discriminator_state", False)
-                or continuation_checkpoint_info is not None
+                or (
+                    continuation_checkpoint_info is not None
+                    and not bool(
+                        getattr(args, "continue_preserve_intent_discriminator_state", False)
+                    )
+                )
             ),
             "trainer_config": _checkpoint_trainer_config_from_args(
                 trainer_config,

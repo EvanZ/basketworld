@@ -7,6 +7,14 @@ const props = defineProps({
     type: Array,
     required: true,
   },
+  showGhostTrails: {
+    type: Boolean,
+    default: true,
+  },
+  showEpisodeOutcome: {
+    type: Boolean,
+    default: true,
+  },
   playbookOverlay: {
     type: Object,
     default: null,
@@ -86,6 +94,14 @@ const props = defineProps({
   reboundTargetOverlay: {
     type: Object,
     default: null,
+  },
+  hidePassRays: {
+    type: Boolean,
+    default: false,
+  },
+  showReboundPreviewShotTrajectory: {
+    type: Boolean,
+    default: false,
   },
   placementMode: {
     type: Boolean,
@@ -1419,6 +1435,18 @@ const basketPosition = computed(() => {
     // The basket axial coordinates already match the environment; no offset needed.
     return axialToCartesian(q, r);
 });
+const reboundPreviewShotTrajectory = computed(() => {
+  if (!props.showReboundPreviewShotTrajectory || !hasReboundTargetOverlay.value) return null;
+  const source = props.reboundTargetOverlay?.shot?.source;
+  if (source !== 'current_ball_holder' && source !== 'terminal_missed_shot') return null;
+  const shooterId = Number(props.reboundTargetOverlay?.shot?.player_id);
+  const position = currentGameState.value?.positions?.[shooterId];
+  if (!Number.isFinite(shooterId) || !Array.isArray(position) || position.length < 2) return null;
+  const start = axialToCartesian(Number(position[0]), Number(position[1]));
+  const end = basketPosition.value;
+  return { start, end, ...buildShotArcGeometry(start, end) };
+});
+
 
 const sampledReboundTargetPoint = computed(() => {
   if (!showReboundTargetOverlay.value) return null;
@@ -2901,6 +2929,7 @@ const playerTransitions = computed(() => {
 // Compute pass rays from ball handler to teammates with pass success probabilities
 const passRays = computed(() => {
   const gs = currentGameState.value;
+  if (props.hidePassRays) return [];
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return [];
   
   const ballHandlerId = gs.ball_holder;
@@ -2962,6 +2991,7 @@ const passRays = computed(() => {
 // Preview which teammate will receive a pass based on current selection/strategy
 const passTargetPreview = computed(() => {
   const gs = currentGameState.value;
+  if (props.hidePassRays) return null;
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return null;
 
   let passerId = gs.ball_holder;
@@ -4236,7 +4266,7 @@ onBeforeUnmount(() => {
 
         <!-- Draw Ghost Trails -->
         <g 
-          v-if="showPlayers"
+          v-if="showPlayers && showGhostTrails"
           v-for="(gameState, step) in gameHistory" 
           :key="`step-${step}`" 
           :style="{ opacity: 0.1 + (0.2 * step / (gameHistory.length - 1)) }"
@@ -4264,7 +4294,7 @@ onBeforeUnmount(() => {
         </g>
         
         <!-- Draw Transition Arrows -->
-        <g v-if="showPlayers" v-for="move in playerTransitions" :key="move.key" :style="{ opacity: move.opacity }">
+        <g v-if="showPlayers && showGhostTrails" v-for="move in playerTransitions" :key="move.key" :style="{ opacity: move.opacity }">
           <line
             :x1="move.startX"
             :y1="move.startY"
@@ -4277,7 +4307,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Pass target preview (selected receiver) -->
-        <g v-if="passTargetPreview && showPlayers" class="pass-preview-group">
+        <g v-if="passTargetPreview && showPlayers && !hidePassRays" class="pass-preview-group">
           <line
             :x1="passTargetPreview.start.x"
             :y1="passTargetPreview.start.y"
@@ -4611,7 +4641,21 @@ onBeforeUnmount(() => {
           </text>
         </g>
 
-        <!-- Rebound target probabilities (read-only preview after terminal missed shots) -->
+        <!-- Hypothetical current-holder shot path used by rebound preview. -->
+        <g v-if="reboundPreviewShotTrajectory" class="rebound-preview-shot-layer">
+          <path
+            :d="reboundPreviewShotTrajectory.path"
+            class="rebound-preview-shot-trajectory"
+          />
+          <circle
+            :cx="reboundPreviewShotTrajectory.start.x"
+            :cy="reboundPreviewShotTrajectory.start.y"
+            :r="HEX_RADIUS * 0.18"
+            class="rebound-preview-shot-origin"
+          />
+        </g>
+
+        <!-- Rebound target probabilities (read-only preview for the current ball holder or terminal miss) -->
         <g class="rebound-target-layer" v-if="hasReboundTargetOverlay">
           <text
             v-if="reboundOverlayTitle"
@@ -4640,6 +4684,14 @@ onBeforeUnmount(() => {
             :stroke-width="reboundTargetStrokeWidth(pt)"
             :class="['rebound-target-cell', { sampled: pt.key === sampledReboundTargetKey }]"
           />
+          <g v-if="sampledReboundTargetPoint" class="rebound-target-marker">
+            <text
+              :x="sampledReboundTargetPoint.x"
+              :y="sampledReboundTargetPoint.y + HEX_RADIUS * 0.55"
+              text-anchor="middle"
+              class="rebound-target-marker-label"
+            >T</text>
+          </g>
           <text
             v-for="pt in reboundTargetLabelPoints"
             :key="`rebound-target-label-${pt.key}`"
@@ -4736,7 +4788,7 @@ onBeforeUnmount(() => {
         </g>
         
         <!-- Draw Pass Rays (ball handler to teammates with pass success probabilities) - drawn after players for visibility -->
-        <g v-if="showPlayers" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
+        <g v-if="showPlayers && !hidePassRays" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
           <line
             :x1="ray.x1"
             :y1="ray.y1"
@@ -4759,7 +4811,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Flash effect for completed passes -->
-        <g v-if="passFlash && showPlayers" :key="`pass-flash-${passFlash.flashKey}`" class="pass-flash-group">
+        <g v-if="passFlash && showPlayers && !hidePassRays" :key="`pass-flash-${passFlash.flashKey}`" class="pass-flash-group">
           <template v-if="normalizedPassAnimationStyle === 'projectile' && passProjectile">
             <line
               :x1="passFlash.x1"
@@ -4956,7 +5008,7 @@ onBeforeUnmount(() => {
       </g>
 
       <!-- Outcome Text (drawn outside the transformed group to keep it upright) -->
-      <g v-if="episodeOutcome" class="outcome-text-group">
+      <g v-if="episodeOutcome && showEpisodeOutcome" class="outcome-text-group">
           <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Made Dunk!' : (episodeOutcome.isThree ? 'Made 3!' : 'Made 2!') }}</tspan>
@@ -5826,6 +5878,20 @@ onBeforeUnmount(() => {
   stroke: rgba(2, 6, 23, 0.9);
   stroke-width: 0px;
 }
+.rebound-target-marker {
+  pointer-events: none;
+}
+
+
+.rebound-target-marker-label {
+  fill: #fef3c7;
+  font-size: 0.66rem;
+  font-weight: 900;
+  paint-order: stroke;
+  stroke: rgba(2, 6, 23, 0.96);
+  stroke-width: 2px;
+}
+
 
 .rebound-result-layer {
   pointer-events: none;
@@ -6168,6 +6234,24 @@ onBeforeUnmount(() => {
   55% { transform: translateY(calc(-0.82 * var(--jump-amp, 8px))) scale(var(--jump-scale-peak, 1)); }
   85% { transform: translateY(calc(-0.12 * var(--jump-amp, 8px))) scale(1.04); }
   100% { transform: translateY(0) scale(1); }
+}
+
+.rebound-preview-shot-trajectory {
+  fill: none;
+  stroke: #38bdf8;
+  stroke-width: 4;
+  stroke-dasharray: 10 7;
+  stroke-linecap: round;
+  opacity: 0.9;
+  pointer-events: none;
+  filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.7));
+}
+
+.rebound-preview-shot-origin {
+  fill: #38bdf8;
+  stroke: #e0f2fe;
+  stroke-width: 2;
+  pointer-events: none;
 }
 
 .shot-flash-line {
