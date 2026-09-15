@@ -213,6 +213,19 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
     return response.json();
 }
 
+export async function getReboundPreview(options = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/rebound_preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options || {}),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to compute rebound preview');
+  }
+  return response.json();
+}
+
 export async function mctsAdvise(options = {}) {
   const response = await fetch(`${API_BASE_URL}/api/mcts_advise`, {
     method: 'POST',
@@ -431,6 +444,7 @@ export async function runEvaluation(
   randomizeOffensePermutation = false,
   intentSelectionMode = 'learned_sample',
   startTemplateOptions = null,
+  envOverrides = null,
 ) {
   const templateOptions = startTemplateOptions || {};
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
@@ -447,6 +461,7 @@ export async function runEvaluation(
       start_template_prob: templateOptions.prob ?? null,
       start_template_jitter_scale: templateOptions.jitterScale ?? null,
       start_template_mirror_prob: templateOptions.mirrorProb ?? null,
+      env_overrides: envOverrides && typeof envOverrides === 'object' ? envOverrides : null,
     }),
   });
   if (!response.ok) {
@@ -583,6 +598,24 @@ export async function replayCounterfactualSnapshot(payload = {}) {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to replay counterfactual snapshot');
+  }
+  return response.json();
+}
+
+export async function setCurrentReboundSkills(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_current_rebound_skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      rebound_skills: Array.isArray(payload.rebound_skills) ? payload.rebound_skills : [],
+      rebound_skill_specialists: Array.isArray(payload.rebound_skill_specialists)
+        ? payload.rebound_skill_specialists
+        : undefined,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to set current rebound skills');
   }
   return response.json();
 }
@@ -728,6 +761,19 @@ export async function setDefenderPressureParams(payload = {}) {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to update defender pressure parameters');
+  }
+  return response.json();
+}
+
+export async function setReboundParams(payload = {}) {
+  const response = await fetch(`${API_BASE_URL}/api/set_rebound_params`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update rebound parameters');
   }
   return response.json();
 }

@@ -19,6 +19,23 @@
     <meta name="twitter:title" content="BasketWorld" />
     <meta name="twitter:description" content="Play BasketWorld." />
     <meta name="twitter:image" content="https://basketworld.toplines.app/social-splash.jpg" />
+
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [['\\(', '\\)'], ['$', '$']],
+          displayMath: [['\\[', '\\]']],
+        },
+        startup: {
+          typeset: false,
+        },
+      };
+    </script>
+    <script
+      id="MathJax-script"
+      async
+      src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-mml-chtml.js"
+    ></script>
   </head>
   <body>
     <div id="app"></div>

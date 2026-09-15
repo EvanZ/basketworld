@@ -1151,6 +1151,16 @@ def get_parser() -> argparse.ArgumentParser:
         help="Full assist bonus as % of shot reward.",
     )
     parser.add_argument(
+        "--rebound-terminal-reward-mode",
+        dest="rebound_terminal_reward_mode",
+        choices=("actual_points", "last_shot_ep_on_defensive_rebound", "last_shot_ep"),
+        default="actual_points",
+        help=(
+            "Terminal possession reward used when rebounds are enabled. actual_points uses only sampled made-shot points; "
+            "last_shot_ep pays terminal-shot EP; last_shot_ep_on_defensive_rebound is legacy and biased high relative to PPP."
+        ),
+    )
+    parser.add_argument(
         "--base-steal-rate",
         dest="base_steal_rate",
         type=float,
@@ -1177,6 +1187,125 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.3,
         help="Minimum steal weight for defenders near passer (1.0 at receiver). Defenders closer to receiver are more dangerous.",
+    )
+    parser.add_argument(
+        "--pass-interception-model",
+        dest="pass_interception_model",
+        choices=("line", "lob_aware", "reaction"),
+        default="line",
+        help="Pass interception model: line keeps legacy line-of-sight risk; lob_aware adds passer/receiver pressure and softens lane risk for near-rim lob receivers; reaction uses the speed/reaction receiver-pressure model.",
+    )
+    parser.add_argument(
+        "--pass-passer-pressure-weight",
+        dest="pass_passer_pressure_weight",
+        type=float,
+        default=0.0,
+        help="Additional lob-aware risk from defenders near the passer and aligned with the pass direction.",
+    )
+    parser.add_argument(
+        "--pass-receiver-pressure-weight",
+        dest="pass_receiver_pressure_weight",
+        type=float,
+        default=0.0,
+        help="Additional lob-aware risk from defenders near the receiver and aligned with the catch path.",
+    )
+    parser.add_argument(
+        "--pass-lob-lane-multiplier",
+        dest="pass_lob_lane_multiplier",
+        type=float,
+        default=0.35,
+        help="Multiplier applied to lane-interception risk for lob-aware passes to receivers near the rim.",
+    )
+    parser.add_argument(
+        "--pass-lob-receiver-distance",
+        dest="pass_lob_receiver_distance",
+        type=float,
+        default=1.0,
+        help="Receiver hex distance from basket at or below which lob-aware lane-risk reduction applies.",
+    )
+    parser.add_argument(
+        "--pass-speed",
+        dest="pass_speed",
+        type=float,
+        default=3.5,
+        help="Reaction pass model: pass speed in hexes per decision step.",
+    )
+    parser.add_argument(
+        "--defender-reaction-time",
+        dest="defender_reaction_time",
+        type=float,
+        default=0.35,
+        help="Reaction pass model: defender reaction delay before moving toward the catch point.",
+    )
+    parser.add_argument(
+        "--defender-speed",
+        dest="defender_speed",
+        type=float,
+        default=1.25,
+        help="Reaction pass model: defender closing speed in hexes per decision step.",
+    )
+    parser.add_argument(
+        "--defender-reach-radius",
+        dest="defender_reach_radius",
+        type=float,
+        default=0.65,
+        help="Reaction pass model: extra catch-point contest radius.",
+    )
+    parser.add_argument(
+        "--reaction-softness",
+        dest="reaction_softness",
+        type=float,
+        default=0.55,
+        help="Reaction pass model: sigmoid softness for reachable catch-point pressure.",
+    )
+    parser.add_argument(
+        "--base-passer-risk",
+        dest="base_passer_risk",
+        type=float,
+        default=0.06,
+        help="Reaction pass model: base passer-side pressure hazard per nearby defender.",
+    )
+    parser.add_argument(
+        "--passer-pressure-decay",
+        dest="passer_pressure_decay",
+        type=float,
+        default=1.35,
+        help="Reaction pass model: exponential decay for passer-side pressure with defender distance.",
+    )
+    parser.add_argument(
+        "--base-receiver-risk",
+        dest="base_receiver_risk",
+        type=float,
+        default=0.35,
+        help="Reaction pass model: base receiver-side hazard multiplier per reacting defender.",
+    )
+    parser.add_argument(
+        "--receiver-alignment-min",
+        dest="receiver_alignment_min",
+        type=float,
+        default=0.35,
+        help="Reaction pass model: minimum receiver pressure alignment multiplier.",
+    )
+    parser.add_argument(
+        "--receiver-alignment-width",
+        dest="receiver_alignment_width",
+        type=float,
+        default=2.0,
+        help="Reaction pass model: perpendicular distance where receiver alignment fades to its floor.",
+    )
+    parser.add_argument(
+        "--max-receiver-hazard",
+        dest="max_receiver_hazard",
+        type=float,
+        default=0.85,
+        help="Reaction pass model: maximum per-defender receiver-side hazard.",
+    )
+    parser.add_argument(
+        "--lane-weight",
+        dest="lane_weight",
+        type=float,
+        default=0.0,
+        help="Reaction pass model: weight on the legacy line lane-risk term.",
     )
     parser.add_argument(
         "--episode-sample-prob",

@@ -468,6 +468,21 @@ def selector_completed_pass_boundary(info: Any) -> bool:
     return False
 
 
+def selector_offensive_rebound_boundary(info: Any) -> bool:
+    if not isinstance(info, dict):
+        return False
+    action_results = info.get("action_results", {})
+    if not isinstance(action_results, dict):
+        return False
+    rebounds = action_results.get("rebounds", [])
+    if not isinstance(rebounds, list):
+        return False
+    return any(
+        isinstance(rebound, dict) and bool(rebound.get("offensive"))
+        for rebound in rebounds
+    )
+
+
 def selector_segment_boundary_reason(
     training_params: dict | None,
     *,
@@ -485,6 +500,8 @@ def selector_segment_boundary_reason(
     )
     if int(segment_length) >= min_play_steps and selector_completed_pass_boundary(info):
         return "completed_pass"
+    if int(segment_length) >= min_play_steps and selector_offensive_rebound_boundary(info):
+        return "offensive_rebound"
     return None
 
 

@@ -1,8 +1,10 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from basketworld.utils.mlflow_params import (
     get_mlflow_params,
     get_mlflow_phi_shaping_params,
+    get_mlflow_start_template_library,
     get_mlflow_training_params,
 )
 
@@ -94,6 +96,53 @@ def test_get_mlflow_training_params_includes_multiselect_and_disc_priors():
     assert training["intent_selector_min_play_steps"] == 4
     assert training["intent_disc_lambda_shot"] == 0.2
     assert training["intent_disc_lambda_q"] == 0.05
+
+
+def test_get_mlflow_training_params_supports_jax_start_template_aliases():
+    client = _FakeClient(
+        {
+            "jax/env/start_template_enabled": "true",
+            "jax/env/start_template_library": "configs/start_templates_5v5.json",
+            "jax/env/start_template_library_artifact_path": "metadata/start_template_library.json",
+            "jax/env/start_template_library_template_count": "12",
+            "jax/env/start_template_prob": "0.8",
+            "jax/env/start_template_jitter_scale": "1.25",
+            "jax/env/start_template_mirror_prob": "0.4",
+            "jax/env/start_template_strict": "true",
+        }
+    )
+
+    training = get_mlflow_training_params(client, "dummy")
+
+    assert training["start_template_enabled"] is True
+    assert training["start_template_library"] == "configs/start_templates_5v5.json"
+    assert training["start_template_library_artifact_path"] == "metadata/start_template_library.json"
+    assert training["start_template_library_template_count"] == 12
+    assert training["start_template_prob"] == 0.8
+    assert training["start_template_jitter_scale"] == 1.25
+    assert training["start_template_mirror_prob"] == 0.4
+    assert training["start_template_strict"] is True
+
+
+def test_get_mlflow_start_template_library_uses_jax_env_players():
+    library_path = Path(__file__).resolve().parents[1] / "configs" / "start_templates_5v5.json"
+
+    class _FakeArtifactClient(_FakeClient):
+        def download_artifacts(self, run_id, artifact_path, dst_path):
+            return str(library_path)
+
+    client = _FakeArtifactClient(
+        {
+            "start_template_library_artifact_path": "metadata/start_template_library.json",
+            "jax/env/players": "5",
+        }
+    )
+
+    library = get_mlflow_start_template_library(client, "dummy")
+
+    assert library is not None
+    assert library["players_per_side"] == 5
+    assert len(library["templates"]) == 12
 
 
 def test_get_mlflow_training_params_supports_jax_selector_aliases():

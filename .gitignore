@@ -53,6 +53,7 @@ mlruns/
 models/
 mlruns/
 mlartifacts/
+artifacts/mlflow_checkpoints/
 .opponent_cache/
 checkpoints/phase_a_dev/*
 !basketworld_jax/models
@@ -67,6 +68,9 @@ benchmarks/jax_phase_a_train_scaffold.json
 *.csv
 basketworld_jax/results/
 analytics/jax_intent_sample_embed/
+analytics/rebound_sim/outputs/
+analytics/rebound_physics/outputs/
+analytics/rebound_sim/outputs_fitted_table/*.json
 
 
 # temp
@@ -93,6 +97,7 @@ prompts/
 
 .vscode/
 .DS_Store
+/site/
 
 app/backend/episodes/
 # keep social preview asset in repo

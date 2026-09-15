@@ -57,6 +57,17 @@ pip install -r requirements.txt       # installs basketworld in editable mode
 # Backend deps are included; alternatively: pip install -r app/backend/requirements.txt
 ```
 
+### Documentation
+
+The JAX-first environment and training documentation uses MkDocs Material and is served locally:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs serve
+```
+
+Open `http://127.0.0.1:8000/`. Run `mkdocs build --strict` to validate the site.
+
 Run MLflow locally (default for training/backend):
 ```bash
 ./start_mlflow.sh --disable-s3
@@ -129,4 +140,5 @@ uvicorn app.backend.main:app --host 0.0.0.0 --port 8080 --reload
 - Frontend: `npm run dev` in `app/frontend` with `VITE_API_BASE_URL` set
 - Pointer passing doc: `readmes/POINTER_TARGETED_PASS_MODE.md`
 - Set-attention policy/value diagram: `readmes/SET_ATTENTION_POLICY_VALUE_ARCHITECTURE.md`
-- Docs: `readmes/` (obs migration, EP refactors, phi shaping, coordinate systems) and `docs/` (opponent sampling, schedule continuation)
+- Curated JAX-first documentation: `mkdocs serve` (source in `docs/site/`)
+- Engineering notes: `readmes/` and the remaining files under `docs/`

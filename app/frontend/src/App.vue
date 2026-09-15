@@ -6,7 +6,7 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal } from './services/api';
+import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
 
 function cloneState(state) {
@@ -19,6 +19,109 @@ function normalizeShotAccumulator(acc) {
   for (const [key, val] of Object.entries(acc)) {
     if (!Array.isArray(val) || val.length < 2) continue;
     result[key] = [Number(val[0]) || 0, Number(val[1]) || 0];
+  }
+  return result;
+}
+
+function normalizeReboundCountMap(rawMap) {
+  const out = {};
+  if (!rawMap || typeof rawMap !== 'object') return out;
+  for (const [rawKey, rawCount] of Object.entries(rawMap)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    const count = Number(rawCount || 0);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !Number.isFinite(count) || count <= 0) continue;
+    out[`${q},${r}`] = (out[`${q},${r}`] || 0) + count;
+  }
+  return out;
+}
+
+function normalizeReboundPlayerCountMaps(rawMaps) {
+  const out = {};
+  if (!rawMaps || typeof rawMaps !== 'object') return out;
+  for (const [rawPlayerId, rawMap] of Object.entries(rawMaps)) {
+    const playerId = String(rawPlayerId || '').trim();
+    if (!playerId) continue;
+    const normalized = normalizeReboundCountMap(rawMap);
+    if (Object.keys(normalized).length > 0) out[playerId] = normalized;
+  }
+  return out;
+}
+
+function normalizeReboundAccumulator(acc) {
+  const result = {};
+  if (!acc || typeof acc !== 'object') return result;
+  for (const [rawKey, rawBucket] of Object.entries(acc)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !rawBucket || typeof rawBucket !== 'object') continue;
+    const targets = normalizeReboundCountMap(rawBucket.targets || rawBucket.target || {});
+    const targetOffensive = normalizeReboundCountMap(rawBucket.target_offensive || rawBucket.targets_offensive || {});
+    const rebounders = normalizeReboundCountMap(rawBucket.rebounders || rawBucket.winners || {});
+    const rebounderOffensive = normalizeReboundCountMap(rawBucket.rebounder_offensive || rawBucket.rebounders_offensive || {});
+    const targetsByPlayer = normalizeReboundPlayerCountMaps(rawBucket.targets_by_player || rawBucket.targetsByPlayer || {});
+    const targetOffensiveByPlayer = normalizeReboundPlayerCountMaps(rawBucket.target_offensive_by_player || rawBucket.targets_offensive_by_player || rawBucket.targetOffensiveByPlayer || {});
+    const reboundersByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounders_by_player || rawBucket.winners_by_player || rawBucket.reboundersByPlayer || {});
+    const rebounderOffensiveByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounder_offensive_by_player || rawBucket.rebounders_offensive_by_player || rawBucket.rebounderOffensiveByPlayer || {});
+    const targetChancesByPlayer = normalizeReboundPlayerCountMaps(rawBucket.target_chances_by_player || rawBucket.targetChancesByPlayer || {});
+    const rebounderChancesByPlayer = normalizeReboundPlayerCountMaps(rawBucket.rebounder_chances_by_player || rawBucket.rebounderChancesByPlayer || {});
+    const totalRaw = Number(rawBucket.total || 0);
+    const total = Number.isFinite(totalRaw) && totalRaw > 0
+      ? totalRaw
+      : Math.max(
+        Object.values(targets).reduce((sum, val) => sum + Number(val || 0), 0),
+        Object.values(rebounders).reduce((sum, val) => sum + Number(val || 0), 0),
+      );
+    if (total <= 0) continue;
+    result[`${q},${r}`] = {
+      total,
+      targets,
+      targetOffensive,
+      rebounders,
+      rebounderOffensive,
+      targetsByPlayer,
+      targetOffensiveByPlayer,
+      reboundersByPlayer,
+      rebounderOffensiveByPlayer,
+      targetChancesByPlayer,
+      rebounderChancesByPlayer,
+    };
+  }
+  return result;
+}
+
+function normalizePositioningAccumulator(acc) {
+  const result = {};
+  if (!acc || typeof acc !== 'object') return result;
+  for (const [rawKey, rawBucket] of Object.entries(acc)) {
+    const key = String(rawKey || '').trim();
+    const [qStr, rStr] = key.split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r) || !rawBucket || typeof rawBucket !== 'object') continue;
+    const offense = normalizeReboundCountMap(rawBucket.offense || rawBucket.offense_all || rawBucket.offenseAll || {});
+    const offenseNonShooter = normalizeReboundCountMap(rawBucket.offense_non_shooter || rawBucket.offenseNonShooter || {});
+    const defense = normalizeReboundCountMap(rawBucket.defense || {});
+    const shooter = normalizeReboundCountMap(rawBucket.shooter || {});
+    const totalRaw = Number(rawBucket.total || 0);
+    const total = Number.isFinite(totalRaw) && totalRaw > 0
+      ? totalRaw
+      : Math.max(
+        Object.values(shooter).reduce((sum, val) => sum + Number(val || 0), 0),
+        0,
+      );
+    if (total <= 0) continue;
+    result[`${q},${r}`] = {
+      total,
+      offense,
+      offenseNonShooter,
+      defense,
+      shooter,
+    };
   }
   return result;
 }
@@ -80,6 +183,25 @@ function buildDisplayActions(actionsTaken, actionsTakenMeta = null) {
   return mapped;
 }
 
+function appendReboundOutcomesToMoves(moves, actionResults) {
+  if (!moves || typeof moves !== 'object' || !actionResults || typeof actionResults !== 'object') {
+    return moves;
+  }
+  const rebounds = Array.isArray(actionResults.rebounds)
+    ? actionResults.rebounds
+    : (actionResults.rebound ? [actionResults.rebound] : []);
+  for (const rebound of rebounds) {
+    if (!rebound || rebound.attempt === false) continue;
+    const winner = Number(rebound.winner ?? rebound.winner_player_id ?? rebound.player_id);
+    if (!Number.isFinite(winner) || winner < 0) continue;
+    const label = rebound.offensive ? 'ORB' : (rebound.defensive ? 'DRB' : 'REB');
+    const key = `Player ${winner}`;
+    const existing = String(moves[key] || 'NOOP');
+    moves[key] = existing && existing !== 'NOOP' ? `${existing} + ${label}` : label;
+  }
+  return moves;
+}
+
 function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
   const mapped = {};
   if (!actionsTaken || typeof actionsTaken !== 'object') {
@@ -98,6 +220,7 @@ function buildBoardSelectionActions(actionsTaken, actionsTakenMeta = null) {
 
 const gameState = ref(null);      // For current state and UI logic
 const gameHistory = ref([]);     // For ghost trails
+const showGhostTrails = ref(true);
 const policyProbs = ref(null);   // For AI suggestions
 const templateSandboxMode = ref(false);
 
@@ -119,11 +242,52 @@ function syncPolicyProbsFromState(state) {
   policyProbs.value = hasAnyProbabilities(snapshotProbs) ? snapshotProbs : null;
 }
 
+function getRandomStartTemplateOptionsFromControls() {
+  const controls = controlsRef.value;
+  return controls?.getRandomStartTemplateOptions?.()
+    || controls?.getRandomSelfPlayStartTemplateOptions?.()
+    || null;
+}
+
+async function applyStartTemplateOptionsToCurrentState(options) {
+  if (!options?.templateId) return false;
+  const response = await applyStartTemplate(
+    options.templateId,
+    options.mirrored ?? null,
+    true,
+    options.seed ?? null,
+  );
+  if (!response?.state) {
+    throw new Error(response?.message || 'Failed to apply random start template.');
+  }
+  gameState.value = response.state;
+  if (gameHistory.value.length > 0) {
+    gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
+  } else {
+    gameHistory.value = [cloneState(response.state)];
+  }
+  syncPolicyProbsFromState(response.state);
+  clearReboundPreview();
+  currentSelections.value = null;
+  userSelections.value = {};
+  return true;
+}
+
 const isLoading = ref(false);
 const error = ref(null);
 const initialSetup = ref(null);
 const activePlayerId = ref(null);
 const shotAccumulator = ref({});
+const reboundAccumulator = ref({});
+const positioningAccumulator = ref({});
+const reboundHeatmapEnabled = ref(false);
+const positioningHeatmapEnabled = ref(false);
+const positioningHeatmapKind = ref('offense_non_shooter');
+const reboundHeatmapKind = ref('targets');
+const reboundHeatmapPlayer = ref('all');
+const selectedReboundShotKey = ref('');
+const selectedReboundShotKeys = ref([]);
+const isReboundMultiSelecting = ref(false);
 const playbookAnalysis = ref(null);
 const selectedPlaybookIntent = ref(null);
 const playbookShowPlayerPaths = ref(true);
@@ -134,12 +298,101 @@ const playbookPlayerFilter = ref('all');
 const shotChartTarget = ref('team');
 const assistLinksByPair = ref({});
 const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
+const passLinksByPair = ref({});
+const completedPassLinksByPair = ref({});
 const potentialAssistLinksByPair = ref({});
 const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
 const sankeyFlowMode = ref('assisted');
 const sankeyShotType = ref('all');
+const reboundPreviewEnabled = ref(false);
+const reboundPreview = ref(null);
+const reboundPreviewLoading = ref(false);
+const reboundPreviewError = ref(null);
+const reboundPreviewParams = ref({
+  targetTemperature: 1.0,
+  targetUniformMix: 0.0,
+  targetDistanceWeight: 1.0,
+  winnerTemperature: 1.0,
+});
 
 const ASSIST_SHOT_TYPES = ['dunk', 'two', 'three'];
+
+const REBOUND_REASON_LABELS = {
+  disabled: 'Disabled',
+  game_not_initialized: 'Game not initialized',
+  ball_holder_unavailable: 'No current ball holder is available',
+  terminal_not_missed_shot: 'Last terminal event was not a missed shot',
+  last_terminal_shot_was_made: 'Last terminal shot was made',
+  fitted_table_missing: 'Fitted rebound table not found',
+  missing_positions: 'Missing player positions',
+  position_outside_rebound_table_court: 'Current court/positions do not match rebound table',
+  shooter_position_unavailable: 'Shooter position unavailable',
+};
+
+function clearReboundPreview() {
+  reboundPreview.value = null;
+  reboundPreviewError.value = null;
+  reboundPreviewLoading.value = false;
+}
+
+function reboundPct(value, digits = 1) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '0.0%';
+  return `${(Math.max(0, Math.min(1, num)) * 100).toFixed(digits)}%`;
+}
+
+function reboundReasonLabel(reason) {
+  const key = String(reason || '').trim();
+  return REBOUND_REASON_LABELS[key] || key || 'No rebound preview available';
+}
+
+function reboundTeamLabel(team) {
+  const normalized = String(team || '').toLowerCase();
+  if (normalized === 'offense') return 'O';
+  if (normalized === 'defense') return 'D';
+  return 'P';
+}
+
+function reboundPlayerLabel(player) {
+  if (!player || player.player_id === undefined || player.player_id === null) return 'N/A';
+  return `${reboundTeamLabel(player.team)}${player.player_id}`;
+}
+
+const reboundPreviewWinnerRows = computed(() => {
+  const rows = Array.isArray(reboundPreview.value?.winner_probs) ? reboundPreview.value.winner_probs : [];
+  return rows.slice().sort((a, b) => Number(b?.conditional_prob || 0) - Number(a?.conditional_prob || 0));
+});
+
+const reboundPreviewStatusText = computed(() => {
+  if (reboundPreviewLoading.value) return 'Computing rebound preview...';
+  if (reboundPreviewError.value) return reboundPreviewError.value;
+  if (reboundPreview.value?.available) return '';
+  return reboundReasonLabel(reboundPreview.value?.reason);
+});
+
+async function refreshReboundPreview() {
+  if (!reboundPreviewEnabled.value || !gameState.value) {
+    clearReboundPreview();
+    return;
+  }
+  reboundPreviewLoading.value = true;
+  reboundPreviewError.value = null;
+  try {
+    const params = reboundPreviewParams.value || {};
+    reboundPreview.value = await getReboundPreview({
+      enabled: true,
+      target_temperature: Number(params.targetTemperature ?? 1.0),
+      target_uniform_mix: Number(params.targetUniformMix ?? 0.0),
+      target_distance_weight: Number(params.targetDistanceWeight ?? 1.0),
+      winner_temperature: Number(params.winnerTemperature ?? 1.0),
+    });
+  } catch (err) {
+    reboundPreview.value = null;
+    reboundPreviewError.value = err?.message || 'Failed to compute rebound preview';
+  } finally {
+    reboundPreviewLoading.value = false;
+  }
+}
 
 function emptyAssistLinkTypeMap() {
   return { dunk: {}, two: {}, three: {} };
@@ -217,6 +470,8 @@ const currentSelections = ref(null);
 // Track user-selected actions for display on game board
 const userSelections = ref({});
 const isSelfPlaying = ref(false);
+const selfPlayStarting = ref(false);
+const selfPlayLoadingMessage = ref('');
 const canReplay = ref(false);
 const isReplaying = ref(false);
 const isReplayPaused = ref(false);
@@ -327,12 +582,23 @@ const defaultEvalConfig = () => ({
   ballHolder: null,
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
+  reboundSkills: [],
+  reboundSkillsPinned: false,
+  reboundSkillSampling: {
+    mode: 'model',
+    std: 1.0,
+    targetEdge: 0.0,
+    tolerance: 0.25,
+    maxAttempts: 5000,
+  },
+  showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
   intentSelectionMode: 'learned_sample',
   startTemplateMode: 'checkpoint',
   startTemplateProb: 1.0,
   startTemplateJitterScale: 0.0,
   startTemplateMirrorProb: 0.0,
+  envOverrides: {},
 });
 const defaultTemplateAuthoringConfig = () => ({
   positions: [],
@@ -349,10 +615,82 @@ const templateConfig = ref(defaultTemplateAuthoringConfig());
 const perPlayerEvalStats = ref({});
 const perIntentEvalStats = ref({});
 const placementPassPreview = ref({});
+const passLabBoardConfig = ref({ active: false, positions: [], ballHolder: null, passProbs: {} });
 const isEvalPlacementMode = computed(() => evalConfig.value.mode === 'custom');
 const isTemplatePlacementMode = computed(() => activeControlsTab.value === 'template');
-const isBoardEditingMode = computed(() => isEvalPlacementMode.value || isTemplatePlacementMode.value);
+const isPassLabPlacementMode = computed(() => activeControlsTab.value === 'pass_lab' && Boolean(passLabBoardConfig.value?.active));
+const isBoardEditingMode = computed(() => isEvalPlacementMode.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
+const boardPlacementEditable = computed(() => {
+  if (isTemplatePlacementMode.value || isPassLabPlacementMode.value) return true;
+  return Boolean(evalConfig.value.placementEditing);
+});
+const boardPlacementPositions = computed(() => {
+  if (isTemplatePlacementMode.value) return templateConfig.value.positions;
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.positions || [];
+  return evalConfig.value.positions;
+});
+const boardPlacementBallHolder = computed(() => {
+  if (isTemplatePlacementMode.value) return templateConfig.value.ballHolder;
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.ballHolder;
+  return evalConfig.value.ballHolder;
+});
+const boardPlacementPassProbs = computed(() => {
+  if (isPassLabPlacementMode.value) return passLabBoardConfig.value.passProbs || {};
+  if (isTemplatePlacementMode.value) return {};
+  return placementPassPreview.value;
+});
+const boardReboundSkillOverrides = computed(() => {
+  if (!evalConfig.value.showReboundSkillsOnBoard) return {};
+  const values = Array.isArray(evalConfig.value.reboundSkills) ? evalConfig.value.reboundSkills : [];
+  if (!values.length || !gameState.value) return {};
+  const ids = [
+    ...(Array.isArray(gameState.value.offense_ids) ? gameState.value.offense_ids : []),
+    ...(Array.isArray(gameState.value.defense_ids) ? gameState.value.defense_ids : []),
+  ];
+  const out = {};
+  ids.forEach((pid, idx) => {
+    const numeric = Number(values[idx] ?? 0);
+    if (Number.isFinite(numeric)) out[String(pid)] = numeric;
+  });
+  return out;
+});
+const boardShowCoordinates = computed(() => (
+  isTemplatePlacementMode.value
+  || isPassLabPlacementMode.value
+  || sourceHeatmapEnabled.value
+  || Boolean(boardReboundTargetOverlay.value)
+));
+const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const activeControlsTab = ref('controls');
+const reboundHeatmapPlayerOptions = computed(() => {
+  const opts = [{ label: 'All players', value: 'all' }];
+  const offenseIds = Array.isArray(gameState.value?.offense_ids) ? gameState.value.offense_ids : [];
+  const defenseIds = Array.isArray(gameState.value?.defense_ids) ? gameState.value.defense_ids : [];
+  offenseIds.forEach((pid, idx) => opts.push({ label: `O${idx} Player ${pid}`, value: String(pid) }));
+  defenseIds.forEach((pid, idx) => opts.push({ label: `D${idx} Player ${pid}`, value: String(pid) }));
+  return opts;
+});
+const reboundHeatmapSelectedPlayerLabel = computed(() => {
+  const selected = String(reboundHeatmapPlayer.value || 'all');
+  const found = reboundHeatmapPlayerOptions.value.find((opt) => opt.value === selected);
+  return found?.label || 'All players';
+});
+watch(reboundHeatmapPlayerOptions, (options) => {
+  const selected = String(reboundHeatmapPlayer.value || 'all');
+  if (!options.some((opt) => opt.value === selected)) reboundHeatmapPlayer.value = 'all';
+});
+watch(reboundHeatmapEnabled, (enabled) => {
+  if (enabled && positioningHeatmapEnabled.value) {
+    positioningHeatmapEnabled.value = false;
+    clearSelectedReboundShot();
+  }
+});
+watch(positioningHeatmapEnabled, (enabled) => {
+  if (enabled && reboundHeatmapEnabled.value) {
+    reboundHeatmapEnabled.value = false;
+    clearSelectedReboundShot();
+  }
+});
 const shotChartOptions = computed(() => {
   const opts = [{ label: 'Team', value: 'team' }];
   const offenseIds = gameState.value?.offense_ids || [];
@@ -382,8 +720,334 @@ const shotChartOptions = computed(() => {
 const hasShotChartData = computed(
   () => !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0,
 );
+const hasReboundHeatmapData = computed(
+  () => !!reboundAccumulator.value && Object.keys(reboundAccumulator.value).length > 0,
+);
+const showReboundHeatmapSelector = computed(
+  () => !isBoardEditingMode.value && hasReboundHeatmapData.value,
+);
+const hasPositioningHeatmapData = computed(
+  () => !!positioningAccumulator.value && Object.keys(positioningAccumulator.value).length > 0,
+);
+const showPositioningHeatmapSelector = computed(
+  () => !isBoardEditingMode.value && hasPositioningHeatmapData.value,
+);
+const positioningAdvantageMode = computed(() => (
+  positioningHeatmapEnabled.value && String(positioningHeatmapKind.value || '') === 'source_advantage'
+));
+const sourceHeatmapNeedsSelection = computed(() => (
+  reboundHeatmapEnabled.value
+  || (positioningHeatmapEnabled.value && !positioningAdvantageMode.value)
+));
+const sourceHeatmapEnabled = computed(() => sourceHeatmapNeedsSelection.value || positioningAdvantageMode.value);
+const reboundHeatmapSourceAccumulator = computed(() => {
+  const out = {};
+  for (const [key, bucket] of Object.entries(reboundAccumulator.value || {})) {
+    const total = Number(bucket?.total || 0);
+    if (total > 0) out[key] = [total, 0];
+  }
+  return out;
+});
+const positioningHeatmapSourceAccumulator = computed(() => {
+  const out = {};
+  for (const [key, bucket] of Object.entries(positioningAccumulator.value || {})) {
+    const total = Number(bucket?.total || 0);
+    if (total > 0) out[key] = [total, 0];
+  }
+  return out;
+});
+const selectedReboundShotKeysDisplay = computed(() => (
+  Array.isArray(selectedReboundShotKeys.value) ? selectedReboundShotKeys.value : []
+));
+const selectedReboundShotLabel = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value;
+  if (keys.length === 0) return '';
+  if (keys.length === 1) return keys[0];
+  return `${keys.length} sources`;
+});
+function addReboundCounts(target, source) {
+  for (const [key, value] of Object.entries(source || {})) {
+    const count = Number(value || 0);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    target[key] = (target[key] || 0) + count;
+  }
+}
+function addReboundPlayerCounts(target, source) {
+  for (const [playerId, sourceMap] of Object.entries(source || {})) {
+    if (!target[playerId]) target[playerId] = {};
+    addReboundCounts(target[playerId], sourceMap);
+    if (Object.keys(target[playerId]).length === 0) delete target[playerId];
+  }
+}
+const selectedReboundHeatmapBucket = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value.filter((key) => reboundAccumulator.value?.[key]);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) return reboundAccumulator.value[keys[0]];
+  const bucket = {
+    total: 0,
+    targets: {},
+    targetOffensive: {},
+    rebounders: {},
+    rebounderOffensive: {},
+    targetsByPlayer: {},
+    targetOffensiveByPlayer: {},
+    reboundersByPlayer: {},
+    rebounderOffensiveByPlayer: {},
+    targetChancesByPlayer: {},
+    rebounderChancesByPlayer: {},
+  };
+  for (const key of keys) {
+    const src = reboundAccumulator.value[key] || {};
+    bucket.total += Number(src.total || 0);
+    addReboundCounts(bucket.targets, src.targets);
+    addReboundCounts(bucket.targetOffensive, src.targetOffensive);
+    addReboundCounts(bucket.rebounders, src.rebounders);
+    addReboundCounts(bucket.rebounderOffensive, src.rebounderOffensive);
+    addReboundPlayerCounts(bucket.targetsByPlayer, src.targetsByPlayer);
+    addReboundPlayerCounts(bucket.targetOffensiveByPlayer, src.targetOffensiveByPlayer);
+    addReboundPlayerCounts(bucket.reboundersByPlayer, src.reboundersByPlayer);
+    addReboundPlayerCounts(bucket.rebounderOffensiveByPlayer, src.rebounderOffensiveByPlayer);
+    addReboundPlayerCounts(bucket.targetChancesByPlayer, src.targetChancesByPlayer);
+    addReboundPlayerCounts(bucket.rebounderChancesByPlayer, src.rebounderChancesByPlayer);
+  }
+  return bucket;
+});
+const boardEvalReboundOverlay = computed(() => {
+  if (!reboundHeatmapEnabled.value || isReboundMultiSelecting.value || selectedReboundShotKeysDisplay.value.length === 0) return null;
+  const bucket = selectedReboundHeatmapBucket.value;
+  if (!bucket) return null;
+  const mapName = reboundHeatmapKind.value === 'rebounders' ? 'rebounders' : 'targets';
+  const selectedPlayer = String(reboundHeatmapPlayer.value || 'all');
+  const hasPlayerFilter = selectedPlayer !== 'all';
+  const aggregateMap = bucket[mapName] || {};
+  const rawMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.reboundersByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetsByPlayer?.[selectedPlayer] || {}))
+    : aggregateMap;
+  const chanceMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.rebounderChancesByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetChancesByPlayer?.[selectedPlayer] || {}))
+    : {};
+  const offensiveMap = hasPlayerFilter
+    ? (mapName === 'rebounders'
+      ? (bucket.rebounderOffensiveByPlayer?.[selectedPlayer] || {})
+      : (bucket.targetOffensiveByPlayer?.[selectedPlayer] || {}))
+    : (mapName === 'rebounders' ? (bucket.rebounderOffensive || {}) : (bucket.targetOffensive || {}));
+  const total = Object.values(rawMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const chanceTotal = Object.values(chanceMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const aggregateTotal = Object.values(aggregateMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  const offensiveTotal = Object.values(offensiveMap).reduce((sum, val) => sum + Number(val || 0), 0);
+  if (total <= 0) return null;
+  const targetCells = Object.entries(rawMap)
+    .map(([key, count]) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      const c = Number(count || 0);
+      if (!Number.isFinite(q) || !Number.isFinite(r) || c <= 0) return null;
+      const offensiveCount = Number(offensiveMap[key] || 0);
+      const chanceCount = Number(chanceMap[key] || 0);
+      return {
+        q,
+        r,
+        prob: c / total,
+        count: c,
+        chance_count: hasPlayerFilter ? chanceCount : null,
+        offensive_count: offensiveCount,
+        orb_pct: hasPlayerFilter ? null : (c > 0 ? offensiveCount / c : 0),
+        rebound_rate_label: hasPlayerFilter && chanceCount > 0
+          ? `REB ${(c / chanceCount * 100).toFixed(0)}%`
+          : null,
+      };
+    })
+    .filter(Boolean);
+  const kindLabel = mapName === 'rebounders' ? 'rebounder location' : 'catch target';
+  const playerLabel = hasPlayerFilter ? ` | ${reboundHeatmapSelectedPlayerLabel.value}` : '';
+  return {
+    available: true,
+    source: 'eval_rebound_heatmap',
+    title: `Eval rebounds from ${selectedReboundShotLabel.value} | ${kindLabel}${playerLabel}`,
+    summary: hasPlayerFilter
+      ? `${reboundHeatmapSelectedPlayerLabel.value} REB ${chanceTotal > 0 ? ((total / chanceTotal) * 100).toFixed(1) : '0.0'}% (${Math.round(total)}/${Math.round(chanceTotal)})`
+      : `Total ORB ${((offensiveTotal / total) * 100).toFixed(1)}% (${Math.round(offensiveTotal)}/${Math.round(total)})`,
+    target_cells: targetCells,
+    shot: { player_id: null, shot_type: kindLabel },
+  };
+});
+function sumCountMap(map) {
+  return Object.values(map || {}).reduce((sum, val) => sum + Number(val || 0), 0);
+}
+
+const selectedPositioningHeatmapBucket = computed(() => {
+  const keys = selectedReboundShotKeysDisplay.value.filter((key) => positioningAccumulator.value?.[key]);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) return positioningAccumulator.value[keys[0]];
+  const bucket = {
+    total: 0,
+    offense: {},
+    offenseNonShooter: {},
+    defense: {},
+    shooter: {},
+  };
+  for (const key of keys) {
+    const src = positioningAccumulator.value[key] || {};
+    bucket.total += Number(src.total || 0);
+    addReboundCounts(bucket.offense, src.offense);
+    addReboundCounts(bucket.offenseNonShooter, src.offenseNonShooter);
+    addReboundCounts(bucket.defense, src.defense);
+    addReboundCounts(bucket.shooter, src.shooter);
+  }
+  return bucket;
+});
+
+function buildPositioningAdvantageCells() {
+  const targetCells = [];
+  let sourceCount = 0;
+  let weightedAdvantageSum = 0;
+  let shotWeightSum = 0;
+
+  for (const [sourceKey, positionBucket] of Object.entries(positioningAccumulator.value || {})) {
+    const [qStr, rStr] = String(sourceKey || '').split(',');
+    const q = Number(qStr);
+    const r = Number(rStr);
+    if (!Number.isFinite(q) || !Number.isFinite(r)) continue;
+
+    const reboundBucket = reboundAccumulator.value?.[sourceKey];
+    const targetMap = reboundBucket?.targets || {};
+    const targetTotal = sumCountMap(targetMap);
+    if (targetTotal <= 0) continue;
+
+    const offenseMap = positionBucket?.offenseNonShooter || {};
+    const defenseMap = positionBucket?.defense || {};
+    const offenseTotal = sumCountMap(offenseMap);
+    const defenseTotal = sumCountMap(defenseMap);
+    if (offenseTotal <= 0 || defenseTotal <= 0) continue;
+
+    let advantage = 0;
+    for (const [targetKey, rawCount] of Object.entries(targetMap)) {
+      const targetCount = Number(rawCount || 0);
+      if (!Number.isFinite(targetCount) || targetCount <= 0) continue;
+      const targetProb = targetCount / targetTotal;
+      const offenseProb = Number(offenseMap[targetKey] || 0) / offenseTotal;
+      const defenseProb = Number(defenseMap[targetKey] || 0) / defenseTotal;
+      advantage += targetProb * (offenseProb - defenseProb);
+    }
+
+    const shotCount = Number(positionBucket?.total || 0);
+    if (!Number.isFinite(advantage) || Math.abs(advantage) <= 0) continue;
+    if (shotCount > 0) {
+      weightedAdvantageSum += advantage * shotCount;
+      shotWeightSum += shotCount;
+    }
+    sourceCount += 1;
+    targetCells.push({
+      q,
+      r,
+      prob: Math.abs(advantage),
+      signed_prob: advantage,
+      count: Number.isFinite(shotCount) && shotCount > 0 ? shotCount : null,
+      label: `${advantage >= 0 ? '+' : ''}${(advantage * 100).toFixed(1)}%`,
+    });
+  }
+
+  return {
+    targetCells,
+    sourceCount,
+    meanAdvantage: shotWeightSum > 0 ? weightedAdvantageSum / shotWeightSum : 0,
+  };
+}
+
+const boardEvalPositioningOverlay = computed(() => {
+  if (!positioningHeatmapEnabled.value) return null;
+  const kind = String(positioningHeatmapKind.value || 'offense_non_shooter');
+
+  if (kind === 'source_advantage') {
+    const { targetCells, sourceCount, meanAdvantage } = buildPositioningAdvantageCells();
+    if (targetCells.length === 0) return null;
+    return {
+      available: true,
+      source: 'eval_positioning_advantage_heatmap',
+      color_mode: 'diverging',
+      title: 'Eval shot-source rebound positioning advantage',
+      summary: `Target-weighted O-D near rebound targets | ${sourceCount} shot sources | mean ${meanAdvantage >= 0 ? '+' : ''}${(meanAdvantage * 100).toFixed(1)}%`,
+      target_cells: targetCells,
+      shot: { player_id: null, shot_type: 'positioning advantage' },
+    };
+  }
+
+  if (isReboundMultiSelecting.value || selectedReboundShotKeysDisplay.value.length === 0) return null;
+  const bucket = selectedPositioningHeatmapBucket.value;
+  if (!bucket) return null;
+  const offenseMap = bucket.offenseNonShooter || {};
+  const defenseMap = bucket.defense || {};
+  const totalShots = Number(bucket.total || 0);
+  let targetCells = [];
+  let titleKind = 'offense non-shooter density';
+  let summary = '';
+
+  if (kind === 'offense_minus_defense') {
+    const offenseTotal = sumCountMap(offenseMap);
+    const defenseTotal = sumCountMap(defenseMap);
+    const keys = new Set([...Object.keys(offenseMap), ...Object.keys(defenseMap)]);
+    targetCells = [...keys].map((key) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      if (!Number.isFinite(q) || !Number.isFinite(r)) return null;
+      const offenseProb = offenseTotal > 0 ? Number(offenseMap[key] || 0) / offenseTotal : 0;
+      const defenseProb = defenseTotal > 0 ? Number(defenseMap[key] || 0) / defenseTotal : 0;
+      const diff = offenseProb - defenseProb;
+      if (Math.abs(diff) <= 0) return null;
+      return {
+        q,
+        r,
+        prob: Math.abs(diff),
+        signed_prob: diff,
+        count: null,
+        label: `${diff >= 0 ? '+' : ''}${(diff * 100).toFixed(1)}%`,
+      };
+    }).filter(Boolean);
+    titleKind = 'offense - defense density';
+    summary = `O samples ${Math.round(offenseTotal)} | D samples ${Math.round(defenseTotal)} | ${Math.round(totalShots)} shots`;
+  } else {
+    const rawMap = kind === 'defense' ? defenseMap : offenseMap;
+    const total = sumCountMap(rawMap);
+    titleKind = kind === 'defense' ? 'defense density' : 'offense non-shooter density';
+    summary = `${Math.round(total)} player-position samples from ${Math.round(totalShots)} shots`;
+    targetCells = Object.entries(rawMap).map(([key, count]) => {
+      const [qStr, rStr] = String(key).split(',');
+      const q = Number(qStr);
+      const r = Number(rStr);
+      const c = Number(count || 0);
+      if (!Number.isFinite(q) || !Number.isFinite(r) || c <= 0 || total <= 0) return null;
+      return {
+        q,
+        r,
+        prob: c / total,
+        count: c,
+      };
+    }).filter(Boolean);
+  }
+
+  if (targetCells.length === 0) return null;
+  return {
+    available: true,
+    source: 'eval_positioning_heatmap',
+    color_mode: kind === 'offense_minus_defense' ? 'diverging' : 'density',
+    title: `Eval positioning from ${selectedReboundShotLabel.value} | ${titleKind}`,
+    summary,
+    target_cells: targetCells,
+    shot: { player_id: null, shot_type: titleKind },
+  };
+});
+
 const hasAssistSankeyData = computed(
-  () => hasPositiveLinkCount(assistLinksByPair.value) || hasPositiveLinkCount(potentialAssistLinksByPair.value),
+  () => hasPositiveLinkCount(assistLinksByPair.value)
+    || hasPositiveLinkCount(potentialAssistLinksByPair.value)
+    || hasPositiveLinkCount(passLinksByPair.value)
+    || hasPositiveLinkCount(completedPassLinksByPair.value),
 );
 const showShotChartSelector = computed(
   () => !isBoardEditingMode.value && hasShotChartData.value,
@@ -470,25 +1134,107 @@ const boardRenderKey = computed(() => {
   ].join('-');
 });
 const boardPolicyProbabilities = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? null : policyProbs.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value) ? null : policyProbs.value
 );
 const boardSelectedActionsDisplay = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : visibleBoardSelectedActions.value
+  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value) ? {} : visibleBoardSelectedActions.value
 );
-const boardShotAccumulatorDisplay = computed(() =>
-  (isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value) ? {} : shotAccumulatorForBoard.value
-);
+function buildReboundTargetOverlayFromState(state) {
+  const results = state?.last_action_results;
+  const rebound = results?.rebound || (Array.isArray(results?.rebounds) ? results.rebounds[0] : null);
+  if (!rebound || !rebound.attempt) return null;
+
+  const targetProb = Number(rebound.target_prob);
+  const target = Array.isArray(rebound.target) && rebound.target.length >= 2
+    ? {
+      q: Number(rebound.target[0]),
+      r: Number(rebound.target[1]),
+      prob: Number.isFinite(targetProb) ? targetProb : 1,
+      index: rebound.target_cell_index ?? null,
+    }
+    : null;
+  const targetCells = Array.isArray(rebound.target_cells)
+    ? rebound.target_cells
+      .map((cell) => ({
+        q: Number(cell?.q),
+        r: Number(cell?.r),
+        prob: Number(cell?.prob),
+        index: cell?.index ?? null,
+      }))
+      .filter((cell) => Number.isFinite(cell.q) && Number.isFinite(cell.r) && Number.isFinite(cell.prob) && cell.prob > 0)
+    : [];
+  const winnerId = Number(rebound.winner);
+  const winnerProb = Number(rebound.winner_conditional_prob);
+  const sampledWinner = Number.isFinite(winnerId)
+    ? {
+      player_id: winnerId,
+      team: rebound.winner_team || null,
+      conditional_prob: Number.isFinite(winnerProb) ? winnerProb : 1,
+    }
+    : null;
+  if (!target || !sampledWinner) return null;
+
+  return {
+    available: true,
+    source: 'live_rebound_step',
+    target_cells: targetCells.length ? targetCells : [target],
+    sampled_target: target,
+    sampled_winner: sampledWinner,
+    winner_probs: Array.isArray(rebound.winner_probs) ? rebound.winner_probs : [],
+    shot: {
+      player_id: rebound.shot_shooter,
+      shot_type: rebound.offensive ? 'offensive rebound' : 'defensive rebound',
+    },
+  };
+}
+
+const visibleBoardStateForOverlay = computed(() => {
+  const history = boardGameHistory.value;
+  if (Array.isArray(history) && history.length > 0) {
+    return history[history.length - 1];
+  }
+  return gameState.value;
+});
+
+const liveReboundTargetOverlay = computed(() => buildReboundTargetOverlayFromState(visibleBoardStateForOverlay.value));
+
+const boardReboundTargetOverlay = computed(() => {
+  if (isPlaybookBoardPreviewActive.value || isBoardEditingMode.value) return null;
+  if (boardEvalPositioningOverlay.value) return boardEvalPositioningOverlay.value;
+  if (boardEvalReboundOverlay.value) return boardEvalReboundOverlay.value;
+  // Eval shot charts should not be hidden by a stale live rebound overlay from the current board state.
+  if (hasShotChartData.value && !reboundPreviewEnabled.value) return null;
+  if (disableTransitionsForCapture.value) return liveReboundTargetOverlay.value;
+  if (reboundPreviewEnabled.value && reboundPreview.value?.available) return reboundPreview.value;
+  return liveReboundTargetOverlay.value;
+});
+const boardShotAccumulatorDisplay = computed(() => {
+  if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) {
+    return reboundHeatmapSourceAccumulator.value;
+  }
+  if (positioningHeatmapEnabled.value && !positioningAdvantageMode.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) {
+    return positioningHeatmapSourceAccumulator.value;
+  }
+  return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value)
+    ? {}
+    : shotAccumulatorForBoard.value;
+});
 const initialControlsTab = computed(() =>
   templateSandboxMode.value ? 'template' : 'environment'
 );
-const boardShotChartLabelDisplay = computed(() =>
-  isPlaybookBoardPreviewActive.value ? '' : boardShotChartLabel.value
-);
+const boardShotChartLabelDisplay = computed(() => {
+  if (reboundHeatmapEnabled.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) return 'Select shot source for rebound heatmap';
+  if (positioningHeatmapEnabled.value && !positioningAdvantageMode.value && (selectedReboundShotKeysDisplay.value.length === 0 || isReboundMultiSelecting.value)) return 'Select shot source for positioning heatmap';
+  return (boardReboundTargetOverlay.value || isPlaybookBoardPreviewActive.value) ? '' : boardShotChartLabel.value;
+});
 
 const selectedSankeyLinkMap = computed(() => {
-  const flowMode = sankeyFlowMode.value === 'potential' ? 'potential' : 'assisted';
+  const rawFlowMode = String(sankeyFlowMode.value || 'assisted');
+  const flowMode = ['potential', 'pass_attempts', 'completed_passes'].includes(rawFlowMode) ? rawFlowMode : 'assisted';
   const typeMode = ASSIST_SHOT_TYPES.includes(sankeyShotType.value) ? sankeyShotType.value : 'all';
 
+  if (flowMode === 'pass_attempts') return passLinksByPair.value || {};
+  if (flowMode === 'completed_passes') return completedPassLinksByPair.value || {};
   if (flowMode === 'potential') {
     if (typeMode === 'all') return potentialAssistLinksByPair.value || {};
     return potentialAssistLinksByType.value?.[typeMode] || {};
@@ -500,7 +1246,9 @@ const selectedSankeyLinkMap = computed(() => {
 const assistSankeyTitle = computed(() => {
   const flowLabel = sankeyFlowMode.value === 'potential'
     ? 'Potential Assist Flows (Missed)'
-    : 'Assist Flows (Made)';
+    : (sankeyFlowMode.value === 'pass_attempts'
+      ? 'Pass Attempt Flows'
+      : (sankeyFlowMode.value === 'completed_passes' ? 'Completed Pass Flows' : 'Assist Flows (Made)'));
   const typeLabel = sankeyShotType.value === 'all'
     ? 'All Shot Types'
     : (sankeyShotType.value === 'dunk'
@@ -508,9 +1256,12 @@ const assistSankeyTitle = computed(() => {
       : (sankeyShotType.value === 'two' ? '2PT' : '3PT'));
   return `${flowLabel} • ${typeLabel}`;
 });
-const assistSankeyTotalLabel = computed(() =>
-  sankeyFlowMode.value === 'potential' ? 'Potential assists (missed)' : 'Assisted makes',
-);
+const assistSankeyTotalLabel = computed(() => {
+  if (sankeyFlowMode.value === 'potential') return 'Potential assists (missed)';
+  if (sankeyFlowMode.value === 'pass_attempts') return 'Pass attempts';
+  if (sankeyFlowMode.value === 'completed_passes') return 'Completed passes';
+  return 'Assisted makes';
+});
 
 const assistSankeyPlayerIds = computed(() => {
   const state = gameState.value;
@@ -526,7 +1277,7 @@ const assistSankeyPlayerIds = computed(() => {
   }
 
   const fallback = new Set();
-  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value]) {
+  for (const rawMap of [assistLinksByPair.value, potentialAssistLinksByPair.value, passLinksByPair.value, completedPassLinksByPair.value]) {
     for (const key of Object.keys(rawMap || {})) {
       const parsed = parseAssistLinkKey(key);
       if (!parsed) continue;
@@ -564,16 +1315,24 @@ const assistSankeyLinks = computed(() => {
 });
 
 const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
+const REBOUND_STEP_DURATION_MS = 3000;
+const REBOUND_CAPTURE_OFFSETS_MS = [0, 180, 360, 540, 720, 960, 1200, 1500, 1800, 2100, 2400, 2700, 3000];
 const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
 const moveTransitionMs = computed(() => Math.max(120, gifStepDurationMs.value || BASE_STEP_DURATION_MS));
 const disableTransitionsForCapture = ref(false);
 const moveProgressForCapture = ref(1);
+const reboundProgressForCapture = ref(1);
 const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 
-// Watch for when episodes end to stop auto-play behavior
+// Watch for game-state changes; keep the live rebound preview aligned with the current holder.
 watch(gameState, async (newState, oldState) => {
     syncPolicyProbsFromState(newState);
+    if (!newState) {
+        clearReboundPreview();
+    } else if (reboundPreviewEnabled.value) {
+        await refreshReboundPreview();
+    }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
         aiMode.value = true;
@@ -590,6 +1349,20 @@ watch(gameState, async (newState, oldState) => {
         }, 100);
     }
 });
+
+watch(reboundPreviewEnabled, async (enabled) => {
+  if (!enabled) {
+    clearReboundPreview();
+    return;
+  }
+  await refreshReboundPreview();
+});
+
+watch(reboundPreviewParams, async () => {
+  if (reboundPreviewEnabled.value && gameState.value) {
+    await refreshReboundPreview();
+  }
+}, { deep: true });
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
@@ -608,14 +1381,21 @@ async function handleGameStarted(setupData) {
   // Clear move history for new game
   moveHistory.value = [];
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   // Clear any self-play selections state
   currentSelections.value = null;
   userSelections.value = {};
@@ -685,14 +1465,21 @@ async function handleTemplateSandboxStarted(setupData = {}) {
 
   moveHistory.value = [];
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   playbookAnalysis.value = null;
   selectedPlaybookIntent.value = null;
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   currentSelections.value = null;
   userSelections.value = {};
   isSelfPlaying.value = false;
@@ -793,7 +1580,7 @@ async function handleActionsSubmitted(actions) {
                 ...lastMove.moves,
                 ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
               };
-              lastMove.moves = newMoves;
+              lastMove.moves = appendReboundOutcomesToMoves(newMoves, response.state?.last_action_results);
           }
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {
@@ -866,6 +1653,7 @@ async function handleResetPositions() {
     if (gameHistory.value.length > 0) {
       gameHistory.value[gameHistory.value.length - 1] = cloneState(response.state);
     }
+    syncPolicyProbsFromState(response.state);
 
   } catch (err) {
     console.error('[App] Failed to reset turn via backend:', err);
@@ -918,6 +1706,34 @@ function handlePatchedGameState(newState) {
   const clonedState = cloneState(newState);
   gameHistory.value = [clonedState];
   syncPolicyProbsFromState(newState);
+}
+
+function syncSelectedReboundShotKey() {
+  const keys = Array.isArray(selectedReboundShotKeys.value) ? selectedReboundShotKeys.value : [];
+  selectedReboundShotKey.value = keys.length === 1 ? keys[0] : keys.join(' + ');
+}
+
+function handleReboundShotSelected(key, meta = {}) {
+  const normalized = String(key || '').trim();
+  if (!sourceHeatmapNeedsSelection.value || !normalized) return;
+  const sourceMap = positioningHeatmapEnabled.value ? positioningAccumulator.value : reboundAccumulator.value;
+  if (!sourceMap?.[normalized]) return;
+  const current = Array.isArray(selectedReboundShotKeys.value) ? [...selectedReboundShotKeys.value] : [];
+  if (meta?.shiftKey) {
+    const idx = current.indexOf(normalized);
+    if (idx >= 0) current.splice(idx, 1);
+    else current.push(normalized);
+    selectedReboundShotKeys.value = current;
+  } else {
+    selectedReboundShotKeys.value = [normalized];
+  }
+  syncSelectedReboundShotKey();
+}
+
+function clearSelectedReboundShot() {
+  selectedReboundShotKeys.value = [];
+  selectedReboundShotKey.value = '';
+  isReboundMultiSelecting.value = false;
 }
 
 async function handleShotClockAdjustment(delta) {
@@ -1227,9 +2043,11 @@ function handleSelfPlayButton() {
     console.log('[App] Self-play disabled in sandbox/editing modes');
     return;
   }
-  // Get current selections from PlayerControls
-  const preselected = controlsRef.value?.getSelectedActions?.() || null;
-  handleSelfPlay(preselected);
+  // Get current selections from PlayerControls. If self-play is configured
+  // to reset onto a random template, discard stale actions from the old board.
+  const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
+  const preselected = startTemplateOptions ? null : (controlsRef.value?.getSelectedActions?.() || null);
+  handleSelfPlay(preselected, startTemplateOptions);
 }
 
 function handleTemplateSelfPlay(options = {}) {
@@ -1239,27 +2057,37 @@ function handleTemplateSelfPlay(options = {}) {
   }
   handleSelfPlay(null, options || {});
 }
-
-// New function for self-play mode (runs full episode)
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
-  if (!gameState.value || !aiMode.value) return;
+  if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
   const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
-  // Start deterministic self-play on backend: snapshot seed and initial state
+  selfPlayStarting.value = true;
+  selfPlayLoadingMessage.value = 'Starting self-play…';
+  error.value = null;
+  await nextTick();
+
+  // Snapshot the backend state before beginning the first visible self-play step.
   try {
     const res = await startSelfPlay(startTemplateOptions);
-    if (res && res.status === 'success' && res.state) {
-      // Reset UI to backend's reset state so trajectories align
-      gameState.value = res.state;
-      gameHistory.value = [res.state];
-      moveHistory.value = [];
-      currentSelections.value = null;
+    if (!res || res.status !== 'success' || !res.state) {
+      throw new Error(res?.message || 'Failed to start self-play.');
     }
-  } catch (e) {
-    console.error('[App] Failed to start self-play on backend:', e);
+    gameState.value = res.state;
+    gameHistory.value = [res.state];
+    moveHistory.value = [];
+    currentSelections.value = null;
+    selfPlayLoadingMessage.value = 'Preparing first self-play step…';
+  } catch (err) {
+    error.value = err.message;
+    console.error('[App] Failed to start self-play on backend:', err);
+    selfPlayStarting.value = false;
+    selfPlayLoadingMessage.value = '';
+    return;
   }
+
   isSelfPlaying.value = true;
   currentSelections.value = null;
-  
+  let firstSelfPlayStep = true;
+
   // Run full episode with AI controlling all players
   while (gameState.value && !gameState.value.done) {
     try {
@@ -1428,6 +2256,11 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
+        if (firstSelfPlayStep) {
+          firstSelfPlayStep = false;
+          selfPlayStarting.value = false;
+          selfPlayLoadingMessage.value = '';
+        }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
         if (moveHistory.value.length > 0) {
@@ -1447,7 +2280,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
                 ...lastMove.moves,
                 ...buildDisplayActions(response.actions_taken, response.actions_taken_meta),
               };
-              lastMove.moves = newMoves;
+              lastMove.moves = appendReboundOutcomesToMoves(newMoves, response.state?.last_action_results);
           }
           // Store shot clock when action was decided (before execution): board + 1
           if (response.state.shot_clock !== undefined) {
@@ -1490,6 +2323,8 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     }
   }
   // Self-play finished
+  selfPlayStarting.value = false;
+  selfPlayLoadingMessage.value = '';
   isSelfPlaying.value = false;
   currentSelections.value = null;
   canReplay.value = true;
@@ -1506,6 +2341,11 @@ function handleEvalConfigChanged(nextConfig) {
       ...base.skills,
       ...(current.skills || {}),
       ...(nextConfig?.skills || {}),
+    },
+    reboundSkillSampling: {
+      ...base.reboundSkillSampling,
+      ...(current.reboundSkillSampling || {}),
+      ...(nextConfig?.reboundSkillSampling || {}),
     },
   };
   if (merged.mode !== 'custom') {
@@ -1589,6 +2429,20 @@ function seedEvalConfigFromGameState(copySkills = true) {
     gameState.value.offense_shooting_pct_by_player ||
     null;
   const skills = { ...base.skills };
+  const liveReboundSkills = gameState.value.player_rebound_skills || {};
+  const allIds = [
+    ...(gameState.value.offense_ids || []),
+    ...(gameState.value.defense_ids || []),
+  ];
+  const reboundSkills = allIds.map((pid) => {
+    const value = liveReboundSkills?.[String(pid)] ?? liveReboundSkills?.[pid] ?? 0;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : 0;
+  });
+  const existingReboundSkills = Array.isArray(evalConfig.value?.reboundSkills)
+    ? evalConfig.value.reboundSkills
+    : [];
+  const preservePinnedReboundSkills = Boolean(evalConfig.value?.reboundSkillsPinned);
   if (copySkills && sourceSkills) {
     skills.layup = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.layup?.[idx]));
     skills.three_pt = Array.from({ length: offenseCount }, (_, idx) => probToPercent(sourceSkills?.three_pt?.[idx]));
@@ -1600,6 +2454,10 @@ function seedEvalConfigFromGameState(copySkills = true) {
     positions,
     ballHolder: gameState.value.ball_holder ?? evalConfig.value.ballHolder,
     skills: copySkills ? skills : (evalConfig.value?.skills || skills),
+    reboundSkills: preservePinnedReboundSkills && existingReboundSkills.length
+      ? existingReboundSkills
+      : reboundSkills,
+    reboundSkillsPinned: preservePinnedReboundSkills,
   };
 }
 
@@ -1640,18 +2498,51 @@ function handleTemplatePlacementUpdate({ playerId, q, r }) {
   handleTemplateConfigChanged({ positions });
 }
 
+function handlePassLabConfigChanged(config) {
+  const positions = Array.isArray(config?.positions)
+    ? config.positions.map((pos) => Array.isArray(pos) ? [Number(pos[0]) || 0, Number(pos[1]) || 0] : [0, 0])
+    : [];
+  passLabBoardConfig.value = {
+    active: Boolean(config?.active),
+    positions,
+    ballHolder: config?.ballHolder ?? null,
+    passProbs: config?.passProbs && typeof config.passProbs === 'object' ? { ...config.passProbs } : {},
+  };
+}
+
+function handlePassLabPlacementUpdate({ playerId, q, r }) {
+  if (playerId === undefined || playerId === null) return;
+  const next = Array.isArray(passLabBoardConfig.value.positions)
+    ? passLabBoardConfig.value.positions.map((pos) => [pos[0], pos[1]])
+    : [];
+  next[Number(playerId)] = [Number(q) || 0, Number(r) || 0];
+  passLabBoardConfig.value = {
+    ...passLabBoardConfig.value,
+    positions: next,
+  };
+  controlsRef.value?.handlePassLabPlacementUpdate?.({ playerId, q, r });
+}
+
 function handleBoardPlacementUpdate(payload) {
   if (isTemplatePlacementMode.value) {
     handleTemplatePlacementUpdate(payload);
+    return;
+  }
+  if (isPassLabPlacementMode.value) {
+    handlePassLabPlacementUpdate(payload);
     return;
   }
   handleEvalPlacementUpdate(payload);
 }
 
 function buildCustomEvalSetup() {
-  if (!gameState.value || evalConfig.value.mode !== 'custom') return null;
-  const usePinnedPlacement = !!evalConfig.value.placementEditing;
-  const shootingMode = evalConfig.value.shootingMode || 'random';
+  if (!gameState.value) return null;
+  const reboundSkillSampling = evalConfig.value.reboundSkillSampling || {};
+  const useConstrainedReboundSampling = String(reboundSkillSampling.mode || 'model') === 'constrained_gaussian';
+  const isCustomMode = evalConfig.value.mode === 'custom';
+  if (!isCustomMode && !useConstrainedReboundSampling) return null;
+  const usePinnedPlacement = isCustomMode && !!evalConfig.value.placementEditing;
+  const shootingMode = isCustomMode ? (evalConfig.value.shootingMode || 'random') : 'random';
   const payload = {
     shooting_mode: shootingMode,
   };
@@ -1686,6 +2577,31 @@ function buildCustomEvalSetup() {
       dunk: toProb('dunk'),
     };
   }
+  const reboundSkills = Array.isArray(evalConfig.value.reboundSkills) ? evalConfig.value.reboundSkills : [];
+  const allReboundSkillIds = [
+    ...(gameState.value.offense_ids || []),
+    ...(gameState.value.defense_ids || []),
+  ].map((pid) => Number(pid));
+  const totalPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
+  const usePinnedReboundSkills = isCustomMode && Boolean(evalConfig.value.reboundSkillsPinned) && reboundSkills.length;
+  if (usePinnedReboundSkills) {
+    const skillsByPlayerId = Array.from({ length: totalPlayers }, () => 0);
+    allReboundSkillIds.forEach((pid, idx) => {
+      const numeric = Number(reboundSkills[idx] ?? 0);
+      if (Number.isInteger(pid) && pid >= 0 && pid < totalPlayers && Number.isFinite(numeric)) {
+        skillsByPlayerId[pid] = numeric;
+      }
+    });
+    payload.rebound_skills = skillsByPlayerId;
+  } else if (useConstrainedReboundSampling) {
+    payload.rebound_skill_sampling = {
+      mode: 'constrained_gaussian',
+      std: Math.max(0, Number(reboundSkillSampling.std ?? 1.0)),
+      target_edge: Number(reboundSkillSampling.targetEdge ?? 0.0),
+      tolerance: Math.max(0, Number(reboundSkillSampling.tolerance ?? 0.25)),
+      max_attempts: Math.max(1, Math.floor(Number(reboundSkillSampling.maxAttempts ?? 5000))),
+    };
+  }
   return payload;
 }
 
@@ -1708,12 +2624,19 @@ async function handleEvaluation() {
   
   const numEpisodes = Math.max(1, Math.min(evalNumEpisodes.value, 1000000));
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
   perIntentEvalStats.value = {};
@@ -1736,12 +2659,10 @@ async function handleEvaluation() {
     console.log(`[App] Starting evaluation: ${numEpisodes} episodes, playerDeterministic=${playerDeterministic.value}, opponentDeterministic=${opponentDeterministic.value}`);
     
     let customSetup = null;
-    if (evalConfig.value.mode === 'custom') {
-      try {
-        customSetup = buildCustomEvalSetup();
-      } catch (setupErr) {
-        throw new Error(setupErr.message || 'Invalid custom eval setup');
-      }
+    try {
+      customSetup = buildCustomEvalSetup();
+    } catch (setupErr) {
+      throw new Error(setupErr.message || 'Invalid custom eval setup');
     }
     
     // Run evaluation on backend (this will block until all episodes complete)
@@ -1758,6 +2679,7 @@ async function handleEvaluation() {
         jitterScale: Number(evalConfig.value.startTemplateJitterScale ?? 0.0),
         mirrorProb: Number(evalConfig.value.startTemplateMirrorProb ?? 0.0),
       },
+      evalConfig.value.envOverrides || null,
     );
     
   if (response.status === 'success' && Array.isArray(response.results)) {
@@ -1791,9 +2713,15 @@ async function handleEvaluation() {
         console.warn('[App] No shot_accumulator returned from evaluation');
       }
       shotAccumulator.value = normalizeShotAccumulator(response.shot_accumulator || {});
+      reboundAccumulator.value = normalizeReboundAccumulator(response.rebound_accumulator || {});
+      positioningAccumulator.value = normalizePositioningAccumulator(response.positioning_accumulator || {});
+      const selectedSourceMap = positioningHeatmapEnabled.value ? positioningAccumulator.value : reboundAccumulator.value;
+      if (!selectedSourceMap[selectedReboundShotKey.value]) selectedReboundShotKey.value = '';
       const evalDiagnostics = response.eval_diagnostics || {};
       assistLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.assist_links);
       assistLinksByType.value = normalizeAssistLinkMapByType(evalDiagnostics.assist_links_by_type);
+      passLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.pass_links);
+      completedPassLinksByPair.value = normalizeAssistLinkMap(evalDiagnostics.completed_pass_links);
       potentialAssistLinksByPair.value = normalizeAssistLinkMap(
         evalDiagnostics.potential_assist_links,
       );
@@ -1882,32 +2810,57 @@ const liveButtonsDisabled = computed(() =>
   templateSandboxMode.value || activeControlsTab.value === 'eval' || activeControlsTab.value === 'template'
 );
 
-function stateHasAnimatedFlash(state) {
+function animatedFlashKindsForState(state) {
   const results = state?.last_action_results;
-  if (!results) return false;
+  if (!results) return { hasShot: false, hasPass: false, hasRebound: false };
 
-  const hasShot = results.shots && Object.keys(results.shots).length > 0;
-  const hasPass =
+  const hasShot = Boolean(results.shots && Object.keys(results.shots).length > 0);
+  const hasRebound = Array.isArray(results.rebounds) && results.rebounds.length > 0;
+  const hasPass = Boolean(
     results.passes &&
     Object.values(results.passes).some(
       (passRes) =>
         passRes &&
         passRes.success &&
         Number.isFinite(Number(passRes.target))
-    );
+    ),
+  );
 
-  return Boolean(hasShot || hasPass);
+  return { hasShot, hasPass, hasRebound };
+}
+
+function stateHasAnimatedFlash(state) {
+  const kinds = animatedFlashKindsForState(state);
+  return Boolean(kinds.hasShot || kinds.hasPass || kinds.hasRebound);
 }
 
 function captureOffsetsForState(state) {
-  const hasFlash = stateHasAnimatedFlash(state);
+  const { hasShot, hasPass, hasRebound } = animatedFlashKindsForState(state);
   const moveEnd = moveTransitionMs.value;
-  if (hasFlash) {
+  if (hasRebound) {
+    const reboundEnd = Math.max(moveEnd, REBOUND_STEP_DURATION_MS);
+    const merged = [...REBOUND_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, reboundEnd];
+    return Array.from(new Set(merged)).sort((a, b) => a - b);
+  }
+  if (hasShot || hasPass) {
     const merged = [...FLASH_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
     return Array.from(new Set(merged)).sort((a, b) => a - b);
   }
   const merged = [...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
   return Array.from(new Set(merged)).sort((a, b) => a - b);
+}
+
+function gifPlaybackDurationForState(state) {
+  const { hasRebound } = animatedFlashKindsForState(state);
+  const baseDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+  return hasRebound ? Math.max(baseDurationMs, REBOUND_STEP_DURATION_MS) : baseDurationMs;
+}
+
+function reboundProgressForStateOffset(state, offsetMs) {
+  const { hasRebound } = animatedFlashKindsForState(state);
+  if (!hasRebound) return 1;
+  const durationMs = gifPlaybackDurationForState(state);
+  return durationMs > 0 ? Math.min(1, offsetMs / durationMs) : 1;
 }
 
 function interpolateState(prevState, currState, t) {
@@ -1935,9 +2888,20 @@ async function handleSaveEpisode() {
   try {
     disableTransitionsForCapture.value = true;
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
     await nextTick();
-    // Check if we have episode states to render
-    const states = replayStates.value.length > 0 ? replayStates.value : [gameState.value];
+    // Check if we have episode states to render. Prefer the longest history so
+    // self-play possessions that continue after offensive rebounds are not truncated
+    // by a shorter/manual replay buffer.
+    const stateSources = [
+      Array.isArray(replayStates.value) ? replayStates.value : [],
+      Array.isArray(gameHistory.value) ? gameHistory.value : [],
+      gameState.value ? [gameState.value] : [],
+    ];
+    const states = stateSources.reduce(
+      (best, candidate) => (candidate.length > best.length ? candidate : best),
+      [],
+    );
     
     if (!states || states.length === 0) {
       alert('No episode states available to save');
@@ -1968,7 +2932,7 @@ async function handleSaveEpisode() {
         await new Promise(resolve => setTimeout(resolve, 60));
 
         const offsets = captureOffsetsForState(states[i]);
-        const stepDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
+        const stepDurationMs = gifPlaybackDurationForState(states[i]);
         const frameDurationMs = stepDurationMs / offsets.length;
 
         let lastOffset = 0;
@@ -1980,9 +2944,12 @@ async function handleSaveEpisode() {
           }
 
           const prevState = i > 0 ? states[i - 1] : states[i];
-          const t = moveTransitionMs.value > 0 ? Math.min(1, offset / moveTransitionMs.value) : 1;
-          moveProgressForCapture.value = t;
-          const interpState = interpolateState(prevState, states[i], t);
+          const moveDurationMs = moveTransitionMs.value;
+          const moveT = moveDurationMs > 0 ? Math.min(1, offset / moveDurationMs) : 1;
+          const reboundT = reboundProgressForStateOffset(states[i], offset);
+          moveProgressForCapture.value = moveT;
+          reboundProgressForCapture.value = reboundT;
+          const interpState = interpolateState(prevState, states[i], moveT);
           const tempHistory = [...states.slice(0, i), interpState];
           gameHistory.value = tempHistory;
           // eslint-disable-next-line no-await-in-loop
@@ -2013,6 +2980,7 @@ async function handleSaveEpisode() {
       gameHistory.value = replayStates.value.slice(0, savedStepIndex + 1);
     }
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
     
     if (frames.length === 0) {
       alert('Failed to generate any frames');
@@ -2036,6 +3004,7 @@ async function handleSaveEpisode() {
   } finally {
     disableTransitionsForCapture.value = false;
     moveProgressForCapture.value = 1;
+    reboundProgressForCapture.value = 1;
   }
 }
 
@@ -2194,18 +3163,26 @@ function toggleReplayPause() {
   isReplayPaused.value = !isReplayPaused.value;
 }
 
-function handlePlayAgain() {
+async function handlePlayAgain() {
+  const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
   cancelReplayAnimation();
   gameState.value = null;
   gameHistory.value = [];
   policyProbs.value = null;
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
+  clearReboundPreview();
   placementPassPreview.value = {};
   evalConfig.value = defaultEvalConfig();
   activePlayerId.value = null;
@@ -2225,17 +3202,31 @@ function handlePlayAgain() {
   evalNumEpisodes.value = 100;
   if (initialSetup.value) {
     if (initialSetup.value.mode === 'template_sandbox') {
-      handleTemplateSandboxStarted(initialSetup.value);
+      await handleTemplateSandboxStarted(initialSetup.value);
     } else {
-      handleGameStarted(initialSetup.value);
+      await handleGameStarted(initialSetup.value);
+      if (startTemplateOptions) {
+        try {
+          await applyStartTemplateOptionsToCurrentState(startTemplateOptions);
+        } catch (err) {
+          console.error('[App] Failed to apply random start template after New Game:', err);
+          alert(`Failed to apply random start template: ${err.message}`);
+        }
+      }
     }
   }
 }
 
 function clearEvaluationArtifacts() {
   shotAccumulator.value = {};
+  reboundAccumulator.value = {};
+  positioningAccumulator.value = {};
+  selectedReboundShotKey.value = '';
+  selectedReboundShotKeys.value = [];
   assistLinksByPair.value = {};
   assistLinksByType.value = emptyAssistLinkTypeMap();
+  passLinksByPair.value = {};
+  completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
   shotChartTarget.value = 'team';
@@ -2298,6 +3289,7 @@ function startEvaluationProgressPolling(expectedTotal) {
 
 // --- Global keyboard shortcuts ---
 function onKeydown(e) {
+  if (e.key === 'Shift' && sourceHeatmapNeedsSelection.value) isReboundMultiSelecting.value = true;
   const tag = (e.target?.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') return; // avoid typing conflicts
   const key = e.key?.toLowerCase();
@@ -2353,14 +3345,20 @@ function onKeydown(e) {
   }
 }
 
+function onKeyup(e) {
+  if (e.key === 'Shift') isReboundMultiSelecting.value = false;
+}
+
 onMounted(() => {
   // Clear persisted stats once per app load
   try { resetStatsStorage(); } catch (_) {}
   window.addEventListener('keydown', onKeydown);
+  window.addEventListener('keyup', onKeyup);
 });
 onBeforeUnmount(() => {
   stopEvaluationProgressPolling();
   window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('keyup', onKeyup);
 });
 </script>
 
@@ -2401,6 +3399,15 @@ onBeforeUnmount(() => {
             <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Show Opponent Actions</span>
           </button>
+          <button
+            class="toggle-btn"
+            type="button"
+            :aria-pressed="showGhostTrails"
+            @click="showGhostTrails = !showGhostTrails"
+          >
+            <font-awesome-icon :icon="showGhostTrails ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+            <span class="toggle-label">Ghost Trails</span>
+          </button>
         </div>
 
       </div>
@@ -2410,20 +3417,67 @@ onBeforeUnmount(() => {
       <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
       <div class="top-row">
       <div class="board-area">
-        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
+        <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector || showReboundHeatmapSelector || showPositioningHeatmapSelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
           <template v-if="activeControlsTab !== 'playbook' && showShotChartSelector">
             <label>Shot chart:</label>
-            <select v-model="shotChartTarget">
+            <select v-model="shotChartTarget" :disabled="sourceHeatmapEnabled">
               <option v-for="opt in shotChartOptions" :key="opt.value" :value="opt.value">
                 {{ opt.label }}
               </option>
             </select>
+          </template>
+          <template v-if="activeControlsTab !== 'playbook' && showReboundHeatmapSelector">
+            <label class="inline-check">
+              <input type="checkbox" v-model="reboundHeatmapEnabled" />
+              <span>Rebound mode</span>
+            </label>
+            <select v-model="reboundHeatmapKind" :disabled="!reboundHeatmapEnabled">
+              <option value="targets">Catch target</option>
+              <option value="rebounders">Rebounder location</option>
+            </select>
+            <select v-model="reboundHeatmapPlayer" :disabled="!reboundHeatmapEnabled">
+              <option v-for="opt in reboundHeatmapPlayerOptions" :key="`rebound-player-${opt.value}`" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <button
+              v-if="reboundHeatmapEnabled && selectedReboundShotKeysDisplay.length > 0"
+              class="small-action-button"
+              type="button"
+              @click="clearSelectedReboundShot"
+            >
+              Change source ({{ selectedReboundShotLabel }})
+            </button>
+            <span v-else-if="reboundHeatmapEnabled" class="status-note">Click a shot hex, or hold Shift and click multiple</span>
+          </template>
+          <template v-if="activeControlsTab !== 'playbook' && showPositioningHeatmapSelector">
+            <label class="inline-check">
+              <input type="checkbox" v-model="positioningHeatmapEnabled" />
+              <span>Positioning mode</span>
+            </label>
+            <select v-model="positioningHeatmapKind" :disabled="!positioningHeatmapEnabled">
+              <option value="offense_non_shooter">Offense non-shooters</option>
+              <option value="defense">Defense</option>
+              <option value="offense_minus_defense">Offense - defense</option>
+              <option value="source_advantage">Shot-source advantage</option>
+            </select>
+            <button
+              v-if="positioningHeatmapEnabled && !positioningAdvantageMode && selectedReboundShotKeysDisplay.length > 0"
+              class="small-action-button"
+              type="button"
+              @click="clearSelectedReboundShot"
+            >
+              Change source ({{ selectedReboundShotLabel }})
+            </button>
+            <span v-else-if="positioningHeatmapEnabled && !positioningAdvantageMode" class="status-note">Click a shot hex, or hold Shift and click multiple</span>
           </template>
           <template v-if="activeControlsTab !== 'playbook' && showSankeySelector">
             <label>Sankey:</label>
             <select v-model="sankeyFlowMode">
               <option value="assisted">Assisted makes</option>
               <option value="potential">Potential assists (missed)</option>
+              <option value="pass_attempts">Pass attempts</option>
+              <option value="completed_passes">Completed passes</option>
             </select>
             <label>Type:</label>
             <select v-model="sankeyShotType">
@@ -2469,6 +3523,8 @@ onBeforeUnmount(() => {
           :key="boardRenderKey"
           ref="gameBoardRef"
           :game-history="boardGameHistory" 
+          :show-ghost-trails="showGhostTrails"
+          :show-episode-outcome="activeControlsTab !== 'stats'"
           :playbook-overlay="boardPlaybookOverlay"
           v-model:activePlayerId="activePlayerId"
           :policy-probabilities="boardPolicyProbabilities"
@@ -2476,19 +3532,31 @@ onBeforeUnmount(() => {
           :selected-actions="boardSelectedActionsDisplay"
           :shot-accumulator="boardShotAccumulatorDisplay"
           :shot-chart-label="boardShotChartLabelDisplay"
+          :shot-cells-clickable="sourceHeatmapNeedsSelection && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :shot-chart-count-only="sourceHeatmapNeedsSelection && (selectedReboundShotKeysDisplay.length === 0 || isReboundMultiSelecting)"
+          :selected-shot-cells="sourceHeatmapNeedsSelection ? selectedReboundShotKeysDisplay : []"
+          :hide-players="sourceHeatmapEnabled"
+          :hide-clock-overlays="sourceHeatmapEnabled"
+          :show-rebound-skills="evalConfig.showReboundSkillsOnBoard"
+          :rebound-skill-overrides="boardReboundSkillOverrides"
+          :rebound-target-overlay="boardReboundTargetOverlay"
+          :hide-pass-rays="reboundPreviewEnabled"
+          :show-rebound-preview-shot-trajectory="reboundPreviewEnabled"
           :placement-mode="isBoardEditingMode"
-          :placement-editable="isTemplatePlacementMode ? true : evalConfig.placementEditing"
-          :placement-positions="isTemplatePlacementMode ? templateConfig.positions : evalConfig.positions"
-          :placement-ball-holder="isTemplatePlacementMode ? templateConfig.ballHolder : evalConfig.ballHolder"
-          :placement-pass-probs="isTemplatePlacementMode ? {} : placementPassPreview"
-          :show-coordinates="isTemplatePlacementMode"
+          :placement-editable="boardPlacementEditable"
+          :placement-positions="boardPlacementPositions"
+          :placement-ball-holder="boardPlacementBallHolder"
+          :placement-pass-probs="boardPlacementPassProbs"
+          :show-coordinates="boardShowCoordinates"
           @update-player-position="handlePlayerPositionUpdate"
           @update-placement="handleBoardPlacementUpdate"
+          @select-shot-cell="handleReboundShotSelected"
           @adjust-shot-clock="handleShotClockAdjustment"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
-          :disable-backend-value-fetches="isPlaybookBoardPreviewActive || isTemplatePlacementMode"
+          :rebound-progress="reboundProgressForCapture"
+          :disable-backend-value-fetches="boardDisableBackendValueFetches"
           :allow-position-drag="!isPlaybookBoardPreviewActive"
           :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"
         />
@@ -2551,6 +3619,7 @@ onBeforeUnmount(() => {
           @eval-run="handleEvalRunRequested"
           @template-self-play="handleTemplateSelfPlay"
           @active-tab-changed="handleActiveTabChanged"
+          @pass-lab-config-changed="handlePassLabConfigChanged"
           @stats-reset="handleStatsReset"
           ref="controlsRef"
         />
@@ -2567,9 +3636,9 @@ onBeforeUnmount(() => {
           <button 
             @click="handleSelfPlayButton" 
             class="action-button self-play-button"
-            :disabled="!aiMode || gameState.done || liveButtonsDisabled"
+            :disabled="!aiMode || gameState.done || liveButtonsDisabled || selfPlayStarting || isSelfPlaying"
           >
-            Self-Play
+            {{ selfPlayStarting ? 'Preparing…' : 'Self-Play' }}
           </button>
           
           <button 
@@ -2589,7 +3658,70 @@ onBeforeUnmount(() => {
             New Game
           </button>
         </div>
+        <div
+          v-if="selfPlayStarting"
+          class="self-play-loading"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="self-play-spinner" aria-hidden="true"></span>
+          <span>{{ selfPlayLoadingMessage }}</span>
+        </div>
 
+
+
+        <div v-if="gameState && !isBoardEditingMode && !isPlaybookBoardPreviewActive" class="rebound-preview-panel">
+          <div class="rebound-preview-header">
+            <label class="inline-check rebound-preview-toggle">
+              <input type="checkbox" v-model="reboundPreviewEnabled" />
+              <span>Rebound preview for current ball holder</span>
+            </label>
+            <button
+              v-if="reboundPreviewEnabled"
+              class="rebound-preview-refresh"
+              @click="refreshReboundPreview"
+              :disabled="reboundPreviewLoading"
+            >
+              Refresh
+            </button>
+          </div>
+          <div v-if="reboundPreviewEnabled" class="rebound-preview-controls">
+            <label>
+              Target temp
+              <input type="number" min="0.1" max="5" step="0.05" v-model.number="reboundPreviewParams.targetTemperature" />
+            </label>
+            <label>
+              Uniform mix
+              <input type="number" min="0" max="1" step="0.05" v-model.number="reboundPreviewParams.targetUniformMix" />
+            </label>
+            <label>
+              Distance wt
+              <input type="number" min="0" max="5" step="0.05" v-model.number="reboundPreviewParams.targetDistanceWeight" />
+            </label>
+            <label>
+              Winner temp
+              <input type="number" min="0.1" max="5" step="0.05" v-model.number="reboundPreviewParams.winnerTemperature" />
+            </label>
+          </div>
+          <div v-if="reboundPreviewEnabled && reboundPreviewStatusText" class="rebound-preview-status">
+            {{ reboundPreviewStatusText }}
+          </div>
+          <div v-if="reboundPreviewEnabled && reboundPreview?.available" class="rebound-preview-summary">
+            <div class="rebound-preview-meta">
+              <span>{{ reboundPreview.shot?.source === 'terminal_missed_shot' ? 'Missed shot' : 'Preview shot' }}: {{ reboundPlayerLabel(reboundPreview.shot) }} {{ reboundPreview.shot?.shot_type }}</span>
+              <span>Target: {{ reboundPreview.sampled_target?.q }},{{ reboundPreview.sampled_target?.r }} ({{ reboundPct(reboundPreview.sampled_target?.prob) }})</span>
+              <span>Winner: {{ reboundPlayerLabel(reboundPreview.sampled_winner) }} {{ reboundPct(reboundPreview.sampled_winner?.conditional_prob) }}</span>
+            </div>
+            <div class="rebound-winner-list">
+              <div class="rebound-winner-list-title">Win probability given sampled target</div>
+              <div v-for="row in reboundPreviewWinnerRows" :key="`rebound-winner-${row.player_id}`" class="rebound-winner-row">
+                <span class="rebound-winner-player">{{ reboundPlayerLabel(row) }}</span>
+                <span class="rebound-winner-bar"><span :style="{ width: reboundPct(row.conditional_prob) }"></span></span>
+                <span class="rebound-winner-prob">{{ reboundPct(row.conditional_prob) }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
         <div v-if="gameState.done || isManualStepping" class="save-episode-row">
           <div class="gif-speed-control">
             <label for="gif-speed-slider">GIF speed</label>
@@ -2879,6 +4011,14 @@ header {
   color: var(--app-text-muted);
   font-size: 0.85rem;
 }
+.shot-chart-selector .small-action-button {
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 999px;
+  background: rgba(13, 20, 38, 0.85);
+  color: var(--app-text);
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
 
 .controls-area {
   display: flex;
@@ -2896,6 +4036,28 @@ header {
   display: flex;
   gap: 0.6rem;
   justify-content: center;
+}
+
+.self-play-loading {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 0.55rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.self-play-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid rgba(56, 189, 248, 0.25);
+  border-top-color: var(--app-accent);
+  border-radius: 50%;
+  animation: self-play-spin 0.75s linear infinite;
+}
+
+@keyframes self-play-spin {
+  to { transform: rotate(360deg); }
 }
 
 .save-episode-row {
@@ -2987,5 +4149,118 @@ header {
   .top-row {
     grid-template-columns: 1fr;
   }
+}
+
+.rebound-preview-panel {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 18px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.rebound-preview-header,
+.rebound-preview-meta,
+.rebound-preview-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.rebound-preview-header {
+  justify-content: space-between;
+}
+
+.rebound-preview-toggle {
+  color: var(--app-text);
+}
+
+.rebound-preview-refresh {
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--app-accent);
+  padding: 0.35rem 0.8rem;
+}
+
+.rebound-preview-controls {
+  margin-top: 0.75rem;
+}
+
+.rebound-preview-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: var(--app-text-muted);
+  font-size: 0.75rem;
+}
+
+.rebound-preview-controls input {
+  width: 92px;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.65);
+  color: var(--app-text);
+}
+
+.rebound-preview-status {
+  margin-top: 0.75rem;
+  color: var(--app-text-muted);
+  font-size: 0.85rem;
+}
+
+.rebound-preview-summary {
+  margin-top: 0.8rem;
+}
+
+.rebound-preview-meta {
+  color: var(--app-text);
+  font-size: 0.84rem;
+}
+
+.rebound-winner-list {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+
+.rebound-winner-list-title {
+  color: var(--app-text-muted);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+}
+
+.rebound-winner-row {
+  display: grid;
+  grid-template-columns: 44px minmax(80px, 1fr) 48px;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.rebound-winner-player {
+  color: var(--app-text);
+  font-weight: 700;
+}
+
+.rebound-winner-bar {
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.9);
+  overflow: hidden;
+}
+
+.rebound-winner-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #fbbf24);
+}
+
+.rebound-winner-prob {
+  color: var(--app-accent);
+  text-align: right;
 }
 </style>

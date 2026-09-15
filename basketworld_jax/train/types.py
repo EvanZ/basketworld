@@ -19,6 +19,9 @@ class TrainerConfig:
     ppo_minibatches: int = 1
     single_episode_rollouts: bool = False
     ppo_completed_episodes_only: bool = False
+    rebound_critic_policy_coef: float = 0.0
+    rebound_critic_value_coef: float = 0.0
+    rebound_counterfactual_positioning_coef: float = 0.0
 
 
 class TrajectoryBatch(NamedTuple):
@@ -33,6 +36,12 @@ class TrajectoryBatch(NamedTuple):
     opponent_deterministic_episode: Any
     selected_log_probs: Any
     values: Any
+    rebound_values: Any
+    rebound_aux_targets: Any
+    rebound_aux_mask: Any
+    rebound_positioning_mask: Any
+    rebound_counterfactual_advantages: Any
+    rebound_counterfactual_mask: Any
     rewards: Any
     dones: Any
     phi_r_shape: Any
@@ -66,6 +75,15 @@ class TrajectoryBatch(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_target_cells: Any
+    rebound_winners: Any
+    rebound_global_contests: Any
+    shot_clock_reset_14: Any
+    rebound_reward_advances: Any
+    rebound_reward_settlements: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any
@@ -81,6 +99,7 @@ class TrajectoryBatch(NamedTuple):
     selector_boundary_episode_start: Any
     selector_boundary_commitment_timeout: Any
     selector_boundary_completed_pass: Any
+    selector_boundary_offensive_rebound: Any
     selector_intent_index: Any
     selector_old_log_prob: Any
     selector_value: Any
@@ -100,6 +119,9 @@ class RolloutOutput(NamedTuple):
     final_selector_values: Any
     final_flat_obs: Any
     final_action_mask: Any
+    rebound_diagnostic_totals: Any = None
+    rebound_diagnostic_argmax_totals: Any = None
+    rebound_diagnostic_sampled_totals: Any = None
 
 
 class PPOBatch(NamedTuple):
@@ -112,6 +134,14 @@ class PPOBatch(NamedTuple):
     old_values: Any
     advantages: Any
     returns: Any
+    rebound_values: Any
+    rebound_advantages: Any
+    rebound_aux_targets: Any
+    rebound_aux_mask: Any
+    rebound_positioning_mask: Any
+    rebound_counterfactual_advantages: Any
+    rebound_counterfactual_raw_advantages: Any
+    rebound_counterfactual_mask: Any
     active_mask: Any
     loss_weights: Any
     loss_denominator: Any
@@ -153,6 +183,15 @@ class EvalTrace(NamedTuple):
     opponent_shot_dunks: Any
     opponent_shot_twos: Any
     opponent_shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_target_cells: Any
+    rebound_winners: Any
+    rebound_global_contests: Any
+    shot_clock_reset_14: Any
+    rebound_reward_advances: Any
+    rebound_reward_settlements: Any
     intent_index: Any
     intent_active: Any
     intent_age: Any
@@ -167,6 +206,49 @@ class EvalTrace(NamedTuple):
     terminal_episode_steps: Any
     offense_score: Any
     defense_score: Any
+
+
+class DeployEvalTotals(NamedTuple):
+    active_steps: Any
+    completed_episode_steps: Any
+    offense_reward: Any
+    defense_reward: Any
+    pass_attempts: Any
+    completed_passes: Any
+    assists: Any
+    turnovers: Any
+    turnover_pass_out_of_bounds: Any
+    turnover_intercepted: Any
+    turnover_defender_pressure: Any
+    turnover_move_out_of_bounds: Any
+    turnover_shot_clock: Any
+    turnover_offensive_three_seconds: Any
+    shot_attempts: Any
+    shot_makes: Any
+    shot_dunks: Any
+    shot_twos: Any
+    shot_threes: Any
+    rebound_attempts: Any
+    offensive_rebounds: Any
+    defensive_rebounds: Any
+    rebound_global_contests: Any
+    shot_clock_reset_14: Any
+    rebound_reward_advance_count: Any
+    rebound_reward_advance_total: Any
+    rebound_reward_settlement_total: Any
+    offensive_three_seconds: Any
+    defensive_lane_violations: Any
+    selector_applied: Any
+    selector_boundary_episode_start: Any
+    selector_boundary_commitment_timeout: Any
+    selector_boundary_completed_pass: Any
+    selector_boundary_offensive_rebound: Any
+
+
+class DeployEvalOutput(NamedTuple):
+    final_state: Any
+    totals: DeployEvalTotals
+    rebound_diagnostic_totals: Any
 
 
 def compute_gae_and_returns(rewards, values, dones, bootstrap_values, *, gamma: float, gae_lambda: float, jax, jnp):
@@ -235,7 +317,6 @@ def build_trajectory_training_masks(trajectory: TrajectoryBatch, trainer_config:
         completed_episode_count.astype(jnp.float32),
     )
 
-
 def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, jnp) -> PPOBatch:
     advantages, returns = compute_gae_and_returns(
         rollout.trajectory.rewards,
@@ -265,6 +346,55 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         normalized_advantages,
         jnp.zeros_like(normalized_advantages),
     )
+    rebound_aux_mask = (
+        rollout.trajectory.rebound_aux_mask.astype(jnp.float32)
+        * active_mask.astype(jnp.float32)
+    )
+    rebound_raw_advantages = (
+        rollout.trajectory.rebound_aux_targets.astype(jnp.float32)
+        - rollout.trajectory.rebound_values.astype(jnp.float32)
+    )
+    rebound_adv_norm_den = jnp.maximum(jnp.sum(rebound_aux_mask), 1.0)
+    rebound_adv_mean = (
+        jnp.sum(rebound_raw_advantages * rebound_aux_mask) / rebound_adv_norm_den
+    )
+    rebound_adv_var = (
+        jnp.sum(jnp.square(rebound_raw_advantages - rebound_adv_mean) * rebound_aux_mask)
+        / rebound_adv_norm_den
+    )
+    normalized_rebound_advantages = (
+        (rebound_raw_advantages - rebound_adv_mean)
+        / jnp.sqrt(jnp.maximum(rebound_adv_var, 1.0e-8))
+    )
+    normalized_rebound_advantages = jnp.where(
+        rebound_aux_mask.astype(jnp.bool_),
+        normalized_rebound_advantages,
+        jnp.zeros_like(normalized_rebound_advantages),
+    )
+    rebound_counterfactual_mask = (
+        rollout.trajectory.rebound_counterfactual_mask.astype(jnp.float32)
+        * active_mask[..., None].astype(jnp.float32)
+    )
+    rebound_counterfactual_raw_advantages = (
+        rollout.trajectory.rebound_counterfactual_advantages.astype(jnp.float32)
+    )
+    rebound_counterfactual_denominator = jnp.maximum(
+        jnp.sum(rebound_counterfactual_mask), 1.0
+    )
+    rebound_counterfactual_rms = jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(
+                jnp.square(rebound_counterfactual_raw_advantages)
+                * rebound_counterfactual_mask
+            ) / rebound_counterfactual_denominator,
+            1.0e-8,
+        )
+    )
+    normalized_rebound_counterfactual_advantages = jnp.where(
+        rebound_counterfactual_mask.astype(jnp.bool_),
+        rebound_counterfactual_raw_advantages / rebound_counterfactual_rms,
+        jnp.zeros_like(rebound_counterfactual_raw_advantages),
+    )
     return PPOBatch(
         flat_obs=rollout.trajectory.flat_obs.reshape(
             -1,
@@ -288,6 +418,33 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         old_values=rollout.trajectory.values.reshape(-1),
         advantages=normalized_advantages.reshape(-1),
         returns=returns.reshape(-1),
+        rebound_values=rollout.trajectory.rebound_values.reshape(-1),
+        rebound_advantages=normalized_rebound_advantages.reshape(-1),
+        rebound_aux_targets=rollout.trajectory.rebound_aux_targets.reshape(-1),
+        rebound_aux_mask=rebound_aux_mask.reshape(-1),
+        rebound_positioning_mask=(
+            rollout.trajectory.rebound_positioning_mask.astype(jnp.float32)
+            * rebound_aux_mask[..., None]
+        ).reshape(
+            -1,
+            int(rollout.trajectory.rebound_positioning_mask.shape[-1]),
+        ),
+        rebound_counterfactual_advantages=(
+            normalized_rebound_counterfactual_advantages.reshape(
+                -1,
+                int(rollout.trajectory.rebound_counterfactual_advantages.shape[-1]),
+            )
+        ),
+        rebound_counterfactual_raw_advantages=(
+            rebound_counterfactual_raw_advantages.reshape(
+                -1,
+                int(rollout.trajectory.rebound_counterfactual_advantages.shape[-1]),
+            )
+        ),
+        rebound_counterfactual_mask=rebound_counterfactual_mask.reshape(
+            -1,
+            int(rollout.trajectory.rebound_counterfactual_mask.shape[-1]),
+        ),
         active_mask=flat_active_mask,
         loss_weights=flat_loss_weights,
         loss_denominator=jnp.full_like(flat_loss_weights, loss_denominator.astype(jnp.float32)),
@@ -308,8 +465,6 @@ def compute_discounted_returns(rewards, dones, bootstrap_values, *, gamma: float
         (rewards[::-1], dones[::-1]),
     )
     return returns_rev[::-1]
-
-
 def compute_selector_segment_returns(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, jnp):
     rewards = rollout.trajectory.rewards.astype(jnp.float32)
     dones = rollout.trajectory.dones.astype(jnp.float32)

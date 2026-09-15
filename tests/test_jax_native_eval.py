@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import inspect
 
+import numpy as np
 import pytest
 
 from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
 from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
+from basketworld_jax.eval.native import (
+    _phi_beta_for_eval,
+    _post_orb_continuation_diagnostics_from_trace,
+    _task_reward_scale_for_eval,
+)
 from basketworld_jax.train.main import parse_args, run_training_loop, validate_train_args
 
 
@@ -22,6 +28,67 @@ def _native_eval_env_params() -> dict:
         TRAIN_FROZEN_VALUES.get("offensive_three_seconds", False)
     )
     return params
+
+
+def test_post_orb_continuation_diagnostics_compare_values_with_shaped_returns():
+    trace = {
+        "active": np.asarray([[1], [1], [1], [0]], dtype=np.int8),
+        "terminal_episode_steps": np.asarray([[0], [0], [3], [0]], dtype=np.int32),
+        "offensive_rebound": np.asarray([[1], [0], [0], [0]], dtype=np.int8),
+        "shot_success": np.asarray([[0], [0], [1], [0]], dtype=np.int8),
+        "shot_value": np.asarray([[0.0], [0.0], [2.0], [0.0]], dtype=np.float32),
+        "offense_values": np.asarray([[0.0], [0.8], [0.0], [0.0]], dtype=np.float32),
+        "defense_values": np.asarray([[0.0], [-0.7], [0.0], [0.0]], dtype=np.float32),
+        "offense_rewards": np.zeros((4, 1), dtype=np.float32),
+        "defense_rewards": np.zeros((4, 1), dtype=np.float32),
+        "offense_training_rewards": np.asarray([[0.4], [0.1], [1.5], [0.0]], dtype=np.float32),
+        "defense_training_rewards": np.asarray([[-0.4], [-0.1], [-1.5], [0.0]], dtype=np.float32),
+        "done": np.asarray([[0], [0], [1], [0]], dtype=np.int8),
+    }
+
+    diagnostics = _post_orb_continuation_diagnostics_from_trace(
+        trace,
+        env_index=0,
+        gamma=0.5,
+    )
+
+    assert diagnostics["post_orb_samples"] == 1
+    assert diagnostics["post_orb_points_sum"] == pytest.approx(2.0)
+    assert diagnostics["post_orb_consensus_value_sum"] == pytest.approx(0.75)
+    assert diagnostics["post_orb_offense_shaped_return_sum"] == pytest.approx(0.85)
+    assert diagnostics["post_orb_defense_shaped_return_sum"] == pytest.approx(-0.85)
+    assert diagnostics["post_orb_consensus_shaped_return_sum"] == pytest.approx(0.85)
+
+    trace["terminal_episode_steps"] = np.zeros((4, 1), dtype=np.int32)
+    truncated = _post_orb_continuation_diagnostics_from_trace(
+        trace,
+        env_index=0,
+        gamma=0.5,
+    )
+    assert truncated["post_orb_samples"] == 0
+    assert truncated["post_orb_shaped_return_samples"] == 0
+
+
+def test_task_reward_scale_for_eval_matches_update_schedule():
+    payload = {"update_index": 250, "trainer_config": {}}
+    params = {
+        "jax/task_reward_scale_start": 0.1,
+        "jax/task_reward_scale_end": 1.0,
+        "jax/task_reward_scale_warmup_updates": 0,
+        "jax/task_reward_scale_ramp_updates": 500,
+    }
+
+    assert _task_reward_scale_for_eval(params, payload) == pytest.approx(0.55)
+    assert _task_reward_scale_for_eval({}, payload) == pytest.approx(1.0)
+
+    phi_params = {
+        "jax/enable_phi_shaping": True,
+        "jax/phi_beta_start": 0.0,
+        "jax/phi_beta_end": 0.25,
+        "jax/phi_beta_warmup_updates": 0,
+        "jax/phi_beta_ramp_updates": 500,
+    }
+    assert _phi_beta_for_eval(phi_params, payload, default=0.0) == pytest.approx(0.125)
 
 
 def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
@@ -103,6 +170,11 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
     assert "shot_dunk_share" in diagnostics["jax_native_summary"]
     assert "shot_two_share" in diagnostics["jax_native_summary"]
     assert "shot_three_share" in diagnostics["jax_native_summary"]
+    assert "post_orb_shaped_return_sample_count" in diagnostics["jax_native_summary"]
+    assert "post_orb_consensus_shaped_return_per_sample" in diagnostics["jax_native_summary"]
+    assert "post_orb_critic_minus_shaped_return_per_sample" in diagnostics["jax_native_summary"]
+    assert diagnostics["jax_native_summary"]["post_orb_shaped_return_includes_training_intent_bonus"] is False
+    assert "post_orb_phi_beta" in diagnostics["jax_native_summary"]
     assert diagnostics["jax_native_summary"]["intent_active_episodes"] == 0
     assert diagnostics["jax_native_summary"]["intent_inactive_episodes"] == 3
     assert diagnostics["jax_native_summary"]["defense_intent_active_episodes"] == 0

@@ -1,0 +1,87 @@
+site_name: BasketWorld
+site_description: JAX-first documentation for the BasketWorld reinforcement-learning environment
+repo_url: https://github.com/EvanZ/basketworld
+repo_name: EvanZ/basketworld
+docs_dir: docs/site
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Environment:
+      - Overview: environment/index.md
+      - Court and geometry: environment/geometry.md
+      - Actions and observations: environment/actions-observations.md
+  - Physics and rewards:
+      - Movement and rules: physics/movement-rules.md
+      - Shooting and pressure: physics/shooting-pressure.md
+      - Passing and turnovers: physics/passing-turnovers.md
+      - Rebounds: physics/rebounds.md
+      - Rewards and termination: physics/rewards-termination.md
+  - JAX implementation:
+      - Architecture: jax/index.md
+      - Policy architecture: jax/policy.md
+      - RL training: jax/training.md
+      - Intent and play discovery: jax/intents.md
+      - Training operations: jax/operations.md
+  - Historical SB3 implementation:
+      - SB3 architecture and migration: history/sb3.md

@@ -27,6 +27,24 @@ def _library_path() -> Path:
     return Path(__file__).resolve().parents[3] / "configs" / "start_templates_v2.json"
 
 
+def _library_5v5_path() -> Path:
+    return Path(__file__).resolve().parents[3] / "configs" / "start_templates_5v5.json"
+
+
+def test_local_training_param_template_library_fallback_loads_5v5_library():
+    library, path = lifecycle_routes._load_start_template_library_from_training_params(
+        {
+            "players": 5,
+            "start_template_library": str(_library_5v5_path()),
+        }
+    )
+
+    assert path == str(_library_5v5_path())
+    assert library is not None
+    assert library["players_per_side"] == 5
+    assert len(library["templates"]) > 0
+
+
 def test_start_self_play_can_resolve_loaded_template_library(isolated_game_state):
     env = HexagonBasketballEnv(
         players=3,

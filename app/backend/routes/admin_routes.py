@@ -48,6 +48,7 @@ from app.backend.schemas import (
     ReplayCounterfactualRequest,
     SaveStartTemplateLibraryRequest,
     SetBallHolderRequest,
+    SetCurrentReboundSkillsRequest,
     SetIntentStateRequest,
     SetOffenseSkillsRequest,
     SetPassLogitBiasRequest,
@@ -112,6 +113,31 @@ def _refresh_after_live_env_edit() -> None:
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to sync live edit to JAX runtime: {err}",
+            ) from err
+        return
+    _rebuild_cached_obs()
+
+
+def _refresh_after_static_env_param_edit(updated_params: dict) -> None:
+    """Refresh cached runtime state after env parameters used by kernel statics change."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is not None:
+        try:
+            if hasattr(jax_runtime, "env_params") and isinstance(jax_runtime.env_params, dict):
+                jax_runtime.env_params.update(updated_params or {})
+            if hasattr(jax_runtime, "refresh_static_from_display_env"):
+                jax_runtime.refresh_static_from_display_env()
+            game_state.env = getattr(jax_runtime, "display_env", game_state.env)
+            if hasattr(jax_runtime, "observation_dict"):
+                user_team = getattr(game_state, "user_team", Team.OFFENSE)
+                game_state.obs = jax_runtime.observation_dict(
+                    observer_is_offense=user_team != Team.DEFENSE
+                )
+                game_state.prev_obs = None
+        except Exception as err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to refresh JAX runtime env parameters: {err}",
             ) from err
         return
     _rebuild_cached_obs()
@@ -1174,7 +1200,12 @@ def _run_jax_playbook_batch(
                     ).astype(jnp.int32)
 
                 def _scan_step(carry, _):
-                    state_in, key_in, last_completed_pass_boundary = carry
+                    (
+                        state_in,
+                        key_in,
+                        last_completed_pass_boundary,
+                        last_offensive_rebound_boundary,
+                    ) = carry
                     (
                         key_next,
                         selector_key,
@@ -1202,13 +1233,24 @@ def _run_jax_playbook_batch(
                             & last_completed_pass_boundary.astype(jnp.bool_)
                             & (age >= int(selector_min_play_steps_arg))
                         )
-                        selector_boundary = timeout_boundary | completed_pass_boundary
+                        offensive_rebound_boundary = (
+                            active
+                            & last_offensive_rebound_boundary.astype(jnp.bool_)
+                            & (age >= int(selector_min_play_steps_arg))
+                        )
+                        selector_boundary = (
+                            timeout_boundary
+                            | completed_pass_boundary
+                            | offensive_rebound_boundary
+                        )
                         selector_obs = build_policy_observation_batch_with_role_flag(
                             static_arg,
                             state_in,
                             role_flag_offense_arg,
                             jnp,
                             model_type=spec.model_type,
+                            rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                         )
                         neutral_context = {
                             "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -1273,6 +1315,8 @@ def _run_jax_playbook_batch(
                         role_flag_offense_arg,
                         jnp,
                         model_type=spec.model_type,
+                        rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                     )
                     defense_obs = build_policy_observation_batch_with_role_flag(
                         static_arg,
@@ -1280,6 +1324,8 @@ def _run_jax_playbook_batch(
                         role_flag_defense_arg,
                         jnp,
                         model_type=spec.model_type,
+                        rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
+                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                     )
                     offense_context = build_policy_intent_context_batch_with_role_flag(
                         static_arg,
@@ -1346,13 +1392,22 @@ def _run_jax_playbook_batch(
                     next_completed_pass_boundary = (
                         out.completed_pass.astype(jnp.bool_) & ~out.done.astype(jnp.bool_)
                     )
-                    return (out.state, key_next, next_completed_pass_boundary), trace
+                    next_offensive_rebound_boundary = (
+                        out.offensive_rebound.astype(jnp.bool_) & ~out.done.astype(jnp.bool_)
+                    )
+                    return (
+                        out.state,
+                        key_next,
+                        next_completed_pass_boundary,
+                        next_offensive_rebound_boundary,
+                    ), trace
 
-                (_, _, _), trace_out = jax.lax.scan(
+                (_, _, _, _), trace_out = jax.lax.scan(
                     _scan_step,
                     (
                         state_arg,
                         eval_key_arg,
+                        jnp.zeros((state_arg.positions.shape[0],), dtype=jnp.bool_),
                         jnp.zeros((state_arg.positions.shape[0],), dtype=jnp.bool_),
                     ),
                     xs=None,
@@ -1793,6 +1848,39 @@ def restore_counterfactual_snapshot_route():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to restore snapshot: {e}")
+
+
+@router.post("/api/set_current_rebound_skills")
+def set_current_rebound_skills_route(req: SetCurrentReboundSkillsRequest):
+    """Override current live JAX rebound skills without resetting the episode."""
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is None:
+        raise HTTPException(status_code=400, detail="Current rebound skill overrides require a JAX runtime.")
+    if not game_state.env or game_state.obs is None:
+        raise HTTPException(status_code=400, detail="Game not initialized.")
+
+    try:
+        applied = jax_runtime.set_current_rebound_skills(
+            list(req.rebound_skills or []),
+            rebound_skill_specialists=(
+                list(req.rebound_skill_specialists)
+                if req.rebound_skill_specialists is not None
+                else None
+            ),
+            game_state=game_state,
+        )
+        updated_state = get_ui_game_state()
+        if game_state.episode_states:
+            game_state.episode_states[-1] = updated_state
+        return {
+            "status": "success",
+            "applied": applied,
+            "state": updated_state,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set current rebound skills: {e}")
 
 
 @router.post("/api/replay_counterfactual_snapshot")
@@ -2455,9 +2543,37 @@ def _set_pressure_params_impl(
         "steal_perp_decay",
         "steal_distance_factor",
         "steal_position_weight_min",
+        "pass_interception_model",
+        "pass_passer_pressure_weight",
+        "pass_receiver_pressure_weight",
+        "pass_lob_lane_multiplier",
+        "pass_lob_receiver_distance",
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "base_passer_risk",
+        "passer_pressure_decay",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "receiver_alignment_width",
+        "max_receiver_hazard",
+        "lane_weight",
         "defender_pressure_distance",
         "defender_pressure_turnover_chance",
         "defender_pressure_decay_lambda",
+        "rebound_winner_distance_weight",
+        "rebound_basket_position_weight",
+        "rebound_winner_temperature",
+        "rebound_skill_std",
+        "rebound_skill_sampling_mode",
+        "rebound_skill_high",
+        "rebound_skill_low",
+        "rebound_skill_weight",
+        "rebound_contest_mode",
+        "rebound_contest_radius",
+        "rebound_obs_top_n_targets",
     }
     scoped_param_keys = {
         "all": set(all_param_keys),
@@ -2473,11 +2589,41 @@ def _set_pressure_params_impl(
             "steal_perp_decay",
             "steal_distance_factor",
             "steal_position_weight_min",
+            "pass_interception_model",
+            "pass_passer_pressure_weight",
+            "pass_receiver_pressure_weight",
+            "pass_lob_lane_multiplier",
+            "pass_lob_receiver_distance",
+            "pass_speed",
+            "defender_reaction_time",
+            "defender_speed",
+            "defender_reach_radius",
+            "reaction_softness",
+            "base_passer_risk",
+            "passer_pressure_decay",
+            "base_receiver_risk",
+            "receiver_alignment_min",
+            "receiver_alignment_width",
+            "max_receiver_hazard",
+            "lane_weight",
         },
         "defender_pressure": {
             "defender_pressure_distance",
             "defender_pressure_turnover_chance",
             "defender_pressure_decay_lambda",
+        },
+        "rebounding": {
+            "rebound_winner_distance_weight",
+            "rebound_basket_position_weight",
+            "rebound_winner_temperature",
+            "rebound_skill_std",
+            "rebound_skill_sampling_mode",
+            "rebound_skill_high",
+            "rebound_skill_low",
+            "rebound_skill_weight",
+            "rebound_contest_mode",
+            "rebound_contest_radius",
+            "rebound_obs_top_n_targets",
         },
     }
     requested_scope = (
@@ -2522,6 +2668,57 @@ def _set_pressure_params_impl(
             "steal_position_weight_min": _default_value(
                 "steal_position_weight_min", getattr(env, "steal_position_weight_min", 0.3)
             ),
+            "pass_interception_model": _default_value(
+                "pass_interception_model", getattr(env, "pass_interception_model", "line")
+            ),
+            "pass_passer_pressure_weight": _default_value(
+                "pass_passer_pressure_weight", getattr(env, "pass_passer_pressure_weight", 0.0)
+            ),
+            "pass_receiver_pressure_weight": _default_value(
+                "pass_receiver_pressure_weight", getattr(env, "pass_receiver_pressure_weight", 0.0)
+            ),
+            "pass_lob_lane_multiplier": _default_value(
+                "pass_lob_lane_multiplier", getattr(env, "pass_lob_lane_multiplier", 0.35)
+            ),
+            "pass_lob_receiver_distance": _default_value(
+                "pass_lob_receiver_distance", getattr(env, "pass_lob_receiver_distance", 1.0)
+            ),
+            "pass_speed": _default_value(
+                "pass_speed", getattr(env, "pass_speed", 3.5)
+            ),
+            "defender_reaction_time": _default_value(
+                "defender_reaction_time", getattr(env, "defender_reaction_time", 0.35)
+            ),
+            "defender_speed": _default_value(
+                "defender_speed", getattr(env, "defender_speed", 1.25)
+            ),
+            "defender_reach_radius": _default_value(
+                "defender_reach_radius", getattr(env, "defender_reach_radius", 0.65)
+            ),
+            "reaction_softness": _default_value(
+                "reaction_softness", getattr(env, "reaction_softness", 0.55)
+            ),
+            "base_passer_risk": _default_value(
+                "base_passer_risk", getattr(env, "base_passer_risk", 0.06)
+            ),
+            "passer_pressure_decay": _default_value(
+                "passer_pressure_decay", getattr(env, "passer_pressure_decay", 1.35)
+            ),
+            "base_receiver_risk": _default_value(
+                "base_receiver_risk", getattr(env, "base_receiver_risk", 0.35)
+            ),
+            "receiver_alignment_min": _default_value(
+                "receiver_alignment_min", getattr(env, "receiver_alignment_min", 0.35)
+            ),
+            "receiver_alignment_width": _default_value(
+                "receiver_alignment_width", getattr(env, "receiver_alignment_width", 2.0)
+            ),
+            "max_receiver_hazard": _default_value(
+                "max_receiver_hazard", getattr(env, "max_receiver_hazard", 0.85)
+            ),
+            "lane_weight": _default_value(
+                "lane_weight", getattr(env, "lane_weight", 0.0)
+            ),
             "defender_pressure_distance": _default_value(
                 "defender_pressure_distance", getattr(env, "defender_pressure_distance", 1)
             ),
@@ -2532,6 +2729,50 @@ def _set_pressure_params_impl(
             "defender_pressure_decay_lambda": _default_value(
                 "defender_pressure_decay_lambda",
                 getattr(env, "defender_pressure_decay_lambda", 1.0),
+            ),
+            "rebound_winner_distance_weight": _default_value(
+                "rebound_winner_distance_weight",
+                getattr(env, "rebound_winner_distance_weight", 1.0),
+            ),
+            "rebound_basket_position_weight": _default_value(
+                "rebound_basket_position_weight",
+                getattr(env, "rebound_basket_position_weight", 0.0),
+            ),
+            "rebound_winner_temperature": _default_value(
+                "rebound_winner_temperature",
+                getattr(env, "rebound_winner_temperature", 1.0),
+            ),
+            "rebound_skill_std": _default_value(
+                "rebound_skill_std",
+                getattr(env, "rebound_skill_std", 0.0),
+            ),
+            "rebound_skill_sampling_mode": _default_value(
+                "rebound_skill_sampling_mode",
+                getattr(env, "rebound_skill_sampling_mode", "gaussian"),
+            ),
+            "rebound_skill_high": _default_value(
+                "rebound_skill_high",
+                getattr(env, "rebound_skill_high", 1.0),
+            ),
+            "rebound_skill_low": _default_value(
+                "rebound_skill_low",
+                getattr(env, "rebound_skill_low", -0.25),
+            ),
+            "rebound_skill_weight": _default_value(
+                "rebound_skill_weight",
+                getattr(env, "rebound_skill_weight", 0.0),
+            ),
+            "rebound_contest_mode": _default_value(
+                "rebound_contest_mode",
+                getattr(env, "rebound_contest_mode", "global_contest"),
+            ),
+            "rebound_contest_radius": _default_value(
+                "rebound_contest_radius",
+                getattr(env, "rebound_contest_radius", 1),
+            ),
+            "rebound_obs_top_n_targets": _default_value(
+                "rebound_obs_top_n_targets",
+                getattr(env, "rebound_obs_top_n_targets", 0),
             ),
         }
         if active_scope:
@@ -2562,9 +2803,37 @@ def _set_pressure_params_impl(
             "steal_perp_decay": req.steal_perp_decay,
             "steal_distance_factor": req.steal_distance_factor,
             "steal_position_weight_min": req.steal_position_weight_min,
+            "pass_interception_model": req.pass_interception_model,
+            "pass_passer_pressure_weight": req.pass_passer_pressure_weight,
+            "pass_receiver_pressure_weight": req.pass_receiver_pressure_weight,
+            "pass_lob_lane_multiplier": req.pass_lob_lane_multiplier,
+            "pass_lob_receiver_distance": req.pass_lob_receiver_distance,
+            "pass_speed": req.pass_speed,
+            "defender_reaction_time": req.defender_reaction_time,
+            "defender_speed": req.defender_speed,
+            "defender_reach_radius": req.defender_reach_radius,
+            "reaction_softness": req.reaction_softness,
+            "base_passer_risk": req.base_passer_risk,
+            "passer_pressure_decay": req.passer_pressure_decay,
+            "base_receiver_risk": req.base_receiver_risk,
+            "receiver_alignment_min": req.receiver_alignment_min,
+            "receiver_alignment_width": req.receiver_alignment_width,
+            "max_receiver_hazard": req.max_receiver_hazard,
+            "lane_weight": req.lane_weight,
             "defender_pressure_distance": req.defender_pressure_distance,
             "defender_pressure_turnover_chance": req.defender_pressure_turnover_chance,
             "defender_pressure_decay_lambda": req.defender_pressure_decay_lambda,
+            "rebound_winner_distance_weight": req.rebound_winner_distance_weight,
+            "rebound_basket_position_weight": req.rebound_basket_position_weight,
+            "rebound_winner_temperature": req.rebound_winner_temperature,
+            "rebound_skill_std": req.rebound_skill_std,
+            "rebound_skill_sampling_mode": req.rebound_skill_sampling_mode,
+            "rebound_skill_high": req.rebound_skill_high,
+            "rebound_skill_low": req.rebound_skill_low,
+            "rebound_skill_weight": req.rebound_skill_weight,
+            "rebound_contest_mode": req.rebound_contest_mode,
+            "rebound_contest_radius": req.rebound_contest_radius,
+            "rebound_obs_top_n_targets": req.rebound_obs_top_n_targets,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
         if active_scope and active_scope != "all":
@@ -2674,6 +2943,70 @@ def _set_pressure_params_impl(
             0.0,
             1.0,
         )
+    if "pass_interception_model" in payload:
+        model = str(payload["pass_interception_model"] or "line").strip().lower()
+        aliases = {
+            "line": "line",
+            "legacy": "line",
+            "lob": "lob_aware",
+            "lob-aware": "lob_aware",
+            "lob_aware": "lob_aware",
+            "reaction": "reaction",
+            "speed": "reaction",
+            "speed_based": "reaction",
+            "speed-based": "reaction",
+        }
+        if model not in aliases:
+            raise HTTPException(
+                status_code=400,
+                detail="pass_interception_model must be one of: line, lob_aware, reaction.",
+            )
+        normalized["pass_interception_model"] = aliases[model]
+    if "pass_passer_pressure_weight" in payload:
+        normalized["pass_passer_pressure_weight"] = _validate_min(
+            _as_float(payload["pass_passer_pressure_weight"], "pass_passer_pressure_weight"),
+            "pass_passer_pressure_weight",
+            0.0,
+        )
+    if "pass_receiver_pressure_weight" in payload:
+        normalized["pass_receiver_pressure_weight"] = _validate_min(
+            _as_float(payload["pass_receiver_pressure_weight"], "pass_receiver_pressure_weight"),
+            "pass_receiver_pressure_weight",
+            0.0,
+        )
+    if "pass_lob_lane_multiplier" in payload:
+        normalized["pass_lob_lane_multiplier"] = _validate_range(
+            _as_float(payload["pass_lob_lane_multiplier"], "pass_lob_lane_multiplier"),
+            "pass_lob_lane_multiplier",
+            0.0,
+            1.0,
+        )
+    if "pass_lob_receiver_distance" in payload:
+        normalized["pass_lob_receiver_distance"] = _validate_min(
+            _as_float(payload["pass_lob_receiver_distance"], "pass_lob_receiver_distance"),
+            "pass_lob_receiver_distance",
+            0.0,
+        )
+    for key in (
+        "pass_speed",
+        "defender_reaction_time",
+        "defender_speed",
+        "defender_reach_radius",
+        "reaction_softness",
+        "passer_pressure_decay",
+        "receiver_alignment_width",
+    ):
+        if key in payload:
+            normalized[key] = _validate_min(_as_float(payload[key], key), key, 0.0)
+    for key in (
+        "base_passer_risk",
+        "base_receiver_risk",
+        "receiver_alignment_min",
+        "max_receiver_hazard",
+        "lane_weight",
+    ):
+        if key in payload:
+            normalized[key] = _validate_range(_as_float(payload[key], key), key, 0.0, 1.0)
 
     if "defender_pressure_distance" in payload:
         normalized["defender_pressure_distance"] = _as_int(
@@ -2704,6 +3037,70 @@ def _set_pressure_params_impl(
             0.0,
         )
 
+    if "rebound_winner_distance_weight" in payload:
+        normalized["rebound_winner_distance_weight"] = _validate_min(
+            _as_float(payload["rebound_winner_distance_weight"], "rebound_winner_distance_weight"),
+            "rebound_winner_distance_weight",
+            0.0,
+        )
+    if "rebound_basket_position_weight" in payload:
+        normalized["rebound_basket_position_weight"] = _validate_min(
+            _as_float(payload["rebound_basket_position_weight"], "rebound_basket_position_weight"),
+            "rebound_basket_position_weight",
+            0.0,
+        )
+    if "rebound_winner_temperature" in payload:
+        normalized["rebound_winner_temperature"] = _validate_min(
+            _as_float(payload["rebound_winner_temperature"], "rebound_winner_temperature"),
+            "rebound_winner_temperature",
+            1.0e-6,
+        )
+    if "rebound_skill_std" in payload:
+        normalized["rebound_skill_std"] = _validate_min(
+            _as_float(payload["rebound_skill_std"], "rebound_skill_std"),
+            "rebound_skill_std",
+            0.0,
+        )
+    if "rebound_skill_sampling_mode" in payload:
+        mode = str(payload["rebound_skill_sampling_mode"] or "gaussian").strip().lower().replace("-", "_")
+        if mode in {"normal", "gaussian"}:
+            mode = "gaussian"
+        elif mode in {"one_high", "one_high_per_team", "specialist", "specialist_per_team"}:
+            mode = "one_high_per_team"
+        else:
+            raise HTTPException(status_code=400, detail="rebound_skill_sampling_mode must be 'gaussian' or 'one_high_per_team'.")
+        normalized["rebound_skill_sampling_mode"] = mode
+    if "rebound_skill_high" in payload:
+        normalized["rebound_skill_high"] = _as_float(payload["rebound_skill_high"], "rebound_skill_high")
+    if "rebound_skill_low" in payload:
+        normalized["rebound_skill_low"] = _as_float(payload["rebound_skill_low"], "rebound_skill_low")
+    if "rebound_skill_weight" in payload:
+        normalized["rebound_skill_weight"] = _validate_min(
+            _as_float(payload["rebound_skill_weight"], "rebound_skill_weight"),
+            "rebound_skill_weight",
+            0.0,
+        )
+    if "rebound_contest_mode" in payload:
+        mode = str(payload["rebound_contest_mode"] or "global_contest").strip().lower().replace("-", "_")
+        if mode in {"global", "global_softmax"}:
+            mode = "global_contest"
+        elif mode in {"local", "local_contest"}:
+            mode = "local_contest"
+        else:
+            raise HTTPException(status_code=400, detail="rebound_contest_mode must be 'global_contest' or 'local_contest'.")
+        normalized["rebound_contest_mode"] = mode
+    if "rebound_contest_radius" in payload:
+        normalized["rebound_contest_radius"] = _validate_min(
+            _as_int(payload["rebound_contest_radius"], "rebound_contest_radius"),
+            "rebound_contest_radius",
+            0,
+        )
+    if "rebound_obs_top_n_targets" in payload:
+        normalized["rebound_obs_top_n_targets"] = _validate_min(
+            _as_int(payload["rebound_obs_top_n_targets"], "rebound_obs_top_n_targets"),
+            "rebound_obs_top_n_targets",
+            0,
+        )
     try:
         for key, val in normalized.items():
             setattr(env, key, val)
@@ -2716,7 +3113,7 @@ def _set_pressure_params_impl(
             game_state.env_optional_params = {}
         game_state.env_optional_params.update(normalized)
 
-        _rebuild_cached_obs()
+        _refresh_after_static_env_param_edit(normalized)
 
         updated_state = get_ui_game_state()
         if game_state.episode_states:
@@ -2758,6 +3155,12 @@ def set_pass_interception_params(req: SetPressureParamsRequest):
 def set_defender_pressure_params(req: SetPressureParamsRequest):
     """Update only defender turnover-pressure parameters."""
     return _set_pressure_params_impl(req, forced_scope="defender_pressure")
+
+
+@router.post("/api/set_rebound_params")
+def set_rebound_params(req: SetPressureParamsRequest):
+    """Update only rebound winner-model parameters."""
+    return _set_pressure_params_impl(req, forced_scope="rebounding")
 
 
 @router.post("/api/swap_policies")

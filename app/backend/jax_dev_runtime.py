@@ -12,6 +12,8 @@ from basketworld.utils.start_templates import resolve_start_template
 from basketworld_jax.env.minimal import (
     ACTION_COUNT,
     PASS_ACTION_START,
+    REBOUND_CONTEST_MODE_LOCAL,
+    REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
     TURNOVER_REASON_DEFENDER_PRESSURE,
@@ -37,6 +39,223 @@ from app.backend.inference_adapters import (
     get_policy_metadata,
     unwrap_inference_model,
 )
+
+_JAX_STATIC_ONLY_ENV_KEYS = {
+    "enable_rebounds",
+    "rebound_table_model_dir",
+    "rebound_target_temperature",
+    "rebound_target_uniform_mix",
+    "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
+    "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
+    "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
+    "offensive_rebound_shot_clock_reset",
+    "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
+}
+
+
+_JAX_STATIC_ONLY_ENV_DEFAULTS = {
+    "enable_rebounds": False,
+    "rebound_table_model_dir": "",
+    "rebound_target_temperature": 1.0,
+    "rebound_target_uniform_mix": 0.0,
+    "rebound_winner_distance_weight": 1.0,
+    "rebound_basket_position_weight": 0.0,
+    "rebound_winner_temperature": 1.0,
+    "rebound_skill_std": 0.0,
+    "rebound_skill_sampling_mode": "gaussian",
+    "rebound_skill_high": 1.0,
+    "rebound_skill_low": -0.25,
+    "rebound_skill_weight": 0.0,
+    "rebound_contest_mode": "global_contest",
+    "rebound_contest_radius": 1,
+    "rebound_obs_top_n_targets": 0,
+    "offensive_rebound_shot_clock_reset": 14,
+    "rebound_terminal_reward_mode": "actual_points",
+    "enable_rebound_reward_redistribution": False,
+    "offensive_rebound_reward_advance": 0.4,
+    "rebound_reward_once_per_possession": True,
+}
+
+_JAX_STATIC_ONLY_ENV_CASTS = {
+    "enable_rebounds": "bool",
+    "rebound_table_model_dir": "str",
+    "rebound_target_temperature": "float",
+    "rebound_target_uniform_mix": "float",
+    "rebound_winner_distance_weight": "float",
+    "rebound_basket_position_weight": "float",
+    "rebound_winner_temperature": "float",
+    "rebound_skill_std": "float",
+    "rebound_skill_sampling_mode": "str",
+    "rebound_skill_high": "float",
+    "rebound_skill_low": "float",
+    "rebound_skill_weight": "float",
+    "rebound_contest_mode": "str",
+    "rebound_contest_radius": "int",
+    "rebound_obs_top_n_targets": "int",
+    "offensive_rebound_shot_clock_reset": "int",
+    "rebound_terminal_reward_mode": "str",
+    "enable_rebound_reward_redistribution": "bool",
+    "offensive_rebound_reward_advance": "float",
+    "rebound_reward_once_per_possession": "bool",
+}
+
+
+def _canonical_rebound_contest_mode(value: Any) -> str:
+    raw = str(value or "global_contest").strip().lower().replace("-", "_")
+    if raw in {"local", "local_contest"}:
+        return "local_contest"
+    return "global_contest"
+
+
+def _rebound_contest_mode_from_static(static: Any) -> str:
+    try:
+        mode_id = int(np.asarray(static.rebound_contest_mode).reshape(-1)[0])
+    except Exception:
+        return "global_contest"
+    return "local_contest" if mode_id == int(REBOUND_CONTEST_MODE_LOCAL) else "global_contest"
+
+
+def _rebound_skill_sampling_mode_from_static(static: Any) -> str:
+    try:
+        mode_id = int(np.asarray(static.rebound_skill_sampling_mode).reshape(-1)[0])
+    except Exception:
+        return "gaussian"
+    return "one_high_per_team" if mode_id == int(REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM) else "gaussian"
+
+
+def _float_from_static_field(static: Any, field_name: str, fallback: float) -> float:
+    try:
+        return float(np.asarray(getattr(static, field_name)).reshape(-1)[0])
+    except Exception:
+        return float(fallback)
+
+
+def _int_from_static_field(static: Any, field_name: str, fallback: int) -> int:
+    try:
+        return int(np.asarray(getattr(static, field_name)).reshape(-1)[0])
+    except Exception:
+        return int(fallback)
+
+
+def _infer_attention_observation_dims(
+    current_dim: int,
+    *,
+    expected_dim: int,
+    token_count: int,
+    token_dim: int,
+    global_dim: int,
+) -> tuple[int, int] | None:
+    if token_count <= 0:
+        return None
+    max_token_dim = max(1, (int(current_dim) - 1) // int(token_count))
+    candidates: list[tuple[tuple[int, int, int], int, int]] = []
+    for current_token_dim in range(1, max_token_dim + 1):
+        current_global_dim = int(current_dim) - 1 - (int(token_count) * int(current_token_dim))
+        if current_global_dim < 0:
+            continue
+        if current_dim >= expected_dim:
+            if current_token_dim < token_dim or current_global_dim < global_dim:
+                continue
+            # Prefer interpreting extras as a small number of added globals, then
+            # added per-token fields. This handles 10*18+8+1 -> 10*17+7+1.
+            score = (current_global_dim - global_dim, current_token_dim - token_dim, -current_token_dim)
+        else:
+            if current_token_dim > token_dim or current_global_dim > global_dim:
+                continue
+            # When padding for older checkpoints, preserve as much current
+            # structure as possible.
+            score = (token_dim - current_token_dim, global_dim - current_global_dim, -current_token_dim)
+        candidates.append((score, current_token_dim, current_global_dim))
+    if not candidates:
+        return None
+    _score, current_token_dim, current_global_dim = min(candidates, key=lambda item: item[0])
+    return int(current_token_dim), int(current_global_dim)
+
+
+def _adapt_attention_observation_to_spec(flat_obs, spec, jnp):
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    token_count = int(spec.token_player_count)
+    token_dim = int(spec.token_dim)
+    global_dim = int(spec.global_dim)
+    dims = _infer_attention_observation_dims(
+        current_dim,
+        expected_dim=expected_dim,
+        token_count=token_count,
+        token_dim=token_dim,
+        global_dim=global_dim,
+    )
+    if dims is None:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+    current_token_dim, current_global_dim = dims
+    if current_token_dim <= 0 or current_global_dim < 0:
+        raise ValueError(f"Cannot adapt attention observation dim {current_dim} to checkpoint dim {expected_dim}.")
+
+    players = flat_obs[:, : token_count * current_token_dim].reshape(
+        flat_obs.shape[0], token_count, current_token_dim
+    )
+    if current_token_dim >= token_dim:
+        players = players[:, :, :token_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], token_count, token_dim - current_token_dim), dtype=flat_obs.dtype)
+        players = jnp.concatenate([players, pad], axis=-1)
+
+    global_start = token_count * current_token_dim
+    globals_vec = flat_obs[:, global_start : global_start + current_global_dim]
+    if current_global_dim >= global_dim:
+        globals_vec = globals_vec[:, :global_dim]
+    else:
+        pad = jnp.zeros((flat_obs.shape[0], global_dim - current_global_dim), dtype=flat_obs.dtype)
+        globals_vec = jnp.concatenate([globals_vec, pad], axis=-1)
+
+    role_start = global_start + current_global_dim
+    role_flag = flat_obs[:, role_start : role_start + 1]
+    if role_flag.shape[-1] < 1:
+        role_flag = jnp.zeros((flat_obs.shape[0], 1), dtype=flat_obs.dtype)
+
+    return jnp.concatenate(
+        [players.reshape(flat_obs.shape[0], token_count * token_dim), globals_vec, role_flag],
+        axis=1,
+    ).astype(jnp.float32)
+
+
+def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
+    if not hasattr(spec, "flat_obs_dim"):
+        return flat_obs
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    if current_dim == expected_dim:
+        return flat_obs
+    if str(spec.model_type) == "attention":
+        return _adapt_attention_observation_to_spec(flat_obs, spec, jnp)
+    if current_dim < expected_dim:
+        raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
+    n_players = int(static.role_encoding.shape[0])
+    offense_count = int(static.offense_ids.shape[0])
+    tail_dim = 4 + 1 + (3 * offense_count)
+    extra_dim = current_dim - expected_dim
+    if (
+        n_players > 0
+        and extra_dim > 0
+        and extra_dim % n_players == 0
+        and extra_dim <= (2 * n_players)
+        and current_dim > (extra_dim + tail_dim)
+    ):
+        remove_start = current_dim - tail_dim - extra_dim
+        return jnp.concatenate([flat_obs[:, :remove_start], flat_obs[:, remove_start + extra_dim :]], axis=1).astype(jnp.float32)
+    return flat_obs[:, :expected_dim].astype(jnp.float32)
+
 
 _SELECTOR_METADATA_PRIORITY_KEYS = {
     "intent_selector_enabled",
@@ -96,6 +315,43 @@ def _coerce_int(value: Any, default: int = 0) -> int:
     except Exception:
         return int(default)
 
+
+
+def _coerce_runtime_static_value(key: str, value: Any) -> Any:
+    kind = _JAX_STATIC_ONLY_ENV_CASTS.get(key)
+    if kind == "bool":
+        return _coerce_bool(value)
+    if kind == "float":
+        return _coerce_float(value)
+    if kind == "int":
+        return _coerce_int(value)
+    if kind == "str":
+        return str(value)
+    return value
+
+
+def _jax_static_env_params_from_policy(policy_obj: Any) -> dict[str, Any]:
+    """Extract JAX kernel-only env attrs from checkpoint metadata.
+
+    These fields are intentionally not passed to the legacy Python env
+    constructor, but the JAX kernel reads them from display-env attributes.
+    """
+    metadata = get_policy_metadata(policy_obj) or {}
+    sources = (
+        metadata.get("frozen_config"),
+        metadata.get("env_config"),
+        metadata.get("trainer_config"),
+    )
+    out: dict[str, Any] = {}
+    if any(isinstance(source, dict) for source in sources[:2]):
+        out.update(_JAX_STATIC_ONLY_ENV_DEFAULTS)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in _JAX_STATIC_ONLY_ENV_KEYS:
+            if key in source and source[key] not in (None, ""):
+                out[key] = _coerce_runtime_static_value(key, source[key])
+    return out
 
 def _coerce_play_name_map(metadata: dict[str, Any] | None, num_intents: int) -> dict[str, str]:
     if not isinstance(metadata, dict):
@@ -168,11 +424,17 @@ class JaxDevRuntime:
         self.role_flag_defense = float(role_flag_defense)
         self.required_params = copy.deepcopy(required_params)
         self.env_params = copy.deepcopy(env_params)
+        display_env_params = {
+            key: value
+            for key, value in self.env_params.items()
+            if key not in _JAX_STATIC_ONLY_ENV_KEYS
+        }
         self.display_env = HexagonBasketballEnv(
             **self.required_params,
-            **self.env_params,
+            **display_env_params,
             render_mode="rgb_array",
         )
+        self._apply_jax_static_env_attrs()
 
         raw_model = unwrap_inference_model(unified_policy)
         if raw_model is None or not hasattr(raw_model, "jax"):
@@ -184,6 +446,7 @@ class JaxDevRuntime:
         self.state = None
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
+        self.episode_rebounds: list[dict[str, Any]] = []
         if rng_seed is None:
             rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
         self._rng_seed = int(rng_seed)
@@ -195,7 +458,14 @@ class JaxDevRuntime:
             "defense": None,
         }
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition: dict[str, Any] | None = None
+
+    def _apply_jax_static_env_attrs(self) -> None:
+        for key in _JAX_STATIC_ONLY_ENV_KEYS:
+            if key in self.env_params:
+                setattr(self.display_env, key, self.env_params[key])
+
 
     @property
     def n_players(self) -> int:
@@ -246,10 +516,14 @@ class JaxDevRuntime:
             "display_env": copy.deepcopy(self.display_env),
             "last_step_output": self._clone_jax_tree(self.last_step_output),
             "last_action_results": copy.deepcopy(self.last_action_results),
+            "episode_rebounds": copy.deepcopy(self.episode_rebounds),
             "last_policy_probs": copy.deepcopy(self._last_policy_probs),
             "last_attention_payload": copy.deepcopy(self._last_attention_payload),
             "last_attention_payloads": copy.deepcopy(self._last_attention_payloads),
             "last_completed_pass_boundary": bool(self._last_completed_pass_boundary),
+            "last_offensive_rebound_boundary": bool(
+                self._last_offensive_rebound_boundary
+            ),
             "last_selector_transition": copy.deepcopy(self._last_selector_transition),
         }
 
@@ -277,6 +551,7 @@ class JaxDevRuntime:
         self.last_action_results = copy.deepcopy(
             snapshot.get("last_action_results") or self._empty_action_results()
         )
+        self.episode_rebounds = copy.deepcopy(snapshot.get("episode_rebounds") or [])
         self._last_policy_probs = copy.deepcopy(snapshot.get("last_policy_probs"))
         self._last_attention_payload = copy.deepcopy(snapshot.get("last_attention_payload"))
         payloads = snapshot.get("last_attention_payloads")
@@ -290,7 +565,12 @@ class JaxDevRuntime:
                 "offense": copy.deepcopy(self._last_attention_payload),
                 "defense": None,
             }
-        self._last_completed_pass_boundary = bool(snapshot.get("last_completed_pass_boundary", False))
+        self._last_completed_pass_boundary = bool(
+            snapshot.get("last_completed_pass_boundary", False)
+        )
+        self._last_offensive_rebound_boundary = bool(
+            snapshot.get("last_offensive_rebound_boundary", False)
+        )
         self._last_selector_transition = copy.deepcopy(snapshot.get("last_selector_transition"))
         self._sync_display_env()
         if game_state is not None:
@@ -299,8 +579,62 @@ class JaxDevRuntime:
             game_state.prev_obs = None
             self._capture_turn_start(game_state)
 
+    def set_current_rebound_skills(
+        self,
+        rebound_skills: list[float],
+        *,
+        rebound_skill_specialists: list[bool] | None = None,
+        game_state: Any | None = None,
+    ) -> dict[str, Any]:
+        """Override current-state rebound skills without resetting or advancing RNG."""
+        if self.state is None:
+            raise RuntimeError("JAX runtime is not initialized.")
+        values = np.asarray(rebound_skills, dtype=np.float32).reshape(-1)
+        if values.size != int(self.n_players):
+            raise ValueError(f"Expected {self.n_players} rebound skill values, got {values.size}.")
+
+        current_skill = np.asarray(getattr(self.state, "rebound_skill"), dtype=np.float32)
+        if current_skill.ndim != 2:
+            raise RuntimeError("Unexpected rebound_skill state shape.")
+        batch_size = int(current_skill.shape[0])
+        skill_batch = np.broadcast_to(values[None, :], (batch_size, values.size)).astype(np.float32)
+
+        if rebound_skill_specialists is None:
+            if _rebound_skill_sampling_mode_from_static(self.static) == "one_high_per_team":
+                specialist_values = (values > 0.0).astype(np.float32)
+            else:
+                specialist_values = np.zeros_like(values, dtype=np.float32)
+        else:
+            specialist_values = np.asarray(rebound_skill_specialists, dtype=np.float32).reshape(-1)
+            if specialist_values.size != int(self.n_players):
+                raise ValueError(
+                    f"Expected {self.n_players} rebound skill specialist values, got {specialist_values.size}."
+                )
+            specialist_values = np.where(specialist_values > 0.0, 1.0, 0.0).astype(np.float32)
+        specialist_batch = np.broadcast_to(
+            specialist_values[None, :],
+            (batch_size, specialist_values.size),
+        ).astype(np.float32)
+
+        self.state = self.state._replace(
+            rebound_skill=self.jnp.asarray(skill_batch, dtype=self.jnp.float32),
+            rebound_skill_specialist=self.jnp.asarray(specialist_batch, dtype=self.jnp.float32),
+        )
+        self._last_policy_probs = None
+        self._clear_attention_payload_cache()
+        self._sync_display_env()
+        if game_state is not None:
+            game_state.env = self.display_env
+            game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+            game_state.prev_obs = None
+        return {
+            "rebound_skills": [float(v) for v in values.tolist()],
+            "rebound_skill_specialists": [bool(v > 0.0) for v in specialist_values.tolist()],
+        }
+
     def refresh_static_from_display_env(self) -> None:
         """Refresh immutable JAX kernel config after live display-env edits."""
+        self._apply_jax_static_env_attrs()
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
@@ -324,6 +658,11 @@ class JaxDevRuntime:
         self.raw_model = raw_model
         self.jax = raw_model.jax
         self.jnp = raw_model.jnp
+
+        checkpoint_static_params = _jax_static_env_params_from_policy(unified_policy)
+        if checkpoint_static_params:
+            self.env_params.update(checkpoint_static_params)
+            self.refresh_static_from_display_env()
 
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
@@ -355,9 +694,11 @@ class JaxDevRuntime:
         )
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
+        self.episode_rebounds = []
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         return {"start_template": template_metadata} if template_metadata else {}
@@ -435,9 +776,11 @@ class JaxDevRuntime:
         self.state = self.state._replace(**updates)
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
+        self.episode_rebounds = []
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         self.display_env.training_team = user_team
@@ -521,12 +864,19 @@ class JaxDevRuntime:
             role_flag,
             self.jnp,
             model_type=str(self.raw_model.spec.model_type),
+            rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
+        obs = _adapt_policy_observation_to_spec(obs, self.static, self.raw_model.spec, self.jnp)
         players, globals_vec, _ = build_token_observation_components_batch(
             self.static,
             self.state,
             role_flag,
             self.jnp,
+            rebound_win_prob_features=bool(
+                getattr(self.raw_model.spec, "rebound_win_prob_features", False)
+            ),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
         skills = self.jnp.stack(
             [
@@ -565,7 +915,10 @@ class JaxDevRuntime:
             role_flag,
             self.jnp,
             model_type=str(raw.spec.model_type),
+            rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
         )
+        flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, raw.spec, self.jnp)
         full_action_mask = build_action_masks_batch(self.static, self.state, self.jnp)
         team_ids_device = self.static.offense_ids if observer_is_offense else self.static.defense_ids
         team_ids = [int(v) for v in np.asarray(team_ids_device).reshape(-1).tolist()]
@@ -724,7 +1077,14 @@ class JaxDevRuntime:
         self.state = out.state
         self.last_step_output = out
         self.last_action_results = self._action_results_from_step(prev_state, out)
-        self._last_completed_pass_boundary = bool(_as_bool(out.completed_pass[0]) and not _as_bool(out.done[0]))
+        if self.last_action_results.get("rebounds"):
+            self.episode_rebounds.extend(copy.deepcopy(self.last_action_results["rebounds"]))
+        self._last_completed_pass_boundary = bool(
+            _as_bool(out.completed_pass[0]) and not _as_bool(out.done[0])
+        )
+        self._last_offensive_rebound_boundary = bool(
+            _as_bool(out.offensive_rebound[0]) and not _as_bool(out.done[0])
+        )
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
@@ -834,6 +1194,7 @@ class JaxDevRuntime:
         if meta is not None and "source" not in meta:
             meta["source"] = getattr(game_state, "start_template_library_source", None)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         game_state.replay_seed = seed
         game_state.replay_initial_positions = [tuple(pos) for pos in self.positions]
@@ -885,6 +1246,7 @@ class JaxDevRuntime:
             )
         self.state = self.state._replace(**state_updates)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -914,9 +1276,11 @@ class JaxDevRuntime:
         self.state = self.state._replace(**updates)
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
+        self.episode_rebounds = []
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -992,6 +1356,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
         game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
@@ -1115,11 +1480,187 @@ class JaxDevRuntime:
         defense = self._team_policy_output(self.unified_policy, observer_is_offense=False, deterministic=True)
         return {"offensive_value": float(offense.values), "defensive_value": float(defense.values)}
 
+    def _softmax_np(self, logits: np.ndarray) -> np.ndarray:
+        logits = np.asarray(logits, dtype=np.float64)
+        if logits.size == 0:
+            return logits
+        shifted = logits - np.nanmax(logits)
+        exp = np.exp(shifted)
+        total = float(np.sum(exp))
+        if total <= 0.0 or not np.isfinite(total):
+            return np.ones_like(logits, dtype=np.float64) / float(logits.size)
+        return exp / total
+
+    def _cell_index_for_position(self, position: np.ndarray) -> int | None:
+        coords = np.asarray(self.jax.device_get(self.static.cell_coords), dtype=np.int32)
+        pos = np.asarray(position, dtype=np.int32).reshape(-1)[:2]
+        matches = np.nonzero(np.all(coords == pos, axis=1))[0]
+        if matches.size == 0:
+            return None
+        return int(matches[0])
+
+    def _rebound_target_distribution_payload(
+        self,
+        *,
+        shot_type: int,
+        shooter: int,
+        sampled_target_cell: int,
+        prev_positions: np.ndarray,
+    ) -> tuple[list[dict[str, Any]], float | None]:
+        coords = np.asarray(self.jax.device_get(self.static.cell_coords), dtype=np.int32)
+        if coords.ndim != 2 or coords.shape[0] == 0:
+            return [], None
+        if shooter < 0 or shooter >= int(prev_positions.shape[0]):
+            return [], None
+        shot_cell_idx = self._cell_index_for_position(prev_positions[shooter])
+        if shot_cell_idx is None:
+            return [], None
+
+        table = np.asarray(self.jax.device_get(self.static.rebound_target_probs), dtype=np.float64)
+        if table.ndim != 3 or table.shape[-1] != coords.shape[0]:
+            return [], None
+        safe_shot_type = int(np.clip(int(shot_type), 0, table.shape[0] - 1))
+        safe_shot_cell = int(np.clip(int(shot_cell_idx), 0, table.shape[1] - 1))
+        raw_probs = np.asarray(table[safe_shot_type, safe_shot_cell], dtype=np.float64)
+        if raw_probs.size == 0:
+            return [], None
+
+        raw_total = float(np.sum(raw_probs))
+        if raw_total <= 0.0 or not np.isfinite(raw_total):
+            probs = np.ones_like(raw_probs, dtype=np.float64) / float(raw_probs.size)
+        else:
+            raw_probs = raw_probs / raw_total
+            uniform = np.ones_like(raw_probs, dtype=np.float64) / float(raw_probs.size)
+            mix = float(np.asarray(self.jax.device_get(self.static.rebound_target_uniform_mix)))
+            mix = float(np.clip(mix, 0.0, 1.0))
+            mixed = (1.0 - mix) * raw_probs + mix * uniform
+            temp = float(np.asarray(self.jax.device_get(self.static.rebound_target_temperature)))
+            temp = max(1.0e-6, temp if np.isfinite(temp) else 1.0)
+            logits = np.log(np.maximum(mixed, 1.0e-8)) / temp
+            probs = self._softmax_np(logits)
+
+        target_cells = [
+            {
+                "index": int(idx),
+                "q": int(coords[idx, 0]),
+                "r": int(coords[idx, 1]),
+                "prob": float(prob),
+            }
+            for idx, prob in enumerate(probs.tolist())
+            if float(prob) > 0.0
+        ]
+        sampled_prob = None
+        if 0 <= sampled_target_cell < probs.shape[0]:
+            sampled_prob = float(probs[int(sampled_target_cell)])
+        return target_cells, sampled_prob
+
+    def _rebound_winner_probabilities_payload(
+        self,
+        *,
+        sampled_target_cell: int,
+        winner: int,
+        next_state: Any,
+    ) -> tuple[list[dict[str, Any]], float | None, dict[str, Any]]:
+        coords = np.asarray(self.jax.device_get(self.static.cell_coords), dtype=np.int32)
+        kernel_contest_mode = _rebound_contest_mode_from_static(self.static)
+        empty_info = {
+            "contest_mode": kernel_contest_mode,
+            "contest_radius_used": None,
+            "contest_fallback_global": False,
+        }
+        if sampled_target_cell < 0 or sampled_target_cell >= int(coords.shape[0]):
+            return [], None, empty_info
+        positions = np.asarray(self.jax.device_get(_field0(next_state, "positions")), dtype=np.int32)
+        player_cell_indices: list[int] = []
+        for pos in positions:
+            idx = self._cell_index_for_position(pos)
+            player_cell_indices.append(0 if idx is None else int(idx))
+        safe_indices = np.clip(np.asarray(player_cell_indices, dtype=np.int32), 0, coords.shape[0] - 1)
+        distance_matrix = np.asarray(self.jax.device_get(self.static.cell_distance_matrix), dtype=np.float64)
+        distances = distance_matrix[
+            safe_indices,
+            int(np.clip(sampled_target_cell, 0, distance_matrix.shape[1] - 1)),
+        ]
+        rebound_skill = np.asarray(self.jax.device_get(_field0(next_state, "rebound_skill")), dtype=np.float64)
+        skill_weight = float(np.asarray(self.jax.device_get(self.static.rebound_skill_weight)))
+        effective_distances = distances - (max(0.0, skill_weight) * rebound_skill)
+        basket_distances_by_cell = np.asarray(
+            self.jax.device_get(self.static.basket_distance_by_cell),
+            dtype=np.float64,
+        )
+        target_basket_distance = float(
+            basket_distances_by_cell[int(np.clip(sampled_target_cell, 0, len(coords) - 1))]
+        )
+        player_basket_distances = basket_distances_by_cell[safe_indices]
+        basket_position_penalties = np.maximum(0.0, player_basket_distances - target_basket_distance)
+        weight = float(np.asarray(self.jax.device_get(self.static.rebound_winner_distance_weight)))
+        basket_weight = float(np.asarray(self.jax.device_get(self.static.rebound_basket_position_weight)))
+        temp = float(np.asarray(self.jax.device_get(self.static.rebound_winner_temperature)))
+        temp = max(1.0e-6, temp if np.isfinite(temp) else 1.0)
+        global_logits = (
+            (-max(0.0, weight) * effective_distances)
+            - (max(0.0, basket_weight) * basket_position_penalties)
+        ) / temp
+
+        contest_mode = kernel_contest_mode
+        radius_used: int | None = None
+        fallback_global = False
+        eligible = np.ones_like(distances, dtype=bool)
+        logits = np.asarray(global_logits, dtype=np.float64)
+
+        if contest_mode == "local_contest":
+            initial_radius = max(0, _int_from_static_field(self.static, "rebound_contest_radius", 1))
+            radius_eligible = distances <= float(initial_radius)
+            if bool(np.any(radius_eligible)):
+                eligible = radius_eligible.astype(bool)
+                radius_used = int(initial_radius)
+                logits = np.where(eligible, global_logits, -1.0e9)
+            else:
+                fallback_global = True
+
+        probs = self._softmax_np(logits)
+        rows = []
+        offense_ids = set(int(pid) for pid in self.offense_ids)
+        defense_ids = set(int(pid) for pid in self.defense_ids)
+        if contest_mode == "local_contest" and not fallback_global:
+            row_indices = np.nonzero(eligible)[0].tolist()
+        else:
+            row_indices = list(range(int(probs.shape[0])))
+        for pid in row_indices:
+            prob = float(probs[int(pid)])
+            team = "offense" if pid in offense_ids else ("defense" if pid in defense_ids else "unknown")
+            rows.append({
+                "player_id": int(pid),
+                "team": team,
+                "conditional_prob": prob,
+                "distance_to_sampled_target": int(round(float(distances[pid]))),
+                "effective_distance_to_sampled_target": float(effective_distances[pid]),
+                "distance_to_basket": float(player_basket_distances[pid]),
+                "target_distance_to_basket": float(target_basket_distance),
+                "basket_position_penalty": float(basket_position_penalties[pid]),
+                "rebound_skill": float(rebound_skill[pid]),
+                "eligible": bool(eligible[pid]),
+                "contest_mode": contest_mode,
+                "contest_radius_used": radius_used,
+                "contest_fallback_global": bool(fallback_global),
+            })
+        rows.sort(key=lambda row: (-float(row["conditional_prob"]), int(row["player_id"])))
+        winner_prob = None
+        if 0 <= winner < probs.shape[0]:
+            winner_prob = float(probs[int(winner)])
+        contest_info = {
+            "contest_mode": contest_mode,
+            "contest_radius_used": radius_used,
+            "contest_fallback_global": bool(fallback_global),
+        }
+        return rows, winner_prob, contest_info
+
     def _empty_action_results(self) -> dict[str, Any]:
         return {
             "moves": {},
             "passes": {},
             "shots": {},
+            "rebounds": [],
             "collisions": [],
             "turnovers": [],
             "defensive_lane_violations": [],
@@ -1152,6 +1693,53 @@ class JaxDevRuntime:
                 "assist_full": assist_full,
                 "assist_passer_id": assist_passer if assist_passer >= 0 else None,
             }
+        if _as_bool(getattr(out, "rebound_attempt", np.asarray([0]))[0]):
+            winner = _as_int(out.rebound_winner[0])
+            target_cell_idx = _as_int(out.rebound_target_cell[0])
+            target = None
+            if 0 <= target_cell_idx < int(np.asarray(self.static.cell_coords).shape[0]):
+                target_arr = np.asarray(
+                    self.jax.device_get(self.static.cell_coords[target_cell_idx]),
+                    dtype=np.int32,
+                )
+                target = [int(target_arr[0]), int(target_arr[1])]
+            winner_team = None
+            if 0 <= winner < self.n_players:
+                winner_team = "OFFENSE" if winner in self.offense_ids else "DEFENSE"
+            shot_type = _as_int(out.shot_type[0])
+            shot_shooter = _as_int(out.shot_shooter[0])
+            target_cells, target_prob = self._rebound_target_distribution_payload(
+                shot_type=shot_type,
+                shooter=shot_shooter,
+                sampled_target_cell=target_cell_idx,
+                prev_positions=prev_positions,
+            )
+            winner_probs, winner_prob, contest_info = self._rebound_winner_probabilities_payload(
+                sampled_target_cell=target_cell_idx,
+                winner=winner,
+                next_state=next_state,
+            )
+            rebound = {
+                "attempt": True,
+                "offensive": _as_bool(out.offensive_rebound[0]),
+                "defensive": _as_bool(out.defensive_rebound[0]),
+                "winner": winner if winner >= 0 else None,
+                "winner_team": winner_team,
+                "winner_conditional_prob": winner_prob,
+                "winner_probs": winner_probs,
+                "contest_mode": contest_info.get("contest_mode"),
+                "contest_radius_used": contest_info.get("contest_radius_used"),
+                "contest_fallback_global": contest_info.get("contest_fallback_global"),
+                "target_cell_index": target_cell_idx if target_cell_idx >= 0 else None,
+                "target": target,
+                "target_prob": target_prob,
+                "target_cells": target_cells,
+                "shot_clock_reset_14": _as_bool(out.shot_clock_reset_14[0]),
+                "shot_shooter": shot_shooter,
+                "shot_type": shot_type,
+            }
+            results["rebounds"].append(rebound)
+            results["rebound"] = rebound
         if _as_bool(out.pass_attempt[0]):
             passer = _as_int(out.pass_passer[0])
             receiver = _as_int(out.pass_receiver[0])
@@ -1217,6 +1805,12 @@ class JaxDevRuntime:
 
     def _reward_reason(self, *, defense: bool = False) -> str:
         results = self.last_action_results
+        if results.get("rebounds"):
+            rebound = results["rebounds"][0]
+            if rebound.get("offensive"):
+                return "Off Reb" if not defense else "Opp Off Reb"
+            if rebound.get("defensive"):
+                return "Def Reb" if defense else "Opp Def Reb"
         if results.get("shots"):
             shot = next(iter(results["shots"].values()))
             return "Opp Shot" if defense else ("Shot Make" if shot.get("success") else "Shot Miss")
@@ -1451,7 +2045,10 @@ class JaxDevRuntime:
             self.role_flag_offense,
             self.jnp,
             model_type=str(self.raw_model.spec.model_type),
+            rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
+            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
         )
+        flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, self.raw_model.spec, self.jnp)
         batch_size = flat_obs.shape[0]
         neutral_context = {
             "intent_index": self.jnp.zeros((batch_size,), dtype=self.jnp.int32),
@@ -1546,6 +2143,8 @@ class JaxDevRuntime:
         )
         if bool(self._last_completed_pass_boundary) and age >= min_play_steps:
             return "completed_pass"
+        if bool(self._last_offensive_rebound_boundary) and age >= min_play_steps:
+            return "offensive_rebound"
         return None
 
     def _maybe_apply_selector_boundary(self, game_state: Any) -> dict[str, Any] | None:
@@ -1567,6 +2166,7 @@ class JaxDevRuntime:
         game_state.selector_segment_index = int(getattr(game_state, "selector_segment_index", 0) or 0) + 1
         game_state.selector_last_boundary_reason = str(reason)
         self._last_completed_pass_boundary = False
+        self._last_offensive_rebound_boundary = False
         self._last_selector_transition = {
             "reason": str(reason),
             "previous_intent_index": int(previous_intent),
@@ -1594,6 +2194,7 @@ class JaxDevRuntime:
         )
         intent_age = _as_int(_field0(self.state, "intent_age"))
         last_completed_pass_boundary = bool(self._last_completed_pass_boundary)
+        last_offensive_rebound_boundary = bool(self._last_offensive_rebound_boundary)
         completed_pass_min_steps_remaining = max(0, int(min_play_steps) - int(intent_age))
         completed_pass_min_steps_met = (
             last_completed_pass_boundary and completed_pass_min_steps_remaining == 0
@@ -1633,6 +2234,7 @@ class JaxDevRuntime:
             "commitment_steps": int(max(1, _as_int(self.static.intent_commitment_steps))),
             "eligible_boundary_reason": self._selector_boundary_reason(game_state),
             "last_completed_pass_boundary": bool(last_completed_pass_boundary),
+            "last_offensive_rebound_boundary": bool(last_offensive_rebound_boundary),
             "completed_pass_min_steps_met": bool(completed_pass_min_steps_met),
             "completed_pass_min_steps_remaining": int(completed_pass_min_steps_remaining),
             "last_transition": last_transition,
@@ -1721,9 +2323,41 @@ class JaxDevRuntime:
         shot_distance = np.asarray(self.jax.device_get(profile["distance"][0]), dtype=np.int32)
         shot_value = np.asarray(self.jax.device_get(profile["shot_value"][0]), dtype=np.float32)
         play_map = self._play_name_map(game_state)
+        rebound_skill = np.asarray(self.jax.device_get(_field0(self.state, "rebound_skill")), dtype=np.float32)
+        rebound_skill_specialist = np.asarray(
+            self.jax.device_get(_field0(self.state, "rebound_skill_specialist")),
+            dtype=np.float32,
+        )
+        player_rebound_skills = {str(pid): float(rebound_skill[int(pid)]) for pid in range(int(rebound_skill.shape[0]))}
+        player_rebound_skill_specialists = {
+            str(pid): bool(rebound_skill_specialist[int(pid)] > 0.0)
+            for pid in range(int(rebound_skill_specialist.shape[0]))
+        }
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
+        rebound_target_observation_features = bool(
+            getattr(self.raw_model.spec, "rebound_target_observation_features", True)
+        )
+        player_labels = [
+            "q_norm", "r_norm", "role", "has_ball", "layup_pct", "three_pt_pct",
+            "dunk_pct", "lane_steps_norm", "expected_points", "turnover_probability",
+            "pass_steal_probability", "distance_to_ball", "distance_to_best_ep_player",
+            "distance_to_nearest_opponent", "distance_to_nearest_teammate",
+        ]
+        if rebound_target_observation_features:
+            player_labels.append("distance_to_expected_rebound_target")
+        player_labels.append("rebound_skill")
+        if rebound_target_observation_features:
+            player_labels.append("rebound_skill_specialist")
+        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
+            player_labels.append("rebound_win_probability")
         globals_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
+        if rebound_target_observation_features:
+            globals_labels.extend(
+                ["expected_rebound_target_q", "expected_rebound_target_r", "target_entropy"]
+            )
+        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
+            globals_labels.append("offensive_rebound_probability")
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
 
@@ -1753,6 +2387,7 @@ class JaxDevRuntime:
             "obs": np.asarray(obs_dict["obs"], dtype=np.float32).reshape(-1).tolist(),
             "obs_tokens": {
                 "players": np.asarray(obs_dict["players"], dtype=np.float32).tolist(),
+                "players_labels": player_labels,
                 "globals": np.asarray(obs_dict["globals"], dtype=np.float32).tolist(),
                 "globals_labels": globals_labels,
                 "attention": attention_payload,
@@ -1760,6 +2395,9 @@ class JaxDevRuntime:
             },
             "obs_tokens_version": 1,
             "last_action_results": copy.deepcopy(self.last_action_results),
+            "episode_rebounds": copy.deepcopy(self.episode_rebounds),
+            "player_rebound_skills": player_rebound_skills,
+            "player_rebound_skill_specialists": player_rebound_skill_specialists,
             "offense_ids": self.offense_ids,
             "defense_ids": self.defense_ids,
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
@@ -1791,6 +2429,30 @@ class JaxDevRuntime:
                 "dunk_std": float(self.display_env.dunk_std or 0.0),
                 "allow_dunks": bool(self.display_env.allow_dunks),
             },
+            "rebound_runtime": {
+                "enabled": bool(getattr(self.display_env, "enable_rebounds", False)),
+                "kernel_enabled": _as_bool(self.static.enable_rebounds),
+                "table_model_dir": str(getattr(self.display_env, "rebound_table_model_dir", "") or ""),
+                "target_temperature": float(getattr(self.display_env, "rebound_target_temperature", 1.0)),
+                "target_uniform_mix": float(getattr(self.display_env, "rebound_target_uniform_mix", 0.0)),
+                "winner_distance_weight": float(getattr(self.display_env, "rebound_winner_distance_weight", 1.0)),
+                "basket_position_weight": _float_from_static_field(self.static, "rebound_basket_position_weight", 0.0),
+                "winner_temperature": float(getattr(self.display_env, "rebound_winner_temperature", 1.0)),
+                "skill_std": float(getattr(self.display_env, "rebound_skill_std", 0.0)),
+                "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(self.static),
+                "skill_high": _float_from_static_field(self.static, "rebound_skill_high", 1.0),
+                "skill_low": _float_from_static_field(self.static, "rebound_skill_low", -0.25),
+                "skill_weight": float(getattr(self.display_env, "rebound_skill_weight", 0.0)),
+                "contest_mode": _rebound_contest_mode_from_static(self.static),
+                "contest_radius": _int_from_static_field(self.static, "rebound_contest_radius", 1),
+                "obs_top_n_targets": _int_from_static_field(self.static, "rebound_obs_top_n_targets", 0),
+                "offensive_rebound_shot_clock_reset": int(getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)),
+                "terminal_reward_mode": str(getattr(self.display_env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+                "reward_redistribution_enabled": _as_bool(self.static.enable_rebound_reward_redistribution),
+                "offensive_rebound_reward_advance": _float_from_static_field(self.static, "offensive_rebound_reward_advance", 0.4),
+                "reward_once_per_possession": _as_bool(self.static.rebound_reward_once_per_possession),
+                "target_table_shape": [int(v) for v in self.static.rebound_target_probs.shape],
+            },
             "defender_pressure_distance": int(self.display_env.defender_pressure_distance or 1),
             "defender_pressure_turnover_chance": float(self.display_env.defender_pressure_turnover_chance or 0.05),
             "defender_pressure_decay_lambda": float(self.display_env.defender_pressure_decay_lambda or 1.0),
@@ -1798,6 +2460,23 @@ class JaxDevRuntime:
             "steal_perp_decay": float(self.display_env.steal_perp_decay or 1.5),
             "steal_distance_factor": float(self.display_env.steal_distance_factor or 0.08),
             "steal_position_weight_min": float(self.display_env.steal_position_weight_min or 0.3),
+            "pass_interception_model": str(getattr(self.display_env, "pass_interception_model", "line") or "line"),
+            "pass_passer_pressure_weight": float(getattr(self.display_env, "pass_passer_pressure_weight", 0.0)),
+            "pass_receiver_pressure_weight": float(getattr(self.display_env, "pass_receiver_pressure_weight", 0.0)),
+            "pass_lob_lane_multiplier": float(getattr(self.display_env, "pass_lob_lane_multiplier", 0.35)),
+            "pass_lob_receiver_distance": float(getattr(self.display_env, "pass_lob_receiver_distance", 1.0)),
+            "pass_speed": float(getattr(self.display_env, "pass_speed", 3.5)),
+            "defender_reaction_time": float(getattr(self.display_env, "defender_reaction_time", 0.35)),
+            "defender_speed": float(getattr(self.display_env, "defender_speed", 1.25)),
+            "defender_reach_radius": float(getattr(self.display_env, "defender_reach_radius", 0.65)),
+            "reaction_softness": float(getattr(self.display_env, "reaction_softness", 0.55)),
+            "base_passer_risk": float(getattr(self.display_env, "base_passer_risk", 0.06)),
+            "passer_pressure_decay": float(getattr(self.display_env, "passer_pressure_decay", 1.35)),
+            "base_receiver_risk": float(getattr(self.display_env, "base_receiver_risk", 0.35)),
+            "receiver_alignment_min": float(getattr(self.display_env, "receiver_alignment_min", 0.35)),
+            "receiver_alignment_width": float(getattr(self.display_env, "receiver_alignment_width", 2.0)),
+            "max_receiver_hazard": float(getattr(self.display_env, "max_receiver_hazard", 0.85)),
+            "lane_weight": float(getattr(self.display_env, "lane_weight", 0.0)),
             "spawn_distance": int(self.display_env.spawn_distance or 3),
             "max_spawn_distance": (
                 int(self.display_env.max_spawn_distance)

@@ -18,7 +18,7 @@ from basketworld.utils.mlflow_params import (
 )
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.envs.basketworld_env_v2 import ActionType, Team
-from basketworld.utils.start_templates import resolve_start_template
+from basketworld.utils.start_templates import load_start_template_library, resolve_start_template
 from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.inference_adapters import (
@@ -39,6 +39,7 @@ from app.backend.selector_runtime import (
     maybe_apply_rollout_multisegment_boundary,
     selector_runtime_active_for_rollout,
 )
+from app.backend.rebound_preview import compute_rebound_preview
 from app.backend.policies import (
     _compute_param_counts_from_policy,
     get_latest_policies_from_run,
@@ -51,6 +52,7 @@ from app.backend.schemas import (
     InitGameRequest,
     ListPoliciesRequest,
     MCTSAdviseRequest,
+    ReboundPreviewRequest,
     StartSelfPlayRequest,
     TemplateBootstrapRequest,
 )
@@ -67,6 +69,50 @@ from fastapi.encoders import jsonable_encoder
 router = APIRouter()
 
 
+_JAX_RUNTIME_STATIC_ENV_KEYS = {
+    # JAX kernel-only env/static fields. The legacy Python env constructor does
+    # not accept these, but build_kernel_static_from_env reads them from attrs.
+    "enable_rebounds",
+    "rebound_table_model_dir",
+    "rebound_target_temperature",
+    "rebound_target_uniform_mix",
+    "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
+    "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
+    "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
+    "offensive_rebound_shot_clock_reset",
+    "rebound_terminal_reward_mode",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
+}
+
+
+_REBOUND_RUNTIME_STICKY_ENV_KEYS = {
+    "rebound_winner_distance_weight",
+    "rebound_basket_position_weight",
+    "rebound_winner_temperature",
+    "rebound_skill_std",
+    "rebound_skill_sampling_mode",
+    "rebound_skill_high",
+    "rebound_skill_low",
+    "rebound_skill_weight",
+    "rebound_contest_mode",
+    "rebound_contest_radius",
+    "rebound_obs_top_n_targets",
+    "enable_rebound_reward_redistribution",
+    "offensive_rebound_reward_advance",
+    "rebound_reward_once_per_possession",
+}
+
+
 def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     """Separate real env kwargs from wrapper/training-only metadata."""
     env_signature = inspect.signature(basketworld.HexagonBasketballEnv.__init__)
@@ -76,6 +122,15 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
     wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
     return env_kwargs, wrapper_kwargs
+
+
+def _jax_runtime_env_params(env_kwargs: dict, optional_params: dict) -> dict:
+    """Merge constructor-safe env kwargs with JAX static-only attrs."""
+    merged = dict(env_kwargs or {})
+    for key in _JAX_RUNTIME_STATIC_ENV_KEYS:
+        if key in optional_params:
+            merged[key] = optional_params[key]
+    return merged
 
 
 def _str_to_bool(value) -> bool:
@@ -110,6 +165,23 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "steal_perp_decay": float,
     "steal_distance_factor": float,
     "steal_position_weight_min": float,
+    "pass_interception_model": str,
+    "pass_passer_pressure_weight": float,
+    "pass_receiver_pressure_weight": float,
+    "pass_lob_lane_multiplier": float,
+    "pass_lob_receiver_distance": float,
+    "pass_speed": float,
+    "defender_reaction_time": float,
+    "defender_speed": float,
+    "defender_reach_radius": float,
+    "reaction_softness": float,
+    "base_passer_risk": float,
+    "passer_pressure_decay": float,
+    "base_receiver_risk": float,
+    "receiver_alignment_min": float,
+    "receiver_alignment_width": float,
+    "max_receiver_hazard": float,
+    "lane_weight": float,
     "spawn_distance": int,
     "max_spawn_distance": int,
     "defender_spawn_distance": int,
@@ -152,6 +224,26 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "intent_null_prob": float,
     "defense_intent_null_prob": float,
     "intent_visible_to_defense_prob": float,
+    "enable_rebounds": _str_to_bool,
+    "rebound_table_model_dir": str,
+    "rebound_target_temperature": float,
+    "rebound_target_uniform_mix": float,
+    "rebound_winner_distance_weight": float,
+    "rebound_basket_position_weight": float,
+    "rebound_winner_temperature": float,
+    "rebound_skill_std": float,
+    "rebound_skill_sampling_mode": str,
+    "rebound_skill_high": float,
+    "rebound_skill_low": float,
+    "rebound_skill_weight": float,
+    "rebound_contest_mode": str,
+    "rebound_contest_radius": int,
+    "rebound_obs_top_n_targets": int,
+    "offensive_rebound_shot_clock_reset": int,
+    "rebound_terminal_reward_mode": str,
+    "enable_rebound_reward_redistribution": _str_to_bool,
+    "offensive_rebound_reward_advance": float,
+    "rebound_reward_once_per_possession": _str_to_bool,
 }
 
 
@@ -172,6 +264,28 @@ def _overlay_jax_mlflow_env_params(optional_params: dict, mlflow_params: dict) -
         names = (f"jax/env/{key}",)
         if key == "offensive_three_seconds":
             names = (f"jax/env/{key}", "jax/env/offensive_three_seconds_enabled")
+        elif key == "rebound_contest_radius":
+            names = (
+                "jax/env/rebound_contest_radius",
+                "jax/rebound_contest_radius",
+                "jax/env/rebound_contest_initial_radius",
+                "jax/rebound_contest_initial_radius",
+            )
+        elif key in {
+            "rebound_skill_std",
+            "rebound_skill_sampling_mode",
+            "rebound_skill_high",
+            "rebound_skill_low",
+            "rebound_skill_weight",
+            "rebound_basket_position_weight",
+            "rebound_contest_mode",
+            "rebound_obs_top_n_targets",
+            "rebound_terminal_reward_mode",
+            "enable_rebound_reward_redistribution",
+            "offensive_rebound_reward_advance",
+            "rebound_reward_once_per_possession",
+        }:
+            names = (f"jax/env/{key}", f"jax/{key}")
         for name in names:
             if name not in mlflow_params:
                 continue
@@ -390,6 +504,35 @@ def _load_start_template_library_for_run(
         return None
 
 
+def _load_start_template_library_from_training_params(
+    mlflow_training_params: dict,
+) -> tuple[dict | None, str | None]:
+    """Best-effort fallback for local/dev runs when the MLflow artifact is absent."""
+    source_path = str(mlflow_training_params.get("start_template_library") or "").strip()
+    if not source_path:
+        return None, None
+
+    expanded = os.path.expandvars(os.path.expanduser(source_path))
+    candidates = [Path(expanded)]
+    if not candidates[0].is_absolute():
+        repo_root = Path(basketworld.__file__).resolve().parents[1]
+        candidates.extend([Path.cwd() / expanded, repo_root / expanded])
+
+    players_per_side = int(mlflow_training_params.get("players") or 3)
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            library = load_start_template_library(
+                candidate,
+                players_per_side=players_per_side,
+            )
+            return library, str(candidate)
+        except Exception as exc:
+            print(f"[start_templates] Failed to load local template library {candidate}: {exc}")
+    return None, None
+
+
 _SESSION_START_TEMPLATE_SOURCES = {"local_file", "file_upload", "session_editor"}
 
 
@@ -415,6 +558,12 @@ def _resolve_start_template_library_for_init(
                 )
             ),
         )
+
+    local_library, local_path = _load_start_template_library_from_training_params(
+        mlflow_training_params
+    )
+    if local_library is not None:
+        return local_library, "local_file", local_path
 
     source = str(previous_source or "").strip()
     if previous_library is not None and source in _SESSION_START_TEMPLATE_SOURCES:
@@ -672,6 +821,15 @@ async def init_game(request: InitGameRequest):
     opponent_unified_policy_name = request.opponent_unified_policy_name
     if not run_id:
         raise HTTPException(status_code=400, detail="init_game requires run_id.")
+
+    previous_run_id = getattr(game_state, "run_id", None)
+    previous_unified_policy_key = getattr(game_state, "unified_policy_key", None)
+    previous_opponent_policy_key = getattr(game_state, "opponent_unified_policy_key", None)
+    previous_env_optional_params = copy.deepcopy(getattr(game_state, "env_optional_params", None) or {})
+    previous_runtime_env = getattr(getattr(game_state, "jax_runtime", None), "display_env", None)
+    if previous_runtime_env is None:
+        previous_runtime_env = getattr(game_state, "env", None)
+
     previous_start_template_library = copy.deepcopy(
         getattr(game_state, "mlflow_start_template_library", None)
     )
@@ -796,8 +954,24 @@ async def init_game(request: InitGameRequest):
         if request.dunk_pct is not None:
             optional_params["dunk_pct"] = request.dunk_pct
 
-        game_state.unified_policy_key = os.path.basename(unified_path)
-        game_state.opponent_unified_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        mlflow_default_env_optional_params = copy.deepcopy(optional_params)
+
+        target_unified_policy_key = os.path.basename(unified_path)
+        target_opponent_policy_key = os.path.basename(opponent_unified_path) if opponent_unified_path else None
+        same_loaded_policy = (
+            str(previous_run_id or "") == run_id
+            and previous_unified_policy_key == target_unified_policy_key
+            and previous_opponent_policy_key == target_opponent_policy_key
+        )
+        if same_loaded_policy:
+            for key in _REBOUND_RUNTIME_STICKY_ENV_KEYS:
+                if previous_runtime_env is not None and hasattr(previous_runtime_env, key):
+                    optional_params[key] = copy.deepcopy(getattr(previous_runtime_env, key))
+                elif key in previous_env_optional_params:
+                    optional_params[key] = copy.deepcopy(previous_env_optional_params[key])
+
+        game_state.unified_policy_key = target_unified_policy_key
+        game_state.opponent_unified_policy_key = target_opponent_policy_key
         game_state.unified_policy_backend = get_policy_backend_kind(game_state.unified_policy)
         game_state.defense_policy_backend = get_policy_backend_kind(game_state.defense_policy)
         game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
@@ -813,7 +987,7 @@ async def init_game(request: InitGameRequest):
 
             game_state.jax_runtime = JaxDevRuntime(
                 required_params=required_params,
-                env_params=env_optional_params,
+                env_params=_jax_runtime_env_params(env_optional_params, optional_params),
                 unified_policy=game_state.unified_policy,
                 opponent_policy=game_state.defense_policy,
                 user_team=resolved_user_team,
@@ -878,8 +1052,12 @@ async def init_game(request: InitGameRequest):
         game_state.prev_obs = None
 
         game_state.env_required_params = copy.deepcopy(required_params)
-        game_state.env_optional_params = copy.deepcopy(env_optional_params)
-        game_state.mlflow_env_optional_defaults = copy.deepcopy(env_optional_params)
+        active_env_optional_params = copy.deepcopy(env_optional_params)
+        for key in _JAX_RUNTIME_STATIC_ENV_KEYS:
+            if key in optional_params:
+                active_env_optional_params[key] = copy.deepcopy(optional_params[key])
+        game_state.env_optional_params = active_env_optional_params
+        game_state.mlflow_env_optional_defaults = copy.deepcopy(mlflow_default_env_optional_params)
         game_state.unified_policy_path = unified_path
         game_state.opponent_policy_path = opponent_unified_path
 
@@ -1688,6 +1866,21 @@ def mcts_advise(request: MCTSAdviseRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MCTS failed: {e}")
+
+
+@router.post("/api/rebound_preview")
+def rebound_preview(request: ReboundPreviewRequest | None = None):
+    """Read-only rebound target/winner preview for the live holder or a terminal miss."""
+    request = request or ReboundPreviewRequest()
+    try:
+        return jsonable_encoder(compute_rebound_preview(game_state, request))
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    except Exception as err:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Rebound preview failed: {err}")
 
 
 @router.post("/api/start_self_play")

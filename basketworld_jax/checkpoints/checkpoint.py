@@ -201,7 +201,9 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
 
 
 def _state_dir(path: str | Path) -> Path:
-    return Path(path) / STATE_SUBDIR
+    # Orbax requires absolute checkpoint paths even when our metadata helpers
+    # accept relative paths from CLI arguments.
+    return Path(path).expanduser().resolve() / STATE_SUBDIR
 
 
 def _metadata_path(path: str | Path) -> Path:

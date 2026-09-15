@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "players_per_side": 5,
+  "templates": [
+    {
+      "id": "high_pnr_slot_left",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 1], "jitter_radius": 1, "role": "weak_side_lift"},
+        {"anchor": [3, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [2, 5], "jitter_radius": 0, "role": "screen_setter"},
+        {"anchor": [1, 7], "jitter_radius": 1, "role": "strong_side_corner"},
+        {"anchor": [5, 6], "jitter_radius": 1, "role": "weak_side_corner"}
+      ],
+      "defense": [
+        {"anchor": [2, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [2, 6], "jitter_radius": 0, "role": "screen_defender"},
+        {"anchor": [1, 5], "jitter_radius": 1, "role": "nail_help"},
+        {"anchor": [0, 7], "jitter_radius": 1, "role": "strong_corner_defender"},
+        {"anchor": [4, 6], "jitter_radius": 1, "role": "weak_corner_defender"}
+      ]
+    },
+    {
+      "id": "high_pnr_empty_corner",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [5, 0], "jitter_radius": 1, "role": "high_lift"},
+        {"anchor": [3, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [2, 3], "jitter_radius": 0, "role": "screen_setter"},
+        {"anchor": [0, 6], "jitter_radius": 0, "role": "dunker_spot"},
+        {"anchor": [4, 7], "jitter_radius": 1, "role": "weak_corner_spacer"}
+      ],
+      "defense": [
+        {"anchor": [2, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [1, 3], "jitter_radius": 0, "role": "screen_defender"},
+        {"anchor": [0, 5], "jitter_radius": 0, "role": "rim_tag"},
+        {"anchor": [3, 1], "jitter_radius": 1, "role": "high_help"},
+        {"anchor": [3, 7], "jitter_radius": 1, "role": "weak_corner_defender"}
+      ]
+    },
+    {
+      "id": "horns_double_high",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 2], "jitter_radius": 0, "role": "left_horn"},
+        {"anchor": [3, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [3, 6], "jitter_radius": 0, "role": "right_horn"},
+        {"anchor": [1, 1], "jitter_radius": 1, "role": "weak_corner"},
+        {"anchor": [1, 8], "jitter_radius": 1, "role": "strong_corner"}
+      ],
+      "defense": [
+        {"anchor": [2, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [3, 2], "jitter_radius": 0, "role": "left_horn_defender"},
+        {"anchor": [2, 6], "jitter_radius": 0, "role": "right_horn_defender"},
+        {"anchor": [0, 2], "jitter_radius": 1, "role": "weak_corner_defender"},
+        {"anchor": [0, 7], "jitter_radius": 1, "role": "strong_corner_defender"}
+      ]
+    },
+    {
+      "id": "top_entry_five_out",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [5, 1], "jitter_radius": 1, "role": "left_slot"},
+        {"anchor": [4, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [4, 7], "jitter_radius": 1, "role": "right_slot"},
+        {"anchor": [1, 1], "jitter_radius": 1, "role": "left_corner"},
+        {"anchor": [1, 8], "jitter_radius": 1, "role": "right_corner"}
+      ],
+      "defense": [
+        {"anchor": [3, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [4, 2], "jitter_radius": 1, "role": "left_slot_defender"},
+        {"anchor": [3, 7], "jitter_radius": 1, "role": "right_slot_defender"},
+        {"anchor": [0, 1], "jitter_radius": 1, "role": "left_corner_defender"},
+        {"anchor": [0, 8], "jitter_radius": 1, "role": "right_corner_defender"}
+      ]
+    },
+    {
+      "id": "wing_entry_strong_corner",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 1], "jitter_radius": 1, "role": "weak_slot"},
+        {"anchor": [2, 3], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [1, 5], "jitter_radius": 0, "role": "middle_release"},
+        {"anchor": [0, 7], "jitter_radius": 1, "role": "strong_corner"},
+        {"anchor": [4, 7], "jitter_radius": 1, "role": "weak_corner"}
+      ],
+      "defense": [
+        {"anchor": [1, 3], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "gap_help"},
+        {"anchor": [0, 5], "jitter_radius": 0, "role": "rim_help"},
+        {"anchor": [-1, 7], "jitter_radius": 1, "role": "corner_defender"},
+        {"anchor": [3, 7], "jitter_radius": 1, "role": "weak_corner_defender"}
+      ]
+    },
+    {
+      "id": "wing_entry_slot_lift",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [5, 2], "jitter_radius": 1, "role": "lifted_guard"},
+        {"anchor": [2, 5], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "slot_screen"},
+        {"anchor": [-1, 8], "jitter_radius": 1, "role": "strong_corner"},
+        {"anchor": [4, 1], "jitter_radius": 1, "role": "weak_slot"}
+      ],
+      "defense": [
+        {"anchor": [1, 5], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "screen_defender"},
+        {"anchor": [0, 6], "jitter_radius": 0, "role": "low_help"},
+        {"anchor": [-2, 8], "jitter_radius": 1, "role": "strong_corner_defender"},
+        {"anchor": [3, 2], "jitter_radius": 1, "role": "weak_slot_defender"}
+      ]
+    },
+    {
+      "id": "corner_entry_baseline",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 2], "jitter_radius": 1, "role": "safety"},
+        {"anchor": [-1, 8], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [1, 6], "jitter_radius": 0, "role": "middle_flash"},
+        {"anchor": [3, 5], "jitter_radius": 1, "role": "weak_slot"},
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "dunker_spot"}
+      ],
+      "defense": [
+        {"anchor": [-2, 8], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [0, 7], "jitter_radius": 0, "role": "baseline_stunt"},
+        {"anchor": [0, 5], "jitter_radius": 0, "role": "rim_help"},
+        {"anchor": [2, 5], "jitter_radius": 1, "role": "weak_slot_defender"},
+        {"anchor": [3, 2], "jitter_radius": 1, "role": "safety_defender"}
+      ]
+    },
+    {
+      "id": "short_corner_touch",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 1], "jitter_radius": 1, "role": "weak_slot"},
+        {"anchor": [-1, 6], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "high_release"},
+        {"anchor": [2, 7], "jitter_radius": 1, "role": "strong_corner_lift"},
+        {"anchor": [5, 6], "jitter_radius": 1, "role": "weak_corner"}
+      ],
+      "defense": [
+        {"anchor": [-1, 5], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "rim_wall"},
+        {"anchor": [1, 5], "jitter_radius": 0, "role": "dig"},
+        {"anchor": [1, 7], "jitter_radius": 1, "role": "corner_defender"},
+        {"anchor": [4, 6], "jitter_radius": 1, "role": "weak_corner_defender"}
+      ]
+    },
+    {
+      "id": "elbow_post_touch",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [4, 2], "jitter_radius": 1, "role": "slot_spacer"},
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [0, 6], "jitter_radius": 0, "role": "dunker_spot"},
+        {"anchor": [2, 7], "jitter_radius": 1, "role": "corner_lift"},
+        {"anchor": [5, 6], "jitter_radius": 1, "role": "weak_corner"}
+      ],
+      "defense": [
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [-1, 5], "jitter_radius": 0, "role": "rim_help"},
+        {"anchor": [1, 6], "jitter_radius": 0, "role": "tag"},
+        {"anchor": [1, 7], "jitter_radius": 1, "role": "corner_defender"},
+        {"anchor": [4, 6], "jitter_radius": 1, "role": "weak_corner_defender"}
+      ]
+    },
+    {
+      "id": "spread_slot_drive",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 24,
+      "offense": [
+        {"anchor": [5, 1], "jitter_radius": 1, "role": "weak_corner"},
+        {"anchor": [3, 3], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [4, 6], "jitter_radius": 1, "role": "opposite_slot"},
+        {"anchor": [0, 7], "jitter_radius": 1, "role": "strong_corner"},
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "paint_flash"}
+      ],
+      "defense": [
+        {"anchor": [2, 3], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "nail_help"},
+        {"anchor": [0, 6], "jitter_radius": 0, "role": "rim_help"},
+        {"anchor": [-1, 7], "jitter_radius": 1, "role": "corner_defender"},
+        {"anchor": [3, 6], "jitter_radius": 1, "role": "opposite_slot_defender"}
+      ]
+    },
+    {
+      "id": "offensive_rebound_crash_shape",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 18,
+      "offense": [
+        {"anchor": [4, 1], "jitter_radius": 1, "role": "perimeter_spacer"},
+        {"anchor": [2, 4], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [0, 5], "jitter_radius": 0, "role": "crasher"},
+        {"anchor": [1, 7], "jitter_radius": 1, "role": "corner_crasher"},
+        {"anchor": [4, 7], "jitter_radius": 1, "role": "weak_spacer"}
+      ],
+      "defense": [
+        {"anchor": [1, 4], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [-1, 5], "jitter_radius": 0, "role": "rim_body"},
+        {"anchor": [0, 6], "jitter_radius": 0, "role": "inside_rebounder"},
+        {"anchor": [1, 8], "jitter_radius": 1, "role": "corner_boxout"},
+        {"anchor": [3, 7], "jitter_radius": 1, "role": "weak_boxout"}
+      ]
+    },
+    {
+      "id": "late_clock_scramble",
+      "weight": 1,
+      "mirrorable": true,
+      "shot_clock": 10,
+      "offense": [
+        {"anchor": [4, 0], "jitter_radius": 1, "role": "high_release"},
+        {"anchor": [2, 6], "jitter_radius": 0, "role": "ball_handler", "has_ball": true},
+        {"anchor": [1, 4], "jitter_radius": 1, "role": "middle_release"},
+        {"anchor": [-2, 7], "jitter_radius": 1, "role": "corner_bailout"},
+        {"anchor": [5, 5], "jitter_radius": 1, "role": "weak_bailout"}
+      ],
+      "defense": [
+        {"anchor": [1, 6], "jitter_radius": 0, "role": "on_ball"},
+        {"anchor": [1, 5], "jitter_radius": 0, "role": "dig"},
+        {"anchor": [0, 4], "jitter_radius": 0, "role": "rim_help"},
+        {"anchor": [-1, 7], "jitter_radius": 1, "role": "corner_defender"},
+        {"anchor": [4, 5], "jitter_radius": 1, "role": "weak_bailout_defender"}
+      ]
+    }
+  ]
+}

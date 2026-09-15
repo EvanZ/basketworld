@@ -44,6 +44,34 @@ def test_actor_critic_forward_shapes():
     assert out["attention_weights"].shape == (4, 0, 0, 0)
 
 
+def test_rebound_critic_head_is_opt_in_and_initialized_for_training():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    spec = ActorCriticSpec(
+        flat_obs_dim=5,
+        training_player_count=2,
+        action_dim_per_player=3,
+        total_action_dim=6,
+        hidden_dims=(8,),
+        rebound_critic_enabled=True,
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
+    flat_obs = jnp.ones((4, 5), dtype=jnp.float32)
+
+    training_out = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        include_rebound_critic=True,
+    )
+    inference_out = actor_critic_forward(params, flat_obs, spec, jnp)
+
+    assert training_out["rebound_values"].shape == (4,)
+    assert np.isfinite(np.asarray(training_out["rebound_values"])).all()
+    np.testing.assert_allclose(np.asarray(inference_out["rebound_values"]), 0.0)
+
 def test_attention_actor_critic_forward_shapes():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")

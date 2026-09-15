@@ -104,6 +104,23 @@ class HexagonBasketballEnv(gym.Env):
         steal_perp_decay: float = 1.5,
         steal_distance_factor: float = 0.08,
         steal_position_weight_min: float = 0.3,
+        pass_interception_model: str = "line",
+        pass_passer_pressure_weight: float = 0.0,
+        pass_receiver_pressure_weight: float = 0.0,
+        pass_lob_lane_multiplier: float = 0.35,
+        pass_lob_receiver_distance: float = 1.0,
+        pass_speed: float = 3.5,
+        defender_reaction_time: float = 0.35,
+        defender_speed: float = 1.25,
+        defender_reach_radius: float = 0.65,
+        reaction_softness: float = 0.55,
+        base_passer_risk: float = 0.06,
+        passer_pressure_decay: float = 1.35,
+        base_receiver_risk: float = 0.35,
+        receiver_alignment_min: float = 0.35,
+        receiver_alignment_width: float = 2.0,
+        max_receiver_hazard: float = 0.85,
+        lane_weight: float = 0.0,
         three_point_distance: float = 4.0,
         three_point_short_distance: Optional[float] = None,
         three_pt_extra_hex_decay: float = 0.05,
@@ -160,6 +177,8 @@ class HexagonBasketballEnv(gym.Env):
         # Preferred: percentage-based assist shaping
         potential_assist_pct: float = 0.10,
         full_assist_bonus_pct: float = 0.05,
+        # Rebound-enabled terminal reward mode.
+        rebound_terminal_reward_mode: str = "actual_points",
         # Observation controls
         use_egocentric_obs: bool = True,
         egocentric_rotate_to_hoop: bool = True,
@@ -229,6 +248,23 @@ class HexagonBasketballEnv(gym.Env):
         self.steal_perp_decay = steal_perp_decay
         self.steal_distance_factor = steal_distance_factor
         self.steal_position_weight_min = steal_position_weight_min
+        self.pass_interception_model = str(pass_interception_model or "line").strip().lower()
+        self.pass_passer_pressure_weight = float(pass_passer_pressure_weight)
+        self.pass_receiver_pressure_weight = float(pass_receiver_pressure_weight)
+        self.pass_lob_lane_multiplier = float(pass_lob_lane_multiplier)
+        self.pass_lob_receiver_distance = float(pass_lob_receiver_distance)
+        self.pass_speed = max(0.1, float(pass_speed))
+        self.defender_reaction_time = max(0.0, float(defender_reaction_time))
+        self.defender_speed = max(0.0, float(defender_speed))
+        self.defender_reach_radius = max(0.0, float(defender_reach_radius))
+        self.reaction_softness = max(0.05, float(reaction_softness))
+        self.base_passer_risk = max(0.0, min(1.0, float(base_passer_risk)))
+        self.passer_pressure_decay = max(0.0, float(passer_pressure_decay))
+        self.base_receiver_risk = max(0.0, min(1.0, float(base_receiver_risk)))
+        self.receiver_alignment_min = max(0.0, min(1.0, float(receiver_alignment_min)))
+        self.receiver_alignment_width = max(0.1, float(receiver_alignment_width))
+        self.max_receiver_hazard = max(0.0, min(1.0, float(max_receiver_hazard)))
+        self.lane_weight = max(0.0, min(1.0, float(lane_weight)))
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
         self.defender_spawn_distance = defender_spawn_distance
@@ -536,6 +572,7 @@ class HexagonBasketballEnv(gym.Env):
         # Percentage-based assist rewards (preferred)
         self.potential_assist_pct: float = float(potential_assist_pct)
         self.full_assist_bonus_pct: float = float(full_assist_bonus_pct)
+        self.rebound_terminal_reward_mode: str = str(rebound_terminal_reward_mode or "actual_points")
 
         # --- Potential-based shaping (Phi) configuration ---
         self.enable_phi_shaping: bool = bool(enable_phi_shaping)

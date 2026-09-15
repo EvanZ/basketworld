@@ -19,6 +19,22 @@ export function getDefaultStats() {
     twoPt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
     threePt: { attempts: 0, made: 0, assists: 0, potentialAssists: 0 },
     turnovers: 0,
+    rebounds: {
+      offensive: 0,
+      defensive: 0,
+      byPlayer: {},
+      byPlayerOffensive: {},
+      byPlayerDefensive: {},
+      targetDistanceSumOffense: 0,
+      targetDistanceSumDefense: 0,
+      targetDistanceCount: 0,
+      postOrbSamples: 0,
+      postOrbPoints: 0,
+      postOrbValueSamples: 0,
+      postOrbConsensusValue: 0,
+      postOrbOffenseValue: 0,
+      postOrbDefenseValue: 0,
+    },
     violations: {
       defensiveLane: 0,
       offensiveThreeSeconds: 0,
@@ -30,6 +46,14 @@ export function getDefaultStats() {
     intentInactiveCount: 0,
     turnoverReasons: {},
     actionMix: {
+      noop: 0,
+      move: 0,
+      shoot: 0,
+      pass: 0,
+      other: 0,
+      total: 0,
+    },
+    actionMixHolder: {
       noop: 0,
       move: 0,
       shoot: 0,
@@ -62,6 +86,29 @@ export function getDefaultStats() {
       sampleCounts: {},
       argmaxCounts: {},
     },
+    reboundDiagnostics: {
+      globalContestRate: 0,
+      totalGlobalContests: 0,
+      eligibility: {},
+      resolvedParams: {},
+    },
+    valueDiagnostics: {
+      discount_gamma: 0,
+      sample_count: 0,
+      completed_episode_count: 0,
+      offense_value_mean: 0,
+      defense_value_mean: 0,
+      value_sum_mean: 0,
+      value_sum_abs_mean: 0,
+      offense_return_mean: 0,
+      defense_return_mean: 0,
+      return_sum_mean: 0,
+      return_sum_abs_mean: 0,
+      offense_value_bias_mean: 0,
+      defense_value_bias_mean: 0,
+      offense_value_mae: 0,
+      defense_value_mae: 0,
+    },
   };
 }
 
@@ -92,6 +139,22 @@ export function loadStats() {
         potentialAssists: Number(parsed?.threePt?.potentialAssists) || 0,
       },
       turnovers: Number(parsed.turnovers) || 0,
+      rebounds: {
+        offensive: Number(parsed?.rebounds?.offensive) || 0,
+        defensive: Number(parsed?.rebounds?.defensive) || 0,
+        byPlayer: normalizeNumberRecord(parsed?.rebounds?.byPlayer || parsed?.rebounds?.byPlayerOffensive),
+        byPlayerOffensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerOffensive || parsed?.rebounds?.byPlayer),
+        byPlayerDefensive: normalizeNumberRecord(parsed?.rebounds?.byPlayerDefensive),
+        targetDistanceSumOffense: Number(parsed?.rebounds?.targetDistanceSumOffense) || 0,
+        targetDistanceSumDefense: Number(parsed?.rebounds?.targetDistanceSumDefense) || 0,
+        targetDistanceCount: Number(parsed?.rebounds?.targetDistanceCount) || 0,
+        postOrbSamples: Number(parsed?.rebounds?.postOrbSamples) || 0,
+        postOrbPoints: Number(parsed?.rebounds?.postOrbPoints) || 0,
+        postOrbValueSamples: Number(parsed?.rebounds?.postOrbValueSamples) || 0,
+        postOrbConsensusValue: Number(parsed?.rebounds?.postOrbConsensusValue) || 0,
+        postOrbOffenseValue: Number(parsed?.rebounds?.postOrbOffenseValue) || 0,
+        postOrbDefenseValue: Number(parsed?.rebounds?.postOrbDefenseValue) || 0,
+      },
       violations: {
         defensiveLane: Number(parsed?.violations?.defensiveLane) || 0,
         offensiveThreeSeconds: Number(parsed?.violations?.offensiveThreeSeconds) || 0,
@@ -109,6 +172,14 @@ export function loadStats() {
         pass: Number(parsed?.actionMix?.pass) || 0,
         other: Number(parsed?.actionMix?.other) || 0,
         total: Number(parsed?.actionMix?.total) || 0,
+      },
+      actionMixHolder: {
+        noop: Number(parsed?.actionMixHolder?.noop) || 0,
+        move: Number(parsed?.actionMixHolder?.move) || 0,
+        shoot: Number(parsed?.actionMixHolder?.shoot) || 0,
+        pass: Number(parsed?.actionMixHolder?.pass) || 0,
+        other: Number(parsed?.actionMixHolder?.other) || 0,
+        total: Number(parsed?.actionMixHolder?.total) || 0,
       },
       rewardBreakdown: {
         totalReward: Number(parsed?.rewardBreakdown?.totalReward) || 0,
@@ -137,6 +208,19 @@ export function loadStats() {
         sampleCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.sampleCounts),
         argmaxCounts: normalizeNumberRecord(parsed?.selectorDiagnostics?.argmaxCounts),
       },
+      reboundDiagnostics: {
+        globalContestRate: Number(parsed?.reboundDiagnostics?.globalContestRate) || 0,
+        totalGlobalContests: Number(parsed?.reboundDiagnostics?.totalGlobalContests) || 0,
+        eligibility: (parsed?.reboundDiagnostics?.eligibility && typeof parsed.reboundDiagnostics.eligibility === 'object')
+          ? { ...parsed.reboundDiagnostics.eligibility }
+          : {},
+        resolvedParams: (parsed?.reboundDiagnostics?.resolvedParams && typeof parsed.reboundDiagnostics.resolvedParams === 'object')
+          ? { ...parsed.reboundDiagnostics.resolvedParams }
+          : {},
+      },
+      valueDiagnostics: (parsed?.valueDiagnostics && typeof parsed.valueDiagnostics === 'object')
+        ? { ...parsed.valueDiagnostics }
+        : getDefaultStats().valueDiagnostics,
     };
   } catch (e) {
     // Corrupt storage; reset

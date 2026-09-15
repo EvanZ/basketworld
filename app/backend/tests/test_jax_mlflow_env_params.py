@@ -47,6 +47,18 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/phi_use_ball_handler_only": "false",
         "jax/env/start_template_library": "/tmp/templates.json",
         "jax/env/start_template_prob": "1.0",
+        "jax/env/rebound_skill_std": "0.75",
+        "jax/env/rebound_skill_sampling_mode": "one_high_per_team",
+        "jax/env/rebound_skill_high": "1.0",
+        "jax/env/rebound_skill_low": "-0.25",
+        "jax/env/rebound_skill_weight": "1.25",
+        "jax/env/rebound_basket_position_weight": "0.75",
+        "jax/env/rebound_contest_mode": "local_contest",
+        "jax/env/rebound_contest_radius": "1",
+        "jax/env/rebound_obs_top_n_targets": "3",
+        "jax/env/enable_rebound_reward_redistribution": "true",
+        "jax/env/offensive_rebound_reward_advance": "0.35",
+        "jax/env/rebound_reward_once_per_possession": "false",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
@@ -82,6 +94,55 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["phi_use_ball_handler_only"] is False
     assert merged["start_template_library"] == "/tmp/templates.json"
     assert merged["start_template_prob"] == 1.0
+    assert merged["rebound_skill_std"] == 0.75
+    assert merged["rebound_skill_sampling_mode"] == "one_high_per_team"
+    assert merged["rebound_skill_high"] == 1.0
+    assert merged["rebound_skill_low"] == -0.25
+    assert merged["rebound_skill_weight"] == 1.25
+    assert merged["rebound_basket_position_weight"] == 0.75
+    assert merged["rebound_contest_mode"] == "local_contest"
+    assert merged["rebound_contest_radius"] == 1
+    assert merged["rebound_obs_top_n_targets"] == 3
+
+    assert merged["enable_rebound_reward_redistribution"] is True
+    assert merged["offensive_rebound_reward_advance"] == 0.35
+    assert merged["rebound_reward_once_per_possession"] is False
+
+
+def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():
+    merged = _overlay_jax_mlflow_env_params(
+        {},
+        {
+            "jax/rebound_skill_std": "0.5",
+            "jax/rebound_skill_sampling_mode": "one_high_per_team",
+            "jax/rebound_skill_high": "2.0",
+            "jax/rebound_skill_low": "-0.5",
+            "jax/rebound_skill_weight": "1.5",
+            "jax/rebound_basket_position_weight": "0.8",
+            "jax/rebound_terminal_reward_mode": "last_shot_ep",
+            "jax/rebound_contest_mode": "local_contest",
+            "jax/enable_rebound_reward_redistribution": "true",
+            "jax/offensive_rebound_reward_advance": "0.45",
+            "jax/rebound_reward_once_per_possession": "false",
+            "jax/rebound_contest_initial_radius": "2",
+            "jax/rebound_obs_top_n_targets": "2",
+        },
+    )
+
+    assert merged["rebound_skill_std"] == 0.5
+    assert merged["rebound_skill_sampling_mode"] == "one_high_per_team"
+    assert merged["rebound_skill_high"] == 2.0
+    assert merged["rebound_skill_low"] == -0.5
+    assert merged["rebound_skill_weight"] == 1.5
+    assert merged["rebound_basket_position_weight"] == 0.8
+    assert merged["rebound_terminal_reward_mode"] == "last_shot_ep"
+    assert merged["rebound_contest_mode"] == "local_contest"
+    assert merged["rebound_contest_radius"] == 2
+    assert merged["rebound_obs_top_n_targets"] == 2
+
+    assert merged["enable_rebound_reward_redistribution"] is True
+    assert merged["offensive_rebound_reward_advance"] == 0.45
+    assert merged["rebound_reward_once_per_possession"] is False
 
 
 def test_overlay_jax_mlflow_training_params_exposes_selector_config():

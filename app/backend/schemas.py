@@ -3,11 +3,21 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 
+class ReboundSkillSamplingSetup(BaseModel):
+    mode: Literal["constrained_gaussian"] = "constrained_gaussian"
+    std: float = 1.0
+    target_edge: float = 0.0
+    tolerance: float = 0.25
+    max_attempts: int = 5000
+
+
 class CustomEvalSetup(BaseModel):
     initial_positions: list[tuple[int, int]] | None = None
     ball_holder: int | None = None
     shooting_mode: Literal["random", "fixed"] = "random"
     offense_skills: dict[str, list[float]] | None = None
+    rebound_skills: list[float] | None = None
+    rebound_skill_sampling: ReboundSkillSamplingSetup | None = None
 
 
 class InitGameRequest(BaseModel):
@@ -71,6 +81,16 @@ class PassStealPreviewRequest(BaseModel):
     ball_holder: int
 
 
+class ReboundPreviewRequest(BaseModel):
+    enabled: bool = True
+    seed: int | None = None
+    target_temperature: float = 1.0
+    target_uniform_mix: float = 0.0
+    target_distance_weight: float | None = None
+    winner_temperature: float | None = None
+    table_model_dir: str | None = None
+
+
 class ActionRequest(BaseModel):
     actions: dict[str, object]  # Accept ints, action names, or structured payloads like {type:"PASS", target:id}.
     player_deterministic: bool | None = None
@@ -113,6 +133,7 @@ class EvaluationRequest(BaseModel):
     start_template_prob: float | None = None
     start_template_jitter_scale: float | None = None
     start_template_mirror_prob: float | None = None
+    env_overrides: dict[str, object] | None = None
 
 
 class SaveEpisodeRequest(BaseModel):
@@ -155,6 +176,11 @@ class ReplayCounterfactualRequest(BaseModel):
     player_deterministic: bool = True
     opponent_deterministic: bool = True
     max_steps: int = 256
+
+
+class SetCurrentReboundSkillsRequest(BaseModel):
+    rebound_skills: List[float]
+    rebound_skill_specialists: List[bool] | None = None
 
 
 class PlaybookAnalysisRequest(BaseModel):
@@ -203,10 +229,39 @@ class SetPressureParamsRequest(BaseModel):
     steal_perp_decay: float | None = None
     steal_distance_factor: float | None = None
     steal_position_weight_min: float | None = None
+    pass_interception_model: str | None = None
+    pass_passer_pressure_weight: float | None = None
+    pass_receiver_pressure_weight: float | None = None
+    pass_lob_lane_multiplier: float | None = None
+    pass_lob_receiver_distance: float | None = None
+    pass_speed: float | None = None
+    defender_reaction_time: float | None = None
+    defender_speed: float | None = None
+    defender_reach_radius: float | None = None
+    reaction_softness: float | None = None
+    base_passer_risk: float | None = None
+    passer_pressure_decay: float | None = None
+    base_receiver_risk: float | None = None
+    receiver_alignment_min: float | None = None
+    receiver_alignment_width: float | None = None
+    max_receiver_hazard: float | None = None
+    lane_weight: float | None = None
     # Defender turnover pressure
     defender_pressure_distance: int | None = None
     defender_pressure_turnover_chance: float | None = None
     defender_pressure_decay_lambda: float | None = None
+    # Rebounding winner model
+    rebound_winner_distance_weight: float | None = None
+    rebound_basket_position_weight: float | None = None
+    rebound_winner_temperature: float | None = None
+    rebound_skill_std: float | None = None
+    rebound_skill_sampling_mode: str | None = None
+    rebound_skill_high: float | None = None
+    rebound_skill_low: float | None = None
+    rebound_skill_weight: float | None = None
+    rebound_contest_mode: str | None = None
+    rebound_contest_radius: int | None = None
+    rebound_obs_top_n_targets: int | None = None
 
 
 class PlayableStartRequest(BaseModel):

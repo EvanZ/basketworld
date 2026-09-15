@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from app.backend import state as backend_state
-from app.backend.jax_dev_runtime import JaxDevRuntime
+from app.backend.jax_dev_runtime import JaxDevRuntime, _adapt_policy_observation_to_spec
 from app.backend.routes import admin_routes
 from app.backend.routes import lifecycle_routes
 from app.backend.schemas import (
@@ -35,16 +35,50 @@ class _FakeSpec:
     attention_num_cls_tokens: int = 0
     num_intents: int = 8
     intent_selector_enabled: bool = False
+    rebound_win_prob_features: bool = False
+
+
+@dataclass(frozen=True)
+class _FakeAttentionSpec:
+    model_type: str = "attention"
+    flat_obs_dim: int = (10 * 17) + 7 + 1
+    token_player_count: int = 10
+    token_dim: int = 17
+    global_dim: int = 7
+
+
+def test_jax_dev_runtime_adapts_attention_observation_with_extra_token_and_global_features():
+    spec = _FakeAttentionSpec()
+    current_token_dim = 18
+    current_global_dim = 8
+    token_count = int(spec.token_player_count)
+    current_dim = (token_count * current_token_dim) + current_global_dim + 1
+    flat = jnp.arange(current_dim, dtype=jnp.float32)[None, :]
+
+    adapted = np.asarray(_adapt_policy_observation_to_spec(flat, SimpleNamespace(), spec, jnp))
+
+    assert adapted.shape == (1, int(spec.flat_obs_dim))
+    current_players = np.asarray(flat[:, : token_count * current_token_dim]).reshape(1, token_count, current_token_dim)
+    expected_players = current_players[:, :, : int(spec.token_dim)].reshape(1, token_count * int(spec.token_dim))
+    np.testing.assert_allclose(adapted[:, : token_count * int(spec.token_dim)], expected_players)
+    adapted_global_start = token_count * int(spec.token_dim)
+    current_global_start = token_count * current_token_dim
+    np.testing.assert_allclose(
+        adapted[:, adapted_global_start : adapted_global_start + int(spec.global_dim)],
+        np.asarray(flat[:, current_global_start : current_global_start + int(spec.global_dim)]),
+    )
+    np.testing.assert_allclose(adapted[:, -1], np.asarray(flat[:, current_global_start + current_global_dim]))
 
 
 class _FakeRawJaxModel:
     metadata = {"policy_spec": {"model_type": "mlp"}}
 
-    def __init__(self, action_bias: int | None = None):
+    def __init__(self, action_bias: int | None = None, metadata: dict | None = None):
         self.jax = jax
         self.jnp = jnp
         self.params = {}
         self.spec = _FakeSpec()
+        self.metadata = dict(metadata or self.metadata)
         self._sample_key = jax.random.PRNGKey(123)
         self.action_bias = action_bias
 
@@ -97,6 +131,25 @@ def _make_runtime(
     if reset_seed is not None:
         runtime.reset(seed=reset_seed)
     return runtime
+
+
+def test_jax_dev_runtime_labels_rebound_win_probability_observation_features():
+    runtime = _make_runtime()
+    runtime.raw_model.spec = _FakeSpec(rebound_win_prob_features=True)
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    state = runtime.get_full_game_state(game_state, include_policy_probs=False)
+    obs_tokens = state["obs_tokens"]
+
+    assert len(obs_tokens["globals"]) == 8
+    assert len(obs_tokens["globals_labels"]) == len(obs_tokens["globals"])
+    assert obs_tokens["globals_labels"][-1] == "offensive_rebound_probability"
+    assert len(obs_tokens["players"][0]) == 19
 
 
 def test_state_snapshot_dispatches_to_jax_runtime(monkeypatch):
@@ -236,6 +289,64 @@ def test_jax_dev_runtime_replace_policies_refreshes_policy_outputs():
     )
     first_player = runtime.offense_ids[0]
     assert new_probs[first_player][0] > old_probs[first_player][0]
+
+
+
+def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata():
+    runtime = _make_runtime(
+        env_params={
+            "rebound_target_temperature": 0.25,
+            "rebound_winner_temperature": 0.25,
+        }
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.obs = runtime.observation_dict()
+
+    new_policy = _FakeRawJaxModel(
+        metadata={
+            "policy_spec": {"model_type": "mlp"},
+            "env_config": {
+                "enable_rebounds": False,
+                "rebound_target_temperature": 0.75,
+                "rebound_winner_temperature": 0.5,
+                "offensive_rebound_shot_clock_reset": 13,
+            },
+        }
+    )
+    runtime.replace_policies(
+        unified_policy=new_policy,
+        opponent_policy=new_policy,
+        game_state=game_state,
+    )
+
+    assert runtime.env_params["enable_rebounds"] is False
+    assert runtime.display_env.enable_rebounds is False
+    assert float(np.asarray(runtime.static.rebound_target_temperature)) == pytest.approx(0.75)
+    assert float(np.asarray(runtime.static.rebound_winner_temperature)) == pytest.approx(0.5)
+    assert int(np.asarray(runtime.static.offensive_rebound_shot_clock_reset)) == 13
+
+    runtime.env_params["enable_rebounds"] = True
+    runtime.display_env.enable_rebounds = True
+    non_rebound_policy = _FakeRawJaxModel(
+        metadata={
+            "policy_spec": {"model_type": "mlp"},
+            "env_config": {},
+        }
+    )
+    runtime.replace_policies(
+        unified_policy=non_rebound_policy,
+        opponent_policy=non_rebound_policy,
+        game_state=game_state,
+    )
+
+    assert runtime.env_params["enable_rebounds"] is False
+    assert runtime.display_env.enable_rebounds is False
+    assert int(np.asarray(runtime.static.enable_rebounds)) == 0
 
 
 def test_jax_dev_runtime_self_play_respects_requested_template_seed():
@@ -806,6 +917,41 @@ def test_jax_dev_runtime_self_play_reselects_after_completed_pass_boundary(monke
     assert body["selector_transition"]["intent_index"] == 6
     assert body["state"]["intent_index_current"] == 6
     assert body["state"]["selector_last_boundary_reason"] == "completed_pass"
+
+
+def test_jax_dev_runtime_self_play_reselects_after_offensive_rebound_boundary(monkeypatch):
+    runtime, game_state = _make_selector_runtime_and_state()
+    runtime.set_offense_intent_state(
+        active=True,
+        intent_index=2,
+        intent_age=3,
+        intent_commitment_remaining=2,
+        game_state=game_state,
+    )
+    runtime._last_offensive_rebound_boundary = True
+    monkeypatch.setattr(
+        runtime,
+        "_sample_selector_intent",
+        lambda _game_state: {
+            "intent_index": 7,
+            "used_selector": True,
+            "alpha": 1.0,
+            "eps": 0.0,
+            "value": 0.5,
+        },
+    )
+    monkeypatch.setattr(runtime, "_selector_preferences", lambda _game_state: None)
+
+    body = runtime.step(
+        ActionRequest(actions={}, player_deterministic=True, opponent_deterministic=True),
+        game_state,
+    )
+
+    assert body["status"] == "success"
+    assert body["selector_transition"]["reason"] == "offensive_rebound"
+    assert body["selector_transition"]["intent_index"] == 7
+    assert body["state"]["intent_index_current"] == 7
+    assert body["state"]["selector_last_boundary_reason"] == "offensive_rebound"
 
 
 def test_jax_dev_runtime_unseeded_resets_advance_rng_key():
