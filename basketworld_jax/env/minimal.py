@@ -1641,6 +1641,53 @@ def build_offense_expected_points_batch(static: KernelStatic, state: KernelState
     )
 
 
+def _build_legacy_phi_expected_points_batch(static: KernelStatic, state: KernelState, jnp):
+    """Expected points under the Python environment's discrete Phi definition.
+
+    The JAX shot-profile features intentionally interpolate make probability by
+    continuous court distance.  The legacy Python potential function instead
+    calls ``_calculate_shot_probability`` with *hex* distance.  Keep that
+    distinction here so Phi shaping remains transition-equivalent without
+    changing the observation/profile contract.
+    """
+    profile = build_shot_profile_batch(static, state, jnp)
+    distances = profile["distance"].astype(jnp.float32)
+    d0 = jnp.asarray(1.0, dtype=jnp.float32)
+    d1 = jnp.maximum(static.three_point_distance + 1.0, d0 + 1.0)
+    interpolation = jnp.clip((distances - d0) / (d1 - d0), 0.0, 1.0)
+    base_probability = state.layup_pct + (
+        state.three_pt_pct - state.layup_pct
+    ) * interpolation
+    base_probability = jnp.where(distances <= d0, state.layup_pct, base_probability)
+    extra_hexes = jnp.maximum(0.0, distances - jnp.floor(d1))
+    base_probability = jnp.where(
+        distances > d1,
+        base_probability - (static.three_pt_extra_hex_decay * extra_hexes),
+        base_probability,
+    )
+    base_probability = jnp.where(
+        static.allow_dunks.astype(jnp.bool_) & (distances == 0.0),
+        state.dunk_pct,
+        base_probability,
+    )
+    base_probability = jnp.clip(base_probability, 0.01, 0.99)
+    probability = jnp.clip(
+        base_probability * profile["pressure_multiplier"],
+        0.01,
+        0.99,
+    )
+    shot_value = jnp.where(
+        static.allow_dunks.astype(jnp.bool_) & (distances == 0.0),
+        jnp.full_like(probability, 2.0),
+        jnp.where(
+            profile["is_three"],
+            jnp.full_like(probability, 3.0),
+            jnp.full_like(probability, 2.0),
+        ),
+    )
+    return shot_value * probability
+
+
 def _local_rebound_contest_mask_from_distances(
     static: KernelStatic,
     target_distances,
@@ -1920,7 +1967,11 @@ def _phi_shot_quality_single(static: KernelStatic, state: KernelState, jnp):
     holder_valid = state.ball_holder >= 0
     safe_holder = jnp.clip(state.ball_holder, 0, n_players - 1)
     batched_state = _single_state_to_batched(state, jnp)
-    expected_points = build_shot_profile_batch(static, batched_state, jnp)["expected_points"][0]
+    expected_points = _build_legacy_phi_expected_points_batch(
+        static,
+        batched_state,
+        jnp,
+    )[0]
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     role_encoding = _active_role_encoding_single(static, state, jnp)
     holder_is_offense = role_encoding[safe_holder] > 0.0
