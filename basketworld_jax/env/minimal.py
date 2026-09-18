@@ -54,17 +54,22 @@ TURNOVER_REASON_DEFENDER_PRESSURE = 3
 TURNOVER_REASON_MOVE_OUT_OF_BOUNDS = 4
 TURNOVER_REASON_SHOT_CLOCK = 5
 TURNOVER_REASON_OFFENSIVE_THREE_SECONDS = 6
+TURNOVER_REASON_INBOUND_TIMEOUT = 7
+TURNOVER_REASON_INBOUND_INVALID_PASS = 8
 TEAM_A = 0
 TEAM_B = 1
 GAME_PHASE_LIVE = 0
-# A possession has ended, but the next one cannot begin until the baseline
-# inbound implementation assigns an inbounder (#20).
+# A designated player holds the ball outside the baseline until a pass is
+# released or the inbound deadline expires.  Keep the old name as the public
+# alias used by the #19 state-contract tests.
 GAME_PHASE_AWAITING_INBOUND = 1
+GAME_PHASE_INBOUND = GAME_PHASE_AWAITING_INBOUND
 POSSESSION_END_NONE = 0
 POSSESSION_END_MADE_BASKET = 1
 POSSESSION_END_DEFENSIVE_REBOUND = 2
 POSSESSION_END_TURNOVER = 3
 POSSESSION_END_DEFENSIVE_VIOLATION = 4
+POSSESSION_END_INBOUND_VIOLATION = 5
 SHOT_TYPE_NONE = 0
 SHOT_TYPE_DUNK = 1
 SHOT_TYPE_TWO = 2
@@ -254,6 +259,8 @@ class KernelStatic(NamedTuple):
     rebound_reward_once_per_possession: Any
     enable_multi_possession: Any
     multi_possession_limit: Any
+    inbound_position: Any
+    inbound_deadline_steps: Any
 
 
 class KernelState(NamedTuple):
@@ -302,6 +309,7 @@ class KernelState(NamedTuple):
     inbound_team: Any
     inbound_player: Any
     inbound_reason: Any
+    inbound_steps_remaining: Any
     clearance_achieved: Any
 
 
@@ -570,6 +578,7 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "inbound_team": -1,
         "inbound_player": -1,
         "inbound_reason": POSSESSION_END_NONE,
+        "inbound_steps_remaining": 0,
         "clearance_achieved": 1,
     }
 
@@ -766,6 +775,13 @@ def stack_state_snapshots(
         ),
         inbound_reason=xp.asarray(
             np.asarray([int(item.get("inbound_reason", POSSESSION_END_NONE)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        inbound_steps_remaining=xp.asarray(
+            np.asarray(
+                [int(item.get("inbound_steps_remaining", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
             dtype=xp.int32,
         ),
         clearance_achieved=xp.asarray(
@@ -1054,6 +1070,13 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         pass_target_ids[passer_id, : len(teammates)] = np.asarray(teammates, dtype=np.int32)
     start_templates = _compiled_start_template_arrays(env)
     rebound_target_probs = _compiled_rebound_target_probs(env, cells)
+    baseline_west = np.asarray(
+        env.hex_directions[ActionType.MOVE_W.value - MOVE_ACTION_START],
+        dtype=np.int32,
+    )
+    inbound_position = basket_position + baseline_west
+    if tuple(inbound_position.tolist()) in set(cells):
+        raise ValueError("Baseline inbound position must be outside the playable court.")
 
     return KernelStatic(
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
@@ -1280,6 +1303,11 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         ),
         multi_possession_limit=xp.asarray(
             max(1, int(getattr(env, "multi_possession_limit", 25))),
+            dtype=xp.int32,
+        ),
+        inbound_position=xp.asarray(inbound_position, dtype=xp.int32),
+        inbound_deadline_steps=xp.asarray(
+            max(1, int(getattr(env, "inbound_deadline_steps", 5))),
             dtype=xp.int32,
         ),
     )
@@ -1524,13 +1552,67 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         occupied_move_masks,
         move_masks,
     )
+
+    # After releasing an inbound pass, the inbounder remains at the single
+    # outside-baseline coordinate until taking a legal adjacent move onto the
+    # court.  These are the only generally out-of-bounds movement masks.
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    pending_inbounder = (
+        (state.inbound_player[:, None] == player_ids[None, :])
+        & (state.inbound_player[:, None] >= 0)
+        & (~found)
+    )
+    entry_positions = state.positions[:, :, None, :] + static.hex_directions[None, None, :, :]
+    _, entry_found = _lookup_cell_indices(static.cell_coords, entry_positions, jnp)
+    entry_occupied = jnp.any(
+        jnp.all(
+            entry_positions[:, :, :, None, :] == state.positions[:, None, None, :, :],
+            axis=-1,
+        ),
+        axis=-1,
+    )
+    reentry_masks = (
+        entry_found
+        & (~entry_occupied)
+    ).astype(jnp.int8)
+    reentry_active = pending_inbounder & (
+        state.game_phase[:, None] == GAME_PHASE_LIVE
+    )
+    move_masks = jnp.where(reentry_active[:, :, None], reentry_masks, move_masks)
+    current_inbounder = pending_inbounder & (
+        state.game_phase[:, None] == GAME_PHASE_INBOUND
+    )
+    move_masks = jnp.where(
+        current_inbounder[:, :, None],
+        jnp.zeros_like(move_masks),
+        move_masks,
+    )
     masks = masks.at[:, :, MOVE_ACTION_START:MOVE_ACTION_END].set(move_masks)
 
-    player_ids = jnp.arange(n_players, dtype=jnp.int32)
     holder_mask = (state.ball_holder[:, None] == player_ids[None, :]) & (state.ball_holder[:, None] >= 0)
-    masks = masks.at[:, :, ActionType.SHOOT.value].set(holder_mask.astype(jnp.int8))
+    shot_allowed = (
+        (state.game_phase[:, None] == GAME_PHASE_LIVE)
+        & (
+            (~static.enable_multi_possession.astype(jnp.bool_))
+            | state.clearance_achieved[:, None].astype(jnp.bool_)
+        )
+    )
+    masks = masks.at[:, :, ActionType.SHOOT.value].set(
+        (holder_mask & shot_allowed).astype(jnp.int8)
+    )
 
-    pass_masks = holder_mask[:, :, None].astype(jnp.int8) * static.pointer_pass_slot_mask[None, :, :]
+    safe_targets = jnp.clip(static.pointer_pass_target_ids, 0, n_players - 1)
+    target_positions = state.positions[:, safe_targets, :]
+    _, target_on_court = _lookup_cell_indices(static.cell_coords, target_positions, jnp)
+    valid_targets = (
+        (static.pointer_pass_target_ids[None, :, :] >= 0)
+        & target_on_court
+    )
+    pass_masks = (
+        holder_mask[:, :, None]
+        & static.pointer_pass_slot_mask[None, :, :].astype(jnp.bool_)
+        & valid_targets
+    ).astype(jnp.int8)
     masks = masks.at[:, :, PASS_ACTION_START:PASS_ACTION_END].set(pass_masks)
     return masks
 
@@ -2105,7 +2187,12 @@ def build_turnover_probabilities_batch(static: KernelStatic, state: KernelState,
     total_turnover = 1.0 - jnp.prod(1.0 - turnover_prob, axis=1)
 
     out = jnp.zeros((batch_size, offense_count), dtype=jnp.float32)
-    return jnp.where(ball_holder_offense_mask, total_turnover[:, None], out)
+    holder_risk = jnp.where(ball_holder_offense_mask, total_turnover[:, None], out)
+    return jnp.where(
+        (state.game_phase == GAME_PHASE_LIVE)[:, None],
+        holder_risk,
+        out,
+    )
 
 
 def build_pass_steal_contributions_batch(static: KernelStatic, state: KernelState, jnp):
@@ -2908,7 +2995,17 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
     proposed = current_positions + deltas
 
     _, proposed_found = _lookup_cell_indices(static.cell_coords, proposed, jnp)
-    basket_collision = jnp.all(proposed == static.basket_position, axis=-1) & (~static.allow_dunks.astype(jnp.bool_))
+    reentering_inbounder = (
+        (jnp.arange(n_players, dtype=jnp.int32) == state.inbound_player)
+        & (state.inbound_player >= 0)
+        & (state.game_phase == GAME_PHASE_LIVE)
+        & jnp.all(current_positions == static.inbound_position[None, :], axis=-1)
+    )
+    basket_collision = (
+        jnp.all(proposed == static.basket_position, axis=-1)
+        & (~static.allow_dunks.astype(jnp.bool_))
+        & (~reentering_inbounder)
+    )
     valid_move = requested_move & proposed_found & (~basket_collision)
     intended_dest = jnp.where(valid_move[:, None], proposed, intended_dest)
 
@@ -2951,6 +3048,122 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
     return final_positions, ball_holder, turnover_any, turnover_player
 
 
+def _return_pending_inbounder_to_court_single(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+):
+    """Place an outside pending inbounder on the nearest free legal cell.
+
+    This is used only when another dead-ball boundary occurs before that player
+    re-enters.  It prevents repeated inbound violations from accumulating
+    duplicate players at the single outside-baseline coordinate.
+    """
+    n_players = state.positions.shape[0]
+    safe_player = jnp.clip(state.inbound_player, 0, n_players - 1)
+    pending_position = state.positions[safe_player]
+    _, pending_on_court = _lookup_cell_indices(
+        static.cell_coords,
+        pending_position[None, :],
+        jnp,
+    )
+    needs_return = (state.inbound_player >= 0) & (~pending_on_court[0])
+
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    other_positions = jnp.where(
+        (player_ids == safe_player)[:, None],
+        jnp.broadcast_to(static.inbound_position, state.positions.shape),
+        state.positions,
+    )
+    occupied = jnp.any(
+        jnp.all(
+            static.cell_coords[:, None, :] == other_positions[None, :, :],
+            axis=-1,
+        ),
+        axis=1,
+    )
+    # A baseline inbounder may legally step onto the under-basket cell even
+    # when ordinary dunk-position movement is disabled.
+    legal = ~occupied
+    distances = _hex_distance(
+        static.cell_coords,
+        static.inbound_position[None, :],
+        jnp,
+    ).astype(jnp.int32)
+    tie_break = jnp.arange(static.cell_coords.shape[0], dtype=jnp.int32)
+    score = (distances * (static.cell_coords.shape[0] + 1)) + tie_break
+    return_idx = jnp.argmin(
+        jnp.where(legal, score, jnp.full_like(score, 1_000_000))
+    )
+    return_position = static.cell_coords[return_idx]
+    updated_position = jnp.where(needs_return, return_position, pending_position)
+    return state.positions.at[safe_player].set(updated_position)
+
+
+def _prepare_inbound_positions_single(
+    static: KernelStatic,
+    state: KernelState,
+    receiving_team,
+    jnp,
+):
+    restored_positions = _return_pending_inbounder_to_court_single(
+        static,
+        state,
+        jnp,
+    )
+    receiving_ids = jnp.where(
+        receiving_team == TEAM_A,
+        static.offense_ids,
+        static.defense_ids,
+    )
+    distances = _hex_distance(
+        restored_positions[receiving_ids],
+        static.inbound_position[None, :],
+        jnp,
+    )
+    inbounder = receiving_ids[jnp.argmin(distances)]
+    inbound_positions = restored_positions.at[inbounder].set(
+        static.inbound_position
+    )
+    return restored_positions, inbound_positions, inbounder
+
+
+def _clear_reentered_inbound_metadata_single(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+):
+    safe_player = jnp.clip(
+        state.inbound_player,
+        0,
+        state.positions.shape[0] - 1,
+    )
+    _, found = _lookup_cell_indices(
+        static.cell_coords,
+        state.positions[safe_player][None, :],
+        jnp,
+    )
+    reentered = (state.inbound_player >= 0) & found[0]
+    return _replace_state(
+        state,
+        inbound_team=jnp.where(
+            reentered,
+            jnp.asarray(-1, dtype=jnp.int8),
+            state.inbound_team,
+        ),
+        inbound_player=jnp.where(
+            reentered,
+            jnp.asarray(-1, dtype=jnp.int32),
+            state.inbound_player,
+        ),
+        inbound_reason=jnp.where(
+            reentered,
+            jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+            state.inbound_reason,
+        ),
+    )
+
+
 def _finalize_possession_single(
     static: KernelStatic,
     state: KernelState,
@@ -2963,9 +3176,9 @@ def _finalize_possession_single(
 ):
     """Advance the game-level state after one completed possession.
 
-    Dead-ball endings enter ``AWAITING_INBOUND`` rather than receiving a
-    synthetic ball holder.  Live rebounds and steals retain their winner and
-    immediately become the next possession; #21 later applies clearance.
+    Dead-ball endings immediately designate and relocate the nearest inbounder.
+    Live rebounds and steals retain their winner and immediately become the
+    next possession; #21 later completes clearance detection.
     """
     multi = static.enable_multi_possession.astype(jnp.bool_)
     possession_ended = possession_ended.astype(jnp.bool_)
@@ -2973,10 +3186,34 @@ def _finalize_possession_single(
     completed = state.completed_possessions + advance.astype(jnp.int32)
     game_done = advance & (completed >= static.multi_possession_limit)
     awaiting_inbound = advance & (~game_done) & requires_inbound.astype(jnp.bool_)
+    (
+        restored_positions,
+        inbound_positions,
+        selected_inbounder,
+    ) = _prepare_inbound_positions_single(
+        static,
+        state,
+        next_offense_team,
+        jnp,
+    )
+    boundary_positions = jnp.where(
+        awaiting_inbound,
+        inbound_positions,
+        jnp.where(
+            game_done,
+            restored_positions,
+            state.positions,
+        ),
+    )
     reset_possession_state = advance
     next_state = _replace_state(
         state,
-        ball_holder=jnp.where(awaiting_inbound, jnp.asarray(-1, dtype=jnp.int32), state.ball_holder),
+        positions=boundary_positions,
+        ball_holder=jnp.where(
+            awaiting_inbound,
+            selected_inbounder.astype(jnp.int32),
+            state.ball_holder,
+        ),
         shot_clock=jnp.where(advance, static.shot_clock_max, state.shot_clock),
         pressure_exposure=jnp.where(advance, jnp.asarray(0.0, dtype=jnp.float32), state.pressure_exposure),
         offense_lane_steps=jnp.where(
@@ -3041,17 +3278,38 @@ def _finalize_possession_single(
         inbound_team=jnp.where(
             awaiting_inbound,
             next_offense_team.astype(jnp.int8),
-            jnp.asarray(-1, dtype=jnp.int8),
+            jnp.where(
+                game_done,
+                jnp.asarray(-1, dtype=jnp.int8),
+                state.inbound_team,
+            ),
         ),
         inbound_player=jnp.where(
             awaiting_inbound,
-            jnp.asarray(-1, dtype=jnp.int32),
-            jnp.asarray(-1, dtype=jnp.int32),
+            selected_inbounder.astype(jnp.int32),
+            jnp.where(
+                game_done,
+                jnp.asarray(-1, dtype=jnp.int32),
+                state.inbound_player,
+            ),
         ),
         inbound_reason=jnp.where(
             awaiting_inbound,
             possession_end_reason.astype(jnp.int32),
-            jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+            jnp.where(
+                game_done,
+                jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+                state.inbound_reason,
+            ),
+        ),
+        inbound_steps_remaining=jnp.where(
+            awaiting_inbound,
+            static.inbound_deadline_steps.astype(jnp.int32),
+            jnp.where(
+                advance,
+                jnp.asarray(0, dtype=jnp.int32),
+                state.inbound_steps_remaining,
+            ),
         ),
         clearance_achieved=jnp.where(
             advance,
@@ -3122,9 +3380,275 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         )
 
     def _awaiting_inbound(_):
-        # #20 turns this state into a live baseline-inbound play.  Until then,
-        # no player action can accidentally advance another possession.
-        return _already_done(None)._replace(done=jnp.asarray(False))
+        pass_key, interceptor_key, move_key = jax.random.split(key, 3)
+        n_players = state.positions.shape[0]
+        player_ids = jnp.arange(n_players, dtype=jnp.int32)
+        safe_inbounder = jnp.clip(state.inbound_player, 0, n_players - 1)
+        countdown_state = _replace_state(
+            state,
+            step_count=state.step_count + 1,
+            shot_clock=jnp.maximum(
+                jnp.asarray(0, dtype=jnp.int32),
+                state.shot_clock - 1,
+            ),
+            inbound_steps_remaining=jnp.maximum(
+                jnp.asarray(0, dtype=jnp.int32),
+                state.inbound_steps_remaining - 1,
+            ),
+            # Lane clocks are reset at the possession boundary and remain
+            # frozen until the inbound pass establishes live play.
+            offense_lane_steps=state.offense_lane_steps,
+            defense_lane_steps=state.defense_lane_steps,
+        )
+        inbounder_action = actions[safe_inbounder]
+        is_pass = (
+            (state.inbound_player >= 0)
+            & (inbounder_action >= PASS_ACTION_START)
+            & (inbounder_action < PASS_ACTION_END)
+        )
+        slot_idx = jnp.clip(inbounder_action - PASS_ACTION_START, 0, 5)
+        receiver = static.pointer_pass_target_ids[safe_inbounder, slot_idx]
+        safe_receiver = jnp.clip(receiver, 0, n_players - 1)
+        active_offense_ids = _active_offense_ids_single(
+            static,
+            countdown_state,
+            jax,
+        )
+        receiver_is_teammate = jnp.any(active_offense_ids == receiver)
+        _, receiver_found = _lookup_cell_indices(
+            static.cell_coords,
+            countdown_state.positions[safe_receiver][None, :],
+            jnp,
+        )
+        valid_release = (
+            is_pass
+            & (receiver >= 0)
+            & receiver_is_teammate
+            & receiver_found[0]
+        )
+
+        steal_contribs = _pass_steal_contribs_single(
+            static,
+            countdown_state,
+            jnp,
+        )
+        pass_probs = 1.0 - jnp.prod(1.0 - steal_contribs, axis=-1)
+        receiver_slot = jnp.argmax(
+            (active_offense_ids == receiver).astype(jnp.int32)
+        )
+        receiver_safe_slot = jnp.clip(receiver_slot, 0, pass_probs.shape[0] - 1)
+        steal_prob = jnp.where(
+            valid_release,
+            pass_probs[receiver_safe_slot],
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        intercepted = valid_release & (jax.random.uniform(pass_key) < steal_prob)
+        completed = valid_release & (~intercepted)
+
+        receiver_steal_contribs = jnp.where(
+            valid_release,
+            steal_contribs[receiver_safe_slot],
+            jnp.zeros_like(steal_contribs[receiver_safe_slot]),
+        )
+        has_interceptor_weight = jnp.sum(receiver_steal_contribs) > 0.0
+        interceptor_logits = jnp.where(
+            receiver_steal_contribs > 0.0,
+            jnp.log(jnp.maximum(receiver_steal_contribs, 1.0e-8)),
+            jnp.asarray(-1.0e9, dtype=jnp.float32),
+        )
+        sampled_interceptor_idx = jax.random.categorical(
+            interceptor_key,
+            interceptor_logits,
+        ).astype(jnp.int32)
+        active_defense_ids = _active_defense_ids_single(
+            static,
+            countdown_state,
+            jax,
+        )
+        sampled_interceptor = active_defense_ids[
+            jnp.clip(
+                sampled_interceptor_idx,
+                0,
+                active_defense_ids.shape[0] - 1,
+            )
+        ]
+        fallback_interceptor = _turnover_to_defense_single(
+            static,
+            countdown_state,
+            countdown_state.positions,
+            safe_inbounder,
+            jax,
+            jnp,
+        )
+        interceptor = jnp.where(
+            has_interceptor_weight,
+            sampled_interceptor,
+            fallback_interceptor,
+        )
+
+        # The inbounder cannot move, shoot, or be stripped while outside.  All
+        # other players use ordinary simultaneous movement during the count.
+        movement_actions = jnp.where(
+            player_ids == safe_inbounder,
+            jnp.asarray(ActionType.NOOP.value, dtype=jnp.int32),
+            actions,
+        )
+        positions_after, _, _, _ = _resolve_movement_single(
+            static,
+            countdown_state,
+            movement_actions,
+            move_key,
+            jax,
+            jnp,
+        )
+        moved_state = _replace_state(
+            countdown_state,
+            positions=positions_after,
+        )
+
+        invalid_release = is_pass & (~valid_release)
+        deadline_expired = (
+            (~valid_release)
+            & (~invalid_release)
+            & (countdown_state.inbound_steps_remaining <= 0)
+        )
+        shot_clock_expired = (
+            (~valid_release)
+            & (~invalid_release)
+            & (~deadline_expired)
+            & (countdown_state.shot_clock <= 0)
+        )
+        inbound_violation = (
+            invalid_release | deadline_expired | shot_clock_expired
+        )
+        violation_reason = jnp.where(
+            invalid_release,
+            jnp.asarray(TURNOVER_REASON_INBOUND_INVALID_PASS, dtype=jnp.int32),
+            jnp.where(
+                deadline_expired,
+                jnp.asarray(TURNOVER_REASON_INBOUND_TIMEOUT, dtype=jnp.int32),
+                jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
+            ),
+        )
+        event_receiver = jnp.where(is_pass, receiver, no_player)
+        base_output = _already_done(None)._replace(
+            state=moved_state,
+            done=jnp.asarray(False),
+            pass_attempt=is_pass.astype(jnp.int8),
+            pass_passer=jnp.where(is_pass, safe_inbounder, no_player),
+            pass_receiver=event_receiver,
+        )
+
+        def _completed_pass(_):
+            next_state = _replace_state(
+                moved_state,
+                ball_holder=safe_receiver,
+                game_phase=jnp.asarray(GAME_PHASE_LIVE, dtype=jnp.int8),
+                inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+                assist_active=jnp.asarray(1, dtype=jnp.int8),
+                assist_passer=safe_inbounder,
+                assist_recipient=safe_receiver,
+                assist_expires_at=moved_state.step_count
+                + static.assist_window.astype(jnp.int32),
+            )
+            pass_rewards = _offense_team_reward_vector_single(
+                static,
+                next_state,
+                static.pass_reward.astype(jnp.float32),
+                jnp,
+            )
+            return base_output._replace(
+                state=next_state,
+                rewards=pass_rewards,
+                completed_pass=jnp.asarray(1, dtype=jnp.int8),
+            )
+
+        def _intercepted_pass(_):
+            turnover_state = _replace_state(
+                moved_state,
+                ball_holder=interceptor,
+            )
+            final_state, game_done, possession_ended = _finalize_possession_single(
+                static,
+                turnover_state,
+                possession_ended=jnp.asarray(True),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_TURNOVER,
+                    dtype=jnp.int32,
+                ),
+                next_offense_team=1 - moved_state.offense_team,
+                requires_inbound=jnp.asarray(False),
+                jnp=jnp,
+            )
+            return base_output._replace(
+                state=final_state,
+                done=game_done,
+                turnover=jnp.asarray(1, dtype=jnp.int8),
+                terminal_episode_steps=jnp.where(
+                    game_done,
+                    final_state.step_count.astype(jnp.int32),
+                    zero_steps,
+                ),
+                turnover_player=safe_inbounder,
+                turnover_reason=jnp.asarray(
+                    TURNOVER_REASON_INTERCEPTED,
+                    dtype=jnp.int32,
+                ),
+                steal_player=interceptor,
+                possession_ended=possession_ended.astype(jnp.int8),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_TURNOVER,
+                    dtype=jnp.int32,
+                ),
+            )
+
+        def _inbound_violation(_):
+            final_state, game_done, possession_ended = _finalize_possession_single(
+                static,
+                moved_state,
+                possession_ended=jnp.asarray(True),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_INBOUND_VIOLATION,
+                    dtype=jnp.int32,
+                ),
+                next_offense_team=1 - moved_state.offense_team,
+                requires_inbound=jnp.asarray(True),
+                jnp=jnp,
+            )
+            return base_output._replace(
+                state=final_state,
+                done=game_done,
+                turnover=jnp.asarray(1, dtype=jnp.int8),
+                terminal_episode_steps=jnp.where(
+                    game_done,
+                    final_state.step_count.astype(jnp.int32),
+                    zero_steps,
+                ),
+                turnover_player=safe_inbounder,
+                turnover_reason=violation_reason,
+                possession_ended=possession_ended.astype(jnp.int8),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_INBOUND_VIOLATION,
+                    dtype=jnp.int32,
+                ),
+            )
+
+        return jax.lax.cond(
+            intercepted,
+            _intercepted_pass,
+            lambda __: jax.lax.cond(
+                completed,
+                _completed_pass,
+                lambda ___: jax.lax.cond(
+                    inbound_violation,
+                    _inbound_violation,
+                    lambda ____: base_output,
+                    operand=None,
+                ),
+                operand=None,
+            ),
+            operand=None,
+        )
 
     def _run_active(_):
         pressure_key, action_key, move_key = jax.random.split(key, 3)
@@ -3313,14 +3837,25 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 receiver_slot = jnp.argmax((active_offense_ids == receiver).astype(jnp.int32))
                 receiver_safe_slot = jnp.clip(receiver_slot, 0, pass_probs.shape[0] - 1)
                 receiver_is_teammate = jnp.any(active_offense_ids == receiver)
+                safe_receiver = jnp.clip(receiver, 0, actions.shape[0] - 1)
+                _, receiver_found = _lookup_cell_indices(
+                    static.cell_coords,
+                    shot_clock_state.positions[safe_receiver][None, :],
+                    jnp,
+                )
+                receiver_valid = (
+                    (receiver >= 0)
+                    & receiver_is_teammate
+                    & receiver_found[0]
+                )
                 steal_prob = jnp.where(
-                    (receiver >= 0) & receiver_is_teammate,
+                    receiver_valid,
                     pass_probs[receiver_safe_slot],
                     0.0,
                 )
-                theft = (receiver < 0) | (pass_draw < steal_prob)
+                theft = (~receiver_valid) | (pass_draw < steal_prob)
                 receiver_steal_contribs = jnp.where(
-                    (receiver >= 0) & receiver_is_teammate,
+                    receiver_valid,
                     steal_contribs[receiver_safe_slot],
                     jnp.zeros_like(steal_contribs[receiver_safe_slot]),
                 )
@@ -3349,7 +3884,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     shot_clock_state.step_count + static.assist_window.astype(jnp.int32),
                 )
                 turnover_reason = jnp.where(
-                    receiver < 0,
+                    ~receiver_valid,
                     jnp.asarray(TURNOVER_REASON_PASS_OUT_OF_BOUNDS, dtype=jnp.int32),
                     jnp.asarray(TURNOVER_REASON_INTERCEPTED, dtype=jnp.int32),
                 )
@@ -3368,7 +3903,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     ~theft,
                     turnover_reason,
                     receiver.astype(jnp.int32),
-                    jnp.where((receiver >= 0) & theft, steal_holder.astype(jnp.int32), no_player),
+                    jnp.where(receiver_valid & theft, steal_holder.astype(jnp.int32), no_player),
                 )
 
             (
@@ -3464,6 +3999,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=assist_passer,
                 assist_recipient=assist_recipient,
                 assist_expires_at=assist_expires_at,
+            )
+            final_state = _clear_reentered_inbound_metadata_single(
+                static,
+                final_state,
+                jnp,
             )
             shooter_is_team_a = static.role_encoding[shot_shooter] > 0.0
             scored_points = shot_value * shot_success.astype(jnp.float32)
@@ -4575,6 +5115,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         inbound_team=jnp.asarray(-1, dtype=jnp.int8),
         inbound_player=jnp.asarray(-1, dtype=jnp.int32),
         inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+        inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         # Initial spawning remains the legacy playable state; clearance is
         # only required after a possession switch once #21 enables it.
         clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
@@ -4612,6 +5153,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "inbound_deadline_steps",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

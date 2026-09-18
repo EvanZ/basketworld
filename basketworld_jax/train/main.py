@@ -229,6 +229,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "inbound_deadline_steps",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -340,6 +341,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_counterfactual_positioning_enabled",
     "enable_multi_possession",
     "multi_possession_limit",
+    "inbound_deadline_steps",
 )
 
 
@@ -905,6 +907,15 @@ def parse_args(argv=None):
         help="Completed possessions per multi-possession game.",
     )
     parser.add_argument(
+        "--inbound-deadline-steps",
+        type=int,
+        default=5,
+        help=(
+            "Simulation steps allowed to release a baseline inbound pass; "
+            "one current environment step represents one countdown second."
+        ),
+    )
+    parser.add_argument(
         "--rebound-table-model-dir",
         type=str,
         default="",
@@ -1224,6 +1235,8 @@ def validate_train_args(args) -> None:
     if bool(getattr(args, "enable_multi_possession", False)):
         if int(getattr(args, "multi_possession_limit", 25)) < 1:
             raise SystemExit("--multi-possession-limit must be >= 1.")
+        if int(getattr(args, "inbound_deadline_steps", 5)) < 1:
+            raise SystemExit("--inbound-deadline-steps must be >= 1.")
         if bool(getattr(args, "start_template_enabled", False)):
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
@@ -1424,6 +1437,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "rebound_counterfactual_positioning_enabled": False,
     "enable_multi_possession": False,
     "multi_possession_limit": 25,
+    "inbound_deadline_steps": 5,
 }
 
 

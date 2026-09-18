@@ -1,7 +1,8 @@
 # Half-court multi-possession implementation plan
 
 Status: issue #19's game-state and possession-lifecycle foundation is
-implemented and acceptance-tested. Baseline inbounding remains in issue #20.
+implemented and acceptance-tested. Issue #20's baseline inbounding is
+implemented and acceptance-tested, pending maintainer approval.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
 
@@ -36,14 +37,29 @@ This milestone introduces inbounding and clearance before a later full-court env
 ### Baseline inbounding
 
 - Made baskets and possession-ending violations use an actual baseline inbound.
-- Start from a designated location outside the baseline. Select the nearest player on the team receiving possession, with deterministic tie-breaking, and relocate that player.
+- Start from the axial coordinate one `MOVE_W` step behind the basket (currently
+  basket `[-4, 8]`, inbound `[-5, 8]`). Select the nearest player on the team
+  receiving possession, with stable player-ID tie-breaking, and relocate only
+  that player.
 - Give the inbounder a configurable five-second release deadline.
 - Start the shot clock as soon as the inbounder has the ball. Other players move while the countdown runs.
 - Reuse ordinary passing/interception behavior with an outside-baseline origin. Protect the held ball from direct steals while the inbounder is outside; a released pass can be intercepted.
 - Apply the deadline to pass release, not catch/flight completion.
-- After release, the inbounder can legally re-enter and become a normal receiver, including under the basket.
+- After release, the inbounder can legally re-enter and become a normal
+  receiver. In the current geometry the only adjacent inbounds cell is the
+  basket cell, so this entry remains legal even when ordinary dunk-position
+  movement is disabled. If it is occupied, entry is masked until it becomes
+  free; moving occupants do not vacate it early within the same simultaneous
+  movement step.
 - An inbound timeout or failed pass with no controller produces another dead-ball restart for the appropriate team. A defensive interception starts live possession for the actual interceptor.
-- Define baseline coordinates, blocked-entry handling, event ordering, and lane-counter treatment in the inbound issue before finalizing those mechanics.
+- On a new dead-ball restart before the prior inbounder has re-entered, restore
+  that player to the nearest free court cell before selecting the new inbounder;
+  this prevents repeated violations from stacking players outside the baseline.
+- Reset lane counters at the possession boundary, freeze them during the
+  inbound countdown, and resume them on the first live-ball step.
+- Resolve a valid released pass first on a deadline step, including its
+  completion or interception. Only when there is no valid release do invalid
+  target, inbound-deadline, and shot-clock violations apply, in that order.
 - Explicitly classify violations by the offending team. A defensive lane violation keeps its existing one-point award, completes the possession, and gives the same offense a baseline inbound; it is counted exactly once and never switches the ball to the violating defense.
 
 ### Clearance
@@ -100,7 +116,8 @@ The current rebound launch configurations collect two batches of 512 environment
 
 Introduce an opt-in JAX game mode in which teams retain their identities and alternate offense/defense across multiple possessions at the same hoop. A made basket, defensive rebound, or possession-ending turnover ends a possession; only the configured game limit ends an episode.
 
-The state contract also reserves inbound team/player/reason and clearance fields now. They are populated at a handoff but are not yet playable or enforced; #20 assigns the inbounder and #21 enforces clearance.
+The state contract reserves inbound team/player/reason and clearance fields.
+#20 assigns and runs the inbounder; #21 completes live clearance detection.
 
 Dependencies: none.
 
@@ -150,9 +167,7 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 ## Remaining decisions
 
-1. Exact outside-baseline coordinate, legal entry mapping, blocked-entry behavior, and lane-counter treatment during inbounding.
-2. Same-step priority among legal last-moment release, interception, shot-clock expiration, and game termination.
-3. Potential coefficient scheduling across update boundaries.
+1. Potential coefficient scheduling across update boundaries.
 
 Resolve these in the owning issues and update this document before shipping the corresponding behavior.
 

@@ -18,6 +18,8 @@ from basketworld_jax.env.minimal import (
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
     TURNOVER_REASON_DEFENDER_PRESSURE,
+    TURNOVER_REASON_INBOUND_INVALID_PASS,
+    TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
@@ -1536,6 +1538,8 @@ def _turnover_reason_label(code: int) -> str:
         int(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS): "move_out_of_bounds",
         int(TURNOVER_REASON_SHOT_CLOCK): "shot_clock_violation",
         int(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS): "offensive_three_seconds",
+        int(TURNOVER_REASON_INBOUND_TIMEOUT): "inbound_timeout",
+        int(TURNOVER_REASON_INBOUND_INVALID_PASS): "inbound_invalid_pass",
     }
     return labels.get(int(code), "unknown")
 
