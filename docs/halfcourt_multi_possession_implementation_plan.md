@@ -158,6 +158,21 @@ Train a policy from scratch on fixed rollout chunks of continuous games. Updates
 
 Dependencies: [#22](https://github.com/EvanZ/basketworld/issues/22).
 
+Implementation notes:
+
+- every active rollout step is PPO-eligible even when its game continues beyond
+  the update boundary; GAE bootstraps across rollout cuts and stops only at a
+  true game terminal;
+- the two fixed-team cohorts share one actor-critic update while observations,
+  intent context, selector eligibility, and diagnostics follow each team's
+  current offense/defense role;
+- historical opponent identity and deterministic/stochastic action mode are
+  pinned for each game row and change only after a real game reset;
+- checkpoints preserve continuous environment state, the opponent candidate
+  pool, per-row opponent assignments, action modes, and opponent RNG state;
+- `scripts/run_jax_5v5_halfcourt_multi_possession.sh` is the fresh-training
+  launcher for the agreed 25-possession, 1,024-environment configuration.
+
 ### 6. [evaluation, UI, and end-to-end validation (#24)](https://github.com/EvanZ/basketworld/issues/24)
 
 Users can run and inspect full half-court games, compare policies fairly, and distinguish correct mechanics from whether clearing has been learned.
@@ -180,7 +195,7 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 ## Remaining decisions
 
-No unresolved decisions remain for issues #19 through #22.
+No unresolved decisions remain for issues #19 through #23.
 
 ## Deferred
 

@@ -82,6 +82,7 @@ def build_checkpoint_payload(
     last_metrics: dict[str, Any] | None,
     selector_opt_state=None,
     opponent_info: dict[str, Any] | None = None,
+    opponent_pool_state: dict[str, Any] | None = None,
     env_config: dict[str, Any] | None = None,
     intent_discriminator_state: dict[str, Any] | None = None,
     play_name_metadata: dict[str, Any] | None = None,
@@ -105,6 +106,22 @@ def build_checkpoint_payload(
         "last_metrics": None if last_metrics is None else dict(last_metrics),
         "opponent_info": None if opponent_info is None else dict(opponent_info),
     }
+    if opponent_pool_state is not None:
+        pool_state = dict(opponent_pool_state)
+        payload["opponent_pool_state"] = {
+            "candidate_infos": list(pool_state.get("candidate_infos", [])),
+            "rng_state": dict(pool_state.get("rng_state", {})),
+            "enabled": bool(pool_state.get("enabled", False)),
+        }
+        payload["state"]["opponent_candidate_params"] = _tree_to_numpy(
+            pool_state.get("candidate_params")
+        )
+        payload["state"]["opponent_assignments"] = _tree_to_numpy(
+            pool_state.get("assignments", {})
+        )
+        payload["state"]["opponent_deterministic_modes"] = _tree_to_numpy(
+            pool_state.get("deterministic_modes", {})
+        )
     if selector_opt_state is not None:
         payload["state"]["selector_opt_state"] = _tree_to_numpy(selector_opt_state)
     if intent_discriminator_state is not None:
@@ -132,6 +149,10 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "last_metrics": _to_jsonable(payload["last_metrics"]),
         "opponent_info": _to_jsonable(payload.get("opponent_info")),
     }
+    if payload.get("opponent_pool_state") is not None:
+        metadata["opponent_pool_state"] = _to_jsonable(
+            payload["opponent_pool_state"]
+        )
     if payload.get("env_config") is not None:
         metadata["env_config"] = _to_jsonable(dict(payload["env_config"]))
     if payload.get("intent_discriminator_state") is not None:
@@ -182,6 +203,18 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         "last_metrics": _from_jsonable(metadata["last_metrics"]),
         "opponent_info": _from_jsonable(metadata.get("opponent_info")),
     }
+    if "opponent_pool_state" in metadata:
+        pool_meta = dict(
+            _from_jsonable(metadata.get("opponent_pool_state")) or {}
+        )
+        payload["opponent_pool_state"] = {
+            **pool_meta,
+            "candidate_params": state.get("opponent_candidate_params"),
+            "assignments": state.get("opponent_assignments", {}),
+            "deterministic_modes": state.get(
+                "opponent_deterministic_modes", {}
+            ),
+        }
     if "env_config" in metadata:
         payload["env_config"] = _from_jsonable(metadata["env_config"])
     if "intent_discriminator_state" in metadata:

@@ -30,9 +30,11 @@ class TrajectoryBatch(NamedTuple):
     flat_obs: Any
     policy_intent_index: Any
     policy_intent_gate: Any
+    training_role: Any
     action_mask: Any
     actions: Any
     full_actions: Any
+    opponent_assignment: Any
     opponent_deterministic_episode: Any
     selected_log_probs: Any
     values: Any
@@ -127,6 +129,8 @@ class RolloutOutput(NamedTuple):
     final_selector_values: Any
     final_flat_obs: Any
     final_action_mask: Any
+    final_opponent_assignment: Any = None
+    final_opponent_deterministic_episode: Any = None
     rebound_diagnostic_totals: Any = None
     rebound_diagnostic_argmax_totals: Any = None
     rebound_diagnostic_sampled_totals: Any = None

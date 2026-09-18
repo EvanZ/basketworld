@@ -1271,6 +1271,14 @@ def validate_train_args(args) -> None:
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
             )
+        if bool(getattr(args, "single_episode_rollouts", False)):
+            raise SystemExit(
+                "--single-episode-rollouts is incompatible with continuous multi-possession training."
+            )
+        if bool(getattr(args, "ppo_completed_episodes_only", False)):
+            raise SystemExit(
+                "--ppo-completed-episodes-only is incompatible with continuous multi-possession training."
+            )
         reward_mode = str(
             getattr(args, "multi_possession_reward_mode", "win_loss") or "win_loss"
         )
@@ -1945,6 +1953,7 @@ def _save_training_checkpoint(
     eval_trajectories: list[dict[str, Any]],
     last_metrics: dict[str, Any] | None,
     opponent_info: dict[str, Any] | None,
+    opponent_pool_state: dict[str, Any] | None = None,
     selector_opt_state=None,
     intent_discriminator_state: dict[str, Any] | None = None,
     play_name_metadata: dict[str, Any] | None = None,
@@ -1971,6 +1980,7 @@ def _save_training_checkpoint(
         eval_trajectories=eval_trajectories,
         last_metrics=last_metrics,
         opponent_info=opponent_info,
+        opponent_pool_state=opponent_pool_state,
         intent_discriminator_state=intent_discriminator_state,
         play_name_metadata=play_name_metadata,
     )
@@ -2395,6 +2405,84 @@ def _select_opponent_from_pool(
     if chosen is None:
         return None, None
     return chosen["params"], dict(chosen["info"])
+
+
+def _opponent_candidate_probabilities(
+    candidates: list[dict[str, Any]],
+    *,
+    args,
+) -> np.ndarray:
+    """Return the configured sampling distribution over stable candidate ids."""
+    count = len(candidates)
+    if count <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    recent_count = max(1, min(int(getattr(args, "opponent_pool_size", 10)), count))
+    recent_start = count - recent_count
+    beta = float(np.clip(float(getattr(args, "opponent_pool_beta", 0.7)), 0.0, 1.0))
+    if recent_count == 1 or beta >= 1.0:
+        recent_probs = np.zeros((recent_count,), dtype=np.float64)
+        recent_probs[-1] = 1.0
+    else:
+        weights = np.asarray(
+            [
+                (1.0 - beta) * (beta ** (recent_count - idx))
+                for idx in range(1, recent_count + 1)
+            ],
+            dtype=np.float64,
+        )
+        recent_probs = weights / max(float(weights.sum()), 1.0e-12)
+    probs = np.zeros((count,), dtype=np.float64)
+    probs[recent_start:] = recent_probs
+    exploration = float(
+        np.clip(float(getattr(args, "opponent_pool_exploration", 0.0)), 0.0, 1.0)
+    )
+    if exploration > 0.0 and recent_start > 0:
+        probs = ((1.0 - exploration) * probs) + (
+            exploration * np.full((count,), 1.0 / float(count), dtype=np.float64)
+        )
+    return (probs / max(float(probs.sum()), 1.0e-12)).astype(np.float32)
+
+
+def _stack_opponent_candidate_params(candidates, *, jax, jnp):
+    if not candidates:
+        return None
+    return jax.tree_util.tree_map(
+        lambda *leaves: jnp.stack(leaves, axis=0),
+        *[candidate["params"] for candidate in candidates],
+    )
+
+
+def _unstack_opponent_candidate_params(stacked_params, count: int, *, jax):
+    if stacked_params is None or int(count) <= 0:
+        return []
+    return [
+        jax.tree_util.tree_map(lambda leaf, idx=idx: leaf[idx], stacked_params)
+        for idx in range(int(count))
+    ]
+
+
+def _build_opponent_pool_checkpoint_state(
+    candidates,
+    assignments,
+    deterministic_modes,
+    *,
+    opponent_rng,
+    enabled: bool,
+    jax,
+    jnp,
+):
+    return {
+        "enabled": bool(enabled),
+        "candidate_infos": [dict(candidate["info"]) for candidate in candidates],
+        "candidate_params": _stack_opponent_candidate_params(
+            candidates,
+            jax=jax,
+            jnp=jnp,
+        ),
+        "assignments": dict(assignments),
+        "deterministic_modes": dict(deterministic_modes),
+        "rng_state": dict(opponent_rng.bit_generator.state),
+    }
 
 
 def _effective_opponent_group_count(args, *, candidate_count: int) -> int:
@@ -3454,6 +3542,8 @@ def _summarize_role_rollout_metrics(
     defense_score_delta = np.asarray(rollout.trajectory.defense_score_delta, dtype=np.float32)
     active_mask = np.asarray(rollout.trajectory.active_mask, dtype=np.float32)
     active_bool = active_mask > 0.5
+    training_role = np.asarray(rollout.trajectory.training_role, dtype=np.float32)
+    episode_start = np.asarray(rollout.trajectory.episode_start, dtype=np.float32)
     active_count = float(active_mask.sum())
     total_count = int(active_mask.size)
 
@@ -3516,6 +3606,14 @@ def _summarize_role_rollout_metrics(
         f"{role}_done_rate": _active_mean(dones),
         f"{role}_active_step_count": int(active_count),
         f"{role}_active_step_fraction": _safe_metric_ratio(active_count, total_count),
+        f"{role}_learner_offense_step_fraction": _active_mean(training_role > 0.0),
+        f"{role}_learner_defense_step_fraction": _active_mean(training_role < 0.0),
+        f"{role}_starting_offense_count": _active_sum(
+            (episode_start > 0.5) & (training_role > 0.0)
+        ),
+        f"{role}_starting_defense_count": _active_sum(
+            (episode_start > 0.5) & (training_role < 0.0)
+        ),
         f"{role}_completed_episodes": int(completed_episodes),
         f"{role}_completed_episode_count": int(completed_episodes),
         f"{role}_completed_active_step_count": int(completed_episode_steps),
@@ -3948,6 +4046,36 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             opponent_params = None
 
+    pinned_opponent_pool_enabled = bool(
+        getattr(args, "enable_multi_possession", False)
+    )
+    initial_assignment = 0 if opponent_candidates else -1
+    opponent_assignments = {
+        role: jnp.full(
+            (int(args.kernel_batch_size),),
+            initial_assignment,
+            dtype=jnp.int32,
+        )
+        for role in TRAINING_ROLES
+    }
+    initial_mode_prob = float(
+        getattr(args, "opponent_deterministic_episode_prob", 0.0)
+    )
+    opponent_deterministic_modes = {
+        role: jnp.asarray(
+            opponent_rng.random(int(args.kernel_batch_size)) < initial_mode_prob,
+            dtype=jnp.bool_,
+        )
+        for role in TRAINING_ROLES
+    }
+    if pinned_opponent_pool_enabled and opponent_candidates:
+        opponent_params = None
+        grouped_opponent_params = None
+        active_opponent_info = {
+            "source": "pinned_pool",
+            "candidate_count": len(opponent_candidates),
+        }
+
     initial_params = init_actor_critic_params(
         jax,
         jnp,
@@ -4057,6 +4185,47 @@ def run_training_loop(args) -> dict[str, Any]:
             base_key = jax.device_put(jax.random.fold_in(base_key, completed_updates))
         else:
             base_key = jax.device_put(checkpoint_payload["base_key"])
+        restored_opponent_pool = checkpoint_payload.get("opponent_pool_state")
+        if (
+            pinned_opponent_pool_enabled
+            and not reset_resume_env_state
+            and restored_opponent_pool is not None
+        ):
+            restored_infos = list(
+                restored_opponent_pool.get("candidate_infos", []) or []
+            )
+            restored_params = _unstack_opponent_candidate_params(
+                restored_opponent_pool.get("candidate_params"),
+                len(restored_infos),
+                jax=jax,
+            )
+            opponent_candidates = [
+                {"params": jax.device_put(candidate_params), "info": dict(info)}
+                for candidate_params, info in zip(
+                    restored_params,
+                    restored_infos,
+                    strict=True,
+                )
+            ]
+            restored_assignments = dict(
+                restored_opponent_pool.get("assignments", {}) or {}
+            )
+            restored_modes = dict(
+                restored_opponent_pool.get("deterministic_modes", {}) or {}
+            )
+            opponent_assignments = {
+                role: jax.device_put(restored_assignments[role])
+                for role in TRAINING_ROLES
+            }
+            opponent_deterministic_modes = {
+                role: jax.device_put(restored_modes[role])
+                for role in TRAINING_ROLES
+            }
+            restored_rng_state = restored_opponent_pool.get("rng_state")
+            if restored_rng_state:
+                opponent_rng.bit_generator.state = dict(restored_rng_state)
+            opponent_params = None
+            grouped_opponent_params = None
         train_history = []
         deploy_eval_history = []
         eval_trajectories = list(checkpoint_payload.get("eval_trajectories", []))
@@ -4093,7 +4262,14 @@ def run_training_loop(args) -> dict[str, Any]:
                 info=dict(candidate["info"]),
             )
         if continuation_candidates:
-            if grouped_opponent_sampling_enabled:
+            if pinned_opponent_pool_enabled:
+                opponent_params = None
+                grouped_opponent_params = None
+                active_opponent_info = {
+                    "source": "pinned_pool",
+                    "candidate_count": len(opponent_candidates),
+                }
+            elif grouped_opponent_sampling_enabled:
                 grouped_opponent_params, active_opponent_info = _select_grouped_opponents_from_pool(
                     opponent_candidates,
                     args=args,
@@ -4172,6 +4348,26 @@ def run_training_loop(args) -> dict[str, Any]:
                 args,
                 update_idx,
             )
+            pinned_candidate_params = (
+                _stack_opponent_candidate_params(
+                    opponent_candidates,
+                    jax=jax,
+                    jnp=jnp,
+                )
+                if pinned_opponent_pool_enabled and opponent_candidates
+                else None
+            )
+            pinned_candidate_probs = (
+                jnp.asarray(
+                    _opponent_candidate_probabilities(
+                        opponent_candidates,
+                        args=args,
+                    ),
+                    dtype=jnp.float32,
+                )
+                if pinned_candidate_params is not None
+                else None
+            )
             selector_multiselect_enabled = bool(
                 getattr(args, "intent_selector_multiselect_enabled", False)
             )
@@ -4180,7 +4376,25 @@ def run_training_loop(args) -> dict[str, Any]:
             rollout_start_ns = perf_counter_ns()
             role_rollouts = {}
             for role, rollout_key in zip(TRAINING_ROLES, rollout_keys, strict=True):
-                if grouped_opponent_params is not None:
+                if pinned_candidate_params is not None:
+                    role_rollouts[role] = frozen_rollout_runner(
+                        active_statics[role],
+                        current_states[role],
+                        params,
+                        pinned_candidate_params,
+                        opponent_assignments[role],
+                        opponent_deterministic_modes[role],
+                        pinned_candidate_probs,
+                        rollout_key,
+                        int(args.rollout_horizon),
+                        selector_alpha,
+                        selector_eps,
+                        selector_multiselect_enabled,
+                        selector_min_play_steps,
+                        single_episode_rollout,
+                        float(opponent_deterministic_episode_prob),
+                    )
+                elif grouped_opponent_params is not None:
                     role_rollouts[role] = grouped_rollout_runner(
                         active_statics[role],
                         current_states[role],
@@ -4210,11 +4424,18 @@ def run_training_loop(args) -> dict[str, Any]:
                         single_episode_rollout,
                     )
                 else:
+                    single_candidate_params = jax.tree_util.tree_map(
+                        lambda leaf: leaf[None, ...],
+                        opponent_params,
+                    )
                     role_rollouts[role] = frozen_rollout_runner(
                         active_statics[role],
                         current_states[role],
                         params,
-                        opponent_params,
+                        single_candidate_params,
+                        jnp.zeros_like(opponent_assignments[role]),
+                        opponent_deterministic_modes[role],
+                        jnp.ones((1,), dtype=jnp.float32),
                         rollout_key,
                         int(args.rollout_horizon),
                         selector_alpha,
@@ -4225,6 +4446,16 @@ def run_training_loop(args) -> dict[str, Any]:
                         float(opponent_deterministic_episode_prob),
                     )
             block_until_ready_tree(role_rollouts)
+            if pinned_candidate_params is not None:
+                opponent_assignments = {
+                    role: role_rollouts[role].final_opponent_assignment
+                    for role in TRAINING_ROLES
+                }
+            if pinned_candidate_params is not None or opponent_params is not None:
+                opponent_deterministic_modes = {
+                    role: role_rollouts[role].final_opponent_deterministic_episode
+                    for role in TRAINING_ROLES
+                }
             rollout_elapsed_ns = perf_counter_ns() - rollout_start_ns
             role_rollouts = {
                 role: _apply_task_reward_scale_to_rollout(
@@ -4245,19 +4476,26 @@ def run_training_loop(args) -> dict[str, Any]:
             }
 
             if bool(getattr(args, "intent_selector_enabled", False)):
-                selector_batch = build_selector_batch(
-                    role_rollouts["offense"],
-                    trainer_config,
-                    jax,
-                    jnp,
-                )
-                pending_selector_batches.append(
-                    limit_selector_batch_samples(
-                        selector_batch,
+                for role in TRAINING_ROLES:
+                    selector_batch = build_selector_batch(
+                        role_rollouts[role],
+                        trainer_config,
+                        jax,
                         jnp,
-                        max_samples=int(getattr(args, "intent_selector_max_samples_per_update", 0)),
                     )
-                )
+                    pending_selector_batches.append(
+                        limit_selector_batch_samples(
+                            selector_batch,
+                            jnp,
+                            max_samples=int(
+                                getattr(
+                                    args,
+                                    "intent_selector_max_samples_per_update",
+                                    0,
+                                )
+                            ),
+                        )
+                    )
 
             intent_disc_metrics: dict[str, Any] = {}
             latest_intent_sample_payload = None
@@ -4273,14 +4511,18 @@ def run_training_loop(args) -> dict[str, Any]:
                     "intent_disc_skipped_warmup": 1.0 if float(intent_beta) <= 0.0 else 0.0,
                 }
                 if float(intent_beta) > 0.0:
+                    intent_rollout = concatenate_rollout_outputs(
+                        [role_rollouts[role] for role in TRAINING_ROLES],
+                        jnp,
+                    )
                     intent_training_mask, _, _ = build_trajectory_training_masks(
-                        role_rollouts["offense"].trajectory,
+                        intent_rollout.trajectory,
                         trainer_config,
                         jax,
                         jnp,
                     )
                     intent_features, intent_labels, intent_active_mask = build_intent_step_features_from_rollout(
-                        role_rollouts["offense"],
+                        intent_rollout,
                         intent_disc_spec,
                         jnp,
                         training_mask=intent_training_mask,
@@ -4309,15 +4551,24 @@ def run_training_loop(args) -> dict[str, Any]:
                         clip=float(intent_disc_spec.bonus_clip),
                         jnp=jnp,
                     )
-                    role_rollouts["offense"] = apply_intent_bonus_to_rollout(
-                        role_rollouts["offense"],
-                        intent_bonus,
-                        jnp,
-                    )
-                    role_reward_components["offense"] = {
-                        **role_reward_components["offense"],
-                        "intent_bonus": intent_bonus.astype(jnp.float32),
-                    }
+                    batch_offset = 0
+                    for role in TRAINING_ROLES:
+                        role_batch_size = int(
+                            role_rollouts[role].trajectory.rewards.shape[1]
+                        )
+                        role_bonus = intent_bonus[
+                            :, batch_offset : batch_offset + role_batch_size
+                        ]
+                        role_rollouts[role] = apply_intent_bonus_to_rollout(
+                            role_rollouts[role],
+                            role_bonus,
+                            jnp,
+                        )
+                        role_reward_components[role] = {
+                            **role_reward_components[role],
+                            "intent_bonus": role_bonus.astype(jnp.float32),
+                        }
+                        batch_offset += role_batch_size
                     norm_bonus_np = np.asarray(jax.device_get(intent_bonus), dtype=np.float32)
                     active_norm_bonus = norm_bonus_np[active_mask_np]
                     intent_disc_metrics.update(
@@ -4353,7 +4604,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             labels=intent_labels,
                             active_mask=intent_active_mask,
                             bonus=intent_bonus,
-                            rollout=role_rollouts["offense"],
+                            rollout=intent_rollout,
                             spec=intent_disc_spec,
                             jax=jax,
                             jnp=jnp,
@@ -4500,7 +4751,7 @@ def run_training_loop(args) -> dict[str, Any]:
             if bool(getattr(args, "intent_selector_enabled", False)):
                 last_metrics.update(
                     summarize_selector_metrics(
-                        role_rollouts["offense"],
+                        rollout_out,
                         num_intents=int(args.num_intents),
                         alpha=selector_alpha,
                         eps=selector_eps,
@@ -4548,6 +4799,27 @@ def run_training_loop(args) -> dict[str, Any]:
                 last_metrics["opponent_source"] = "legal_random"
                 last_metrics["opponent_group_count"] = 0
                 last_metrics["opponent_unique_update_count"] = 0
+            if pinned_opponent_pool_enabled:
+                assignment_values = np.concatenate(
+                    [
+                        np.asarray(
+                            jax.device_get(opponent_assignments[role]),
+                            dtype=np.int32,
+                        )
+                        for role in TRAINING_ROLES
+                    ]
+                )
+                assigned = assignment_values[assignment_values >= 0]
+                last_metrics["opponent_pool_candidate_count"] = int(
+                    len(opponent_candidates)
+                )
+                last_metrics["opponent_assigned_game_count"] = int(assigned.size)
+                last_metrics["opponent_legal_random_game_count"] = int(
+                    np.sum(assignment_values < 0)
+                )
+                last_metrics["opponent_active_candidate_count"] = int(
+                    np.unique(assigned).size
+                )
             loop_elapsed_ns = perf_counter_ns() - loop_start_ns
             loop_elapsed_sec = max(loop_elapsed_ns / 1e9, 1e-12)
             loop_steps = int(args.kernel_batch_size) * int(args.rollout_horizon) * len(TRAINING_ROLES)
@@ -4819,6 +5091,29 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             if should_checkpoint:
                 saved_candidate_info = None
+                if opponent_pool_enabled and pinned_opponent_pool_enabled:
+                    _add_opponent_candidate(
+                        opponent_candidates,
+                        params=params,
+                        info={
+                            "source": "self_checkpoint",
+                            "update_index": int(update_idx),
+                            "candidate_kind": "self_checkpoint",
+                        },
+                    )
+                opponent_pool_checkpoint_state = (
+                    _build_opponent_pool_checkpoint_state(
+                        opponent_candidates,
+                        opponent_assignments,
+                        opponent_deterministic_modes,
+                        opponent_rng=opponent_rng,
+                        enabled=pinned_opponent_pool_enabled,
+                        jax=jax,
+                        jnp=jnp,
+                    )
+                    if pinned_opponent_pool_enabled
+                    else None
+                )
                 intent_discriminator_state = None
                 if intent_disc_enabled and intent_disc_spec is not None:
                     intent_discriminator_state = {
@@ -4844,6 +5139,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         eval_trajectories=eval_trajectories,
                         last_metrics=last_metrics,
                         opponent_info=active_opponent_info,
+                        opponent_pool_state=opponent_pool_checkpoint_state,
                         intent_discriminator_state=intent_discriminator_state,
                         play_name_metadata=play_name_metadata,
                     )
@@ -4898,6 +5194,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             eval_trajectories=eval_trajectories,
                             last_metrics=last_metrics,
                             opponent_info=active_opponent_info,
+                            opponent_pool_state=opponent_pool_checkpoint_state,
                             intent_discriminator_state=intent_discriminator_state,
                             play_name_metadata=play_name_metadata,
                         )
@@ -4921,15 +5218,27 @@ def run_training_loop(args) -> dict[str, Any]:
                         }
                     latest_checkpoint_path = None
                 if opponent_pool_enabled and saved_candidate_info is not None:
-                    _add_opponent_candidate(
-                        opponent_candidates,
-                        params=params,
-                        info={
+                    if pinned_opponent_pool_enabled:
+                        opponent_candidates[-1]["info"] = {
                             **saved_candidate_info,
                             "candidate_kind": "self_checkpoint",
-                        },
-                    )
-                    if grouped_opponent_sampling_enabled:
+                        }
+                        opponent_params = None
+                        grouped_opponent_params = None
+                        active_opponent_info = {
+                            "source": "pinned_pool",
+                            "candidate_count": len(opponent_candidates),
+                        }
+                    else:
+                        _add_opponent_candidate(
+                            opponent_candidates,
+                            params=params,
+                            info={
+                                **saved_candidate_info,
+                                "candidate_kind": "self_checkpoint",
+                            },
+                        )
+                    if not pinned_opponent_pool_enabled and grouped_opponent_sampling_enabled:
                         grouped_opponent_params, active_opponent_info = _select_grouped_opponents_from_pool(
                             opponent_candidates,
                             args=args,
@@ -4938,7 +5247,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             jnp=jnp,
                         )
                         opponent_params = None
-                    else:
+                    elif not pinned_opponent_pool_enabled:
                         opponent_params, active_opponent_info = _select_opponent_from_pool(
                             opponent_candidates,
                             args=args,

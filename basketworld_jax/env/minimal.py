@@ -1455,6 +1455,28 @@ def _active_role_encoding_batch(static: KernelStatic, state: KernelState, jnp):
     return jnp.where(team_a_mask == team_a_is_offense, 1.0, -1.0).astype(jnp.float32)
 
 
+def build_training_role_flags_batch(static: KernelStatic, state: KernelState, jnp):
+    """Return each fixed learner team's current offense/defense role per row."""
+    training_team_is_a = static.training_role_flag > 0.0
+    team_a_is_offense = state.offense_team == TEAM_A
+    return jnp.where(
+        training_team_is_a == team_a_is_offense,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(-1.0, dtype=jnp.float32),
+    )
+
+
+def build_opponent_role_flags_batch(static: KernelStatic, state: KernelState, jnp):
+    return -build_training_role_flags_batch(static, state, jnp)
+
+
+def _broadcast_role_flag_batch(role_flag_value, batch_size: int, jnp):
+    role_flag = jnp.asarray(role_flag_value, dtype=jnp.float32)
+    if role_flag.ndim > 0:
+        role_flag = role_flag.reshape((batch_size,))
+    return jnp.broadcast_to(role_flag, (batch_size,))
+
+
 def _advance_role_intent_single(static: KernelStatic, enabled, index, active, age, remaining, jnp):
     enabled_bool = enabled.astype(jnp.bool_)
     active_bool = active.astype(jnp.bool_)
@@ -2635,7 +2657,7 @@ def build_multi_possession_observation_features_batch(
 ) -> tuple[Any, Any]:
     """Return versioned per-player and global game-context features."""
     batch_size, n_players, _ = state.positions.shape
-    role_flag = jnp.full((batch_size,), role_flag_value, dtype=jnp.float32)
+    role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)
     viewer_is_offense = role_flag > 0.0
     viewer_is_team_a = jnp.where(
         viewer_is_offense,
@@ -2707,7 +2729,7 @@ def build_flat_observation_batch_with_role_flag(
     multi_possession_features: bool = False,
 ):
     batch_size = state.positions.shape[0]
-    role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
+    role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     parts = [
         build_observation_vector_batch(
             static,
@@ -2746,7 +2768,7 @@ def build_flat_observation_batch(
     return build_flat_observation_batch_with_role_flag(
         static,
         state,
-        static.training_role_flag,
+        build_training_role_flags_batch(static, state, jnp),
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
@@ -2916,7 +2938,7 @@ def build_token_observation_components_batch(
         )
         players = jnp.concatenate([players, multi_players], axis=-1)
         globals_vec = jnp.concatenate([globals_vec, multi_globals], axis=-1)
-    role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
+    role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     return players, globals_vec, role_flag
 
 
@@ -2961,7 +2983,7 @@ def build_token_observation_batch(
     return build_token_observation_batch_with_role_flag(
         static,
         state,
-        static.training_role_flag,
+        build_training_role_flags_batch(static, state, jnp),
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
@@ -3014,7 +3036,7 @@ def build_policy_observation_batch(
     return build_policy_observation_batch_with_role_flag(
         static,
         state,
-        static.training_role_flag,
+        build_training_role_flags_batch(static, state, jnp),
         jnp,
         model_type=model_type,
         rebound_win_prob_features=rebound_win_prob_features,
@@ -3031,7 +3053,7 @@ def build_policy_intent_context_batch_with_role_flag(
 ) -> dict[str, Any]:
     """Return the runtime intent context consumed by intent-conditioned policies."""
     batch_size = state.positions.shape[0]
-    role_flag = jnp.full((batch_size,), role_flag_value, dtype=jnp.float32)
+    role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)
     is_offense = role_flag > 0.0
     offense_gate = (
         static.enable_intent_learning.astype(jnp.bool_)
@@ -3057,7 +3079,7 @@ def build_policy_intent_context_batch(
     return build_policy_intent_context_batch_with_role_flag(
         static,
         state,
-        static.training_role_flag,
+        build_training_role_flags_batch(static, state, jnp),
         jnp,
     )
 

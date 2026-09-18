@@ -39,6 +39,20 @@ scheduled shaping, grouped opponents, and MLflow, use
 reference. Read the flags before running it: it is a long research job, not a
 quickstart.
 
+### Continuous half-court training
+
+`scripts/run_jax_5v5_halfcourt_multi_possession.sh` starts the agreed fresh
+25-possession half-court experiment. It intentionally does not load a
+pretrained policy, continuation checkpoint, or starting templates. The two
+fixed-team cohorts feed one shared PPO update, and unfinished games continue
+across rollout and optimizer-update boundaries.
+
+In this mode, rollout cuts bootstrap the value function; only true game endings
+cut the bootstrap. Historical opponents and their sampled action mode are
+pinned per game row until that game ends. Do not combine multi-possession mode
+with `--single-episode-rollouts` or `--ppo-completed-episodes-only`; validation
+rejects both because they would discard or respawn unfinished games.
+
 ## MLflow
 
 `--log-mlflow` starts a run through the repository's MLflow configuration. The
@@ -74,6 +88,8 @@ The payload includes:
 - PRNG key;
 - recent evaluation traces and metrics;
 - opponent information;
+- optional opponent candidate parameters, per-row assignments and action modes,
+  and opponent-pool RNG state for continuous games;
 - optional offense/defense discriminator state;
 - optional play-name metadata.
 

@@ -12,10 +12,12 @@ from basketworld_jax.env import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_aggregated_reward_batch,
+    build_opponent_role_flags_batch,
     build_policy_intent_context_batch,
     build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch,
     build_policy_observation_batch_with_role_flag,
+    build_training_role_flags_batch,
     replace_done_states,
     reset_batch_minimal,
     resolve_team_player_ids,
@@ -171,6 +173,14 @@ def concatenate_rollout_outputs(rollouts: Sequence[RolloutOutput], jnp) -> Rollo
         ),
         final_action_mask=jnp.concatenate(
             [rollout.final_action_mask for rollout in rollouts],
+            axis=0,
+        ),
+        final_opponent_assignment=jnp.concatenate(
+            [rollout.final_opponent_assignment for rollout in rollouts],
+            axis=0,
+        ),
+        final_opponent_deterministic_episode=jnp.concatenate(
+            [rollout.final_opponent_deterministic_episode for rollout in rollouts],
             axis=0,
         ),
         rebound_diagnostic_totals=rebound_diagnostic_totals,
@@ -755,11 +765,7 @@ def _maybe_apply_selector_segment_start(
 
     alpha = jnp.clip(jnp.asarray(selector_alpha, dtype=jnp.float32), 0.0, 1.0)
     multiselect_enabled = jnp.asarray(selector_multiselect_enabled).astype(jnp.bool_)
-    should_run = (
-        static.enable_intent_learning.astype(jnp.bool_)
-        & (static.training_role_flag > 0.0)
-        & (alpha > 0.0)
-    )
+    should_run = static.enable_intent_learning.astype(jnp.bool_) & (alpha > 0.0)
 
     def _disabled(_):
         return state, metrics
@@ -792,7 +798,10 @@ def _maybe_apply_selector_segment_start(
         )[:, 0]
         entropy = -jnp.sum(probs * log_probs, axis=-1)
         max_prob = jnp.max(probs, axis=-1)
-        alpha_used = jax.random.uniform(alpha_key, shape=(batch_size,)) < alpha
+        training_is_offense = build_training_role_flags_batch(static, state, jnp) > 0.0
+        alpha_used = (
+            jax.random.uniform(alpha_key, shape=(batch_size,)) < alpha
+        ) & training_is_offense
         (
             episode_start,
             commitment_timeout,
@@ -855,10 +864,7 @@ def _maybe_apply_deterministic_selector_segment_start(
     if not bool(spec.intent_selector_enabled):
         return state, metrics
 
-    should_run = (
-        static.enable_intent_learning.astype(jnp.bool_)
-        & (static.training_role_flag > 0.0)
-    )
+    should_run = static.enable_intent_learning.astype(jnp.bool_)
 
     def _disabled(_):
         return state, metrics
@@ -886,7 +892,9 @@ def _maybe_apply_deterministic_selector_segment_start(
             )
         )
         entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1.0e-8)), axis=-1)
-        active_episode = ~state.episode_ended.astype(jnp.bool_)
+        active_episode = (
+            ~state.episode_ended.astype(jnp.bool_)
+        ) & (build_training_role_flags_batch(static, state, jnp) > 0.0)
         (
             episode_start,
             commitment_timeout,
@@ -976,6 +984,25 @@ def _mask_step_metrics(metrics: dict[str, Any], active_mask, jnp) -> dict[str, A
         key: jnp.where(active_mask, value, jnp.zeros_like(value))
         for key, value in metrics.items()
     }
+
+
+def update_pinned_opponent_episode_state(
+    current_assignment,
+    current_deterministic_mode,
+    reset_done,
+    sampled_assignment,
+    sampled_deterministic_mode,
+    jnp,
+):
+    """Change opponent identity/action mode only at a real game reset."""
+    return (
+        jnp.where(reset_done, sampled_assignment, current_assignment),
+        jnp.where(
+            reset_done,
+            sampled_deterministic_mode,
+            current_deterministic_mode,
+        ),
+    )
 
 
 def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
@@ -1108,9 +1135,15 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
+                training_role=build_training_role_flags_batch(
+                    static, policy_state, jnp
+                ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_assignment=jnp.full(
+                    active_step.shape, -1, dtype=jnp.int32
+                ),
                 opponent_deterministic_episode=jnp.zeros_like(active_step, dtype=jnp.float32),
                 selected_log_probs=policy_out["selected_log_probs"],
                 values=policy_out["values"],
@@ -1269,6 +1302,12 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            final_opponent_assignment=jnp.full(
+                final_state.episode_ended.shape, -1, dtype=jnp.int32
+            ),
+            final_opponent_deterministic_episode=jnp.zeros_like(
+                final_state.episode_ended, dtype=jnp.bool_
+            ),
             rebound_diagnostic_totals=rebound_diagnostic_totals,
         )
 
@@ -1280,7 +1319,10 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
         static,
         initial_state,
         params,
-        opponent_params,
+        opponent_params_by_candidate,
+        initial_opponent_assignment,
+        initial_opponent_deterministic_episode,
+        opponent_candidate_probs,
         rollout_key,
         horizon: int,
         selector_alpha=0.0,
@@ -1298,6 +1340,46 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             0.0,
             1.0,
         )
+        candidate_count = int(opponent_candidate_probs.shape[0])
+
+        def _sample_candidate_opponent_actions(
+            opponent_flat_obs,
+            opponent_action_mask,
+            opponent_intent_context,
+            opponent_assignment,
+            key,
+        ):
+            safe_assignment = jnp.clip(opponent_assignment, 0, candidate_count - 1)
+            selected_params = jax.tree_util.tree_map(
+                lambda leaf: leaf[safe_assignment],
+                opponent_params_by_candidate,
+            )
+            env_keys = jax.random.split(key, batch_size)
+
+            def _run_one(candidate_params, obs, mask, intent_index, intent_gate, env_key):
+                out = run_actor_critic(
+                    candidate_params,
+                    obs[None, :],
+                    mask[None, :, :],
+                    spec,
+                    env_key,
+                    jax,
+                    jnp,
+                    intent_context={
+                        "intent_index": intent_index[None],
+                        "intent_gate": intent_gate[None],
+                    },
+                )
+                return out["sampled_actions"][0], out["deterministic_actions"][0]
+
+            return jax.vmap(_run_one)(
+                selected_params,
+                opponent_flat_obs,
+                opponent_action_mask,
+                opponent_intent_context["intent_index"],
+                opponent_intent_context["intent_gate"],
+                env_keys,
+            )
 
         def _scan_step(carry, _):
             (
@@ -1305,12 +1387,23 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 key,
                 completed_pass_boundary,
                 offensive_rebound_boundary,
+                opponent_assignment,
                 opponent_deterministic_episode,
                 rebound_diagnostic_totals,
                 rebound_diagnostic_argmax_totals,
                 rebound_diagnostic_sampled_totals,
             ) = carry
-            key, selector_key, policy_key, opponent_key, env_key, reset_key, opponent_det_key = jax.random.split(key, 7)
+            (
+                key,
+                selector_key,
+                policy_key,
+                opponent_key,
+                uniform_opponent_key,
+                env_key,
+                reset_key,
+                opponent_assignment_key,
+                opponent_det_key,
+            ) = jax.random.split(key, 9)
             active_step = (~state.episode_ended.astype(jnp.bool_))
             flat_obs = build_policy_observation_batch(
                 static,
@@ -1342,7 +1435,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, policy_state, jnp),
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -1357,7 +1450,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 policy_state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, policy_state, jnp),
                 jnp,
             )
             full_action_mask = build_action_masks_batch(static, policy_state, jnp)
@@ -1375,20 +1468,30 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 intent_context=policy_intent_context,
                 include_rebound_critic=bool(spec.rebound_critic_enabled),
             )
-            opponent_out = run_actor_critic(
-                opponent_params,
-                opponent_flat_obs,
+            sampled_candidate_actions, deterministic_candidate_actions = (
+                _sample_candidate_opponent_actions(
+                    opponent_flat_obs,
+                    opponent_action_mask,
+                    opponent_intent_context,
+                    opponent_assignment,
+                    opponent_key,
+                )
+            )
+            uniform_opponent_actions = sample_uniform_legal_actions_jax(
                 opponent_action_mask,
-                spec,
-                opponent_key,
+                uniform_opponent_key,
                 jax,
                 jnp,
-                intent_context=opponent_intent_context,
+            )
+            candidate_actions = jnp.where(
+                opponent_deterministic_episode[:, None],
+                deterministic_candidate_actions,
+                sampled_candidate_actions,
             )
             opponent_actions = jnp.where(
-                opponent_deterministic_episode[:, None],
-                opponent_out["deterministic_actions"],
-                opponent_out["sampled_actions"],
+                (opponent_assignment >= 0)[:, None],
+                candidate_actions,
+                uniform_opponent_actions,
             )
             full_actions = assemble_full_actions_jax(
                 policy_out["sampled_actions"],
@@ -1416,10 +1519,21 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 opponent_deterministic_episode_prob,
                 (batch_size,),
             )
-            next_opponent_deterministic_episode = jnp.where(
-                reset_done,
-                next_opponent_deterministic_episode_sample,
+            sampled_assignment = jax.random.categorical(
+                opponent_assignment_key,
+                jnp.log(jnp.maximum(opponent_candidate_probs, 1.0e-12)),
+                shape=(batch_size,),
+            ).astype(jnp.int32)
+            (
+                next_opponent_assignment,
+                next_opponent_deterministic_episode,
+            ) = update_pinned_opponent_episode_state(
+                opponent_assignment,
                 opponent_deterministic_episode,
+                reset_done,
+                sampled_assignment,
+                next_opponent_deterministic_episode_sample,
+                jnp,
             )
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
@@ -1462,9 +1576,17 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
+                training_role=build_training_role_flags_batch(
+                    static, policy_state, jnp
+                ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_assignment=jnp.where(
+                    active_step,
+                    opponent_assignment,
+                    jnp.asarray(-1, dtype=jnp.int32),
+                ),
                 opponent_deterministic_episode=jnp.where(
                     active_step,
                     opponent_deterministic_episode.astype(jnp.float32),
@@ -1577,24 +1699,20 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 key,
                 next_completed_pass_boundary,
                 next_offensive_rebound_boundary,
+                next_opponent_assignment,
                 next_opponent_deterministic_episode,
                 next_rebound_diagnostic_totals,
                 next_rebound_diagnostic_argmax_totals,
                 next_rebound_diagnostic_sampled_totals,
             ), transition
 
-        scan_key, opponent_det_init_key = jax.random.split(rollout_key)
+        scan_key = rollout_key
         initial_completed_pass_boundary = jnp.zeros(
             (batch_size,),
             dtype=jnp.bool_,
         )
         initial_offensive_rebound_boundary = jnp.zeros_like(
             initial_completed_pass_boundary
-        )
-        initial_opponent_deterministic_episode = jax.random.bernoulli(
-            opponent_det_init_key,
-            opponent_deterministic_episode_prob,
-            (batch_size,),
         )
         initial_rebound_diagnostic_totals = zero_rebound_diagnostic_totals_like(
             jnp.asarray(0.0, dtype=jnp.float32),
@@ -1613,7 +1731,8 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             _,
             _,
             _,
-            _,
+            final_opponent_assignment,
+            final_opponent_deterministic_episode,
             rebound_diagnostic_totals,
             rebound_diagnostic_argmax_totals,
             rebound_diagnostic_sampled_totals,
@@ -1624,6 +1743,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 scan_key,
                 initial_completed_pass_boundary,
                 initial_offensive_rebound_boundary,
+                initial_opponent_assignment,
                 initial_opponent_deterministic_episode,
                 initial_rebound_diagnostic_totals,
                 initial_rebound_diagnostic_argmax_totals,
@@ -1668,12 +1788,14 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            final_opponent_assignment=final_opponent_assignment,
+            final_opponent_deterministic_episode=final_opponent_deterministic_episode,
             rebound_diagnostic_totals=rebound_diagnostic_totals,
             rebound_diagnostic_argmax_totals=rebound_diagnostic_argmax_totals,
             rebound_diagnostic_sampled_totals=rebound_diagnostic_sampled_totals,
         )
 
-    return jax.jit(_runner, static_argnums=(5,))
+    return jax.jit(_runner, static_argnums=(8,))
 
 
 def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
@@ -1697,6 +1819,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
         group_count = int(opponent_group_count)
         batch_size = int(initial_state.positions.shape[0])
         group_size = batch_size // group_count
+        group_assignment = jnp.repeat(
+            jnp.arange(group_count, dtype=jnp.int32),
+            group_size,
+        )
         opponent_deterministic_episode_prob = jnp.clip(
             jnp.asarray(opponent_deterministic_episode_prob, dtype=jnp.float32),
             0.0,
@@ -1800,7 +1926,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             opponent_flat_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, policy_state, jnp),
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -1811,7 +1937,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 policy_state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, policy_state, jnp),
                 jnp,
             )
             full_action_mask = build_action_masks_batch(static, policy_state, jnp)
@@ -1912,9 +2038,13 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 flat_obs=flat_obs,
                 policy_intent_index=policy_intent_context["intent_index"],
                 policy_intent_gate=policy_intent_context["intent_gate"],
+                training_role=build_training_role_flags_batch(
+                    static, policy_state, jnp
+                ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
                 full_actions=full_actions,
+                opponent_assignment=group_assignment,
                 opponent_deterministic_episode=jnp.where(
                     active_step,
                     opponent_deterministic_episode.astype(jnp.float32),
@@ -2063,7 +2193,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             _,
             _,
             _,
-            _,
+            final_opponent_deterministic_episode,
             rebound_diagnostic_totals,
             rebound_diagnostic_argmax_totals,
             rebound_diagnostic_sampled_totals,
@@ -2114,6 +2244,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             final_selector_values=final_selector_values,
             final_flat_obs=final_flat_obs,
             final_action_mask=final_action_mask,
+            final_opponent_assignment=group_assignment,
+            final_opponent_deterministic_episode=final_opponent_deterministic_episode,
             rebound_diagnostic_totals=rebound_diagnostic_totals,
             rebound_diagnostic_argmax_totals=rebound_diagnostic_argmax_totals,
             rebound_diagnostic_sampled_totals=rebound_diagnostic_sampled_totals,
@@ -2245,7 +2377,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, state, jnp),
                 jnp,
             )
 
@@ -2280,7 +2412,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 build_policy_observation_batch_with_role_flag(
                     static,
                     state,
-                    -static.training_role_flag,
+                    build_opponent_role_flags_batch(static, state, jnp),
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -2435,7 +2567,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, state, jnp),
                 jnp,
             )
 
@@ -2469,7 +2601,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 build_policy_observation_batch_with_role_flag(
                     static,
                     state,
-                    -static.training_role_flag,
+                    build_opponent_role_flags_batch(static, state, jnp),
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -2623,7 +2755,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
             defense_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
-                -static.training_role_flag,
+                build_opponent_role_flags_batch(static, state, jnp),
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -2645,7 +2777,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 intent_context=build_policy_intent_context_batch_with_role_flag(
                     static,
                     state,
-                    -static.training_role_flag,
+                    build_opponent_role_flags_batch(static, state, jnp),
                     jnp,
                 ),
             )
