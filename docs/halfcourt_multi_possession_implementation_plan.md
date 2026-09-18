@@ -1,8 +1,8 @@
 # Half-court multi-possession implementation plan
 
-Status: issue #19's game-state and possession-lifecycle foundation is
-implemented and acceptance-tested. Issue #20's baseline inbounding is
-implemented and acceptance-tested, pending maintainer approval.
+Status: issues #19 and #20 are implemented, acceptance-tested, and accepted.
+Issue #21's clearance and live-switch mechanics are implemented and
+acceptance-tested, pending maintainer approval.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
 
@@ -69,7 +69,10 @@ This milestone introduces inbounding and clearance before a later full-court env
 - A new holder already beyond the line is immediately cleared.
 - The outside-baseline inbounder cannot clear the ball. An inbound receiver outside the arc can; a receiver under the basket cannot.
 - Once cleared, the ball may return inside without clearing again. Offensive rebounds preserve clearance.
-- Mask shooting before clearance; retain ordinary movement/passing and the running shot clock.
+- Keep shooting selectable before clearance, but resolve the attempt as a
+  clearance violation: record no shot attempt, complete the possession once,
+  and give the other team a baseline inbound. Retain ordinary movement/passing
+  and the running shot clock while clearing.
 - Another turnover during clearing starts the other team's possession with clearance recomputed from its holder.
 - Let the policy learn to clear. Initially add no scripted clearance controller, clearance reward, or remedial curriculum. Measure success/time and failures first.
 

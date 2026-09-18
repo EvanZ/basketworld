@@ -60,6 +60,10 @@ class TrajectoryBatch(NamedTuple):
     turnover_move_out_of_bounds: Any
     turnover_shot_clock: Any
     turnover_offensive_three_seconds: Any
+    turnover_clearance_violation: Any
+    clearance_events: Any
+    clearance_elapsed_steps: Any
+    turnovers_before_clearance: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -168,6 +172,9 @@ class EvalTrace(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    clearance_events: Any
+    clearance_elapsed_steps: Any
+    turnovers_before_clearance: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -223,6 +230,10 @@ class DeployEvalTotals(NamedTuple):
     turnover_move_out_of_bounds: Any
     turnover_shot_clock: Any
     turnover_offensive_three_seconds: Any
+    turnover_clearance_violation: Any
+    clearance_events: Any
+    clearance_elapsed_steps: Any
+    turnovers_before_clearance: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any

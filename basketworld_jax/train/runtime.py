@@ -25,6 +25,7 @@ from basketworld_jax.env import (
 )
 from basketworld_jax.env.minimal import (
     ReboundDiagnosticTotals,
+    TURNOVER_REASON_CLEARANCE_VIOLATION,
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
@@ -631,6 +632,7 @@ def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
         "turnover_move_out_of_bounds": _reason_flag(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS),
         "turnover_shot_clock": _reason_flag(TURNOVER_REASON_SHOT_CLOCK),
         "turnover_offensive_three_seconds": _reason_flag(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS),
+        "turnover_clearance_violation": _reason_flag(TURNOVER_REASON_CLEARANCE_VIOLATION),
     }
 
 
@@ -1123,6 +1125,17 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
+                clearance_elapsed_steps=jnp.where(
+                    active_step,
+                    env_out.clearance_elapsed_steps.astype(jnp.int32),
+                    0,
+                ),
+                turnovers_before_clearance=jnp.where(
+                    active_step,
+                    env_out.turnover_before_clearance.astype(jnp.int8),
+                    0,
+                ),
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -1441,6 +1454,17 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
+                clearance_elapsed_steps=jnp.where(
+                    active_step,
+                    env_out.clearance_elapsed_steps.astype(jnp.int32),
+                    0,
+                ),
+                turnovers_before_clearance=jnp.where(
+                    active_step,
+                    env_out.turnover_before_clearance.astype(jnp.int8),
+                    0,
+                ),
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -1855,6 +1879,17 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
+                clearance_elapsed_steps=jnp.where(
+                    active_step,
+                    env_out.clearance_elapsed_steps.astype(jnp.int32),
+                    0,
+                ),
+                turnovers_before_clearance=jnp.where(
+                    active_step,
+                    env_out.turnover_before_clearance.astype(jnp.int8),
+                    0,
+                ),
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -2083,6 +2118,9 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                clearance_events=env_out.clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
+                turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2193,6 +2231,9 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                clearance_events=env_out.clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
+                turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2358,6 +2399,9 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
                 turnovers=env_out.turnover.astype(jnp.int8),
+                clearance_events=env_out.clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
+                turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2539,6 +2583,14 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 turnover_shot_clock=_active_sum(turnover_metrics["turnover_shot_clock"]),
                 turnover_offensive_three_seconds=_active_sum(
                     turnover_metrics["turnover_offensive_three_seconds"]
+                ),
+                turnover_clearance_violation=_active_sum(
+                    turnover_metrics["turnover_clearance_violation"]
+                ),
+                clearance_events=_active_sum(env_out.clearance_event),
+                clearance_elapsed_steps=_active_sum(env_out.clearance_elapsed_steps),
+                turnovers_before_clearance=_active_sum(
+                    env_out.turnover_before_clearance
                 ),
                 shot_attempts=_active_sum(shot_metrics["shot_attempts"]),
                 shot_makes=_active_sum(shot_metrics["shot_makes"]),
@@ -2766,6 +2818,7 @@ def summarize_deploy_eval_outputs(
         "move_out_of_bounds": "turnover_move_out_of_bounds",
         "shot_clock": "turnover_shot_clock",
         "offensive_three_seconds": "turnover_offensive_three_seconds",
+        "clearance_violation": "turnover_clearance_violation",
     }
     for reason, field in reason_fields.items():
         metrics[f"turnover_{reason}_count"] = int(totals[field])
@@ -3454,6 +3507,7 @@ def summarize_turnover_diagnostics(
     turnover_move_out_of_bounds,
     turnover_shot_clock,
     turnover_offensive_three_seconds,
+    turnover_clearance_violation,
 ) -> dict[str, float]:
     terminal_steps_arr = np.asarray(terminal_episode_steps, dtype=np.int32)
     completed_episodes = int((terminal_steps_arr > 0).sum())
@@ -3481,6 +3535,7 @@ def summarize_turnover_diagnostics(
         "move_out_of_bounds": _total(turnover_move_out_of_bounds),
         "shot_clock": _total(turnover_shot_clock),
         "offensive_three_seconds": _total(turnover_offensive_three_seconds),
+        "clearance_violation": _total(turnover_clearance_violation),
     }
     for reason, total in reason_items.items():
         metrics[f"total_turnovers_reason_{reason}"] = total
@@ -3569,6 +3624,8 @@ def summarize_ppo_eligible_episode_metrics(
         "completed_passes": trajectory.completed_passes,
         "assists": trajectory.assists,
         "turnovers": trajectory.turnovers,
+        "clearance_events": trajectory.clearance_events,
+        "turnovers_before_clearance": trajectory.turnovers_before_clearance,
         "learner_turnovers": trajectory.learner_turnovers,
         "opponent_turnovers": trajectory.opponent_turnovers,
         "offensive_three_seconds": trajectory.offensive_three_seconds,
@@ -3626,6 +3683,16 @@ def summarize_ppo_eligible_episode_metrics(
         else:
             metrics[f"{prefix}_{name}_per_completed_episode"] = _per_completed_episode(total)
 
+    clearance_count = _masked_total(trajectory.clearance_events, mask)
+    clearance_elapsed_total = _masked_total(
+        trajectory.clearance_elapsed_steps,
+        mask * np.asarray(trajectory.clearance_events, dtype=np.float32),
+    )
+    metrics[f"{prefix}_clearance_elapsed_steps_total"] = clearance_elapsed_total
+    metrics[f"{prefix}_clearance_elapsed_steps_mean"] = float(
+        clearance_elapsed_total / max(1.0, clearance_count)
+    )
+
     terminal_reason_items = {
         "shot": trajectory.shot_attempts,
         "turnover": trajectory.turnovers,
@@ -3637,6 +3704,7 @@ def summarize_ppo_eligible_episode_metrics(
         "turnover_move_out_of_bounds": trajectory.turnover_move_out_of_bounds,
         "turnover_shot_clock": trajectory.turnover_shot_clock,
         "turnover_offensive_three_seconds": trajectory.turnover_offensive_three_seconds,
+        "turnover_clearance_violation": trajectory.turnover_clearance_violation,
         "offensive_three_seconds": trajectory.offensive_three_seconds,
         "defensive_lane_violation": trajectory.defensive_lane_violations,
         "shot_make": trajectory.shot_makes,
@@ -3988,6 +4056,31 @@ def summarize_training_step(
             "rebound_reward_net_total": rebound_reward_advances + rebound_reward_settlements,
         }
     )
+    clearance_events = float(
+        np.asarray(rollout_out.trajectory.clearance_events, dtype=np.float32).sum()
+    )
+    clearance_elapsed_total = float(
+        np.asarray(
+            rollout_out.trajectory.clearance_elapsed_steps,
+            dtype=np.float32,
+        ).sum()
+    )
+    turnovers_before_clearance = float(
+        np.asarray(
+            rollout_out.trajectory.turnovers_before_clearance,
+            dtype=np.float32,
+        ).sum()
+    )
+    summary.update(
+        {
+            "clearance_event_count": int(clearance_events),
+            "clearance_elapsed_steps_total": clearance_elapsed_total,
+            "clearance_elapsed_steps_mean": float(
+                clearance_elapsed_total / max(1.0, clearance_events)
+            ),
+            "turnovers_before_clearance_count": int(turnovers_before_clearance),
+        }
+    )
     summary.update(
         summarize_turnover_diagnostics(
             terminal_episode_steps=rollout_out.trajectory.terminal_episode_steps,
@@ -3999,6 +4092,7 @@ def summarize_training_step(
             turnover_move_out_of_bounds=rollout_out.trajectory.turnover_move_out_of_bounds,
             turnover_shot_clock=rollout_out.trajectory.turnover_shot_clock,
             turnover_offensive_three_seconds=rollout_out.trajectory.turnover_offensive_three_seconds,
+            turnover_clearance_violation=rollout_out.trajectory.turnover_clearance_violation,
         )
     )
     summary.update(

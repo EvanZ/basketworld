@@ -17,6 +17,7 @@ from basketworld_jax.env.minimal import (
     REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
+    TURNOVER_REASON_CLEARANCE_VIOLATION,
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INBOUND_INVALID_PASS,
     TURNOVER_REASON_INBOUND_TIMEOUT,
@@ -1043,6 +1044,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "turnover_player": env_out.turnover_player.astype(jnp.int32),
                 "turnover_reason": env_out.turnover_reason.astype(jnp.int32),
                 "steal_player": env_out.steal_player.astype(jnp.int32),
+                "clearance_events": env_out.clearance_event.astype(jnp.int8),
+                "clearance_elapsed_steps": env_out.clearance_elapsed_steps.astype(jnp.int32),
+                "turnovers_before_clearance": env_out.turnover_before_clearance.astype(jnp.int8),
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
                 "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
                 "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
@@ -1407,6 +1411,11 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "episode_start_selection_counts": {},
         },
         "turnover_reasons": {},
+        "clearance": {
+            "events": 0,
+            "elapsed_steps_total": 0,
+            "turnovers_before_clearance": 0,
+        },
         "assist_links": {},
         "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
         "potential_assist_links": {},
@@ -1540,6 +1549,7 @@ def _turnover_reason_label(code: int) -> str:
         int(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS): "offensive_three_seconds",
         int(TURNOVER_REASON_INBOUND_TIMEOUT): "inbound_timeout",
         int(TURNOVER_REASON_INBOUND_INVALID_PASS): "inbound_invalid_pass",
+        int(TURNOVER_REASON_CLEARANCE_VIOLATION): "clearance_violation",
     }
     return labels.get(int(code), "unknown")
 
@@ -2208,6 +2218,15 @@ def run_native_jax_evaluation(
                     int(trace["ball_holder"][t, idx]),
                     user_team_ids_set,
                 )
+                clearance_diag = eval_diagnostics["clearance"]
+                if int(trace["clearance_events"][t, idx]):
+                    clearance_diag["events"] += 1
+                    clearance_diag["elapsed_steps_total"] += int(
+                        trace["clearance_elapsed_steps"][t, idx]
+                    )
+                clearance_diag["turnovers_before_clearance"] += int(
+                    trace["turnovers_before_clearance"][t, idx]
+                )
                 if int(trace["pass_attempts"][t, idx]):
                     _record_pass_link_diagnostics(
                         eval_diagnostics,
@@ -2804,6 +2823,16 @@ def run_native_jax_evaluation(
     selector_diag["episode_start_mean_raw_probs"] = selector_start_mean_raw_probs
     selector_diag["episode_start_mean_raw_max_prob"] = float(selector_start_mean_raw_max_prob)
     rebound_diag_final = eval_diagnostics.get("rebounds") or {}
+    clearance_diag_final = eval_diagnostics.get("clearance") or {}
+    clearance_event_count = int(clearance_diag_final.get("events", 0) or 0)
+    clearance_elapsed_total = int(
+        clearance_diag_final.get("elapsed_steps_total", 0) or 0
+    )
+    clearance_diag_final["elapsed_steps_mean"] = (
+        float(clearance_elapsed_total / clearance_event_count)
+        if clearance_event_count > 0
+        else 0.0
+    )
     rebound_eligibility = dict(rebound_diag_final.get("eligibility", {}) or {})
     rebound_target_distance_count = int(rebound_diag_final.get("target_distance_count", 0) or 0)
     post_orb_samples = int(rebound_diag_final.get("post_orb_samples", 0) or 0)
@@ -2930,6 +2959,13 @@ def run_native_jax_evaluation(
         "completed_passes_per_episode": _mean(all_completed_passes),
         "assists_per_episode": _mean(all_assists),
         "turnovers_per_episode": _mean(all_turnovers),
+        "clearance_event_count": clearance_event_count,
+        "clearance_elapsed_steps_mean": float(
+            clearance_diag_final["elapsed_steps_mean"]
+        ),
+        "turnovers_before_clearance_count": int(
+            clearance_diag_final.get("turnovers_before_clearance", 0) or 0
+        ),
         "rebound_attempts_per_episode": _mean(all_rebound_attempts),
         "offensive_rebounds_per_episode": _mean(all_offensive_rebounds),
         "defensive_rebounds_per_episode": _mean(all_defensive_rebounds),

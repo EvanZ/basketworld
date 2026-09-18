@@ -56,6 +56,7 @@ TURNOVER_REASON_SHOT_CLOCK = 5
 TURNOVER_REASON_OFFENSIVE_THREE_SECONDS = 6
 TURNOVER_REASON_INBOUND_TIMEOUT = 7
 TURNOVER_REASON_INBOUND_INVALID_PASS = 8
+TURNOVER_REASON_CLEARANCE_VIOLATION = 9
 TEAM_A = 0
 TEAM_B = 1
 GAME_PHASE_LIVE = 0
@@ -303,9 +304,7 @@ class KernelState(NamedTuple):
     game_phase: Any
     team_a_score: Any
     team_b_score: Any
-    # Reserved by the two following mechanics.  #20 assigns the inbounder;
-    # #21 makes clearance enforceable.  Keeping them in the game contract now
-    # avoids changing the JAX state tree midway through the milestone.
+    # Dead-ball inbound and live-possession clearance state.
     inbound_team: Any
     inbound_player: Any
     inbound_reason: Any
@@ -359,6 +358,9 @@ class StepBatchOutput(NamedTuple):
     rebound_diagnostics: Any
     possession_ended: Any
     possession_end_reason: Any
+    clearance_event: Any
+    clearance_elapsed_steps: Any
+    turnover_before_clearance: Any
 
 
 class ReboundDiagnosticTotals(NamedTuple):
@@ -1590,13 +1592,7 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
     masks = masks.at[:, :, MOVE_ACTION_START:MOVE_ACTION_END].set(move_masks)
 
     holder_mask = (state.ball_holder[:, None] == player_ids[None, :]) & (state.ball_holder[:, None] >= 0)
-    shot_allowed = (
-        (state.game_phase[:, None] == GAME_PHASE_LIVE)
-        & (
-            (~static.enable_multi_possession.astype(jnp.bool_))
-            | state.clearance_achieved[:, None].astype(jnp.bool_)
-        )
-    )
+    shot_allowed = state.game_phase[:, None] == GAME_PHASE_LIVE
     masks = masks.at[:, :, ActionType.SHOOT.value].set(
         (holder_mask & shot_allowed).astype(jnp.int8)
     )
@@ -3164,6 +3160,61 @@ def _clear_reentered_inbound_metadata_single(
     )
 
 
+def _holder_controls_three_point_single(
+    static: KernelStatic,
+    state: KernelState,
+    offense_team,
+    jnp,
+):
+    """Whether the designated offense controls the ball beyond the arc."""
+    n_players = state.positions.shape[0]
+    safe_holder = jnp.clip(state.ball_holder, 0, n_players - 1)
+    offense_ids = jnp.where(
+        offense_team == TEAM_A,
+        static.offense_ids,
+        static.defense_ids,
+    )
+    holder_is_offense = jnp.any(offense_ids == state.ball_holder)
+    cell_idx, found = _lookup_cell_indices(
+        static.cell_coords,
+        state.positions[safe_holder][None, :],
+        jnp,
+    )
+    outside_arc = static.three_point_by_cell[
+        jnp.clip(cell_idx[0], 0, static.three_point_by_cell.shape[0] - 1)
+    ].astype(jnp.bool_)
+    return (
+        (state.ball_holder >= 0)
+        & holder_is_offense
+        & found[0]
+        & outside_arc
+    )
+
+
+def _apply_clearance_for_current_holder_single(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+):
+    holder_cleared = _holder_controls_three_point_single(
+        static,
+        state,
+        state.offense_team,
+        jnp,
+    )
+    can_clear = (
+        static.enable_multi_possession.astype(jnp.bool_)
+        & (state.game_phase == GAME_PHASE_LIVE)
+        & holder_cleared
+    )
+    return _replace_state(
+        state,
+        clearance_achieved=(
+            state.clearance_achieved.astype(jnp.bool_) | can_clear
+        ).astype(jnp.int8),
+    )
+
+
 def _finalize_possession_single(
     static: KernelStatic,
     state: KernelState,
@@ -3177,8 +3228,8 @@ def _finalize_possession_single(
     """Advance the game-level state after one completed possession.
 
     Dead-ball endings immediately designate and relocate the nearest inbounder.
-    Live rebounds and steals retain their winner and immediately become the
-    next possession; #21 later completes clearance detection.
+    Live rebounds and steals retain their winner, immediately become the next
+    possession, and derive clearance from the new holder's actual location.
     """
     multi = static.enable_multi_possession.astype(jnp.bool_)
     possession_ended = possession_ended.astype(jnp.bool_)
@@ -3186,6 +3237,7 @@ def _finalize_possession_single(
     completed = state.completed_possessions + advance.astype(jnp.int32)
     game_done = advance & (completed >= static.multi_possession_limit)
     awaiting_inbound = advance & (~game_done) & requires_inbound.astype(jnp.bool_)
+    live_handoff = advance & (~game_done) & (~requires_inbound.astype(jnp.bool_))
     (
         restored_positions,
         inbound_positions,
@@ -3313,7 +3365,17 @@ def _finalize_possession_single(
         ),
         clearance_achieved=jnp.where(
             advance,
-            jnp.asarray(0, dtype=jnp.int8),
+            jnp.where(
+                live_handoff
+                & _holder_controls_three_point_single(
+                    static,
+                    state,
+                    next_offense_team,
+                    jnp,
+                ),
+                jnp.asarray(1, dtype=jnp.int8),
+                jnp.asarray(0, dtype=jnp.int8),
+            ),
             state.clearance_achieved,
         ),
         episode_ended=jnp.where(game_done, jnp.asarray(1, dtype=jnp.int8), state.episode_ended),
@@ -3377,6 +3439,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             rebound_diagnostics=zero_rebound_diagnostics,
             possession_ended=zero_flag,
             possession_end_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+            clearance_event=zero_flag,
+            clearance_elapsed_steps=zero_steps,
+            turnover_before_clearance=zero_flag,
         )
 
     def _awaiting_inbound(_):
@@ -3551,6 +3616,15 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_expires_at=moved_state.step_count
                 + static.assist_window.astype(jnp.int32),
             )
+            next_state = _apply_clearance_for_current_holder_single(
+                static,
+                next_state,
+                jnp,
+            )
+            clearance_event = (
+                (~state.clearance_achieved.astype(jnp.bool_))
+                & next_state.clearance_achieved.astype(jnp.bool_)
+            )
             pass_rewards = _offense_team_reward_vector_single(
                 static,
                 next_state,
@@ -3561,6 +3635,16 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 state=next_state,
                 rewards=pass_rewards,
                 completed_pass=jnp.asarray(1, dtype=jnp.int8),
+                clearance_event=clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=jnp.where(
+                    clearance_event,
+                    jnp.maximum(
+                        jnp.asarray(0, dtype=jnp.int32),
+                        static.shot_clock_max.astype(jnp.int32)
+                        - next_state.shot_clock.astype(jnp.int32),
+                    ),
+                    zero_steps,
+                ),
             )
 
         def _intercepted_pass(_):
@@ -3579,6 +3663,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 next_offense_team=1 - moved_state.offense_team,
                 requires_inbound=jnp.asarray(False),
                 jnp=jnp,
+            )
+            clearance_event = (
+                (~game_done)
+                & (final_state.game_phase == GAME_PHASE_LIVE)
+                & final_state.clearance_achieved.astype(jnp.bool_)
             )
             return base_output._replace(
                 state=final_state,
@@ -3600,6 +3689,19 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     POSSESSION_END_TURNOVER,
                     dtype=jnp.int32,
                 ),
+                clearance_event=clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=jnp.where(
+                    clearance_event,
+                    jnp.maximum(
+                        jnp.asarray(0, dtype=jnp.int32),
+                        static.shot_clock_max.astype(jnp.int32)
+                        - final_state.shot_clock.astype(jnp.int32),
+                    ),
+                    zero_steps,
+                ),
+                turnover_before_clearance=(
+                    ~state.clearance_achieved.astype(jnp.bool_)
+                ).astype(jnp.int8),
             )
 
         def _inbound_violation(_):
@@ -3631,6 +3733,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     POSSESSION_END_INBOUND_VIOLATION,
                     dtype=jnp.int32,
                 ),
+                turnover_before_clearance=(
+                    ~state.clearance_achieved.astype(jnp.bool_)
+                ).astype(jnp.int8),
             )
 
         return jax.lax.cond(
@@ -3719,6 +3824,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 pressure_done,
                 jnp,
             )
+            pressure_clearance_event = (
+                static.enable_multi_possession.astype(jnp.bool_)
+                & (~pressure_done)
+                & (pressure_state.game_phase == GAME_PHASE_LIVE)
+                & pressure_state.clearance_achieved.astype(jnp.bool_)
+            )
             return StepBatchOutput(
                 state=pressure_state,
                 rewards=pressure_rewards,
@@ -3769,6 +3880,20 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_diagnostics=zero_rebound_diagnostics,
                 possession_ended=pressure_possession_ended.astype(jnp.int8),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
+                clearance_event=pressure_clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=jnp.where(
+                    pressure_clearance_event,
+                    jnp.maximum(
+                        jnp.asarray(0, dtype=jnp.int32),
+                        static.shot_clock_max.astype(jnp.int32)
+                        - pressure_state.shot_clock.astype(jnp.int32),
+                    ),
+                    zero_steps,
+                ),
+                turnover_before_clearance=(
+                    static.enable_multi_possession.astype(jnp.bool_)
+                    & (~state.clearance_achieved.astype(jnp.bool_))
+                ).astype(jnp.int8),
             )
 
         def _normal_step(_):
@@ -3778,6 +3903,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             holder_action = actions[safe_holder]
             holder_has_ball = ball_holder >= 0
             is_shot = holder_has_ball & (holder_action == ActionType.SHOOT.value)
+            clearance_violation = (
+                is_shot
+                & static.enable_multi_possession.astype(jnp.bool_)
+                & (~shot_clock_state.clearance_achieved.astype(jnp.bool_))
+            )
             is_pass = holder_has_ball & (holder_action >= PASS_ACTION_START) & (holder_action < PASS_ACTION_END)
             pass_attempt = is_pass.astype(jnp.int8)
 
@@ -3803,6 +3933,25 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             shot_ep_all = shot_profile["expected_points"][0]
             shot_distances = shot_profile["distance"][0]
             shot_is_three = shot_profile["is_three"][0]
+
+            def _do_clearance_violation(_):
+                return (
+                    ball_holder_after,
+                    assist_active,
+                    assist_passer,
+                    assist_recipient,
+                    assist_expires_at,
+                    jnp.asarray(False),
+                    jnp.asarray(False),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(True),
+                    jnp.asarray(False),
+                    jnp.asarray(TURNOVER_REASON_CLEARANCE_VIOLATION, dtype=jnp.int32),
+                    no_player,
+                    no_player,
+                )
 
             def _do_shot(_):
                 draw = jax.random.uniform(shot_key)
@@ -3923,27 +4072,32 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 pass_receiver,
                 action_steal_player,
             ) = jax.lax.cond(
-                is_shot,
-                _do_shot,
+                clearance_violation,
+                _do_clearance_violation,
                 lambda _: jax.lax.cond(
-                    is_pass,
-                    _do_pass,
-                    lambda __: (
-                        ball_holder_after,
-                        assist_active,
-                        assist_passer,
-                        assist_recipient,
-                        assist_expires_at,
-                        jnp.asarray(False),
-                        jnp.asarray(False),
-                        jnp.asarray(0.0, dtype=jnp.float32),
-                        jnp.asarray(0.0, dtype=jnp.float32),
-                        jnp.asarray(0.0, dtype=jnp.float32),
-                        jnp.asarray(False),
-                        jnp.asarray(False),
-                        no_reason,
-                        no_player,
-                        no_player,
+                    is_shot,
+                    _do_shot,
+                    lambda __: jax.lax.cond(
+                        is_pass,
+                        _do_pass,
+                        lambda ___: (
+                            ball_holder_after,
+                            assist_active,
+                            assist_passer,
+                            assist_recipient,
+                            assist_expires_at,
+                            jnp.asarray(False),
+                            jnp.asarray(False),
+                            jnp.asarray(0.0, dtype=jnp.float32),
+                            jnp.asarray(0.0, dtype=jnp.float32),
+                            jnp.asarray(0.0, dtype=jnp.float32),
+                            jnp.asarray(False),
+                            jnp.asarray(False),
+                            no_reason,
+                            no_player,
+                            no_player,
+                        ),
+                        operand=None,
                     ),
                     operand=None,
                 ),
@@ -4001,6 +4155,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_expires_at=assist_expires_at,
             )
             final_state = _clear_reentered_inbound_metadata_single(
+                static,
+                final_state,
+                jnp,
+            )
+            final_state = _apply_clearance_for_current_holder_single(
                 static,
                 final_state,
                 jnp,
@@ -4424,6 +4583,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 | (turnover_reason == jnp.asarray(TURNOVER_REASON_MOVE_OUT_OF_BOUNDS, dtype=jnp.int32))
                 | (turnover_reason == jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32))
                 | (turnover_reason == jnp.asarray(TURNOVER_REASON_OFFENSIVE_THREE_SECONDS, dtype=jnp.int32))
+                | (turnover_reason == jnp.asarray(TURNOVER_REASON_CLEARANCE_VIOLATION, dtype=jnp.int32))
             )
             requires_inbound = (
                 (possession_end_reason == jnp.asarray(POSSESSION_END_MADE_BASKET, dtype=jnp.int32))
@@ -4472,6 +4632,23 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
             potential_assist_event = (assist_valid & shot_active).astype(jnp.int8)
             event_assist_passer = jnp.where(potential_assist_event.astype(jnp.bool_), assist_passer, no_player)
+            offense_switched = final_state.offense_team != state.offense_team
+            clearance_event = (
+                static.enable_multi_possession.astype(jnp.bool_)
+                & final_state.clearance_achieved.astype(jnp.bool_)
+                & (
+                    (
+                        (~possession_ended.astype(jnp.bool_))
+                        & (~state.clearance_achieved.astype(jnp.bool_))
+                    )
+                    | (
+                        possession_ended.astype(jnp.bool_)
+                        & (~done.astype(jnp.bool_))
+                        & offense_switched
+                        & (final_state.game_phase == GAME_PHASE_LIVE)
+                    )
+                )
+            )
             return StepBatchOutput(
                 state=final_state,
                 rewards=rewards,
@@ -4527,6 +4704,21 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_diagnostics=rebound_diagnostics,
                 possession_ended=possession_ended.astype(jnp.int8),
                 possession_end_reason=possession_end_reason,
+                clearance_event=clearance_event.astype(jnp.int8),
+                clearance_elapsed_steps=jnp.where(
+                    clearance_event,
+                    jnp.maximum(
+                        jnp.asarray(0, dtype=jnp.int32),
+                        static.shot_clock_max.astype(jnp.int32)
+                        - final_state.shot_clock.astype(jnp.int32),
+                    ),
+                    zero_steps,
+                ),
+                turnover_before_clearance=(
+                    static.enable_multi_possession.astype(jnp.bool_)
+                    & turnover_event.astype(jnp.bool_)
+                    & (~state.clearance_achieved.astype(jnp.bool_))
+                ).astype(jnp.int8),
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)
@@ -5116,8 +5308,8 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         inbound_player=jnp.asarray(-1, dtype=jnp.int32),
         inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
         inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
-        # Initial spawning remains the legacy playable state; clearance is
-        # only required after a possession switch once #21 enables it.
+        # The opening possession is already live; clearing is required only
+        # after a possession switch.
         clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
     )
 

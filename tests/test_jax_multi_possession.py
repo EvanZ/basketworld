@@ -38,6 +38,7 @@ def _multi_possession_static(
     players: int = 2,
     possession_limit: int = 2,
     illegal_defense_enabled: bool = False,
+    offensive_three_seconds_enabled: bool = False,
 ):
     env = HexagonBasketballEnv(
         players=players,
@@ -51,7 +52,7 @@ def _multi_possession_static(
         defender_pressure_turnover_chance=0.0,
         base_steal_rate=0.0,
         illegal_defense_enabled=illegal_defense_enabled,
-        offensive_three_seconds_enabled=False,
+        offensive_three_seconds_enabled=offensive_three_seconds_enabled,
         enable_phi_shaping=False,
     )
     env.enable_multi_possession = True
@@ -245,11 +246,7 @@ def _complete_inbound(static, state, seed: int):
         jnp,
     )
     assert np.all(np.asarray(reentry_out.state.inbound_player) == -1)
-    # #21 owns the actual clearance transition.  Lifecycle-only tests mark it
-    # complete so their next forced shot remains in scope for #19.
-    return reentry_out.state._replace(
-        clearance_achieved=jnp.ones_like(reentry_out.state.clearance_achieved)
-    )
+    return reentry_out.state
 
 
 def _force_rebound_winner(static, state, winner: int):
@@ -432,7 +429,9 @@ def test_deadline_release_is_accepted_and_under_basket_receiver_cannot_shoot_bef
     post_masks = np.asarray(
         build_action_masks_batch(static, out.state, jnp), dtype=np.int8
     )
-    assert post_masks[0, receiver, ActionType.SHOOT.value] == 0
+    # Shooting remains selectable before clearance; #21 resolves the attempt
+    # as a violation instead of silently masking it.
+    assert post_masks[0, receiver, ActionType.SHOOT.value] == 1
 
 
 def test_inbounder_waits_for_occupied_entry_then_reenters_under_basket_and_becomes_eligible():
@@ -768,10 +767,17 @@ def test_live_steal_switches_possession_without_a_dead_ball_inbound():
     assert int(np.asarray(out.state.offense_team)[0]) == TEAM_A
     assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_LIVE
     assert int(np.asarray(out.state.inbound_team)[0]) == -1
-    assert int(np.asarray(out.state.clearance_achieved)[0]) == 0
-    assert int(np.asarray(out.state.ball_holder)[0]) in set(
-        np.asarray(static.offense_ids, dtype=np.int32).tolist()
+    new_holder = int(np.asarray(out.state.ball_holder)[0])
+    assert new_holder in set(np.asarray(static.offense_ids, dtype=np.int32).tolist())
+    new_holder_position = np.asarray(out.state.positions)[0, new_holder]
+    holder_cell = int(
+        np.flatnonzero(
+            np.all(np.asarray(static.cell_coords) == new_holder_position, axis=1)
+        )[0]
     )
+    expected_clearance = int(np.asarray(static.three_point_by_cell)[holder_cell])
+    assert int(np.asarray(out.state.clearance_achieved)[0]) == expected_clearance
+    assert int(np.asarray(out.clearance_event)[0]) == expected_clearance
 
 
 def test_rebounds_and_dead_ball_offensive_violation_have_distinct_lifecycle_transitions():
