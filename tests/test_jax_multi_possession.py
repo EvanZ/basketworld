@@ -196,13 +196,20 @@ def test_live_steal_switches_possession_without_a_dead_ball_inbound():
         ball_holder=jnp.asarray([team_b_holder], dtype=jnp.int32),
     )
     actions = jnp.full((1, state.positions.shape[1]), ActionType.NOOP.value, dtype=jnp.int32)
-    out = step_batch_minimal(
-        static,
+    compiled_step = jax.jit(
+        lambda state_arg, actions_arg, keys_arg: step_batch_minimal(
+            static,
+            state_arg,
+            actions_arg,
+            keys_arg,
+            jax,
+            jnp,
+        )
+    )
+    out = compiled_step(
         state,
         actions,
         jax.random.split(jax.random.PRNGKey(12), 1),
-        jax,
-        jnp,
     )
 
     assert int(np.asarray(out.turnover)[0]) == 1
