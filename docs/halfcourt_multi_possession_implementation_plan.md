@@ -20,6 +20,7 @@ This milestone introduces inbounding and clearance before a later full-court env
 
 - Keep stable team identities, player membership, and scores while offensive/defensive roles change.
 - Use the existing initial spawn and holder selection with start templates disabled. This is the only full spawn during a game.
+- At each game reset, sample the starting offense with equal probability for either team. Treat this as the result of a jump ball; do not simulate the jump itself. Apply the existing holder-selection logic to the selected offense and record the result for reproducibility and diagnostics.
 - Preserve positions across live possession changes. For dead-ball restarts, relocate only the inbounder; do not reset the remaining formation.
 - Preserve player attributes, including shooting and rebound skills, throughout the game.
 - Made baskets, defensive rebounds, and possession-ending turnovers complete a possession. An offensive rebound extends the current possession.
@@ -87,6 +88,7 @@ The current rebound launch configurations collect two batches of 512 environment
 - Build a fresh-run launcher without continuation arguments and with templates disabled. Historical opponents, if used, are snapshots from this run.
 - Start by comparing against the existing horizon/epoch/minibatch scale. Longer horizons or different lambda are experiments, not assumed requirements.
 - Track completed games and outcome frequency alongside steps and updates. A game can span several updates, so these measures are not interchangeable.
+- Track starting-team counts and outcome splits. Training uses the sampled 50/50 start; paired evaluation still swaps the starter to reduce comparison variance.
 
 ## Implementation issues
 
