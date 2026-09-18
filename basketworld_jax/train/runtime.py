@@ -1005,6 +1005,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -1117,6 +1118,24 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 **rebound_counterfactual,
                 rewards=masked_reward,
                 dones=masked_done,
+                game_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.game_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                auxiliary_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.auxiliary_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                team_a_score_delta=jnp.where(active_step, env_out.team_a_score_delta, 0.0),
+                team_b_score_delta=jnp.where(active_step, env_out.team_b_score_delta, 0.0),
                 phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
@@ -1220,7 +1239,12 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             jnp,
             model_type=spec.model_type,
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+            rebound_target_observation_features=bool(
+                getattr(spec, "rebound_target_observation_features", True)
+            ),
+            multi_possession_features=bool(
+                getattr(spec, "multi_possession_features", False)
+            ),
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
@@ -1295,6 +1319,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -1321,7 +1346,12 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
             )
             policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -1446,6 +1476,24 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                game_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.game_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                auxiliary_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.auxiliary_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                team_a_score_delta=jnp.where(active_step, env_out.team_a_score_delta, 0.0),
+                team_b_score_delta=jnp.where(active_step, env_out.team_b_score_delta, 0.0),
                 phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
@@ -1590,7 +1638,12 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             jnp,
             model_type=spec.model_type,
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+            rebound_target_observation_features=bool(
+                getattr(spec, "rebound_target_observation_features", True)
+            ),
+            multi_possession_features=bool(
+                getattr(spec, "multi_possession_features", False)
+            ),
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
@@ -1724,6 +1777,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -1751,6 +1805,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -1871,6 +1926,24 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                game_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.game_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                auxiliary_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.auxiliary_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
+                team_a_score_delta=jnp.where(active_step, env_out.team_a_score_delta, 0.0),
+                team_b_score_delta=jnp.where(active_step, env_out.team_b_score_delta, 0.0),
                 phi_r_shape=jnp.where(active_step, env_out.phi_r_shape.astype(jnp.float32), 0.0),
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
@@ -2015,7 +2088,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             jnp,
             model_type=spec.model_type,
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
         )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
@@ -2069,7 +2143,12 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
                 ),
                 spec,
                 jnp,
@@ -2114,6 +2193,14 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                game_rewards=jnp.sum(
+                    env_out.game_reward * static.training_player_mask[None, :], axis=1
+                ),
+                auxiliary_rewards=jnp.sum(
+                    env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
+                ),
+                team_a_score_delta=env_out.team_a_score_delta.astype(jnp.float32),
+                team_b_score_delta=env_out.team_b_score_delta.astype(jnp.float32),
                 pass_attempts=env_out.pass_attempt.astype(jnp.int8),
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
@@ -2170,7 +2257,12 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
                 ),
                 spec,
                 jnp,
@@ -2192,7 +2284,12 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
                 ),
                 opponent_action_mask,
                 spec,
@@ -2227,6 +2324,14 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                game_rewards=jnp.sum(
+                    env_out.game_reward * static.training_player_mask[None, :], axis=1
+                ),
+                auxiliary_rewards=jnp.sum(
+                    env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
+                ),
+                team_a_score_delta=env_out.team_a_score_delta.astype(jnp.float32),
+                team_b_score_delta=env_out.team_b_score_delta.astype(jnp.float32),
                 pass_attempts=env_out.pass_attempt.astype(jnp.int8),
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
@@ -2342,7 +2447,12 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
                 ),
                 spec,
                 jnp,
@@ -2363,7 +2473,12 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     jnp,
                     model_type=spec.model_type,
                     rebound_win_prob_features=bool(spec.rebound_win_prob_features),
-                rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
                 ),
                 opponent_action_mask,
                 opponent_intent_context,
@@ -2395,6 +2510,14 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                game_rewards=jnp.sum(
+                    env_out.game_reward * static.training_player_mask[None, :], axis=1
+                ),
+                auxiliary_rewards=jnp.sum(
+                    env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
+                ),
+                team_a_score_delta=env_out.team_a_score_delta.astype(jnp.float32),
+                team_b_score_delta=env_out.team_b_score_delta.astype(jnp.float32),
                 pass_attempts=env_out.pass_attempt.astype(jnp.int8),
                 completed_passes=env_out.completed_pass.astype(jnp.int8),
                 assists=env_out.assist.astype(jnp.int8),
@@ -2469,6 +2592,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             state, selector_metrics = _maybe_apply_deterministic_selector_segment_start(
                 static,
@@ -2494,6 +2618,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             defense_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -2503,6 +2628,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             offense_forward = actor_critic_forward(
                 params,
@@ -2566,6 +2692,12 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
                 offense_reward=_active_sum(jnp.sum(env_out.rewards[:, offense_ids], axis=1)),
                 defense_reward=_active_sum(jnp.sum(env_out.rewards[:, defense_ids], axis=1)),
+                game_reward=_active_sum(jnp.sum(env_out.game_reward[:, offense_ids], axis=1)),
+                auxiliary_reward=_active_sum(
+                    jnp.sum(env_out.auxiliary_reward[:, offense_ids], axis=1)
+                ),
+                team_a_score_delta=_active_sum(env_out.team_a_score_delta),
+                team_b_score_delta=_active_sum(env_out.team_b_score_delta),
                 pass_attempts=_active_sum(env_out.pass_attempt),
                 completed_passes=_active_sum(env_out.completed_pass),
                 assists=_active_sum(env_out.assist),
@@ -2756,6 +2888,10 @@ def summarize_deploy_eval_outputs(
         ),
         "mean_offense_reward_per_episode": _per_episode(totals["offense_reward"]),
         "mean_defense_reward_per_episode": _per_episode(totals["defense_reward"]),
+        "game_reward_total": totals["game_reward"],
+        "auxiliary_reward_total": totals["auxiliary_reward"],
+        "team_a_score_delta_total": totals["team_a_score_delta"],
+        "team_b_score_delta_total": totals["team_b_score_delta"],
         "mean_offense_score": _per_episode(offense_score),
         "mean_defense_score": _per_episode(defense_score),
         "mean_score_margin": _per_episode(offense_score - defense_score),
@@ -3952,6 +4088,26 @@ def summarize_training_step(
     phi_prev_mean = _active_mean(rollout_out.trajectory.phi_prev, rollout_active)
     phi_next_mean = _active_mean(rollout_out.trajectory.phi_next, rollout_active)
     phi_beta_mean = _active_mean(rollout_out.trajectory.phi_beta, rollout_active)
+    game_reward_mean = _active_mean(
+        rollout_out.trajectory.game_rewards,
+        rollout_active,
+    )
+    auxiliary_reward_mean = _active_mean(
+        rollout_out.trajectory.auxiliary_rewards,
+        rollout_active,
+    )
+    team_a_score_delta_total = float(
+        (
+            np.asarray(rollout_out.trajectory.team_a_score_delta, dtype=np.float32)
+            * rollout_active
+        ).sum()
+    )
+    team_b_score_delta_total = float(
+        (
+            np.asarray(rollout_out.trajectory.team_b_score_delta, dtype=np.float32)
+            * rollout_active
+        ).sum()
+    )
     done_rate = _active_mean(rollout_out.trajectory.dones, rollout_active)
     opponent_deterministic_episode_rate = _active_mean(
         rollout_out.trajectory.opponent_deterministic_episode,
@@ -4010,6 +4166,10 @@ def summarize_training_step(
         "phi_prev_mean": phi_prev_mean,
         "phi_next_mean": phi_next_mean,
         "phi_beta_mean": phi_beta_mean,
+        "game_reward_mean": game_reward_mean,
+        "auxiliary_reward_mean": auxiliary_reward_mean,
+        "team_a_score_delta_total": team_a_score_delta_total,
+        "team_b_score_delta_total": team_b_score_delta_total,
         "done_rate": done_rate,
         "opponent_deterministic_episode_rate": opponent_deterministic_episode_rate,
         "mean_return": return_mean,

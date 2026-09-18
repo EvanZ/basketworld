@@ -1,7 +1,7 @@
 # Half-court multi-possession implementation plan
 
-Status: issues #19 and #20 are implemented, acceptance-tested, and accepted.
-Issue #21's clearance and live-switch mechanics are implemented and
+Status: issues #19 through #21 are implemented, acceptance-tested, and
+accepted. Issue #22's observations and game-level rewards are implemented and
 acceptance-tested, pending maintainer approval.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
@@ -80,7 +80,10 @@ This milestone introduces inbounding and clearance before a later full-court env
 
 Start training from random initialization. There is no pretrained-policy or continuation-run requirement.
 
-The proposed primary experiment uses +1 for a win, -1 for a loss, and 0 for a tie, awarded once at actual game termination. Retain a separately selectable point-differential baseline for comparison.
+The primary `win_loss` objective uses +1 for a win, -1 for a loss, and 0 for a
+tie, awarded once at actual game termination. The separately selectable
+`point_differential` objective awards the final fixed-team score difference at
+the same boundary. Both are zero-sum.
 
 For score-potential shaping, define potential from each fixed team's perspective:
 
@@ -90,9 +93,16 @@ Phi_B(state) = -Phi_A(state)
 shaping_A = gamma * Phi_A(next_state) - Phi_A(state)
 ```
 
-Force terminal potential to zero only at the actual end of the game, with the corresponding final adjustment. Preserve potential through ordinary possession changes and rollout boundaries. Test the telescoping sum for gamma=1. If the scale/beta is scheduled across updates, retain the necessary previous potential or otherwise ensure that the schedule does not silently invalidate this property.
+Force terminal potential to zero only at the actual end of the game, with the
+corresponding final adjustment. Preserve the effective beta-weighted potential
+through ordinary possession changes and rollout boundaries. When beta changes
+between updates, subtract the cached prior effective potential and use the new
+beta for the next potential; this preserves telescoping for gamma=1.
 
-Current pass/assist/violation/EP and intent bonuses must be configured explicitly, rather than silently changing the win-plus-score-potential objective. Log raw outcome reward, score changes, phi, and enabled auxiliary terms separately.
+Legacy pass/assist/violation/EP/rebound rewards are disabled in the initial
+multi-possession objective. They can be added only with the explicit
+`multi_possession_aux_rewards_enabled` configuration and are logged separately
+from raw game reward, fixed-team score changes, and phi shaping.
 
 Leave optional rebound reward advances disabled initially. If supported, explicitly settle any possession-scoped ledger once at possession end without treating the game critic as terminal.
 
@@ -170,9 +180,7 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 ## Remaining decisions
 
-1. Potential coefficient scheduling across update boundaries.
-
-Resolve these in the owning issues and update this document before shipping the corresponding behavior.
+No unresolved decisions remain for issues #19 through #22.
 
 ## Deferred
 

@@ -12,6 +12,7 @@ from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     MOVE_ACTION_END,
     MOVE_ACTION_START,
+    MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_END,
     PASS_ACTION_START,
     REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
@@ -133,6 +134,13 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "enable_rebound_reward_redistribution",
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
+    "enable_multi_possession",
+    "multi_possession_limit",
+    "multi_possession_reward_mode",
+    "score_potential_scale",
+    "multi_possession_aux_rewards_enabled",
+    "multi_possession_schema_version",
+    "inbound_deadline_steps",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -156,6 +164,13 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "enable_rebound_reward_redistribution": False,
     "offensive_rebound_reward_advance": 0.4,
     "rebound_reward_once_per_possession": True,
+    "enable_multi_possession": False,
+    "multi_possession_limit": 25,
+    "multi_possession_reward_mode": "win_loss",
+    "score_potential_scale": 1.0,
+    "multi_possession_aux_rewards_enabled": False,
+    "multi_possession_schema_version": 2,
+    "inbound_deadline_steps": 5,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -179,6 +194,13 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "enable_rebound_reward_redistribution": "bool",
     "offensive_rebound_reward_advance": "float",
     "rebound_reward_once_per_possession": "bool",
+    "enable_multi_possession": "bool",
+    "multi_possession_limit": "int",
+    "multi_possession_reward_mode": "str",
+    "score_potential_scale": "float",
+    "multi_possession_aux_rewards_enabled": "bool",
+    "multi_possession_schema_version": "int",
+    "inbound_deadline_steps": "int",
 }
 
 
@@ -289,6 +311,12 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, j
     current_dim = int(flat_obs.shape[-1])
     if current_dim == expected_dim:
         return flat_obs
+
+    if bool(getattr(spec, "multi_possession_features", False)):
+        raise ValueError(
+            "Multi-possession policy observation dim does not match its versioned checkpoint schema: "
+            f"runtime={current_dim}, checkpoint={expected_dim}."
+        )
 
     if str(spec.model_type) == "attention":
         return _adapt_attention_observation_to_spec(flat_obs, spec, jnp)
@@ -936,6 +964,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             selector_obs = _adapt_policy_observation_to_spec(selector_obs, static, spec, jnp)
             policy_state, selector_trace = _maybe_apply_selector_segment_start(
@@ -956,6 +985,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             offense_obs = _adapt_policy_observation_to_spec(offense_obs, static, spec, jnp)
             defense_obs = build_policy_observation_batch_with_role_flag(
@@ -966,6 +996,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
             defense_obs = _adapt_policy_observation_to_spec(defense_obs, static, spec, jnp)
             offense_intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -1018,6 +1049,15 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "defense_values": defense_values,
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
                 "defense_rewards": jnp.sum(env_out.rewards[:, defense_ids], axis=1),
+                "game_rewards": jnp.sum(env_out.game_reward[:, offense_ids], axis=1),
+                "auxiliary_rewards": jnp.sum(
+                    env_out.auxiliary_reward[:, offense_ids], axis=1
+                ),
+                "team_a_score_delta": env_out.team_a_score_delta.astype(jnp.float32),
+                "team_b_score_delta": env_out.team_b_score_delta.astype(jnp.float32),
+                "phi_r_shape": env_out.phi_r_shape.astype(jnp.float32),
+                "phi_prev": env_out.phi_prev.astype(jnp.float32),
+                "phi_next": env_out.phi_next.astype(jnp.float32),
                 "offense_score_delta": (
                     env_out.state.offense_score - policy_state.offense_score
                 ).astype(jnp.float32),
@@ -1116,6 +1156,11 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "completed": completed.astype(np.int8),
         "offense_rewards": np.asarray(trace["offense_rewards"])[:, :take].sum(axis=0),
         "defense_rewards": np.asarray(trace["defense_rewards"])[:, :take].sum(axis=0),
+        "game_rewards": np.asarray(trace["game_rewards"])[:, :take].sum(axis=0),
+        "auxiliary_rewards": np.asarray(trace["auxiliary_rewards"])[:, :take].sum(axis=0),
+        "team_a_score_delta": np.asarray(trace["team_a_score_delta"])[:, :take].sum(axis=0),
+        "team_b_score_delta": np.asarray(trace["team_b_score_delta"])[:, :take].sum(axis=0),
+        "phi_shaping": np.asarray(trace["phi_r_shape"])[:, :take].sum(axis=0),
         "offense_points": np.asarray(trace["offense_score_delta"])[:, :take].sum(axis=0),
         "defense_points": np.asarray(trace["defense_score_delta"])[:, :take].sum(axis=0),
         "pass_attempts": np.asarray(trace["pass_attempts"])[:, :take].sum(axis=0),
@@ -1941,6 +1986,33 @@ def run_native_jax_evaluation(
     for key, value in static_params.items():
         setattr(env, key, value)
     static = build_kernel_static_from_env(env, jnp)
+    static_multi = bool(
+        int(np.asarray(jax.device_get(static.enable_multi_possession)).reshape(-1)[0])
+    )
+    spec_multi = bool(getattr(spec, "multi_possession_features", False))
+    if static_multi != spec_multi:
+        raise ValueError(
+            "JAX checkpoint multi-possession observation schema does not match "
+            f"the evaluation environment (checkpoint={spec_multi}, environment={static_multi})."
+        )
+    checkpoint_schema_version = int(getattr(spec, "observation_schema_version", 1))
+    environment_schema_version = int(
+        np.asarray(
+            jax.device_get(static.multi_possession_schema_version),
+            dtype=np.int32,
+        ).reshape(-1)[0]
+    )
+    if static_multi and (
+        checkpoint_schema_version != int(MULTI_POSSESSION_SCHEMA_VERSION)
+        or environment_schema_version != int(MULTI_POSSESSION_SCHEMA_VERSION)
+    ):
+        raise ValueError(
+            "JAX checkpoint or environment uses an incompatible multi-possession "
+            "observation schema version "
+            f"(checkpoint={checkpoint_schema_version}, "
+            f"environment={environment_schema_version}, "
+            f"supported={MULTI_POSSESSION_SCHEMA_VERSION})."
+        )
     base_phi_beta = float(
         np.asarray(jax.device_get(static.phi_beta), dtype=np.float32).reshape(-1)[0]
     )
@@ -2032,6 +2104,11 @@ def run_native_jax_evaluation(
     all_completed: list[int] = []
     all_offense_rewards: list[float] = []
     all_defense_rewards: list[float] = []
+    all_game_rewards: list[float] = []
+    all_auxiliary_rewards: list[float] = []
+    all_phi_shaping: list[float] = []
+    all_team_a_score_delta: list[float] = []
+    all_team_b_score_delta: list[float] = []
     all_offense_points: list[float] = []
     all_defense_points: list[float] = []
     all_pass_attempts: list[float] = []
@@ -2764,6 +2841,17 @@ def run_native_jax_evaluation(
         all_completed.extend([int(v) for v in stats["completed"].tolist()])
         all_offense_rewards.extend([float(v) for v in stats["offense_rewards"].tolist()])
         all_defense_rewards.extend([float(v) for v in stats["defense_rewards"].tolist()])
+        all_game_rewards.extend([float(v) for v in stats["game_rewards"].tolist()])
+        all_auxiliary_rewards.extend(
+            [float(v) for v in stats["auxiliary_rewards"].tolist()]
+        )
+        all_phi_shaping.extend([float(v) for v in stats["phi_shaping"].tolist()])
+        all_team_a_score_delta.extend(
+            [float(v) for v in stats["team_a_score_delta"].tolist()]
+        )
+        all_team_b_score_delta.extend(
+            [float(v) for v in stats["team_b_score_delta"].tolist()]
+        )
         all_offense_points.extend([float(v) for v in stats["offense_points"].tolist()])
         all_defense_points.extend([float(v) for v in stats["defense_points"].tolist()])
         all_pass_attempts.extend([float(v) for v in stats["pass_attempts"].tolist()])
@@ -2952,6 +3040,11 @@ def run_native_jax_evaluation(
         "mean_steps": _mean(all_steps),
         "offense_reward_per_episode": _mean(all_offense_rewards),
         "defense_reward_per_episode": _mean(all_defense_rewards),
+        "game_reward_per_episode": _mean(all_game_rewards),
+        "auxiliary_reward_per_episode": _mean(all_auxiliary_rewards),
+        "phi_shaping_per_episode": _mean(all_phi_shaping),
+        "team_a_score_delta_per_episode": _mean(all_team_a_score_delta),
+        "team_b_score_delta_per_episode": _mean(all_team_b_score_delta),
         "offense_points_per_episode": _mean(all_offense_points),
         "defense_points_per_episode": _mean(all_defense_points),
         "score_margin_per_episode": _mean(np.asarray(all_offense_points) - np.asarray(all_defense_points)),

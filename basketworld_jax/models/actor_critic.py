@@ -43,6 +43,8 @@ class ActorCriticSpec:
     rebound_win_prob_features: bool = False
     rebound_target_observation_features: bool = True
     rebound_critic_enabled: bool = False
+    multi_possession_features: bool = False
+    observation_schema_version: int = 1
 
 
 def build_actor_critic_spec(
@@ -72,6 +74,8 @@ def build_actor_critic_spec(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     rebound_critic_enabled: bool = False,
+    multi_possession_features: bool = False,
+    observation_schema_version: int = 1,
 ) -> ActorCriticSpec:
     if flat_obs_batch.ndim != 2:
         raise ValueError(
@@ -159,6 +163,8 @@ def build_actor_critic_spec(
         rebound_win_prob_features=bool(rebound_win_prob_features),
         rebound_target_observation_features=bool(rebound_target_observation_features),
         rebound_critic_enabled=bool(rebound_critic_enabled),
+        multi_possession_features=bool(multi_possession_features),
+        observation_schema_version=int(observation_schema_version),
     )
 
 

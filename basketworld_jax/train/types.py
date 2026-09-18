@@ -44,6 +44,10 @@ class TrajectoryBatch(NamedTuple):
     rebound_counterfactual_mask: Any
     rewards: Any
     dones: Any
+    game_rewards: Any
+    auxiliary_rewards: Any
+    team_a_score_delta: Any
+    team_b_score_delta: Any
     phi_r_shape: Any
     phi_prev: Any
     phi_next: Any
@@ -168,6 +172,10 @@ class EvalTrace(NamedTuple):
     full_actions: Any
     rewards: Any
     dones: Any
+    game_rewards: Any
+    auxiliary_rewards: Any
+    team_a_score_delta: Any
+    team_b_score_delta: Any
     pass_attempts: Any
     completed_passes: Any
     assists: Any
@@ -220,6 +228,10 @@ class DeployEvalTotals(NamedTuple):
     completed_episode_steps: Any
     offense_reward: Any
     defense_reward: Any
+    game_reward: Any
+    auxiliary_reward: Any
+    team_a_score_delta: Any
+    team_b_score_delta: Any
     pass_attempts: Any
     completed_passes: Any
     assists: Any

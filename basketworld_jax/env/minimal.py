@@ -29,11 +29,14 @@ TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM = 1
 TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM = 1
 TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM = 2
 TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM = 3
+TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 2
+TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM = 5
 
 
 def token_observation_dims(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ) -> tuple[int, int]:
     """Return player/global token dimensions for the selected observation schema."""
     player_dim = TOKEN_OBS_PLAYER_DIM
@@ -42,10 +45,11 @@ def token_observation_dims(
         player_dim -= TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM
         global_dim -= TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM
     if bool(rebound_win_prob_features):
-        return (
-            player_dim + TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM,
-            global_dim + TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM,
-        )
+        player_dim += TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM
+        global_dim += TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM
+    if bool(multi_possession_features):
+        player_dim += TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM
+        global_dim += TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM
     return player_dim, global_dim
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -83,6 +87,13 @@ REBOUND_TERMINAL_REWARD_MODE_IDS = {
     "last_shot_ep_on_defensive_rebound": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP_ON_DEFENSIVE_REBOUND,
     "last_shot_ep": REBOUND_TERMINAL_REWARD_LAST_SHOT_EP,
 }
+MULTI_POSSESSION_REWARD_WIN_LOSS = 0
+MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL = 1
+MULTI_POSSESSION_REWARD_MODE_IDS = {
+    "win_loss": MULTI_POSSESSION_REWARD_WIN_LOSS,
+    "point_differential": MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL,
+}
+MULTI_POSSESSION_SCHEMA_VERSION = 2
 REBOUND_CONTEST_MODE_GLOBAL = 0
 REBOUND_CONTEST_MODE_LOCAL = 1
 REBOUND_CONTEST_MODE_IDS = {
@@ -260,6 +271,10 @@ class KernelStatic(NamedTuple):
     rebound_reward_once_per_possession: Any
     enable_multi_possession: Any
     multi_possession_limit: Any
+    multi_possession_reward_mode: Any
+    score_potential_scale: Any
+    multi_possession_aux_rewards_enabled: Any
+    multi_possession_schema_version: Any
     inbound_position: Any
     inbound_deadline_steps: Any
 
@@ -355,6 +370,10 @@ class StepBatchOutput(NamedTuple):
     phi_prev: Any
     phi_next: Any
     phi_beta: Any
+    game_reward: Any
+    auxiliary_reward: Any
+    team_a_score_delta: Any
+    team_b_score_delta: Any
     rebound_diagnostics: Any
     possession_ended: Any
     possession_end_reason: Any
@@ -1307,6 +1326,38 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(1, int(getattr(env, "multi_possession_limit", 25))),
             dtype=xp.int32,
         ),
+        multi_possession_reward_mode=xp.asarray(
+            MULTI_POSSESSION_REWARD_MODE_IDS.get(
+                str(
+                    getattr(env, "multi_possession_reward_mode", "win_loss")
+                    or "win_loss"
+                ).strip().lower(),
+                MULTI_POSSESSION_REWARD_WIN_LOSS,
+            ),
+            dtype=xp.int32,
+        ),
+        score_potential_scale=xp.asarray(
+            max(0.0, float(getattr(env, "score_potential_scale", 1.0))),
+            dtype=xp.float32,
+        ),
+        multi_possession_aux_rewards_enabled=xp.asarray(
+            1
+            if bool(getattr(env, "multi_possession_aux_rewards_enabled", False))
+            else 0,
+            dtype=xp.int8,
+        ),
+        multi_possession_schema_version=xp.asarray(
+            int(
+                getattr(
+                    env,
+                    "multi_possession_schema_version",
+                    MULTI_POSSESSION_SCHEMA_VERSION
+                    if bool(getattr(env, "enable_multi_possession", False))
+                    else 1,
+                )
+            ),
+            dtype=xp.int32,
+        ),
         inbound_position=xp.asarray(inbound_position, dtype=xp.int32),
         inbound_deadline_steps=xp.asarray(
             max(1, int(getattr(env, "inbound_deadline_steps", 5))),
@@ -1610,6 +1661,10 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         & valid_targets
     ).astype(jnp.int8)
     masks = masks.at[:, :, PASS_ACTION_START:PASS_ACTION_END].set(pass_masks)
+    active = (~state.episode_ended.astype(jnp.bool_))[:, None, None]
+    masks = masks.at[:, :, 1:].set(
+        masks[:, :, 1:] * active.astype(jnp.int8)
+    )
     return masks
 
 
@@ -2111,27 +2166,44 @@ def _apply_phi_shaping_single(
     done,
     jnp,
 ):
-    # #22 replaces the current possession-local potential with a game score
-    # potential.  Do not attach the old role-relative shaping signal to the
-    # newly switched offense in the interim.
-    enabled = static.enable_phi_shaping.astype(jnp.bool_) & (~static.enable_multi_possession.astype(jnp.bool_))
+    enabled = static.enable_phi_shaping.astype(jnp.bool_)
+    multi = static.enable_multi_possession.astype(jnp.bool_)
     phi_prev = previous_state.cached_phi.astype(jnp.float32)
-    raw_phi_next = _phi_shot_quality_single(static, next_state, jnp)
-    phi_next = jnp.where(done.astype(jnp.bool_), jnp.asarray(0.0, dtype=jnp.float32), raw_phi_next)
-    # The baseline-inbound phase intentionally has no holder yet.  Preserve
-    # the current potential across that implementation boundary for the
-    # legacy path; #22 supplies the multi-possession game potential.
+    legacy_raw_phi_next = _phi_shot_quality_single(static, next_state, jnp)
+    score_phi_next = (
+        static.score_potential_scale.astype(jnp.float32)
+        * (
+            next_state.team_a_score.astype(jnp.float32)
+            - next_state.team_b_score.astype(jnp.float32)
+        )
+    )
+    # In multi-possession mode the cache stores the effective, beta-weighted
+    # team-A potential.  Retaining that exact value across rollout/update
+    # boundaries makes coefficient changes telescope instead of silently
+    # reweighting the previous state with the new beta.
+    multi_phi_next = static.phi_beta.astype(jnp.float32) * score_phi_next
+    legacy_phi_next = jnp.where(
+        done.astype(jnp.bool_),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        legacy_raw_phi_next,
+    )
+    phi_next = jnp.where(multi, multi_phi_next, legacy_phi_next)
     phi_next = jnp.where(
-        static.enable_multi_possession.astype(jnp.bool_)
-        & (next_state.game_phase == GAME_PHASE_AWAITING_INBOUND),
-        phi_prev,
+        done.astype(jnp.bool_),
+        jnp.asarray(0.0, dtype=jnp.float32),
         phi_next,
     )
     r_shape = (static.reward_shaping_gamma.astype(jnp.float32) * phi_next) - phi_prev
-    shaped = static.phi_beta.astype(jnp.float32) * r_shape
+    shaped = jnp.where(
+        multi,
+        r_shape,
+        static.phi_beta.astype(jnp.float32) * r_shape,
+    )
     per_team = shaped / static.offense_ids.shape[0]
-    offense_mask = _active_role_encoding_single(static, next_state, jnp) > 0.0
-    shaped_rewards = rewards + jnp.where(offense_mask, per_team, -per_team)
+    team_a_mask = static.role_encoding > 0.0
+    active_offense_mask = _active_role_encoding_single(static, next_state, jnp) > 0.0
+    reward_positive_mask = jnp.where(multi, team_a_mask, active_offense_mask)
+    shaped_rewards = rewards + jnp.where(reward_positive_mask, per_team, -per_team)
     next_state = _replace_state(
         next_state,
         cached_phi=jnp.where(enabled, phi_next, next_state.cached_phi),
@@ -2143,6 +2215,78 @@ def _apply_phi_shaping_single(
         jnp.where(enabled, phi_prev, jnp.asarray(0.0, dtype=jnp.float32)),
         jnp.where(enabled, phi_next, jnp.asarray(0.0, dtype=jnp.float32)),
         jnp.where(enabled, static.phi_beta.astype(jnp.float32), jnp.asarray(0.0, dtype=jnp.float32)),
+    )
+
+
+def _fixed_team_reward_vector_single(static: KernelStatic, team_a_value, jnp):
+    per_player = team_a_value.astype(jnp.float32) / static.offense_ids.shape[0]
+    return jnp.where(static.role_encoding > 0.0, per_player, -per_player)
+
+
+def _finalize_step_rewards_single(
+    static: KernelStatic,
+    previous_state: KernelState,
+    output: StepBatchOutput,
+    jnp,
+):
+    """Apply fixed-team game rewards and potential shaping exactly once."""
+    multi = static.enable_multi_possession.astype(jnp.bool_)
+    done = output.done.astype(jnp.bool_)
+    score_diff = (
+        output.state.team_a_score.astype(jnp.float32)
+        - output.state.team_b_score.astype(jnp.float32)
+    )
+    terminal_value = jnp.where(
+        static.multi_possession_reward_mode
+        == jnp.asarray(MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL, dtype=jnp.int32),
+        score_diff,
+        jnp.sign(score_diff),
+    )
+    game_reward = jnp.where(
+        multi
+        & done
+        & (~previous_state.episode_ended.astype(jnp.bool_)),
+        _fixed_team_reward_vector_single(static, terminal_value, jnp),
+        jnp.zeros_like(output.rewards),
+    )
+    auxiliary_reward = jnp.where(
+        multi & static.multi_possession_aux_rewards_enabled.astype(jnp.bool_),
+        output.rewards,
+        jnp.where(multi, jnp.zeros_like(output.rewards), output.rewards),
+    )
+    reward_base = jnp.where(multi, game_reward + auxiliary_reward, output.rewards)
+    (
+        next_state,
+        rewards,
+        phi_r_shape,
+        phi_prev,
+        phi_next,
+        phi_beta,
+    ) = _apply_phi_shaping_single(
+        static,
+        previous_state,
+        output.state,
+        reward_base,
+        output.done,
+        jnp,
+    )
+    return output._replace(
+        state=next_state,
+        rewards=rewards,
+        phi_r_shape=phi_r_shape,
+        phi_prev=phi_prev,
+        phi_next=phi_next,
+        phi_beta=phi_beta,
+        game_reward=game_reward,
+        auxiliary_reward=jnp.where(multi, auxiliary_reward, jnp.zeros_like(output.rewards)),
+        team_a_score_delta=(
+            output.state.team_a_score.astype(jnp.float32)
+            - previous_state.team_a_score.astype(jnp.float32)
+        ),
+        team_b_score_delta=(
+            output.state.team_b_score.astype(jnp.float32)
+            - previous_state.team_b_score.astype(jnp.float32)
+        ),
     )
 
 
@@ -2483,6 +2627,75 @@ def build_offense_skill_deltas_batch(static: KernelStatic, state: KernelState, j
     return stacked.reshape(stacked.shape[0], -1).astype(jnp.float32)
 
 
+def build_multi_possession_observation_features_batch(
+    static: KernelStatic,
+    state: KernelState,
+    role_flag_value,
+    jnp,
+) -> tuple[Any, Any]:
+    """Return versioned per-player and global game-context features."""
+    batch_size, n_players, _ = state.positions.shape
+    role_flag = jnp.full((batch_size,), role_flag_value, dtype=jnp.float32)
+    viewer_is_offense = role_flag > 0.0
+    viewer_is_team_a = jnp.where(
+        viewer_is_offense,
+        state.offense_team == TEAM_A,
+        state.offense_team == TEAM_B,
+    )
+    score_diff_a = (
+        state.team_a_score.astype(jnp.float32)
+        - state.team_b_score.astype(jnp.float32)
+    )
+    score_norm = jnp.maximum(
+        3.0 * static.multi_possession_limit.astype(jnp.float32),
+        1.0,
+    )
+    relative_score = jnp.where(viewer_is_team_a, score_diff_a, -score_diff_a) / score_norm
+    possession_limit = jnp.maximum(
+        static.multi_possession_limit.astype(jnp.float32),
+        1.0,
+    )
+    possessions_remaining = jnp.maximum(
+        0.0,
+        possession_limit - state.completed_possessions.astype(jnp.float32),
+    ) / possession_limit
+    clearance_required = (
+        ~state.clearance_achieved.astype(jnp.bool_)
+    ).astype(jnp.float32)
+    inbound_phase = (
+        state.game_phase == GAME_PHASE_AWAITING_INBOUND
+    ).astype(jnp.float32)
+    inbound_countdown = (
+        state.inbound_steps_remaining.astype(jnp.float32)
+        / jnp.maximum(static.inbound_deadline_steps.astype(jnp.float32), 1.0)
+    )
+    globals_vec = jnp.stack(
+        [
+            relative_score,
+            possessions_remaining,
+            clearance_required,
+            inbound_phase,
+            inbound_countdown,
+        ],
+        axis=-1,
+    ).astype(jnp.float32)
+
+    player_ids = jnp.arange(n_players, dtype=jnp.int32)
+    is_inbounder = (
+        (state.inbound_player[:, None] == player_ids[None, :])
+        & (state.inbound_player[:, None] >= 0)
+    ).astype(jnp.float32)
+    on_court = jnp.any(
+        jnp.all(
+            state.positions[:, :, None, :] == static.cell_coords[None, None, :, :],
+            axis=-1,
+        ),
+        axis=-1,
+    ).astype(jnp.float32)
+    players = jnp.stack([is_inbounder, on_court], axis=-1).astype(jnp.float32)
+    return players, globals_vec
+
+
 def build_flat_observation_batch_with_role_flag(
     static: KernelStatic,
     state: KernelState,
@@ -2491,23 +2704,34 @@ def build_flat_observation_batch_with_role_flag(
     *,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     batch_size = state.positions.shape[0]
     role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
-    return jnp.concatenate(
+    parts = [
+        build_observation_vector_batch(
+            static,
+            state,
+            jnp,
+            rebound_win_prob_features=rebound_win_prob_features,
+            rebound_target_observation_features=rebound_target_observation_features,
+        )
+    ]
+    if multi_possession_features:
+        multi_players, multi_globals = build_multi_possession_observation_features_batch(
+            static,
+            state,
+            role_flag_value,
+            jnp,
+        )
+        parts.extend([multi_players.reshape(batch_size, -1), multi_globals])
+    parts.extend(
         [
-            build_observation_vector_batch(
-                static,
-                state,
-                jnp,
-                rebound_win_prob_features=rebound_win_prob_features,
-                rebound_target_observation_features=rebound_target_observation_features,
-            ),
             role_flag,
             build_offense_skill_deltas_batch(static, state, jnp),
-        ],
-        axis=1,
-    ).astype(jnp.float32)
+        ]
+    )
+    return jnp.concatenate(parts, axis=1).astype(jnp.float32)
 
 
 def build_flat_observation_batch(
@@ -2517,6 +2741,7 @@ def build_flat_observation_batch(
     *,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -2525,6 +2750,7 @@ def build_flat_observation_batch(
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
+        multi_possession_features=multi_possession_features,
     )
 
 
@@ -2555,6 +2781,7 @@ def build_token_observation_components_batch(
     *,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     """Build set-observation components matching the production token layout."""
     batch_size, n_players, _ = state.positions.shape
@@ -2680,6 +2907,15 @@ def build_token_observation_components_batch(
     if rebound_win_prob_features:
         global_features.append(rebound_features["orb_prob"])
     globals_vec = jnp.stack(global_features, axis=-1).astype(jnp.float32)
+    if multi_possession_features:
+        multi_players, multi_globals = build_multi_possession_observation_features_batch(
+            static,
+            state,
+            role_flag_value,
+            jnp,
+        )
+        players = jnp.concatenate([players, multi_players], axis=-1)
+        globals_vec = jnp.concatenate([globals_vec, multi_globals], axis=-1)
     role_flag = jnp.full((batch_size, 1), role_flag_value, dtype=jnp.float32)
     return players, globals_vec, role_flag
 
@@ -2692,6 +2928,7 @@ def build_token_observation_batch_with_role_flag(
     *,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     players, globals_vec, role_flag = build_token_observation_components_batch(
         static,
@@ -2700,6 +2937,7 @@ def build_token_observation_batch_with_role_flag(
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
+        multi_possession_features=multi_possession_features,
     )
     return jnp.concatenate(
         [
@@ -2718,6 +2956,7 @@ def build_token_observation_batch(
     *,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     return build_token_observation_batch_with_role_flag(
         static,
@@ -2726,6 +2965,7 @@ def build_token_observation_batch(
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
+        multi_possession_features=multi_possession_features,
     )
 
 
@@ -2738,6 +2978,7 @@ def build_policy_observation_batch_with_role_flag(
     model_type: str,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     if str(model_type) == "attention":
         return build_token_observation_batch_with_role_flag(
@@ -2747,6 +2988,7 @@ def build_policy_observation_batch_with_role_flag(
             jnp,
             rebound_win_prob_features=rebound_win_prob_features,
             rebound_target_observation_features=rebound_target_observation_features,
+            multi_possession_features=multi_possession_features,
         )
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -2755,6 +2997,7 @@ def build_policy_observation_batch_with_role_flag(
         jnp,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
+        multi_possession_features=multi_possession_features,
     )
 
 
@@ -2766,6 +3009,7 @@ def build_policy_observation_batch(
     model_type: str,
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
 ):
     return build_policy_observation_batch_with_role_flag(
         static,
@@ -2775,6 +3019,7 @@ def build_policy_observation_batch(
         model_type=model_type,
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
+        multi_possession_features=multi_possession_features,
     )
 
 
@@ -3436,6 +3681,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             phi_prev=zero_float,
             phi_next=zero_float,
             phi_beta=zero_float,
+            game_reward=zero_rewards,
+            auxiliary_reward=zero_rewards,
+            team_a_score_delta=zero_float,
+            team_b_score_delta=zero_float,
             rebound_diagnostics=zero_rebound_diagnostics,
             possession_ended=zero_flag,
             possession_end_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
@@ -3809,21 +4058,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 pressure_state,
                 episode_ended=pressure_done.astype(pressure_state.episode_ended.dtype),
             )
-            (
-                pressure_state,
-                pressure_rewards,
-                phi_r_shape,
-                phi_prev,
-                phi_next,
-                phi_beta,
-            ) = _apply_phi_shaping_single(
-                static,
-                state,
-                pressure_state,
-                pressure_base_rewards,
-                pressure_done,
-                jnp,
-            )
+            pressure_rewards = pressure_base_rewards
+            phi_r_shape = zero_float
+            phi_prev = zero_float
+            phi_next = zero_float
+            phi_beta = zero_float
             pressure_clearance_event = (
                 static.enable_multi_possession.astype(jnp.bool_)
                 & (~pressure_done)
@@ -3877,6 +4116,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
                 phi_beta=phi_beta,
+                game_reward=zero_rewards,
+                auxiliary_reward=zero_rewards,
+                team_a_score_delta=zero_float,
+                team_b_score_delta=zero_float,
                 rebound_diagnostics=zero_rebound_diagnostics,
                 possession_ended=pressure_possession_ended.astype(jnp.int8),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
@@ -4615,21 +4858,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 final_state,
                 episode_ended=done.astype(final_state.episode_ended.dtype),
             )
-            (
-                final_state,
-                rewards,
-                phi_r_shape,
-                phi_prev,
-                phi_next,
-                phi_beta,
-            ) = _apply_phi_shaping_single(
-                static,
-                state,
-                final_state,
-                rewards,
-                done,
-                jnp,
-            )
+            phi_r_shape = zero_float
+            phi_prev = zero_float
+            phi_next = zero_float
+            phi_beta = zero_float
             potential_assist_event = (assist_valid & shot_active).astype(jnp.int8)
             event_assist_passer = jnp.where(potential_assist_event.astype(jnp.bool_), assist_passer, no_player)
             offense_switched = final_state.offense_team != state.offense_team
@@ -4701,6 +4933,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 phi_prev=phi_prev,
                 phi_next=phi_next,
                 phi_beta=phi_beta,
+                game_reward=zero_rewards,
+                auxiliary_reward=zero_rewards,
+                team_a_score_delta=zero_float,
+                team_b_score_delta=zero_float,
                 rebound_diagnostics=rebound_diagnostics,
                 possession_ended=possession_ended.astype(jnp.int8),
                 possession_end_reason=possession_end_reason,
@@ -4723,7 +4959,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)
 
-    return jax.lax.cond(
+    raw_output = jax.lax.cond(
         state.episode_ended.astype(jnp.bool_),
         _already_done,
         lambda _: jax.lax.cond(
@@ -4734,6 +4970,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         ),
         operand=None,
     )
+    return _finalize_step_rewards_single(static, state, raw_output, jnp)
 
 
 def step_batch_minimal(static: KernelStatic, state: KernelState, actions, rng_keys, jax, jnp):
@@ -5345,6 +5582,10 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "multi_possession_reward_mode",
+        "score_potential_scale",
+        "multi_possession_aux_rewards_enabled",
+        "multi_possession_schema_version",
         "inbound_deadline_steps",
     ):
         if hasattr(args, key):

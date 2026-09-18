@@ -33,6 +33,7 @@ from basketworld_jax.checkpoints import (
 )
 from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.env import (
+    MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_END,
     PASS_ACTION_START,
     token_observation_dims,
@@ -229,6 +230,9 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "multi_possession_reward_mode",
+        "score_potential_scale",
+        "multi_possession_aux_rewards_enabled",
         "inbound_deadline_steps",
     }
 )
@@ -341,6 +345,9 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_counterfactual_positioning_enabled",
     "enable_multi_possession",
     "multi_possession_limit",
+    "multi_possession_reward_mode",
+    "score_potential_scale",
+    "multi_possession_aux_rewards_enabled",
     "inbound_deadline_steps",
 )
 
@@ -916,6 +923,29 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--multi-possession-reward-mode",
+        choices=("win_loss", "point_differential"),
+        default="win_loss",
+        help=(
+            "Terminal fixed-team game objective: +/-1/0 outcome or final "
+            "team-A point differential."
+        ),
+    )
+    parser.add_argument(
+        "--score-potential-scale",
+        type=float,
+        default=1.0,
+        help="Scale for the fixed-team score-difference potential in multi-possession games.",
+    )
+    parser.add_argument(
+        "--multi-possession-aux-rewards-enabled",
+        action="store_true",
+        help=(
+            "Explicitly add the legacy pass/assist/violation/EP/rebound reward "
+            "bundle to the selected multi-possession game objective."
+        ),
+    )
+    parser.add_argument(
         "--rebound-table-model-dir",
         type=str,
         default="",
@@ -1241,6 +1271,33 @@ def validate_train_args(args) -> None:
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
             )
+        reward_mode = str(
+            getattr(args, "multi_possession_reward_mode", "win_loss") or "win_loss"
+        )
+        if reward_mode not in {"win_loss", "point_differential"}:
+            raise SystemExit(
+                "--multi-possession-reward-mode must be 'win_loss' or 'point_differential'."
+            )
+        if float(getattr(args, "score_potential_scale", 1.0)) < 0.0:
+            raise SystemExit("--score-potential-scale must be >= 0.")
+        if bool(getattr(args, "enable_phi_shaping", False)):
+            if bool(getattr(args, "phi_use_ball_handler_only", False)):
+                raise SystemExit(
+                    "--phi-use-ball-handler-only is incompatible with multi-possession score potential shaping."
+                )
+            if float(getattr(args, "phi_blend_weight", 0.0)) != 0.0:
+                raise SystemExit(
+                    "--phi-blend-weight is incompatible with multi-possession score potential shaping."
+                )
+    else:
+        if bool(getattr(args, "multi_possession_aux_rewards_enabled", False)):
+            raise SystemExit(
+                "--multi-possession-aux-rewards-enabled requires --enable-multi-possession."
+            )
+        if str(getattr(args, "multi_possession_reward_mode", "win_loss")) != "win_loss":
+            raise SystemExit(
+                "--multi-possession-reward-mode requires --enable-multi-possession."
+            )
     for key in ("rebound_target_temperature", "rebound_winner_temperature"):
         value = float(getattr(args, key, 1.0))
         if value <= 0.0:
@@ -1420,11 +1477,17 @@ def validate_train_args(args) -> None:
 
 
 def _jax_env_config_from_args(args) -> dict[str, Any]:
-    return {
+    config = {
         key: to_builtin(getattr(args, key))
         for key in JAX_ENV_MLFLOW_PARAM_KEYS
         if hasattr(args, key)
     }
+    config["multi_possession_schema_version"] = (
+        MULTI_POSSESSION_SCHEMA_VERSION
+        if bool(getattr(args, "enable_multi_possession", False))
+        else 1
+    )
+    return config
 
 
 _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
@@ -1437,6 +1500,10 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "rebound_counterfactual_positioning_enabled": False,
     "enable_multi_possession": False,
     "multi_possession_limit": 25,
+    "multi_possession_reward_mode": "win_loss",
+    "score_potential_scale": 1.0,
+    "multi_possession_aux_rewards_enabled": False,
+    "multi_possession_schema_version": 1,
     "inbound_deadline_steps": 5,
 }
 
@@ -1694,9 +1761,11 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
     rebound_target_observation_features = bool(
         getattr(args, "rebound_target_observation_features", True)
     )
+    multi_possession_features = bool(getattr(args, "enable_multi_possession", False))
     token_dim, global_dim = token_observation_dims(
         rebound_win_prob_features,
         rebound_target_observation_features,
+        multi_possession_features,
     )
     return build_actor_critic_spec(
         flat_obs_np,
@@ -1732,6 +1801,10 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         rebound_critic_enabled=bool(getattr(args, "rebound_critic_enabled", False)),
+        multi_possession_features=multi_possession_features,
+        observation_schema_version=(
+            MULTI_POSSESSION_SCHEMA_VERSION if multi_possession_features else 1
+        ),
     )
 
 
@@ -3158,9 +3231,21 @@ def _rollout_phi_reward_component(rollout, static, task_reward_scale: float, jnp
 def _build_reward_component_arrays(rollout, static, task_reward_scale: float, jnp) -> dict[str, Any]:
     phi_reward = _rollout_phi_reward_component(rollout, static, task_reward_scale, jnp)
     task_reward = rollout.trajectory.rewards.astype(jnp.float32) - phi_reward
+    schedule_scale = jnp.asarray(float(task_reward_scale), dtype=jnp.float32)
+    static_scale = jnp.asarray(static.task_reward_scale, dtype=jnp.float32)
     return {
         "task_reward": task_reward,
         "phi_reward": phi_reward,
+        "game_reward": (
+            rollout.trajectory.game_rewards.astype(jnp.float32)
+            * static_scale
+            * schedule_scale
+        ),
+        "auxiliary_reward": (
+            rollout.trajectory.auxiliary_rewards.astype(jnp.float32)
+            * static_scale
+            * schedule_scale
+        ),
         "intent_bonus": jnp.zeros_like(task_reward, dtype=jnp.float32),
     }
 
@@ -3410,6 +3495,24 @@ def _summarize_role_rollout_metrics(
         f"{role}_opponent_mean_reward": opponent_reward_mean,
         f"{role}_learner_reward_total": learner_reward_total,
         f"{role}_opponent_reward_total": opponent_reward_total,
+        f"{role}_game_reward_mean": _active_mean(
+            rollout.trajectory.game_rewards
+        ),
+        f"{role}_game_reward_total": _active_sum(
+            rollout.trajectory.game_rewards
+        ),
+        f"{role}_auxiliary_reward_mean": _active_mean(
+            rollout.trajectory.auxiliary_rewards
+        ),
+        f"{role}_auxiliary_reward_total": _active_sum(
+            rollout.trajectory.auxiliary_rewards
+        ),
+        f"{role}_team_a_score_delta_total": _active_sum(
+            rollout.trajectory.team_a_score_delta
+        ),
+        f"{role}_team_b_score_delta_total": _active_sum(
+            rollout.trajectory.team_b_score_delta
+        ),
         f"{role}_done_rate": _active_mean(dones),
         f"{role}_active_step_count": int(active_count),
         f"{role}_active_step_fraction": _safe_metric_ratio(active_count, total_count),
@@ -3753,6 +3856,7 @@ def run_training_loop(args) -> dict[str, Any]:
         rebound_target_observation_features=bool(
             getattr(args, "rebound_target_observation_features", True)
         ),
+        multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
     )
     action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[:, training_player_ids_jnp, :]
     flat_obs_np = np.asarray(jax.device_get(flat_obs), dtype=np.float32)
@@ -4929,6 +5033,7 @@ def run_train_scaffold(args) -> dict[str, Any]:
         rebound_target_observation_features=bool(
             getattr(args, "rebound_target_observation_features", True)
         ),
+        multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
     )
     policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
     action_masks = build_action_masks_batch(static, state, jnp)[:, training_player_ids_jnp, :]
