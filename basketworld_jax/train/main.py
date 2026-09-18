@@ -227,6 +227,8 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "offensive_rebound_reward_advance",
         "rebound_reward_once_per_possession",
         "rebound_counterfactual_positioning_enabled",
+        "enable_multi_possession",
+        "multi_possession_limit",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -336,6 +338,8 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
     "rebound_counterfactual_positioning_enabled",
+    "enable_multi_possession",
+    "multi_possession_limit",
 )
 
 
@@ -887,6 +891,20 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--enable-multi-possession",
+        action="store_true",
+        help=(
+            "Run a fixed-length half-court game made of multiple possessions. "
+            "Opening possession is sampled 50/50; start templates are disabled."
+        ),
+    )
+    parser.add_argument(
+        "--multi-possession-limit",
+        type=int,
+        default=25,
+        help="Completed possessions per multi-possession game.",
+    )
+    parser.add_argument(
         "--rebound-table-model-dir",
         type=str,
         default="",
@@ -1203,6 +1221,13 @@ def validate_train_args(args) -> None:
             raise SystemExit("--enable-rebounds requires --rebound-table-model-dir.")
         if not Path(rebound_table_model_dir).exists():
             raise SystemExit(f"--rebound-table-model-dir does not exist: {rebound_table_model_dir}")
+    if bool(getattr(args, "enable_multi_possession", False)):
+        if int(getattr(args, "multi_possession_limit", 25)) < 1:
+            raise SystemExit("--multi-possession-limit must be >= 1.")
+        if bool(getattr(args, "start_template_enabled", False)):
+            raise SystemExit(
+                "--start-template-enabled is incompatible with --enable-multi-possession."
+            )
     for key in ("rebound_target_temperature", "rebound_winner_temperature"):
         value = float(getattr(args, key, 1.0))
         if value <= 0.0:
@@ -1397,6 +1422,8 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "offensive_rebound_reward_advance": 0.4,
     "rebound_reward_once_per_possession": True,
     "rebound_counterfactual_positioning_enabled": False,
+    "enable_multi_possession": False,
+    "multi_possession_limit": 25,
 }
 
 

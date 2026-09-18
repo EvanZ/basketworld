@@ -1,6 +1,7 @@
 # Half-court multi-possession implementation plan
 
-Status: planning only; implementation has not started.
+Status: implementation underway; issue #19 establishes the game-state and
+possession-lifecycle foundation. Baseline inbounding remains in issue #20.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
 
@@ -40,7 +41,7 @@ This milestone introduces inbounding and clearance before a later full-court env
 - After release, the inbounder can legally re-enter and become a normal receiver, including under the basket.
 - An inbound timeout or failed pass with no controller produces another dead-ball restart for the appropriate team. A defensive interception starts live possession for the actual interceptor.
 - Define baseline coordinates, blocked-entry handling, event ordering, and lane-counter treatment in the inbound issue before finalizing those mechanics.
-- Explicitly classify violations by the offending team. Current defensive lane violations award the offense a point; their new restart/scoring/counting rule is an open decision, not an automatic switch to the violating defense.
+- Explicitly classify violations by the offending team. A defensive lane violation keeps its existing one-point award, completes the possession, and gives the same offense a baseline inbound; it is counted exactly once and never switches the ball to the violating defense.
 
 ### Clearance
 
@@ -96,6 +97,8 @@ The current rebound launch configurations collect two batches of 512 environment
 
 Introduce an opt-in JAX game mode in which teams retain their identities and alternate offense/defense across multiple possessions at the same hoop. A made basket, defensive rebound, or possession-ending turnover ends a possession; only the configured game limit ends an episode.
 
+The state contract also reserves inbound team/player/reason and clearance fields now. They are populated at a handoff but are not yet playable or enforced; #20 assigns the inbounder and #21 enforces clearance.
+
 Dependencies: none.
 
 ### 2. [baseline inbounding and dead-ball restarts (#20)](https://github.com/EvanZ/basketworld/issues/20)
@@ -146,9 +149,8 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 1. Exact possession-limit default (25 versus a nearby even number), retaining configurability and paired evaluation.
 2. Exact outside-baseline coordinate, legal entry mapping, blocked-entry behavior, and lane-counter treatment during inbounding.
-3. Defensive lane violation scoring, restart ownership, and possession-count behavior.
-4. Same-step priority among legal last-moment release, interception, shot-clock expiration, and game termination.
-5. Potential coefficient scheduling across update boundaries.
+3. Same-step priority among legal last-moment release, interception, shot-clock expiration, and game termination.
+4. Potential coefficient scheduling across update boundaries.
 
 Resolve these in the owning issues and update this document before shipping the corresponding behavior.
 
