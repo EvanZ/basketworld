@@ -1,7 +1,7 @@
 # Half-court multi-possession implementation plan
 
-Status: implementation underway; issue #19 establishes the game-state and
-possession-lifecycle foundation. Baseline inbounding remains in issue #20.
+Status: issue #19's game-state and possession-lifecycle foundation is
+implemented and acceptance-tested. Baseline inbounding remains in issue #20.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
 
@@ -27,7 +27,10 @@ This milestone introduces inbounding and clearance before a later full-court env
 - Made baskets, defensive rebounds, and possession-ending turnovers complete a possession. An offensive rebound extends the current possession.
 - Reset the shot clock and possession-scoped assist/lane/play state for a new possession. Retain the existing offensive-rebound continuation and shot-clock reset behavior.
 - Count completed possessions, including a possession lost during inbounding, exactly once. Resolve the final score before computing the game outcome, and do not start a new inbound after game termination.
-- Use a configurable possession limit, initially around 25. Support odd/even limits; evaluate with paired starting-team swaps. Choose the precise default before the initial launcher is finalized.
+- Use a configurable possession limit with a default of 25. Support odd/even
+  limits; a seeded 50/50 opening-possession draw keeps training fair in
+  expectation, while paired evaluation swaps the starter to remove the
+  remaining odd-game variance.
 - Keep the existing single-possession mode available. Configuration must make mode selection and incompatible combinations explicit.
 
 ### Baseline inbounding
@@ -147,10 +150,9 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 ## Remaining decisions
 
-1. Exact possession-limit default (25 versus a nearby even number), retaining configurability and paired evaluation.
-2. Exact outside-baseline coordinate, legal entry mapping, blocked-entry behavior, and lane-counter treatment during inbounding.
-3. Same-step priority among legal last-moment release, interception, shot-clock expiration, and game termination.
-4. Potential coefficient scheduling across update boundaries.
+1. Exact outside-baseline coordinate, legal entry mapping, blocked-entry behavior, and lane-counter treatment during inbounding.
+2. Same-step priority among legal last-moment release, interception, shot-clock expiration, and game termination.
+3. Potential coefficient scheduling across update boundaries.
 
 Resolve these in the owning issues and update this document before shipping the corresponding behavior.
 
