@@ -1,8 +1,8 @@
 # Half-court multi-possession implementation plan
 
-Status: issues #19 through #21 are implemented, acceptance-tested, and
-accepted. Issue #22's observations and game-level rewards are implemented and
-acceptance-tested, pending maintainer approval.
+Status: issues #19 through #23 are implemented, acceptance-tested, and
+accepted. Issue #24 is integrating evaluation, the development UI, and
+end-to-end validation; it remains open pending maintainer approval.
 
 Parent tracker: [#18](https://github.com/EvanZ/basketworld/issues/18)
 
@@ -21,7 +21,9 @@ This milestone introduces inbounding and clearance before a later full-court env
 ### Teams, spawning, and possessions
 
 - Keep stable team identities, player membership, and scores while offensive/defensive roles change.
-- Use the existing initial spawn and holder selection with start templates disabled. This is the only full spawn during a game.
+- Sample each stable team's players into distinct, neutral on-court cells at game start, before either team has possession. Then assign the 50/50 jump-ball winner and its ball-handler. Do not use offensive spawn-distance or defender-matching rules in this mode. Start templates are disabled. This is the only full spawn during a game.
+- Start the opening possession with the full shot clock; do not randomize its
+  initial value in continuous mode.
 - At each game reset, sample the starting offense with equal probability for either team. Treat this as the result of a jump ball; do not simulate the jump itself. Apply the existing holder-selection logic to the selected offense and record the result for reproducibility and diagnostics.
 - Preserve positions across live possession changes. For dead-ball restarts, relocate only the inbounder; do not reset the remaining formation.
 - Preserve player attributes, including shooting and rebound skills, throughout the game.
@@ -180,6 +182,23 @@ Users can run and inspect full half-court games, compare policies fairly, and di
 Dependencies: [#19](https://github.com/EvanZ/basketworld/issues/19), [#20](https://github.com/EvanZ/basketworld/issues/20), [#21](https://github.com/EvanZ/basketworld/issues/21), [#22](https://github.com/EvanZ/basketworld/issues/22), [#23](https://github.com/EvanZ/basketworld/issues/23).
 
 The individual issues contain detailed scope, primary code areas, and acceptance tests. Each implementation increment owns its focused tests; the final issue covers integration and user-facing validation.
+
+#### #24 implementation checklist
+
+- [x] Carry continuous-game static configuration through checkpoint hydration,
+  native evaluation, and the interactive JAX runtime.
+- [x] Keep policies attached to stable Team A/B rosters while their observed
+  offense/defense role changes possession by possession.
+- [x] Expose score, active offense, possession count, inbound countdown,
+  clearance state, baseline inbounder, and legal re-entry cells in the UI.
+- [x] Disable and explain start-template controls in continuous mode.
+- [x] Pair native-evaluation reset seeds with swapped starters and report
+  completed W/L/T separately from horizon-truncated games.
+- [x] Publish inbound, clearance, turnover-before-clearance, rebound, score,
+  margin, possession, and points-per-possession diagnostics.
+- [x] Complete final focused mechanics, PPO/resume, backend, frontend-build,
+  and legacy-regression validation; request maintainer approval before issue
+  closure.
 
 ## Validation strategy
 

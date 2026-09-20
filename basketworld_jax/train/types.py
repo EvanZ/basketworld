@@ -70,6 +70,8 @@ class TrajectoryBatch(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    possession_ended: Any
+    completed_possession_live_steps: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -107,6 +109,7 @@ class TrajectoryBatch(NamedTuple):
     selector_applied: Any
     selector_fallback_used: Any
     selector_boundary_episode_start: Any
+    selector_boundary_possession_start: Any
     selector_boundary_commitment_timeout: Any
     selector_boundary_completed_pass: Any
     selector_boundary_offensive_rebound: Any
@@ -187,6 +190,8 @@ class EvalTrace(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    possession_ended: Any
+    completed_possession_live_steps: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -250,6 +255,8 @@ class DeployEvalTotals(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    completed_possessions: Any
+    completed_possession_live_steps: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -267,6 +274,7 @@ class DeployEvalTotals(NamedTuple):
     defensive_lane_violations: Any
     selector_applied: Any
     selector_boundary_episode_start: Any
+    selector_boundary_possession_start: Any
     selector_boundary_commitment_timeout: Any
     selector_boundary_completed_pass: Any
     selector_boundary_offensive_rebound: Any

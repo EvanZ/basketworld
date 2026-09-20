@@ -92,6 +92,13 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "enable_rebound_reward_redistribution",
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
+    "enable_multi_possession",
+    "multi_possession_limit",
+    "multi_possession_reward_mode",
+    "score_potential_scale",
+    "multi_possession_aux_rewards_enabled",
+    "multi_possession_schema_version",
+    "inbound_deadline_steps",
 }
 
 
@@ -244,6 +251,13 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "enable_rebound_reward_redistribution": _str_to_bool,
     "offensive_rebound_reward_advance": float,
     "rebound_reward_once_per_possession": _str_to_bool,
+    "enable_multi_possession": _str_to_bool,
+    "multi_possession_limit": int,
+    "multi_possession_reward_mode": str,
+    "score_potential_scale": float,
+    "multi_possession_aux_rewards_enabled": _str_to_bool,
+    "multi_possession_schema_version": int,
+    "inbound_deadline_steps": int,
 }
 
 
@@ -672,6 +686,12 @@ def _resolve_self_play_start_template(
         return [], None, None, None
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
+    runtime_env = getattr(game_state.env, "unwrapped", game_state.env)
+    if bool(getattr(runtime_env, "enable_multi_possession", False)):
+        raise HTTPException(
+            status_code=400,
+            detail="Start templates are disabled for continuous multi-possession games.",
+        )
     library = getattr(game_state, "mlflow_start_template_library", None)
     if not library or not isinstance(library, dict):
         raise HTTPException(
@@ -690,7 +710,7 @@ def _resolve_self_play_start_template(
     if template is None:
         raise HTTPException(status_code=404, detail=f"Unknown start template: {template_id}")
 
-    env = getattr(game_state.env, "unwrapped", game_state.env)
+    env = runtime_env
     original_rng = getattr(env, "_rng", None)
     seed = getattr(request, "template_seed", None)
     if seed is not None:
@@ -775,9 +795,26 @@ def _maybe_apply_app_multisegment_boundary(info: dict | None, done: bool) -> str
     return boundary.get("reason")
 
 
+def _run_uses_multi_possession(client, run_id: str) -> bool:
+    """Read the lightweight setup-mode flag logged with a training run."""
+    try:
+        params = dict(client.get_run(run_id).data.params or {})
+    except Exception as exc:
+        print(f"[list_policies] Failed to read run params for {run_id}: {exc}")
+        return False
+    # Legacy SB3 training logs the bare CLI argument, while JAX training
+    # namespaces environment parameters under ``jax/env/``.
+    return _str_to_bool(
+        params.get(
+            "jax/env/enable_multi_possession",
+            params.get("enable_multi_possession", False),
+        )
+    )
+
+
 @router.post("/api/list_policies")
 def list_policies(request: ListPoliciesRequest):
-    """Return available unified policy filenames for a run."""
+    """Return available policy filenames and lightweight run setup metadata."""
     try:
         try:
             setup_mlflow(verbose=False)
@@ -785,20 +822,24 @@ def list_policies(request: ListPoliciesRequest):
             print(f"[list_policies] MLflow setup warning: {setup_err}")
 
         client = mlflow.tracking.MlflowClient()
+        multi_possession = _run_uses_multi_possession(client, request.run_id)
         try:
             unified_paths = list_policies_from_run(client, request.run_id)
         except Exception as e:
             print(f"[list_policies] Failed to list artifacts for run {request.run_id}: {e}")
-            return {"unified": []}
+            return {"unified": [], "enable_multi_possession": multi_possession}
         if not unified_paths:
-            return {"unified": []}
-        return {"unified": [os.path.basename(p) for p in unified_paths]}
+            return {"unified": [], "enable_multi_possession": multi_possession}
+        return {
+            "unified": [os.path.basename(p) for p in unified_paths],
+            "enable_multi_possession": multi_possession,
+        }
     except Exception as e:
         import traceback
 
         print(f"Error listing policies: {e}")
         traceback.print_exc()
-        return {"unified": []}
+        return {"unified": [], "enable_multi_possession": False}
 
 
 @router.post("/api/init_game")
@@ -953,6 +994,11 @@ async def init_game(request: InitGameRequest):
             optional_params["allow_dunks"] = request.allow_dunks
         if request.dunk_pct is not None:
             optional_params["dunk_pct"] = request.dunk_pct
+        if request.multi_possession_limit is not None:
+            # This is a runtime episode-length choice. It does not alter the
+            # loaded policy; it only controls how many completed possessions
+            # the dev game plays before ending.
+            optional_params["multi_possession_limit"] = request.multi_possession_limit
 
         mlflow_default_env_optional_params = copy.deepcopy(optional_params)
 
@@ -994,6 +1040,12 @@ async def init_game(request: InitGameRequest):
                 role_flag_offense=game_state.role_flag_offense,
                 role_flag_defense=game_state.role_flag_defense,
             )
+            # The JAX runtime canonicalizes multi-possession ownership to
+            # Team A / blue.  Persist its resolved value before any state or
+            # observation is created so a jump-ball winner cannot leak into
+            # the player-vs-opponent mapping.
+            resolved_user_team = game_state.jax_runtime.user_team
+            game_state.user_team = resolved_user_team
             game_state.jax_runtime.reset()
             game_state.env = game_state.jax_runtime.display_env
             game_state.obs = game_state.jax_runtime.observation_dict(

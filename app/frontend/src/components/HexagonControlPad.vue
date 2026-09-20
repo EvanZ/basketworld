@@ -31,6 +31,10 @@ const props = defineProps({
   layoutVariant: {
     type: String,
     default: 'classic',
+  },
+  readOnly: {
+    type: Boolean,
+    default: false,
   }
 });
 
@@ -202,6 +206,7 @@ function getCourtTileFill() {
 }
 
 function selectAction(action) {
+  if (props.readOnly) return;
   emit('action-selected', action);
 }
 </script>
@@ -216,6 +221,7 @@ function selectAction(action) {
         @click="selectAction(button.action)"
         class="action-button hex-action-button"
         :class="{ selected: button.action === selectedAction }"
+        :disabled="readOnly"
         :title="button.action"
       >
         <svg class="hex-tile-bg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
@@ -240,6 +246,7 @@ function selectAction(action) {
         @click="selectAction(action)"
         class="action-button classic-action-button"
         :class="{ selected: action === selectedAction }"
+        :disabled="readOnly"
         :title="action"
       >
         <span class="icon-wrapper" :style="{ transform: `rotate(${getActionVisual(action).rotation + (getActionVisual(action).offset || 0)}deg)` }">
@@ -295,6 +302,11 @@ function selectAction(action) {
   transition: background-color 0.2s, color 0.2s, border-color 0.2s;
 }
 
+.action-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .classic-action-button {
   width: 44px; /* Standardize width */
   height: 44px; /* Standardize height */
@@ -327,14 +339,14 @@ function selectAction(action) {
   vector-effect: non-scaling-stroke;
 }
 
-.hex-action-button:hover {
+.hex-action-button:not(:disabled):hover {
   color: var(--app-accent);
   transform: translate(-50%, -50%) translateY(-1px);
   z-index: 3;
   box-shadow: 0 12px 25px rgba(14, 165, 233, 0.35);
 }
 
-.hex-action-button:hover .hex-tile-bg polygon {
+.hex-action-button:not(:disabled):hover .hex-tile-bg polygon {
   stroke: rgba(56, 189, 248, 0.75);
 }
 
@@ -360,7 +372,7 @@ function selectAction(action) {
   box-shadow: none;
 }
 
-.hex-action-button.selected:hover {
+.hex-action-button.selected:not(:disabled):hover {
   box-shadow: 0 12px 25px rgba(14, 165, 233, 0.35);
 }
 

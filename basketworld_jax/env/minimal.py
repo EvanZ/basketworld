@@ -316,6 +316,9 @@ class KernelState(NamedTuple):
     offense_team: Any
     starting_offense_team: Any
     completed_possessions: Any
+    # Counts only LIVE action ticks in the current possession. Dead-ball
+    # inbound ticks are intentionally excluded.
+    live_possession_steps: Any
     game_phase: Any
     team_a_score: Any
     team_b_score: Any
@@ -377,6 +380,9 @@ class StepBatchOutput(NamedTuple):
     rebound_diagnostics: Any
     possession_ended: Any
     possession_end_reason: Any
+    # The finished possession's live-action duration. Zero for non-boundary
+    # steps and for a possession lost during an inbound before live play.
+    completed_possession_live_steps: Any
     clearance_event: Any
     clearance_elapsed_steps: Any
     turnover_before_clearance: Any
@@ -425,13 +431,18 @@ def build_rebound_diagnostics(
     winner_logits,
     use_local_contest,
     local_eligible,
+    participant_mask,
     jax,
     jnp,
 ) -> ReboundDiagnosticTotals:
     active = rebound_active.astype(jnp.float32)
     offense_mask = role_encoding > 0.0
     defense_mask = ~offense_mask
-    eligible = jnp.where(use_local_contest, local_eligible, jnp.ones_like(local_eligible, dtype=jnp.bool_))
+    eligible = jnp.where(
+        use_local_contest,
+        local_eligible,
+        participant_mask.astype(jnp.bool_),
+    )
     eligible_offense = eligible & offense_mask
     eligible_defense = eligible & defense_mask
     eligible_float = eligible.astype(jnp.float32)
@@ -593,6 +604,7 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "offense_team": TEAM_A,
         "starting_offense_team": TEAM_A,
         "completed_possessions": 0,
+        "live_possession_steps": 0,
         "game_phase": GAME_PHASE_LIVE,
         "team_a_score": float(getattr(env, "offense_score", 0.0)),
         "team_b_score": float(getattr(env, "defense_score", 0.0)),
@@ -772,6 +784,10 @@ def stack_state_snapshots(
         ),
         completed_possessions=xp.asarray(
             np.asarray([int(item.get("completed_possessions", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        live_possession_steps=xp.asarray(
+            np.asarray([int(item.get("live_possession_steps", 0)) for item in snapshots], dtype=np.int32),
             dtype=xp.int32,
         ),
         game_phase=xp.asarray(
@@ -1848,17 +1864,23 @@ def _local_rebound_contest_mask_from_distances(
     target_distances,
     player_player_distances,
     jnp,
+    participant_mask=None,
 ):
     """Return local-contest eligibility for one target in one env row."""
     initial_radius = jnp.maximum(jnp.asarray(0, dtype=jnp.int32), static.rebound_contest_radius.astype(jnp.int32))
     target_distances_i32 = target_distances.astype(jnp.int32)
 
-    radius_eligible = target_distances_i32 <= initial_radius
+    participants = (
+        jnp.ones_like(target_distances_i32, dtype=jnp.bool_)
+        if participant_mask is None
+        else participant_mask.astype(jnp.bool_)
+    )
+    radius_eligible = (target_distances_i32 <= initial_radius) & participants
     found = jnp.any(radius_eligible)
     eligible = jnp.where(
         found,
         radius_eligible,
-        jnp.ones_like(target_distances_i32, dtype=jnp.bool_),
+        participants,
     )
     radius_used = jnp.where(found, initial_radius, jnp.asarray(-1, dtype=jnp.int32))
     fallback_global = ~found
@@ -1897,20 +1919,25 @@ def _rebound_winner_logits_for_positions(
     effective_rebound_distances = rebound_distances - (
         static.rebound_skill_weight * rebound_skill.astype(jnp.float32)
     )
-    global_winner_logits = (
+    raw_global_winner_logits = (
         (-static.rebound_winner_distance_weight * effective_rebound_distances)
         - (static.rebound_basket_position_weight * basket_position_penalty)
     ) / static.rebound_winner_temperature
+    global_winner_logits = jnp.where(
+        player_cell_found,
+        raw_global_winner_logits,
+        jnp.asarray(-1.0e9, dtype=jnp.float32),
+    )
     radius = jnp.maximum(
         jnp.asarray(0, dtype=jnp.int32),
         static.rebound_contest_radius.astype(jnp.int32),
     )
-    radius_eligible = rebound_distances.astype(jnp.int32) <= radius
+    radius_eligible = (rebound_distances.astype(jnp.int32) <= radius) & player_cell_found
     found_eligible = jnp.any(radius_eligible, axis=-1)
     local_eligible = jnp.where(
         found_eligible[..., None],
         radius_eligible,
-        jnp.ones_like(radius_eligible, dtype=jnp.bool_),
+        player_cell_found,
     )
     use_local_contest = (
         (static.rebound_contest_mode == REBOUND_CONTEST_MODE_LOCAL)
@@ -2080,16 +2107,24 @@ def build_rebound_observation_features_batch(
             static.rebound_skill_weight
             * state.rebound_skill.astype(jnp.float32)[..., None]
         )
-        global_winner_logits = (
+        raw_global_winner_logits = (
             (-static.rebound_winner_distance_weight * effective_rebound_distances)
             - (static.rebound_basket_position_weight * basket_position_penalty)
         ) / static.rebound_winner_temperature
+        global_winner_logits = jnp.where(
+            player_cell_found[..., None],
+            raw_global_winner_logits,
+            jnp.asarray(-1.0e9, dtype=jnp.float32),
+        )
 
         radius = jnp.maximum(
             jnp.asarray(0, dtype=jnp.int32),
             static.rebound_contest_radius.astype(jnp.int32),
         )
-        local_eligible = rebound_distances.astype(jnp.int32) <= radius
+        local_eligible = (
+            (rebound_distances.astype(jnp.int32) <= radius)
+            & player_cell_found[..., None]
+        )
         local_has_eligible = jnp.any(local_eligible, axis=1)
         use_local_contest = (
             (static.rebound_contest_mode == REBOUND_CONTEST_MODE_LOCAL)
@@ -2681,8 +2716,12 @@ def build_multi_possession_observation_features_batch(
         0.0,
         possession_limit - state.completed_possessions.astype(jnp.float32),
     ) / possession_limit
+    # Clearance only constrains a live possession. During a dead-ball inbound
+    # the receiving side has not yet established possession to clear, so keep
+    # this feature aligned with the rule and the UI indicator.
     clearance_required = (
-        ~state.clearance_achieved.astype(jnp.bool_)
+        (state.game_phase == GAME_PHASE_LIVE)
+        & (~state.clearance_achieved.astype(jnp.bool_))
     ).astype(jnp.float32)
     inbound_phase = (
         state.game_phase == GAME_PHASE_AWAITING_INBOUND
@@ -3177,7 +3216,9 @@ def _apply_offensive_three_seconds_single(static: KernelStatic, state: KernelSta
 
     has_ball = player_ids == state.ball_holder
     threshold = static.three_second_max_steps
-    non_holder_violation = offense_mask & in_lane & (~has_ball) & (updated_steps >= threshold)
+    # A player may occupy the lane for the configured number of complete
+    # simulation ticks. Remaining for one additional tick is the violation.
+    non_holder_violation = offense_mask & in_lane & (~has_ball) & (updated_steps > threshold)
     holder_violation = (
         offense_mask
         & in_lane
@@ -3363,10 +3404,43 @@ def _return_pending_inbounder_to_court_single(
     return state.positions.at[safe_player].set(updated_position)
 
 
+def _select_inbounder_single(
+    static: KernelStatic,
+    positions,
+    receiving_team,
+    inbound_selection_key,
+    jax,
+    jnp,
+):
+    """Select a closest receiving player, breaking equal distances uniformly."""
+    receiving_ids = jnp.where(
+        receiving_team == TEAM_A,
+        static.offense_ids,
+        static.defense_ids,
+    )
+    distances = _hex_distance(
+        positions[receiving_ids],
+        static.inbound_position[None, :],
+        jnp,
+    )
+    closest_distance = jnp.min(distances)
+    tied_for_closest = distances == closest_distance
+    # There can be more than two equally near teammates. A uniform draw among
+    # all tied candidates generalizes the requested coin flip without using
+    # stable roster order as a hidden tie-break.
+    tie_scores = jax.random.uniform(inbound_selection_key, shape=distances.shape)
+    selected_index = jnp.argmax(
+        jnp.where(tied_for_closest, tie_scores, -jnp.ones_like(tie_scores))
+    )
+    return receiving_ids[selected_index]
+
+
 def _prepare_inbound_positions_single(
     static: KernelStatic,
     state: KernelState,
     receiving_team,
+    inbound_selection_key,
+    jax,
     jnp,
 ):
     restored_positions = _return_pending_inbounder_to_court_single(
@@ -3374,17 +3448,14 @@ def _prepare_inbound_positions_single(
         state,
         jnp,
     )
-    receiving_ids = jnp.where(
-        receiving_team == TEAM_A,
-        static.offense_ids,
-        static.defense_ids,
-    )
-    distances = _hex_distance(
-        restored_positions[receiving_ids],
-        static.inbound_position[None, :],
+    inbounder = _select_inbounder_single(
+        static,
+        restored_positions,
+        receiving_team,
+        inbound_selection_key,
+        jax,
         jnp,
     )
-    inbounder = receiving_ids[jnp.argmin(distances)]
     inbound_positions = restored_positions.at[inbounder].set(
         static.inbound_position
     )
@@ -3490,6 +3561,8 @@ def _finalize_possession_single(
     possession_end_reason,
     next_offense_team,
     requires_inbound,
+    inbound_selection_key,
+    jax,
     jnp,
 ):
     """Advance the game-level state after one completed possession.
@@ -3503,6 +3576,32 @@ def _finalize_possession_single(
     advance = multi & possession_ended
     completed = state.completed_possessions + advance.astype(jnp.int32)
     game_done = advance & (completed >= static.multi_possession_limit)
+    (
+        inbound_key,
+        offense_intent_key,
+        defense_intent_key,
+        intent_visible_key,
+    ) = jax.random.split(inbound_selection_key, 4)
+    next_offense_intent = _sample_role_intent_single(
+        static,
+        static.enable_intent_learning,
+        static.intent_null_prob,
+        offense_intent_key,
+        jax,
+        jnp,
+    )
+    next_defense_intent = _sample_role_intent_single(
+        static,
+        static.enable_defense_intent_learning,
+        static.defense_intent_null_prob,
+        defense_intent_key,
+        jax,
+        jnp,
+    )
+    next_intent_visible_to_defense = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & (jax.random.uniform(intent_visible_key) < static.intent_visible_to_defense_prob)
+    ).astype(jnp.int8)
     awaiting_inbound = advance & (~game_done) & requires_inbound.astype(jnp.bool_)
     live_handoff = advance & (~game_done) & (~requires_inbound.astype(jnp.bool_))
     (
@@ -3513,6 +3612,8 @@ def _finalize_possession_single(
         static,
         state,
         next_offense_team,
+        inbound_key,
+        jax,
         jnp,
     )
     boundary_positions = jnp.where(
@@ -3549,37 +3650,41 @@ def _finalize_possession_single(
         assist_passer=jnp.where(reset_possession_state, jnp.asarray(-1, dtype=jnp.int32), state.assist_passer),
         assist_recipient=jnp.where(reset_possession_state, jnp.asarray(-1, dtype=jnp.int32), state.assist_recipient),
         assist_expires_at=jnp.where(reset_possession_state, jnp.asarray(-1, dtype=jnp.int32), state.assist_expires_at),
-        intent_index=jnp.where(reset_possession_state, jnp.asarray(0, dtype=jnp.int32), state.intent_index),
-        intent_active=jnp.where(reset_possession_state, jnp.asarray(0, dtype=jnp.int8), state.intent_active),
-        intent_age=jnp.where(reset_possession_state, jnp.asarray(0, dtype=jnp.int32), state.intent_age),
+        # A multi-possession boundary creates a fresh offensive segment. This
+        # provisional sampled intent keeps the new offense conditioned during
+        # an inbound and lets the learned selector replace it on that team's
+        # first action tick.
+        intent_index=jnp.where(advance, next_offense_intent["index"], state.intent_index),
+        intent_active=jnp.where(advance, next_offense_intent["active"], state.intent_active),
+        intent_age=jnp.where(advance, next_offense_intent["age"], state.intent_age),
         intent_commitment_remaining=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int32),
+            advance,
+            next_offense_intent["commitment_remaining"],
             state.intent_commitment_remaining,
         ),
         intent_visible_to_defense=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int8),
+            advance,
+            next_intent_visible_to_defense,
             state.intent_visible_to_defense,
         ),
         defense_intent_index=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int32),
+            advance,
+            next_defense_intent["index"],
             state.defense_intent_index,
         ),
         defense_intent_active=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int8),
+            advance,
+            next_defense_intent["active"],
             state.defense_intent_active,
         ),
         defense_intent_age=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int32),
+            advance,
+            next_defense_intent["age"],
             state.defense_intent_age,
         ),
         defense_intent_commitment_remaining=jnp.where(
-            reset_possession_state,
-            jnp.asarray(0, dtype=jnp.int32),
+            advance,
+            next_defense_intent["commitment_remaining"],
             state.defense_intent_commitment_remaining,
         ),
         rebound_reward_advance_paid=jnp.where(
@@ -3589,6 +3694,11 @@ def _finalize_possession_single(
         ),
         offense_team=jnp.where(advance, next_offense_team.astype(jnp.int8), state.offense_team),
         completed_possessions=completed,
+        live_possession_steps=jnp.where(
+            advance,
+            jnp.asarray(0, dtype=jnp.int32),
+            state.live_possession_steps,
+        ),
         game_phase=jnp.where(
             awaiting_inbound,
             jnp.asarray(GAME_PHASE_AWAITING_INBOUND, dtype=jnp.int8),
@@ -3647,7 +3757,12 @@ def _finalize_possession_single(
         ),
         episode_ended=jnp.where(game_done, jnp.asarray(1, dtype=jnp.int8), state.episode_ended),
     )
-    return next_state, game_done, possession_ended
+    completed_possession_live_steps = jnp.where(
+        advance,
+        state.live_possession_steps.astype(jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    return next_state, game_done, possession_ended, completed_possession_live_steps
 
 
 def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key, jax, jnp):
@@ -3710,23 +3825,24 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             rebound_diagnostics=zero_rebound_diagnostics,
             possession_ended=zero_flag,
             possession_end_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+            completed_possession_live_steps=zero_steps,
             clearance_event=zero_flag,
             clearance_elapsed_steps=zero_steps,
             turnover_before_clearance=zero_flag,
         )
 
     def _awaiting_inbound(_):
-        pass_key, interceptor_key, move_key = jax.random.split(key, 3)
+        pass_key, interceptor_key, move_key, inbound_selection_key = jax.random.split(key, 4)
         n_players = state.positions.shape[0]
         player_ids = jnp.arange(n_players, dtype=jnp.int32)
         safe_inbounder = jnp.clip(state.inbound_player, 0, n_players - 1)
         countdown_state = _replace_state(
             state,
             step_count=state.step_count + 1,
-            shot_clock=jnp.maximum(
-                jnp.asarray(0, dtype=jnp.int32),
-                state.shot_clock - 1,
-            ),
+            # The inbound five-count is independent of the shot clock.  The
+            # shot clock starts only once an eligible teammate catches the
+            # inbound pass and live possession is established.
+            shot_clock=state.shot_clock,
             inbound_steps_remaining=jnp.maximum(
                 jnp.asarray(0, dtype=jnp.int32),
                 state.inbound_steps_remaining - 1,
@@ -3848,23 +3964,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             & (~invalid_release)
             & (countdown_state.inbound_steps_remaining <= 0)
         )
-        shot_clock_expired = (
-            (~valid_release)
-            & (~invalid_release)
-            & (~deadline_expired)
-            & (countdown_state.shot_clock <= 0)
-        )
-        inbound_violation = (
-            invalid_release | deadline_expired | shot_clock_expired
-        )
+        inbound_violation = invalid_release | deadline_expired
         violation_reason = jnp.where(
             invalid_release,
             jnp.asarray(TURNOVER_REASON_INBOUND_INVALID_PASS, dtype=jnp.int32),
-            jnp.where(
-                deadline_expired,
-                jnp.asarray(TURNOVER_REASON_INBOUND_TIMEOUT, dtype=jnp.int32),
-                jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
-            ),
+            jnp.asarray(TURNOVER_REASON_INBOUND_TIMEOUT, dtype=jnp.int32),
         )
         event_receiver = jnp.where(is_pass, receiver, no_player)
         base_output = _already_done(None)._replace(
@@ -3923,7 +4027,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 moved_state,
                 ball_holder=interceptor,
             )
-            final_state, game_done, possession_ended = _finalize_possession_single(
+            (
+                final_state,
+                game_done,
+                possession_ended,
+                completed_possession_live_steps,
+            ) = _finalize_possession_single(
                 static,
                 turnover_state,
                 possession_ended=jnp.asarray(True),
@@ -3933,6 +4042,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 ),
                 next_offense_team=1 - moved_state.offense_team,
                 requires_inbound=jnp.asarray(False),
+                inbound_selection_key=inbound_selection_key,
+                jax=jax,
                 jnp=jnp,
             )
             clearance_event = (
@@ -3960,6 +4071,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     POSSESSION_END_TURNOVER,
                     dtype=jnp.int32,
                 ),
+                completed_possession_live_steps=completed_possession_live_steps,
                 clearance_event=clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=jnp.where(
                     clearance_event,
@@ -3976,7 +4088,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
 
         def _inbound_violation(_):
-            final_state, game_done, possession_ended = _finalize_possession_single(
+            (
+                final_state,
+                game_done,
+                possession_ended,
+                completed_possession_live_steps,
+            ) = _finalize_possession_single(
                 static,
                 moved_state,
                 possession_ended=jnp.asarray(True),
@@ -3986,6 +4103,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 ),
                 next_offense_team=1 - moved_state.offense_team,
                 requires_inbound=jnp.asarray(True),
+                inbound_selection_key=inbound_selection_key,
+                jax=jax,
                 jnp=jnp,
             )
             return base_output._replace(
@@ -4004,6 +4123,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     POSSESSION_END_INBOUND_VIOLATION,
                     dtype=jnp.int32,
                 ),
+                completed_possession_live_steps=completed_possession_live_steps,
                 turnover_before_clearance=(
                     ~state.clearance_achieved.astype(jnp.bool_)
                 ).astype(jnp.int8),
@@ -4027,10 +4147,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         )
 
     def _run_active(_):
-        pressure_key, action_key, move_key = jax.random.split(key, 3)
+        pressure_key, action_key, move_key, inbound_selection_key = jax.random.split(key, 4)
         next_state = _replace_state(
             state,
             step_count=state.step_count + 1,
+            live_possession_steps=state.live_possession_steps + jnp.asarray(1, dtype=jnp.int32),
             episode_ended=jnp.asarray(0, dtype=state.episode_ended.dtype),
         )
         next_state = advance_intent_clock_single(static, next_state, jnp)
@@ -4062,13 +4183,23 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 ball_holder=pressure_holder,
                 rebound_reward_advance_paid=zero_float,
             )
-            pressure_state, pressure_game_done, pressure_possession_ended = _finalize_possession_single(
+            (
+                pressure_state,
+                pressure_game_done,
+                pressure_possession_ended,
+                pressure_completed_possession_live_steps,
+            ) = _finalize_possession_single(
                 static,
                 pressure_state,
                 possession_ended=jnp.asarray(True),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
                 next_offense_team=1 - next_state.offense_team,
-                requires_inbound=jnp.asarray(False),
+                # A defender-pressure turnover is a forced/dead-ball change of
+                # possession.  The receiving team must restart from a baseline
+                # inbound, unlike an intercepted pass which stays live.
+                requires_inbound=jnp.asarray(True),
+                inbound_selection_key=inbound_selection_key,
+                jax=jax,
                 jnp=jnp,
             )
             pressure_done = jnp.where(
@@ -4145,6 +4276,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_diagnostics=zero_rebound_diagnostics,
                 possession_ended=pressure_possession_ended.astype(jnp.int8),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
+                completed_possession_live_steps=pressure_completed_possession_live_steps,
                 clearance_event=pressure_clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=jnp.where(
                     pressure_clearance_event,
@@ -4478,10 +4610,19 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_distances
                 - (static.rebound_skill_weight * final_state.rebound_skill.astype(jnp.float32))
             )
-            global_winner_logits = (
+            raw_global_winner_logits = (
                 (-static.rebound_winner_distance_weight * effective_rebound_distances)
                 - (static.rebound_basket_position_weight * basket_position_penalty)
             ) / static.rebound_winner_temperature
+            # Rebounds are resolved after simultaneous movement. A player who
+            # entered the court on this shot tick may contend; a still-outside
+            # inbounder cannot be assigned a rebound through the safe-cell
+            # fallback used for distance-table lookups.
+            global_winner_logits = jnp.where(
+                player_cell_found,
+                raw_global_winner_logits,
+                jnp.asarray(-1.0e9, dtype=jnp.float32),
+            )
             player_player_distances = static.cell_distance_matrix[
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[0] - 1)[:, None],
                 jnp.clip(safe_player_cell_idx, 0, static.cell_distance_matrix.shape[1] - 1)[None, :],
@@ -4491,6 +4632,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_distances.astype(jnp.int32),
                 player_player_distances,
                 jnp,
+                participant_mask=player_cell_found,
             )
             local_winner_logits = jnp.where(
                 local_eligible,
@@ -4552,7 +4694,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 eligible_for_credit = jnp.where(
                     use_local_contest,
                     local_eligible,
-                    jnp.ones_like(local_eligible, dtype=jnp.bool_),
+                    player_cell_found,
                 )
                 signal_mask = (
                     rebound_active
@@ -4589,10 +4731,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 basket_weight=static.rebound_basket_position_weight,
                 skill_weight=static.rebound_skill_weight,
                 temperature=static.rebound_winner_temperature,
-                global_winner_logits=global_winner_logits,
+                global_winner_logits=raw_global_winner_logits,
                 winner_logits=winner_logits,
                 use_local_contest=use_local_contest,
                 local_eligible=local_eligible,
+                participant_mask=player_cell_found,
                 jax=jax,
                 jnp=jnp,
             )
@@ -4862,13 +5005,20 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     & (~rebound_enabled)
                 )
             )
-            final_state, multi_game_done, possession_ended = _finalize_possession_single(
+            (
+                final_state,
+                multi_game_done,
+                possession_ended,
+                completed_possession_live_steps,
+            ) = _finalize_possession_single(
                 static,
                 final_state,
                 possession_ended=possession_ended,
                 possession_end_reason=possession_end_reason,
                 next_offense_team=next_offense_team,
                 requires_inbound=requires_inbound,
+                inbound_selection_key=inbound_selection_key,
+                jax=jax,
                 jnp=jnp,
             )
             done = jnp.where(
@@ -4962,6 +5112,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 rebound_diagnostics=rebound_diagnostics,
                 possession_ended=possession_ended.astype(jnp.int8),
                 possession_end_reason=possession_end_reason,
+                completed_possession_live_steps=completed_possession_live_steps,
                 clearance_event=clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=jnp.where(
                     clearance_event,
@@ -5162,6 +5313,12 @@ def _sample_clamped_probabilities(mean, std, shape, key, jax, jnp):
 
 
 def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
+    """Sample the legacy single-possession opening formation.
+
+    The configured offense spawn and defender-matching rules are intentionally
+    retained here. Continuous multi-possession games use the separate neutral
+    opening sampler below.
+    """
     offense_count = int(static.offense_ids.shape[0])
     cell_count = int(static.cell_coords.shape[0])
     offense_key, match_key, defense_key = jax.random.split(key, 3)
@@ -5200,6 +5357,33 @@ def _sample_reset_positions_single(static: KernelStatic, key, jax, jnp):
     positions = positions.at[static.offense_ids].set(static.cell_coords[offense_cell_indices])
     positions = positions.at[static.defense_ids].set(static.cell_coords[defense_cell_indices])
     return positions
+
+
+def _sample_neutral_opening_positions_single(static: KernelStatic, key, jax, jnp):
+    """Sample a non-overlapping layout before either team has possession.
+
+    A continuous half-court game begins with a simulated jump ball.  There is
+    no offense or defense while those opening locations are drawn, so this
+    deliberately ignores the legacy offensive-distance and defender-matching
+    spawn rules. The basket cell remains excluded just as it is in normal
+    reset placement. A tiny custom court falls back to all playable cells.
+    """
+    n_players = int(static.role_encoding.shape[0])
+    cell_count = int(static.cell_coords.shape[0])
+    non_basket_mask = static.non_basket_cell_mask.astype(jnp.bool_)
+    legal_mask = jnp.where(
+        jnp.sum(non_basket_mask.astype(jnp.int32)) >= n_players,
+        non_basket_mask,
+        jnp.ones((cell_count,), dtype=jnp.bool_),
+    )
+    cell_indices = _sample_unique_indices_from_mask(
+        legal_mask,
+        n_players,
+        key,
+        jax,
+        jnp,
+    )
+    return static.cell_coords[cell_indices]
 
 
 def _sample_start_template_positions_single(static: KernelStatic, template_index, key, jax, jnp):
@@ -5318,12 +5502,20 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     defense_dunk_key = jax.random.fold_in(dunk_key, TEAM_B)
     starting_team_key = jax.random.fold_in(shot_clock_key, TEAM_B)
 
-    shot_clock = jax.random.randint(
+    sampled_shot_clock = jax.random.randint(
         shot_clock_key,
         shape=(),
         minval=static.shot_clock_min,
         maxval=static.shot_clock_max + 1,
         dtype=jnp.int32,
+    )
+    # A continuous game begins with a fresh full possession, matching every
+    # later possession boundary. Keep the legacy random opening clock in
+    # single-possession mode (and still consume its key for reproducibility).
+    shot_clock = jnp.where(
+        static.enable_multi_possession.astype(jnp.bool_),
+        static.shot_clock_max.astype(jnp.int32),
+        sampled_shot_clock,
     )
     layup_samples = _sample_clamped_probabilities(
         static.base_layup_pct,
@@ -5453,8 +5645,20 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         gaussian_rebound_skill_specialist,
     )
 
-    positions = _sample_reset_positions_single(static, positions_key, jax, jnp)
-    holder_offset = jax.random.randint(holder_key, shape=(), minval=0, maxval=offense_count, dtype=jnp.int32)
+    # Continuous games sample neutral positions first, then use the 50/50
+    # draw to decide which stable team won the simulated jump ball. The legacy
+    # offense/defense reset formation remains unchanged.
+    positions = jax.lax.cond(
+        static.enable_multi_possession.astype(jnp.bool_),
+        lambda _: _sample_neutral_opening_positions_single(static, positions_key, jax, jnp),
+        lambda _: _sample_reset_positions_single(
+            static,
+            positions_key,
+            jax,
+            jnp,
+        ),
+        operand=None,
+    )
     sampled_starting_team = jnp.where(
         jax.random.bernoulli(starting_team_key),
         jnp.asarray(TEAM_B, dtype=jnp.int8),
@@ -5465,6 +5669,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         sampled_starting_team,
         jnp.asarray(TEAM_A, dtype=jnp.int8),
     )
+    holder_offset = jax.random.randint(holder_key, shape=(), minval=0, maxval=offense_count, dtype=jnp.int32)
     starting_ids = jnp.where(
         offense_team == TEAM_A,
         static.offense_ids,
@@ -5485,6 +5690,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     template_index = jnp.argmax((template_draw <= template_cdf).astype(jnp.int32)).astype(jnp.int32)
     use_template = (
         static.start_template_enabled.astype(jnp.bool_)
+        & (~static.enable_multi_possession.astype(jnp.bool_))
         & (jax.random.uniform(template_draw_key) < static.start_template_prob)
     )
     template_positions, template_ball_holder = _sample_start_template_positions_single(
@@ -5526,7 +5732,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         static.enable_intent_learning.astype(jnp.bool_)
         & (jax.random.uniform(intent_visible_key) < static.intent_visible_to_defense_prob)
     )
-    return KernelState(
+    initial_state = KernelState(
         positions=positions,
         ball_holder=ball_holder,
         shot_clock=shot_clock,
@@ -5560,6 +5766,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         offense_team=offense_team,
         starting_offense_team=offense_team,
         completed_possessions=jnp.asarray(0, dtype=jnp.int32),
+        live_possession_steps=jnp.asarray(0, dtype=jnp.int32),
         game_phase=jnp.asarray(GAME_PHASE_LIVE, dtype=jnp.int8),
         team_a_score=jnp.asarray(0.0, dtype=jnp.float32),
         team_b_score=jnp.asarray(0.0, dtype=jnp.float32),
@@ -5567,9 +5774,27 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         inbound_player=jnp.asarray(-1, dtype=jnp.int32),
         inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
         inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
-        # The opening possession is already live; clearing is required only
-        # after a possession switch.
+        # This is finalized below from the jump-ball winner's actual cell.
+        # Keep the provisional value valid for the legacy mode as well.
         clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
+    )
+    # Opening possession follows the same clearance invariant as a live
+    # change of possession: the jump-ball winner must clear if they control
+    # the ball inside the arc, while a winner already beyond the arc is
+    # genuinely clear. Legacy single-possession resets do not use clearance.
+    opening_holder_cleared = _holder_controls_three_point_single(
+        static,
+        initial_state,
+        offense_team,
+        jnp,
+    )
+    return _replace_state(
+        initial_state,
+        clearance_achieved=jnp.where(
+            static.enable_multi_possession.astype(jnp.bool_),
+            opening_holder_cleared.astype(jnp.int8),
+            jnp.asarray(1, dtype=jnp.int8),
+        ),
     )
 
 

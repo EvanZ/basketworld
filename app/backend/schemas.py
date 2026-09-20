@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ReboundSkillSamplingSetup(BaseModel):
@@ -31,6 +31,7 @@ class InitGameRequest(BaseModel):
     defender_spawn_distance: int | None = None
     allow_dunks: bool | None = None
     dunk_pct: float | None = None
+    multi_possession_limit: int | None = Field(default=None, ge=1)
 
 
 class TemplateBootstrapRequest(BaseModel):
@@ -140,6 +141,16 @@ class SaveEpisodeRequest(BaseModel):
     frames: List[str]  # Base64-encoded PNG images
     durations: Optional[List[float]] = None  # Optional per-frame durations in seconds
     step_duration_ms: Optional[float] = None  # Optional fallback duration per step in milliseconds
+
+
+class EpisodeExportFrameRequest(BaseModel):
+    index: int = Field(ge=0)
+    frame: str = Field(max_length=32 * 1024 * 1024)
+    duration: float = Field(ge=0.01, le=655.35, allow_inf_nan=False)
+
+
+class EpisodeExportFinishRequest(BaseModel):
+    frame_count: int = Field(ge=1)
 
 
 class UpdatePositionRequest(BaseModel):

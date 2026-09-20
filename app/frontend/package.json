@@ -12,6 +12,7 @@
     "@fortawesome/free-regular-svg-icons": "^7.0.0",
     "@fortawesome/free-solid-svg-icons": "^7.0.0",
     "@fortawesome/vue-fontawesome": "^3.1.1",
+    "dseg": "0.46.0",
     "vue": "^3.3.4"
   },
   "devDependencies": {

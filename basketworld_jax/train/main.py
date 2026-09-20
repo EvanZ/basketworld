@@ -3390,6 +3390,10 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
         rollout.trajectory.selector_boundary_episode_start,
         dtype=bool,
     )
+    selector_boundary_possession_start = np.asarray(
+        rollout.trajectory.selector_boundary_possession_start,
+        dtype=bool,
+    )
     selector_boundary_commitment_timeout = np.asarray(
         rollout.trajectory.selector_boundary_commitment_timeout,
         dtype=bool,
@@ -3421,6 +3425,13 @@ def summarize_selector_metrics(rollout, *, num_intents: int, alpha: float, eps: 
         "selector_fallback_count": int(selector_fallback_used.sum()),
         "selector_fallback_rate": _safe_metric_ratio(int(selector_fallback_used.sum()), total_steps),
         "selector_boundary_episode_start_count": int(selector_boundary_episode_start.sum()),
+        "selector_boundary_possession_start_count": int(
+            selector_boundary_possession_start.sum()
+        ),
+        "selector_boundary_possession_start_rate": _safe_metric_ratio(
+            int(selector_boundary_possession_start.sum()),
+            int(selector_applied.sum()),
+        ),
         "selector_boundary_commitment_timeout_count": int(selector_boundary_commitment_timeout.sum()),
         "selector_boundary_commitment_timeout_rate": _safe_metric_ratio(
             int(selector_boundary_commitment_timeout.sum()),
@@ -3893,6 +3904,7 @@ def _print_checkpoint_summary(
         ("selector_usage_rate", metrics.get("selector_usage_rate")),
         ("selector_applied_count", metrics.get("selector_applied_count")),
         ("selector_fallback_count", metrics.get("selector_fallback_count")),
+        ("selector_boundary_possession_start_count", metrics.get("selector_boundary_possession_start_count")),
         ("selector_boundary_commitment_timeout_count", metrics.get("selector_boundary_commitment_timeout_count")),
         ("selector_boundary_completed_pass_count", metrics.get("selector_boundary_completed_pass_count")),
         ("selector_boundary_offensive_rebound_count", metrics.get("selector_boundary_offensive_rebound_count")),

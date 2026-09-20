@@ -673,6 +673,7 @@ def _zero_selector_transition_metrics(state, jnp) -> dict[str, Any]:
         "selector_applied": jnp.zeros(batch_shape, dtype=jnp.int8),
         "selector_fallback_used": jnp.zeros(batch_shape, dtype=jnp.int8),
         "selector_boundary_episode_start": jnp.zeros(batch_shape, dtype=jnp.int8),
+        "selector_boundary_possession_start": jnp.zeros(batch_shape, dtype=jnp.int8),
         "selector_boundary_commitment_timeout": jnp.zeros(batch_shape, dtype=jnp.int8),
         "selector_boundary_completed_pass": jnp.zeros(batch_shape, dtype=jnp.int8),
         "selector_boundary_offensive_rebound": jnp.zeros(batch_shape, dtype=jnp.int8),
@@ -706,7 +707,12 @@ def _selector_segment_application_masks(
     jnp,
 ):
     active = state.intent_active.astype(jnp.bool_)
-    episode_start = active & (state.intent_age == 0)
+    segment_start = active & (state.intent_age == 0)
+    # Game and possession starts both initialize a new offensive intent. Keep
+    # them separate in metrics: continuous games create many possession
+    # starts without ending the underlying episode.
+    game_start = segment_start & (state.step_count == 0)
+    possession_start = segment_start & (state.step_count > 0)
     commitment_timeout = (
         multiselect_enabled
         & active
@@ -725,7 +731,7 @@ def _selector_segment_application_masks(
         & jnp.asarray(offensive_rebound_boundary).astype(jnp.bool_)
         & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
     )
-    eligible = episode_start | commitment_timeout | completed_pass | offensive_rebound
+    eligible = segment_start | commitment_timeout | completed_pass | offensive_rebound
     used = eligible & alpha_used
     # Exploration already happens through epsilon-mixed selector probabilities. A random
     # segment fallback makes multiselect active during warmup and mostly random when
@@ -733,7 +739,8 @@ def _selector_segment_application_masks(
     fallback_used = jnp.zeros_like(used, dtype=jnp.bool_)
     applied = used
     return (
-        episode_start,
+        game_start,
+        possession_start,
         commitment_timeout,
         completed_pass,
         offensive_rebound,
@@ -803,7 +810,8 @@ def _maybe_apply_selector_segment_start(
             jax.random.uniform(alpha_key, shape=(batch_size,)) < alpha
         ) & training_is_offense
         (
-            episode_start,
+            game_start,
+            possession_start,
             commitment_timeout,
             completed_pass,
             offensive_rebound,
@@ -831,7 +839,8 @@ def _maybe_apply_selector_segment_start(
             "selector_used": used.astype(jnp.int8),
             "selector_applied": applied.astype(jnp.int8),
             "selector_fallback_used": fallback_used.astype(jnp.int8),
-            "selector_boundary_episode_start": (applied & episode_start).astype(jnp.int8),
+            "selector_boundary_episode_start": (applied & game_start).astype(jnp.int8),
+            "selector_boundary_possession_start": (applied & possession_start).astype(jnp.int8),
             "selector_boundary_commitment_timeout": (applied & commitment_timeout).astype(jnp.int8),
             "selector_boundary_completed_pass": (applied & completed_pass & (~commitment_timeout)).astype(jnp.int8),
             "selector_boundary_offensive_rebound": (
@@ -896,7 +905,8 @@ def _maybe_apply_deterministic_selector_segment_start(
             ~state.episode_ended.astype(jnp.bool_)
         ) & (build_training_role_flags_batch(static, state, jnp) > 0.0)
         (
-            episode_start,
+            game_start,
+            possession_start,
             commitment_timeout,
             completed_pass,
             offensive_rebound,
@@ -924,7 +934,8 @@ def _maybe_apply_deterministic_selector_segment_start(
             "selector_used": used.astype(jnp.int8),
             "selector_applied": applied.astype(jnp.int8),
             "selector_fallback_used": fallback_used.astype(jnp.int8),
-            "selector_boundary_episode_start": (applied & episode_start).astype(jnp.int8),
+            "selector_boundary_episode_start": (applied & game_start).astype(jnp.int8),
+            "selector_boundary_possession_start": (applied & possession_start).astype(jnp.int8),
             "selector_boundary_commitment_timeout": (applied & commitment_timeout).astype(jnp.int8),
             "selector_boundary_completed_pass": (
                 applied & completed_pass & (~commitment_timeout)
@@ -1186,6 +1197,16 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 turnovers_before_clearance=jnp.where(
                     active_step,
                     env_out.turnover_before_clearance.astype(jnp.int8),
+                    0,
+                ),
+                possession_ended=jnp.where(
+                    active_step,
+                    env_out.possession_ended.astype(jnp.int8),
+                    0,
+                ),
+                completed_possession_live_steps=jnp.where(
+                    active_step,
+                    env_out.completed_possession_live_steps.astype(jnp.int32),
                     0,
                 ),
                 **turnover_metrics,
@@ -1633,6 +1654,16 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 turnovers_before_clearance=jnp.where(
                     active_step,
                     env_out.turnover_before_clearance.astype(jnp.int8),
+                    0,
+                ),
+                possession_ended=jnp.where(
+                    active_step,
+                    env_out.possession_ended.astype(jnp.int8),
+                    0,
+                ),
+                completed_possession_live_steps=jnp.where(
+                    active_step,
+                    env_out.completed_possession_live_steps.astype(jnp.int32),
                     0,
                 ),
                 **turnover_metrics,
@@ -2093,6 +2124,16 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     env_out.turnover_before_clearance.astype(jnp.int8),
                     0,
                 ),
+                possession_ended=jnp.where(
+                    active_step,
+                    env_out.possession_ended.astype(jnp.int8),
+                    0,
+                ),
+                completed_possession_live_steps=jnp.where(
+                    active_step,
+                    env_out.completed_possession_live_steps.astype(jnp.int32),
+                    0,
+                ),
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -2340,6 +2381,10 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                possession_ended=env_out.possession_ended.astype(jnp.int8),
+                completed_possession_live_steps=(
+                    env_out.completed_possession_live_steps.astype(jnp.int32)
+                ),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2471,6 +2516,10 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                possession_ended=env_out.possession_ended.astype(jnp.int8),
+                completed_possession_live_steps=(
+                    env_out.completed_possession_live_steps.astype(jnp.int32)
+                ),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2657,6 +2706,10 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                possession_ended=env_out.possession_ended.astype(jnp.int8),
+                completed_possession_live_steps=(
+                    env_out.completed_possession_live_steps.astype(jnp.int32)
+                ),
                 **shot_metrics,
                 **rebound_metrics,
                 **_build_intent_transition_metrics(state),
@@ -2856,6 +2909,10 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 turnovers_before_clearance=_active_sum(
                     env_out.turnover_before_clearance
                 ),
+                completed_possessions=_active_sum(env_out.possession_ended),
+                completed_possession_live_steps=_active_sum(
+                    env_out.completed_possession_live_steps
+                ),
                 shot_attempts=_active_sum(shot_metrics["shot_attempts"]),
                 shot_makes=_active_sum(shot_metrics["shot_makes"]),
                 shot_dunks=_active_sum(shot_metrics["shot_dunks"]),
@@ -2878,6 +2935,9 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 selector_applied=_active_sum(selector_metrics["selector_applied"]),
                 selector_boundary_episode_start=_active_sum(
                     selector_metrics["selector_boundary_episode_start"]
+                ),
+                selector_boundary_possession_start=_active_sum(
+                    selector_metrics["selector_boundary_possession_start"]
                 ),
                 selector_boundary_commitment_timeout=_active_sum(
                     selector_metrics["selector_boundary_commitment_timeout"]
@@ -3018,6 +3078,14 @@ def summarize_deploy_eval_outputs(
             totals["completed_episode_steps"],
             completed_episode_count,
         ),
+        "completed_possession_count": int(totals["completed_possessions"]),
+        "completed_possession_live_steps": int(
+            totals["completed_possession_live_steps"]
+        ),
+        "mean_live_steps_per_completed_possession": _rate(
+            totals["completed_possession_live_steps"],
+            totals["completed_possessions"],
+        ),
         "mean_offense_reward_per_episode": _per_episode(totals["offense_reward"]),
         "mean_defense_reward_per_episode": _per_episode(totals["defense_reward"]),
         "game_reward_total": totals["game_reward"],
@@ -3068,6 +3136,9 @@ def summarize_deploy_eval_outputs(
         "selector_applied_per_episode": _per_episode(totals["selector_applied"]),
         "selector_boundary_episode_start_count": int(
             totals["selector_boundary_episode_start"]
+        ),
+        "selector_boundary_possession_start_count": int(
+            totals["selector_boundary_possession_start"]
         ),
         "selector_boundary_commitment_timeout_count": int(
             totals["selector_boundary_commitment_timeout"]
@@ -3714,6 +3785,30 @@ def summarize_episode_events(
     return metrics
 
 
+def summarize_completed_possession_pace(
+    possession_ended,
+    completed_possession_live_steps,
+) -> dict[str, float | int]:
+    """Summarize live ticks reported at completed possession boundaries.
+
+    Because the kernel emits the duration only at the boundary, this remains
+    exact when a rollout ends partway through the following possession.
+    """
+    completed = np.asarray(possession_ended, dtype=np.float32)
+    live_steps = np.asarray(completed_possession_live_steps, dtype=np.float32)
+    completed_count = int(completed.sum())
+    total_live_steps = int(live_steps.sum())
+    return {
+        "completed_possession_count": completed_count,
+        "completed_possession_live_steps": total_live_steps,
+        "mean_live_steps_per_completed_possession": (
+            float(total_live_steps / completed_count)
+            if completed_count > 0
+            else 0.0
+        ),
+    }
+
+
 def summarize_shot_type_metrics(
     prefix: str,
     *,
@@ -4309,6 +4404,12 @@ def summarize_training_step(
         "advantage_std": advantage_std,
     }
     summary.update(episode_metrics)
+    summary.update(
+        summarize_completed_possession_pace(
+            rollout_out.trajectory.possession_ended,
+            rollout_out.trajectory.completed_possession_live_steps,
+        )
+    )
     summary["completed_episode_count"] = int(episode_metrics["completed_episodes"])
     summary["completed_active_step_count"] = int(episode_metrics["completed_episode_steps"])
     summary.update(

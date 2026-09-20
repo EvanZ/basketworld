@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import { getShotProbability, getPassStealProbabilities, renderGifFromPngs } from '@/services/api';
+import { captureBoardPng } from '@/utils/boardCapture';
 
 const props = defineProps({
   gameHistory: {
@@ -12,6 +13,12 @@ const props = defineProps({
     default: true,
   },
   showEpisodeOutcome: {
+    type: Boolean,
+    default: true,
+  },
+  // During GIF capture, let the terminal action play before the final game
+  // title replaces it for the held closing frame.
+  showEndGameOutcome: {
     type: Boolean,
     default: true,
   },
@@ -94,6 +101,10 @@ const props = defineProps({
   reboundTargetOverlay: {
     type: Object,
     default: null,
+  },
+  showReboundDistribution: {
+    type: Boolean,
+    default: false,
   },
   hidePassRays: {
     type: Boolean,
@@ -219,8 +230,21 @@ function toIdSet(values) {
 }
 
 function getPlayableOwnershipSets(gameState) {
-  const userIds = toIdSet(gameState?.playable_user_ids);
-  const aiIds = toIdSet(gameState?.playable_ai_ids);
+  // In continuous games Team A/B are stable blue/red rosters while
+  // offense_ids/defense_ids change with possession. Prefer explicit owner
+  // fields, with Team A/B as the multi-possession fallback—never the active
+  // offense/defense role.
+  const isMultiPossession = gameState?.enable_multi_possession === true;
+  const userIds = toIdSet(
+    gameState?.playable_user_ids
+      ?? gameState?.user_player_ids
+      ?? (isMultiPossession ? gameState?.team_a_ids : undefined),
+  );
+  const aiIds = toIdSet(
+    gameState?.playable_ai_ids
+      ?? gameState?.ai_player_ids
+      ?? (isMultiPossession ? gameState?.team_b_ids : undefined),
+  );
   return { userIds, aiIds };
 }
 
@@ -362,6 +386,9 @@ let shotFlashSerial = 0;
 const shotFlashNowMs = ref(0);
 const shotFlashRaf = ref(null);
 const shotFlashTimeout = ref(null);
+const shotAttemptBanner = ref(null);
+let shotAttemptBannerSerial = 0;
+let shotAttemptBannerTimeout = null;
 const lastShotAnimationKey = ref(null);
 const shotJumpPlayerId = ref(null);
 const shotJumpTimeout = ref(null);
@@ -376,6 +403,10 @@ const shotInFlightPlayerId = computed(() => {
 });
 const showShotPressureRing = ref(true);
 const showDefenderPressureShake = ref(true);
+// Pass-success rays add useful diagnostic context, but keep the court uncluttered
+// until the player explicitly asks for them.
+const showPassRays = ref(false);
+const passRaysVisible = computed(() => showPassRays.value && !props.hidePassRays);
 const policyVisibility = ref(new Set()); // Player IDs with policy overlays shown
 const showDownloadMenu = ref(false);
 const downloadMenuRef = ref(null);
@@ -388,6 +419,7 @@ const SHOOT_JUMP_PERIOD_SECONDS = 2.0;
 const SHOOT_JUMP_AMPLITUDE_PX = HEX_RADIUS * 1.0;
 const SHOOT_DUNK_AMPLITUDE_PX = HEX_RADIUS * 1.33;
 const SHOOT_JUMP_SCALE = 1.2;
+const SHOT_ATTEMPT_BANNER_DURATION_MS = 2000;
 const SHOOT_DUNK_SCALE = 1.5;
 
 function clearClickTimeout() {
@@ -399,6 +431,99 @@ function clearClickTimeout() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reboundBannerText(actionResults) {
+  const rebound = actionResults?.rebound
+    || (Array.isArray(actionResults?.rebounds) ? actionResults.rebounds[0] : null);
+  if (!rebound || typeof rebound !== 'object') return null;
+  if (rebound.defensive) return 'Defense Rebound';
+  if (rebound.offensive) return 'Offense Rebound';
+  return null;
+}
+
+function shotAttemptBannerPayload(shotResult, actionResults = null) {
+  if (!shotResult || typeof shotResult !== 'object') return null;
+  const made = Boolean(shotResult.success);
+  const isThree = Boolean(shotResult.is_three ?? shotResult.isThree);
+  return {
+    text: `${made ? 'Made' : 'Missed'} ${isThree ? '3PT' : '2PT'}`,
+    made,
+    kind: made ? 'made' : 'missed',
+    reboundText: made ? null : reboundBannerText(actionResults),
+  };
+}
+
+function turnoverBannerPayload(actionResults) {
+  const turnovers = Array.isArray(actionResults?.turnovers)
+    ? actionResults.turnovers
+    : [];
+  const turnover = turnovers.find((entry) => entry && typeof entry === 'object');
+  if (!turnover) return null;
+  const reason = String(turnover.reason || '').toLowerCase();
+  const isSteal = reason === 'steal';
+  // The runtime records an offensive three-seconds violation as the turnover
+  // reason and also supplies the lane-violation detail for the court overlay.
+  const isLaneViolation = reason === 'offensive_three_seconds'
+    || reason === 'offensive_lane_violation'
+    || Boolean(actionResults?.offensive_lane_violations?.length);
+  return {
+    text: isSteal ? 'Steal' : (isLaneViolation ? 'Turnover - Lane Violation' : 'Turnover'),
+    made: false,
+    kind: isSteal ? 'steal' : 'turnover',
+    reboundText: null,
+  };
+}
+
+function defensiveLaneViolationBannerPayload(actionResults) {
+  if (!Array.isArray(actionResults?.defensive_lane_violations)
+    || actionResults.defensive_lane_violations.length === 0) {
+    return null;
+  }
+  return {
+    text: 'Turnover - Illegal Defense',
+    made: false,
+    kind: 'turnover',
+    reboundText: null,
+  };
+}
+
+function shotAttemptBannerPayloadForState(state) {
+  const actionResults = state?.last_action_results;
+  const shots = actionResults?.shots;
+  const firstShot = shots && typeof shots === 'object'
+    ? Object.values(shots).find((result) => result && typeof result === 'object')
+    : null;
+  return shotAttemptBannerPayload(firstShot, actionResults)
+    ?? turnoverBannerPayload(actionResults)
+    ?? defensiveLaneViolationBannerPayload(actionResults);
+}
+
+function clearShotAttemptBanner() {
+  if (shotAttemptBannerTimeout) {
+    clearTimeout(shotAttemptBannerTimeout);
+    shotAttemptBannerTimeout = null;
+  }
+  shotAttemptBanner.value = null;
+}
+
+function triggerShotAttemptBanner(shotResult, actionResults = null) {
+  const payload = shotAttemptBannerPayload(shotResult, actionResults);
+  if (!payload) return;
+  triggerOutcomeBanner(payload);
+}
+
+function triggerOutcomeBanner(payload) {
+  if (!payload) return;
+  clearShotAttemptBanner();
+  shotAttemptBanner.value = {
+    ...payload,
+    key: ++shotAttemptBannerSerial,
+  };
+  shotAttemptBannerTimeout = setTimeout(() => {
+    shotAttemptBanner.value = null;
+    shotAttemptBannerTimeout = null;
+  }, SHOT_ATTEMPT_BANNER_DURATION_MS);
 }
 
 function closeDownloadMenu() {
@@ -629,6 +754,13 @@ const currentGameState = computed(() => {
   return cloned;
 });
 
+// Derive directly from the visible state as well as the timed latch below.
+// That makes the result readable on the shot frame even if a rapid self-play
+// update arrives before the watcher has had a chance to display its flash.
+const visibleShotAttemptBanner = computed(() =>
+  shotAttemptBanner.value ?? shotAttemptBannerPayloadForState(currentGameState.value),
+);
+
 const allPoliciesVisible = computed(() => {
   const positions = currentGameState.value?.positions;
   if (!positions || positions.length === 0) return false;
@@ -826,6 +958,14 @@ const showReboundTargetOverlay = computed(() => (
   || reboundOverlayRevealProgress.value >= REBOUND_OVERLAY_REVEAL_PROGRESS
 ));
 
+// The live rebound animation is an outcome visualization, not part of the
+// optional probability distribution. Keep the ball flight and winner marker
+// visible after every rebound while allowing the dense cell distribution to
+// remain off by default.
+const shouldShowReboundDistribution = computed(() => (
+  props.showReboundDistribution || !isLiveReboundStepOverlay.value
+));
+
 const reboundTargetCells = computed(() => {
   if (!showReboundTargetOverlay.value) return [];
   if (props.placementMode) return [];
@@ -868,6 +1008,7 @@ const reboundTargetCells = computed(() => {
 });
 
 const hasReboundTargetOverlay = computed(() => {
+  if (!shouldShowReboundDistribution.value) return false;
   if (!showReboundTargetOverlay.value) return false;
   if (reboundTargetCells.value.length > 0) return true;
   return Boolean(sampledReboundTargetKey.value && props.reboundTargetOverlay?.sampled_winner);
@@ -1458,7 +1599,7 @@ const sampledReboundTargetPoint = computed(() => {
 });
 
 const reboundWinnerPoint = computed(() => {
-  if (!hasReboundTargetOverlay.value) return null;
+  if (!showReboundTargetOverlay.value) return null;
   const winner = props.reboundTargetOverlay?.sampled_winner;
   const playerId = Number(winner?.player_id ?? winner?.playerId);
   const pos = currentGameState.value?.positions?.[playerId];
@@ -1473,7 +1614,7 @@ const reboundWinnerPoint = computed(() => {
 
 const reboundResultOverlay = computed(() => {
   const winner = reboundWinnerPoint.value;
-  if (!hasReboundTargetOverlay.value || !winner) return null;
+  if (!winner) return null;
   const start = basketPosition.value;
   const end = { x: winner.x, y: winner.y };
   const target = sampledReboundTargetPoint.value || {
@@ -1861,7 +2002,7 @@ const laneStepIndicatorStacks = computed(() => {
         radius,
         lit: i < clamped,
         color,
-        violation: steps >= maxSteps,
+        violation: steps > maxSteps,
       });
     }
     return {
@@ -1884,6 +2025,63 @@ const laneStepIndicatorStacks = computed(() => {
 });
 
 const shotClockValue = computed(() => currentGameState.value?.shot_clock ?? 0);
+const multiPossessionScoreboard = computed(() => {
+  const state = currentGameState.value;
+  if (!state?.enable_multi_possession) return null;
+  const toScore = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.round(number) : 0;
+  };
+  const stacksByRole = Object.fromEntries(
+    laneStepIndicatorStacks.value.map((stack) => [stack.key, stack]),
+  );
+  const offenseStack = stacksByRole.offense;
+  const defenseStack = stacksByRole.defense;
+  const compactLaneLights = (stack) => {
+    const steps = Math.max(0, Number(stack?.steps ?? 0));
+    const maxSteps = Math.max(1, Number(stack?.maxSteps ?? 3));
+    return {
+      title: `${stack?.label || 'Team'} lane steps: ${steps}/${maxSteps}`,
+      lights: Array.from({ length: 3 }, (_, index) => ({
+        key: `${stack?.key || 'team'}-score-light-${index}`,
+        lit: index < Math.min(steps, 3),
+        violation: steps > maxSteps && index === 2,
+      })),
+    };
+  };
+  const userOnOffense = state.offense_label === 'user';
+  return {
+    completedPossessions: Number(state.completed_possessions ?? 0),
+    possessionLimit: Number(state.multi_possession_limit ?? 0),
+    userScore: toScore(state.user_score),
+    aiScore: toScore(state.ai_score),
+    userHasPossession: userOnOffense,
+    aiHasPossession: !userOnOffense,
+    userLane: compactLaneLights(userOnOffense ? offenseStack : defenseStack),
+    aiLane: compactLaneLights(userOnOffense ? defenseStack : offenseStack),
+    inboundActive: state.game_phase === 'awaiting_inbound',
+    inboundStepsRemaining: Math.max(0, Number(state.inbound_steps_remaining ?? 0)),
+    inboundDeadlineSteps: Math.max(1, Number(state.inbound_deadline_steps ?? 5)),
+  };
+});
+// This is deliberately derived from the visible state rather than latched for
+// a fixed duration: it remains on every live step until the ball is cleared.
+const clearanceRequiredBannerVisible = computed(() => {
+  const state = currentGameState.value;
+  return Boolean(
+    multiPossessionScoreboard.value
+    && state?.clearance_required
+    && state?.game_phase === 'live',
+  );
+});
+const endGameResultText = computed(() => {
+  const state = currentGameState.value;
+  const playerScore = Number(state?.user_score ?? 0);
+  const aiScore = Number(state?.ai_score ?? 0);
+  if (playerScore > aiScore) return 'Blue Wins';
+  if (aiScore > playerScore) return 'Red Wins';
+  return 'Tie Game';
+});
 const shotClockMax = computed(() => {
   const state = currentGameState.value;
   if (!state) return 24;
@@ -1910,67 +2108,6 @@ const displayedShotClockValue = computed(() => {
   }
   return shotClockValue.value;
 });
-
-function drawLaneStepClockIndicators(ctx, scale, shotClockBox) {
-  const stacks = laneStepIndicatorStacks.value;
-  if (props.minimalChrome || hasShotCounts.value || !Array.isArray(stacks) || stacks.length === 0) {
-    return;
-  }
-
-  const lightRadius = 5.5 * scale;
-  const lightGap = 12 * scale;
-  const stackGap = 24 * scale;
-  const labelGap = 8 * scale;
-  const bottomY = shotClockBox.y + shotClockBox.height - (lightRadius * 1.15);
-  const rightX = shotClockBox.x - (14 * scale);
-  const firstX = rightX - ((stacks.length - 1) * stackGap);
-
-  ctx.save();
-  ctx.textAlign = "center";
-  ctx.textBaseline = "bottom";
-  ctx.font = `${12 * scale}px sans-serif`;
-
-  stacks.forEach((stack, idx) => {
-    const x = firstX + (idx * stackGap);
-    const maxSteps = Math.max(1, Number(stack.maxSteps) || 1);
-    const steps = Math.max(0, Number(stack.steps) || 0);
-    const color = stack.color || "#94a3b8";
-    const labelY = bottomY - ((maxSteps - 1) * (lightRadius * 2 + lightGap)) - lightRadius - labelGap;
-
-    ctx.shadowBlur = 3 * scale;
-    ctx.shadowColor = "rgba(2, 6, 23, 0.75)";
-    ctx.fillStyle = color;
-    ctx.fillText(stack.shortLabel || "", x, labelY);
-    ctx.shadowBlur = 0;
-
-    for (let i = 0; i < maxSteps; i += 1) {
-      const y = bottomY - (i * (lightRadius * 2 + lightGap));
-      const lit = i < Math.min(maxSteps, steps);
-      const violation = steps >= maxSteps;
-
-      ctx.beginPath();
-      ctx.arc(x, y, lightRadius, 0, Math.PI * 2);
-      if (lit) {
-        ctx.fillStyle = "#ffffff";
-        ctx.shadowColor = color;
-        ctx.shadowBlur = (violation ? 9 : 6) * scale;
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5 * scale;
-        ctx.stroke();
-      } else {
-        ctx.fillStyle = "rgba(148, 163, 184, 0.2)";
-        ctx.fill();
-        ctx.strokeStyle = "rgba(15, 23, 42, 0.75)";
-        ctx.lineWidth = 1 * scale;
-        ctx.stroke();
-      }
-    }
-  });
-
-  ctx.restore();
-}
 
 watch(shotClockValue, (newVal) => {
   if (!props.isShotClockUpdating) {
@@ -2061,6 +2198,23 @@ const viewBox = computed(() => {
     
     const allX = courtLayout.value.map(h => h.x);
     const allY = courtLayout.value.map(h => h.y);
+    // An inbounder is deliberately placed just beyond the baseline. Include
+    // that legal dead-ball area so it remains visible rather than clipped.
+    const state = currentGameState.value;
+    const contextCells = [
+      state?.inbound_position,
+      ...(Array.isArray(state?.legal_inbound_entry_positions)
+        ? state.legal_inbound_entry_positions
+        : []),
+    ];
+    for (const cell of contextCells) {
+      if (!Array.isArray(cell) || cell.length < 2) continue;
+      const { x, y } = axialToCartesian(Number(cell[0]), Number(cell[1]));
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        allX.push(x);
+        allY.push(y);
+      }
+    }
     
     const margin = props.minimalChrome ? HEX_RADIUS * 1.8 : HEX_RADIUS * 3;
     const minX = Math.min(...allX) - margin;
@@ -2072,6 +2226,27 @@ const viewBox = computed(() => {
     const height = maxY - minY;
 
     return `${minX} ${minY} ${width} ${height}`;
+});
+
+const inboundMarker = computed(() => {
+  const state = currentGameState.value;
+  if (!state?.enable_multi_possession || state?.inbound_player === null || state?.inbound_player === undefined) {
+    return null;
+  }
+  const pos = state.inbound_position;
+  if (!Array.isArray(pos) || pos.length < 2) return null;
+  return axialToCartesian(Number(pos[0]), Number(pos[1]));
+});
+
+const legalInboundEntryMarkers = computed(() => {
+  const entries = currentGameState.value?.legal_inbound_entry_positions;
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .filter((pos) => Array.isArray(pos) && pos.length >= 2)
+    .map((pos) => {
+      const { x, y } = axialToCartesian(Number(pos[0]), Number(pos[1]));
+      return { key: `${pos[0]},${pos[1]}`, x, y };
+    });
 });
 
 const courtCenter = computed(() => {
@@ -2775,6 +2950,17 @@ function normalizeForcedEpisodeOutcome(rawOutcome) {
 }
 
 const episodeOutcome = computed(() => {
+    // A completed multi-possession episode takes precedence over the final
+    // possession event (for example, a defensive rebound) so the board makes
+    // it clear that play is over.
+    if (currentGameState.value?.enable_multi_possession && currentGameState.value.done) {
+        // GIF capture first renders the terminal action (whose compact banner
+        // remains visible), then holds the game title on its own final frame.
+        // Do not fall through to the legacy oversized made/missed overlay
+        // while the action itself is being captured.
+        return props.showEndGameOutcome ? { type: 'END_GAME' } : null;
+    }
+
     const forcedOutcome = normalizeForcedEpisodeOutcome(props.forcedEpisodeOutcome);
     if (forcedOutcome) return forcedOutcome;
 
@@ -2929,7 +3115,7 @@ const playerTransitions = computed(() => {
 // Compute pass rays from ball handler to teammates with pass success probabilities
 const passRays = computed(() => {
   const gs = currentGameState.value;
-  if (props.hidePassRays) return [];
+  if (!passRaysVisible.value) return [];
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return [];
   
   const ballHandlerId = gs.ball_holder;
@@ -2991,7 +3177,7 @@ const passRays = computed(() => {
 // Preview which teammate will receive a pass based on current selection/strategy
 const passTargetPreview = computed(() => {
   const gs = currentGameState.value;
-  if (props.hidePassRays) return null;
+  if (!passRaysVisible.value) return null;
   if (!gs || gs.ball_holder === null || gs.ball_holder === undefined) return null;
 
   let passerId = gs.ball_holder;
@@ -3124,8 +3310,67 @@ const normalizedPassAnimationStyle = computed(() => {
   return mode === 'ray' ? 'ray' : 'projectile';
 });
 
+function capturePassFlashFromState(state) {
+  const actionResults = state?.last_action_results;
+  const passes = actionResults?.passes && typeof actionResults.passes === 'object'
+    ? actionResults.passes
+    : {};
+  let passerId = null;
+  let receiverId = null;
+
+  for (const [rawPasserId, pass] of Object.entries(passes)) {
+    const target = Number(pass?.target);
+    if (pass?.success && Number.isFinite(target)) {
+      passerId = Number(rawPasserId);
+      receiverId = target;
+      break;
+    }
+  }
+
+  if (!Number.isFinite(passerId) || !Number.isFinite(receiverId)) {
+    const intercepted = (Array.isArray(actionResults?.turnovers) ? actionResults.turnovers : [])
+      .find((turnover) => (
+        turnover
+        && String(turnover.reason || '').toLowerCase() === 'steal'
+        && Number.isFinite(Number(turnover.player_id))
+        && Number.isFinite(Number(turnover.stolen_by))
+      ));
+    if (intercepted) {
+      passerId = Number(intercepted.player_id);
+      receiverId = Number(intercepted.stolen_by);
+    }
+  }
+
+  if (!Number.isFinite(passerId) || !Number.isFinite(receiverId)) return null;
+  const passerPos = state?.positions?.[passerId];
+  const receiverPos = state?.positions?.[receiverId];
+  if (!passerPos || !receiverPos) return null;
+  const start = axialToCartesian(passerPos[0], passerPos[1]);
+  const end = axialToCartesian(receiverPos[0], receiverPos[1]);
+  return {
+    flashKey: `capture-pass-${passerId}-${receiverId}`,
+    passerId,
+    receiverId,
+    x1: start.x,
+    y1: start.y,
+    x2: end.x,
+    y2: end.y,
+    labelX: (start.x + end.x) / 2,
+    labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
+  };
+}
+
+// Exported frames must be reproducible from serialized state. The live flash
+// refs are timer-driven, so capture derives the same geometry without relying
+// on a watcher having fired before the board is cloned.
+const activePassFlash = computed(() => (
+  props.disableTransitions
+    ? capturePassFlashFromState(currentGameState.value)
+    : passFlash.value
+));
+
 const passFlashProgress = computed(() => {
-  const flash = passFlash.value;
+  const flash = activePassFlash.value;
   if (!flash) return 0;
   if (props.disableTransitions) {
     return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
@@ -3142,7 +3387,7 @@ const passFlashOpacity = computed(() => {
 });
 
 const passProjectile = computed(() => {
-  const flash = passFlash.value;
+  const flash = activePassFlash.value;
   if (!flash) return null;
 
   const dx = flash.x2 - flash.x1;
@@ -3196,7 +3441,7 @@ const passProjectile = computed(() => {
 });
 
 const passBallOutline = computed(() => {
-  const flash = passFlash.value;
+  const flash = activePassFlash.value;
   if (!flash) return null;
 
   const dx = flash.x2 - flash.x1;
@@ -3308,6 +3553,40 @@ function buildShotArcGeometry(start, end) {
   };
 }
 
+function captureShotFlashFromState(state) {
+  const shots = state?.last_action_results?.shots;
+  if (!shots || typeof shots !== 'object') return null;
+  const entry = Object.entries(shots)
+    .find(([rawShooterId, shot]) => Number.isFinite(Number(rawShooterId)) && shot && typeof shot === 'object');
+  if (!entry) return null;
+  const [rawShooterId, shot] = entry;
+  const shooterId = Number(rawShooterId);
+  const shooterPos = state?.positions?.[shooterId];
+  const basketPos = state?.basket_position;
+  if (!shooterPos || !basketPos) return null;
+  const start = axialToCartesian(shooterPos[0], shooterPos[1]);
+  const end = axialToCartesian(basketPos[0], basketPos[1]);
+  const arc = buildShotArcGeometry(start, end);
+  return {
+    flashKey: `capture-shot-${shooterId}-${Number(shot.success)}`,
+    shooterId,
+    x1: start.x,
+    y1: start.y,
+    x2: end.x,
+    y2: end.y,
+    controlX: arc.controlX,
+    controlY: arc.controlY,
+    color: shot.success ? '#22c55e' : '#ef4444',
+    path: arc.path,
+  };
+}
+
+const activeShotFlash = computed(() => (
+  props.disableTransitions
+    ? captureShotFlashFromState(currentGameState.value)
+    : shotFlash.value
+));
+
 function quadraticBezierPoint(start, control, end, t) {
   const clampedT = Math.max(0, Math.min(1, t));
   const oneMinusT = 1 - clampedT;
@@ -3332,7 +3611,7 @@ function quadraticBezierTangent(start, control, end, t) {
 }
 
 const shotFlashProgress = computed(() => {
-  const flash = shotFlash.value;
+  const flash = activeShotFlash.value;
   if (!flash) return 0;
   if (props.disableTransitions) {
     return Math.max(0, Math.min(1, Number(props.moveProgress ?? 1)));
@@ -3351,7 +3630,7 @@ const shotFlashOpacity = computed(() => {
 const shotLaneOpacity = computed(() => 0.22 + shotFlashOpacity.value * 0.28);
 
 const shotProjectile = computed(() => {
-  const flash = shotFlash.value;
+  const flash = activeShotFlash.value;
   if (!flash) return null;
 
   const start = { x: flash.x1, y: flash.y1 };
@@ -3403,7 +3682,7 @@ const shotProjectile = computed(() => {
 });
 
 const shotBallOutline = computed(() => {
-  const flash = shotFlash.value;
+  const flash = activeShotFlash.value;
   if (!flash) return null;
 
   const start = { x: flash.x1, y: flash.y1 };
@@ -3609,8 +3888,17 @@ watch(
     if (!state) {
       clearShotFlash();
       clearShotJump();
+      clearShotAttemptBanner();
       lastShotAnimationKey.value = null;
       return;
+    }
+
+    // Turnovers do not produce a shot animation, so announce them explicitly.
+    // The banner stays visible briefly after the next possession begins.
+    const turnoverOrViolationBanner = turnoverBannerPayload(state.last_action_results)
+      ?? defensiveLaneViolationBannerPayload(state.last_action_results);
+    if (turnoverOrViolationBanner) {
+      triggerOutcomeBanner(turnoverOrViolationBanner);
     }
 
     const shots = state.last_action_results?.shots;
@@ -3647,6 +3935,7 @@ watch(
     const start = axialToCartesian(shooterPos[0], shooterPos[1]);
     const end = axialToCartesian(basketPos[0], basketPos[1]);
     const success = !!shotData.result.success;
+    const isThree = Boolean(shotData.result.is_three ?? shotData.result.isThree);
     const isDunk =
       (shotData.result && typeof shotData.result.is_dunk === 'boolean' && shotData.result.is_dunk) ||
       hexDistance(shooterPos, basketPos) === 0;
@@ -3655,6 +3944,7 @@ watch(
       Number(state.shot_clock ?? -1),
       Number(shotData.shooterId),
       success ? 1 : 0,
+      isThree ? 1 : 0,
       isDunk ? 1 : 0,
       Number(shotData.result?.distance ?? -1),
       Number(shooterPos[0]),
@@ -3667,262 +3957,28 @@ watch(
     }
     lastShotAnimationKey.value = shotAnimationKey;
 
+    triggerShotAttemptBanner(shotData.result, state.last_action_results);
     triggerShotFlash(shotData.shooterId, start, end, success, isDunk);
   },
   { immediate: true }
 );
 
 async function downloadBoardAsImage() {
-  if (!svgRef.value) return;
-  
   try {
-    // Helper to inline computed styles from source to target
-    const inlineStyles = (source, target) => {
-      const computed = window.getComputedStyle(source);
-      const properties = [
-        'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
-        'stroke-linecap', 'stroke-opacity',
-        'opacity', 'font-family', 'font-size', 'font-weight',
-        'text-anchor', 'dominant-baseline', 'paint-order',
-        'transform', 'transform-origin', 'transform-box'
-      ];
-      properties.forEach(prop => {
-        // Only set if not default/empty to keep it clean, 
-        // but essential for class-based styles to persist
-        const val = computed.getPropertyValue(prop);
-        if (val) target.style[prop] = val;
-      });
-      
-      for (let i = 0; i < source.children.length; i++) {
-        if (target.children[i]) {
-          inlineStyles(source.children[i], target.children[i]);
-        }
-      }
-    };
-
-    // Clone the SVG to avoid modifying the original
-    const svgClone = svgRef.value.cloneNode(true);
-    
-    // Inline styles to ensure they are captured (since classes won't work in standalone SVG)
-    inlineStyles(svgRef.value, svgClone);
-    
-    // Get the viewBox dimensions
-    const viewBox = svgRef.value.getAttribute('viewBox').split(' ').map(Number);
-    const [minX, minY, width, height] = viewBox;
-    
-    // Set explicit width and height for rendering
-    svgClone.setAttribute('width', width);
-    svgClone.setAttribute('height', height);
-    
-    // Serialize the SVG to a string
-    const serializer = new XMLSerializer();
-    let svgString = serializer.serializeToString(svgClone);
-    
-    // Add XML declaration and ensure proper encoding
-    svgString = '<?xml version="1.0" encoding="UTF-8"?>' + svgString;
-    
-    // Create a blob from the SVG string
-    const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(svgBlob);
-    
-    // Create an image element to load the SVG
-    const img = new Image();
-    
-    // Capture state variables before async operations to ensure consistency
-    const shotClock = currentGameState.value?.shot_clock;
-    const hasShotClock = shotClock !== undefined && shotClock !== null;
-    const shouldDrawShotClock = !props.hideClockOverlays && !hasShotCounts.value && hasShotClock;
-    const shotClockVal = String(shotClock);
-
-    img.onload = () => {
-      // Create a canvas with the SVG dimensions
-      const canvas = document.createElement('canvas');
-      const scale = 2; // Higher resolution
-      canvas.width = width * scale;
-      canvas.height = height * scale;
-      
-      const ctx = canvas.getContext('2d');
-      
-      // Fill with dark background to match web app
-      ctx.fillStyle = '#0a0f1e';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      
-      // Draw the SVG onto the canvas (scaled up)
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      
-      // Draw Shot Clock if available and not in shot overlay mode
-      if (shouldDrawShotClock) {
-        const fontSize = 48 * scale;
-        const paddingX = 16 * scale;
-        const paddingY = 4 * scale;
-        const margin = 20 * scale;
-        
-        ctx.font = `${fontSize}px "DSEG7 Classic", monospace`;
-        const textMetrics = ctx.measureText(shotClockVal);
-        const textWidth = textMetrics.width;
-        const boxWidth = textWidth + (paddingX * 2);
-        const boxHeight = fontSize + (paddingY * 2);
-        
-        const x = canvas.width - boxWidth - margin;
-        const y = margin;
-        
-        ctx.fillStyle = '#1a1a1a';
-        ctx.fillRect(x, y, boxWidth, boxHeight);
-        ctx.strokeStyle = '#333';
-        ctx.lineWidth = 2 * scale;
-        ctx.strokeRect(x, y, boxWidth, boxHeight);
-        
-        ctx.fillStyle = '#ff4d4d';
-        ctx.shadowColor = '#ff4d4d';
-        ctx.shadowBlur = 10 * scale;
-        ctx.textBaseline = 'top';
-        ctx.fillText(shotClockVal, x + paddingX, y + paddingY);
-        ctx.shadowBlur = 0;
-      }
-      
-      // Convert canvas to PNG and download (PNG supports transparency)
-      canvas.toBlob((blob) => {
-        const link = document.createElement('a');
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-        link.download = `basketworld-board-${timestamp}.png`;
-        link.href = URL.createObjectURL(blob);
-        link.click();
-        
-        // Cleanup
-        URL.revokeObjectURL(url);
-        URL.revokeObjectURL(link.href);
-      }, 'image/png');
-    };
-    
-    img.src = url;
-  } catch (err) {
-    console.error('[GameBoard] Failed to download image:', err);
-    alert('Failed to download board image');
+    const png = await renderStateToPng();
+    const link = document.createElement("a");
+    link.download = "basketworld-board-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png";
+    link.href = png;
+    link.click();
+  } catch (error) {
+    console.error("[GameBoard] Failed to download image:", error);
+    alert("Failed to download board image: " + error.message);
   }
 }
 
-// Expose method to render current state as PNG (for episode saving)
-async function renderStateToPng() {
-  if (!svgRef.value) return null;
-  
-  try {
-    // Helper to inline computed styles
-    const inlineStyles = (source, target) => {
-      const computed = window.getComputedStyle(source);
-      const properties = [
-        'fill', 'stroke', 'stroke-width', 'stroke-dasharray',
-        'stroke-linecap', 'stroke-opacity',
-        'opacity', 'font-family', 'font-size', 'font-weight',
-        'text-anchor', 'dominant-baseline', 'paint-order',
-        'transform', 'transform-origin', 'transform-box'
-      ];
-      properties.forEach(prop => {
-        const val = computed.getPropertyValue(prop);
-        if (val) target.style[prop] = val;
-      });
-      
-      for (let i = 0; i < source.children.length; i++) {
-        if (target.children[i]) {
-          inlineStyles(source.children[i], target.children[i]);
-        }
-      }
-    };
-
-    const svgClone = svgRef.value.cloneNode(true);
-    inlineStyles(svgRef.value, svgClone);
-    
-    const viewBox = svgRef.value.getAttribute('viewBox').split(' ').map(Number);
-    const [minX, minY, width, height] = viewBox;
-    
-    svgClone.setAttribute('width', width);
-    svgClone.setAttribute('height', height);
-    
-    const serializer = new XMLSerializer();
-    let svgString = serializer.serializeToString(svgClone);
-    svgString = '<?xml version="1.0" encoding="UTF-8"?>' + svgString;
-    
-    const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(svgBlob);
-    
-    // Return a promise that resolves with the PNG data URL
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      const shotClock = currentGameState.value?.shot_clock;
-      const hasShotClock = shotClock !== undefined && shotClock !== null;
-      const shouldDrawShotClock = !props.hideClockOverlays && !hasShotCounts.value && hasShotClock;
-      const shotClockVal = String(shotClock);
-
-      img.onload = () => {
-        try {
-          const canvas = document.createElement('canvas');
-          const scale = 2;
-          canvas.width = width * scale;
-          canvas.height = height * scale;
-          
-          const ctx = canvas.getContext('2d');
-          
-          // Fill with dark background to match web app
-          ctx.fillStyle = '#0a0f1e';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          
-          // Draw Shot Clock if available and not in shot overlay mode
-          if (shouldDrawShotClock) {
-            const fontSize = 48 * scale;
-            const paddingX = 16 * scale;
-            const paddingY = 4 * scale;
-            const margin = 20 * scale;
-            
-            ctx.font = `${fontSize}px "DSEG7 Classic", monospace`;
-            const textMetrics = ctx.measureText(shotClockVal);
-            const textWidth = textMetrics.width;
-            const boxWidth = textWidth + (paddingX * 2);
-            const boxHeight = fontSize + (paddingY * 2);
-            
-            const x = canvas.width - boxWidth - margin;
-            const y = margin;
-            
-            ctx.fillStyle = '#1a1a1a';
-            ctx.fillRect(x, y, boxWidth, boxHeight);
-            ctx.strokeStyle = '#333';
-            ctx.lineWidth = 2 * scale;
-            ctx.strokeRect(x, y, boxWidth, boxHeight);
-            
-            ctx.fillStyle = '#ff4d4d';
-            ctx.shadowColor = '#ff4d4d';
-            ctx.shadowBlur = 10 * scale;
-            ctx.textBaseline = 'top';
-            ctx.fillText(shotClockVal, x + paddingX, y + paddingY);
-            ctx.shadowBlur = 0;
-
-            drawLaneStepClockIndicators(ctx, scale, { x, y, width: boxWidth, height: boxHeight });
-          }
-          
-          // Convert canvas to PNG data URL
-          const dataUrl = canvas.toDataURL('image/png');
-          
-          // Cleanup
-          URL.revokeObjectURL(url);
-          
-          resolve(dataUrl);
-        } catch (err) {
-          URL.revokeObjectURL(url);
-          reject(err);
-        }
-      };
-      
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        reject(new Error('Failed to load SVG image'));
-      };
-      
-      img.src = url;
-    });
-  } catch (err) {
-    console.error('[GameBoard] Failed to render PNG:', err);
-    return null;
-  }
+// PNG downloads and both GIF workflows capture the same live board DOM.
+async function renderStateToPng(options = {}) {
+  return captureBoardPng(svgRef.value?.parentElement, options);
 }
 
 // Expose method to parent component
@@ -3939,6 +3995,7 @@ onBeforeUnmount(() => {
   clearPassFlash();
   clearShotFlash();
   clearShotJump();
+  clearShotAttemptBanner();
 });
 
 </script>
@@ -3949,6 +4006,7 @@ onBeforeUnmount(() => {
     :class="{
       'no-move-transitions': disableTransitions,
       'minimal-chrome': minimalChrome,
+      'multi-possession-board': !!multiPossessionScoreboard,
     }"
   >
     <div class="board-toolbar">
@@ -4006,6 +4064,16 @@ onBeforeUnmount(() => {
         >
           <font-awesome-icon :icon="showDefenderPressureShake ? ['fas','toggle-on'] : ['fas','toggle-off']" />
           <span class="toggle-label">Defender Motion</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="showPassRays = !showPassRays"
+          :aria-pressed="passRaysVisible"
+          :disabled="hidePassRays"
+          title="Show or hide pass-success rays from the ball handler"
+        >
+          <font-awesome-icon :icon="passRaysVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Pass Rays</span>
         </button>
       </div>
     </div>
@@ -4307,13 +4375,36 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Pass target preview (selected receiver) -->
-        <g v-if="passTargetPreview && showPlayers && !hidePassRays" class="pass-preview-group">
+        <g v-if="passTargetPreview && showPlayers && passRaysVisible" class="pass-preview-group">
           <line
             :x1="passTargetPreview.start.x"
             :y1="passTargetPreview.start.y"
             :x2="passTargetPreview.end.x"
             :y2="passTargetPreview.end.y"
             class="pass-preview-line"
+          />
+        </g>
+
+        <!-- The inbounder waits outside the baseline until the inbound pass is
+             released.  Legal re-entry cells appear after a successful pass. -->
+        <g v-if="inboundMarker && showPlayers" class="inbound-context-layer">
+          <circle
+            :cx="inboundMarker.x"
+            :cy="inboundMarker.y"
+            :r="HEX_RADIUS * 0.72"
+            class="inbound-baseline-marker"
+          />
+          <text
+            :x="inboundMarker.x"
+            :y="inboundMarker.y - HEX_RADIUS * 0.95"
+            text-anchor="middle"
+            class="inbound-label"
+          >INBOUND</text>
+          <polygon
+            v-for="marker in legalInboundEntryMarkers"
+            :key="`legal-entry-${marker.key}`"
+            :points="hexPointsFor(marker.x, marker.y, HEX_RADIUS * 0.82)"
+            class="legal-inbound-entry"
           />
         </g>
 
@@ -4520,7 +4611,7 @@ onBeforeUnmount(() => {
             </text>
             <!-- Ball handler indicator / turnover pressure meter -->
             <g
-              v-if="player.hasBall && !passFlash && !shotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id"
+              v-if="player.hasBall && !activePassFlash && !activeShotFlash && shotJumpPlayerId !== player.id && shotInFlightPlayerId !== player.id"
               class="ball-indicator-wrap"
               style="pointer-events: none;"
             >
@@ -4788,7 +4879,7 @@ onBeforeUnmount(() => {
         </g>
         
         <!-- Draw Pass Rays (ball handler to teammates with pass success probabilities) - drawn after players for visibility -->
-        <g v-if="showPlayers && !hidePassRays" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
+        <g v-if="showPlayers && passRaysVisible" v-for="ray in passRays" :key="`pass-ray-${ray.teammateId}`" class="pass-ray-group">
           <line
             :x1="ray.x1"
             :y1="ray.y1"
@@ -4811,13 +4902,13 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Flash effect for completed passes -->
-        <g v-if="passFlash && showPlayers && !hidePassRays" :key="`pass-flash-${passFlash.flashKey}`" class="pass-flash-group">
+        <g v-if="activePassFlash && showPlayers" :key="`pass-flash-${activePassFlash.flashKey}`" class="pass-flash-group">
           <template v-if="normalizedPassAnimationStyle === 'projectile' && passProjectile">
             <line
-              :x1="passFlash.x1"
-              :y1="passFlash.y1"
-              :x2="passFlash.x2"
-              :y2="passFlash.y2"
+              :x1="activePassFlash.x1"
+              :y1="activePassFlash.y1"
+              :x2="activePassFlash.x2"
+              :y2="activePassFlash.y2"
               class="pass-projectile-lane"
               :opacity="passProjectile.laneOpacity"
             />
@@ -4854,36 +4945,36 @@ onBeforeUnmount(() => {
           />
           <line
             v-if="normalizedPassAnimationStyle !== 'projectile' || !passProjectile"
-            :x1="passFlash.x1"
-            :y1="passFlash.y1"
-            :x2="passFlash.x2"
-            :y2="passFlash.y2"
+            :x1="activePassFlash.x1"
+            :y1="activePassFlash.y1"
+            :x2="activePassFlash.x2"
+            :y2="activePassFlash.y2"
             :stroke="ballColor"
             class="pass-flash-line"
             :opacity="passFlashOpacity"
           />
           <text
-            :x="passFlash.labelX"
-            :y="passFlash.labelY"
+            :x="activePassFlash.labelX"
+            :y="activePassFlash.labelY"
             text-anchor="middle"
             dominant-baseline="middle"
             :fill="ballColor"
             class="pass-flash-text"
             :opacity="passFlashOpacity"
           >
-            {{ getOutcomePlayerLabel(passFlash.passerId) }} -> {{ getOutcomePlayerLabel(passFlash.receiverId) }}
+            {{ getOutcomePlayerLabel(activePassFlash.passerId) }} -> {{ getOutcomePlayerLabel(activePassFlash.receiverId) }}
           </text>
         </g>
 
         <!-- Flash effect for shot attempts -->
-        <g v-if="shotFlash && showPlayers" :key="`shot-flash-${shotFlash.flashKey}`" class="shot-flash-group">
+        <g v-if="activeShotFlash && showPlayers" :key="`shot-flash-${activeShotFlash.flashKey}`" class="shot-flash-group">
           <path
-            :d="shotFlash.path"
-            :stroke="shotFlash.color"
+            :d="activeShotFlash.path"
+            :stroke="activeShotFlash.color"
             class="shot-flash-line"
             fill="none"
             :opacity="shotLaneOpacity"
-            :style="{ filter: `drop-shadow(0 0 10px ${shotFlash.color})` }"
+            :style="{ filter: `drop-shadow(0 0 10px ${activeShotFlash.color})` }"
           />
           <line
             v-if="shotProjectile"
@@ -4892,14 +4983,14 @@ onBeforeUnmount(() => {
             :x2="shotProjectile.shaftX2"
             :y2="shotProjectile.shaftY2"
             class="shot-projectile-shaft"
-            :stroke="shotFlash.color"
+            :stroke="activeShotFlash.color"
             :opacity="shotProjectile.projectileOpacity"
           />
           <polygon
             v-if="shotProjectile"
             :points="shotProjectile.headPoints"
             class="shot-projectile-head"
-            :fill="shotFlash.color"
+            :fill="activeShotFlash.color"
             :opacity="shotProjectile.projectileOpacity"
           />
           <circle
@@ -4917,7 +5008,7 @@ onBeforeUnmount(() => {
             :cy="shotProjectile.impactY"
             :r="shotProjectile.impactRadius"
             class="shot-projectile-impact"
-            :stroke="shotFlash.color"
+            :stroke="activeShotFlash.color"
             :opacity="shotProjectile.impactOpacity"
           />
         </g>
@@ -5009,6 +5100,15 @@ onBeforeUnmount(() => {
 
       <!-- Outcome Text (drawn outside the transformed group to keep it upright) -->
       <g v-if="episodeOutcome && showEpisodeOutcome" class="outcome-text-group">
+          <text
+            v-if="episodeOutcome.type === 'END_GAME'"
+            :x="courtCenter.x"
+            :y="courtCenter.y"
+            class="outcome-text end-game"
+          >
+            <tspan :x="courtCenter.x" dy="-0.55em">End Game</tspan>
+            <tspan :x="courtCenter.x" dy="1.25em" class="end-game-result">{{ endGameResultText }}</tspan>
+          </text>
           <text v-if="episodeOutcome.type === 'MADE_SHOT'" x="50%" y="15%" class="outcome-text made">
               <tspan class="player-outcome-text" x="50%" dy="-1.2em">{{ getOutcomePlayerLabel(episodeOutcome.playerId) }}</tspan>
               <tspan x="50%" dy="1.2em">{{ episodeOutcome.isDunk ? 'Made Dunk!' : (episodeOutcome.isThree ? 'Made 3!' : 'Made 2!') }}</tspan>
@@ -5086,7 +5186,101 @@ onBeforeUnmount(() => {
       </g>
 
     </svg>
-    <div class="shot-clock-wrapper" v-if="!hideClockOverlays && !hasShotCounts">
+    <section
+      v-if="multiPossessionScoreboard"
+      class="game-scoreboard"
+      aria-label="Game scoreboard"
+    >
+      <div class="score-side score-side-you" :class="{ 'has-possession': multiPossessionScoreboard.userHasPossession }">
+        <span
+          class="score-possession-light"
+          :class="{ lit: multiPossessionScoreboard.userHasPossession }"
+          :title="multiPossessionScoreboard.userHasPossession ? 'Player has possession' : 'Player is defending'"
+          aria-hidden="true"
+        ></span>
+        <div class="score-side-main">
+          <span class="score-team">Player</span>
+          <span class="score-digits">{{ multiPossessionScoreboard.userScore }}</span>
+          <span class="score-lane-meter" :title="multiPossessionScoreboard.userLane.title">
+            <span
+              v-for="light in multiPossessionScoreboard.userLane.lights"
+              :key="light.key"
+              class="score-lane-light"
+              :class="{ lit: light.lit, violation: light.violation }"
+            ></span>
+          </span>
+        </div>
+      </div>
+      <div class="score-center">
+        <div class="score-clock-readouts">
+          <span class="score-clock-readout">
+            <span class="score-period-label">Shot Clock</span>
+            <span class="clock-digits">{{ displayedShotClockValue }}</span>
+          </span>
+          <span
+            v-if="multiPossessionScoreboard.inboundActive"
+            class="inbound-clock-readout"
+            :title="`Inbound count: ${multiPossessionScoreboard.inboundStepsRemaining} of ${multiPossessionScoreboard.inboundDeadlineSteps} steps remaining`"
+            aria-live="polite"
+          >
+            <span class="score-period-label">Inbound</span>
+            <span class="inbound-clock-digits">{{ multiPossessionScoreboard.inboundStepsRemaining }}</span>
+          </span>
+        </div>
+        <span class="score-possession-count">
+          {{ multiPossessionScoreboard.completedPossessions }}/{{ multiPossessionScoreboard.possessionLimit }} possessions
+        </span>
+      </div>
+      <div class="score-side score-side-ai" :class="{ 'has-possession': multiPossessionScoreboard.aiHasPossession }">
+        <div class="score-side-main">
+          <span class="score-team">AI</span>
+          <span class="score-digits">{{ multiPossessionScoreboard.aiScore }}</span>
+          <span class="score-lane-meter" :title="multiPossessionScoreboard.aiLane.title">
+            <span
+              v-for="light in multiPossessionScoreboard.aiLane.lights"
+              :key="light.key"
+              class="score-lane-light"
+              :class="{ lit: light.lit, violation: light.violation }"
+            ></span>
+          </span>
+        </div>
+        <span
+          class="score-possession-light"
+          :class="{ lit: multiPossessionScoreboard.aiHasPossession }"
+          :title="multiPossessionScoreboard.aiHasPossession ? 'AI has possession' : 'AI is defending'"
+          aria-hidden="true"
+        ></span>
+      </div>
+    </section>
+    <div v-if="multiPossessionScoreboard" class="board-banner-area">
+      <div
+        v-if="clearanceRequiredBannerVisible"
+        class="clearance-required-banner"
+        role="status"
+        aria-live="polite"
+      >
+        Clearance Required
+      </div>
+      <div
+        v-if="visibleShotAttemptBanner"
+        :key="visibleShotAttemptBanner.key ?? `${visibleShotAttemptBanner.text}-${visibleShotAttemptBanner.made}`"
+        class="shot-attempt-banner"
+        :class="{
+          made: visibleShotAttemptBanner.made,
+          missed: !visibleShotAttemptBanner.made,
+          steal: visibleShotAttemptBanner.kind === 'steal',
+          turnover: visibleShotAttemptBanner.kind === 'turnover',
+        }"
+        role="status"
+        aria-live="polite"
+      >
+        <span>{{ visibleShotAttemptBanner.text }}</span>
+        <span v-if="visibleShotAttemptBanner.reboundText" class="shot-attempt-rebound">
+          {{ visibleShotAttemptBanner.reboundText }}
+        </span>
+      </div>
+    </div>
+    <div class="shot-clock-wrapper" v-if="!hideClockOverlays && !hasShotCounts && !multiPossessionScoreboard">
       <div v-if="!minimalChrome && currentGameState && laneStepIndicatorStacks.length" class="lane-step-clock-indicators">
         <div
           v-for="stack in laneStepIndicatorStacks"
@@ -5106,8 +5300,10 @@ onBeforeUnmount(() => {
           </span>
         </div>
       </div>
-      <div class="shot-clock-overlay">
-        {{ displayedShotClockValue }}
+      <div class="shot-clock-readout">
+        <div class="shot-clock-overlay">
+          {{ displayedShotClockValue }}
+        </div>
       </div>
       <div v-if="allowShotClockAdjustment" class="shot-clock-controls">
         <button
@@ -5150,6 +5346,13 @@ onBeforeUnmount(() => {
   box-shadow: none;
 }
 
+.game-board-container.multi-possession-board {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  container-type: inline-size;
+}
+
 .shot-clock-overlay {
   position: relative;
   font-family: 'DSEG7 Classic', sans-serif;
@@ -5162,6 +5365,306 @@ onBeforeUnmount(() => {
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d; /* Glowing effect */
   pointer-events: none; /* Make it non-interactive */
   z-index: 10; /* Ensure it's above the SVG */
+}
+
+.shot-clock-readout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.game-scoreboard {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  z-index: 11;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: stretch;
+  /* Scale with this board, not the window or the root font size. At 640px
+     this is 16px; the floor keeps compact-board controls legible. */
+  font-size: max(12px, 2.5cqw);
+  gap: 0.5em;
+  min-width: 18.75em;
+  padding: 0.35em 0.65em;
+  white-space: nowrap;
+  border: 1px solid #333;
+  border-radius: 8px;
+  background: rgba(26, 26, 26, 0.96);
+  box-shadow: 0 10px 20px rgba(2, 6, 23, 0.55);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* Reserve header space for the scoreboard rather than laying it over the
+   court. The developer controls sit below it as a compact utility row. */
+.multi-possession-board .game-scoreboard {
+  position: relative;
+  top: auto;
+  left: auto;
+  align-self: center;
+  order: -2;
+  margin: 0.45rem 0 0.25rem;
+  transform: none;
+}
+
+.board-banner-area {
+  /* Always reserve both slots, including the rebound subtitle. Banners may
+     appear, expire or coexist without moving the court (or GIF frame bounds). */
+  order: -1;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-rows: 1.7rem 2.9rem;
+  gap: 0.3rem;
+  padding: 0.15rem 0 0.3rem;
+  place-items: center;
+  pointer-events: none;
+}
+
+.shot-attempt-banner {
+  position: relative;
+  z-index: 13;
+  align-self: center;
+  grid-row: 2;
+  min-width: 10.5rem;
+  margin: 0;
+  padding: 0.34rem 1rem;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.98);
+  box-shadow: 0 0 10px currentColor;
+  color: #f8fafc;
+  font-size: 0.9rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.28rem;
+  line-height: 1;
+  text-align: center;
+  text-transform: uppercase;
+  animation: shot-attempt-banner-enter 0.16s ease-out both;
+  pointer-events: none;
+}
+
+.clearance-required-banner {
+  position: relative;
+  z-index: 13;
+  align-self: center;
+  grid-row: 1;
+  min-width: 12.5rem;
+  margin: 0;
+  padding: 0.3rem 0.95rem;
+  border: 1px solid #fbbf24;
+  border-radius: 6px;
+  background: rgba(120, 53, 15, 0.96);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.7);
+  color: #fef3c7;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  line-height: 1;
+  text-align: center;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.shot-attempt-banner.made {
+  color: #22c55e;
+}
+
+.shot-attempt-banner.missed {
+  color: #ef4444;
+}
+
+.shot-attempt-banner.steal {
+  color: #fbbf24;
+}
+
+.shot-attempt-banner.turnover {
+  color: #ef4444;
+}
+
+.shot-attempt-rebound {
+  color: rgba(248, 250, 252, 0.94);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+}
+
+/* Export supplies explicit animation progress. Do not capture the first,
+   almost-transparent instant of the unrelated CSS banner entrance. */
+.no-move-transitions .shot-attempt-banner {
+  animation: none;
+}
+
+@keyframes shot-attempt-banner-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(-0.35rem) scale(0.94);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.score-side {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  min-width: 4.75em;
+  padding: 0.25em 0.45em;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 6px;
+  opacity: 0.73;
+  transition: opacity 0.18s ease, box-shadow 0.18s ease;
+}
+
+.score-side.has-possession {
+  opacity: 1;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+
+.score-side-main {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.22em;
+}
+
+.score-side-you {
+  background: #007bff;
+  border-color: #ffffff;
+}
+
+.score-side-ai {
+  background: #dc3545;
+  border-color: #ffffff;
+}
+
+.score-team {
+  color: rgba(248, 250, 252, 0.95);
+  font-size: max(10px, 0.72em);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.score-digits {
+  color: #f8fafc;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: 2.2em;
+  line-height: 1;
+  text-shadow: 0 0 3px rgba(248, 250, 252, 0.65), 0 0 8px rgba(248, 250, 252, 0.2);
+}
+
+.score-possession-light {
+  width: 0.7em;
+  height: 0.7em;
+  flex-shrink: 0;
+  border: 1px solid rgba(248, 250, 252, 0.72);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.score-possession-light.lit {
+  border-color: rgba(255, 255, 255, 0.98);
+  background: #ffffff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.95), 0 0 12px rgba(255, 255, 255, 0.55);
+}
+
+.score-lane-meter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3em;
+  min-height: 0.55em;
+}
+
+.score-lane-light {
+  width: 0.52em;
+  height: 0.52em;
+  border: 1px solid rgba(248, 250, 252, 0.72);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.35);
+  transition: background 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.score-lane-light.lit {
+  border-color: rgba(255, 255, 255, 0.98);
+  background: #ffffff;
+  box-shadow: 0 0 5px rgba(255, 255, 255, 0.9), 0 0 9px rgba(255, 255, 255, 0.5);
+}
+
+.score-lane-light.violation {
+  box-shadow: 0 0 7px rgba(248, 250, 252, 0.92);
+}
+
+.score-center {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 7.25em;
+  padding: 0 0.4em;
+  border-right: 1px solid rgba(148, 163, 184, 0.25);
+  border-left: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.score-clock-readouts {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 0.5em;
+}
+
+.score-clock-readout,
+.inbound-clock-readout {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.inbound-clock-readout {
+  min-width: 2.4em;
+  padding-left: 0.5em;
+  border-left: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.score-period-label {
+  margin-bottom: 0.25em;
+  color: rgba(226, 232, 240, 0.78);
+  font-size: max(10px, 0.68em);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.clock-digits {
+  color: #ff4d4d;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: 2em;
+  line-height: 1;
+  text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d;
+}
+
+.inbound-clock-digits {
+  color: #fbbf24;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: 1.6em;
+  line-height: 1;
+  text-shadow: 0 0 5px #fbbf24, 0 0 10px #fbbf24;
+}
+
+.score-possession-count {
+  margin-top: 0.6em;
+  color: rgba(226, 232, 240, 0.68);
+  font-size: max(9px, 0.55em);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .shot-clock-wrapper {
@@ -5258,6 +5761,41 @@ onBeforeUnmount(() => {
   align-items: center;
   max-width: min(92%, 560px);
   z-index: 12;
+}
+
+.multi-possession-board .board-toolbar {
+  position: relative;
+  top: auto;
+  left: auto;
+  align-self: center;
+  order: -1;
+  justify-content: center;
+  gap: 0.35rem;
+  max-width: calc(100% - 1rem);
+  margin: 0 0 0.35rem;
+}
+
+.multi-possession-board .pressure-controls-row {
+  flex-basis: auto;
+  gap: 0.35rem;
+}
+
+.multi-possession-board .download-button {
+  padding: 0.2rem 0.38rem;
+  border-radius: 5px;
+  font-size: 1.05rem;
+}
+
+.multi-possession-board .board-toggle-btn {
+  gap: 0.3rem;
+  padding: 0.27rem 0.48rem;
+  font-size: 0.64rem;
+  letter-spacing: 0.055em;
+}
+
+.multi-possession-board .board-toggle-btn :deep(svg) {
+  width: 0.9em;
+  height: 0.9em;
 }
 
 .pressure-controls-row {
@@ -5447,6 +5985,30 @@ onBeforeUnmount(() => {
   stroke-linecap: round;
   /* stroke-dasharray: 4 8; */
   filter: drop-shadow(0px 0px 3px rgba(225, 244, 223, 0.6));
+}
+.inbound-context-layer {
+  pointer-events: none;
+}
+.inbound-baseline-marker {
+  fill: rgba(250, 204, 21, 0.14);
+  stroke: #facc15;
+  stroke-width: 2.5;
+  stroke-dasharray: 5 4;
+}
+.inbound-label {
+  fill: #fde68a;
+  font-size: 0.52rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  paint-order: stroke;
+  stroke: #0f172a;
+  stroke-width: 2px;
+}
+.legal-inbound-entry {
+  fill: rgba(74, 222, 128, 0.2);
+  stroke: #4ade80;
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
 }
 .offensive-lane {
   fill: rgba(218, 3, 68, 0.631);
@@ -6133,6 +6695,8 @@ onBeforeUnmount(() => {
     font-size: 54px; /* A smaller font size for longer text */
 }
 .made { fill: lightgreen; }
+.end-game { fill: #ffff00; }
+.end-game-result { font-size: 38px; }
 .missed { fill: #ff4d4d; }
 .turnover { fill: #ff4d4d; }
 .violation { fill: orange; }

@@ -8,6 +8,7 @@ import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
+import { startEpisodeGifExport } from './services/api';
 
 function cloneState(state) {
   return state ? JSON.parse(JSON.stringify(state)) : null;
@@ -305,6 +306,7 @@ const potentialAssistLinksByType = ref({ dunk: {}, two: {}, three: {} });
 const sankeyFlowMode = ref('assisted');
 const sankeyShotType = ref('all');
 const reboundPreviewEnabled = ref(false);
+const showLastReboundDistribution = ref(false);
 const reboundPreview = ref(null);
 const reboundPreviewLoading = ref(false);
 const reboundPreviewError = ref(null);
@@ -472,6 +474,10 @@ const userSelections = ref({});
 const isSelfPlaying = ref(false);
 const selfPlayStarting = ref(false);
 const selfPlayLoadingMessage = ref('');
+// The self-play token stops a loop that is waiting on a request. The game
+// token prevents an old loop response from overwriting a newly-created board.
+let selfPlaySessionId = 0;
+let gameSessionId = 0;
 const canReplay = ref(false);
 const isReplaying = ref(false);
 const isReplayPaused = ref(false);
@@ -486,7 +492,8 @@ const tabsMountEl = ref(null);
 const gameBoardRef = ref(null);
 const phiRef = vueRef(null);
 
-// AI Mode for pre-selecting actions, not automatic play
+// Player AI pre-selects actions for the user-controlled team; the opponent
+// remains AI-controlled in either mode.
 const aiMode = ref(true);
 const playerDeterministic = ref(false);
 const opponentDeterministic = ref(true);
@@ -658,7 +665,9 @@ const boardShowCoordinates = computed(() => (
   isTemplatePlacementMode.value
   || isPassLabPlacementMode.value
   || sourceHeatmapEnabled.value
-  || Boolean(boardReboundTargetOverlay.value)
+  // A live rebound overlay supplies the outcome animation only; it should not
+  // turn on the board-editing coordinate labels.
+  || Boolean(boardReboundTargetOverlay.value && boardReboundTargetOverlay.value.source !== 'live_rebound_step')
 ));
 const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
 const activeControlsTab = ref('controls');
@@ -1204,7 +1213,9 @@ const boardReboundTargetOverlay = computed(() => {
   if (boardEvalReboundOverlay.value) return boardEvalReboundOverlay.value;
   // Eval shot charts should not be hidden by a stale live rebound overlay from the current board state.
   if (hasShotChartData.value && !reboundPreviewEnabled.value) return null;
-  if (disableTransitionsForCapture.value) return liveReboundTargetOverlay.value;
+  if (disableTransitionsForCapture.value) {
+    return liveReboundTargetOverlay.value;
+  }
   if (reboundPreviewEnabled.value && reboundPreview.value?.available) return reboundPreview.value;
   return liveReboundTargetOverlay.value;
 });
@@ -1266,9 +1277,11 @@ const assistSankeyTotalLabel = computed(() => {
 const assistSankeyPlayerIds = computed(() => {
   const state = gameState.value;
   const userTeam = String(state?.user_team_name || 'OFFENSE').toUpperCase();
-  const ids = userTeam === 'DEFENSE'
-    ? (state?.defense_ids || [])
-    : (state?.offense_ids || []);
+  const ids = Array.isArray(state?.user_player_ids)
+    ? state.user_player_ids
+    : (state?.enable_multi_possession
+      ? (state?.team_a_ids || [])
+      : (userTeam === 'DEFENSE' ? (state?.defense_ids || []) : (state?.offense_ids || [])));
   const normalized = ids
     .map((id) => Number(id))
     .filter((id) => Number.isFinite(id));
@@ -1314,16 +1327,30 @@ const assistSankeyLinks = computed(() => {
   return out;
 });
 
-const FLASH_CAPTURE_OFFSETS_MS = [0, 120, 240, 360, 480, 600, 720, 840];
 const REBOUND_STEP_DURATION_MS = 3000;
-const REBOUND_CAPTURE_OFFSETS_MS = [0, 180, 360, 540, 720, 960, 1200, 1500, 1800, 2100, 2400, 2700, 3000];
-const MOVE_CAPTURE_OFFSETS_MS = [0, 90, 180, 260];
+const END_GAME_GIF_HOLD_SECONDS = 1;
 const moveTransitionMs = computed(() => Math.max(120, gifStepDurationMs.value || BASE_STEP_DURATION_MS));
 const disableTransitionsForCapture = ref(false);
 const moveProgressForCapture = ref(1);
 const reboundProgressForCapture = ref(1);
+const showEndGameOutcomeForCapture = ref(true);
 const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
+const gifWidthPx = ref(960);
+const gifAnimationDetail = ref('standard');
+
+const GIF_CAPTURE_DETAIL = Object.freeze({
+  fast: Object.freeze({ movement: 2, action: 5, rebound: 7 }),
+  standard: Object.freeze({ movement: 3, action: 7, rebound: 9 }),
+  smooth: Object.freeze({ movement: 5, action: 12, rebound: 15 }),
+});
+
+function normalizedGifWidthPx() {
+  const width = Math.round(Number(gifWidthPx.value));
+  // Keep frames at a useful minimum while remaining comfortably below the GIF
+  // encoder's 16-million-pixel canvas limit at normal board aspect ratios.
+  return Number.isFinite(width) ? Math.min(3840, Math.max(240, width)) : 960;
+}
 
 // Watch for game-state changes; keep the live rebound preview aligned with the current holder.
 watch(gameState, async (newState, oldState) => {
@@ -1366,6 +1393,8 @@ watch(reboundPreviewParams, async () => {
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
+  const sessionId = ++gameSessionId;
+  stopSelfPlay();
   cancelReplayAnimation();
   activeControlsTab.value = 'environment';
   
@@ -1431,7 +1460,9 @@ async function handleGameStarted(setupData) {
       defensePolicyName: setupData.defensePolicyName,
       unifiedPolicyName: setupData.unifiedPolicyName ?? null,
       opponentUnifiedPolicyName: setupData.opponentUnifiedPolicyName ?? null,
+      multiPossessionLimit: setupData.multiPossessionLimit ?? null,
     });
+    if (sessionId !== gameSessionId) return;
     
     // Restore phi shaping parameters if we had them
     if (savedPhiParams && response.status === 'success') {
@@ -1451,15 +1482,18 @@ async function handleGameStarted(setupData) {
       throw new Error(response.message || 'Failed to start game.');
     }
   } catch (err) {
+    if (sessionId !== gameSessionId) return;
     error.value = err.message;
     console.error(err);
   } finally {
-    isLoading.value = false;
+    if (sessionId === gameSessionId) isLoading.value = false;
   }
 }
 
 async function handleTemplateSandboxStarted(setupData = {}) {
   console.log('[App] Opening template sandbox with data:', setupData);
+  const sessionId = ++gameSessionId;
+  stopSelfPlay();
   cancelReplayAnimation();
   activeControlsTab.value = 'template';
 
@@ -1512,6 +1546,7 @@ async function handleTemplateSandboxStarted(setupData = {}) {
       run_id: setupData.runId || null,
       user_team_name: setupData.userTeam || 'OFFENSE',
     });
+    if (sessionId !== gameSessionId) return;
     if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
@@ -1520,10 +1555,11 @@ async function handleTemplateSandboxStarted(setupData = {}) {
       throw new Error(response.message || 'Failed to open template sandbox.');
     }
   } catch (err) {
+    if (sessionId !== gameSessionId) return;
     error.value = err.message;
     console.error(err);
   } finally {
-    isLoading.value = false;
+    if (sessionId === gameSessionId) isLoading.value = false;
   }
 }
 
@@ -1826,6 +1862,10 @@ async function handlePolicySwap({ target, policyName }) {
 }
 
 async function handleSwapTeams() {
+  if (gameState.value?.enable_multi_possession) {
+    console.warn('[App] Team swaps are disabled for multi-possession games.');
+    return;
+  }
   if (isLoading.value || isStepRunning.value || isBallHolderUpdating.value) {
     console.log('[App] Team swap already blocked by an active operation.');
     return;
@@ -2016,9 +2056,9 @@ const visibleBoardSelectedActions = computed(() => {
   if (!state) return selections;
 
   const userTeamName = String(state.user_team_name || 'OFFENSE').toUpperCase();
-  const userTeamIds = userTeamName === 'DEFENSE'
-    ? (state.defense_ids || [])
-    : (state.offense_ids || []);
+  const userTeamIds = Array.isArray(state.user_player_ids)
+    ? state.user_player_ids
+    : (userTeamName === 'DEFENSE' ? (state.defense_ids || []) : (state.offense_ids || []));
   const allowedIds = new Set(
     userTeamIds
       .map((id) => Number(id))
@@ -2057,8 +2097,27 @@ function handleTemplateSelfPlay(options = {}) {
   }
   handleSelfPlay(null, options || {});
 }
+
+function stopSelfPlay() {
+  selfPlaySessionId += 1;
+  selfPlayStarting.value = false;
+  selfPlayLoadingMessage.value = '';
+  isSelfPlaying.value = false;
+  currentSelections.value = null;
+}
+
+function isCurrentSelfPlaySession(sessionId) {
+  return sessionId === selfPlaySessionId;
+}
+
+function isCurrentGameSession(sessionId) {
+  return sessionId === gameSessionId;
+}
+
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
+  const sessionId = ++selfPlaySessionId;
+  const activeGameSessionId = ++gameSessionId;
   const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
   selfPlayStarting.value = true;
   selfPlayLoadingMessage.value = 'Starting self-play…';
@@ -2068,6 +2127,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   // Snapshot the backend state before beginning the first visible self-play step.
   try {
     const res = await startSelfPlay(startTemplateOptions);
+    if (!isCurrentGameSession(activeGameSessionId)) return;
     if (!res || res.status !== 'success' || !res.state) {
       throw new Error(res?.message || 'Failed to start self-play.');
     }
@@ -2075,8 +2135,11 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     gameHistory.value = [res.state];
     moveHistory.value = [];
     currentSelections.value = null;
-    selfPlayLoadingMessage.value = 'Preparing first self-play step…';
+    if (isCurrentSelfPlaySession(sessionId)) {
+      selfPlayLoadingMessage.value = 'Preparing first self-play step…';
+    }
   } catch (err) {
+    if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) return;
     error.value = err.message;
     console.error('[App] Failed to start self-play on backend:', err);
     selfPlayStarting.value = false;
@@ -2084,12 +2147,13 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     return;
   }
 
+  if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) return;
   isSelfPlaying.value = true;
   currentSelections.value = null;
   let firstSelfPlayStep = true;
 
   // Run full episode with AI controlling all players
-  while (gameState.value && !gameState.value.done) {
+  while (isCurrentGameSession(activeGameSessionId) && isCurrentSelfPlaySession(sessionId) && gameState.value && !gameState.value.done) {
     try {
       // Get AI actions for user-controlled players
       let aiActions = {};
@@ -2106,9 +2170,13 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       
       if (policyProbs.value) {
         // Determine which players are user-controlled
-        const userControlledIds = gameState.value.user_team_name === 'OFFENSE' 
-          ? gameState.value.offense_ids 
-          : gameState.value.defense_ids;
+        const userControlledIds = Array.isArray(gameState.value.user_player_ids)
+          ? gameState.value.user_player_ids
+          : (gameState.value.enable_multi_possession
+            ? (gameState.value.team_a_ids || [])
+            : (gameState.value.user_team_name === 'OFFENSE'
+              ? gameState.value.offense_ids
+              : gameState.value.defense_ids));
         
         // Get AI actions for user-controlled players
         for (const playerId of userControlledIds) {
@@ -2239,6 +2307,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       } catch (err) {
         console.warn('[App Self-play] Failed to fetch pass steal probs:', err);
       }
+      if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) break;
       
       // Push move to history (state values will be added after step response)
       const currentStateValues = gameState.value?.state_values;
@@ -2253,6 +2322,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       });
       
       const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value, mctsOptions);
+      if (!isCurrentGameSession(activeGameSessionId)) break;
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
@@ -2311,18 +2381,21 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
           });
         }
         try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
+        if (!isCurrentSelfPlaySession(sessionId)) break;
         // Small delay to make the progression visible
         await new Promise(resolve => setTimeout(resolve, 100));
       } else {
         throw new Error(response.message || 'Failed to process step.');
       }
     } catch (err) {
+      if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) break;
       error.value = err.message;
       console.error(err);
       break;
     }
   }
   // Self-play finished
+  if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) return;
   selfPlayStarting.value = false;
   selfPlayLoadingMessage.value = '';
   isSelfPlaying.value = false;
@@ -2824,36 +2897,57 @@ function animatedFlashKindsForState(state) {
         passRes.success &&
         Number.isFinite(Number(passRes.target))
     ),
+  ) || Boolean(
+    Array.isArray(results.turnovers)
+    && results.turnovers.some((turnover) => String(turnover?.reason || '').toLowerCase() === 'steal')
   );
 
   return { hasShot, hasPass, hasRebound };
 }
 
-function stateHasAnimatedFlash(state) {
-  const kinds = animatedFlashKindsForState(state);
-  return Boolean(kinds.hasShot || kinds.hasPass || kinds.hasRebound);
+function captureOffsets(durationMs, frameCount) {
+  const duration = Math.max(0, Number(durationMs) || 0);
+  const count = Math.max(1, Math.trunc(Number(frameCount) || 1));
+  if (count === 1) return [duration];
+  return Array.from({ length: count }, (_, index) => Math.round(duration * index / (count - 1)));
 }
 
-function captureOffsetsForState(state) {
+function stateHasPositionChange(previousState, state) {
+  const previous = previousState?.positions;
+  const current = state?.positions;
+  if (!Array.isArray(previous) || !Array.isArray(current) || previous.length !== current.length) {
+    return false;
+  }
+  return current.some((position, index) => (
+    !Array.isArray(position)
+    || !Array.isArray(previous[index])
+    || position[0] !== previous[index][0]
+    || position[1] !== previous[index][1]
+  ));
+}
+
+function captureOffsetsForState(previousState, state) {
   const { hasShot, hasPass, hasRebound } = animatedFlashKindsForState(state);
   const moveEnd = moveTransitionMs.value;
+  const detail = GIF_CAPTURE_DETAIL[gifAnimationDetail.value] || GIF_CAPTURE_DETAIL.standard;
   if (hasRebound) {
     const reboundEnd = Math.max(moveEnd, REBOUND_STEP_DURATION_MS);
-    const merged = [...REBOUND_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, reboundEnd];
-    return Array.from(new Set(merged)).sort((a, b) => a - b);
+    return captureOffsets(reboundEnd, detail.rebound);
   }
   if (hasShot || hasPass) {
-    const merged = [...FLASH_CAPTURE_OFFSETS_MS, ...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
-    return Array.from(new Set(merged)).sort((a, b) => a - b);
+    return captureOffsets(moveEnd, detail.action);
   }
-  const merged = [...MOVE_CAPTURE_OFFSETS_MS, moveEnd];
-  return Array.from(new Set(merged)).sort((a, b) => a - b);
+  return captureOffsets(moveEnd, stateHasPositionChange(previousState, state) ? detail.movement : 1);
 }
 
 function gifPlaybackDurationForState(state) {
   const { hasRebound } = animatedFlashKindsForState(state);
   const baseDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
   return hasRebound ? Math.max(baseDurationMs, REBOUND_STEP_DURATION_MS) : baseDurationMs;
+}
+
+function isCompletedMultiPossessionGame(state) {
+  return state?.enable_multi_possession === true && state?.done === true;
 }
 
 function reboundProgressForStateOffset(state, offsetMs) {
@@ -2884,11 +2978,20 @@ function interpolateState(prevState, currState, t) {
   };
 }
 
+const isSavingEpisode = ref(false);
+const episodeSaveProgress = ref('');
+
 async function handleSaveEpisode() {
+  if (isSavingEpisode.value) return;
+  isSavingEpisode.value = true;
+  let writer;
+  const savedStepIndex = currentStepIndex.value;
+  const savedHistory = gameHistory.value;
   try {
     disableTransitionsForCapture.value = true;
     moveProgressForCapture.value = 1;
     reboundProgressForCapture.value = 1;
+    showEndGameOutcomeForCapture.value = false;
     await nextTick();
     // Check if we have episode states to render. Prefer the longest history so
     // self-play possessions that continue after offensive rebounds are not truncated
@@ -2910,14 +3013,13 @@ async function handleSaveEpisode() {
     
     console.log(`[handleSaveEpisode] Generating ${states.length} frames...`);
     
-    // Save current step index to restore later
-    const savedStepIndex = currentStepIndex.value;
-    
-    // Generate PNG frames for each state
-    const frames = [];
-    const frameDurations = [];
+    // Upload each PNG immediately; accumulating them into one JSON payload can
+    // exceed the browser's maximum string size on multi-possession episodes.
+    writer = await startEpisodeGifExport();
+    let frameCount = 0;
     for (let i = 0; i < states.length; i++) {
       try {
+        episodeSaveProgress.value = `Saving step ${i + 1}/${states.length}`;
         // Update currentStepIndex so boardSelectedActions shows correct actions for this frame
         currentStepIndex.value = i;
         
@@ -2925,86 +3027,80 @@ async function handleSaveEpisode() {
         const tempHistory = states.slice(0, i + 1);
         gameHistory.value = tempHistory;
         
-        // Wait for Vue to update the DOM
-        await nextTick();
-        
-        // Give a small delay to ensure rendering is complete
-        await new Promise(resolve => setTimeout(resolve, 60));
-
-        const offsets = captureOffsetsForState(states[i]);
+        const previousState = i > 0 ? states[i - 1] : states[i];
+        const offsets = captureOffsetsForState(previousState, states[i]);
         const stepDurationMs = gifPlaybackDurationForState(states[i]);
         const frameDurationMs = stepDurationMs / offsets.length;
+        const isFinalGameState = i === states.length - 1 && isCompletedMultiPossessionGame(states[i]);
 
-        let lastOffset = 0;
         for (const offset of offsets) {
-          const waitMs = Math.max(offset - lastOffset, 0);
-          if (waitMs > 0) {
-            // eslint-disable-next-line no-await-in-loop
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-          }
-
-          const prevState = i > 0 ? states[i - 1] : states[i];
+          // Capture uses explicit progress props while CSS transitions are
+          // disabled. The offsets define the visual state and GIF timing; they
+          // do not require waiting through the live animation in real time.
           const moveDurationMs = moveTransitionMs.value;
           const moveT = moveDurationMs > 0 ? Math.min(1, offset / moveDurationMs) : 1;
           const reboundT = reboundProgressForStateOffset(states[i], offset);
+          const isFinalCaptureFrame = isFinalGameState && offset === offsets[offsets.length - 1];
           moveProgressForCapture.value = moveT;
           reboundProgressForCapture.value = reboundT;
-          const interpState = interpolateState(prevState, states[i], moveT);
+          // Keep terminal actions visible during their animation. End Game is
+          // rendered only for the final one-second hold after that action.
+          showEndGameOutcomeForCapture.value = isFinalCaptureFrame;
+          const interpState = interpolateState(previousState, states[i], moveT);
           const tempHistory = [...states.slice(0, i), interpState];
           gameHistory.value = tempHistory;
+          // Vue must commit the explicit visual state before it is cloned into
+          // a PNG, but no timer is necessary after this DOM update.
           // eslint-disable-next-line no-await-in-loop
           await nextTick();
-          // Give a tiny delay for the DOM to paint
-          // eslint-disable-next-line no-await-in-loop
-          await new Promise(resolve => setTimeout(resolve, 10));
 
           // Render this state as PNG
           if (gameBoardRef.value && gameBoardRef.value.renderStateToPng) {
             // eslint-disable-next-line no-await-in-loop
-            const pngDataUrl = await gameBoardRef.value.renderStateToPng();
-            if (pngDataUrl) {
-              frames.push(pngDataUrl);
-              frameDurations.push(frameDurationMs / 1000);
-            }
+            const pngDataUrl = await gameBoardRef.value.renderStateToPng({
+              width: normalizedGifWidthPx(),
+            });
+            if (!pngDataUrl) throw new Error('Board renderer returned an empty image');
+            await writer.append(pngDataUrl, isFinalCaptureFrame
+              ? END_GAME_GIF_HOLD_SECONDS : frameDurationMs / 1000);
+            frameCount += 1;
+          } else {
+            throw new Error('Game board is unavailable for capture');
           }
-          lastOffset = offset;
         }
       } catch (err) {
-        console.error(`Failed to render frame ${i}:`, err);
+        throw new Error(`Could not capture step ${i + 1}: ${err.message}`);
       }
     }
     
     // Restore the original state
     currentStepIndex.value = savedStepIndex;
-    if (replayStates.value.length > 0) {
-      gameHistory.value = replayStates.value.slice(0, savedStepIndex + 1);
-    }
+    gameHistory.value = savedHistory;
     moveProgressForCapture.value = 1;
     reboundProgressForCapture.value = 1;
+    showEndGameOutcomeForCapture.value = true;
     
-    if (frames.length === 0) {
+    if (frameCount === 0) {
       alert('Failed to generate any frames');
       return;
     }
     
-    if (frameDurations.length !== frames.length) {
-      const fallbackDur = Math.max(0.2, (gifStepDurationMs.value || BASE_STEP_DURATION_MS) / 1000);
-      while (frameDurations.length < frames.length) {
-        frameDurations.push(fallbackDur);
-      }
-      frameDurations.length = frames.length;
-    }
-
-    // Send frames (with per-frame durations) to backend to create GIF
-    const res = await saveEpisodeFromPngs(frames, frameDurations, gifStepDurationMs.value);
+    episodeSaveProgress.value = `Encoding ${frameCount} frames…`;
+    const res = await writer.finish();
     alert(`Episode saved to ${res.file_path}`);
   } catch (e) {
     console.error('Failed to save episode:', e);
     alert(`Failed to save episode: ${e.message}`);
   } finally {
+    await writer?.abort().catch((error) => console.warn('Could not clean up GIF export:', error));
+    currentStepIndex.value = savedStepIndex;
+    gameHistory.value = savedHistory;
     disableTransitionsForCapture.value = false;
     moveProgressForCapture.value = 1;
     reboundProgressForCapture.value = 1;
+    showEndGameOutcomeForCapture.value = true;
+    isSavingEpisode.value = false;
+    episodeSaveProgress.value = '';
   }
 }
 
@@ -3165,6 +3261,7 @@ function toggleReplayPause() {
 
 async function handlePlayAgain() {
   const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
+  stopSelfPlay();
   cancelReplayAnimation();
   gameState.value = null;
   gameHistory.value = [];
@@ -3215,6 +3312,20 @@ async function handlePlayAgain() {
       }
     }
   }
+}
+
+async function handleMultiPossessionLimitRequested(limit) {
+  if (!gameState.value?.enable_multi_possession || !initialSetup.value) return;
+  const parsed = Math.trunc(Number(limit));
+  if (!Number.isFinite(parsed) || parsed < 1) return;
+  if (parsed === Number(gameState.value.multi_possession_limit)) return;
+
+  // The possession limit is static JAX environment configuration, so applying
+  // it starts a clean game with the already selected policies.
+  await handleGameStarted({
+    ...initialSetup.value,
+    multiPossessionLimit: parsed,
+  });
 }
 
 function clearEvaluationArtifacts() {
@@ -3315,8 +3426,12 @@ function onKeydown(e) {
       }
     }
   } else if (key === 'p') {
-    // Self-Play
-    if (gameState.value && !gameState.value.done) handleSelfPlayButton();
+    // Toggle Self-Play
+    if (isSelfPlaying.value || selfPlayStarting.value) {
+      stopSelfPlay();
+    } else if (gameState.value && !gameState.value.done) {
+      handleSelfPlayButton();
+    }
   } else if (key === 's') {
     // Save Episode
     if (gameState.value?.done) handleSaveEpisode();
@@ -3356,6 +3471,7 @@ onMounted(() => {
   window.addEventListener('keyup', onKeyup);
 });
 onBeforeUnmount(() => {
+  stopSelfPlay();
   stopEvaluationProgressPolling();
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('keyup', onKeyup);
@@ -3385,13 +3501,13 @@ onBeforeUnmount(() => {
         <div v-if="gameState" class="ai-toggle">
           <button class="toggle-btn" @click="aiMode = !aiMode">
             <font-awesome-icon :icon="aiMode ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">AI Mode</span>
+            <span class="toggle-label">Player AI</span>
           </button>
           <button class="toggle-btn" @click="playerDeterministic = !playerDeterministic" :disabled="!aiMode">
             <font-awesome-icon :icon="playerDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Player Deterministic</span>
           </button>
-          <button class="toggle-btn" @click="opponentDeterministic = !opponentDeterministic" :disabled="!aiMode">
+          <button class="toggle-btn" @click="opponentDeterministic = !opponentDeterministic">
             <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
             <span class="toggle-label">Opponent Deterministic</span>
           </button>
@@ -3540,6 +3656,7 @@ onBeforeUnmount(() => {
           :show-rebound-skills="evalConfig.showReboundSkillsOnBoard"
           :rebound-skill-overrides="boardReboundSkillOverrides"
           :rebound-target-overlay="boardReboundTargetOverlay"
+          :show-rebound-distribution="showLastReboundDistribution"
           :hide-pass-rays="reboundPreviewEnabled"
           :show-rebound-preview-shot-trajectory="reboundPreviewEnabled"
           :placement-mode="isBoardEditingMode"
@@ -3556,6 +3673,7 @@ onBeforeUnmount(() => {
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
           :rebound-progress="reboundProgressForCapture"
+          :show-end-game-outcome="showEndGameOutcomeForCapture"
           :disable-backend-value-fetches="boardDisableBackendValueFetches"
           :allow-position-drag="!isPlaybookBoardPreviewActive"
           :allow-shot-clock-adjustment="!isPlaybookBoardPreviewActive"
@@ -3578,6 +3696,7 @@ onBeforeUnmount(() => {
             :is-manual-stepping="isManualStepping"
             :is-evaluating="isEvaluating"
             :is-policy-swapping="isPolicySwapping"
+            :multi-possession-restarting="isLoading"
             :policy-options="policyOptions"
             :policies-loading="policiesLoading"
             :policy-load-error="policyLoadError"
@@ -3620,6 +3739,7 @@ onBeforeUnmount(() => {
           @template-self-play="handleTemplateSelfPlay"
           @active-tab-changed="handleActiveTabChanged"
           @pass-lab-config-changed="handlePassLabConfigChanged"
+          @multi-possession-limit-requested="handleMultiPossessionLimitRequested"
           @stats-reset="handleStatsReset"
           ref="controlsRef"
         />
@@ -3634,11 +3754,12 @@ onBeforeUnmount(() => {
           </button>
           
           <button 
-            @click="handleSelfPlayButton" 
+            @click="(isSelfPlaying || selfPlayStarting) ? stopSelfPlay() : handleSelfPlayButton()"
             class="action-button self-play-button"
-            :disabled="!aiMode || gameState.done || liveButtonsDisabled || selfPlayStarting || isSelfPlaying"
+            :disabled="!isSelfPlaying && !selfPlayStarting && (!aiMode || gameState.done || liveButtonsDisabled)"
+            :title="(isSelfPlaying || selfPlayStarting) ? 'Stop the current self-play episode' : 'Run the current game with policy actions'"
           >
-            {{ selfPlayStarting ? 'Preparing…' : 'Self-Play' }}
+            {{ (isSelfPlaying || selfPlayStarting) ? 'Stop Self-Play' : 'Self-Play' }}
           </button>
           
           <button 
@@ -3672,10 +3793,16 @@ onBeforeUnmount(() => {
 
         <div v-if="gameState && !isBoardEditingMode && !isPlaybookBoardPreviewActive" class="rebound-preview-panel">
           <div class="rebound-preview-header">
-            <label class="inline-check rebound-preview-toggle">
-              <input type="checkbox" v-model="reboundPreviewEnabled" />
-              <span>Rebound preview for current ball holder</span>
-            </label>
+            <div class="rebound-preview-toggles">
+              <label class="inline-check rebound-preview-toggle">
+                <input type="checkbox" v-model="reboundPreviewEnabled" />
+                <span>Rebound preview for current ball holder</span>
+              </label>
+              <label class="inline-check rebound-preview-toggle">
+                <input type="checkbox" v-model="showLastReboundDistribution" />
+                <span>Show last rebound distribution</span>
+              </label>
+            </div>
             <button
               v-if="reboundPreviewEnabled"
               class="rebound-preview-refresh"
@@ -3735,8 +3862,28 @@ onBeforeUnmount(() => {
             />
             <span class="gif-speed-label">{{ (gifStepDurationMs / 1000).toFixed(2) }}s / step</span>
           </div>
-          <button @click="handleSaveEpisode" class="save-episode-button">
-            Save Episode
+          <label class="gif-width-control" for="gif-width-input">
+            GIF width
+            <input
+              id="gif-width-input"
+              type="number"
+              min="240"
+              max="3840"
+              step="10"
+              v-model.number="gifWidthPx"
+            />
+            <span>px</span>
+          </label>
+          <label class="gif-detail-control" for="gif-detail-select">
+            Animation detail
+            <select id="gif-detail-select" v-model="gifAnimationDetail">
+              <option value="fast">Fast</option>
+              <option value="standard">Standard</option>
+              <option value="smooth">Smooth</option>
+            </select>
+          </label>
+          <button @click="handleSaveEpisode" class="save-episode-button" :disabled="isSavingEpisode">
+            {{ isSavingEpisode ? episodeSaveProgress : 'Save Episode' }}
           </button>
         </div>
         
@@ -4079,6 +4226,45 @@ header {
   color: var(--app-text-muted);
 }
 
+.gif-width-control {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--app-text-muted);
+}
+
+.gif-width-control input {
+  width: 5.25rem;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 5px;
+  background: rgba(2, 6, 23, 0.75);
+  color: var(--app-text);
+  padding: 0.2rem 0.35rem;
+}
+
+.gif-detail-control {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--app-text-muted);
+}
+
+.gif-detail-control select {
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 5px;
+  background: rgba(2, 6, 23, 0.75);
+  color: var(--app-text);
+  padding: 0.2rem 0.35rem;
+}
+
 .gif-speed-control input[type='range'] {
   accent-color: var(--app-accent);
 }
@@ -4166,6 +4352,13 @@ header {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
+}
+
+.rebound-preview-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.9rem;
 }
 
 .rebound-preview-header {

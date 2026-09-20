@@ -19,6 +19,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
     TURNOVER_REASON_SHOT_CLOCK,
     build_action_masks_batch,
+    build_multi_possession_observation_features_batch,
     reset_batch_minimal,
     step_batch_minimal,
 )
@@ -69,6 +70,44 @@ def _set_live_team_state(
         inbound_player=jnp.asarray([-1], dtype=jnp.int32),
         clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
     )
+
+
+def test_clearance_required_observation_is_live_only():
+    static = _multi_possession_static(possession_limit=6)
+    opening_state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(100), 1),
+        jax,
+        jnp,
+    )
+    inbound_state = _inbound_state(static, team=TEAM_A, seed=101)
+    live_preclear_state = inbound_state._replace(
+        game_phase=jnp.asarray([GAME_PHASE_LIVE], dtype=jnp.int8),
+        inbound_team=jnp.asarray([-1], dtype=jnp.int8),
+        inbound_player=jnp.asarray([-1], dtype=jnp.int32),
+        inbound_steps_remaining=jnp.asarray([0], dtype=jnp.int32),
+    )
+    state = _stack_states(opening_state, inbound_state, live_preclear_state)
+
+    _, globals_vec = build_multi_possession_observation_features_batch(
+        static,
+        state,
+        jnp.asarray([1.0, 1.0, 1.0], dtype=jnp.float32),
+        jnp,
+    )
+
+    # A jump-ball winner requires clearance exactly when their sampled
+    # opening cell is inside the arc. A pending inbound has no live clearance
+    # obligation; the other live, uncleared row always reports it as required.
+    opening_clearance_required = float(
+        1 - int(np.asarray(opening_state.clearance_achieved, dtype=np.int8)[0])
+    )
+    assert np.asarray(globals_vec[:, 2], dtype=np.float32).tolist() == [
+        opening_clearance_required,
+        0.0,
+        1.0,
+    ]
+    assert np.asarray(globals_vec[:, 3], dtype=np.float32).tolist() == [0.0, 1.0, 0.0]
 
 
 def test_move_to_clear_works_for_both_teams_without_bonus_or_scripted_action():
@@ -445,3 +484,57 @@ def test_preclear_clock_and_offensive_lane_violations_use_dead_ball_restarts():
     )
     assert int(np.asarray(lane_out.turnover_before_clearance)[0]) == 1
     assert int(np.asarray(lane_out.state.game_phase)[0]) == GAME_PHASE_AWAITING_INBOUND
+
+
+def test_offensive_lane_rule_allows_three_complete_ticks_then_violates_on_fourth():
+    static = _multi_possession_static(
+        possession_limit=6,
+        offensive_three_seconds_enabled=True,
+    )._replace(
+        three_second_max_steps=jnp.asarray(3, dtype=jnp.int32),
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(118), 1),
+        jax,
+        jnp,
+    )
+    lane_player = int(np.asarray(static.offense_ids)[1])
+    ball_holder = int(np.asarray(static.offense_ids)[0])
+    lane_cell = int(np.flatnonzero(np.asarray(static.offensive_lane_by_cell))[0])
+    non_lane_cells = np.flatnonzero(~np.asarray(static.offensive_lane_by_cell, dtype=bool))
+    assert non_lane_cells.size >= state.positions.shape[1]
+    positions = np.asarray(state.positions).copy()
+    for player_id, cell_idx in enumerate(non_lane_cells[: state.positions.shape[1]]):
+        positions[0, player_id] = np.asarray(static.cell_coords)[cell_idx]
+    positions[0, lane_player] = np.asarray(static.cell_coords)[lane_cell]
+    state = state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        ball_holder=jnp.asarray([ball_holder], dtype=jnp.int32),
+    )
+
+    for elapsed_ticks in range(1, 4):
+        out = step_batch_minimal(
+            static,
+            state,
+            _noops(state),
+            jax.random.split(jax.random.PRNGKey(120 + elapsed_ticks), 1),
+            jax,
+            jnp,
+        )
+        assert int(np.asarray(out.offensive_three_seconds)[0]) == 0
+        assert int(np.asarray(out.turnover)[0]) == 0
+        assert int(np.asarray(out.state.offense_lane_steps)[0, lane_player]) == elapsed_ticks
+        state = out.state
+
+    out = step_batch_minimal(
+        static,
+        state,
+        _noops(state),
+        jax.random.split(jax.random.PRNGKey(124), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(out.offensive_three_seconds)[0]) == 1
+    assert int(np.asarray(out.turnover_reason)[0]) == TURNOVER_REASON_OFFENSIVE_THREE_SECONDS
+    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_INBOUND

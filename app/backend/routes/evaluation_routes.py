@@ -83,10 +83,46 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "rebound_skill_weight",
     "rebound_contest_mode",
     "rebound_contest_radius",
+    "enable_multi_possession",
+    "multi_possession_limit",
+    "multi_possession_reward_mode",
+    "score_potential_scale",
+    "multi_possession_aux_rewards_enabled",
+    "inbound_deadline_steps",
 }
 
 
 def _coerce_eval_env_override(key: str, value):
+    if key in {"enable_multi_possession", "multi_possession_aux_rewards_enabled"}:
+        if isinstance(value, bool):
+            return value
+        raw = str(value or "").strip().lower()
+        if raw in {"1", "true", "yes", "y", "t"}:
+            return True
+        if raw in {"0", "false", "no", "n", "f"}:
+            return False
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
+    if key in {"multi_possession_limit", "inbound_deadline_steps"}:
+        try:
+            numeric = int(value)
+            if numeric < 1:
+                raise ValueError
+            return numeric
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be a positive integer.")
+    if key == "multi_possession_reward_mode":
+        mode = str(value or "").strip().lower()
+        if mode in {"win_loss", "point_differential"}:
+            return mode
+        raise HTTPException(
+            status_code=400,
+            detail="multi_possession_reward_mode must be 'win_loss' or 'point_differential'.",
+        )
+    if key == "score_potential_scale":
+        try:
+            return max(0.0, float(value))
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be numeric.")
     if key == "rebound_contest_mode":
         raw_value = value
         if isinstance(raw_value, dict):
@@ -163,6 +199,16 @@ def _build_evaluation_optional_params(request: EvaluationRequest) -> tuple[dict,
         "start_template_source": getattr(game_state, "start_template_library_source", None),
         "env_overrides": copy.deepcopy(eval_env_overrides),
     }
+
+    # A template is a single-possession bootstrap.  Continuous games retain
+    # their ordinary reset spawn and only transition through the game's
+    # inbound/clearance state machine, so never silently apply a template here.
+    if bool(optional_params.get("enable_multi_possession", False)):
+        optional_params["start_template_enabled"] = False
+        optional_params.pop("start_template_library", None)
+        diagnostics["start_template_enabled"] = False
+        diagnostics["start_template_disabled_reason"] = "multi_possession"
+        return optional_params, diagnostics
 
     if mode == "disabled":
         optional_params["start_template_enabled"] = False
@@ -290,9 +336,15 @@ def run_evaluation(request: EvaluationRequest):
     )
     print(f"  - shot_clock (max): {game_state.env.shot_clock_steps}")
     print(f"  - min_shot_clock: {game_state.env.min_shot_clock}")
-    print(
-        f"  - Each episode starts with random shot clock in range: [{game_state.env.min_shot_clock}, {game_state.env.shot_clock_steps}] steps"
-    )
+    continuous_eval = bool(eval_optional_params.get("enable_multi_possession", False))
+    if continuous_eval:
+        print(
+            f"  - Each continuous game starts with a full shot clock: {game_state.env.shot_clock_steps} steps"
+        )
+    else:
+        print(
+            f"  - Each episode starts with random shot clock in range: [{game_state.env.min_shot_clock}, {game_state.env.shot_clock_steps}] steps"
+        )
 
     # Log policy assignment to teams
     if game_state.user_team == Team.OFFENSE:
@@ -401,6 +453,8 @@ def run_evaluation(request: EvaluationRequest):
     episode_results = []
     for r in episode_payload or []:
         outcome_info = r.get("outcome_info", {}) if isinstance(r, dict) else {}
+        game = r.get("game", {}) if isinstance(r, dict) else {}
+        completed = bool(r.get("completed", True)) if isinstance(r, dict) else True
         final_state = {
             "last_action_results": {
                 "shots": _to_jsonable(outcome_info.get("shots", {})),
@@ -414,7 +468,18 @@ def run_evaluation(request: EvaluationRequest):
             "shot_clock": outcome_info.get("shot_clock", 0),
             "three_point_distance": outcome_info.get("three_point_distance", 4.0),
             "user_team_name": game_state.user_team.name if game_state.user_team else None,
-            "done": True,
+            # A horizon cutoff is not a completed game, even if the score is
+            # tied at that point.  The UI must not turn it into a final result.
+            "done": completed,
+            "completed": completed,
+            "truncated": not completed,
+            "team_a_score": game.get("team_a_score", outcome_info.get("team_a_score")),
+            "team_b_score": game.get("team_b_score", outcome_info.get("team_b_score")),
+            "user_score": game.get("user_score"),
+            "opponent_score": game.get("opponent_score"),
+            "completed_possessions": game.get(
+                "completed_possessions", outcome_info.get("completed_possessions")
+            ),
         }
         episode_results.append(
             {
@@ -423,6 +488,9 @@ def run_evaluation(request: EvaluationRequest):
                 "final_state": final_state,
                 "steps": r.get("steps") if isinstance(r, dict) else None,
                 "episode_rewards": r.get("episode_rewards") if isinstance(r, dict) else None,
+                "completed": completed,
+                "truncated": not completed,
+                "game": _to_jsonable(game),
             }
         )
 

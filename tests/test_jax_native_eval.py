@@ -5,14 +5,20 @@ import inspect
 import numpy as np
 import pytest
 
+jax = pytest.importorskip("jax")
+import jax.numpy as jnp
+
 from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
 from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
 from basketworld_jax.eval.native import (
+    _apply_paired_starting_teams,
     _phi_beta_for_eval,
     _post_orb_continuation_diagnostics_from_trace,
     _task_reward_scale_for_eval,
 )
+from basketworld_jax.env.minimal import TEAM_A, TEAM_B, reset_batch_minimal
+from tests.test_jax_multi_possession import _multi_possession_static
 from basketworld_jax.train.main import parse_args, run_training_loop, validate_train_args
 
 
@@ -89,6 +95,23 @@ def test_task_reward_scale_for_eval_matches_update_schedule():
         "jax/phi_beta_ramp_updates": 500,
     }
     assert _phi_beta_for_eval(phi_params, payload, default=0.0) == pytest.approx(0.125)
+
+
+def test_native_eval_pairs_reset_rows_with_swapped_starting_teams_without_moving_players():
+    static = _multi_possession_static(players=2, possession_limit=3)
+    pair_keys = jax.random.split(jax.random.PRNGKey(19), 2)
+    state = reset_batch_minimal(static, jnp.repeat(pair_keys, 2, axis=0), jax, jnp)
+
+    paired = _apply_paired_starting_teams(static, state, episode_offset=0, jnp=jnp)
+
+    assert np.asarray(paired.starting_offense_team).tolist() == [TEAM_A, TEAM_B, TEAM_A, TEAM_B]
+    assert np.asarray(paired.offense_team).tolist() == [TEAM_A, TEAM_B, TEAM_A, TEAM_B]
+    team_a_ids = set(np.asarray(static.offense_ids, dtype=np.int32).tolist())
+    team_b_ids = set(np.asarray(static.defense_ids, dtype=np.int32).tolist())
+    for idx, holder in enumerate(np.asarray(paired.ball_holder, dtype=np.int32).tolist()):
+        assert holder in (team_a_ids if idx % 2 == 0 else team_b_ids)
+
+    np.testing.assert_array_equal(np.asarray(paired.positions), np.asarray(state.positions))
 
 
 def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
@@ -203,3 +226,89 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
             "shot_clock",
             "three_point_distance",
         }
+
+
+def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs(tmp_path):
+    checkpoint_dir = tmp_path / "native_multi_eval_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--enable-multi-possession",
+            "--multi-possession-limit",
+            "1",
+            "--inbound-deadline-steps",
+            "2",
+            "--kernel-batch-size",
+            "1",
+            "--rollout-horizon",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--ppo-minibatches",
+            "1",
+            "--num-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--eval-deploy-every-updates",
+            "0",
+            "--eval-deploy-batches",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    checkpoint_path = run_training_loop(args)["latest_checkpoint_path"]
+    optional_params = _native_eval_env_params()
+    optional_params.update(
+        {
+            "enable_multi_possession": True,
+            "multi_possession_limit": 1,
+            "inbound_deadline_steps": 2,
+        }
+    )
+
+    result = run_native_jax_evaluation(
+        num_episodes=4,
+        player_deterministic=True,
+        opponent_deterministic=True,
+        required_params={},
+        optional_params=optional_params,
+        unified_policy_path=checkpoint_path,
+        opponent_policy_path=None,
+        user_team_name="OFFENSE",
+        role_flag_offense=1.0,
+        role_flag_defense=-1.0,
+        eval_seed=321,
+    )
+
+    summary = result["eval_diagnostics"]["jax_native_summary"]
+    pairing = summary["paired_starting_team_evaluation"]
+    assert pairing["enabled"] is True
+    assert pairing["paired_game_count"] == 2
+    assert pairing["starting_team_a_count"] == 2
+    assert pairing["starting_team_b_count"] == 2
+    assert summary["completed_games"] + summary["incomplete_games"] == 4
+    assert summary["win_count"] + summary["loss_count"] + summary["tie_count"] == summary["completed_games"]
+    assert summary["evaluation_horizon_guard"]["cutoff_is_completed_game"] is False
+    assert summary["evaluation_horizon_guard"]["cutoff_is_tie"] is False
+    assert "inbound_timeout_turnover_count" in summary
+    assert "turnovers_before_clearance_count" in summary
+    assert "completed_possession_count" in summary
+    assert "completed_possession_live_steps" in summary
+    assert "mean_live_steps_per_completed_possession" in summary
+    for episode in result["results"]:
+        assert set(episode["game"]) >= {
+            "completed",
+            "result",
+            "team_a_score",
+            "team_b_score",
+            "completed_possessions",
+            "starting_offense_team",
+        }
+        if not episode["completed"]:
+            assert episode["game"]["result"] is None

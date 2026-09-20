@@ -27,12 +27,20 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --court-rows 9 \
   --court-cols 8 \
   --shot-clock 24 \
-  --min-shot-clock 14 \
+  --min-shot-clock 24 \
+  --layup-pct 0.60 \
+  --layup-std 0.05 \
+  --three-pt-pct 0.37 \
+  --three-pt-std 0.05 \
+  --dunk-pct 0.60 \
+  --dunk-std 0.30 \
   --three-point-distance 4.25 \
   --three-point-short-distance 3 \
-  --spawn-distance 5 \
-  --max-spawn-distance 7 \
-  --defender-spawn-distance 3 \
+  --illegal-defense-enabled true \
+  --offensive-three-seconds true \
+  --three-second-lane-width 1 \
+  --three-second-lane-height 3 \
+  --three-second-max-steps 3 \
   --defender-guard-distance 1 \
   --shot-pressure-enabled true \
   --shot-pressure-max 0.25 \
@@ -87,6 +95,54 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --learning-rate 3e-4 \
   --policy-model attention \
   --action-head-mode pointer_targeted \
+  --intent-embedding-enabled \
+  --intent-embedding-dim 16 \
+  --enable-intent-learning true \
+  --enable-defense-intent-learning false \
+  --defense-intent-null-prob 1.0 \
+  --num-intents 8 \
+  --intent-commitment-steps 8 \
+  --intent-null-prob 0.0 \
+  --intent-visible-to-defense-prob 0.0 \
+  --intent-obs-mode private_offense \
+  --intent-selector-enabled true \
+  --intent-selector-hidden-dim 64 \
+  --intent-selector-learning-rate 1e-4 \
+  --intent-selector-alpha-start 0.0 \
+  --intent-selector-alpha-end 1.0 \
+  --intent-selector-alpha-warmup-updates 100 \
+  --intent-selector-alpha-ramp-updates 400 \
+  --intent-selector-eps-start 0.5 \
+  --intent-selector-eps-end 0.15 \
+  --intent-selector-eps-warmup-updates 100 \
+  --intent-selector-eps-ramp-updates 400 \
+  --intent-selector-value-coef 0.5 \
+  --intent-selector-entropy-coef 0.03 \
+  --intent-selector-usage-reg-coef 0.05 \
+  --intent-selector-train-every-rollouts 8 \
+  --intent-selector-max-samples-per-update 1024 \
+  --intent-selector-multiselect-enabled true \
+  --intent-selector-min-play-steps 6 \
+  --intent-diversity-enabled true \
+  --intent-diversity-beta-target 0.05 \
+  --intent-diversity-warmup-updates 100 \
+  --intent-diversity-ramp-updates 400 \
+  --intent-diversity-clip 2.0 \
+  --intent-disc-encoder-type set_step \
+  --intent-disc-hidden-dim 128 \
+  --intent-disc-dropout 0.1 \
+  --intent-disc-batch-size 512 \
+  --intent-disc-updates-per-rollout 4 \
+  --intent-disc-eval-holdout-fraction 0.10 \
+  --intent-disc-current-policy-only true \
+  --intent-disc-include-shot-clock false \
+  --intent-disc-include-pressure-exposure false \
+  --disc-eval-batch-output true \
+  --intent-sample-dump-size 4096 \
+  --task-reward-scale-start 0.1 \
+  --task-reward-scale-end 1.0 \
+  --task-reward-scale-warmup-updates 0 \
+  --task-reward-scale-ramp-updates 500 \
   --enable-phi-shaping true \
   --reward-shaping-gamma 1.0 \
   --phi-beta-start 0.0 \
@@ -104,6 +160,7 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --log-every-updates 10 \
   --eval-every-updates 0 \
   --eval-deploy-every-updates 100 \
-  --eval-deploy-batches 20 \
-  --eval-deploy-horizon 256 \
+  --eval-deploy-batches 4 \
+  --eval-deploy-horizon 1024 \
+  --mlflow-experiment-name halfcourt_multi_possessions \
   --log-mlflow

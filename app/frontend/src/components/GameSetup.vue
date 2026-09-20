@@ -11,26 +11,41 @@ const unifiedPolicies = ref([]);
 const selectedUnifiedPolicy = ref(null);
 const useDifferentOpponentPolicy = ref(false);
 const selectedOpponentUnifiedPolicy = ref(null);
+const isMultiPossessionRun = ref(false);
 
 async function fetchPolicies() {
   if (!runId.value) {
     unifiedPolicies.value = [];
     selectedUnifiedPolicy.value = null;
     selectedOpponentUnifiedPolicy.value = null;
+    isMultiPossessionRun.value = false;
     return;
   }
+  const requestedRunId = runId.value;
   try {
     const res = await listPolicies(runId.value);
+    if (requestedRunId !== runId.value) return;
     unifiedPolicies.value = res.unified || [];
     selectedUnifiedPolicy.value = unifiedPolicies.value.at(-1) || null;
     selectedOpponentUnifiedPolicy.value = selectedUnifiedPolicy.value;
+    isMultiPossessionRun.value = res.enable_multi_possession === true;
+    if (isMultiPossessionRun.value) {
+      // Team A is the blue player roster. Keep the legacy enum only as the
+      // API's stable internal representation of that roster.
+      userTeam.value = 'OFFENSE';
+    }
   } catch (e) {
+    if (requestedRunId !== runId.value) return;
+    isMultiPossessionRun.value = false;
     console.error('Failed to fetch policies', e);
   }
 }
 
 // fetch whenever runId changes with debounce-like watch
-watch(runId, () => { fetchPolicies(); });
+watch(runId, () => {
+  isMultiPossessionRun.value = false;
+  fetchPolicies();
+});
 
 // This component now only needs to emit the user's choices.
 // The parent App.vue will handle the API call and loading state.
@@ -38,7 +53,7 @@ function startGame() {
     if (runId.value) {
         const payload = {
             runId: runId.value,
-            userTeam: userTeam.value,
+            userTeam: isMultiPossessionRun.value ? 'OFFENSE' : userTeam.value,
             unifiedPolicyName: selectedUnifiedPolicy.value,
             opponentUnifiedPolicyName: useDifferentOpponentPolicy.value
                 ? (selectedOpponentUnifiedPolicy.value || selectedUnifiedPolicy.value)
@@ -52,7 +67,7 @@ function startGame() {
 function openTemplateSandbox() {
     emit('template-sandbox-started', {
         runId: runId.value || null,
-        userTeam: userTeam.value,
+        userTeam: isMultiPossessionRun.value ? 'OFFENSE' : userTeam.value,
     });
 }
 </script>
@@ -74,7 +89,7 @@ function openTemplateSandbox() {
                 >
             </div>
             
-            <div class="form-group">
+            <div v-if="!isMultiPossessionRun" class="form-group">
                 <p>Choose your team:</p>
                 <label>
                     <input type="radio" v-model="userTeam" value="OFFENSE">
@@ -85,7 +100,11 @@ function openTemplateSandbox() {
                     Defense
                 </label>
             </div>
-            
+            <div v-else class="form-group fixed-team-summary">
+              <p>Playing as the Blue Team</p>
+              <span>Teams alternate offense and defense; the opening possession is decided by the jump ball.</span>
+            </div>
+
             <div class="form-group" v-if="unifiedPolicies.length > 0">
                 <label for="unifiedPol">Unified Policy:</label>
                 <select id="unifiedPol" v-model="selectedUnifiedPolicy">
@@ -96,7 +115,7 @@ function openTemplateSandbox() {
             <div class="form-group" v-if="unifiedPolicies.length > 0">
                 <label>
                     <input type="checkbox" v-model="useDifferentOpponentPolicy">
-                    Use different policy for frozen opponent
+                    {{ isMultiPossessionRun ? 'Use different policy for opponent team' : 'Use different policy for frozen opponent' }}
                 </label>
             </div>
             <div class="form-group" v-if="useDifferentOpponentPolicy && unifiedPolicies.length > 0">
@@ -156,6 +175,18 @@ function openTemplateSandbox() {
   margin-bottom: 0;
   font-size: 0.8rem;
   color: var(--app-text-muted);
+}
+
+.fixed-team-summary p {
+  margin: 0;
+  color: var(--app-text);
+  font-size: 0.9rem;
+}
+
+.fixed-team-summary span {
+  color: var(--app-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
 }
 
 label {
@@ -227,4 +258,5 @@ button:hover {
   margin-top: 1rem;
   color: #f87171;
 }
+
 </style>

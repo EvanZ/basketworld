@@ -3,7 +3,7 @@ import { computed } from 'vue';
 
 const defaultShortcuts = [
   { key: 'N', label: 'New Game' },
-  { key: 'P', label: 'Self-Play' },
+  { key: 'P', label: 'Start/Stop Self-Play' },
   { key: 'T', label: 'Submit Turn' },
   { key: 'S', label: 'Save Episode' },
   { key: 'Y', label: 'Replay Episode' },

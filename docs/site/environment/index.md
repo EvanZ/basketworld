@@ -1,9 +1,11 @@
 # Environment overview
 
-BasketWorld models one half-court possession per episode. The offense attempts
-to create and convert a shot while the defense applies pressure, obstructs
-passes, and contests rebounds. Both sides act on each discrete simulation
-step.
+BasketWorld defaults to one half-court possession per episode. Its JAX mode
+also supports a configurable continuous half-court game: fixed Team A and Team
+B rosters play repeated possessions at the same hoop, then the game ends only
+after its configured possession limit. The offense attempts to create and
+convert a shot while the defense applies pressure, obstructs passes, and
+contests rebounds. Both sides act on each discrete simulation step.
 
 ## Teams and control
 
@@ -38,6 +40,21 @@ values that change every step.
 Every state field is batched. If `kernel_batch_size = B`, positions have shape
 `(B, 2N, 2)`, the ball holder has shape `(B,)`, and so on. Static tables have
 fixed shapes known during compilation.
+
+## Continuous half-court games
+
+When `enable_multi_possession` is set, `offense_ids` and `defense_ids` remain
+the stable Team A and Team B rosters internally; `KernelState.offense_team`
+identifies the team currently attacking. `team_a_score`, `team_b_score`, and
+`completed_possessions` are game-level state. A made basket begins a baseline
+inbound for the other team. A defensive rebound or live turnover switches the
+offense immediately. After any switch, the new offense must clear the ball
+beyond the three-point line before it can shoot.
+
+The opening possession uses one neutral random spawn: both stable teams are
+placed in distinct on-court cells before a 50/50 jump-ball result assigns the
+first ball-handler. Start templates are disabled in this mode: later starts
+are real inbound or live handoff states, not a fresh formation.
 
 ## Reset
 

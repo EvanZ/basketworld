@@ -146,6 +146,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  multiPossessionRestarting: {
+    type: Boolean,
+    default: false,
+  },
   initialUseMcts: {
     type: Boolean,
     default: false,
@@ -197,7 +201,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded', 'pass-lab-config-changed']);
+const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded', 'pass-lab-config-changed', 'multi-possession-limit-requested']);
 
 const hasExternalTabsMount = computed(() => String(props.tabsMountSelector || '').trim().length > 0);
 const resolvedTabsMount = computed(() => {
@@ -559,6 +563,48 @@ const policiesLoading = computed(() => props.policiesLoading);
 const policyLoadError = computed(() => props.policyLoadError);
 const userPolicySelection = ref('');
 const opponentPolicySelection = ref('');
+const isMultiPossessionGame = computed(() => Boolean(props.gameState?.enable_multi_possession));
+const multiPossessionLimitInput = ref(25);
+const normalizedMultiPossessionLimit = computed(() => {
+  const value = Math.trunc(Number(multiPossessionLimitInput.value));
+  return Number.isFinite(value) && value >= 1 ? value : 1;
+});
+const multiPossessionLimitIsCurrent = computed(() => (
+  normalizedMultiPossessionLimit.value === Number(props.gameState?.multi_possession_limit)
+));
+
+watch(
+  () => props.gameState?.multi_possession_limit,
+  (value) => {
+    const parsed = Math.trunc(Number(value));
+    multiPossessionLimitInput.value = Number.isFinite(parsed) && parsed >= 1 ? parsed : 25;
+  },
+  { immediate: true },
+);
+
+function requestMultiPossessionLimitRestart() {
+  if (!isMultiPossessionGame.value || multiPossessionLimitIsCurrent.value) return;
+  emit('multi-possession-limit-requested', normalizedMultiPossessionLimit.value);
+}
+
+const playerPolicyLabel = computed(() => {
+  if (isMultiPossessionGame.value) return 'Player team';
+  return `Player (${props.gameState?.user_team_name || 'OFFENSE'})`;
+});
+const opponentPolicyLabel = computed(() => {
+  if (isMultiPossessionGame.value) return 'Opponent team';
+  return `Opponent (${props.gameState?.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE'})`;
+});
+const playerPolicyTooltip = computed(() => (
+  isMultiPossessionGame.value
+    ? 'Select the neural network policy for the player team. It controls that team on both offense and defense.'
+    : 'Select the neural network policy controlling the player\'s team.'
+));
+const opponentPolicyTooltip = computed(() => (
+  isMultiPossessionGame.value
+    ? 'Select the neural network policy for the opponent team. Mirror uses the player policy; any other checkpoint is used on both offense and defense.'
+    : 'Select the neural network policy controlling the opponent team. Mirror uses the same policy as the player.'
+));
 
 watch(
   () => props.gameState?.unified_policy_name,
@@ -1837,7 +1883,10 @@ const startTemplateOptions = computed(() => {
     })
     .filter(Boolean);
 });
-const hasLoadedStartTemplates = computed(() => startTemplateOptions.value.length > 0);
+const startTemplatesDisabled = computed(() => Boolean(props.gameState?.start_templates_disabled));
+const hasLoadedStartTemplates = computed(() => (
+  startTemplateOptions.value.length > 0 && !startTemplatesDisabled.value
+));
 const startTemplateDefinitions = computed(() => (
   Array.isArray(props.gameState?.start_template_library?.templates)
     ? props.gameState.start_template_library.templates
@@ -2104,6 +2153,10 @@ function selectStartTemplate(id) {
 
 async function handleApplyStartTemplateToBoard() {
   clearStartTemplateFeedback();
+  if (startTemplatesDisabled.value) {
+    startTemplateActionError.value = 'Start templates are disabled for multi-possession games.';
+    return;
+  }
   if (!selectedStartTemplateId.value) return;
   try {
     const res = await applyStartTemplate(
@@ -2124,6 +2177,10 @@ async function handleApplyStartTemplateToBoard() {
 
 function handleStartSelfPlayFromTemplate() {
   clearStartTemplateFeedback();
+  if (startTemplatesDisabled.value) {
+    startTemplateActionError.value = 'Start templates are disabled for multi-possession games.';
+    return;
+  }
   if (!selectedStartTemplateId.value) return;
   emit('template-self-play', {
     templateId: selectedStartTemplateId.value,
@@ -2133,7 +2190,7 @@ function handleStartSelfPlayFromTemplate() {
 }
 
 function getRandomStartTemplateOptions() {
-  if (!randomStartTemplateForSelfPlay.value) return null;
+  if (startTemplatesDisabled.value || !randomStartTemplateForSelfPlay.value) return null;
   const options = startTemplateOptions.value;
   if (!Array.isArray(options) || options.length === 0) return null;
   const selected = options[Math.floor(Math.random() * options.length)];
@@ -6262,6 +6319,9 @@ const userControlledPlayerIds = computed(() => {
   if (!props.gameState || !props.gameState.user_team_name) {
     return [];
   }
+  if (Array.isArray(props.gameState.user_player_ids)) {
+    return props.gameState.user_player_ids;
+  }
   return props.gameState.user_team_name === 'OFFENSE' 
     ? props.gameState.offense_ids 
     : props.gameState.defense_ids;
@@ -6286,10 +6346,15 @@ watch(
 );
 
 const controlsTabPlayerIds = computed(() => {
-  if (props.showOpponentActions) {
-    return allPlayerIds.value;
-  }
+  // Show Opponent Actions affects board/diagnostic visibility only. Turn
+  // Controls must remain limited to the player-owned roster.
   return userControlledPlayerIds.value;
+});
+
+const isActivePlayerUserControlled = computed(() => {
+  const activePlayerId = Number(props.activePlayerId);
+  if (!Number.isFinite(activePlayerId)) return false;
+  return userControlledPlayerIds.value.some((playerId) => Number(playerId) === activePlayerId);
 });
 
 const offenseIdsLive = computed(() => props.gameState?.offense_ids || []);
@@ -6329,15 +6394,16 @@ const entropyRows = computed(() => {
   const offenseIds = props.gameState.offense_ids || [];
   const defenseIds = props.gameState.defense_ids || [];
   const userTeam = props.gameState.user_team_name;
+  const stableUserIds = Array.isArray(props.gameState.user_player_ids)
+    ? props.gameState.user_player_ids
+    : (userTeam === 'DEFENSE' ? defenseIds : offenseIds);
   const opponentHasOwnPolicy = !!props.gameState.opponent_unified_policy_name;
 
   return allPlayerIds.value.map((pid) => {
     const probs = policyProbabilities.value?.[pid] ?? policyProbabilities.value?.[String(pid)];
     const mask = props.gameState?.action_mask?.[pid];
     const entropy = computeEntropy(probs, mask);
-    const isUserTeam =
-      (userTeam === 'OFFENSE' && offenseIds.includes(pid)) ||
-      (userTeam === 'DEFENSE' && defenseIds.includes(pid));
+    const isUserTeam = stableUserIds.includes(pid);
     const teamLabel = offenseIds.includes(pid) ? 'Offense' : 'Defense';
     const policyOwner = isUserTeam
       ? 'Player policy'
@@ -6955,7 +7021,7 @@ function getReboundContestProbability(move, playerId) {
 }
 
 function handleActionSelected(action) {
-  if (props.disabled) return; // ignore clicks when disabled
+  if (props.disabled || !isActivePlayerUserControlled.value) return;
   if (props.activePlayerId !== null) {
     // If the same action is clicked again, deselect it. Otherwise, select the new one.
     if (selectedActions.value[props.activePlayerId] === action) {
@@ -6988,13 +7054,14 @@ const activePassTargets = computed(() => {
 const activeCanSelectPointerPass = computed(() => {
   if (!isPointerPassMode.value) return false;
   if (props.activePlayerId === null || props.activePlayerId === undefined) return false;
+  if (!isActivePlayerUserControlled.value) return false;
   if (!isBallHolderPlayer(props.activePlayerId)) return false;
   const legal = getLegalActions(props.activePlayerId);
   return legal.some(action => action.startsWith('PASS_'));
 });
 
 function handlePointerPassTargetSelected(targetId) {
-  if (props.disabled || !isPointerPassMode.value) return;
+  if (props.disabled || !isActivePlayerUserControlled.value || !isPointerPassMode.value) return;
   if (props.activePlayerId === null || props.activePlayerId === undefined) return;
   const pid = Number(props.activePlayerId);
   const tid = Number(targetId);
@@ -7035,22 +7102,19 @@ function buildMctsOptions() {
 
 function submitActions() {
   let actionsToSubmit = {};
-  
-  // When manually stepping, we want to collect actions for ALL players (user and opponent)
-  // that have been selected manually.
-  
-  // Determine which players to iterate over. 
-  // If manual mode (AI Mode off), we allow controlling everyone.
-  // If AI mode on, we also want to send everyone (including AI pre-selections).
-  const playersToSubmit = allPlayerIds.value; 
+
+  // Player AI controls only the user team. In manual mode, omit opponents so
+  // the backend always obtains their actions from the configured opponent policy.
+  const playersToSubmit = props.aiMode
+    ? allPlayerIds.value
+    : userControlledPlayerIds.value;
   const mctsTargets = useMctsForStep.value ? new Set(getAdvisorTargets()) : new Set();
 
   for (const playerId of playersToSubmit) {
     // If MCTS is set to override this player, omit the explicit action so the backend can fill it
     if (mctsTargets.has(playerId)) continue;
-    // If a selection exists, use it. Otherwise send 0 (NOOP).
-    // Note: In AI mode, selections are pre-filled. In Manual mode, they are filled by click.
-    // If unselected in manual mode, it defaults to NOOP (0), which allows manual override of opponents.
+    // If a selection exists, use it. Otherwise send 0 (NOOP). In manual mode
+    // this applies only to the user team; opponent IDs are intentionally omitted.
     const actionName = getEffectiveSelectedAction(playerId) || 'NOOP';
     const pointerTarget = resolvePointerPassTarget(playerId, actionName);
     const hasPointerTarget = Number.isFinite(Number(pointerTarget));
@@ -7223,10 +7287,16 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
   if (props.externalSelections) return;
   
   try {
-    if (newAiMode) {
-      // Pre-select AI actions for ALL players when AI mode is enabled
+    if (newAiMode || props.showOpponentActions) {
+      // Player AI previews both teams. In manual-player mode, Show Opponent
+      // Actions previews only the opponent policy; the player team remains
+      // under manual control.
       const newSelections = {};
-      const allIds = allPlayerIds.value;
+      const allIds = newAiMode
+        ? allPlayerIds.value
+        : allPlayerIds.value.filter(
+          (playerId) => !userControlledPlayerIds.value.includes(playerId),
+        );
       
       for (const playerId of allIds) {
         const legalActions = getLegalActions(playerId);
@@ -7298,12 +7368,22 @@ watch([() => props.aiMode, () => props.deterministic, () => props.opponentDeterm
 watch([() => policyProbabilities.value, () => props.showOpponentActions], () => {
   if (props.externalSelections) return;
   try {
-    if (!(props.aiMode && policyProbabilities.value)) {
+    if (!policyProbabilities.value) {
       return;
     }
 
-    const newSelections = {};
-    const allIds = allPlayerIds.value;
+    const allIds = props.aiMode
+      ? allPlayerIds.value
+      : (props.showOpponentActions
+        ? allPlayerIds.value.filter(
+          (playerId) => !userControlledPlayerIds.value.includes(playerId),
+        )
+        : []);
+    if (allIds.length === 0) return;
+
+    // Keep any manually selected player-team actions while refreshing the
+    // visible opponent-policy preview.
+    const newSelections = props.aiMode ? {} : { ...selectedActions.value };
 
     for (const playerId of allIds) {
       const legalActions = getLegalActions(playerId);
@@ -8121,7 +8201,7 @@ function offenseSkillDeltaLabel(idx) {
           :disabled="!hasLoadedStartTemplates"
         />
         <span>Random start template on Self-Play</span>
-        <span class="status-note">{{ hasLoadedStartTemplates ? `${startTemplateOptions.length} loaded` : 'No templates loaded' }}</span>
+        <span class="status-note">{{ startTemplatesDisabled ? 'Disabled for multi-possession' : (hasLoadedStartTemplates ? `${startTemplateOptions.length} loaded` : 'No templates loaded') }}</span>
       </label>
 
       <div class="player-tabs">
@@ -8149,11 +8229,15 @@ function offenseSkillDeltaLabel(idx) {
               :action-values="actionValues && actionValues[activePlayerId] ? actionValues[activePlayerId] : null"
               :value-range="valueRange"
               :is-defense="isDefense"
+              :read-only="!isActivePlayerUserControlled"
               layout-variant="court"
           />
           <div v-if="isPointerPassMode" class="pointer-pass-controls pointer-pass-wrap" :class="{ 'has-pass-selection': activeHasPassSelection }">
             <p class="pointer-pass-label">Pass Target</p>
-            <p v-if="props.gameState && !isBallHolderPlayer(activePlayerId)" class="pointer-pass-note">
+            <p v-if="!isActivePlayerUserControlled" class="pointer-pass-note">
+              Opponent actions are controlled by its policy.
+            </p>
+            <p v-else-if="props.gameState && !isBallHolderPlayer(activePlayerId)" class="pointer-pass-note">
               Select the ball handler to choose a teammate target.
             </p>
             <p v-else-if="!activeCanSelectPointerPass" class="pointer-pass-note">
@@ -8165,7 +8249,7 @@ function offenseSkillDeltaLabel(idx) {
                 :key="`pass-target-${activePlayerId}-${targetId}`"
                 class="pointer-pass-button pointer-pass-btn"
                 :class="{ selected: isPointerPassButtonSelected(targetId) }"
-                :disabled="props.disabled"
+                :disabled="props.disabled || !isActivePlayerUserControlled"
                 @click="handlePointerPassTargetSelected(targetId)"
               >
                 Player {{ targetId }}
@@ -10960,8 +11044,41 @@ function offenseSkillDeltaLabel(idx) {
             </div>
           </div>
 
+          <div v-if="isMultiPossessionGame" class="param-category">
+            <h5>Multi-Possession Game</h5>
+            <div
+              class="param-item"
+              data-tooltip="Total completed possessions across both teams. Applying a new value starts a fresh game with the currently selected policies."
+            >
+              <span class="param-name">Total possessions:</span>
+              <input
+                v-model.number="multiPossessionLimitInput"
+                class="env-param-input"
+                type="number"
+                min="1"
+                step="1"
+                :disabled="multiPossessionRestarting"
+              />
+            </div>
+            <p class="policy-mode-note">
+              Combined across both teams. Applying a new value restarts the current game.
+            </p>
+            <div class="offense-skill-actions">
+              <button
+                class="refresh-policies-btn"
+                :disabled="multiPossessionRestarting || multiPossessionLimitIsCurrent"
+                @click="requestMultiPossessionLimitRestart"
+              >
+                {{ multiPossessionRestarting ? 'Restarting...' : `Restart with ${normalizedMultiPossessionLimit} possessions` }}
+              </button>
+            </div>
+          </div>
+
           <div class="param-category">
             <h5>Policies</h5>
+            <p v-if="isMultiPossessionGame" class="policy-mode-note">
+              Each team uses its selected policy on both offense and defense. Leave the opponent mirrored, or choose another checkpoint.
+            </p>
             <div class="param-item" data-tooltip="MLflow run ID used for currently loaded policies/state.">
               <span class="param-name">Run ID:</span>
               <span class="param-value">{{ props.gameState.run_id || 'N/A' }}</span>
@@ -10970,9 +11087,9 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">Model codename:</span>
               <span class="param-value">{{ props.gameState.model_codename || 'N/A' }}</span>
             </div>
-            <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the player's team">
+            <div class="param-item policy-select-item" :data-tooltip="playerPolicyTooltip">
               <div class="policy-label">
-                Player ({{ props.gameState.user_team_name || 'OFFENSE' }})
+                {{ playerPolicyLabel }}
               </div>
               <div class="policy-select-wrapper">
                 <select
@@ -10999,9 +11116,9 @@ function offenseSkillDeltaLabel(idx) {
                 </select>
               </div>
             </div>
-            <div class="param-item policy-select-item" data-tooltip="Select the neural network policy controlling the opponent team. 'Mirror' uses the same policy as the player.">
+            <div class="param-item policy-select-item" :data-tooltip="opponentPolicyTooltip">
               <div class="policy-label">
-                Opponent ({{ props.gameState.user_team_name === 'OFFENSE' ? 'DEFENSE' : 'OFFENSE' }})
+                {{ opponentPolicyLabel }}
               </div>
               <div class="policy-select-wrapper">
                 <select
@@ -11037,6 +11154,7 @@ function offenseSkillDeltaLabel(idx) {
                 <span v-else>⟳ Refresh </span>
               </button>
               <button
+                v-if="!isMultiPossessionGame"
                 class="refresh-policies-btn"
                 @click="$emit('swap-teams-requested')"
                 :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
@@ -13700,6 +13818,13 @@ function offenseSkillDeltaLabel(idx) {
 
 .policy-status.error {
   color: #fb7185;
+}
+
+.policy-mode-note {
+  margin: -0.1rem 0 0.6rem;
+  color: var(--app-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
 }
 
 .policy-actions {

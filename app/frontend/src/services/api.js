@@ -1,3 +1,5 @@
+import { createEpisodeGifExport } from '../utils/episodeExport';
+
 // Determine the backend base URL.
 // Priority:
 //  1. Vite env variable VITE_API_BASE_URL (e.g., set in .env or at build time)
@@ -66,6 +68,7 @@ export async function initGame(options = {}) {
         defensePolicyName = null,
         unifiedPolicyName = null,
         opponentUnifiedPolicyName = null,
+        multiPossessionLimit = null,
     } = options || {};
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
         method: 'POST',
@@ -79,6 +82,7 @@ export async function initGame(options = {}) {
             defense_policy_name: defensePolicyName,
             unified_policy_name: unifiedPolicyName,
             opponent_unified_policy_name: opponentUnifiedPolicyName,
+            multi_possession_limit: multiPossessionLimit,
         }),
     });
     if (!response.ok) {
@@ -318,26 +322,19 @@ export async function saveEpisode() {
 }
 
 export async function saveEpisodeFromPngs(frames, durations, stepDurationMs) {
-    const payload = { frames };
-    if (Array.isArray(durations)) {
-        payload.durations = durations;
+    const writer = await startEpisodeGifExport();
+    try {
+        for (let index = 0; index < frames.length; index += 1) {
+            await writer.append(frames[index], durations?.[index] ?? (stepDurationMs || 1000) / 1000);
+        }
+        return await writer.finish();
+    } finally {
+        await writer.abort().catch((error) => console.warn('Could not clean up GIF export:', error));
     }
-    if (typeof stepDurationMs === 'number') {
-        payload.step_duration_ms = stepDurationMs;
-    }
-    const response = await fetch(`${API_BASE_URL}/api/save_episode_from_pngs`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ detail: 'Failed to save episode from PNGs' }));
-        console.error('[API] saveEpisodeFromPngs failed:', response.status, errorData);
-        throw new Error(errorData.detail || 'Failed to save episode from PNGs');
-    }
-    return response.json();
+}
+
+export function startEpisodeGifExport() {
+    return createEpisodeGifExport(API_BASE_URL);
 }
 
 export async function renderGifFromPngs(frames, durations, stepDurationMs) {

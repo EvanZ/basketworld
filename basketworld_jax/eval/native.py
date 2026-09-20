@@ -13,6 +13,9 @@ from basketworld_jax.env.minimal import (
     MOVE_ACTION_END,
     MOVE_ACTION_START,
     MULTI_POSSESSION_SCHEMA_VERSION,
+    GAME_PHASE_AWAITING_INBOUND,
+    TEAM_A,
+    TEAM_B,
     PASS_ACTION_END,
     PASS_ACTION_START,
     REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
@@ -503,6 +506,14 @@ def _native_eval_horizon(env, training_params: dict[str, Any] | None, payload: d
     if bool(getattr(env, "enable_rebounds", False)):
         reset_steps = max(1, int(getattr(env, "offensive_rebound_shot_clock_reset", 14)))
         horizon = max(horizon, shot_clock_steps + 3 * reset_steps + 2)
+    if bool(getattr(env, "enable_multi_possession", False)):
+        # A continuous game needs room for every possession, including a
+        # dead-ball inbound. This is a completion guard, not a declaration
+        # that reaching the cutoff is a tie or a valid completed game.
+        possession_limit = max(1, int(getattr(env, "multi_possession_limit", 25)))
+        inbound_steps = max(1, int(getattr(env, "inbound_deadline_steps", 5)))
+        per_possession = int(horizon) + inbound_steps + 2
+        horizon = max(horizon, possession_limit * per_possession)
     return int(horizon)
 
 
@@ -818,6 +829,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "selector_used": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_uniform_used": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_episode_start": jnp.zeros(batch_shape, dtype=jnp.int8),
+                "selector_boundary_possession_start": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_commitment_timeout": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_completed_pass": jnp.zeros(batch_shape, dtype=jnp.int8),
                 "selector_boundary_offensive_rebound": jnp.zeros(batch_shape, dtype=jnp.int8),
@@ -891,7 +903,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 uniform_used = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
             active = state.intent_active.astype(jnp.bool_)
-            episode_start = active & (state.intent_age == 0)
+            segment_start = active & (state.intent_age == 0)
+            episode_start = segment_start & (state.step_count == 0)
+            possession_start = segment_start & (state.step_count > 0)
             multiselect_enabled = jnp.asarray(selector_multiselect_enabled).astype(jnp.bool_)
             commitment_timeout = (
                 multiselect_enabled
@@ -913,7 +927,7 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
             )
             eligible = (
                 static.enable_intent_learning.astype(jnp.bool_)
-                & (episode_start | commitment_timeout | completed_pass | offensive_rebound)
+                & (segment_start | commitment_timeout | completed_pass | offensive_rebound)
             )
             selected_state = set_offense_intent_state_batch(
                 static,
@@ -928,6 +942,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "selector_used": (eligible & selector_used).astype(jnp.int8),
                 "selector_uniform_used": (eligible & uniform_used).astype(jnp.int8),
                 "selector_boundary_episode_start": (eligible & episode_start).astype(jnp.int8),
+                "selector_boundary_possession_start": (
+                    eligible & possession_start
+                ).astype(jnp.int8),
                 "selector_boundary_commitment_timeout": (eligible & commitment_timeout).astype(jnp.int8),
                 "selector_boundary_completed_pass": (
                     eligible & completed_pass & (~commitment_timeout)
@@ -956,10 +973,18 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
         def _scan_step(carry, _):
             state, key, completed_pass_boundary, offensive_rebound_boundary = carry
             key, selector_key, offense_key, defense_key, env_key = jax.random.split(key, 5)
+            # The policy assignment is fixed to Team A/B, while its role is
+            # dynamic across possessions.  This lets each policy act on both
+            # offense and defense without silently swapping checkpoints.
+            team_a_role_flag = jnp.where(
+                state.offense_team == TEAM_A,
+                role_flag_offense,
+                role_flag_defense,
+            )
             selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
-                role_flag_offense,
+                team_a_role_flag,
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -975,61 +1000,77 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 offensive_rebound_boundary,
             )
             full_action_mask = build_action_masks_batch(static, policy_state, jnp)
-            offense_mask = full_action_mask[:, offense_ids, :]
-            defense_mask = full_action_mask[:, defense_ids, :]
-            offense_obs = build_policy_observation_batch_with_role_flag(
+            team_a_mask = full_action_mask[:, offense_ids, :]
+            team_b_mask = full_action_mask[:, defense_ids, :]
+            team_a_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
-                role_flag_offense,
+                jnp.where(
+                    policy_state.offense_team == TEAM_A,
+                    role_flag_offense,
+                    role_flag_defense,
+                ),
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
-            offense_obs = _adapt_policy_observation_to_spec(offense_obs, static, spec, jnp)
-            defense_obs = build_policy_observation_batch_with_role_flag(
+            team_a_obs = _adapt_policy_observation_to_spec(team_a_obs, static, spec, jnp)
+            team_b_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 policy_state,
-                role_flag_defense,
+                jnp.where(
+                    policy_state.offense_team == TEAM_B,
+                    role_flag_offense,
+                    role_flag_defense,
+                ),
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
             )
-            defense_obs = _adapt_policy_observation_to_spec(defense_obs, static, spec, jnp)
-            offense_intent_context = build_policy_intent_context_batch_with_role_flag(
+            team_b_obs = _adapt_policy_observation_to_spec(team_b_obs, static, spec, jnp)
+            team_a_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 policy_state,
-                role_flag_offense,
+                jnp.where(
+                    policy_state.offense_team == TEAM_A,
+                    role_flag_offense,
+                    role_flag_defense,
+                ),
                 jnp,
             )
-            defense_intent_context = build_policy_intent_context_batch_with_role_flag(
+            team_b_intent_context = build_policy_intent_context_batch_with_role_flag(
                 static,
                 policy_state,
-                role_flag_defense,
+                jnp.where(
+                    policy_state.offense_team == TEAM_B,
+                    role_flag_offense,
+                    role_flag_defense,
+                ),
                 jnp,
             )
-            offense_actions, offense_values = _team_policy_step(
+            team_a_actions, team_a_values = _team_policy_step(
                 offense_params,
-                offense_obs,
-                offense_mask,
-                offense_intent_context,
+                team_a_obs,
+                team_a_mask,
+                team_a_intent_context,
                 offense_key,
                 offense_deterministic,
             )
-            defense_actions, defense_values = _team_policy_step(
+            team_b_actions, team_b_values = _team_policy_step(
                 defense_params,
-                defense_obs,
-                defense_mask,
-                defense_intent_context,
+                team_b_obs,
+                team_b_mask,
+                team_b_intent_context,
                 defense_key,
                 defense_deterministic,
             )
             full_actions = assemble_full_actions_jax(
-                offense_actions,
-                defense_actions,
+                team_a_actions,
+                team_b_actions,
                 offense_ids,
                 defense_ids,
                 n_players,
@@ -1045,8 +1086,16 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
                 "active": (~policy_state.episode_ended.astype(jnp.bool_)).astype(jnp.int8),
-                "offense_values": offense_values,
-                "defense_values": defense_values,
+                "offense_values": jnp.where(
+                    policy_state.offense_team == TEAM_A,
+                    team_a_values,
+                    team_b_values,
+                ),
+                "defense_values": jnp.where(
+                    policy_state.offense_team == TEAM_A,
+                    team_b_values,
+                    team_a_values,
+                ),
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
                 "defense_rewards": jnp.sum(env_out.rewards[:, defense_ids], axis=1),
                 "game_rewards": jnp.sum(env_out.game_reward[:, offense_ids], axis=1),
@@ -1055,6 +1104,23 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 ),
                 "team_a_score_delta": env_out.team_a_score_delta.astype(jnp.float32),
                 "team_b_score_delta": env_out.team_b_score_delta.astype(jnp.float32),
+                "team_a_score": env_out.state.team_a_score.astype(jnp.float32),
+                "team_b_score": env_out.state.team_b_score.astype(jnp.float32),
+                "starting_offense_team": policy_state.starting_offense_team.astype(jnp.int8),
+                "offense_team": policy_state.offense_team.astype(jnp.int8),
+                "next_offense_team": env_out.state.offense_team.astype(jnp.int8),
+                "completed_possessions": env_out.state.completed_possessions.astype(jnp.int32),
+                "prior_game_phase": policy_state.game_phase.astype(jnp.int8),
+                "game_phase": env_out.state.game_phase.astype(jnp.int8),
+                "inbound_team": env_out.state.inbound_team.astype(jnp.int8),
+                "inbound_player": env_out.state.inbound_player.astype(jnp.int32),
+                "inbound_steps_remaining": env_out.state.inbound_steps_remaining.astype(jnp.int32),
+                "clearance_achieved": env_out.state.clearance_achieved.astype(jnp.int8),
+                "possession_ended": env_out.possession_ended.astype(jnp.int8),
+                "possession_end_reason": env_out.possession_end_reason.astype(jnp.int32),
+                "completed_possession_live_steps": (
+                    env_out.completed_possession_live_steps.astype(jnp.int32)
+                ),
                 "phi_r_shape": env_out.phi_r_shape.astype(jnp.float32),
                 "phi_prev": env_out.phi_prev.astype(jnp.float32),
                 "phi_next": env_out.phi_next.astype(jnp.float32),
@@ -1151,6 +1217,12 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
     terminal_steps = np.max(np.asarray(trace["terminal_episode_steps"])[:, :take], axis=0)
     completed = terminal_steps > 0
     steps = np.where(completed, terminal_steps, int(horizon)).astype(np.int32)
+    final_indices = np.maximum(0, steps - 1)
+
+    def _final_trace_value(key: str, dtype):
+        values = np.asarray(trace[key])[:, :take]
+        return values[final_indices, np.arange(take)].astype(dtype)
+
     return {
         "steps": steps,
         "completed": completed.astype(np.int8),
@@ -1171,7 +1243,45 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "offensive_rebounds": np.asarray(trace["offensive_rebound"])[:, :take].sum(axis=0),
         "defensive_rebounds": np.asarray(trace["defensive_rebound"])[:, :take].sum(axis=0),
         "rebound_global_contests": np.asarray(trace["rebound_global_contest"])[:, :take].sum(axis=0),
+        "team_a_score": _final_trace_value("team_a_score", np.float32),
+        "team_b_score": _final_trace_value("team_b_score", np.float32),
+        "completed_possessions": _final_trace_value("completed_possessions", np.int32),
+        "starting_offense_team": _final_trace_value("starting_offense_team", np.int8),
+        "inbound_events": (
+            np.asarray(trace["game_phase"])[:, :take] == 1
+        ).sum(axis=0).astype(np.int32),
     }
+
+
+def _apply_paired_starting_teams(static, state, *, episode_offset: int, jnp):
+    """Give adjacent evaluation rows identical reset randomness and opposite starters.
+
+    Multi-possession openings are neutral before the simulated jump ball. A
+    paired comparison therefore changes only the team/player with the ball;
+    neither stable team's positions may be rearranged.
+    """
+    batch_size = int(state.positions.shape[0])
+    desired_starters = (
+        (jnp.arange(batch_size, dtype=jnp.int32) + int(episode_offset)) % 2
+    ).astype(jnp.int8)
+    original_ids = jnp.where(
+        state.offense_team[:, None] == TEAM_A,
+        static.offense_ids[None, :],
+        static.defense_ids[None, :],
+    )
+    holder_matches = state.ball_holder[:, None] == original_ids
+    holder_slot = jnp.argmax(holder_matches.astype(jnp.int32), axis=1)
+    starter_ids = jnp.where(
+        desired_starters[:, None] == TEAM_A,
+        static.offense_ids[None, :],
+        static.defense_ids[None, :],
+    )
+    paired_holder = jnp.take_along_axis(starter_ids, holder_slot[:, None], axis=1)[:, 0]
+    return state._replace(
+        offense_team=desired_starters,
+        starting_offense_team=desired_starters,
+        ball_holder=paired_holder.astype(jnp.int32),
+    )
 
 
 def _empty_value_diagnostics() -> dict[str, float | int]:
@@ -1450,6 +1560,7 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "used_count": 0,
             "uniform_count": 0,
             "boundary_episode_start_count": 0,
+            "boundary_possession_start_count": 0,
             "boundary_commitment_timeout_count": 0,
             "boundary_completed_pass_count": 0,
             "selection_counts": {},
@@ -1460,6 +1571,12 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "events": 0,
             "elapsed_steps_total": 0,
             "turnovers_before_clearance": 0,
+        },
+        "inbounds": {
+            "started": 0,
+            "completed": 0,
+            "timeout_turnovers": 0,
+            "invalid_pass_turnovers": 0,
         },
         "assist_links": {},
         "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
@@ -1989,6 +2106,15 @@ def run_native_jax_evaluation(
     static_multi = bool(
         int(np.asarray(jax.device_get(static.enable_multi_possession)).reshape(-1)[0])
     )
+    # Selector checkpoints are trained for one fixed offensive role.  In a
+    # continuous game the same policy changes roles on each possession; keep
+    # evaluation policy-only until a role-aware selector exists.
+    selector_runtime_enabled = bool(selector_settings["enabled"] and not static_multi)
+    selector_runtime_disabled_reason = (
+        "multi_possession_dynamic_roles"
+        if static_multi and selector_settings["enabled"]
+        else selector_settings["disabled_reason"]
+    )
     spec_multi = bool(getattr(spec, "multi_possession_features", False))
     if static_multi != spec_multi:
         raise ValueError(
@@ -2119,6 +2245,13 @@ def run_native_jax_evaluation(
     all_offensive_rebounds: list[float] = []
     all_defensive_rebounds: list[float] = []
     all_rebound_global_contests: list[float] = []
+    all_team_a_scores: list[float] = []
+    all_team_b_scores: list[float] = []
+    all_completed_possessions: list[int] = []
+    completed_possession_live_steps_total = 0
+    completed_possession_count = 0
+    all_starting_offense_teams: list[int] = []
+    all_inbound_events: list[int] = []
     value_diagnostics_accum = _empty_value_diagnostics()
 
     start = perf_counter()
@@ -2129,7 +2262,15 @@ def run_native_jax_evaluation(
     while completed_episodes < int(num_episodes):
         take = min(batch_size, int(num_episodes) - completed_episodes)
         key, reset_key, eval_key = jax.random.split(key, 3)
-        reset_keys = jax.random.split(reset_key, batch_size)
+        if static_multi:
+            # Each adjacent A/B pair receives exactly the same reset key. The
+            # only controlled difference is which stable team starts, which
+            # removes first-possession bias even when the game limit is odd.
+            pair_count = (batch_size + 1) // 2
+            pair_keys = jax.random.split(reset_key, pair_count)
+            reset_keys = jnp.repeat(pair_keys, 2, axis=0)[:batch_size]
+        else:
+            reset_keys = jax.random.split(reset_key, batch_size)
         initial_state = reset_batch_minimal(static, reset_keys, jax, jnp)
         reset_seed_parts = np.asarray(jax.device_get(reset_key), dtype=np.uint32).reshape(-1)
         custom_setup_seed = int(reset_seed_parts[0]) ^ (int(reset_seed_parts[-1]) << 1)
@@ -2141,6 +2282,13 @@ def run_native_jax_evaluation(
             jnp,
             rng_seed=custom_setup_seed,
         )
+        if static_multi:
+            initial_state = _apply_paired_starting_teams(
+                static,
+                initial_state,
+                episode_offset=completed_episodes,
+                jnp=jnp,
+            )
         trace_device = runner(
             static,
             initial_state,
@@ -2152,7 +2300,7 @@ def run_native_jax_evaluation(
             int(horizon),
             bool(offense_deterministic),
             bool(defense_deterministic),
-            bool(selector_settings["enabled"]),
+            selector_runtime_enabled,
             float(selector_settings["eval_sampling_eps"]),
             bool(selector_settings["multiselect_enabled"]),
             int(selector_settings["min_play_steps"]),
@@ -2179,6 +2327,22 @@ def run_native_jax_evaluation(
             offense_reward = float(stats["offense_rewards"][idx])
             defense_reward = float(stats["defense_rewards"][idx])
             user_reward = offense_reward if user_team == Team.OFFENSE else defense_reward
+            game_completed = bool(stats["completed"][idx])
+            team_a_score = (
+                float(stats["team_a_score"][idx])
+                if static_multi
+                else float(stats["offense_points"][idx])
+            )
+            team_b_score = (
+                float(stats["team_b_score"][idx])
+                if static_multi
+                else float(stats["defense_points"][idx])
+            )
+            user_score = team_a_score if user_team == Team.OFFENSE else team_b_score
+            opponent_score = team_b_score if user_team == Team.OFFENSE else team_a_score
+            game_result = (
+                "win" if user_score > opponent_score else ("loss" if user_score < opponent_score else "tie")
+            ) if game_completed else None
             initial_holder = int(trace["ball_holder"][0, idx]) if int(horizon) > 0 else -1
             if initial_holder >= 0:
                 initial_counts = eval_diagnostics.setdefault("initial_ball_holder_counts", {})
@@ -2235,6 +2399,13 @@ def run_native_jax_evaluation(
             selector_diag["boundary_episode_start_count"] = int(
                 selector_diag.get("boundary_episode_start_count", 0)
             ) + int(np.asarray(trace["selector_boundary_episode_start"])[:active_steps, idx].sum())
+            selector_diag["boundary_possession_start_count"] = int(
+                selector_diag.get("boundary_possession_start_count", 0)
+            ) + int(
+                np.asarray(trace["selector_boundary_possession_start"])[
+                    :active_steps, idx
+                ].sum()
+            )
             selector_diag["boundary_commitment_timeout_count"] = int(
                 selector_diag.get("boundary_commitment_timeout_count", 0)
             ) + int(np.asarray(trace["selector_boundary_commitment_timeout"])[:active_steps, idx].sum())
@@ -2288,6 +2459,11 @@ def run_native_jax_evaluation(
                 per_player_stats[pid]["steps"] += step_count
 
             for t in range(active_steps):
+                if int(trace["possession_ended"][t, idx]):
+                    completed_possession_count += 1
+                    completed_possession_live_steps_total += int(
+                        trace["completed_possession_live_steps"][t, idx]
+                    )
                 _record_action_mix(eval_diagnostics, trace["full_actions"][t, idx], user_team_ids)
                 _record_holder_action_mix(
                     eval_diagnostics,
@@ -2304,6 +2480,20 @@ def run_native_jax_evaluation(
                 clearance_diag["turnovers_before_clearance"] += int(
                     trace["turnovers_before_clearance"][t, idx]
                 )
+                inbound_diag = eval_diagnostics["inbounds"]
+                if int(trace["possession_ended"][t, idx]) and int(trace["game_phase"][t, idx]) == int(GAME_PHASE_AWAITING_INBOUND):
+                    inbound_diag["started"] += 1
+                if (
+                    int(trace["prior_game_phase"][t, idx]) == int(GAME_PHASE_AWAITING_INBOUND)
+                    and int(trace["completed_passes"][t, idx])
+                ):
+                    inbound_diag["completed"] += 1
+                if int(trace["turnovers"][t, idx]):
+                    turnover_reason_code = int(trace["turnover_reason"][t, idx])
+                    if turnover_reason_code == int(TURNOVER_REASON_INBOUND_TIMEOUT):
+                        inbound_diag["timeout_turnovers"] += 1
+                    elif turnover_reason_code == int(TURNOVER_REASON_INBOUND_INVALID_PASS):
+                        inbound_diag["invalid_pass_turnovers"] += 1
                 if int(trace["pass_attempts"][t, idx]):
                     _record_pass_link_diagnostics(
                         eval_diagnostics,
@@ -2821,6 +3011,23 @@ def run_native_jax_evaluation(
                     "defense_intent_index": episode_defense_intent_index,
                     "defense_intent_active": episode_defense_intent_active,
                     "steps": step_count,
+                    "completed": game_completed,
+                    "truncated": not game_completed,
+                    "game": {
+                        "completed": game_completed,
+                        "result": game_result,
+                        "team_a_score": team_a_score,
+                        "team_b_score": team_b_score,
+                        "user_score": user_score,
+                        "opponent_score": opponent_score,
+                        "margin": float(user_score - opponent_score),
+                        "completed_possessions": int(stats["completed_possessions"][idx]),
+                        "starting_offense_team": (
+                            "team_a"
+                            if int(stats["starting_offense_team"][idx]) == TEAM_A
+                            else "team_b"
+                        ),
+                    },
                     "episode_rewards": {
                         "offense": offense_reward,
                         "defense": defense_reward,
@@ -2833,6 +3040,9 @@ def run_native_jax_evaluation(
                         "rebound": rebounds_payload[-1] if rebounds_payload else None,
                         "shot_clock": shot_clock_steps,
                         "three_point_distance": three_point_distance,
+                        "team_a_score": team_a_score,
+                        "team_b_score": team_b_score,
+                        "completed_possessions": int(stats["completed_possessions"][idx]),
                     },
                     "shot_counts": episode_shots,
                 }
@@ -2862,6 +3072,15 @@ def run_native_jax_evaluation(
         all_offensive_rebounds.extend([float(v) for v in stats["offensive_rebounds"].tolist()])
         all_defensive_rebounds.extend([float(v) for v in stats["defensive_rebounds"].tolist()])
         all_rebound_global_contests.extend([float(v) for v in stats["rebound_global_contests"].tolist()])
+        if static_multi:
+            all_team_a_scores.extend([float(v) for v in stats["team_a_score"].tolist()])
+            all_team_b_scores.extend([float(v) for v in stats["team_b_score"].tolist()])
+        else:
+            all_team_a_scores.extend([float(v) for v in stats["offense_points"].tolist()])
+            all_team_b_scores.extend([float(v) for v in stats["defense_points"].tolist()])
+        all_completed_possessions.extend([int(v) for v in stats["completed_possessions"].tolist()])
+        all_starting_offense_teams.extend([int(v) for v in stats["starting_offense_team"].tolist()])
+        all_inbound_events.extend([int(v) for v in stats["inbound_events"].tolist()])
         completed_episodes += take
         if progress_callback is not None:
             progress_callback(completed_episodes, int(num_episodes))
@@ -3024,6 +3243,43 @@ def run_native_jax_evaluation(
         f"Ro={float(value_diagnostics.get('offense_return_mean', 0.0) or 0.0):.3f} "
         f"Rd={float(value_diagnostics.get('defense_return_mean', 0.0) or 0.0):.3f}"
     )
+    completed_game_indices = [
+        idx for idx, completed in enumerate(all_completed) if bool(completed)
+    ]
+    incomplete_game_count = int(len(all_completed) - len(completed_game_indices))
+    completed_user_scores = [
+        (all_team_a_scores[idx] if user_team == Team.OFFENSE else all_team_b_scores[idx])
+        for idx in completed_game_indices
+    ]
+    completed_opponent_scores = [
+        (all_team_b_scores[idx] if user_team == Team.OFFENSE else all_team_a_scores[idx])
+        for idx in completed_game_indices
+    ]
+    completed_margins = [
+        float(user_score - opponent_score)
+        for user_score, opponent_score in zip(completed_user_scores, completed_opponent_scores)
+    ]
+    win_count = int(sum(margin > 0.0 for margin in completed_margins))
+    loss_count = int(sum(margin < 0.0 for margin in completed_margins))
+    tie_count = int(sum(margin == 0.0 for margin in completed_margins))
+    completed_possession_total = int(
+        sum(all_completed_possessions[idx] for idx in completed_game_indices)
+    )
+    paired_game_count = 0
+    paired_complete_count = 0
+    for pair_start in range(0, len(all_completed), 2):
+        pair_end = pair_start + 1
+        if pair_end >= len(all_completed):
+            break
+        starters_are_swapped = {
+            int(all_starting_offense_teams[pair_start]),
+            int(all_starting_offense_teams[pair_end]),
+        } == {TEAM_A, TEAM_B}
+        if starters_are_swapped:
+            paired_game_count += 1
+            paired_complete_count += int(
+                bool(all_completed[pair_start]) and bool(all_completed[pair_end])
+            )
     summary = {
         "backend": "jax",
         "mode": "native_compiled",
@@ -3037,6 +3293,49 @@ def run_native_jax_evaluation(
         "states_per_sec": float((int(num_episodes) * int(horizon)) / elapsed),
         "completed_episodes": int(np.sum(np.asarray(all_completed, dtype=np.int32))),
         "completion_rate": _mean(all_completed),
+        "evaluation_horizon_guard": {
+            "enabled": bool(static_multi),
+            "cutoff_is_completed_game": False,
+            "cutoff_is_tie": False,
+        },
+        "completed_games": int(len(completed_game_indices)),
+        "incomplete_games": int(incomplete_game_count),
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "tie_count": tie_count,
+        "completed_user_score_mean": _mean(completed_user_scores),
+        "completed_opponent_score_mean": _mean(completed_opponent_scores),
+        "completed_margin_mean": _mean(completed_margins),
+        "completed_possessions_total": completed_possession_total,
+        "completed_possession_count": int(completed_possession_count),
+        "completed_possession_live_steps": int(completed_possession_live_steps_total),
+        "mean_live_steps_per_completed_possession": (
+            float(completed_possession_live_steps_total / completed_possession_count)
+            if completed_possession_count > 0
+            else 0.0
+        ),
+        "completed_possessions_mean": _mean(
+            [all_completed_possessions[idx] for idx in completed_game_indices]
+        ),
+        "user_points_per_possession": (
+            float(sum(completed_user_scores) / completed_possession_total)
+            if completed_possession_total > 0
+            else 0.0
+        ),
+        "opponent_points_per_possession": (
+            float(sum(completed_opponent_scores) / completed_possession_total)
+            if completed_possession_total > 0
+            else 0.0
+        ),
+        "paired_starting_team_evaluation": {
+            "enabled": bool(static_multi),
+            "paired_game_count": int(paired_game_count),
+            "paired_completed_game_count": int(paired_complete_count),
+            "unpaired_episode_count": int(len(all_completed) % 2),
+            "starting_team_a_count": int(sum(team == TEAM_A for team in all_starting_offense_teams)),
+            "starting_team_b_count": int(sum(team == TEAM_B for team in all_starting_offense_teams)),
+        },
+        "inbound_events_per_episode": _mean(all_inbound_events),
         "mean_steps": _mean(all_steps),
         "offense_reward_per_episode": _mean(all_offense_rewards),
         "defense_reward_per_episode": _mean(all_defense_rewards),
@@ -3059,6 +3358,10 @@ def run_native_jax_evaluation(
         "turnovers_before_clearance_count": int(
             clearance_diag_final.get("turnovers_before_clearance", 0) or 0
         ),
+        "inbound_started_count": int((eval_diagnostics.get("inbounds") or {}).get("started", 0) or 0),
+        "inbound_completed_count": int((eval_diagnostics.get("inbounds") or {}).get("completed", 0) or 0),
+        "inbound_timeout_turnover_count": int((eval_diagnostics.get("inbounds") or {}).get("timeout_turnovers", 0) or 0),
+        "inbound_invalid_pass_turnover_count": int((eval_diagnostics.get("inbounds") or {}).get("invalid_pass_turnovers", 0) or 0),
         "rebound_attempts_per_episode": _mean(all_rebound_attempts),
         "offensive_rebounds_per_episode": _mean(all_offensive_rebounds),
         "defensive_rebounds_per_episode": _mean(all_defensive_rebounds),
@@ -3158,14 +3461,18 @@ def run_native_jax_evaluation(
         "defense_intent_active_rate": (
             float(defense_intent_active_episodes / int(num_episodes)) if int(num_episodes) else 0.0
         ),
-        "selector_enabled": bool(selector_settings["enabled"]),
+        "selector_enabled": selector_runtime_enabled,
         "selector_spec_enabled": bool(selector_settings["spec_enabled"]),
         "selector_config_enabled": bool(selector_settings["config_enabled"]),
         "selector_config_mode": str(selector_settings["selector_mode"]),
-        "selector_disabled_reason": selector_settings["disabled_reason"],
+        "selector_disabled_reason": selector_runtime_disabled_reason,
         "selector_selection_mode": str(selector_settings["mode_label"]),
         "selector_training_alpha": float(selector_settings["training_alpha"]),
-        "selector_eval_alpha": float(selector_settings["eval_alpha"]),
+        "selector_eval_alpha": (
+            float(selector_settings["eval_alpha"])
+            if selector_runtime_enabled
+            else 0.0
+        ),
         "selector_eps": float(selector_settings["eps"]),
         "selector_eval_sampling_eps": float(selector_settings["eval_sampling_eps"]),
         "selector_multiselect_enabled": bool(selector_settings["multiselect_enabled"]),
@@ -3181,6 +3488,9 @@ def run_native_jax_evaluation(
         ),
         "selector_boundary_episode_start_count": int(
             selector_diag.get("boundary_episode_start_count", 0) or 0
+        ),
+        "selector_boundary_possession_start_count": int(
+            selector_diag.get("boundary_possession_start_count", 0) or 0
         ),
         "selector_boundary_commitment_timeout_count": int(
             selector_diag.get("boundary_commitment_timeout_count", 0) or 0

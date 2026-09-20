@@ -47,11 +47,39 @@ pretrained policy, continuation checkpoint, or starting templates. The two
 fixed-team cohorts feed one shared PPO update, and unfinished games continue
 across rollout and optimizer-update boundaries.
 
+The launcher enables the established offense-only latent-intent stack: eight
+intents, attention embeddings, the learned selector, and the diversity
+objective. The team currently on offense receives its private intent context;
+defensive intent learning remains disabled. Its 100-update warmup and
+400-update ramp fit the launcher's 500-update experiment rather than copying
+the much longer continuation schedule.
+
 In this mode, rollout cuts bootstrap the value function; only true game endings
 cut the bootstrap. Historical opponents and their sampled action mode are
 pinned per game row until that game ends. Do not combine multi-possession mode
 with `--single-episode-rollouts` or `--ppo-completed-episodes-only`; validation
 rejects both because they would discard or respawn unfinished games.
+
+### Inspecting and evaluating continuous games
+
+The JAX development board shows stable user/AI scores, the current offense,
+completed and remaining possessions, shot clock, inbound countdown, and the
+clearance requirement. An inbounder is rendered beyond the baseline; after a
+successful inbound, the board marks its legal re-entry cells. Start-template
+controls are disabled in this mode because the normal opening spawn occurs
+only once. Both stable teams receive neutral, distinct on-court locations;
+the 50/50 jump-ball result then assigns the opening ball-handler without
+rearranging either team.
+
+Native evaluation pairs reset seeds and swaps the Team A/Team B starter within
+each pair while preserving the same neutral opening positions. It reports game W/L/T, scores, margins,
+possessions and points per possession only for completed games. Horizon cutoffs
+are reported separately as incomplete games—not as ties. Clearance events/time,
+turnovers before clearance, inbound outcomes, rebound totals, and
+`mean_live_steps_per_completed_possession` remain separate diagnostics. The
+pace metric counts the terminal live action but excludes dead-ball inbound
+ticks, so mechanically correct transitions are not mistaken for a learned
+clearing strategy.
 
 ## MLflow
 

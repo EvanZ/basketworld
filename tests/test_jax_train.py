@@ -350,6 +350,7 @@ def test_rebound_diagnostics_match_kernel_components():
         winner_logits=winner_logits,
         use_local_contest=jnp.asarray(True),
         local_eligible=local_eligible,
+        participant_mask=jnp.ones_like(local_eligible, dtype=jnp.bool_),
         jax=jax,
         jnp=jnp,
     )
@@ -410,6 +411,8 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         completed_passes=3.0,
         assists=1.0,
         turnovers=2.0,
+        completed_possessions=3.0,
+        completed_possession_live_steps=7.0,
         turnover_intercepted=1.0,
         shot_attempts=5.0,
         shot_makes=2.0,
@@ -462,6 +465,11 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
     assert summary["rebound_softmax_win_rate_defense"] == pytest.approx(0.625)
     assert summary["rebound_softmax_empirical_gap_defense"] == pytest.approx(0.125)
     assert summary["turnover_intercepted_share"] == pytest.approx(0.5)
+    assert summary["completed_possession_count"] == 3
+    assert summary["completed_possession_live_steps"] == 7
+    assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(
+        7.0 / 3.0
+    )
 
 
 def test_summarize_rebound_diagnostics_handles_missing_or_zero_totals():
@@ -1266,9 +1274,11 @@ def test_multiselect_boundaries_do_not_apply_random_fallback_intents():
         intent_active = jnp.asarray([1, 1], dtype=jnp.int8)
         intent_age = jnp.asarray([6, 6], dtype=jnp.int32)
         intent_commitment_remaining = jnp.asarray([0, 2], dtype=jnp.int32)
+        step_count = jnp.asarray([6, 6], dtype=jnp.int32)
 
     (
         _episode_start,
+        _possession_start,
         commitment_timeout,
         completed_pass,
         offensive_rebound,
@@ -1300,9 +1310,11 @@ def test_multiselect_classifies_offensive_rebound_boundary_separately():
         intent_active = jnp.asarray([1], dtype=jnp.int8)
         intent_age = jnp.asarray([6], dtype=jnp.int32)
         intent_commitment_remaining = jnp.asarray([2], dtype=jnp.int32)
+        step_count = jnp.asarray([6], dtype=jnp.int32)
 
     (
         _episode_start,
+        _possession_start,
         commitment_timeout,
         completed_pass,
         offensive_rebound,

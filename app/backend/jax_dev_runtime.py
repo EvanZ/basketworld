@@ -16,7 +16,19 @@ from basketworld_jax.env.minimal import (
     REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
+    TEAM_A,
+    TEAM_B,
+    GAME_PHASE_AWAITING_INBOUND,
+    GAME_PHASE_LIVE,
+    POSSESSION_END_DEFENSIVE_REBOUND,
+    POSSESSION_END_DEFENSIVE_VIOLATION,
+    POSSESSION_END_INBOUND_VIOLATION,
+    POSSESSION_END_MADE_BASKET,
+    POSSESSION_END_TURNOVER,
     TURNOVER_REASON_DEFENDER_PRESSURE,
+    TURNOVER_REASON_CLEARANCE_VIOLATION,
+    TURNOVER_REASON_INBOUND_INVALID_PASS,
+    TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
@@ -61,6 +73,15 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "enable_rebound_reward_redistribution",
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
+    # Multi-possession state is kernel-only.  The legacy display env does not
+    # expose these constructor arguments, but the compiled kernel reads attrs.
+    "enable_multi_possession",
+    "multi_possession_limit",
+    "multi_possession_reward_mode",
+    "score_potential_scale",
+    "multi_possession_aux_rewards_enabled",
+    "multi_possession_schema_version",
+    "inbound_deadline_steps",
 }
 
 
@@ -85,6 +106,13 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "enable_rebound_reward_redistribution": False,
     "offensive_rebound_reward_advance": 0.4,
     "rebound_reward_once_per_possession": True,
+    "enable_multi_possession": False,
+    "multi_possession_limit": 25,
+    "multi_possession_reward_mode": "win_loss",
+    "score_potential_scale": 1.0,
+    "multi_possession_aux_rewards_enabled": False,
+    "multi_possession_schema_version": 2,
+    "inbound_deadline_steps": 5,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -108,6 +136,13 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "enable_rebound_reward_redistribution": "bool",
     "offensive_rebound_reward_advance": "float",
     "rebound_reward_once_per_possession": "bool",
+    "enable_multi_possession": "bool",
+    "multi_possession_limit": "int",
+    "multi_possession_reward_mode": "str",
+    "score_potential_scale": "float",
+    "multi_possession_aux_rewards_enabled": "bool",
+    "multi_possession_schema_version": "int",
+    "inbound_deadline_steps": "int",
 }
 
 
@@ -443,6 +478,7 @@ class JaxDevRuntime:
         self.jax = raw_model.jax
         self.jnp = raw_model.jnp
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self._canonicalize_multi_possession_ownership()
         self.state = None
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
@@ -478,6 +514,55 @@ class JaxDevRuntime:
     @property
     def defense_ids(self) -> list[int]:
         return [int(v) for v in np.asarray(self.static.defense_ids).reshape(-1).tolist()]
+
+    @property
+    def multi_possession_enabled(self) -> bool:
+        return _as_bool(self.static.enable_multi_possession)
+
+    def _team_ids(self, team_is_a: bool) -> list[int]:
+        """Return the stable roster for Team A or Team B.
+
+        `KernelStatic.offense_ids` and `defense_ids` retain their historical
+        names, but in a multi-possession game they are stable Team A and Team B
+        rosters.  The active offense lives in `KernelState.offense_team`.
+        """
+        return self.offense_ids if bool(team_is_a) else self.defense_ids
+
+    def _team_is_current_offense(self, team_is_a: bool) -> bool:
+        if not self.multi_possession_enabled:
+            return bool(team_is_a)
+        return bool(_as_int(_field0(self.state, "offense_team")) == TEAM_A) == bool(team_is_a)
+
+    def _active_team_ids(self, *, offense: bool) -> list[int]:
+        team_a_is_offense = self._team_is_current_offense(True)
+        return self._team_ids(team_a_is_offense if offense else not team_a_is_offense)
+
+    def _role_flag_for_team(self, team_is_a: bool) -> float:
+        return (
+            self.role_flag_offense
+            if self._team_is_current_offense(team_is_a)
+            else self.role_flag_defense
+        )
+
+    def _team_is_user(self, team_is_a: bool) -> bool:
+        return bool(team_is_a) == self.user_team_is_a
+
+    @property
+    def user_team_is_a(self) -> bool:
+        """Whether the permanent user roster is Team A (the blue team)."""
+        # Multi-possession setup intentionally has no side selector: blue is
+        # always the user/player team, even while it is defending.
+        return bool(self.multi_possession_enabled or self.user_team == Team.OFFENSE)
+
+    def _canonicalize_multi_possession_ownership(self) -> None:
+        """Enforce the permanent blue/user, red/AI team assignment."""
+        # The opening jump ball only chooses the role of the first possession;
+        # it must never reassign visual or policy ownership.  This is done in
+        # the runtime, not only the setup form, because a policy swap can also
+        # refresh the kernel's static environment configuration.
+        if bool(getattr(self.raw_model.spec, "multi_possession_features", False)):
+            self.user_team = Team.OFFENSE
+            self.display_env.training_team = Team.OFFENSE
 
     def _next_key(self):
         self._rng_key, key = self.jax.random.split(self._rng_key)
@@ -575,7 +660,7 @@ class JaxDevRuntime:
         self._sync_display_env()
         if game_state is not None:
             game_state.env = self.display_env
-            game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+            game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
             self._capture_turn_start(game_state)
 
@@ -625,7 +710,7 @@ class JaxDevRuntime:
         self._sync_display_env()
         if game_state is not None:
             game_state.env = self.display_env
-            game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+            game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
         return {
             "rebound_skills": [float(v) for v in values.tolist()],
@@ -636,6 +721,7 @@ class JaxDevRuntime:
         """Refresh immutable JAX kernel config after live display-env edits."""
         self._apply_jax_static_env_attrs()
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self._canonicalize_multi_possession_ownership()
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         if hasattr(self, "_playbook_batch_runner_cache"):
@@ -673,9 +759,7 @@ class JaxDevRuntime:
         if game_state is not None:
             game_state.env = self.display_env
             if self.state is not None:
-                game_state.obs = self.observation_dict(
-                    observer_is_offense=game_state.user_team != Team.DEFENSE
-                )
+                game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
 
     def reset(
@@ -767,7 +851,7 @@ class JaxDevRuntime:
         seed: int | None = None,
     ) -> dict[str, Any]:
         """Reset the authoritative JAX state for playable-mode possession changes."""
-        self.user_team = user_team
+        self.user_team = Team.OFFENSE if self.multi_possession_enabled else user_team
         self.reset(seed=seed)
         updates: dict[str, Any] = {
             "shot_clock": self.jnp.asarray([int(shot_clock)], dtype=self.jnp.int32),
@@ -783,17 +867,17 @@ class JaxDevRuntime:
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
-        self.display_env.training_team = user_team
+        self.display_env.training_team = self.user_team
         self.display_env.shot_clock_steps = int(shot_clock)
         self.display_env.min_shot_clock = int(shot_clock)
 
-        game_state.user_team = user_team
+        game_state.user_team = self.user_team
         game_state.env = self.display_env
-        game_state.obs = self.observation_dict(observer_is_offense=user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         self._apply_selector_episode_start(game_state)
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         self._capture_turn_start(game_state)
         return self.get_full_game_state(
             game_state,
@@ -811,6 +895,11 @@ class JaxDevRuntime:
     ) -> dict[str, Any] | None:
         if not template_id:
             return None
+        if self.multi_possession_enabled:
+            raise ValueError(
+                "Start templates are disabled for multi-possession games; "
+                "the game uses its normal opening spawn and later inbound restarts."
+            )
         library = self.env_params.get("start_template_library")
         if not isinstance(library, dict):
             raise ValueError("No start-template library is loaded for this JAX runtime.")
@@ -857,7 +946,11 @@ class JaxDevRuntime:
     def observation_dict(self, *, observer_is_offense: bool = True) -> dict[str, Any]:
         if self.state is None:
             raise RuntimeError("JAX runtime is not initialized.")
-        role_flag = self.role_flag_offense if observer_is_offense else self.role_flag_defense
+        # Callers historically pass whether the observer is the static
+        # offense-side roster.  In multi-possession mode that is Team A/B
+        # identity, not the role on the current possession.
+        team_is_a = bool(observer_is_offense)
+        role_flag = self._role_flag_for_team(team_is_a)
         obs = build_policy_observation_batch_with_role_flag(
             self.static,
             self.state,
@@ -866,6 +959,7 @@ class JaxDevRuntime:
             model_type=str(self.raw_model.spec.model_type),
             rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
         )
         obs = _adapt_policy_observation_to_spec(obs, self.static, self.raw_model.spec, self.jnp)
         players, globals_vec, _ = build_token_observation_components_batch(
@@ -877,12 +971,13 @@ class JaxDevRuntime:
                 getattr(self.raw_model.spec, "rebound_win_prob_features", False)
             ),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
         )
         skills = self.jnp.stack(
             [
-                self.state.layup_pct[:, self.static.offense_ids] - self.static.base_layup_pct,
-                self.state.three_pt_pct[:, self.static.offense_ids] - self.static.base_three_pt_pct,
-                self.state.dunk_pct[:, self.static.offense_ids] - self.static.base_dunk_pct,
+                self.state.layup_pct[:, self._team_ids(team_is_a)] - self.static.base_layup_pct,
+                self.state.three_pt_pct[:, self._team_ids(team_is_a)] - self.static.base_three_pt_pct,
+                self.state.dunk_pct[:, self._team_ids(team_is_a)] - self.static.base_dunk_pct,
             ],
             axis=-1,
         ).reshape((1, -1))
@@ -899,7 +994,7 @@ class JaxDevRuntime:
         mask = build_action_masks_batch(self.static, self.state, self.jnp)
         return np.asarray(self.jax.device_get(mask[0]), dtype=np.int8)
 
-    def _team_policy_output(self, policy: Any, *, observer_is_offense: bool, deterministic: bool) -> _TeamPolicyOutput:
+    def _team_policy_output(self, policy: Any, *, team_is_a: bool, deterministic: bool) -> _TeamPolicyOutput:
         raw = unwrap_inference_model(policy)
         if raw is None or not hasattr(raw, "_masked_runner"):
             return _TeamPolicyOutput(
@@ -908,7 +1003,7 @@ class JaxDevRuntime:
                 values=0.0,
                 attention_weights=None,
             )
-        role_flag = self.role_flag_offense if observer_is_offense else self.role_flag_defense
+        role_flag = self._role_flag_for_team(team_is_a)
         flat_obs = build_policy_observation_batch_with_role_flag(
             self.static,
             self.state,
@@ -917,10 +1012,11 @@ class JaxDevRuntime:
             model_type=str(raw.spec.model_type),
             rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(raw.spec, "multi_possession_features", False)),
         )
         flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, raw.spec, self.jnp)
         full_action_mask = build_action_masks_batch(self.static, self.state, self.jnp)
-        team_ids_device = self.static.offense_ids if observer_is_offense else self.static.defense_ids
+        team_ids_device = self.static.offense_ids if team_is_a else self.static.defense_ids
         team_ids = [int(v) for v in np.asarray(team_ids_device).reshape(-1).tolist()]
         team_action_mask = self.jnp.take(full_action_mask, team_ids_device, axis=1)
         intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -966,36 +1062,41 @@ class JaxDevRuntime:
         )
 
     def _choose_joint_policy_actions(self, *, player_deterministic: bool, opponent_deterministic: bool):
-        if self.user_team == Team.OFFENSE:
-            offense_policy = self.unified_policy
-            offense_det = bool(player_deterministic)
-            defense_policy = self.opponent_policy or self.unified_policy
-            defense_det = bool(opponent_deterministic) if self.opponent_policy is not None else bool(player_deterministic)
-        else:
-            offense_policy = self.opponent_policy or self.unified_policy
-            offense_det = bool(opponent_deterministic) if self.opponent_policy is not None else bool(player_deterministic)
-            defense_policy = self.unified_policy
-            defense_det = bool(player_deterministic)
+        def _policy_for_team(team_is_a: bool) -> tuple[Any, bool]:
+            if self._team_is_user(team_is_a):
+                return self.unified_policy, bool(player_deterministic)
+            return (
+                self.opponent_policy or self.unified_policy,
+                bool(opponent_deterministic)
+                if self.opponent_policy is not None
+                else bool(player_deterministic),
+            )
 
-        offense_out = self._team_policy_output(
-            offense_policy,
-            observer_is_offense=True,
-            deterministic=offense_det,
+        team_a_policy, team_a_det = _policy_for_team(True)
+        team_b_policy, team_b_det = _policy_for_team(False)
+        team_a_out = self._team_policy_output(
+            team_a_policy,
+            team_is_a=True,
+            deterministic=team_a_det,
         )
-        defense_out = self._team_policy_output(
-            defense_policy,
-            observer_is_offense=False,
-            deterministic=defense_det,
+        team_b_out = self._team_policy_output(
+            team_b_policy,
+            team_is_a=False,
+            deterministic=team_b_det,
         )
         full_actions = np.zeros(self.n_players, dtype=np.int32)
         for pid in self.offense_ids:
-            full_actions[pid] = offense_out.actions[pid]
+            full_actions[pid] = team_a_out.actions[pid]
         for pid in self.defense_ids:
-            full_actions[pid] = defense_out.actions[pid]
-        probs = {**offense_out.probs_by_player, **defense_out.probs_by_player}
+            full_actions[pid] = team_b_out.actions[pid]
+        probs = {**team_a_out.probs_by_player, **team_b_out.probs_by_player}
         self._last_policy_probs = probs
-        offense_attention = self._attention_payload_from_weights(offense_out.attention_weights, True)
-        defense_attention = self._attention_payload_from_weights(defense_out.attention_weights, False)
+        team_a_attention = self._attention_payload_from_weights(team_a_out.attention_weights, True)
+        team_b_attention = self._attention_payload_from_weights(team_b_out.attention_weights, False)
+        if self._team_is_current_offense(True):
+            offense_attention, defense_attention = team_a_attention, team_b_attention
+        else:
+            offense_attention, defense_attention = team_b_attention, team_a_attention
         self._last_attention_payloads = {
             "offense": offense_attention,
             "defense": defense_attention,
@@ -1088,14 +1189,20 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         game_state.actions_log.append([int(v) for v in full_actions.tolist()])
 
         rewards = np.asarray(self.jax.device_get(out.rewards[0]), dtype=np.float32)
+        prior_team_a_is_offense = (
+            not self.multi_possession_enabled
+            or _as_int(_field0(prev_state, "offense_team")) == TEAM_A
+        )
+        prior_offense_ids = self._team_ids(prior_team_a_is_offense)
+        prior_defense_ids = self._team_ids(not prior_team_a_is_offense)
         step_rewards = {
-            "offense": float(np.sum(rewards[self.offense_ids])),
-            "defense": float(np.sum(rewards[self.defense_ids])),
+            "offense": float(np.sum(rewards[prior_offense_ids])),
+            "defense": float(np.sum(rewards[prior_defense_ids])),
         }
         step_idx = len(game_state.reward_history) + 1
         ep_by_player = self.expected_points()
@@ -1121,7 +1228,8 @@ class JaxDevRuntime:
                 "phi_beta": phi_beta,
                 "ep_by_player": ep_by_player,
                 "ball_handler": int(ball_handler) if ball_handler is not None else -1,
-                "offense_ids": self.offense_ids,
+                "offense_ids": prior_offense_ids,
+                "defense_ids": prior_defense_ids,
                 "is_terminal": is_terminal,
                 "shot_clock": self.shot_clock,
             }
@@ -1134,8 +1242,8 @@ class JaxDevRuntime:
                 "phi_beta": phi_beta,
                 "phi_r_shape": phi_r_shape,
                 "ball_handler": int(ball_handler) if ball_handler is not None else -1,
-                "offense_ids": self.offense_ids,
-                "defense_ids": self.defense_ids,
+                "offense_ids": prior_offense_ids,
+                "defense_ids": prior_defense_ids,
                 "shot_clock": self.shot_clock,
                 "is_terminal": is_terminal,
                 "ep_by_player": ep_by_player,
@@ -1209,7 +1317,7 @@ class JaxDevRuntime:
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
         game_state.episode_states = []
         game_state.phi_log = []
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         self._append_initial_phi_log(game_state)
         self._capture_turn_start(game_state)
         state_payload = self.get_full_game_state(
@@ -1249,13 +1357,18 @@ class JaxDevRuntime:
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         return {"status": "success", "state": self.get_full_game_state(game_state, include_policy_probs=True, include_state_values=True)}
 
     def apply_resolved_start_template(self, resolved: dict[str, Any], game_state: Any) -> None:
         if self.state is None:
             raise RuntimeError("JAX runtime is not initialized.")
+        if self.multi_possession_enabled:
+            raise ValueError(
+                "Start templates are disabled for multi-possession games; "
+                "use the normal opening spawn."
+            )
         positions = np.asarray(
             resolved.get("initial_positions") or [],
             dtype=np.int32,
@@ -1283,7 +1396,7 @@ class JaxDevRuntime:
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         self._capture_turn_start(game_state)
 
@@ -1330,7 +1443,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
 
     def set_offense_intent_state(
@@ -1359,7 +1472,7 @@ class JaxDevRuntime:
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
         self._sync_display_env()
-        game_state.obs = self.observation_dict(observer_is_offense=game_state.user_team != Team.DEFENSE)
+        game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
 
     @property
@@ -1383,16 +1496,26 @@ class JaxDevRuntime:
         env.shot_clock = self.shot_clock
         env.step_count = _as_int(_field0(self.state, "step_count"))
         env.episode_ended = _as_bool(_field0(self.state, "episode_ended"))
-        env.offense_score = _as_float(_field0(self.state, "offense_score"))
-        env.defense_score = _as_float(_field0(self.state, "defense_score"))
+        active_offense_ids = self._active_team_ids(offense=True)
+        if self.multi_possession_enabled:
+            team_a_is_offense = self._team_is_current_offense(True)
+            env.offense_score = _as_float(
+                _field0(self.state, "team_a_score" if team_a_is_offense else "team_b_score")
+            )
+            env.defense_score = _as_float(
+                _field0(self.state, "team_b_score" if team_a_is_offense else "team_a_score")
+            )
+        else:
+            env.offense_score = _as_float(_field0(self.state, "offense_score"))
+            env.defense_score = _as_float(_field0(self.state, "defense_score"))
         env.offense_layup_pct_by_player = [
-            float(v) for v in np.asarray(_field0(self.state, "layup_pct"))[self.offense_ids].tolist()
+            float(v) for v in np.asarray(_field0(self.state, "layup_pct"))[active_offense_ids].tolist()
         ]
         env.offense_three_pt_pct_by_player = [
-            float(v) for v in np.asarray(_field0(self.state, "three_pt_pct"))[self.offense_ids].tolist()
+            float(v) for v in np.asarray(_field0(self.state, "three_pt_pct"))[active_offense_ids].tolist()
         ]
         env.offense_dunk_pct_by_player = [
-            float(v) for v in np.asarray(_field0(self.state, "dunk_pct"))[self.offense_ids].tolist()
+            float(v) for v in np.asarray(_field0(self.state, "dunk_pct"))[active_offense_ids].tolist()
         ]
         env._offensive_lane_steps = {
             int(pid): int(v)
@@ -1427,7 +1550,7 @@ class JaxDevRuntime:
         ep_by_player: list[float],
         ball_handler: int | None,
     ) -> tuple[float, float]:
-        offense_ids = self.offense_ids
+        offense_ids = self._active_team_ids(offense=True)
         team_eps = [
             float(ep_by_player[int(pid)])
             for pid in offense_ids
@@ -1452,8 +1575,8 @@ class JaxDevRuntime:
                 "phi_beta": float(np.asarray(self.static.phi_beta).reshape(-1)[0]),
                 "phi_r_shape": 0.0,
                 "ball_handler": int(ball_handler) if ball_handler is not None else -1,
-                "offense_ids": self.offense_ids,
-                "defense_ids": self.defense_ids,
+                "offense_ids": self._active_team_ids(offense=True),
+                "defense_ids": self._active_team_ids(offense=False),
                 "shot_clock": self.shot_clock,
                 "is_terminal": False,
                 "ep_by_player": ep_by_player,
@@ -1470,15 +1593,21 @@ class JaxDevRuntime:
             dtype=np.float32,
         )
         out: dict[int, float] = {}
-        for idx, pid in enumerate(self.offense_ids):
+        for idx, pid in enumerate(self._active_team_ids(offense=True)):
             if int(pid) != int(self.ball_holder):
                 out[int(pid)] = float(probs[idx])
         return out
 
     def state_values(self) -> dict[str, float]:
-        offense = self._team_policy_output(self.unified_policy, observer_is_offense=True, deterministic=True)
-        defense = self._team_policy_output(self.unified_policy, observer_is_offense=False, deterministic=True)
-        return {"offensive_value": float(offense.values), "defensive_value": float(defense.values)}
+        team_a_policy = self.unified_policy if self._team_is_user(True) else (self.opponent_policy or self.unified_policy)
+        team_b_policy = self.unified_policy if self._team_is_user(False) else (self.opponent_policy or self.unified_policy)
+        team_a = self._team_policy_output(team_a_policy, team_is_a=True, deterministic=True)
+        team_b = self._team_policy_output(team_b_policy, team_is_a=False, deterministic=True)
+        if self._team_is_current_offense(True):
+            offense_value, defense_value = team_a.values, team_b.values
+        else:
+            offense_value, defense_value = team_b.values, team_a.values
+        return {"offensive_value": float(offense_value), "defensive_value": float(defense_value)}
 
     def _softmax_np(self, logits: np.ndarray) -> np.ndarray:
         logits = np.asarray(logits, dtype=np.float64)
@@ -1560,6 +1689,7 @@ class JaxDevRuntime:
         sampled_target_cell: int,
         winner: int,
         next_state: Any,
+        offense_ids: set[int] | None = None,
     ) -> tuple[list[dict[str, Any]], float | None, dict[str, Any]]:
         coords = np.asarray(self.jax.device_get(self.static.cell_coords), dtype=np.int32)
         kernel_contest_mode = _rebound_contest_mode_from_static(self.static)
@@ -1572,9 +1702,12 @@ class JaxDevRuntime:
             return [], None, empty_info
         positions = np.asarray(self.jax.device_get(_field0(next_state, "positions")), dtype=np.int32)
         player_cell_indices: list[int] = []
+        player_on_court: list[bool] = []
         for pos in positions:
             idx = self._cell_index_for_position(pos)
+            player_on_court.append(idx is not None)
             player_cell_indices.append(0 if idx is None else int(idx))
+        on_court = np.asarray(player_on_court, dtype=bool)
         safe_indices = np.clip(np.asarray(player_cell_indices, dtype=np.int32), 0, coords.shape[0] - 1)
         distance_matrix = np.asarray(self.jax.device_get(self.static.cell_distance_matrix), dtype=np.float64)
         distances = distance_matrix[
@@ -1605,12 +1738,12 @@ class JaxDevRuntime:
         contest_mode = kernel_contest_mode
         radius_used: int | None = None
         fallback_global = False
-        eligible = np.ones_like(distances, dtype=bool)
-        logits = np.asarray(global_logits, dtype=np.float64)
+        eligible = on_court.copy()
+        logits = np.where(on_court, global_logits, -1.0e9)
 
         if contest_mode == "local_contest":
             initial_radius = max(0, _int_from_static_field(self.static, "rebound_contest_radius", 1))
-            radius_eligible = distances <= float(initial_radius)
+            radius_eligible = (distances <= float(initial_radius)) & on_court
             if bool(np.any(radius_eligible)):
                 eligible = radius_eligible.astype(bool)
                 radius_used = int(initial_radius)
@@ -1620,12 +1753,13 @@ class JaxDevRuntime:
 
         probs = self._softmax_np(logits)
         rows = []
-        offense_ids = set(int(pid) for pid in self.offense_ids)
-        defense_ids = set(int(pid) for pid in self.defense_ids)
-        if contest_mode == "local_contest" and not fallback_global:
-            row_indices = np.nonzero(eligible)[0].tolist()
-        else:
-            row_indices = list(range(int(probs.shape[0])))
+        offense_ids = (
+            set(int(pid) for pid in self._active_team_ids(offense=True))
+            if offense_ids is None
+            else set(int(pid) for pid in offense_ids)
+        )
+        defense_ids = set(range(self.n_players)) - offense_ids
+        row_indices = np.nonzero(eligible)[0].tolist()
         for pid in row_indices:
             prob = float(probs[int(pid)])
             team = "offense" if pid in offense_ids else ("defense" if pid in defense_ids else "unknown")
@@ -1666,12 +1800,17 @@ class JaxDevRuntime:
             "defensive_lane_violations": [],
             "offensive_lane_violations": [],
             "defender_pressure": {},
+            "inbounds": [],
+            "possession_events": [],
+            "clearance": None,
         }
 
     def _action_results_from_step(self, prev_state, out) -> dict[str, Any]:
         results = self._empty_action_results()
         prev_positions = np.asarray(self.jax.device_get(_field0(prev_state, "positions")), dtype=np.int32)
         next_state = out.state
+        prev_phase = _as_int(_field0(prev_state, "game_phase"))
+        next_phase = _as_int(_field0(next_state, "game_phase"))
         if _as_bool(out.shot_attempt[0]):
             shooter = _as_int(out.shot_shooter[0])
             shot_value = _as_float(out.shot_value[0])
@@ -1703,9 +1842,14 @@ class JaxDevRuntime:
                     dtype=np.int32,
                 )
                 target = [int(target_arr[0]), int(target_arr[1])]
+            prior_team_a_is_offense = (
+                not self.multi_possession_enabled
+                or _as_int(_field0(prev_state, "offense_team")) == TEAM_A
+            )
+            prior_offense_ids = set(self._team_ids(prior_team_a_is_offense))
             winner_team = None
             if 0 <= winner < self.n_players:
-                winner_team = "OFFENSE" if winner in self.offense_ids else "DEFENSE"
+                winner_team = "OFFENSE" if winner in prior_offense_ids else "DEFENSE"
             shot_type = _as_int(out.shot_type[0])
             shot_shooter = _as_int(out.shot_shooter[0])
             target_cells, target_prob = self._rebound_target_distribution_payload(
@@ -1718,6 +1862,7 @@ class JaxDevRuntime:
                 sampled_target_cell=target_cell_idx,
                 winner=winner,
                 next_state=next_state,
+                offense_ids=prior_offense_ids,
             )
             rebound = {
                 "attempt": True,
@@ -1776,6 +1921,9 @@ class JaxDevRuntime:
                 TURNOVER_REASON_OFFENSIVE_THREE_SECONDS: "offensive_three_seconds",
                 TURNOVER_REASON_SHOT_CLOCK: "shot_clock_violation",
                 TURNOVER_REASON_INTERCEPTED: "steal",
+                TURNOVER_REASON_INBOUND_TIMEOUT: "inbound_timeout",
+                TURNOVER_REASON_INBOUND_INVALID_PASS: "inbound_invalid_pass",
+                TURNOVER_REASON_CLEARANCE_VIOLATION: "clearance_violation",
             }
             results["turnovers"].append(
                 {
@@ -1785,6 +1933,41 @@ class JaxDevRuntime:
                     "turnover_pos": tuple(int(v) for v in prev_positions[max(0, player)].tolist()) if player >= 0 else None,
                 }
             )
+        if prev_phase == GAME_PHASE_AWAITING_INBOUND:
+            inbounder = _as_int(_field0(prev_state, "inbound_player"))
+            inbound_team = _as_int(_field0(prev_state, "inbound_team"))
+            results["inbounds"].append(
+                {
+                    "inbounder": inbounder if inbounder >= 0 else None,
+                    "team": "team_a" if inbound_team == TEAM_A else "team_b",
+                    "completed": bool(_as_bool(out.completed_pass[0]) and next_phase == GAME_PHASE_LIVE),
+                    "steps_remaining": _as_int(_field0(next_state, "inbound_steps_remaining")),
+                }
+            )
+        if _as_bool(out.possession_ended[0]):
+            reason = _as_int(out.possession_end_reason[0])
+            reason_map = {
+                POSSESSION_END_MADE_BASKET: "made_basket",
+                POSSESSION_END_DEFENSIVE_REBOUND: "defensive_rebound",
+                POSSESSION_END_TURNOVER: "turnover",
+                POSSESSION_END_DEFENSIVE_VIOLATION: "defensive_violation",
+                POSSESSION_END_INBOUND_VIOLATION: "inbound_violation",
+            }
+            results["possession_events"].append(
+                {
+                    "reason": reason_map.get(reason, "possession_end"),
+                    "completed_possessions": _as_int(_field0(next_state, "completed_possessions")),
+                    "next_offense_team": "team_a"
+                    if _as_int(_field0(next_state, "offense_team")) == TEAM_A
+                    else "team_b",
+                    "awaiting_inbound": bool(next_phase == GAME_PHASE_AWAITING_INBOUND),
+                }
+            )
+        if _as_bool(out.clearance_event[0]):
+            results["clearance"] = {
+                "achieved": True,
+                "elapsed_steps": _as_int(out.clearance_elapsed_steps[0]),
+            }
         if _as_bool(out.offensive_three_seconds[0]):
             player = _as_int(out.turnover_player[0])
             results["offensive_lane_violations"].append(
@@ -1866,14 +2049,17 @@ class JaxDevRuntime:
                 actions_taken_meta[str(pid)] = {"type": name}
         return actions_taken, actions_taken_meta
 
-    def _attention_payload_from_weights(self, weights: np.ndarray | None, observer_is_offense: bool):
+    def _attention_payload_from_weights(self, weights: np.ndarray | None, team_is_a: bool):
         if weights is None:
             return None
+        observer_is_offense = self._team_is_current_offense(team_is_a)
+        offense_ids = set(self._active_team_ids(offense=True))
+        defense_ids = set(self._active_team_ids(offense=False))
         labels = []
         for pid in range(self.n_players):
-            if pid in self.offense_ids:
+            if pid in offense_ids:
                 labels.append(f"O{pid}")
-            elif pid in self.defense_ids:
+            elif pid in defense_ids:
                 labels.append(f"D{pid}")
             else:
                 labels.append(f"P{pid}")
@@ -1923,20 +2109,35 @@ class JaxDevRuntime:
         }
         if str(getattr(self.raw_model.spec, "model_type", "")) == "attention":
             if payloads["offense"] is None:
+                offense_team_is_a = self._team_is_current_offense(True)
+                offense_policy = (
+                    self.unified_policy
+                    if self._team_is_user(offense_team_is_a)
+                    else (self.opponent_policy or self.unified_policy)
+                )
                 offense_weights = self._team_policy_output(
-                    self.unified_policy,
-                    observer_is_offense=True,
+                    offense_policy,
+                    team_is_a=offense_team_is_a,
                     deterministic=True,
                 ).attention_weights
-                payloads["offense"] = self._attention_payload_from_weights(offense_weights, True)
+                payloads["offense"] = self._attention_payload_from_weights(
+                    offense_weights, offense_team_is_a
+                )
             if payloads["defense"] is None:
-                defense_policy = self.opponent_policy or self.unified_policy
+                defense_team_is_a = not self._team_is_current_offense(True)
+                defense_policy = (
+                    self.unified_policy
+                    if self._team_is_user(defense_team_is_a)
+                    else (self.opponent_policy or self.unified_policy)
+                )
                 defense_weights = self._team_policy_output(
                     defense_policy,
-                    observer_is_offense=False,
+                    team_is_a=defense_team_is_a,
                     deterministic=True,
                 ).attention_weights
-                payloads["defense"] = self._attention_payload_from_weights(defense_weights, False)
+                payloads["defense"] = self._attention_payload_from_weights(
+                    defense_weights, defense_team_is_a
+                )
         self._last_attention_payloads = payloads
         self._last_attention_payload = payloads["offense"] if observer_is_offense else payloads["defense"]
         player_key = "offense" if self.user_team != Team.DEFENSE else "defense"
@@ -1976,6 +2177,11 @@ class JaxDevRuntime:
         return params
 
     def _selector_runtime_enabled(self, game_state: Any) -> bool:
+        # Selectors currently encode a single offense-side play segment. A
+        # continuous game changes offense dynamically, so do not apply a
+        # one-sided selector as an implicit clearing/inbound helper.
+        if self.multi_possession_enabled:
+            return False
         if not bool(getattr(self.raw_model.spec, "intent_selector_enabled", False)):
             return False
         if not _as_bool(self.static.enable_intent_learning):
@@ -2047,6 +2253,7 @@ class JaxDevRuntime:
             model_type=str(self.raw_model.spec.model_type),
             rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
         )
         flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, self.raw_model.spec, self.jnp)
         batch_size = flat_obs.shape[0]
@@ -2351,6 +2558,8 @@ class JaxDevRuntime:
             player_labels.append("rebound_skill_specialist")
         if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
             player_labels.append("rebound_win_probability")
+        if self.multi_possession_enabled:
+            player_labels.extend(["is_inbounder", "on_court"])
         globals_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
         if rebound_target_observation_features:
             globals_labels.extend(
@@ -2358,8 +2567,53 @@ class JaxDevRuntime:
             )
         if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
             globals_labels.append("offensive_rebound_probability")
+        if self.multi_possession_enabled:
+            # These game-context features are appended by the JAX kernel for
+            # multi-possession training.  In particular, the inbound clock is
+            # intentionally separate from the shot-clock feature.
+            globals_labels.extend(
+                [
+                    "relative_score",
+                    "possessions_remaining_norm",
+                    "clearance_required",
+                    "inbound_phase",
+                    "inbound_countdown_norm",
+                ]
+            )
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
+        team_a_is_offense = self._team_is_current_offense(True)
+        active_offense_ids = self._active_team_ids(offense=True)
+        active_defense_ids = self._active_team_ids(offense=False)
+        team_a_ids = self._team_ids(True)
+        team_b_ids = self._team_ids(False)
+        # Do not derive ownership from the current possession or from a stale
+        # request-side legacy enum.  Runtime ownership is immutable for the
+        # entire multi-possession game.
+        user_team_is_a = self.user_team_is_a
+        user_ids = self._team_ids(user_team_is_a)
+        ai_ids = self._team_ids(not user_team_is_a)
+        team_a_score = _as_float(_field0(self.state, "team_a_score"))
+        team_b_score = _as_float(_field0(self.state, "team_b_score"))
+        inbound_player = _as_int(_field0(self.state, "inbound_player"))
+        inbound_team = _as_int(_field0(self.state, "inbound_team"))
+        inbound_reason_code = _as_int(_field0(self.state, "inbound_reason"))
+        inbound_reason_map = {
+            POSSESSION_END_MADE_BASKET: "made_basket",
+            POSSESSION_END_DEFENSIVE_REBOUND: "defensive_rebound",
+            POSSESSION_END_TURNOVER: "turnover",
+            POSSESSION_END_DEFENSIVE_VIOLATION: "defensive_violation",
+            POSSESSION_END_INBOUND_VIOLATION: "inbound_violation",
+        }
+        inbound_position = [int(v) for v in np.asarray(self.static.inbound_position).tolist()]
+        legal_inbound_entry_positions: list[list[int]] = []
+        if inbound_player >= 0 and inbound_player < self.n_players:
+            action_mask = np.asarray(obs_dict["action_mask"], dtype=np.int8)
+            origin = positions[inbound_player]
+            directions = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
+            for action_idx, (dq, dr) in enumerate(directions, start=1):
+                if action_idx < action_mask.shape[1] and int(action_mask[inbound_player, action_idx]) == 1:
+                    legal_inbound_entry_positions.append([int(origin[0] + dq), int(origin[1] + dr)])
 
         state = {
             "players_per_side": int(self.display_env.players_per_side or 3),
@@ -2371,8 +2625,59 @@ class JaxDevRuntime:
             "shot_clock": self.shot_clock,
             "min_shot_clock": int(self.display_env.min_shot_clock or 10),
             "shot_clock_steps": int(self.display_env.shot_clock_steps or 24),
-            "user_team_name": game_state.user_team.name,
+            "user_team_name": self.user_team.name,
             "done": _as_bool(_field0(self.state, "episode_ended")),
+            "enable_multi_possession": bool(self.multi_possession_enabled),
+            "multi_possession_limit": _int_from_static_field(self.static, "multi_possession_limit", 1),
+            "team_a_ids": team_a_ids,
+            "team_b_ids": team_b_ids,
+            "user_player_ids": user_ids,
+            "ai_player_ids": ai_ids,
+            "team_ownership": {"team_a": "user", "team_b": "ai"},
+            "team_a_score": float(team_a_score),
+            "team_b_score": float(team_b_score),
+            "user_score": float(team_a_score if user_team_is_a else team_b_score),
+            "ai_score": float(team_b_score if user_team_is_a else team_a_score),
+            "offense_team": "team_a" if team_a_is_offense else "team_b",
+            "offense_label": "user" if self._team_is_user(team_a_is_offense) else "ai",
+            "active_offense_ids": active_offense_ids,
+            "active_defense_ids": active_defense_ids,
+            "completed_possessions": _as_int(_field0(self.state, "completed_possessions")),
+            "remaining_possessions": max(
+                0,
+                _int_from_static_field(self.static, "multi_possession_limit", 1)
+                - _as_int(_field0(self.state, "completed_possessions")),
+            ),
+            "game_phase": (
+                "awaiting_inbound"
+                if _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_AWAITING_INBOUND
+                else "live"
+            ),
+            "inbound_team": (
+                "team_a" if inbound_team == TEAM_A else ("team_b" if inbound_team == TEAM_B else None)
+            ),
+            "inbound_player": inbound_player if inbound_player >= 0 else None,
+            "inbound_reason": inbound_reason_map.get(inbound_reason_code),
+            "inbound_position": inbound_position,
+            "inbound_steps_remaining": _as_int(_field0(self.state, "inbound_steps_remaining")),
+            "inbound_deadline_steps": _int_from_static_field(
+                self.static,
+                "inbound_deadline_steps",
+                5,
+            ),
+            "legal_inbound_entry_positions": legal_inbound_entry_positions,
+            "clearance_achieved": bool(_as_bool(_field0(self.state, "clearance_achieved"))),
+            "clearance_required": bool(
+                self.multi_possession_enabled
+                and not _as_bool(_field0(self.state, "clearance_achieved"))
+                and _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_LIVE
+            ),
+            "start_templates_disabled": bool(self.multi_possession_enabled),
+            "start_templates_disabled_reason": (
+                "Multi-possession games use the normal opening spawn and inbound restarts."
+                if self.multi_possession_enabled
+                else None
+            ),
             "training_team": getattr(self.display_env.training_team, "name", None),
             "counterfactual_snapshot_available": bool(counterfactual_snapshot["available"]),
             "counterfactual_snapshot_step": counterfactual_snapshot["captured_step"],
@@ -2398,8 +2703,10 @@ class JaxDevRuntime:
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
             "player_rebound_skills": player_rebound_skills,
             "player_rebound_skill_specialists": player_rebound_skill_specialists,
-            "offense_ids": self.offense_ids,
-            "defense_ids": self.defense_ids,
+            # Preserve legacy field names for the board, while making them the
+            # *current* offense/defense in continuous games.
+            "offense_ids": active_offense_ids,
+            "defense_ids": active_defense_ids,
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
             "court_width": int(self.display_env.court_width),
             "court_height": int(self.display_env.court_height),
@@ -2562,9 +2869,9 @@ class JaxDevRuntime:
             "unified_policy_name": getattr(game_state, "unified_policy_key", None),
             "opponent_unified_policy_name": getattr(game_state, "opponent_unified_policy_key", None),
             "offense_shooting_pct_by_player": {
-                "layup": [float(v) for v in np.asarray(_field0(self.state, "layup_pct"))[self.offense_ids].tolist()],
-                "three_pt": [float(v) for v in np.asarray(_field0(self.state, "three_pt_pct"))[self.offense_ids].tolist()],
-                "dunk": [float(v) for v in np.asarray(_field0(self.state, "dunk_pct"))[self.offense_ids].tolist()],
+                "layup": [float(v) for v in np.asarray(_field0(self.state, "layup_pct"))[active_offense_ids].tolist()],
+                "three_pt": [float(v) for v in np.asarray(_field0(self.state, "three_pt_pct"))[active_offense_ids].tolist()],
+                "dunk": [float(v) for v in np.asarray(_field0(self.state, "dunk_pct"))[active_offense_ids].tolist()],
             },
             "offense_shooting_pct_sampled": copy.deepcopy(getattr(game_state, "sampled_offense_skills", None) or {}),
             "ep_by_player": [float(v) for v in shot_ep.tolist()],

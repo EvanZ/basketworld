@@ -9,11 +9,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
 from basketworld.utils.evaluation_helpers import get_outcome_category
-from app.backend.schemas import SaveEpisodeRequest
+from app.backend.schemas import SaveEpisodeRequest, EpisodeExportFrameRequest, EpisodeExportFinishRequest
+from app.backend.episode_gif import EpisodeGifExports, quantize_gif_frame
 from app.backend.state import game_state
 
 
 router = APIRouter()
+episode_exports = EpisodeGifExports()
 
 
 def _is_public_mode() -> bool:
@@ -60,6 +62,25 @@ def _decode_png_frames_and_durations(request: SaveEpisodeRequest):
 
     if not pil_frames:
         raise HTTPException(status_code=400, detail="No frames provided after decoding")
+
+    # A browser resize can change the captured dimensions. GIF's logical canvas
+    # is taken from its first frame: pad so later frames cannot be clipped.
+    canvas_size = (
+        max(frame.width for frame in pil_frames),
+        max(frame.height for frame in pil_frames),
+    )
+    for index, frame in enumerate(pil_frames):
+        if frame.size != canvas_size:
+            padded = Image.new("RGB", canvas_size, (10, 15, 30))
+            padded.paste(frame, (0, 0))
+            frame.close()
+            pil_frames[index] = padded
+
+    # Short board animations and full episode exports use the same color
+    # conversion; do not let Pillow fall back to undithered median-cut on save.
+    for index, frame in enumerate(pil_frames):
+        pil_frames[index] = quantize_gif_frame(frame)
+        frame.close()
 
     return pil_frames, durations_ms
 
@@ -159,9 +180,7 @@ def save_episode():
     return {"status": "success", "file_path": file_path}
 
 
-@router.post("/api/save_episode_from_pngs")
-def save_episode_from_pngs(request: SaveEpisodeRequest):
-    """Saves episode from base64-encoded PNG frames sent from frontend."""
+def _episode_png_output_path():
     if _is_public_mode():
         raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
 
@@ -169,7 +188,7 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
     if getattr(game_state, "run_id", None):
         base_dir = os.path.join(base_dir, str(game_state.run_id))
     os.makedirs(base_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     outcome = "Unknown"
     category = None
@@ -215,7 +234,13 @@ def save_episode_from_pngs(request: SaveEpisodeRequest):
     if category is None:
         category = get_outcome_category(outcome)
 
-    file_path = os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
+    return os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
+
+
+@router.post("/api/save_episode_from_pngs")
+def save_episode_from_pngs(request: SaveEpisodeRequest):
+    """Legacy bulk upload; the UI uses bounded episode_exports uploads."""
+    file_path = _episode_png_output_path()
 
     try:
         pil_frames, durations_ms = _decode_png_frames_and_durations(request)
@@ -262,3 +287,52 @@ def render_gif_from_pngs(request: SaveEpisodeRequest):
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to render GIF from PNGs: {e}")
+
+
+def _get_episode_export(export_id):
+    if _is_public_mode():
+        raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
+    try:
+        return episode_exports.get(export_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/api/episode_exports")
+def create_episode_export():
+    destination = _episode_png_output_path()
+    try:
+        return {"export_id": episode_exports.create(destination)}
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/api/episode_exports/{export_id}/frames")
+def append_episode_export(export_id: str, request: EpisodeExportFrameRequest):
+    export = _get_episode_export(export_id)
+    with export.lock:
+        try:
+            export.append(request.index, request.frame, request.duration)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"frame_count": len(export.durations)}
+
+
+@router.post("/api/episode_exports/{export_id}/finish")
+def finish_episode_export(export_id: str, request: EpisodeExportFinishRequest):
+    export = _get_episode_export(export_id)
+    try:
+        with export.lock:
+            return export.finish(request.frame_count)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    finally:
+        episode_exports.remove(export_id)
+
+
+@router.delete("/api/episode_exports/{export_id}")
+def cancel_episode_export(export_id: str):
+    if _is_public_mode():
+        raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
+    episode_exports.remove(export_id)
+    return {"status": "cancelled"}

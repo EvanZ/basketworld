@@ -1,6 +1,10 @@
 from gymnasium import Wrapper
+from types import SimpleNamespace
+import pytest
 
 import app.backend.evaluation as backend_evaluation
+from app.backend.routes import evaluation_routes
+from app.backend.schemas import EvaluationRequest
 from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
 
 
@@ -84,3 +88,106 @@ def test_validate_custom_eval_setup_accepts_constrained_rebound_skill_sampling()
         "tolerance": 0.2,
         "max_attempts": 2500,
     }
+
+
+def test_evaluation_multi_possession_overrides_are_validated_and_disable_templates(monkeypatch):
+    request = EvaluationRequest(
+        env_overrides={
+            "enable_multi_possession": "true",
+            "multi_possession_limit": "7",
+            "multi_possession_reward_mode": "point_differential",
+            "score_potential_scale": "0.25",
+            "multi_possession_aux_rewards_enabled": "false",
+            "inbound_deadline_steps": "4",
+        },
+        start_template_mode="enabled",
+    )
+    monkeypatch.setattr(evaluation_routes.game_state, "env_optional_params", {
+        "start_template_enabled": True,
+        "start_template_library": {"templates": [{"id": "legacy"}]},
+    })
+    monkeypatch.setattr(
+        evaluation_routes.game_state,
+        "mlflow_start_template_library",
+        {"templates": [{"id": "legacy"}]},
+    )
+
+    optional_params, diagnostics = evaluation_routes._build_evaluation_optional_params(
+        request
+    )
+
+    assert optional_params["enable_multi_possession"] is True
+    assert optional_params["multi_possession_limit"] == 7
+    assert optional_params["multi_possession_reward_mode"] == "point_differential"
+    assert optional_params["score_potential_scale"] == pytest.approx(0.25)
+    assert optional_params["multi_possession_aux_rewards_enabled"] is False
+    assert optional_params["inbound_deadline_steps"] == 4
+    assert optional_params["start_template_enabled"] is False
+    assert "start_template_library" not in optional_params
+    assert diagnostics["start_template_disabled_reason"] == "multi_possession"
+
+    with pytest.raises(Exception, match="multi_possession_limit"):
+        evaluation_routes._coerce_eval_env_override("multi_possession_limit", "bad")
+    with pytest.raises(Exception, match="inbound_deadline_steps"):
+        evaluation_routes._coerce_eval_env_override("inbound_deadline_steps", 0)
+
+
+def test_evaluation_response_keeps_cutoff_games_incomplete(monkeypatch):
+    fake_env = SimpleNamespace(shot_clock_steps=24, min_shot_clock=1)
+    monkeypatch.setattr(evaluation_routes.game_state, "env", fake_env)
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy", object())
+    monkeypatch.setattr(evaluation_routes.game_state, "defense_policy", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "env_required_params", {"players": 2})
+    monkeypatch.setattr(
+        evaluation_routes.game_state,
+        "env_optional_params",
+        {"enable_multi_possession": True, "multi_possession_limit": 3},
+    )
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy_path", "/tmp/policy")
+    monkeypatch.setattr(evaluation_routes.game_state, "opponent_policy_path", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "mlflow_training_params", {})
+    monkeypatch.setattr(evaluation_routes.game_state, "user_team", Team.OFFENSE)
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy_key", "test")
+    monkeypatch.setattr(evaluation_routes.game_state, "opponent_unified_policy_key", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "role_flag_offense", 1.0)
+    monkeypatch.setattr(evaluation_routes.game_state, "role_flag_defense", -1.0)
+    monkeypatch.setattr(evaluation_routes, "eval_validate_custom_eval_setup", lambda *_: {})
+    monkeypatch.setattr(evaluation_routes, "reset_evaluation_progress", lambda *_: None)
+    monkeypatch.setattr(evaluation_routes, "update_evaluation_progress", lambda *_: None)
+    monkeypatch.setattr(evaluation_routes, "get_ui_game_state", lambda: {})
+    monkeypatch.setattr(
+        evaluation_routes,
+        "eval_run_evaluation",
+        lambda **_: {
+            "results": [
+                {
+                    "episode": 1,
+                    "steps": 36,
+                    "completed": False,
+                    "truncated": True,
+                    "game": {
+                        "completed": False,
+                        "result": None,
+                        "team_a_score": 4.0,
+                        "team_b_score": 4.0,
+                        "user_score": 4.0,
+                        "opponent_score": 4.0,
+                        "completed_possessions": 2,
+                    },
+                    "outcome_info": {},
+                }
+            ],
+            "shot_accumulator": {},
+            "eval_diagnostics": {},
+        },
+    )
+
+    response = evaluation_routes.run_evaluation(EvaluationRequest(num_episodes=1))
+
+    result = response["results"][0]
+    assert result["completed"] is False
+    assert result["truncated"] is True
+    assert result["game"]["result"] is None
+    assert result["final_state"]["done"] is False
+    assert result["final_state"]["team_a_score"] == pytest.approx(4.0)
+    assert result["final_state"]["completed_possessions"] == 2

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><title>Save Episode integration regression</title></head>
+<body>
+<output id="test-export-result" role="status" style="position:fixed;top:0;left:0;z-index:100000;background:#101827;color:white;padding:8px">Loading recorded episode…</output>
+<div id="app"></div>
+<script>
+  // Surface the real application's completion/error alert as test evidence.
+  window.alert = (message) => { document.querySelector('#test-export-result').textContent = message; };
+</script>
+<script type="module" src="/src/main.js"></script>
+</body></html>

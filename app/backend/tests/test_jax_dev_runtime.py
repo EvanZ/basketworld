@@ -22,7 +22,13 @@ from app.backend.schemas import (
 )
 from app.backend.state import GameState
 from basketworld.envs.basketworld_env_v2 import Team
-from basketworld_jax.env.minimal import SHOT_TYPE_DUNK
+from basketworld_jax.env.minimal import (
+    GAME_PHASE_AWAITING_INBOUND,
+    SHOT_TYPE_DUNK,
+    TEAM_A,
+    TEAM_B,
+    step_batch_minimal,
+)
 
 
 jax = pytest.importorskip("jax")
@@ -36,6 +42,7 @@ class _FakeSpec:
     num_intents: int = 8
     intent_selector_enabled: bool = False
     rebound_win_prob_features: bool = False
+    multi_possession_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ def _make_runtime(
     rng_seed: int | None = None,
     reset_seed: int | None = 17,
     env_params: dict | None = None,
+    user_team: Team = Team.OFFENSE,
 ) -> JaxDevRuntime:
     policy = _FakeRawJaxModel()
     runtime_env_params = {
@@ -125,7 +133,7 @@ def _make_runtime(
         env_params=runtime_env_params,
         unified_policy=policy,
         opponent_policy=policy,
-        user_team=Team.OFFENSE,
+        user_team=user_team,
         rng_seed=rng_seed,
     )
     if reset_seed is not None:
@@ -150,6 +158,26 @@ def test_jax_dev_runtime_labels_rebound_win_probability_observation_features():
     assert len(obs_tokens["globals_labels"]) == len(obs_tokens["globals"])
     assert obs_tokens["globals_labels"][-1] == "offensive_rebound_probability"
     assert len(obs_tokens["players"][0]) == 19
+
+
+def test_jax_dev_runtime_rebound_distribution_excludes_off_court_players():
+    runtime = _make_runtime()
+    off_court_player = int(runtime.offense_ids[0])
+    positions = np.asarray(runtime.state.positions).copy()
+    positions[0, off_court_player] = np.asarray(runtime.static.inbound_position)
+    runtime.state = runtime.state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+    )
+
+    rows, winner_prob, _contest = runtime._rebound_winner_probabilities_payload(
+        sampled_target_cell=0,
+        winner=off_court_player,
+        next_state=runtime.state,
+    )
+
+    assert rows
+    assert all(int(row["player_id"]) != off_court_player for row in rows)
+    assert winner_prob == pytest.approx(0.0)
 
 
 def test_state_snapshot_dispatches_to_jax_runtime(monkeypatch):
@@ -1249,3 +1277,164 @@ def test_set_intent_state_route_updates_jax_runtime(monkeypatch):
     assert runtime.payload["intent_age"] == 1
     assert runtime.payload["intent_commitment_remaining"] == 3
     assert body["state"]["intent_index_current"] == 6
+
+
+def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+            "inbound_deadline_steps": 4,
+        }
+    )
+    runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
+    inbounder = runtime.defense_ids[0]
+    positions = np.asarray(runtime.state.positions).copy()
+    positions[0, inbounder] = np.asarray(runtime.static.inbound_position)
+    runtime.state = runtime.state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        team_a_score=jnp.asarray([4.0], dtype=jnp.float32),
+        team_b_score=jnp.asarray([6.0], dtype=jnp.float32),
+        completed_possessions=jnp.asarray([3], dtype=jnp.int32),
+        game_phase=jnp.asarray([GAME_PHASE_AWAITING_INBOUND], dtype=jnp.int8),
+        inbound_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        inbound_player=jnp.asarray([inbounder], dtype=jnp.int32),
+        inbound_steps_remaining=jnp.asarray([4], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    state = runtime.get_full_game_state(game_state, include_policy_probs=False)
+
+    assert state["enable_multi_possession"] is True
+    assert state["team_a_score"] == pytest.approx(4.0)
+    assert state["team_b_score"] == pytest.approx(6.0)
+    assert state["user_score"] == pytest.approx(4.0)
+    assert state["offense_team"] == "team_b"
+    assert state["offense_label"] == "ai"
+    assert state["offense_ids"] == runtime.defense_ids
+    assert state["defense_ids"] == runtime.offense_ids
+    assert state["user_player_ids"] == runtime.offense_ids
+    assert state["completed_possessions"] == 3
+    assert state["remaining_possessions"] == 2
+    assert state["game_phase"] == "awaiting_inbound"
+    assert state["inbound_player"] == inbounder
+    assert state["inbound_steps_remaining"] == 4
+    assert state["inbound_deadline_steps"] == 4
+    assert state["start_templates_disabled"] is True
+    assert state["obs_tokens"]["globals"]
+    assert state["obs_tokens"]["players_labels"][-2:] == ["is_inbounder", "on_court"]
+    assert len(state["obs_tokens"]["players_labels"]) == len(state["obs_tokens"]["players"][0])
+    assert state["obs_tokens"]["globals_labels"][-5:] == [
+        "relative_score",
+        "possessions_remaining_norm",
+        "clearance_required",
+        "inbound_phase",
+        "inbound_countdown_norm",
+    ]
+    assert runtime.observation_dict(observer_is_offense=True)["role_flag"].tolist() == [-1.0]
+
+
+def test_jax_dev_runtime_keeps_blue_team_as_user_when_red_wins_opening_jump_ball():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        },
+        # Simulate a direct API caller sending the old defensive selection.
+        # The continuous-game ownership contract must still be blue/user.
+        user_team=Team.DEFENSE,
+    )
+    runtime.state = runtime.state._replace(
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        starting_offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        ball_holder=jnp.asarray([runtime.defense_ids[0]], dtype=jnp.int32),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.user_team = Team.DEFENSE
+
+    state = runtime.get_full_game_state(game_state, include_policy_probs=False)
+
+    assert runtime.user_team == Team.OFFENSE
+    assert state["user_team_name"] == "OFFENSE"
+    assert state["offense_team"] == "team_b"
+    assert state["offense_label"] == "ai"
+    assert state["user_player_ids"] == runtime.offense_ids
+    assert state["ai_player_ids"] == runtime.defense_ids
+    assert state["team_ownership"] == {"team_a": "user", "team_b": "ai"}
+
+
+def test_jax_dev_runtime_matches_native_kernel_for_seeded_multi_possession_actions():
+    runtime = _make_runtime(
+        rng_seed=91,
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 3,
+        },
+    )
+    team_b_holder = runtime.defense_ids[0]
+    runtime.state = runtime.state._replace(
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        starting_offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        ball_holder=jnp.asarray([team_b_holder], dtype=jnp.int32),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    initial_state = runtime.state
+    expected_rng, expected_step_key = jax.random.split(runtime._rng_key)
+    noops = jnp.zeros((1, runtime.n_players), dtype=jnp.int32)
+    expected = step_batch_minimal(
+        runtime.static,
+        initial_state,
+        noops,
+        jnp.asarray([expected_step_key]),
+        jax,
+        jnp,
+    )
+
+    response = runtime.step(
+        ActionRequest(
+            actions={str(pid): 0 for pid in range(runtime.n_players)},
+            player_deterministic=True,
+            opponent_deterministic=True,
+        ),
+        game_state,
+    )
+
+    np.testing.assert_array_equal(np.asarray(runtime._rng_key), np.asarray(expected_rng))
+    np.testing.assert_array_equal(
+        np.asarray(runtime.state.positions), np.asarray(expected.state.positions)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(runtime.state.ball_holder), np.asarray(expected.state.ball_holder)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(runtime.state.offense_team), np.asarray(expected.state.offense_team)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(runtime.state.game_phase), np.asarray(expected.state.game_phase)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(runtime.state.completed_possessions),
+        np.asarray(expected.state.completed_possessions),
+    )
+    np.testing.assert_allclose(
+        np.asarray(runtime.state.team_a_score), np.asarray(expected.state.team_a_score)
+    )
+    np.testing.assert_allclose(
+        np.asarray(runtime.state.team_b_score), np.asarray(expected.state.team_b_score)
+    )
+    assert response["state"]["offense_team"] == "team_b"

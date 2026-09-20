@@ -1,5 +1,11 @@
 @import './base.css';
-@import url('https://fonts.cdnfonts.com/css/dseg7-classic');
+@font-face {
+  font-family: 'DSEG7 Classic';
+  src: url('dseg/fonts/DSEG7-Classic/DSEG7Classic-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 
 body {
   display: flex;
