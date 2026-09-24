@@ -30,10 +30,10 @@ class EpisodeGifExport:
         self.updated = time.monotonic()
         self.lock = threading.Lock()
 
-    def append(self, index, frame, duration):
+    def append_png_bytes(self, index, data, duration):
+        """Validate and spool one already-binary PNG frame to the export."""
         if index != len(self.durations):
             raise ValueError(f"Expected frame {len(self.durations)}, received {index}")
-        data = base64.b64decode(frame.split(",", 1)[-1], validate=True)
         with Image.open(io.BytesIO(data)) as image:
             if image.format != "PNG":
                 raise ValueError("Export frames must be PNG images")
@@ -47,6 +47,11 @@ class EpisodeGifExport:
         self.size = canvas_size
         self.durations.append(max(10, int(round(duration * 1000))))
         self.updated = time.monotonic()
+
+    def append(self, index, frame, duration):
+        """Backward-compatible data-URL upload path for older clients."""
+        data = base64.b64decode(frame.split(",", 1)[-1], validate=True)
+        self.append_png_bytes(index, data, duration)
 
     def finish(self, expected_frames):
         if not self.durations or expected_frames != len(self.durations):

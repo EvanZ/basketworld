@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,22 @@ def png_data_url(size, color):
     stream = io.BytesIO()
     Image.new("RGB", size, color).save(stream, format="PNG")
     return "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
+
+
+def png_bytes(size, color):
+    stream = io.BytesIO()
+    Image.new("RGB", size, color).save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def png_batch(frames):
+    metadata = json.dumps([
+        {"index": index, "duration": duration, "length": len(data)}
+        for index, data, duration in frames
+    ]).encode()
+    return len(metadata).to_bytes(4, byteorder="big") + metadata + b"".join(
+        data for _index, data, _duration in frames
+    )
 
 
 @pytest.mark.parametrize("endpoint", ["render_gif_from_pngs", "save_episode_from_pngs"])
@@ -106,6 +123,45 @@ def test_streamed_episode_preserves_all_frames_palettes_sizes_and_hold(export_cl
     from pathlib import Path
     assert not Path(temp_path).exists()
     assert key not in media_routes.episode_exports.sessions
+
+
+def test_streamed_episode_accepts_bounded_binary_png_batches(export_client):
+    key = export_client.post("/api/episode_exports").json()["export_id"]
+    prefix = f"/api/episode_exports/{key}"
+    count = 16
+    for first in range(0, count, 8):
+        frames = []
+        for index in range(first, first + 8):
+            size = (20, 30) if index % 2 == 0 else (30, 50)
+            frames.append((index, png_bytes(size, (index, 255 - index, 40)), 1 if index == count - 1 else 0.1))
+        response = export_client.post(
+            prefix + "/frame_batch",
+            content=png_batch(frames),
+            headers={"content-type": "application/octet-stream"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["frame_count"] == first + 8
+    response = export_client.post(prefix + "/finish", json={"frame_count": count})
+    assert response.status_code == 200, response.text
+    with Image.open(response.json()["file_path"]) as gif:
+        assert gif.n_frames == count
+        assert gif.size == (30, 50)
+        assert gif.info["duration"] == 100
+        gif.seek(count - 1)
+        assert gif.info["duration"] == 1000
+
+
+def test_binary_png_batch_rejects_out_of_order_frames(export_client):
+    key = export_client.post("/api/episode_exports").json()["export_id"]
+    prefix = f"/api/episode_exports/{key}"
+    response = export_client.post(
+        prefix + "/frame_batch",
+        content=png_batch([(1, png_bytes((10, 10), "red"), 1)]),
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Expected frame 0"
+    export_client.delete(prefix)
 
 
 def test_streamed_export_rejects_missing_frames_and_cleans_up(export_client):

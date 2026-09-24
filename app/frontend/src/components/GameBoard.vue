@@ -1,7 +1,10 @@
 <script setup>
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import { getShotProbability, getPassStealProbabilities, renderGifFromPngs } from '@/services/api';
-import { captureBoardPng } from '@/utils/boardCapture';
+import { captureBoardPng, captureBoardPngBlob } from '@/utils/boardCapture';
+import { actionAnimationTiming, hexDistance } from '@/utils/actionAnimationTiming';
+import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
+import { resolveRenderableState } from '@/utils/renderableState';
 
 const props = defineProps({
   gameHistory: {
@@ -162,13 +165,57 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  playerAi: {
+    type: Boolean,
+    default: true,
+  },
+  playerDeterministic: {
+    type: Boolean,
+    default: false,
+  },
+  opponentDeterministic: {
+    type: Boolean,
+    default: true,
+  },
+  fastSelfPlayMode: {
+    type: Boolean,
+    default: false,
+  },
+  fastSelfPlayWarming: {
+    type: Boolean,
+    default: false,
+  },
+  fastModeLocked: {
+    type: Boolean,
+    default: false,
+  },
+  showOpponentActions: {
+    type: Boolean,
+    default: false,
+  },
+  showGhostTrailsControl: {
+    type: Boolean,
+    default: true,
+  },
   forcedEpisodeOutcome: {
     type: Object,
     default: null,
   },
 });
 
-const emit = defineEmits(['update:activePlayerId', 'update-player-position', 'adjust-shot-clock', 'update-placement', 'select-shot-cell']);
+const emit = defineEmits([
+  'update:activePlayerId',
+  'update-player-position',
+  'adjust-shot-clock',
+  'update-placement',
+  'select-shot-cell',
+  'toggle-player-ai',
+  'toggle-player-deterministic',
+  'toggle-opponent-deterministic',
+  'toggle-fast-self-play',
+  'toggle-show-opponent-actions',
+  'toggle-show-ghost-trails',
+]);
 
 // ------------------------------------------------------------
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
@@ -210,13 +257,6 @@ function offsetToAxial(col, row) {
   const q = col - ((row - (row & 1)) >> 1);
   const r = row;
   return { q, r };
-}
-
-// Hex distance on axial coords (matches env._hex_distance)
-function hexDistance(a, b) {
-  const [q1, r1] = a;
-  const [q2, r2] = b;
-  return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
 }
 
 function toIdSet(values) {
@@ -356,11 +396,16 @@ function resolvePassTargetFromAction(gs, passerId, action) {
 
 function getRenderablePlayers(gameState) {
   if (!gameState || !gameState.positions) return [];
-  return gameState.positions.map((pos, index) => {
+  // The state returned after a pass already belongs to its receiver.  The
+  // pre-action snapshot is solely the origin for a transient trajectory; using
+  // it as the board state makes the ball visibly snap back to the passer until
+  // the following simulation tick arrives.
+  const { positions, ballHolder } = resolveRenderableState(gameState);
+  return positions.map((pos, index) => {
     const [q, r] = pos;
     const { x, y } = axialToCartesian(q, r);
     const isOffense = gameState.offense_ids.includes(index);
-    const hasBall = gameState.ball_holder === index;
+    const hasBall = ballHolder === index;
     const owner = getPlayerOwner(gameState, index);
     return { id: index, x, y, isOffense, hasBall, owner };
   });
@@ -372,8 +417,9 @@ const draggedPlayerPos = ref({ x: 0, y: 0 });
 const isDragging = ref(false);
 const passStealProbs = ref({});
 const ballColor = '#ffa500';
-const PASS_FLASH_DURATION_MS = 1100;
-const SHOT_FLASH_DURATION_MS = 1100;
+const PASS_FLASH_BASE_DURATION_MS = 1100;
+const SHOT_FLASH_BASE_DURATION_MS = 1100;
+const REBOUND_FLASH_BASE_DURATION_MS = 650;
 const REBOUND_OVERLAY_REVEAL_PROGRESS = 0.45;
 const PROJECTILE_ARROW_LENGTH_SCALE = 0.5;
 const passFlash = ref(null);
@@ -381,6 +427,10 @@ let passFlashSerial = 0;
 const passFlashNowMs = ref(0);
 const passFlashRaf = ref(null);
 const passFlashTimeout = ref(null);
+const reboundFlash = ref(null);
+const reboundFlashNowMs = ref(0);
+const reboundFlashRaf = ref(null);
+const reboundFlashTimeout = ref(null);
 const shotFlash = ref(null);
 let shotFlashSerial = 0;
 const shotFlashNowMs = ref(0);
@@ -471,19 +521,6 @@ function turnoverBannerPayload(actionResults) {
     text: isSteal ? 'Steal' : (isLaneViolation ? 'Turnover - Lane Violation' : 'Turnover'),
     made: false,
     kind: isSteal ? 'steal' : 'turnover',
-    reboundText: null,
-  };
-}
-
-function defensiveLaneViolationBannerPayload(actionResults) {
-  if (!Array.isArray(actionResults?.defensive_lane_violations)
-    || actionResults.defensive_lane_violations.length === 0) {
-    return null;
-  }
-  return {
-    text: 'Turnover - Illegal Defense',
-    made: false,
-    kind: 'turnover',
     reboundText: null,
   };
 }
@@ -767,17 +804,32 @@ const allPoliciesVisible = computed(() => {
   return policyVisibility.value.size === positions.length;
 });
 
-const offenseStateValue = computed(() => {
+const blueHasPossession = computed(() => {
   const state = currentGameState.value;
-  if (!state || !state.state_values) return null;
-  const val = state.state_values.offensive_value;
+  if (!state) return null;
+  if (state.offense_label === 'user') return true;
+  if (state.offense_label === 'ai') return false;
+  const offenseOwner = state.team_ownership?.[state.offense_team];
+  if (offenseOwner === 'user') return true;
+  if (offenseOwner === 'ai') return false;
+  return null;
+});
+
+const blueStateValue = computed(() => {
+  const state = currentGameState.value;
+  if (!state?.state_values || blueHasPossession.value === null) return null;
+  const val = blueHasPossession.value
+    ? state.state_values.offensive_value
+    : state.state_values.defensive_value;
   return typeof val === 'number' ? val : null;
 });
 
-const defenseStateValue = computed(() => {
+const redStateValue = computed(() => {
   const state = currentGameState.value;
-  if (!state || !state.state_values) return null;
-  const val = state.state_values.defensive_value;
+  if (!state?.state_values || blueHasPossession.value === null) return null;
+  const val = blueHasPossession.value
+    ? state.state_values.defensive_value
+    : state.state_values.offensive_value;
   return typeof val === 'number' ? val : null;
 });
 
@@ -786,7 +838,7 @@ const sortedPlayers = computed(() => {
   if (!gs) return [];
   const players = getRenderablePlayers(gs);
   const activeId = props.activePlayerId;
-  const ballHolderId = gs.ball_holder;
+  const ballHolderId = Number(gs.ball_holder);
 
   const others = players.filter(
     (p) => p.id !== activeId && p.id !== ballHolderId
@@ -949,13 +1001,15 @@ const reboundOverlayRevealProgress = computed(() => {
       : props.reboundProgress;
     return Math.max(0, Math.min(1, Number(progress ?? 1)));
   }
-  if (!shotFlash.value) return 1;
-  return shotFlashProgress.value;
+  const flash = reboundFlash.value;
+  if (!flash) return 1;
+  const elapsed = Math.max(0, Number(reboundFlashNowMs.value ?? performance.now()) - Number(flash.startedAtMs));
+  return Math.max(0, Math.min(1, elapsed / Number(flash.durationMs || REBOUND_FLASH_BASE_DURATION_MS)));
 });
 
 const showReboundTargetOverlay = computed(() => (
   !shouldDelayLiveReboundOverlay.value
-  || reboundOverlayRevealProgress.value >= REBOUND_OVERLAY_REVEAL_PROGRESS
+  || reboundOverlayRevealProgress.value > 0
 ));
 
 // The live rebound animation is an outcome visualization, not part of the
@@ -1646,8 +1700,7 @@ const reboundResultOverlay = computed(() => {
 const reboundProjectileProgress = computed(() => {
   if (!reboundResultOverlay.value) return 0;
   if (!shouldDelayLiveReboundOverlay.value) return 1;
-  const span = Math.max(1e-6, 1 - REBOUND_OVERLAY_REVEAL_PROGRESS);
-  return Math.max(0, Math.min(1, (reboundOverlayRevealProgress.value - REBOUND_OVERLAY_REVEAL_PROGRESS) / span));
+  return reboundOverlayRevealProgress.value;
 });
 
 const reboundProjectile = computed(() => {
@@ -2230,7 +2283,12 @@ const viewBox = computed(() => {
 
 const inboundMarker = computed(() => {
   const state = currentGameState.value;
-  if (!state?.enable_multi_possession || state?.inbound_player === null || state?.inbound_player === undefined) {
+  if (
+    !state?.enable_multi_possession
+    || state?.game_phase !== 'awaiting_inbound'
+    || state?.inbound_player === null
+    || state?.inbound_player === undefined
+  ) {
     return null;
   }
   const pos = state.inbound_position;
@@ -2248,6 +2306,18 @@ const legalInboundEntryMarkers = computed(() => {
       return { key: `${pos[0]},${pos[1]}`, x, y };
     });
 });
+
+function actionOriginPositions(state) {
+  const results = state?.last_action_results;
+  const hasEvent = Boolean(
+    Object.keys(results?.shots || {}).length
+    || Object.keys(results?.passes || {}).length
+    || (Array.isArray(results?.rebounds) && results.rebounds.length)
+    || (Array.isArray(results?.turnovers) && results.turnovers.length)
+  );
+  const positions = results?.pre_action_positions;
+  return hasEvent && Array.isArray(positions) ? positions : state?.positions;
+}
 
 const courtCenter = computed(() => {
   if (courtLayout.value.length === 0) return { x: 0, y: 0 };
@@ -2312,10 +2382,10 @@ const leftSidelineMarkerPosition = computed(() => {
   };
 });
 
-const stateValueBoxWidth = HEX_RADIUS * 3;
+const stateValueBoxWidth = HEX_RADIUS * 4.6;
 const stateValueBoxBaseHeight = HEX_RADIUS * 1.3;
 const stateValueBoxHeight = computed(() =>
-  defenseStateValue.value !== null ? stateValueBoxBaseHeight * 2 : stateValueBoxBaseHeight
+  redStateValue.value !== null ? stateValueBoxBaseHeight * 2 : stateValueBoxBaseHeight
 );
 
 const stateValueAnchor = computed(() => {
@@ -3347,6 +3417,11 @@ function capturePassFlashFromState(state) {
   if (!passerPos || !receiverPos) return null;
   const start = axialToCartesian(passerPos[0], passerPos[1]);
   const end = axialToCartesian(receiverPos[0], receiverPos[1]);
+  const timing = actionAnimationTiming(
+    'pass',
+    hexDistance(passerPos, receiverPos),
+    PASS_FLASH_BASE_DURATION_MS,
+  );
   return {
     flashKey: `capture-pass-${passerId}-${receiverId}`,
     passerId,
@@ -3355,6 +3430,7 @@ function capturePassFlashFromState(state) {
     y1: start.y,
     x2: end.x,
     y2: end.y,
+    durationMs: timing.durationMs,
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
@@ -3377,7 +3453,7 @@ const passFlashProgress = computed(() => {
   }
   const startedAt = Number(flash.startedAtMs ?? passFlashNowMs.value ?? performance.now());
   const elapsed = Math.max(0, Number(passFlashNowMs.value ?? performance.now()) - startedAt);
-  return Math.max(0, Math.min(1, elapsed / PASS_FLASH_DURATION_MS));
+  return Math.max(0, Math.min(1, elapsed / Number(flash.durationMs || PASS_FLASH_BASE_DURATION_MS)));
 });
 
 const passFlashOpacity = computed(() => {
@@ -3496,13 +3572,14 @@ function clearPassFlash() {
   passFlash.value = null;
 }
 
-function triggerPassFlash(passerId, receiverId, start, end) {
+function triggerPassFlash(passerId, receiverId, start, end, distance) {
   if (passFlashTimeout.value) {
     clearTimeout(passFlashTimeout.value);
     passFlashTimeout.value = null;
   }
 
   const startedAtMs = performance.now();
+  const timing = actionAnimationTiming('pass', distance, PASS_FLASH_BASE_DURATION_MS);
   passFlashNowMs.value = startedAtMs;
   passFlash.value = {
     flashKey: ++passFlashSerial,
@@ -3513,6 +3590,7 @@ function triggerPassFlash(passerId, receiverId, start, end) {
     y1: start.y,
     x2: end.x,
     y2: end.y,
+    durationMs: timing.durationMs,
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
@@ -3523,7 +3601,69 @@ function triggerPassFlash(passerId, receiverId, start, end) {
   passFlashTimeout.value = setTimeout(() => {
     passFlash.value = null;
     passFlashTimeout.value = null;
-  }, PASS_FLASH_DURATION_MS);
+  }, timing.durationMs);
+}
+
+function reboundDistanceForState(state) {
+  const results = state?.last_action_results;
+  const rebound = results?.rebound || (Array.isArray(results?.rebounds) ? results.rebounds[0] : null);
+  const winnerId = Number(rebound?.winner ?? rebound?.winner_player_id ?? rebound?.player_id);
+  const winnerPos = state?.positions?.[winnerId];
+  const basketPos = state?.basket_position;
+  if (!Array.isArray(winnerPos) || !Array.isArray(basketPos)) return 0;
+  return hexDistance(basketPos, winnerPos);
+}
+
+function stopReboundFlashClock() {
+  if (reboundFlashRaf.value !== null) {
+    cancelAnimationFrame(reboundFlashRaf.value);
+    reboundFlashRaf.value = null;
+  }
+}
+
+function startReboundFlashClock() {
+  stopReboundFlashClock();
+  const tick = (ts) => {
+    reboundFlashNowMs.value = ts;
+    if (reboundFlash.value && !props.disableTransitions) {
+      reboundFlashRaf.value = requestAnimationFrame(tick);
+    } else {
+      reboundFlashRaf.value = null;
+    }
+  };
+  reboundFlashRaf.value = requestAnimationFrame(tick);
+}
+
+function clearReboundFlash() {
+  if (reboundFlashTimeout.value) {
+    clearTimeout(reboundFlashTimeout.value);
+    reboundFlashTimeout.value = null;
+  }
+  stopReboundFlashClock();
+  reboundFlash.value = null;
+}
+
+function triggerReboundFlash(state, startDelayMs = 0) {
+  clearReboundFlash();
+  const timing = actionAnimationTiming(
+    'rebound',
+    reboundDistanceForState(state),
+    REBOUND_FLASH_BASE_DURATION_MS,
+  );
+  const delayMs = Math.max(0, Number(startDelayMs) || 0);
+  reboundFlashNowMs.value = performance.now();
+  reboundFlash.value = {
+    startedAtMs: reboundFlashNowMs.value + delayMs,
+    durationMs: timing.durationMs,
+  };
+  if (!props.disableTransitions) {
+    startReboundFlashClock();
+  }
+  reboundFlashTimeout.value = setTimeout(() => {
+    reboundFlash.value = null;
+    reboundFlashTimeout.value = null;
+    stopReboundFlashClock();
+  }, delayMs + timing.durationMs);
 }
 
 function buildShotArcGeometry(start, end) {
@@ -3561,12 +3701,17 @@ function captureShotFlashFromState(state) {
   if (!entry) return null;
   const [rawShooterId, shot] = entry;
   const shooterId = Number(rawShooterId);
-  const shooterPos = state?.positions?.[shooterId];
+  const shooterPos = actionOriginPositions(state)?.[shooterId];
   const basketPos = state?.basket_position;
   if (!shooterPos || !basketPos) return null;
   const start = axialToCartesian(shooterPos[0], shooterPos[1]);
   const end = axialToCartesian(basketPos[0], basketPos[1]);
   const arc = buildShotArcGeometry(start, end);
+  const timing = actionAnimationTiming(
+    'shot',
+    hexDistance(shooterPos, basketPos),
+    SHOT_FLASH_BASE_DURATION_MS,
+  );
   return {
     flashKey: `capture-shot-${shooterId}-${Number(shot.success)}`,
     shooterId,
@@ -3578,6 +3723,7 @@ function captureShotFlashFromState(state) {
     controlY: arc.controlY,
     color: shot.success ? '#22c55e' : '#ef4444',
     path: arc.path,
+    durationMs: timing.durationMs,
   };
 }
 
@@ -3618,7 +3764,7 @@ const shotFlashProgress = computed(() => {
   }
   const startedAt = Number(flash.startedAtMs ?? shotFlashNowMs.value ?? performance.now());
   const elapsed = Math.max(0, Number(shotFlashNowMs.value ?? performance.now()) - startedAt);
-  return Math.max(0, Math.min(1, elapsed / SHOT_FLASH_DURATION_MS));
+  return Math.max(0, Math.min(1, elapsed / Number(flash.durationMs || SHOT_FLASH_BASE_DURATION_MS)));
 });
 
 const shotFlashOpacity = computed(() => {
@@ -3754,13 +3900,14 @@ function triggerShotJump(shooterId, isDunk = false) {
   }, SHOOT_JUMP_PERIOD_SECONDS * 1000);
 }
 
-function triggerShotFlash(shooterId, start, end, success, isDunk = false) {
+function triggerShotFlash(shooterId, start, end, success, isDunk = false, distance = 0) {
   if (shotFlashTimeout.value) {
     clearTimeout(shotFlashTimeout.value);
     shotFlashTimeout.value = null;
   }
 
   const startedAtMs = performance.now();
+  const timing = actionAnimationTiming('shot', distance, SHOT_FLASH_BASE_DURATION_MS);
   shotFlashNowMs.value = startedAtMs;
   const arc = buildShotArcGeometry(start, end);
 
@@ -3776,6 +3923,7 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false) {
     controlY: arc.controlY,
     color: success ? '#22c55e' : '#ef4444',
     path: arc.path,
+    durationMs: timing.durationMs,
   };
   if (!props.disableTransitions) {
     startShotFlashClock();
@@ -3784,8 +3932,9 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false) {
   shotFlashTimeout.value = setTimeout(() => {
     shotFlash.value = null;
     shotFlashTimeout.value = null;
-  }, SHOT_FLASH_DURATION_MS);
+  }, timing.durationMs);
   triggerShotJump(shooterId, isDunk);
+  return timing.durationMs;
 }
 
 watch(
@@ -3851,8 +4000,9 @@ watch(
       return;
     }
 
-    const passerPos = state.positions?.[passAnimation.passerId];
-    const receiverPos = state.positions?.[passAnimation.receiverId];
+    const originPositions = actionOriginPositions(state);
+    const passerPos = originPositions?.[passAnimation.passerId];
+    const receiverPos = originPositions?.[passAnimation.receiverId];
     if (!passerPos || !receiverPos) {
       clearPassFlash();
       return;
@@ -3860,7 +4010,13 @@ watch(
 
     const start = axialToCartesian(passerPos[0], passerPos[1]);
     const end = axialToCartesian(receiverPos[0], receiverPos[1]);
-    triggerPassFlash(passAnimation.passerId, passAnimation.receiverId, start, end);
+    triggerPassFlash(
+      passAnimation.passerId,
+      passAnimation.receiverId,
+      start,
+      end,
+      hexDistance(passerPos, receiverPos),
+    );
   },
   { immediate: true }
 );
@@ -3871,6 +4027,7 @@ watch(
     if (disabled) {
       stopPassFlashClock();
       stopShotFlashClock();
+      stopReboundFlashClock();
       return;
     }
     if (passFlash.value) {
@@ -3878,6 +4035,9 @@ watch(
     }
     if (shotFlash.value) {
       startShotFlashClock();
+    }
+    if (reboundFlash.value) {
+      startReboundFlashClock();
     }
   }
 );
@@ -3887,6 +4047,7 @@ watch(
   (state) => {
     if (!state) {
       clearShotFlash();
+      clearReboundFlash();
       clearShotJump();
       clearShotAttemptBanner();
       lastShotAnimationKey.value = null;
@@ -3904,6 +4065,7 @@ watch(
     const shots = state.last_action_results?.shots;
     if (!shots || Object.keys(shots).length === 0) {
       clearShotFlash();
+      clearReboundFlash();
       clearShotJump();
       lastShotAnimationKey.value = null;
       return;
@@ -3919,14 +4081,16 @@ watch(
 
     if (!shotData) {
       clearShotFlash();
+      clearReboundFlash();
       clearShotJump();
       return;
     }
 
-    const shooterPos = state.positions?.[shotData.shooterId];
+    const shooterPos = actionOriginPositions(state)?.[shotData.shooterId];
     const basketPos = state.basket_position;
     if (!shooterPos || !basketPos) {
       clearShotFlash();
+      clearReboundFlash();
       clearShotJump();
       lastShotAnimationKey.value = null;
       return;
@@ -3958,7 +4122,19 @@ watch(
     lastShotAnimationKey.value = shotAnimationKey;
 
     triggerShotAttemptBanner(shotData.result, state.last_action_results);
-    triggerShotFlash(shotData.shooterId, start, end, success, isDunk);
+    const shotDurationMs = triggerShotFlash(
+      shotData.shooterId,
+      start,
+      end,
+      success,
+      isDunk,
+      hexDistance(shooterPos, basketPos),
+    );
+    if (actionResultsHaveRebound(state.last_action_results)) {
+      triggerReboundFlash(state, shotDurationMs * REBOUND_OVERLAY_REVEAL_PROGRESS);
+    } else {
+      clearReboundFlash();
+    }
   },
   { immediate: true }
 );
@@ -3981,9 +4157,14 @@ async function renderStateToPng(options = {}) {
   return captureBoardPng(svgRef.value?.parentElement, options);
 }
 
+async function renderStateToPngBlob(options = {}) {
+  return captureBoardPngBlob(svgRef.value?.parentElement, options);
+}
+
 // Expose method to parent component
 defineExpose({
-  renderStateToPng
+  renderStateToPng,
+  renderStateToPngBlob,
 });
 
 onBeforeUnmount(() => {
@@ -3993,6 +4174,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousemove', onGlobalMouseMove);
   window.removeEventListener('mouseup', onGlobalMouseUp);
   clearPassFlash();
+  clearReboundFlash();
   clearShotFlash();
   clearShotJump();
   clearShotAttemptBanner();
@@ -4036,17 +4218,62 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
-      <button
-        v-if="!minimalChrome"
-        class="toggle-btn board-toggle-btn"
-        @click="toggleAllPolicies"
-        :aria-pressed="allPoliciesVisible"
-        title="Show or hide policy probabilities for all players"
-      >
-        <font-awesome-icon :icon="allPoliciesVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-        <span class="toggle-label">Show Policies</span>
-      </button>
-      <div v-if="!minimalChrome" class="pressure-controls-row">
+      <div v-if="!minimalChrome" class="gameplay-controls-row">
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="emit('toggle-player-ai')"
+        >
+          <font-awesome-icon :icon="playerAi ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Player AI</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          :disabled="!playerAi"
+          @click="emit('toggle-player-deterministic')"
+        >
+          <font-awesome-icon :icon="playerDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Player Deterministic</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="emit('toggle-opponent-deterministic')"
+        >
+          <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Opponent Deterministic</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          :disabled="fastModeLocked"
+          :aria-pressed="fastSelfPlayMode"
+          title="Run self-play without policy, value, attention, and diagnostic payloads"
+          @click="emit('toggle-fast-self-play')"
+        >
+          <font-awesome-icon :icon="fastSelfPlayMode ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">{{ fastSelfPlayWarming ? 'Fast Mode (warming)' : 'Self-Play Fast Mode' }}</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="emit('toggle-show-opponent-actions')"
+        >
+          <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Show Opponent Actions</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="emit('toggle-show-ghost-trails')"
+        >
+          <font-awesome-icon :icon="showGhostTrailsControl ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Ghost Trails</span>
+        </button>
+        <button
+          class="toggle-btn board-toggle-btn"
+          @click="toggleAllPolicies"
+          :aria-pressed="allPoliciesVisible"
+          title="Show or hide policy probabilities for all players"
+        >
+          <font-awesome-icon :icon="allPoliciesVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
+          <span class="toggle-label">Show Policies</span>
+        </button>
         <button
           class="toggle-btn board-toggle-btn"
           @click="showShotPressureRing = !showShotPressureRing"
@@ -4387,19 +4614,21 @@ onBeforeUnmount(() => {
 
         <!-- The inbounder waits outside the baseline until the inbound pass is
              released.  Legal re-entry cells appear after a successful pass. -->
-        <g v-if="inboundMarker && showPlayers" class="inbound-context-layer">
-          <circle
-            :cx="inboundMarker.x"
-            :cy="inboundMarker.y"
-            :r="HEX_RADIUS * 0.72"
-            class="inbound-baseline-marker"
-          />
-          <text
-            :x="inboundMarker.x"
-            :y="inboundMarker.y - HEX_RADIUS * 0.95"
-            text-anchor="middle"
-            class="inbound-label"
-          >INBOUND</text>
+        <g v-if="(inboundMarker || legalInboundEntryMarkers.length) && showPlayers" class="inbound-context-layer">
+          <template v-if="inboundMarker">
+            <circle
+              :cx="inboundMarker.x"
+              :cy="inboundMarker.y"
+              :r="HEX_RADIUS * 0.72"
+              class="inbound-baseline-marker"
+            />
+            <text
+              :x="inboundMarker.x"
+              :y="inboundMarker.y - HEX_RADIUS * 0.95"
+              text-anchor="middle"
+              class="inbound-label"
+            >INBOUND</text>
+          </template>
           <polygon
             v-for="marker in legalInboundEntryMarkers"
             :key="`legal-entry-${marker.key}`"
@@ -4808,7 +5037,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- Sampled rebound result: shot-style ball flight and final winner marker. -->
-        <g class="rebound-result-layer" v-if="reboundResultOverlay">
+        <g class="rebound-result-layer" v-if="reboundResultOverlay && showReboundTargetOverlay">
           <path
             :d="reboundResultOverlay.path"
             :stroke="reboundResultOverlay.color"
@@ -5065,7 +5294,7 @@ onBeforeUnmount(() => {
         </g>
 
         <!-- State-value overlay -->
-        <g v-if="!minimalChrome && (offenseStateValue !== null || defenseStateValue !== null) && showValueAnnotations" class="state-value-overlay">
+        <g v-if="!minimalChrome && (blueStateValue !== null || redStateValue !== null) && showValueAnnotations" class="state-value-overlay">
           <rect
             :x="stateValueAnchor.x"
             :y="stateValueAnchor.y"
@@ -5076,24 +5305,24 @@ onBeforeUnmount(() => {
           />
           <text
             :x="stateValueAnchor.x + stateValueBoxWidth / 2"
-            :y="stateValueAnchor.y + stateValueBoxHeight / 2 - (defenseStateValue !== null ? HEX_RADIUS * 0.35 : 0)"
+            :y="stateValueAnchor.y + stateValueBoxHeight / 2 - (redStateValue !== null ? HEX_RADIUS * 0.35 : 0)"
             text-anchor="middle"
             dominant-baseline="middle"
-            class="state-value-text"
+            class="state-value-text state-value-text-blue"
           >
-            V<tspan baseline-shift="-35%" font-size="65%">o</tspan>
-            {{ offenseStateValue !== null ? offenseStateValue.toFixed(2) : '—' }}
+            V<tspan baseline-shift="-35%" font-size="65%">PL</tspan>
+            {{ blueStateValue !== null ? blueStateValue.toFixed(2) : '—' }}
           </text>
           <text
-            v-if="defenseStateValue !== null"
+            v-if="redStateValue !== null"
             :x="stateValueAnchor.x + stateValueBoxWidth / 2"
             :y="stateValueAnchor.y + stateValueBoxHeight / 2 + HEX_RADIUS * 0.45"
             text-anchor="middle"
             dominant-baseline="middle"
-            class="state-value-text"
+            class="state-value-text state-value-text-red"
           >
-            V<tspan baseline-shift="-35%" font-size="65%">d</tspan>
-            {{ defenseStateValue.toFixed(2) }}
+            V<tspan baseline-shift="-35%" font-size="65%">AI</tspan>
+            {{ redStateValue.toFixed(2) }}
           </text>
         </g>
       </g>
@@ -5252,9 +5481,17 @@ onBeforeUnmount(() => {
         ></span>
       </div>
     </section>
-    <div v-if="multiPossessionScoreboard" class="board-banner-area">
+    <div v-if="multiPossessionScoreboard || fastSelfPlayWarming" class="board-banner-area">
       <div
-        v-if="clearanceRequiredBannerVisible"
+        v-if="fastSelfPlayWarming"
+        class="fast-mode-warming-banner"
+        role="status"
+        aria-live="polite"
+      >
+        Fast Mode Warming Up
+      </div>
+      <div
+        v-else-if="clearanceRequiredBannerVisible"
         class="clearance-required-banner"
         role="status"
         aria-live="polite"
@@ -5270,6 +5507,7 @@ onBeforeUnmount(() => {
           missed: !visibleShotAttemptBanner.made,
           steal: visibleShotAttemptBanner.kind === 'steal',
           turnover: visibleShotAttemptBanner.kind === 'turnover',
+          violation: visibleShotAttemptBanner.kind === 'violation',
         }"
         role="status"
         aria-live="polite"
@@ -5470,6 +5708,28 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.fast-mode-warming-banner {
+  position: relative;
+  z-index: 13;
+  align-self: center;
+  grid-row: 1;
+  min-width: 14.5rem;
+  margin: 0;
+  padding: 0.3rem 0.95rem;
+  border: 1px solid #38bdf8;
+  border-radius: 6px;
+  background: rgba(8, 47, 73, 0.96);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.7);
+  color: #e0f2fe;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  line-height: 1;
+  text-align: center;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
 .shot-attempt-banner.made {
   color: #22c55e;
 }
@@ -5484,6 +5744,10 @@ onBeforeUnmount(() => {
 
 .shot-attempt-banner.turnover {
   color: #ef4444;
+}
+
+.shot-attempt-banner.violation {
+  color: #fbbf24;
 }
 
 .shot-attempt-rebound {
@@ -5775,8 +6039,9 @@ onBeforeUnmount(() => {
   margin: 0 0 0.35rem;
 }
 
-.multi-possession-board .pressure-controls-row {
-  flex-basis: auto;
+.multi-possession-board .gameplay-controls-row {
+  flex-basis: 100%;
+  justify-content: center;
   gap: 0.35rem;
 }
 
@@ -5798,12 +6063,12 @@ onBeforeUnmount(() => {
   height: 0.9em;
 }
 
-.pressure-controls-row {
+.gameplay-controls-row {
   display: inline-flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  flex-basis: 100%;
+  max-width: 100%;
 }
 
 .download-menu {
@@ -5926,6 +6191,7 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
+
 .state-value-overlay rect {
   fill: rgba(15, 15, 20, 0.9);
   stroke: rgba(255, 255, 255, 0.7);
@@ -5934,10 +6200,17 @@ onBeforeUnmount(() => {
 }
 
 .state-value-text {
-  fill: #fffbf2;
   font-size: 1.1rem;
   font-weight: 600;
   letter-spacing: 0.3px;
+}
+
+.state-value-text-blue {
+  fill: #60a5fa;
+}
+
+.state-value-text-red {
+  fill: #f87171;
 }
 
 /* Removed rotation; court now renders in original orientation */

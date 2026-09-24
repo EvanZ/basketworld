@@ -87,6 +87,8 @@ from basketworld_jax.train.runtime import (
     build_compiled_frozen_opponent_rollout_runner,
     build_compiled_grouped_opponent_eval_runner,
     build_compiled_grouped_opponent_rollout_runner,
+    build_compiled_historical_match_eval_runner,
+    HISTORICAL_MATCH_DIAGNOSTIC_KEYS,
     build_compiled_rollout_runner,
     build_jitted_actor_critic_runner,
     build_jitted_ppo_update_runner,
@@ -112,6 +114,13 @@ TRAIN_LOOP_SUMMARY_ARTIFACT_DIR = "results"
 TRAIN_LOOP_SUMMARY_ARTIFACT_NAME = "train_loop_summary.json"
 TRAIN_LOOP_SUMMARY_ARTIFACT_PATH = (
     f"{TRAIN_LOOP_SUMMARY_ARTIFACT_DIR}/{TRAIN_LOOP_SUMMARY_ARTIFACT_NAME}"
+)
+HISTORICAL_EVAL_ARTIFACT_NAME = "historical_opponent_evaluation.json"
+HISTORICAL_EVAL_ARTIFACT_PATH = (
+    f"{TRAIN_LOOP_SUMMARY_ARTIFACT_DIR}/{HISTORICAL_EVAL_ARTIFACT_NAME}"
+)
+HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR = (
+    f"{TRAIN_LOOP_SUMMARY_ARTIFACT_DIR}/historical_opponent_evaluations"
 )
 JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
     {
@@ -672,6 +681,37 @@ def parse_args(argv=None):
         help="Fixed root seed reused for every deploy evaluation event.",
     )
     parser.add_argument(
+        "--historical-eval-updates",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated update milestones for additive historical-opponent "
+            "evaluation, for example '100,2000,5000'. Each milestone forces a "
+            "checkpoint and evaluates against every reached milestone, including itself."
+        ),
+    )
+    parser.add_argument(
+        "--historical-eval-episodes",
+        type=int,
+        default=200,
+        help=(
+            "Episodes per historical matchup. Must be even so candidate Team A and "
+            "Team B assignments are balanced."
+        ),
+    )
+    parser.add_argument(
+        "--historical-eval-horizon",
+        type=int,
+        default=1024,
+        help="Maximum environment steps per historical-evaluation episode.",
+    )
+    parser.add_argument(
+        "--historical-eval-seed",
+        type=int,
+        default=3000000,
+        help="Fixed root seed used for reproducible historical-opponent matchups.",
+    )
+    parser.add_argument(
         "--max-eval-dumps",
         type=int,
         default=4,
@@ -1159,6 +1199,22 @@ def validate_train_args(args) -> None:
             raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
     if int(getattr(args, "eval_deploy_horizon", 128)) < 1:
         raise SystemExit("--eval-deploy-horizon must be >= 1.")
+    historical_updates = _historical_eval_updates(args)
+    if historical_updates:
+        historical_episodes = int(getattr(args, "historical_eval_episodes", 0))
+        if historical_episodes < 2 or historical_episodes % 2:
+            raise SystemExit(
+                "--historical-eval-episodes must be an even integer of at least 2."
+            )
+        if int(getattr(args, "historical_eval_horizon", 0)) < 1:
+            raise SystemExit("--historical-eval-horizon must be >= 1.")
+        if not str(getattr(args, "checkpoint_dir", "") or "").strip() and not bool(
+            getattr(args, "log_mlflow", False)
+        ):
+            raise SystemExit(
+                "--historical-eval-updates requires --checkpoint-dir or --log-mlflow "
+                "so milestone policies can be pinned."
+            )
     role_multiplier = len(TRAINING_ROLES) if bool(getattr(args, "run_train_loop", False)) else 1
     ppo_sample_count = (
         int(getattr(args, "kernel_batch_size"))
@@ -1615,6 +1671,35 @@ def _periodic_checkpoint_updates(args) -> set[int]:
     return due_updates
 
 
+def _historical_eval_updates(args) -> tuple[int, ...]:
+    """Parse the user-configured, explicitly pinned eval milestones."""
+    raw = str(getattr(args, "historical_eval_updates", "") or "").strip()
+    if not raw:
+        return ()
+    tokens = [item.strip() for item in raw.split(",")]
+    if not all(tokens):
+        raise SystemExit(
+            "--historical-eval-updates must be a comma-separated list of positive updates."
+        )
+    try:
+        updates = tuple(int(item) for item in tokens)
+    except ValueError as exc:
+        raise SystemExit(
+            "--historical-eval-updates must contain integer update indices."
+        ) from exc
+    if any(update <= 0 for update in updates):
+        raise SystemExit("--historical-eval-updates entries must be positive.")
+    if tuple(sorted(set(updates))) != updates:
+        raise SystemExit(
+            "--historical-eval-updates must be strictly increasing with no duplicates."
+        )
+    if updates[-1] > int(getattr(args, "num_updates", 0) or 0):
+        raise SystemExit(
+            "--historical-eval-updates cannot include an update after --num-updates."
+        )
+    return updates
+
+
 def _checkpoint_trainer_config_from_args(
     trainer_config: TrainerConfig,
     args,
@@ -1631,6 +1716,18 @@ def _checkpoint_trainer_config_from_args(
         "eval_deploy_batches": int(getattr(args, "eval_deploy_batches", 20)),
         "eval_deploy_horizon": int(getattr(args, "eval_deploy_horizon", 128)),
         "eval_deploy_seed": int(getattr(args, "eval_deploy_seed", 2000000)),
+        "historical_eval_updates": str(
+            getattr(args, "historical_eval_updates", "") or ""
+        ),
+        "historical_eval_episodes": int(
+            getattr(args, "historical_eval_episodes", 200)
+        ),
+        "historical_eval_horizon": int(
+            getattr(args, "historical_eval_horizon", 1024)
+        ),
+        "historical_eval_seed": int(
+            getattr(args, "historical_eval_seed", 3000000)
+        ),
         "enable_intent_learning": bool(getattr(args, "enable_intent_learning", False)),
         "enable_defense_intent_learning": bool(
             getattr(args, "enable_defense_intent_learning", False)
@@ -2572,6 +2669,18 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/eval_every_updates": int(args.eval_every_updates),
         "jax/eval_horizon": int(args.eval_horizon),
         "jax/eval_deploy_every_updates": int(args.eval_deploy_every_updates),
+        "jax/historical_eval_updates": str(
+            getattr(args, "historical_eval_updates", "") or ""
+        ),
+        "jax/historical_eval_episodes": int(
+            getattr(args, "historical_eval_episodes", 200)
+        ),
+        "jax/historical_eval_horizon": int(
+            getattr(args, "historical_eval_horizon", 1024)
+        ),
+        "jax/historical_eval_seed": int(
+            getattr(args, "historical_eval_seed", 3000000)
+        ),
         "jax/eval_deploy_batches": int(args.eval_deploy_batches),
         "jax/eval_deploy_horizon": int(args.eval_deploy_horizon),
         "jax/eval_deploy_seed": int(args.eval_deploy_seed),
@@ -2951,15 +3060,605 @@ def _log_mlflow_intent_sample_artifact(
         return f"{artifact_path}/{path.name}"
 
 
+def _historical_episode_rows(
+    *,
+    final_state,
+    diagnostics: dict[str, Any] | None,
+    candidate_fixed_team: str,
+) -> list[dict[str, Any]]:
+    """Convert compact device-side counters into JSON-ready episode records."""
+    episode_ended = np.asarray(final_state.episode_ended, dtype=bool)
+    team_a_score = np.asarray(final_state.team_a_score, dtype=np.int64)
+    team_b_score = np.asarray(final_state.team_b_score, dtype=np.int64)
+    batch_size = int(episode_ended.size)
+    # Keep the pure host-side summarizer usable with the small synthetic final
+    # states in unit tests and with legacy checkpoints that predate these
+    # multi-possession state fields.
+    starting_offense_team = np.asarray(
+        getattr(final_state, "starting_offense_team", np.zeros(batch_size)),
+        dtype=np.int8,
+    )
+    completed_possessions = np.asarray(
+        getattr(final_state, "completed_possessions", np.zeros(batch_size)),
+        dtype=np.int32,
+    )
+    step_count = np.asarray(
+        getattr(final_state, "step_count", np.zeros(batch_size)),
+        dtype=np.int32,
+    )
+    diagnostic_arrays = {
+        key: np.asarray(value, dtype=np.float64)
+        for key, value in (diagnostics or {}).items()
+    }
+
+    rows = []
+    candidate_is_team_a = candidate_fixed_team == "team_a"
+    for episode_index in range(batch_size):
+        candidate_score = int(
+            team_a_score[episode_index]
+            if candidate_is_team_a
+            else team_b_score[episode_index]
+        )
+        opponent_score = int(
+            team_b_score[episode_index]
+            if candidate_is_team_a
+            else team_a_score[episode_index]
+        )
+        candidate_started_with_possession = bool(
+            int(starting_offense_team[episode_index])
+            == (0 if candidate_is_team_a else 1)
+        )
+        if not bool(episode_ended[episode_index]):
+            outcome = "truncated"
+        elif candidate_score > opponent_score:
+            outcome = "candidate_win"
+        elif candidate_score < opponent_score:
+            outcome = "candidate_loss"
+        else:
+            outcome = "tie"
+        row = {
+            "episode_index": int(episode_index),
+            "candidate_fixed_team": candidate_fixed_team,
+            "candidate_started_with_possession": candidate_started_with_possession,
+            "starting_offense_team": (
+                "team_a" if int(starting_offense_team[episode_index]) == 0 else "team_b"
+            ),
+            "completed": bool(episode_ended[episode_index]),
+            "termination_kind": (
+                "completed" if bool(episode_ended[episode_index]) else "horizon_truncated"
+            ),
+            "candidate_score": candidate_score,
+            "opponent_score": opponent_score,
+            "candidate_point_differential": candidate_score - opponent_score,
+            "outcome": outcome,
+            "completed_possessions": int(completed_possessions[episode_index]),
+            "environment_steps": int(step_count[episode_index]),
+        }
+        for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS:
+            values = diagnostic_arrays.get(key)
+            row[key] = int(round(float(values[episode_index]))) if values is not None else 0
+        rows.append(row)
+    return rows
+
+
+def _historical_outcome_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    completed_rows = [row for row in rows if row["completed"]]
+    completed_count = len(completed_rows)
+    wins = sum(row["outcome"] == "candidate_win" for row in completed_rows)
+    ties = sum(row["outcome"] == "tie" for row in completed_rows)
+    losses = sum(row["outcome"] == "candidate_loss" for row in completed_rows)
+
+    def _mean(key: str) -> float | None:
+        return (
+            float(np.mean([row[key] for row in completed_rows]))
+            if completed_rows
+            else None
+        )
+
+    return {
+        "episode_count": len(rows),
+        "completed_episode_count": completed_count,
+        "candidate_wins": int(wins),
+        "candidate_ties": int(ties),
+        "candidate_losses": int(losses),
+        "candidate_win_rate": float(wins / completed_count) if completed_count else None,
+        "candidate_tie_rate": float(ties / completed_count) if completed_count else None,
+        "candidate_loss_rate": float(losses / completed_count) if completed_count else None,
+        "mean_candidate_score": _mean("candidate_score"),
+        "mean_opponent_score": _mean("opponent_score"),
+        "mean_candidate_point_differential": _mean("candidate_point_differential"),
+    }
+
+
+def _summarize_historical_match(
+    *,
+    candidate_update: int,
+    opponent_update: int,
+    team_a_candidate_final_state,
+    team_b_candidate_final_state,
+    team_a_candidate_diagnostics: dict[str, Any] | None = None,
+    team_b_candidate_diagnostics: dict[str, Any] | None = None,
+    seed: int,
+    horizon: int,
+) -> dict[str, Any]:
+    """Summarize balanced match results and compact gameplay diagnostics."""
+    team_a_rows = _historical_episode_rows(
+        final_state=team_a_candidate_final_state,
+        diagnostics=team_a_candidate_diagnostics,
+        candidate_fixed_team="team_a",
+    )
+    team_b_rows = _historical_episode_rows(
+        final_state=team_b_candidate_final_state,
+        diagnostics=team_b_candidate_diagnostics,
+        candidate_fixed_team="team_b",
+    )
+    episode_rows = [*team_a_rows, *team_b_rows]
+    completed_rows = [row for row in episode_rows if row["completed"]]
+    outcome_summary = _historical_outcome_summary(episode_rows)
+    episode_count = len(episode_rows)
+    completed_count = len(completed_rows)
+
+    scoreline_histogram: dict[str, int] = {}
+    point_differential_histogram: dict[str, int] = {}
+    for row in completed_rows:
+        scoreline = f"{row['candidate_score']}-{row['opponent_score']}"
+        scoreline_histogram[scoreline] = scoreline_histogram.get(scoreline, 0) + 1
+        differential = str(int(row["candidate_point_differential"]))
+        point_differential_histogram[differential] = (
+            point_differential_histogram.get(differential, 0) + 1
+        )
+
+    team_assignment_summaries = {
+        "candidate_team_a": _historical_outcome_summary(team_a_rows),
+        "candidate_team_b": _historical_outcome_summary(team_b_rows),
+    }
+    starting_possession_summaries = {
+        "candidate_started_with_possession": _historical_outcome_summary(
+            [row for row in episode_rows if row["candidate_started_with_possession"]]
+        ),
+        "opponent_started_with_possession": _historical_outcome_summary(
+            [row for row in episode_rows if not row["candidate_started_with_possession"]]
+        ),
+    }
+
+    def _total(key: str) -> int:
+        return int(sum(row[key] for row in episode_rows))
+
+    def _rate(numerator: float, denominator: float) -> float | None:
+        return float(numerator / denominator) if denominator else None
+
+    candidate_score_total = int(sum(row["candidate_score"] for row in completed_rows))
+    opponent_score_total = int(sum(row["opponent_score"] for row in completed_rows))
+    completed_possessions = _total("completed_possessions")
+    scalar_diagnostics: dict[str, Any] = {
+        "mean_candidate_score": outcome_summary["mean_candidate_score"],
+        "mean_opponent_score": outcome_summary["mean_opponent_score"],
+        "mean_combined_score": (
+            float((candidate_score_total + opponent_score_total) / completed_count)
+            if completed_count
+            else None
+        ),
+        "zero_zero_tie_count": int(
+            sum(
+                row["candidate_score"] == 0 and row["opponent_score"] == 0
+                for row in completed_rows
+            )
+        ),
+        "mean_steps_per_episode": _rate(_total("active_steps"), episode_count),
+        "mean_live_steps_per_completed_possession": _rate(
+            _total("completed_possession_live_steps"),
+            completed_possessions,
+        ),
+        "completed_possession_count": completed_possessions,
+        "candidate_points_per_completed_possession": _rate(
+            candidate_score_total,
+            completed_possessions,
+        ),
+        "opponent_points_per_completed_possession": _rate(
+            opponent_score_total,
+            completed_possessions,
+        ),
+    }
+    scalar_diagnostics["zero_zero_tie_rate"] = _rate(
+        scalar_diagnostics["zero_zero_tie_count"],
+        completed_count,
+    )
+    for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS:
+        total = _total(key)
+        scalar_diagnostics[f"{key}_total"] = total
+        scalar_diagnostics[f"{key}_per_completed_episode"] = _rate(
+            total,
+            completed_count,
+        )
+    for side in ("candidate", "opponent"):
+        pass_attempts = scalar_diagnostics[f"{side}_pass_attempts_total"]
+        completed_passes = scalar_diagnostics[f"{side}_completed_passes_total"]
+        shot_attempts = scalar_diagnostics[f"{side}_shot_attempts_total"]
+        clearance_events = scalar_diagnostics[f"{side}_clearance_events_total"]
+        inbound_attempts = scalar_diagnostics[f"{side}_inbound_pass_attempts_total"]
+        scalar_diagnostics[f"{side}_pass_completion_rate"] = _rate(
+            completed_passes,
+            pass_attempts,
+        )
+        scalar_diagnostics[f"{side}_assist_per_completed_pass_rate"] = _rate(
+            scalar_diagnostics[f"{side}_assists_total"],
+            completed_passes,
+        )
+        scalar_diagnostics[f"{side}_shot_make_rate"] = _rate(
+            scalar_diagnostics[f"{side}_shot_makes_total"],
+            shot_attempts,
+        )
+        scalar_diagnostics[f"{side}_rebound_win_rate"] = _rate(
+            scalar_diagnostics[f"{side}_rebounds_total"],
+            scalar_diagnostics["rebound_attempts_total"],
+        )
+        scalar_diagnostics[f"{side}_inbound_pass_completion_rate"] = _rate(
+            scalar_diagnostics[f"{side}_inbound_completed_passes_total"],
+            inbound_attempts,
+        )
+        scalar_diagnostics[f"{side}_mean_clearance_steps"] = _rate(
+            scalar_diagnostics[f"{side}_clearance_elapsed_steps_total"],
+            clearance_events,
+        )
+    for label, assignment_summary in team_assignment_summaries.items():
+        scalar_diagnostics[f"{label}_win_rate"] = assignment_summary[
+            "candidate_win_rate"
+        ]
+        scalar_diagnostics[f"{label}_tie_rate"] = assignment_summary[
+            "candidate_tie_rate"
+        ]
+        scalar_diagnostics[f"{label}_mean_candidate_score"] = assignment_summary[
+            "mean_candidate_score"
+        ]
+    for label, starting_summary in starting_possession_summaries.items():
+        scalar_diagnostics[f"{label}_win_rate"] = starting_summary[
+            "candidate_win_rate"
+        ]
+        scalar_diagnostics[f"{label}_mean_candidate_score"] = starting_summary[
+            "mean_candidate_score"
+        ]
+
+    return {
+        "candidate_update": int(candidate_update),
+        "opponent_update": int(opponent_update),
+        "self_match": bool(candidate_update == opponent_update),
+        "episode_count": episode_count,
+        "episodes_candidate_team_a": len(team_a_rows),
+        "episodes_candidate_team_b": len(team_b_rows),
+        "completed_episode_count": completed_count,
+        "truncated_episode_count": int(episode_count - completed_count),
+        "completion_rate": _rate(completed_count, episode_count) or 0.0,
+        **outcome_summary,
+        **scalar_diagnostics,
+        "scoreline_histogram": scoreline_histogram,
+        "point_differential_histogram": point_differential_histogram,
+        "team_assignment_summaries": team_assignment_summaries,
+        "starting_possession_summaries": starting_possession_summaries,
+        "episode_diagnostics": episode_rows,
+        "seed": int(seed),
+        "horizon": int(horizon),
+        "action_mode": "deterministic",
+    }
+
+
+def _run_historical_match_evaluation(
+    *,
+    runner,
+    statics: dict[str, Any],
+    candidate_params,
+    opponent_params,
+    candidate_update: int,
+    opponent_update: int,
+    args,
+    jax,
+    jnp,
+) -> dict[str, Any]:
+    """Run one reproducible, balanced policy-checkpoint matchup."""
+    episode_count = int(getattr(args, "historical_eval_episodes", 200))
+    episodes_per_assignment = episode_count // 2
+    root_key = jax.random.PRNGKey(int(getattr(args, "historical_eval_seed", 3_000_000)))
+    root_key = jax.random.fold_in(root_key, int(candidate_update))
+    root_key = jax.random.fold_in(root_key, int(opponent_update))
+    reset_key = jax.random.fold_in(root_key, 0)
+    rollout_key = jax.random.fold_in(root_key, 1)
+    reset_keys = jax.random.split(reset_key, episodes_per_assignment)
+    # The two assignments begin from the same seeded game rows. Only policy
+    # ownership changes, removing incidental Team A/B start bias.
+    team_a_initial_state = reset_batch_minimal(
+        statics["offense"], reset_keys, jax, jnp
+    )
+    team_b_initial_state = reset_batch_minimal(
+        statics["defense"], reset_keys, jax, jnp
+    )
+    team_a_final_state, team_a_diagnostics = runner(
+        statics["offense"],
+        team_a_initial_state,
+        candidate_params,
+        opponent_params,
+        jax.random.fold_in(rollout_key, 0),
+        int(getattr(args, "historical_eval_horizon", 1024)),
+        bool(getattr(args, "intent_selector_multiselect_enabled", False)),
+        int(getattr(args, "intent_selector_min_play_steps", 3)),
+    )
+    team_b_final_state, team_b_diagnostics = runner(
+        statics["defense"],
+        team_b_initial_state,
+        candidate_params,
+        opponent_params,
+        jax.random.fold_in(rollout_key, 1),
+        int(getattr(args, "historical_eval_horizon", 1024)),
+        bool(getattr(args, "intent_selector_multiselect_enabled", False)),
+        int(getattr(args, "intent_selector_min_play_steps", 3)),
+    )
+    block_until_ready_tree(
+        (
+            team_a_final_state,
+            team_a_diagnostics,
+            team_b_final_state,
+            team_b_diagnostics,
+        )
+    )
+    return _summarize_historical_match(
+        candidate_update=candidate_update,
+        opponent_update=opponent_update,
+        team_a_candidate_final_state=team_a_final_state,
+        team_b_candidate_final_state=team_b_final_state,
+        team_a_candidate_diagnostics=team_a_diagnostics,
+        team_b_candidate_diagnostics=team_b_diagnostics,
+        seed=int(getattr(args, "historical_eval_seed", 3_000_000)),
+        horizon=int(getattr(args, "historical_eval_horizon", 1024)),
+    )
+
+
+def _historical_eval_artifact_payload(
+    *,
+    milestone_updates: tuple[int, ...],
+    milestone_records: dict[int, dict[str, Any]],
+    match_history: list[dict[str, Any]],
+    update_artifact_paths: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "milestone_updates": [int(update) for update in milestone_updates],
+        "milestone_checkpoints": {
+            str(int(update)): dict(record)
+            for update, record in sorted(milestone_records.items())
+        },
+        "matches": [dict(record) for record in match_history],
+        "evaluation_update_artifacts": {
+            str(int(update)): str(path)
+            for update, path in sorted((update_artifact_paths or {}).items())
+        },
+    }
+
+
+def _persist_historical_eval_artifact(
+    *,
+    checkpoint_dir: str,
+    mlflow,
+    payload: dict[str, Any],
+) -> str | None:
+    local_path = None
+    if checkpoint_dir:
+        local_path = Path(checkpoint_dir) / HISTORICAL_EVAL_ARTIFACT_NAME
+        write_json(local_path, payload)
+    if mlflow is not None:
+        if local_path is not None:
+            mlflow.log_artifact(str(local_path), artifact_path=TRAIN_LOOP_SUMMARY_ARTIFACT_DIR)
+        else:
+            with TemporaryDirectory(prefix="basketworld_jax_historical_eval_") as tmpdir:
+                path = Path(tmpdir) / HISTORICAL_EVAL_ARTIFACT_NAME
+                write_json(path, payload)
+                mlflow.log_artifact(str(path), artifact_path=TRAIN_LOOP_SUMMARY_ARTIFACT_DIR)
+        return HISTORICAL_EVAL_ARTIFACT_PATH
+    return str(local_path) if local_path is not None else None
+
+
+def _historical_eval_update_artifact_path(candidate_update: int) -> str:
+    return (
+        f"{HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR}/"
+        f"update_{int(candidate_update):07d}.json"
+    )
+
+
+def _historical_eval_update_artifact_payload(
+    *,
+    candidate_update: int,
+    milestone_records: dict[int, dict[str, Any]],
+    match_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Create the standalone historical-evaluation record for one update."""
+    candidate_update = int(candidate_update)
+    matches = [
+        dict(record)
+        for record in match_history
+        if int(record.get("candidate_update", -1)) == candidate_update
+    ]
+    opponent_updates = sorted(
+        {int(record["opponent_update"]) for record in matches}
+    )
+    return {
+        "schema_version": 2,
+        "candidate_update": candidate_update,
+        "candidate_checkpoint": dict(milestone_records[candidate_update]),
+        "evaluated_opponent_updates": opponent_updates,
+        "opponent_checkpoints": {
+            str(update): dict(milestone_records[update])
+            for update in opponent_updates
+        },
+        "matches": matches,
+    }
+
+
+def _persist_historical_eval_update_artifact(
+    *,
+    checkpoint_dir: str,
+    mlflow,
+    candidate_update: int,
+    payload: dict[str, Any],
+) -> str:
+    """Persist one candidate-update matchup record locally and/or in MLflow."""
+    artifact_path = _historical_eval_update_artifact_path(candidate_update)
+    filename = Path(artifact_path).name
+    local_path = None
+    if checkpoint_dir:
+        local_path = (
+            Path(checkpoint_dir)
+            / "historical_opponent_evaluations"
+            / filename
+        )
+        write_json(local_path, payload)
+    if mlflow is not None:
+        if local_path is not None:
+            mlflow.log_artifact(
+                str(local_path),
+                artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR,
+            )
+        else:
+            with TemporaryDirectory(prefix="basketworld_jax_historical_eval_update_") as tmpdir:
+                path = Path(tmpdir) / filename
+                write_json(path, payload)
+                mlflow.log_artifact(
+                    str(path),
+                    artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR,
+                )
+        return artifact_path
+    return str(local_path)
+
+
+def _historical_checkpoint_root(
+    *,
+    checkpoint_dir: str,
+    resume_checkpoint: str,
+) -> Path | None:
+    """Find the directory containing numbered checkpoint directories."""
+    if checkpoint_dir:
+        return Path(checkpoint_dir)
+    if resume_checkpoint:
+        return Path(resume_checkpoint).parent
+    return None
+
+
+def _load_historical_eval_artifact(
+    *,
+    checkpoint_root: Path | None,
+    continuation_run_id: str,
+    continue_cache_dir: str,
+) -> dict[str, Any] | None:
+    """Restore the cumulative matchup record when a run is continued."""
+    local_path = (
+        checkpoint_root / HISTORICAL_EVAL_ARTIFACT_NAME
+        if checkpoint_root is not None
+        else None
+    )
+    if local_path is not None and local_path.is_file():
+        with local_path.open("r", encoding="utf-8") as handle:
+            return dict(json.load(handle))
+    if not continuation_run_id:
+        return None
+
+    import mlflow
+
+    setup_mlflow(verbose=False)
+    client = mlflow.tracking.MlflowClient()
+    try:
+        downloaded = _download_mlflow_checkpoint_artifact(
+            client,
+            run_id=continuation_run_id,
+            artifact_path=HISTORICAL_EVAL_ARTIFACT_PATH,
+            cache_dir=continue_cache_dir,
+        )
+    except Exception:
+        return None
+    if not downloaded.is_file():
+        return None
+    with downloaded.open("r", encoding="utf-8") as handle:
+        return dict(json.load(handle))
+
+
+def _restore_historical_milestone_params(
+    *,
+    milestone_updates: tuple[int, ...],
+    completed_updates: int,
+    checkpoint_root: Path | None,
+    continuation_run_id: str,
+    continue_cache_dir: str,
+    spec: ActorCriticSpec,
+    jax,
+) -> tuple[dict[int, Any], dict[int, dict[str, Any]]]:
+    """Load every reached milestone policy so later matches remain comparable."""
+    reached_updates = [update for update in milestone_updates if update <= completed_updates]
+    if not reached_updates:
+        return {}, {}
+
+    client = None
+    restored_params: dict[int, Any] = {}
+    records: dict[int, dict[str, Any]] = {}
+    for update in reached_updates:
+        checkpoint_path = (
+            checkpoint_root / f"update_{int(update):07d}"
+            if checkpoint_root is not None
+            else None
+        )
+        artifact_path = ""
+        if checkpoint_path is None or not checkpoint_path.exists():
+            if not continuation_run_id:
+                raise SystemExit(
+                    "Cannot restore historical-evaluation milestone "
+                    f"update {update}: checkpoint is unavailable locally. "
+                    "Use --checkpoint-dir or --continue-run-id."
+                )
+            if client is None:
+                import mlflow
+
+                setup_mlflow(verbose=False)
+                client = mlflow.tracking.MlflowClient()
+            artifact_path = f"models/update_{int(update):07d}"
+            try:
+                checkpoint_path = _download_mlflow_checkpoint_artifact(
+                    client,
+                    run_id=continuation_run_id,
+                    artifact_path=artifact_path,
+                    cache_dir=continue_cache_dir,
+                )
+            except Exception as exc:
+                raise SystemExit(
+                    "Cannot restore historical-evaluation milestone "
+                    f"update {update} from MLflow artifact {artifact_path!r}."
+                ) from exc
+        payload = load_checkpoint(checkpoint_path)
+        if _normalize_policy_spec_dict(payload.get("policy_spec", {})) != asdict(spec):
+            raise SystemExit(
+                "Historical-evaluation milestone policy_spec does not match "
+                f"the current JAX run (update {update})."
+            )
+        restored_params[int(update)] = jax.device_put(payload["params"])
+        records[int(update)] = {
+            "update_index": int(update),
+            "checkpoint_path": str(checkpoint_path),
+            "artifact_path": artifact_path or None,
+            "pinned": True,
+            "restored_on_resume": True,
+        }
+    return restored_params, records
+
+
 def _build_train_loop_summary_payload(result: dict[str, Any]) -> dict[str, Any]:
     """Build a compact MLflow run summary without per-update trace payloads."""
     train_history = result.get("train_history")
     eval_trajectories = result.get("eval_trajectories")
     deploy_eval_history = result.get("deploy_eval_history")
+    historical_eval_history = result.get("historical_eval_history")
     summary = {
         key: value
         for key, value in result.items()
-        if key not in {"train_history", "eval_trajectories", "deploy_eval_history"}
+        if key
+        not in {
+            "train_history",
+            "eval_trajectories",
+            "deploy_eval_history",
+            "historical_eval_history",
+        }
     }
     summary["train_history_count"] = (
         len(train_history) if isinstance(train_history, list) else 0
@@ -2969,6 +3668,9 @@ def _build_train_loop_summary_payload(result: dict[str, Any]) -> dict[str, Any]:
     )
     summary["deploy_eval_history_count"] = (
         len(deploy_eval_history) if isinstance(deploy_eval_history, list) else 0
+    )
+    summary["historical_eval_match_count"] = (
+        len(historical_eval_history) if isinstance(historical_eval_history, list) else 0
     )
     return summary
 
@@ -3929,6 +4631,7 @@ def _print_checkpoint_summary(
 
 def run_training_loop(args) -> dict[str, Any]:
     validate_train_args(args)
+    historical_milestone_updates = _historical_eval_updates(args)
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
     role_args = {
         role: _args_for_training_role(args, role)
@@ -3980,6 +4683,11 @@ def run_training_loop(args) -> dict[str, Any]:
     frozen_eval_runner = build_compiled_frozen_opponent_eval_runner(jax, jnp, spec)
     grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec)
     grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
+    historical_match_eval_runner = (
+        build_compiled_historical_match_eval_runner(jax, jnp, spec)
+        if historical_milestone_updates
+        else None
+    )
     update_runner, optimizer_transform = build_jitted_ppo_update_runner(jax, jnp, spec, trainer_config)
     selector_optimizer_transform = None
     if bool(getattr(args, "intent_selector_enabled", False)):
@@ -4255,6 +4963,46 @@ def run_training_loop(args) -> dict[str, Any]:
         eval_trajectories = []
         last_metrics = None
 
+    historical_checkpoint_root = _historical_checkpoint_root(
+        checkpoint_dir=checkpoint_dir,
+        resume_checkpoint=resume_checkpoint,
+    )
+    restored_historical_artifact = _load_historical_eval_artifact(
+        checkpoint_root=historical_checkpoint_root,
+        continuation_run_id=str(getattr(args, "continue_run_id", "") or "").strip(),
+        continue_cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
+    )
+    historical_eval_history = list(
+        (restored_historical_artifact or {}).get("matches", []) or []
+    )
+    historical_eval_update_artifact_paths = {
+        int(update): str(path)
+        for update, path in dict(
+            (restored_historical_artifact or {}).get(
+                "evaluation_update_artifacts",
+                {},
+            )
+            or {}
+        ).items()
+    }
+    (
+        historical_milestone_params,
+        historical_milestone_records,
+    ) = _restore_historical_milestone_params(
+        milestone_updates=historical_milestone_updates,
+        completed_updates=completed_updates,
+        checkpoint_root=historical_checkpoint_root,
+        continuation_run_id=str(getattr(args, "continue_run_id", "") or "").strip(),
+        continue_cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
+        spec=spec,
+        jax=jax,
+    )
+    historical_eval_artifact_path = (
+        HISTORICAL_EVAL_ARTIFACT_PATH
+        if historical_eval_history and str(getattr(args, "continue_run_id", "") or "").strip()
+        else None
+    )
+
     continuation_pool_info = None
     if str(getattr(args, "continue_run_id", "") or "").strip() and opponent_pool_enabled:
         continuation_candidates, continuation_pool_info = _load_continuation_opponent_candidates(
@@ -4332,11 +5080,20 @@ def run_training_loop(args) -> dict[str, Any]:
             if int(args.eval_deploy_batches) > 0
             else 0
         )
+        expected_historical_matches = sum(
+            milestone_position
+            for milestone_position, milestone_update in enumerate(
+                historical_milestone_updates,
+                start=1,
+            )
+            if milestone_update > completed_updates
+        )
         progress = build_progress(
             total=(
                 (int(args.num_updates) - completed_updates)
                 + expected_evals
                 + expected_deploy_evals
+                + expected_historical_matches
             ),
             desc="jax_train:loop",
             disable=bool(args.no_progress),
@@ -4344,6 +5101,7 @@ def run_training_loop(args) -> dict[str, Any]:
         )
         pending_selector_batches = []
         periodic_checkpoint_updates = _periodic_checkpoint_updates(args)
+        historical_milestone_set = set(historical_milestone_updates)
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
             loop_start_ns = perf_counter_ns()
@@ -5097,9 +5855,11 @@ def run_training_loop(args) -> dict[str, Any]:
                 progress.set_postfix_str(f"deploy_eval:{update_idx}", refresh=False)
 
             checkpoint_enabled = bool(checkpoint_dir) or mlflow is not None
+            is_historical_milestone = int(update_idx) in historical_milestone_set
             should_checkpoint = checkpoint_enabled and (
                 update_idx == int(args.num_updates)
                 or int(update_idx) in periodic_checkpoint_updates
+                or is_historical_milestone
             )
             if should_checkpoint:
                 saved_candidate_info = None
@@ -5266,6 +6026,62 @@ def run_training_loop(args) -> dict[str, Any]:
                             rng=opponent_rng,
                         )
                         grouped_opponent_params = None
+                if is_historical_milestone:
+                    if saved_candidate_info is None or historical_match_eval_runner is None:
+                        raise RuntimeError(
+                            "Historical-opponent evaluation requires a persisted "
+                            "milestone checkpoint and compiled match runner."
+                        )
+                    historical_milestone_params[int(update_idx)] = params
+                    historical_milestone_records[int(update_idx)] = {
+                        **saved_candidate_info,
+                        "update_index": int(update_idx),
+                        "pinned": True,
+                        "forced_checkpoint": bool(
+                            update_idx != int(args.num_updates)
+                            and int(update_idx) not in periodic_checkpoint_updates
+                        ),
+                    }
+                    for opponent_update in sorted(historical_milestone_params):
+                        match = _run_historical_match_evaluation(
+                            runner=historical_match_eval_runner,
+                            statics=active_statics,
+                            candidate_params=params,
+                            opponent_params=historical_milestone_params[opponent_update],
+                            candidate_update=int(update_idx),
+                            opponent_update=int(opponent_update),
+                            args=args,
+                            jax=jax,
+                            jnp=jnp,
+                        )
+                        historical_eval_history.append(match)
+                        progress.update(1)
+                        progress.set_postfix_str(
+                            f"historical_eval:{update_idx}v{opponent_update}",
+                            refresh=False,
+                        )
+                    historical_eval_update_artifact_paths[int(update_idx)] = (
+                        _persist_historical_eval_update_artifact(
+                            checkpoint_dir=checkpoint_dir,
+                            mlflow=mlflow,
+                            candidate_update=update_idx,
+                            payload=_historical_eval_update_artifact_payload(
+                                candidate_update=update_idx,
+                                milestone_records=historical_milestone_records,
+                                match_history=historical_eval_history,
+                            ),
+                        )
+                    )
+                    historical_eval_artifact_path = _persist_historical_eval_artifact(
+                        checkpoint_dir=checkpoint_dir,
+                        mlflow=mlflow,
+                        payload=_historical_eval_artifact_payload(
+                            milestone_updates=historical_milestone_updates,
+                            milestone_records=historical_milestone_records,
+                            match_history=historical_eval_history,
+                            update_artifact_paths=historical_eval_update_artifact_paths,
+                        ),
+                    )
                 _print_checkpoint_summary(
                     update_index=update_idx,
                     last_metrics=last_metrics,
@@ -5312,6 +6128,17 @@ def run_training_loop(args) -> dict[str, Any]:
             },
             "train_history": train_history,
             "deploy_eval_history": deploy_eval_history,
+            "historical_eval_milestones": list(historical_milestone_updates),
+            "historical_eval_milestone_checkpoints": {
+                str(int(update)): dict(record)
+                for update, record in sorted(historical_milestone_records.items())
+            },
+            "historical_eval_update_artifacts": {
+                str(int(update)): str(path)
+                for update, path in sorted(historical_eval_update_artifact_paths.items())
+            },
+            "historical_eval_history": historical_eval_history,
+            "historical_eval_artifact_path": historical_eval_artifact_path,
             "eval_trajectories": eval_trajectories,
             "final_metrics": last_metrics,
             "latest_checkpoint_path": latest_checkpoint_path,

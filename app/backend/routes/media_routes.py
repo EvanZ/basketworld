@@ -1,11 +1,12 @@
 import os
 import io
+import json
 from datetime import datetime
 from typing import List
 
 import imageio
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
 from basketworld.utils.evaluation_helpers import get_outcome_category
@@ -16,6 +17,8 @@ from app.backend.state import game_state
 
 router = APIRouter()
 episode_exports = EpisodeGifExports()
+EPISODE_EXPORT_BATCH_MAX_FRAMES = 8
+EPISODE_EXPORT_BATCH_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _is_public_mode() -> bool:
@@ -298,6 +301,58 @@ def _get_episode_export(export_id):
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+def _decode_episode_export_batch(body: bytes):
+    """Decode a compact [metadata length][JSON][PNG bytes...] upload.
+
+    Keeping this as a binary request avoids base64 expansion and does not add
+    a multipart parser dependency to the local development backend. The
+    browser only holds one small batch at a time.
+    """
+    if len(body) < 4:
+        raise ValueError("GIF frame batch is missing metadata")
+    if len(body) > EPISODE_EXPORT_BATCH_MAX_BYTES:
+        raise ValueError("GIF frame batch exceeds the 64 MiB limit")
+    metadata_size = int.from_bytes(body[:4], byteorder="big")
+    metadata_end = 4 + metadata_size
+    if metadata_size <= 0 or metadata_end > len(body):
+        raise ValueError("GIF frame batch has invalid metadata")
+    try:
+        metadata = json.loads(body[4:metadata_end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("GIF frame batch metadata is invalid") from error
+    if not isinstance(metadata, list) or not metadata:
+        raise ValueError("GIF frame batch must contain at least one frame")
+    if len(metadata) > EPISODE_EXPORT_BATCH_MAX_FRAMES:
+        raise ValueError(f"GIF frame batches may contain at most {EPISODE_EXPORT_BATCH_MAX_FRAMES} frames")
+
+    frames = []
+    offset = metadata_end
+    for item in metadata:
+        if not isinstance(item, dict):
+            raise ValueError("GIF frame batch metadata is invalid")
+        index = item.get("index")
+        length = item.get("length")
+        duration = item.get("duration")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError("GIF frame batch has an invalid frame index")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError("GIF frame batch has an invalid frame length")
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError) as error:
+            raise ValueError("GIF frame batch has an invalid frame duration") from error
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError("GIF frame batch has an invalid frame duration")
+        end = offset + length
+        if end > len(body):
+            raise ValueError("GIF frame batch is shorter than its metadata")
+        frames.append((index, body[offset:end], duration))
+        offset = end
+    if offset != len(body):
+        raise ValueError("GIF frame batch has unexpected trailing data")
+    return frames
+
+
 @router.post("/api/episode_exports")
 def create_episode_export():
     destination = _episode_png_output_path()
@@ -313,6 +368,26 @@ def append_episode_export(export_id: str, request: EpisodeExportFrameRequest):
     with export.lock:
         try:
             export.append(request.index, request.frame, request.duration)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"frame_count": len(export.durations)}
+
+
+@router.post("/api/episode_exports/{export_id}/frame_batch")
+async def append_episode_export_batch(export_id: str, request: Request):
+    """Append a bounded run of binary PNGs, preserving frame order."""
+    export = _get_episode_export(export_id)
+    try:
+        frames = _decode_episode_export_batch(await request.body())
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    with export.lock:
+        expected_indices = list(range(len(export.durations), len(export.durations) + len(frames)))
+        if [index for index, _data, _duration in frames] != expected_indices:
+            raise HTTPException(status_code=400, detail=f"Expected frame {len(export.durations)}")
+        try:
+            for index, data, duration in frames:
+                export.append_png_bytes(index, data, duration)
         except (ValueError, OSError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"frame_count": len(export.durations)}

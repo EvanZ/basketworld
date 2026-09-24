@@ -16,6 +16,7 @@ from app.backend.schemas import (
     PlaybookAnalysisRequest,
     ReplayCounterfactualRequest,
     SetIntentStateRequest,
+    SetMultiPossessionLimitRequest,
     SetOffenseSkillsRequest,
     StartSelfPlayRequest,
     UpdatePositionRequest,
@@ -27,6 +28,7 @@ from basketworld_jax.env.minimal import (
     SHOT_TYPE_DUNK,
     TEAM_A,
     TEAM_B,
+    _defender_guarding_offense_mask,
     step_batch_minimal,
 )
 
@@ -429,6 +431,104 @@ def test_jax_dev_runtime_self_play_without_template_preserves_current_board():
     assert game_state.replay_initial_positions == cells
     assert game_state.replay_ball_holder == 1
     assert game_state.replay_shot_clock == 18
+
+
+def test_jax_dev_runtime_rejects_stale_self_play_steps_without_recording_them():
+    runtime = _make_runtime()
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    first = runtime.start_self_play(StartSelfPlayRequest(), game_state)
+    stale_session_id = first["replay_session_id"]
+    second = runtime.start_self_play(StartSelfPlayRequest(), game_state)
+    active_session_id = second["replay_session_id"]
+    positions_before = np.asarray(runtime.state.positions).copy()
+    history_before = list(game_state.episode_states)
+
+    with pytest.raises(ValueError, match="earlier episode"):
+        runtime.step(
+            ActionRequest(
+                actions={},
+                player_deterministic=True,
+                opponent_deterministic=True,
+                replay_session_id=stale_session_id,
+            ),
+            game_state,
+        )
+
+    np.testing.assert_array_equal(np.asarray(runtime.state.positions), positions_before)
+    assert game_state.replay_session_id == active_session_id
+    assert game_state.episode_states == history_before
+
+    body = runtime.step(
+        ActionRequest(
+            actions={},
+            player_deterministic=True,
+            opponent_deterministic=True,
+            replay_session_id=active_session_id,
+        ),
+        game_state,
+    )
+    assert body["state"]["replay_session_id"] == active_session_id
+    assert body["state"]["last_action_results"]["pre_action_positions"] == positions_before[0].tolist()
+
+
+def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_only(monkeypatch):
+    runtime = _make_runtime()
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    expected_values = {"offensive_value": 0.25, "defensive_value": -0.25}
+
+    monkeypatch.setattr(runtime, "state_values", lambda: dict(expected_values))
+    monkeypatch.setattr(
+        runtime,
+        "prepare_fast_mode",
+        lambda: {"ready": True, "warming": False, "error": None},
+    )
+    runtime._fast_kernel_ready = True
+
+    start = runtime.start_self_play(StartSelfPlayRequest(fast_mode=True), game_state)
+
+    assert start["status"] == "success"
+    assert start["state"]["fast_mode"] is True
+    assert "policy_probabilities" not in start["state"]
+    assert start["state"]["state_values"] == expected_values
+    assert "obs_tokens" not in start["state"]
+    assert "training_params" not in start["state"]
+
+    # The production Fast Mode path uses a cached JIT kernel.  Disable JIT for
+    # this serialization-focused test so CI does not spend minutes compiling
+    # the full environment just to validate the compact response contract.
+    with runtime.jax.disable_jit():
+        body = runtime.step(
+            ActionRequest(
+                actions={},
+                player_deterministic=True,
+                opponent_deterministic=True,
+                fast_mode=True,
+            ),
+            game_state,
+        )
+
+    state = body["state"]
+    assert body["status"] == "success"
+    assert state["fast_mode"] is True
+    assert len(state["positions"]) == runtime.n_players
+    assert len(state["action_mask"]) == runtime.n_players
+    assert runtime._fast_action_mask is not None
+    assert "last_action_results" in state
+    assert "policy_probabilities" not in state
+    assert state["state_values"] == expected_values
+    assert "pre_step_state_values" not in body
 
 
 def _make_selector_runtime_and_state():
@@ -1339,6 +1439,162 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
         "inbound_countdown_norm",
     ]
     assert runtime.observation_dict(observer_is_offense=True)["role_flag"].tolist() == [-1.0]
+
+
+def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+            "illegal_defense_enabled": True,
+            "defender_guard_distance": 1,
+        },
+    )
+    single_state = jax.tree_util.tree_map(lambda value: value[0], runtime.state)
+    positions = np.asarray(single_state.positions).copy()
+    basket = tuple(int(v) for v in np.asarray(runtime.static.basket_position))
+    inbound = tuple(int(v) for v in np.asarray(runtime.static.inbound_position))
+    defender = runtime.defense_ids[0]
+    inbounder = runtime.offense_ids[0]
+
+    # Keep every on-court offensive teammate farther than the one-hex guard
+    # radius. The baseline inbounder is exactly one hex from the basket.
+    far_cells = [
+        tuple(int(v) for v in cell)
+        for cell in np.asarray(runtime.static.cell_coords)
+        if runtime.display_env._hex_distance(tuple(int(v) for v in cell), basket) > 1
+    ]
+    for player_id, cell in zip(runtime.offense_ids[1:], far_cells):
+        positions[player_id] = cell
+    positions[inbounder] = inbound
+    positions[defender] = basket
+    state = single_state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray(TEAM_A, dtype=jnp.int8),
+        inbound_player=jnp.asarray(inbounder, dtype=jnp.int32),
+    )
+
+    guarding = _defender_guarding_offense_mask(runtime.static, state, state.positions, jax, jnp)
+
+    assert bool(np.asarray(guarding)[runtime.defense_ids.index(defender)]) is False
+
+    # Once the former inbounder has actually entered the court, they are a
+    # valid guarding target again and can reset the defender's lane clock.
+    reentered = next(
+        tuple(int(v) for v in cell)
+        for cell in np.asarray(runtime.static.cell_coords)
+        if runtime.display_env._hex_distance(tuple(int(v) for v in cell), basket) == 1
+    )
+    reentered_positions = positions.copy()
+    reentered_positions[inbounder] = reentered
+    reentered_state = state._replace(
+        positions=jnp.asarray(reentered_positions, dtype=jnp.int32),
+        inbound_player=jnp.asarray(-1, dtype=jnp.int32),
+    )
+    guarding_after_reentry = _defender_guarding_offense_mask(
+        runtime.static,
+        reentered_state,
+        reentered_state.positions,
+        jax,
+        jnp,
+    )
+
+    assert bool(np.asarray(guarding_after_reentry)[runtime.defense_ids.index(defender)]) is True
+
+
+def test_jax_dev_runtime_changes_possession_limit_without_discarding_fast_kernel():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        },
+    )
+    cached_runner = object()
+    runtime._step_batch_runner = cached_runner
+    runtime._fast_kernel_ready = True
+    runtime._fast_kernel_generation = 7
+
+    runtime.set_multi_possession_limit(11)
+
+    assert runtime._step_batch_runner is cached_runner
+    assert runtime.fast_kernel_status()["ready"] is True
+    assert runtime._fast_kernel_generation == 7
+    assert int(np.asarray(runtime.static.multi_possession_limit)) == 11
+    assert runtime.display_env.multi_possession_limit == 11
+
+
+def test_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        },
+    )
+    runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
+    cached_runner = object()
+    runtime._step_batch_runner = cached_runner
+    runtime._fast_kernel_ready = True
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.actions_log = [[1, 2, 3]]
+    game_state.episode_states = [{"old": True}]
+    monkeypatch.setattr(lifecycle_routes, "game_state", game_state)
+
+    response = lifecycle_routes.set_multi_possession_limit(
+        SetMultiPossessionLimitRequest(multi_possession_limit=9)
+    )
+
+    assert response["status"] == "success"
+    assert response["state"]["multi_possession_limit"] == 9
+    assert response["state"]["completed_possessions"] == 0
+    assert response["fast_kernel"]["ready"] is True
+    assert runtime._step_batch_runner is cached_runner
+    assert game_state.actions_log == []
+    assert len(game_state.episode_states) == 1
+
+
+def test_current_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):
+    """New Game is an in-place reset even when the possession cap is unchanged."""
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        },
+    )
+    runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
+    cached_runner = object()
+    runtime._step_batch_runner = cached_runner
+    runtime._fast_kernel_ready = True
+    runtime.state = runtime.state._replace(
+        completed_possessions=jnp.asarray(
+            [3], dtype=runtime.state.completed_possessions.dtype
+        ),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.actions_log = [[1, 2, 3]]
+    game_state.episode_states = [{"old": True}]
+    monkeypatch.setattr(lifecycle_routes, "game_state", game_state)
+
+    response = lifecycle_routes.set_multi_possession_limit(
+        SetMultiPossessionLimitRequest(multi_possession_limit=5)
+    )
+
+    assert response["status"] == "success"
+    assert response["state"]["multi_possession_limit"] == 5
+    assert response["state"]["completed_possessions"] == 0
+    assert response["fast_kernel"]["ready"] is True
+    assert runtime._step_batch_runner is cached_runner
+    assert game_state.actions_log == []
+    assert len(game_state.episode_states) == 1
 
 
 def test_jax_dev_runtime_keeps_blue_team_as_user_when_red_wins_opening_jump_ball():

@@ -26,9 +26,16 @@ from basketworld_jax.env import (
     step_batch_minimal,
 )
 from basketworld_jax.env.minimal import (
+    POSSESSION_END_DEFENSIVE_REBOUND,
+    POSSESSION_END_DEFENSIVE_VIOLATION,
+    POSSESSION_END_INBOUND_VIOLATION,
+    POSSESSION_END_MADE_BASKET,
+    POSSESSION_END_TURNOVER,
     ReboundDiagnosticTotals,
     TURNOVER_REASON_CLEARANCE_VIOLATION,
     TURNOVER_REASON_DEFENDER_PRESSURE,
+    TURNOVER_REASON_INBOUND_INVALID_PASS,
+    TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
     TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
@@ -63,6 +70,78 @@ _SELECTOR_UPDATE_PARAM_NAMES = frozenset(
         "intent_selector_value_head_out",
     }
 )
+
+
+HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
+    "active_steps",
+    "completed_possessions",
+    "completed_possession_live_steps",
+    "rebound_attempts",
+    "candidate_pass_attempts",
+    "candidate_completed_passes",
+    "candidate_assists",
+    "candidate_turnovers",
+    "candidate_steals",
+    "opponent_pass_attempts",
+    "opponent_completed_passes",
+    "opponent_assists",
+    "opponent_turnovers",
+    "opponent_steals",
+    "candidate_shot_attempts",
+    "candidate_shot_makes",
+    "candidate_shot_dunk_attempts",
+    "candidate_shot_two_attempts",
+    "candidate_shot_three_attempts",
+    "opponent_shot_attempts",
+    "opponent_shot_makes",
+    "opponent_shot_dunk_attempts",
+    "opponent_shot_two_attempts",
+    "opponent_shot_three_attempts",
+    "candidate_rebounds",
+    "candidate_offensive_rebounds",
+    "candidate_defensive_rebounds",
+    "opponent_rebounds",
+    "opponent_offensive_rebounds",
+    "opponent_defensive_rebounds",
+    "candidate_clearance_events",
+    "candidate_clearance_elapsed_steps",
+    "candidate_turnovers_before_clearance",
+    "opponent_clearance_events",
+    "opponent_clearance_elapsed_steps",
+    "opponent_turnovers_before_clearance",
+    "candidate_inbound_pass_attempts",
+    "candidate_inbound_completed_passes",
+    "candidate_inbound_turnovers",
+    "opponent_inbound_pass_attempts",
+    "opponent_inbound_completed_passes",
+    "opponent_inbound_turnovers",
+    "candidate_offensive_three_seconds",
+    "candidate_defensive_lane_violations",
+    "opponent_offensive_three_seconds",
+    "opponent_defensive_lane_violations",
+)
+
+for _side in ("candidate", "opponent"):
+    for _reason in (
+        "pass_out_of_bounds",
+        "intercepted",
+        "defender_pressure",
+        "move_out_of_bounds",
+        "shot_clock",
+        "offensive_three_seconds",
+        "inbound_timeout",
+        "inbound_invalid_pass",
+        "clearance_violation",
+    ):
+        HISTORICAL_MATCH_DIAGNOSTIC_KEYS += (f"{_side}_turnover_{_reason}",)
+    for _reason in (
+        "made_basket",
+        "defensive_rebound",
+        "turnover",
+        "defensive_violation",
+        "inbound_violation",
+    ):
+        HISTORICAL_MATCH_DIAGNOSTIC_KEYS += (f"{_side}_possession_end_{_reason}",)
 
 
 def _tree_path_key_names(path) -> tuple[str, ...]:
@@ -856,11 +935,12 @@ def _maybe_apply_selector_segment_start(
     return jax.lax.cond(should_run, _enabled, _disabled, operand=None)
 
 
-def _maybe_apply_deterministic_selector_segment_start(
+def _maybe_apply_deterministic_selector_segment_start_for_role(
     static,
     state,
     params,
     flat_obs,
+    role_flags,
     selector_multiselect_enabled,
     completed_pass_boundary,
     offensive_rebound_boundary,
@@ -903,7 +983,7 @@ def _maybe_apply_deterministic_selector_segment_start(
         entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1.0e-8)), axis=-1)
         active_episode = (
             ~state.episode_ended.astype(jnp.bool_)
-        ) & (build_training_role_flags_batch(static, state, jnp) > 0.0)
+        ) & (jnp.asarray(role_flags, dtype=jnp.float32) > 0.0)
         (
             game_start,
             possession_start,
@@ -971,6 +1051,36 @@ def _maybe_apply_deterministic_selector_segment_start(
         }
 
     return jax.lax.cond(should_run, _enabled, _disabled, operand=None)
+
+
+def _maybe_apply_deterministic_selector_segment_start(
+    static,
+    state,
+    params,
+    flat_obs,
+    selector_multiselect_enabled,
+    completed_pass_boundary,
+    offensive_rebound_boundary,
+    selector_min_play_steps,
+    jax,
+    jnp,
+    spec: ActorCriticSpec,
+):
+    """Apply the deterministic selector for the static training team."""
+    return _maybe_apply_deterministic_selector_segment_start_for_role(
+        static,
+        state,
+        params,
+        flat_obs,
+        build_training_role_flags_batch(static, state, jnp),
+        selector_multiselect_enabled,
+        completed_pass_boundary,
+        offensive_rebound_boundary,
+        selector_min_play_steps,
+        jax,
+        jnp,
+        spec,
+    )
 
 
 def _compute_final_selector_values(params, flat_obs, spec: ActorCriticSpec, jnp):
@@ -2540,6 +2650,397 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
         return final_state, trace
 
     return jax.jit(_runner, static_argnums=(5,))
+
+
+def _zero_historical_match_diagnostics(state, jnp) -> dict[str, Any]:
+    return {
+        key: jnp.zeros(state.episode_ended.shape, dtype=jnp.float32)
+        for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS
+    }
+
+
+def _build_historical_match_step_diagnostics(
+    static,
+    state,
+    env_out,
+    candidate_role_flags,
+    active_step,
+    jnp,
+) -> dict[str, Any]:
+    """Collect compact per-episode gameplay counters for historical matches."""
+    active_step = active_step.astype(jnp.bool_)
+    candidate_is_offense = candidate_role_flags > 0.0
+    inbound_active = state.inbound_player >= 0
+    rebound_winner = jnp.clip(
+        env_out.rebound_winner,
+        0,
+        int(static.role_encoding.shape[0]) - 1,
+    )
+    candidate_rebound = (
+        env_out.rebound_attempt.astype(jnp.bool_)
+        & (static.training_player_mask[rebound_winner] > 0.5)
+    )
+    candidate_steal = (
+        env_out.steal_player >= 0
+    ) & (
+        static.training_player_mask[
+            jnp.clip(
+                env_out.steal_player,
+                0,
+                int(static.role_encoding.shape[0]) - 1,
+            )
+        ]
+        > 0.5
+    )
+    shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+
+    def _count(value):
+        return (
+            active_step
+            & jnp.asarray(value, dtype=jnp.bool_)
+        ).astype(jnp.float32)
+
+    def _split_offense(value, name: str, output: dict[str, Any]) -> None:
+        event = _count(value)
+        output[f"candidate_{name}"] = event * candidate_is_offense.astype(jnp.float32)
+        output[f"opponent_{name}"] = event * (~candidate_is_offense).astype(jnp.float32)
+
+    counters = _zero_historical_match_diagnostics(state, jnp)
+    counters["active_steps"] = active_step.astype(jnp.float32)
+    counters["completed_possessions"] = _count(env_out.possession_ended)
+    counters["completed_possession_live_steps"] = jnp.where(
+        active_step,
+        env_out.completed_possession_live_steps.astype(jnp.float32),
+        0.0,
+    )
+    counters["rebound_attempts"] = _count(env_out.rebound_attempt)
+
+    _split_offense(env_out.pass_attempt, "pass_attempts", counters)
+    _split_offense(env_out.completed_pass, "completed_passes", counters)
+    _split_offense(env_out.assist, "assists", counters)
+    _split_offense(env_out.turnover, "turnovers", counters)
+    _split_offense(shot_metrics["shot_attempts"], "shot_attempts", counters)
+    _split_offense(shot_metrics["shot_makes"], "shot_makes", counters)
+    _split_offense(shot_metrics["shot_dunks"], "shot_dunk_attempts", counters)
+    _split_offense(shot_metrics["shot_twos"], "shot_two_attempts", counters)
+    _split_offense(shot_metrics["shot_threes"], "shot_three_attempts", counters)
+    _split_offense(env_out.clearance_event, "clearance_events", counters)
+    _split_offense(env_out.turnover_before_clearance, "turnovers_before_clearance", counters)
+    _split_offense(env_out.offensive_three_seconds, "offensive_three_seconds", counters)
+
+    clearance_steps = jnp.where(
+        active_step,
+        env_out.clearance_elapsed_steps.astype(jnp.float32),
+        0.0,
+    )
+    counters["candidate_clearance_elapsed_steps"] = clearance_steps * candidate_is_offense.astype(jnp.float32)
+    counters["opponent_clearance_elapsed_steps"] = clearance_steps * (~candidate_is_offense).astype(jnp.float32)
+
+    candidate_rebound_count = _count(candidate_rebound)
+    opponent_rebound_count = _count(
+        env_out.rebound_attempt.astype(jnp.bool_) & (~candidate_rebound)
+    )
+    counters["candidate_rebounds"] = candidate_rebound_count
+    counters["opponent_rebounds"] = opponent_rebound_count
+    counters["candidate_offensive_rebounds"] = candidate_rebound_count * env_out.offensive_rebound.astype(jnp.float32)
+    counters["candidate_defensive_rebounds"] = candidate_rebound_count * env_out.defensive_rebound.astype(jnp.float32)
+    counters["opponent_offensive_rebounds"] = opponent_rebound_count * env_out.offensive_rebound.astype(jnp.float32)
+    counters["opponent_defensive_rebounds"] = opponent_rebound_count * env_out.defensive_rebound.astype(jnp.float32)
+    counters["candidate_steals"] = _count(candidate_steal)
+    counters["opponent_steals"] = _count(
+        (env_out.steal_player >= 0) & (~candidate_steal)
+    )
+
+    inbound_pass = inbound_active & env_out.pass_attempt.astype(jnp.bool_)
+    inbound_completed_pass = inbound_active & env_out.completed_pass.astype(jnp.bool_)
+    inbound_turnover = inbound_active & env_out.turnover.astype(jnp.bool_)
+    _split_offense(inbound_pass, "inbound_pass_attempts", counters)
+    _split_offense(inbound_completed_pass, "inbound_completed_passes", counters)
+    _split_offense(inbound_turnover, "inbound_turnovers", counters)
+
+    candidate_is_defense = ~candidate_is_offense
+    defensive_lane = _count(env_out.defensive_lane_violation)
+    counters["candidate_defensive_lane_violations"] = defensive_lane * candidate_is_defense.astype(jnp.float32)
+    counters["opponent_defensive_lane_violations"] = defensive_lane * (~candidate_is_defense).astype(jnp.float32)
+
+    turnover_reasons = {
+        "pass_out_of_bounds": TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
+        "intercepted": TURNOVER_REASON_INTERCEPTED,
+        "defender_pressure": TURNOVER_REASON_DEFENDER_PRESSURE,
+        "move_out_of_bounds": TURNOVER_REASON_MOVE_OUT_OF_BOUNDS,
+        "shot_clock": TURNOVER_REASON_SHOT_CLOCK,
+        "offensive_three_seconds": TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
+        "inbound_timeout": TURNOVER_REASON_INBOUND_TIMEOUT,
+        "inbound_invalid_pass": TURNOVER_REASON_INBOUND_INVALID_PASS,
+        "clearance_violation": TURNOVER_REASON_CLEARANCE_VIOLATION,
+    }
+    for reason_name, reason in turnover_reasons.items():
+        _split_offense(
+            env_out.turnover.astype(jnp.bool_) & (env_out.turnover_reason == reason),
+            f"turnover_{reason_name}",
+            counters,
+        )
+
+    possession_end_reasons = {
+        "made_basket": POSSESSION_END_MADE_BASKET,
+        "defensive_rebound": POSSESSION_END_DEFENSIVE_REBOUND,
+        "turnover": POSSESSION_END_TURNOVER,
+        "defensive_violation": POSSESSION_END_DEFENSIVE_VIOLATION,
+        "inbound_violation": POSSESSION_END_INBOUND_VIOLATION,
+    }
+    for reason_name, reason in possession_end_reasons.items():
+        _split_offense(
+            env_out.possession_ended.astype(jnp.bool_)
+            & (env_out.possession_end_reason == reason),
+            f"possession_end_{reason_name}",
+            counters,
+        )
+    return counters
+
+
+def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec):
+    """Build deterministic candidate-versus-checkpoint match evaluation.
+
+    ``static.training_player_mask`` chooses whether the candidate controls
+    Team A or Team B.  Running the returned function once with each static
+    training role makes a matchup team-assignment balanced without changing
+    the game's independent jump-ball randomness.
+    """
+
+    def _runner(
+        static,
+        initial_state,
+        candidate_params,
+        opponent_params,
+        rollout_key,
+        horizon: int,
+        selector_multiselect_enabled: bool,
+        selector_min_play_steps: int,
+    ):
+        candidate_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
+        n_players = int(static.role_encoding.shape[0])
+        initial_completed_pass_boundary = jnp.zeros(
+            initial_state.episode_ended.shape,
+            dtype=jnp.bool_,
+        )
+        initial_offensive_rebound_boundary = jnp.zeros_like(
+            initial_completed_pass_boundary
+        )
+        initial_diagnostics = _zero_historical_match_diagnostics(
+            initial_state,
+            jnp,
+        )
+
+        def _scan_step(carry, _):
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                diagnostics,
+            ) = carry
+            key, env_key = jax.random.split(key, 2)
+
+            candidate_role_flags = build_training_role_flags_batch(static, state, jnp)
+            candidate_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                candidate_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                candidate_params,
+                candidate_selector_obs,
+                candidate_role_flags,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+
+            opponent_role_flags = build_opponent_role_flags_batch(static, state, jnp)
+            opponent_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                opponent_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                opponent_params,
+                opponent_selector_obs,
+                opponent_role_flags,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+
+            full_action_mask = build_action_masks_batch(static, state, jnp)
+            candidate_action_mask = full_action_mask[:, candidate_ids, :]
+            opponent_action_mask = full_action_mask[:, opponent_ids, :]
+            candidate_role_flags = build_training_role_flags_batch(static, state, jnp)
+            opponent_role_flags = build_opponent_role_flags_batch(static, state, jnp)
+            candidate_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                candidate_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+            )
+            opponent_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                opponent_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+            )
+            candidate_forward = actor_critic_forward(
+                candidate_params,
+                candidate_obs,
+                spec,
+                jnp,
+                intent_context=build_policy_intent_context_batch_with_role_flag(
+                    static,
+                    state,
+                    candidate_role_flags,
+                    jnp,
+                ),
+            )
+            opponent_forward = actor_critic_forward(
+                opponent_params,
+                opponent_obs,
+                spec,
+                jnp,
+                intent_context=build_policy_intent_context_batch_with_role_flag(
+                    static,
+                    state,
+                    opponent_role_flags,
+                    jnp,
+                ),
+            )
+            candidate_masked = apply_action_mask(
+                candidate_forward["flat_policy_logits"],
+                candidate_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            opponent_masked = apply_action_mask(
+                opponent_forward["flat_policy_logits"],
+                opponent_action_mask,
+                spec,
+                jax,
+                jnp,
+            )
+            full_actions = assemble_full_actions_jax(
+                candidate_masked["deterministic_actions"],
+                opponent_masked["deterministic_actions"],
+                candidate_ids,
+                opponent_ids,
+                n_players,
+                jnp,
+            )
+            env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
+            env_out = step_batch_minimal(
+                static,
+                state,
+                full_actions,
+                env_keys,
+                jax,
+                jnp,
+            )
+            active_step = ~state.episode_ended.astype(jnp.bool_)
+            step_diagnostics = _build_historical_match_step_diagnostics(
+                static,
+                state,
+                env_out,
+                candidate_role_flags,
+                active_step,
+                jnp,
+            )
+            next_diagnostics = {
+                name: diagnostics[name] + step_diagnostics[name]
+                for name in HISTORICAL_MATCH_DIAGNOSTIC_KEYS
+            }
+            next_completed_pass_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.completed_pass.astype(jnp.bool_)
+            )
+            next_offensive_rebound_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.offensive_rebound.astype(jnp.bool_)
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_pass_boundary,
+                next_offensive_rebound_boundary,
+                next_diagnostics,
+            ), None
+
+        (
+            final_state,
+            _,
+            _,
+            _,
+            diagnostics,
+        ), _ = jax.lax.scan(
+            _scan_step,
+            (
+                initial_state,
+                rollout_key,
+                initial_completed_pass_boundary,
+                initial_offensive_rebound_boundary,
+                initial_diagnostics,
+            ),
+            xs=None,
+            length=int(horizon),
+        )
+        return final_state, diagnostics
+
+    return jax.jit(_runner, static_argnums=(5, 6, 7))
 
 
 def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):

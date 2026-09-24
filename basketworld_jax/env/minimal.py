@@ -276,6 +276,7 @@ class KernelStatic(NamedTuple):
     multi_possession_aux_rewards_enabled: Any
     multi_possession_schema_version: Any
     inbound_position: Any
+    technical_inbound_positions: Any
     inbound_deadline_steps: Any
 
 
@@ -1114,6 +1115,32 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
     inbound_position = basket_position + baseline_west
     if tuple(inbound_position.tolist()) in set(cells):
         raise ValueError("Baseline inbound position must be outside the playable court.")
+    # Defensive three seconds resumes with a frontcourt sideline throw-in at
+    # the free-throw-line extension. Sidelines are not modeled as court cells,
+    # so use one off-court coordinate on each side of the half court. After the
+    # pass, ordinary movement masks expose their adjacent on-court entry cells.
+    free_throw_line_col = min(
+        max(0, int(env.three_second_lane_height)),
+        max(0, int(env.court_width) - 1),
+    )
+    technical_inbound_positions = np.asarray(
+        [
+            env._offset_to_axial(free_throw_line_col, -1),
+            env._offset_to_axial(free_throw_line_col, int(env.court_height)),
+        ],
+        dtype=np.int32,
+    )
+    court_cells = set(cells)
+    for position in technical_inbound_positions.tolist():
+        if tuple(position) in court_cells:
+            raise ValueError("Technical-foul inbound position must be outside the playable court.")
+        has_entry_cell = any(
+            tuple((np.asarray(position, dtype=np.int32) + direction).tolist())
+            in court_cells
+            for direction in np.asarray(env.hex_directions, dtype=np.int32)
+        )
+        if not has_entry_cell:
+            raise ValueError("Technical-foul inbound position must border the playable court.")
 
     return KernelStatic(
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
@@ -1375,6 +1402,10 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             dtype=xp.int32,
         ),
         inbound_position=xp.asarray(inbound_position, dtype=xp.int32),
+        technical_inbound_positions=xp.asarray(
+            technical_inbound_positions,
+            dtype=xp.int32,
+        ),
         inbound_deadline_steps=xp.asarray(
             max(1, int(getattr(env, "inbound_deadline_steps", 5))),
             dtype=xp.int32,
@@ -3192,12 +3223,25 @@ def _positions_in_lane(static: KernelStatic, positions, lane_mask, jnp):
 def _defender_guarding_offense_mask(static: KernelStatic, state: KernelState, positions, jax, jnp):
     defense_positions = positions[_active_defense_ids_single(static, state, jax)]
     offense_positions = positions[_active_offense_ids_single(static, state, jax)]
+    # A baseline inbounder is deliberately outside the playable cells until
+    # they re-enter. They cannot satisfy the "guarding an offensive player"
+    # exemption once a teammate catches the inbound: otherwise a defender one
+    # hex inside the basket can camp in the lane while nominally guarding that
+    # out-of-bounds player.
+    _, offense_on_court = _lookup_cell_indices(
+        static.cell_coords,
+        offense_positions,
+        jnp,
+    )
     distances = _hex_distance(
         defense_positions[:, None, :],
         offense_positions[None, :, :],
         jnp,
     ).astype(jnp.float32)
-    guarding = jnp.any(distances <= static.defender_guard_distance, axis=1)
+    guarding = jnp.any(
+        (distances <= static.defender_guard_distance) & offense_on_court[None, :],
+        axis=1,
+    )
     return jnp.where(static.defender_guard_distance > 0.0, guarding, jnp.zeros_like(guarding))
 
 
@@ -3303,7 +3347,7 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
         (jnp.arange(n_players, dtype=jnp.int32) == state.inbound_player)
         & (state.inbound_player >= 0)
         & (state.game_phase == GAME_PHASE_LIVE)
-        & jnp.all(current_positions == static.inbound_position[None, :], axis=-1)
+        & (~_lookup_cell_indices(static.cell_coords, current_positions, jnp)[1])
     )
     basket_collision = (
         jnp.all(proposed == static.basket_position, axis=-1)
@@ -3360,8 +3404,7 @@ def _return_pending_inbounder_to_court_single(
     """Place an outside pending inbounder on the nearest free legal cell.
 
     This is used only when another dead-ball boundary occurs before that player
-    re-enters.  It prevents repeated inbound violations from accumulating
-    duplicate players at the single outside-baseline coordinate.
+    re-enters. It supports both baseline and sideline inbound coordinates.
     """
     n_players = state.positions.shape[0]
     safe_player = jnp.clip(state.inbound_player, 0, n_players - 1)
@@ -3376,7 +3419,7 @@ def _return_pending_inbounder_to_court_single(
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     other_positions = jnp.where(
         (player_ids == safe_player)[:, None],
-        jnp.broadcast_to(static.inbound_position, state.positions.shape),
+        jnp.broadcast_to(pending_position, state.positions.shape),
         state.positions,
     )
     occupied = jnp.any(
@@ -3386,12 +3429,10 @@ def _return_pending_inbounder_to_court_single(
         ),
         axis=1,
     )
-    # A baseline inbounder may legally step onto the under-basket cell even
-    # when ordinary dunk-position movement is disabled.
     legal = ~occupied
     distances = _hex_distance(
         static.cell_coords,
-        static.inbound_position[None, :],
+        pending_position[None, :],
         jnp,
     ).astype(jnp.int32)
     tie_break = jnp.arange(static.cell_coords.shape[0], dtype=jnp.int32)
@@ -3412,6 +3453,26 @@ def _select_inbounder_single(
     jax,
     jnp,
 ):
+    return _select_inbounder_at_position_single(
+        static,
+        positions,
+        receiving_team,
+        static.inbound_position,
+        inbound_selection_key,
+        jax,
+        jnp,
+    )
+
+
+def _select_inbounder_at_position_single(
+    static: KernelStatic,
+    positions,
+    receiving_team,
+    inbound_position,
+    inbound_selection_key,
+    jax,
+    jnp,
+):
     """Select a closest receiving player, breaking equal distances uniformly."""
     receiving_ids = jnp.where(
         receiving_team == TEAM_A,
@@ -3420,7 +3481,7 @@ def _select_inbounder_single(
     )
     distances = _hex_distance(
         positions[receiving_ids],
-        static.inbound_position[None, :],
+        inbound_position[None, :],
         jnp,
     )
     closest_distance = jnp.min(distances)
@@ -3439,6 +3500,7 @@ def _prepare_inbound_positions_single(
     static: KernelStatic,
     state: KernelState,
     receiving_team,
+    inbound_position,
     inbound_selection_key,
     jax,
     jnp,
@@ -3448,16 +3510,17 @@ def _prepare_inbound_positions_single(
         state,
         jnp,
     )
-    inbounder = _select_inbounder_single(
+    inbounder = _select_inbounder_at_position_single(
         static,
         restored_positions,
         receiving_team,
+        inbound_position,
         inbound_selection_key,
         jax,
         jnp,
     )
     inbound_positions = restored_positions.at[inbounder].set(
-        static.inbound_position
+        inbound_position
     )
     return restored_positions, inbound_positions, inbounder
 
@@ -3612,6 +3675,7 @@ def _finalize_possession_single(
         static,
         state,
         next_offense_team,
+        static.inbound_position,
         inbound_key,
         jax,
         jnp,
@@ -3763,6 +3827,77 @@ def _finalize_possession_single(
         jnp.asarray(0, dtype=jnp.int32),
     )
     return next_state, game_done, possession_ended, completed_possession_live_steps
+
+
+def _technical_inbound_position_single(static: KernelStatic, state: KernelState, jnp):
+    """Choose the nearer frontcourt sideline for a defensive technical restart."""
+    safe_holder = jnp.clip(
+        state.ball_holder,
+        0,
+        state.positions.shape[0] - 1,
+    )
+    interruption_position = state.positions[safe_holder]
+    distances = _hex_distance(
+        static.technical_inbound_positions,
+        interruption_position[None, :],
+        jnp,
+    )
+    return static.technical_inbound_positions[jnp.argmin(distances)]
+
+
+def _restart_after_defensive_technical_single(
+    static: KernelStatic,
+    state: KernelState,
+    *,
+    shot_clock_before_interruption,
+    inbound_selection_key,
+    jax,
+    jnp,
+):
+    """Award the technical point and resume the *same* possession from sideline."""
+    technical_inbound_position = _technical_inbound_position_single(static, state, jnp)
+    (
+        _,
+        inbound_positions,
+        inbounder,
+    ) = _prepare_inbound_positions_single(
+        static,
+        state,
+        state.offense_team,
+        technical_inbound_position,
+        inbound_selection_key,
+        jax,
+        jnp,
+    )
+    technical_minimum_clock = jnp.minimum(
+        static.shot_clock_max.astype(jnp.int32),
+        jnp.asarray(14, dtype=jnp.int32),
+    )
+    return _replace_state(
+        state,
+        positions=inbound_positions,
+        ball_holder=inbounder.astype(jnp.int32),
+        # The technical interrupts play before the current simulation tick has
+        # consumed the clock. NBA treatment preserves that clock or grants 14.
+        shot_clock=jnp.maximum(
+            shot_clock_before_interruption.astype(jnp.int32),
+            technical_minimum_clock,
+        ),
+        pressure_exposure=jnp.asarray(0.0, dtype=jnp.float32),
+        offense_lane_steps=jnp.zeros_like(state.offense_lane_steps),
+        defense_lane_steps=jnp.zeros_like(state.defense_lane_steps),
+        assist_active=jnp.asarray(0, dtype=jnp.int8),
+        assist_passer=jnp.asarray(-1, dtype=jnp.int32),
+        assist_recipient=jnp.asarray(-1, dtype=jnp.int32),
+        assist_expires_at=jnp.asarray(-1, dtype=jnp.int32),
+        game_phase=jnp.asarray(GAME_PHASE_AWAITING_INBOUND, dtype=jnp.int8),
+        inbound_team=state.offense_team.astype(jnp.int8),
+        inbound_player=inbounder.astype(jnp.int32),
+        inbound_reason=jnp.asarray(POSSESSION_END_DEFENSIVE_VIOLATION, dtype=jnp.int32),
+        inbound_steps_remaining=static.inbound_deadline_steps.astype(jnp.int32),
+        # Retaining possession also retains clearance status, live-possession
+        # time, selected intents, and the completed-possession counter.
+    )
 
 
 def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key, jax, jnp):
@@ -4147,7 +4282,13 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         )
 
     def _run_active(_):
-        pressure_key, action_key, move_key, inbound_selection_key = jax.random.split(key, 4)
+        (
+            pressure_key,
+            pressure_recipient_key,
+            action_key,
+            move_key,
+            inbound_selection_key,
+        ) = jax.random.split(key, 5)
         next_state = _replace_state(
             state,
             step_count=state.step_count + 1,
@@ -4164,7 +4305,22 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         pressure_draws = jax.random.uniform(pressure_key, shape=pressure_probs.shape)
         pressure_success = pressure_draws < pressure_probs
         pressure_turnover = jnp.any(pressure_success)
-        pressure_def_idx = jnp.argmax(pressure_success.astype(jnp.int32))
+        # Once a pressure turnover occurs, choose its recipient independently
+        # of roster order.  ``pressure_probs`` is the current per-defender
+        # pressure strength; categorical sampling from their log values is a
+        # softmax over those strengths.  This is deliberately separate from
+        # the compound event draw above, preserving the established aggregate
+        # turnover probability while making future player-specific steal skill
+        # a natural addition to the selection logits.
+        pressure_logits = jnp.where(
+            pressure_probs > 0.0,
+            jnp.log(pressure_probs),
+            -jnp.inf,
+        )
+        pressure_def_idx = jax.random.categorical(
+            pressure_recipient_key,
+            pressure_logits,
+        )
         pressure_holder = _active_defense_ids_single(static, next_state, jax)[pressure_def_idx]
 
         def _pressure_done(_):
@@ -4194,10 +4350,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 possession_ended=jnp.asarray(True),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
                 next_offense_team=1 - next_state.offense_team,
-                # A defender-pressure turnover is a forced/dead-ball change of
-                # possession.  The receiving team must restart from a baseline
-                # inbound, unlike an intercepted pass which stays live.
-                requires_inbound=jnp.asarray(True),
+                # A defender-pressure turnover is a live-ball steal.  The
+                # selected defender already controls the ball, so the new
+                # offense continues from that location and must clear unless
+                # the holder is already beyond the arc.
+                requires_inbound=jnp.asarray(False),
                 inbound_selection_key=inbound_selection_key,
                 jax=jax,
                 jnp=jnp,
@@ -4250,7 +4407,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 assist_passer=no_player,
                 turnover_player=jnp.where(next_state.ball_holder >= 0, pressure_turnover_player, no_player),
                 turnover_reason=jnp.asarray(TURNOVER_REASON_DEFENDER_PRESSURE, dtype=jnp.int32),
-                steal_player=no_player,
+                steal_player=pressure_holder.astype(jnp.int32),
                 offensive_three_seconds=zero_flag,
                 defensive_lane_violation=zero_flag,
                 defensive_lane_violation_player=no_player,
@@ -4910,7 +5067,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
 
             shot_clock_turnover = (final_state.shot_clock <= 0) & (~shot_active)
-            done = done | offensive_three_seconds_turnover | defensive_lane_violation
+            done = done | offensive_three_seconds_turnover
             turnover_event = (
                 turnover_from_action
                 | movement_turnover
@@ -4995,7 +5152,6 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
             requires_inbound = (
                 (possession_end_reason == jnp.asarray(POSSESSION_END_MADE_BASKET, dtype=jnp.int32))
-                | (possession_end_reason == jnp.asarray(POSSESSION_END_DEFENSIVE_VIOLATION, dtype=jnp.int32))
                 | dead_ball_turnover
                 # Without rebound mechanics, a missed terminal shot has no
                 # live winner to carry forward, so retain the safe dead-ball
@@ -5005,21 +5161,44 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     & (~rebound_enabled)
                 )
             )
+            def _restart_after_technical(_):
+                return (
+                    _restart_after_defensive_technical_single(
+                        static,
+                        final_state,
+                        shot_clock_before_interruption=state.shot_clock,
+                        inbound_selection_key=inbound_selection_key,
+                        jax=jax,
+                        jnp=jnp,
+                    ),
+                    jnp.asarray(False),
+                    jnp.asarray(False),
+                    zero_steps,
+                )
+
+            def _finalize_normal_possession(_):
+                return _finalize_possession_single(
+                    static,
+                    final_state,
+                    possession_ended=possession_ended,
+                    possession_end_reason=possession_end_reason,
+                    next_offense_team=next_offense_team,
+                    requires_inbound=requires_inbound,
+                    inbound_selection_key=inbound_selection_key,
+                    jax=jax,
+                    jnp=jnp,
+                )
+
             (
                 final_state,
                 multi_game_done,
                 possession_ended,
                 completed_possession_live_steps,
-            ) = _finalize_possession_single(
-                static,
-                final_state,
-                possession_ended=possession_ended,
-                possession_end_reason=possession_end_reason,
-                next_offense_team=next_offense_team,
-                requires_inbound=requires_inbound,
-                inbound_selection_key=inbound_selection_key,
-                jax=jax,
-                jnp=jnp,
+            ) = jax.lax.cond(
+                defensive_lane_violation,
+                _restart_after_technical,
+                _finalize_normal_possession,
+                operand=None,
             )
             done = jnp.where(
                 static.enable_multi_possession.astype(jnp.bool_),

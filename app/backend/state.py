@@ -60,6 +60,10 @@ class GameState:
         self.replay_initial_positions: list[tuple[int, int]] | None = None
         self.replay_ball_holder: int | None = None
         self.replay_shot_clock: int | None = None
+        # Identifies the one recording that a self-play run is allowed to
+        # append to. The browser sends it back with each self-play step so a
+        # late request from an older run cannot contaminate a new replay.
+        self.replay_session_id: str | None = None
         self.replay_offense_skills: dict | None = None  # Store sampled skills for consistency
         self.sampled_offense_skills: dict | None = None  # Baseline skills from initial game creation
         self.actions_log: list[list[int]] = []  # full action arrays per step

@@ -35,7 +35,14 @@ from basketworld_jax.train.main import (
     _checkpoint_interval_for_update,
     _checkpoint_trainer_config_from_args,
     _entropy_coef_for_update,
+    _historical_eval_updates,
+    _historical_eval_artifact_payload,
     _periodic_checkpoint_updates,
+    _persist_historical_eval_artifact,
+    _historical_eval_update_artifact_payload,
+    _persist_historical_eval_update_artifact,
+    _run_historical_match_evaluation,
+    _summarize_historical_match,
     _filter_mlflow_train_metrics,
     _phi_beta_for_update,
     _log_mlflow_params,
@@ -112,6 +119,266 @@ def test_deploy_eval_args_reject_invalid_values():
         validate_train_args(parse_args(["--eval-deploy-batches", "-1"]))
     with pytest.raises(SystemExit, match="--eval-deploy-horizon must be >= 1"):
         validate_train_args(parse_args(["--eval-deploy-horizon", "0"]))
+
+
+def test_historical_eval_milestones_are_additive_and_validate():
+    args = parse_args(
+        [
+            "--num-updates",
+            "5000",
+            "--checkpoint-dir",
+            "artifacts/checkpoints",
+            "--historical-eval-updates",
+            "100,2000,5000",
+        ]
+    )
+    validate_train_args(args)
+    assert _historical_eval_updates(args) == (100, 2000, 5000)
+    assert _periodic_checkpoint_updates(args) == set()
+
+    with pytest.raises(SystemExit, match="strictly increasing"):
+        validate_train_args(
+            parse_args(
+                [
+                    "--num-updates",
+                    "5000",
+                    "--checkpoint-dir",
+                    "artifacts/checkpoints",
+                    "--historical-eval-updates",
+                    "100,100",
+                ]
+            )
+        )
+    with pytest.raises(SystemExit, match="checkpoint-dir or --log-mlflow"):
+        validate_train_args(
+            parse_args(["--num-updates", "100", "--historical-eval-updates", "100"])
+        )
+    with pytest.raises(SystemExit, match="even integer"):
+        validate_train_args(
+            parse_args(
+                [
+                    "--num-updates",
+                    "100",
+                    "--checkpoint-dir",
+                    "artifacts/checkpoints",
+                    "--historical-eval-updates",
+                    "100",
+                    "--historical-eval-episodes",
+                    "3",
+                ]
+            )
+        )
+
+
+def test_historical_match_summary_balances_team_assignments_and_scores():
+    team_a_final = SimpleNamespace(
+        episode_ended=np.asarray([True, True]),
+        team_a_score=np.asarray([5, 3]),
+        team_b_score=np.asarray([1, 3]),
+    )
+    team_b_final = SimpleNamespace(
+        episode_ended=np.asarray([True, True]),
+        team_a_score=np.asarray([2, 3]),
+        team_b_score=np.asarray([4, 1]),
+    )
+
+    summary = _summarize_historical_match(
+        candidate_update=2000,
+        opponent_update=100,
+        team_a_candidate_final_state=team_a_final,
+        team_b_candidate_final_state=team_b_final,
+        seed=91,
+        horizon=1024,
+    )
+
+    assert summary["episodes_candidate_team_a"] == 2
+    assert summary["episodes_candidate_team_b"] == 2
+    assert summary["candidate_wins"] == 2
+    assert summary["candidate_ties"] == 1
+    assert summary["candidate_losses"] == 1
+    assert summary["candidate_win_rate"] == pytest.approx(0.5)
+    assert summary["mean_candidate_point_differential"] == pytest.approx(1.0)
+
+
+def test_historical_match_summary_includes_compact_gameplay_diagnostics():
+    team_a_final = SimpleNamespace(
+        episode_ended=np.asarray([True]),
+        team_a_score=np.asarray([3]),
+        team_b_score=np.asarray([0]),
+        starting_offense_team=np.asarray([0]),
+        completed_possessions=np.asarray([25]),
+        step_count=np.asarray([120]),
+    )
+    team_b_final = SimpleNamespace(
+        episode_ended=np.asarray([True]),
+        team_a_score=np.asarray([0]),
+        team_b_score=np.asarray([0]),
+        starting_offense_team=np.asarray([0]),
+        completed_possessions=np.asarray([25]),
+        step_count=np.asarray([100]),
+    )
+
+    summary = _summarize_historical_match(
+        candidate_update=10,
+        opponent_update=5,
+        team_a_candidate_final_state=team_a_final,
+        team_b_candidate_final_state=team_b_final,
+        team_a_candidate_diagnostics={
+            "active_steps": np.asarray([120]),
+            "completed_possessions": np.asarray([25]),
+            "completed_possession_live_steps": np.asarray([75]),
+            "candidate_pass_attempts": np.asarray([10]),
+            "candidate_completed_passes": np.asarray([8]),
+            "candidate_shot_attempts": np.asarray([4]),
+            "candidate_shot_makes": np.asarray([1]),
+            "candidate_clearance_events": np.asarray([5]),
+            "candidate_clearance_elapsed_steps": np.asarray([11]),
+        },
+        team_b_candidate_diagnostics={
+            "active_steps": np.asarray([100]),
+            "completed_possessions": np.asarray([25]),
+            "completed_possession_live_steps": np.asarray([65]),
+        },
+        seed=3_000_000,
+        horizon=1024,
+    )
+
+    assert summary["zero_zero_tie_count"] == 1
+    assert summary["scoreline_histogram"] == {"3-0": 1, "0-0": 1}
+    assert summary["point_differential_histogram"] == {"3": 1, "0": 1}
+    assert summary["team_assignment_summaries"]["candidate_team_a"]["episode_count"] == 1
+    assert summary["starting_possession_summaries"]["candidate_started_with_possession"]["episode_count"] == 1
+    assert summary["starting_possession_summaries"]["opponent_started_with_possession"]["episode_count"] == 1
+    assert summary["candidate_pass_attempts_total"] == 10
+    assert summary["candidate_pass_completion_rate"] == pytest.approx(0.8)
+    assert summary["candidate_shot_make_rate"] == pytest.approx(0.25)
+    assert summary["candidate_mean_clearance_steps"] == pytest.approx(2.2)
+    assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(2.8)
+    assert len(summary["episode_diagnostics"]) == 2
+    team_a_row, team_b_row = summary["episode_diagnostics"]
+    assert team_a_row["candidate_fixed_team"] == "team_a"
+    assert team_a_row["candidate_score"] == 3
+    assert team_a_row["opponent_score"] == 0
+    assert team_a_row["candidate_pass_attempts"] == 10
+    assert team_a_row["candidate_completed_passes"] == 8
+    assert team_a_row["completed_possessions"] == 25
+    assert team_b_row["candidate_fixed_team"] == "team_b"
+    assert team_b_row["candidate_score"] == 0
+    assert team_b_row["opponent_score"] == 0
+    assert team_b_row["candidate_pass_attempts"] == 0
+    assert team_b_row["completed_possessions"] == 25
+
+
+def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkeypatch):
+    class FakeRandom:
+        @staticmethod
+        def PRNGKey(seed):
+            return int(seed)
+
+        @staticmethod
+        def fold_in(key, value):
+            return int(key) + int(value)
+
+        @staticmethod
+        def split(key, count):
+            return np.arange(int(count), dtype=np.int32) + int(key)
+
+    class FakeJax:
+        random = FakeRandom()
+
+    def _fake_reset(static, keys, jax, jnp):
+        del keys, jax, jnp
+        return static
+
+    def _fake_runner(static, initial_state, *args):
+        del initial_state, args
+        candidate_is_team_a = static == "candidate_team_a"
+        return (
+            SimpleNamespace(
+                episode_ended=np.asarray([True]),
+                team_a_score=np.asarray([2 if candidate_is_team_a else 0]),
+                team_b_score=np.asarray([0 if candidate_is_team_a else 2]),
+                starting_offense_team=np.asarray([0]),
+                completed_possessions=np.asarray([25]),
+                step_count=np.asarray([100]),
+            ),
+            {
+                "active_steps": np.asarray([100]),
+                "candidate_pass_attempts": np.asarray([7]),
+            },
+        )
+
+    monkeypatch.setattr("basketworld_jax.train.main.reset_batch_minimal", _fake_reset)
+    summary = _run_historical_match_evaluation(
+        runner=_fake_runner,
+        statics={"offense": "candidate_team_a", "defense": "candidate_team_b"},
+        candidate_params=object(),
+        opponent_params=object(),
+        candidate_update=10,
+        opponent_update=5,
+        args=SimpleNamespace(
+            historical_eval_episodes=2,
+            historical_eval_seed=3_000_000,
+            historical_eval_horizon=1024,
+            intent_selector_multiselect_enabled=False,
+            intent_selector_min_play_steps=3,
+        ),
+        jax=FakeJax(),
+        jnp=object(),
+    )
+
+    assert summary["candidate_wins"] == 2
+    assert summary["candidate_pass_attempts_total"] == 14
+
+
+def test_historical_eval_artifact_persists_milestones_and_match_mapping(tmp_path):
+    payload = _historical_eval_artifact_payload(
+        milestone_updates=(100, 2000),
+        milestone_records={
+            100: {"update_index": 100, "checkpoint_path": "update_0000100", "pinned": True},
+            2000: {"update_index": 2000, "checkpoint_path": "update_0002000", "pinned": True},
+        },
+        match_history=[
+            {"candidate_update": 100, "opponent_update": 100},
+            {"candidate_update": 2000, "opponent_update": 100},
+            {"candidate_update": 2000, "opponent_update": 2000},
+        ],
+        update_artifact_paths={100: "results/historical_opponent_evaluations/update_0000100.json"},
+    )
+
+    artifact_path = _persist_historical_eval_artifact(
+        checkpoint_dir=str(tmp_path),
+        mlflow=None,
+        payload=payload,
+    )
+
+    assert artifact_path == str(tmp_path / "historical_opponent_evaluation.json")
+    saved = (tmp_path / "historical_opponent_evaluation.json").read_text()
+    assert '"milestone_updates": [' in saved
+    assert '"100"' in saved
+    assert '"candidate_update": 100' in saved
+    assert '"evaluation_update_artifacts"' in saved
+
+    update_payload = _historical_eval_update_artifact_payload(
+        candidate_update=2000,
+        milestone_records={
+            100: {"update_index": 100, "checkpoint_path": "update_0000100", "pinned": True},
+            2000: {"update_index": 2000, "checkpoint_path": "update_0002000", "pinned": True},
+        },
+        match_history=payload["matches"],
+    )
+    update_artifact_path = _persist_historical_eval_update_artifact(
+        checkpoint_dir=str(tmp_path),
+        mlflow=None,
+        candidate_update=2000,
+        payload=update_payload,
+    )
+
+    assert update_artifact_path == str(
+        tmp_path / "historical_opponent_evaluations" / "update_0002000.json"
+    )
+    assert update_payload["evaluated_opponent_updates"] == [100, 2000]
+    assert [match["opponent_update"] for match in update_payload["matches"]] == [100, 2000]
 
 
 def test_fixed_checkpoint_schedule_preserves_modulo_cadence():

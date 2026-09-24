@@ -6,9 +6,10 @@ import PlayerControls from './components/PlayerControls.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
-import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
+import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, prepareFastSelfPlay, setMultiPossessionLimit, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
 import { startEpisodeGifExport } from './services/api';
+import { actionAnimationFrameCount, actionAnimationTiming, hexDistance } from './utils/actionAnimationTiming';
 
 function cloneState(state) {
   return state ? JSON.parse(JSON.stringify(state)) : null;
@@ -498,6 +499,15 @@ const aiMode = ref(true);
 const playerDeterministic = ref(false);
 const opponentDeterministic = ref(true);
 const showOpponentActions = ref(false);
+const fastSelfPlayMode = ref(false);
+const fastSelfPlayWarming = ref(false);
+// Target wall-clock interval between visible self-play steps. The loop below
+// subtracts request/render work so 1,000 ms means one second per step, rather
+// than one second plus backend compute time.
+const selfPlayStepIntervalMs = ref(250);
+const activeFastSelfPlay = ref(false);
+const fastSelfPlayActive = computed(() => activeFastSelfPlay.value && (selfPlayStarting.value || isSelfPlaying.value));
+let fastSelfPlayStatusPollTimer = null;
 
 // Shared move tracking between manual and AI play
 const moveHistory = ref([]);
@@ -669,7 +679,12 @@ const boardShowCoordinates = computed(() => (
   // turn on the board-editing coordinate labels.
   || Boolean(boardReboundTargetOverlay.value && boardReboundTargetOverlay.value.source !== 'live_rebound_step')
 ));
-const boardDisableBackendValueFetches = computed(() => isPlaybookBoardPreviewActive.value || isTemplatePlacementMode.value || isPassLabPlacementMode.value);
+const boardDisableBackendValueFetches = computed(() => (
+  fastSelfPlayActive.value
+  || isPlaybookBoardPreviewActive.value
+  || isTemplatePlacementMode.value
+  || isPassLabPlacementMode.value
+));
 const activeControlsTab = ref('controls');
 const reboundHeatmapPlayerOptions = computed(() => {
   const opts = [{ label: 'All players', value: 'all' }];
@@ -1344,6 +1359,7 @@ const GIF_CAPTURE_DETAIL = Object.freeze({
   standard: Object.freeze({ movement: 3, action: 7, rebound: 9 }),
   smooth: Object.freeze({ movement: 5, action: 12, rebound: 15 }),
 });
+const GIF_EXPORT_BATCH_SIZE = 8;
 
 function normalizedGifWidthPx() {
   const width = Math.round(Number(gifWidthPx.value));
@@ -1357,8 +1373,8 @@ watch(gameState, async (newState, oldState) => {
     syncPolicyProbsFromState(newState);
     if (!newState) {
         clearReboundPreview();
-    } else if (reboundPreviewEnabled.value) {
-        await refreshReboundPreview();
+    } else if (reboundPreviewEnabled.value && !fastSelfPlayActive.value) {
+      await refreshReboundPreview();
     }
     // When an episode ends, disable AI mode to allow starting a new game
     if (newState && newState.done && (!oldState || !oldState.done)) {
@@ -1383,6 +1399,10 @@ watch(reboundPreviewEnabled, async (enabled) => {
     return;
   }
   await refreshReboundPreview();
+});
+
+watch(fastSelfPlayActive, (enabled) => {
+  if (enabled) clearReboundPreview();
 });
 
 watch(reboundPreviewParams, async () => {
@@ -2103,6 +2123,7 @@ function stopSelfPlay() {
   selfPlayStarting.value = false;
   selfPlayLoadingMessage.value = '';
   isSelfPlaying.value = false;
+  activeFastSelfPlay.value = false;
   currentSelections.value = null;
 }
 
@@ -2114,29 +2135,85 @@ function isCurrentGameSession(sessionId) {
   return sessionId === gameSessionId;
 }
 
+function stopFastSelfPlayStatusPolling() {
+  if (fastSelfPlayStatusPollTimer !== null) {
+    clearInterval(fastSelfPlayStatusPollTimer);
+    fastSelfPlayStatusPollTimer = null;
+  }
+}
+
+function applyFastKernelStatus(status) {
+  fastSelfPlayWarming.value = Boolean(status?.warming && !status?.ready);
+  if (!fastSelfPlayWarming.value) stopFastSelfPlayStatusPolling();
+}
+
+function startFastSelfPlayStatusPolling() {
+  if (fastSelfPlayStatusPollTimer !== null) return;
+  const refresh = async () => {
+    if (!fastSelfPlayMode.value) {
+      stopFastSelfPlayStatusPolling();
+      return;
+    }
+    try {
+      applyFastKernelStatus(await prepareFastSelfPlay());
+    } catch (err) {
+      console.warn('[App] Could not read Fast Mode preparation status:', err);
+      stopFastSelfPlayStatusPolling();
+    }
+  };
+  void refresh();
+  fastSelfPlayStatusPollTimer = setInterval(() => { void refresh(); }, 1000);
+}
+
+async function toggleFastSelfPlayMode() {
+  fastSelfPlayMode.value = !fastSelfPlayMode.value;
+  if (!fastSelfPlayMode.value) {
+    fastSelfPlayWarming.value = false;
+    stopFastSelfPlayStatusPolling();
+    return;
+  }
+  try {
+    applyFastKernelStatus(await prepareFastSelfPlay());
+    if (fastSelfPlayWarming.value) startFastSelfPlayStatusPolling();
+  } catch (err) {
+    // Self-play remains available with the diagnostic-light eager fallback.
+    console.warn('[App] Fast Mode preparation could not start:', err);
+    fastSelfPlayWarming.value = false;
+  }
+}
+
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
   const sessionId = ++selfPlaySessionId;
   const activeGameSessionId = ++gameSessionId;
+  const useFastMode = fastSelfPlayMode.value;
   const mctsOptions = (mctsOptionsForStep.value && mctsOptionsForStep.value.use_mcts) ? mctsOptionsForStep.value : null;
+  activeFastSelfPlay.value = useFastMode;
   selfPlayStarting.value = true;
-  selfPlayLoadingMessage.value = 'Starting self-play…';
+  selfPlayLoadingMessage.value = useFastMode ? 'Starting fast self-play…' : 'Starting self-play…';
   error.value = null;
   await nextTick();
+  let replaySessionId = null;
 
   // Snapshot the backend state before beginning the first visible self-play step.
   try {
-    const res = await startSelfPlay(startTemplateOptions);
+    const res = await startSelfPlay(startTemplateOptions, useFastMode);
     if (!isCurrentGameSession(activeGameSessionId)) return;
     if (!res || res.status !== 'success' || !res.state) {
       throw new Error(res?.message || 'Failed to start self-play.');
     }
     gameState.value = res.state;
     gameHistory.value = [res.state];
+    replaySessionId = res.replay_session_id || res.state?.replay_session_id || null;
     moveHistory.value = [];
     currentSelections.value = null;
+    if (useFastMode) {
+      const status = res.fast_kernel || res.state?.fast_kernel;
+      applyFastKernelStatus(status);
+      if (fastSelfPlayWarming.value) startFastSelfPlayStatusPolling();
+    }
     if (isCurrentSelfPlaySession(sessionId)) {
-      selfPlayLoadingMessage.value = 'Preparing first self-play step…';
+      selfPlayLoadingMessage.value = useFastMode ? 'Preparing fast self-play…' : 'Preparing first self-play step…';
     }
   } catch (err) {
     if (!isCurrentGameSession(activeGameSessionId) || !isCurrentSelfPlaySession(sessionId)) return;
@@ -2144,6 +2221,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     console.error('[App] Failed to start self-play on backend:', err);
     selfPlayStarting.value = false;
     selfPlayLoadingMessage.value = '';
+    activeFastSelfPlay.value = false;
     return;
   }
 
@@ -2155,6 +2233,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   // Run full episode with AI controlling all players
   while (isCurrentGameSession(activeGameSessionId) && isCurrentSelfPlaySession(sessionId) && gameState.value && !gameState.value.done) {
     try {
+      const visibleStepStartedAt = performance.now();
       // Get AI actions for user-controlled players
       let aiActions = {};
       const mctsTargets = new Set();
@@ -2168,7 +2247,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         }
       }
       
-      if (policyProbs.value) {
+      if (!useFastMode && policyProbs.value) {
         // Determine which players are user-controlled
         const userControlledIds = Array.isArray(gameState.value.user_player_ids)
           ? gameState.value.user_player_ids
@@ -2271,6 +2350,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       // Clear preselected after applying for the first step
       preselected = null;
       
+      if (!useFastMode) {
       // Track moves for AI self-play (even if all players are MCTS)
       const currentTurn = getNextTurnNumber();
       const teamMoves = {};
@@ -2320,12 +2400,33 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         offensiveValue: currentStateValues?.offensive_value ?? null,
         defensiveValue: currentStateValues?.defensive_value ?? null
       });
+      }
       
-      const response = await stepGame(aiActions, playerDeterministic.value, opponentDeterministic.value, mctsOptions);
+      if (useFastMode && firstSelfPlayStep) {
+        selfPlayLoadingMessage.value = fastSelfPlayWarming.value
+          ? 'Fast Mode is warming in the background; starting the episode…'
+          : 'Preparing fast self-play…';
+        await nextTick();
+      }
+      const response = await stepGame(
+        useFastMode ? {} : aiActions,
+        playerDeterministic.value,
+        opponentDeterministic.value,
+        useFastMode ? null : mctsOptions,
+        useFastMode,
+        replaySessionId,
+      );
       if (!isCurrentGameSession(activeGameSessionId)) break;
       if (response.status === 'success') {
         gameState.value = response.state;
         gameHistory.value.push(cloneState(response.state));
+        if (useFastMode) {
+          currentSelections.value = buildDisplayActions(response.actions_taken, response.actions_taken_meta);
+          if (response.fast_kernel) {
+            applyFastKernelStatus(response.fast_kernel);
+            if (fastSelfPlayWarming.value) startFastSelfPlayStatusPolling();
+          }
+        }
         if (firstSelfPlayStep) {
           firstSelfPlayStep = false;
           selfPlayStarting.value = false;
@@ -2333,7 +2434,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         }
         
         // Update the last move with action results, shot clock, and state values BEFORE action
-        if (moveHistory.value.length > 0) {
+        if (!useFastMode && moveHistory.value.length > 0) {
           const lastMove = moveHistory.value[moveHistory.value.length - 1];
           if (response.state.last_action_results) {
             lastMove.actionResults = response.state.last_action_results;
@@ -2367,7 +2468,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         }
         
         // If game is done, add an END row
-        if (response.state.done && moveHistory.value.length > 0) {
+        if (!useFastMode && response.state.done && moveHistory.value.length > 0) {
           const allIds = [...(response.state.offense_ids || []), ...(response.state.defense_ids || [])];
           const endMoves = {};
           allIds.forEach(pid => {
@@ -2380,10 +2481,19 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
             isEndRow: true
           });
         }
-        try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
+        if (!useFastMode) {
+          try { controlsRef.value?.$refs?.phiRef?.refresh?.(); } catch (_) {}
+        }
         if (!isCurrentSelfPlaySession(sessionId)) break;
-        // Small delay to make the progression visible
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Pace visible steps by their total wall time, not by an extra delay
+        // after request/render work. This keeps a 1,000 ms setting close to
+        // one real second per visible step on both fast and normal self-play.
+        const targetIntervalMs = Math.max(0, Number(selfPlayStepIntervalMs.value) || 0);
+        const remainingDelayMs = Math.max(
+          0,
+          targetIntervalMs - (performance.now() - visibleStepStartedAt),
+        );
+        await new Promise(resolve => setTimeout(resolve, remainingDelayMs));
       } else {
         throw new Error(response.message || 'Failed to process step.');
       }
@@ -2399,6 +2509,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   selfPlayStarting.value = false;
   selfPlayLoadingMessage.value = '';
   isSelfPlaying.value = false;
+  activeFastSelfPlay.value = false;
   currentSelections.value = null;
   canReplay.value = true;
 }
@@ -2888,7 +2999,8 @@ function animatedFlashKindsForState(state) {
   if (!results) return { hasShot: false, hasPass: false, hasRebound: false };
 
   const hasShot = Boolean(results.shots && Object.keys(results.shots).length > 0);
-  const hasRebound = Array.isArray(results.rebounds) && results.rebounds.length > 0;
+  const hasRebound = Boolean(results.rebound)
+    || (Array.isArray(results.rebounds) && results.rebounds.length > 0);
   const hasPass = Boolean(
     results.passes &&
     Object.values(results.passes).some(
@@ -2903,6 +3015,64 @@ function animatedFlashKindsForState(state) {
   );
 
   return { hasShot, hasPass, hasRebound };
+}
+
+function reboundResultForState(state) {
+  const results = state?.last_action_results;
+  return results?.rebound || (Array.isArray(results?.rebounds) ? results.rebounds[0] : null);
+}
+
+function actionDistanceForState(state, kind) {
+  const positions = state?.last_action_results?.pre_action_positions || state?.positions;
+  if (!Array.isArray(positions)) return 0;
+
+  if (kind === 'pass') {
+    const results = state?.last_action_results;
+    const passes = results?.passes && typeof results.passes === 'object' ? results.passes : {};
+    const successfulPass = Object.entries(passes).find(([rawPasserId, pass]) => (
+      Number.isFinite(Number(rawPasserId))
+      && pass?.success
+      && Number.isFinite(Number(pass.target))
+    ));
+    if (successfulPass) {
+      const [rawPasserId, pass] = successfulPass;
+      return hexDistance(positions[Number(rawPasserId)], positions[Number(pass.target)]);
+    }
+    const steal = Array.isArray(results?.turnovers)
+      ? results.turnovers.find((turnover) => (
+        String(turnover?.reason || '').toLowerCase() === 'steal'
+        && Number.isFinite(Number(turnover?.player_id))
+        && Number.isFinite(Number(turnover?.stolen_by))
+      ))
+      : null;
+    return steal
+      ? hexDistance(positions[Number(steal.player_id)], positions[Number(steal.stolen_by)])
+      : 0;
+  }
+
+  if (kind === 'shot') {
+    const shots = state?.last_action_results?.shots;
+    const shot = shots && typeof shots === 'object'
+      ? Object.entries(shots).find(([rawShooterId]) => Number.isFinite(Number(rawShooterId)))
+      : null;
+    if (!shot) return 0;
+    return hexDistance(positions[Number(shot[0])], state?.basket_position);
+  }
+
+  if (kind === 'rebound') {
+    const rebound = reboundResultForState(state);
+    const winnerId = Number(rebound?.winner ?? rebound?.winner_player_id ?? rebound?.player_id);
+    return hexDistance(state?.basket_position, positions[winnerId]);
+  }
+
+  return 0;
+}
+
+function gifActionTimingForState(state, kind) {
+  const baseDurationMs = kind === 'rebound'
+    ? Math.max(moveTransitionMs.value, REBOUND_STEP_DURATION_MS)
+    : Math.max(200, moveTransitionMs.value);
+  return actionAnimationTiming(kind, actionDistanceForState(state, kind), baseDurationMs);
 }
 
 function captureOffsets(durationMs, frameCount) {
@@ -2931,19 +3101,36 @@ function captureOffsetsForState(previousState, state) {
   const moveEnd = moveTransitionMs.value;
   const detail = GIF_CAPTURE_DETAIL[gifAnimationDetail.value] || GIF_CAPTURE_DETAIL.standard;
   if (hasRebound) {
-    const reboundEnd = Math.max(moveEnd, REBOUND_STEP_DURATION_MS);
-    return captureOffsets(reboundEnd, detail.rebound);
+    const timing = gifActionTimingForState(state, 'rebound');
+    return captureOffsets(
+      timing.durationMs,
+      actionAnimationFrameCount('rebound', timing.distance, detail.rebound),
+    );
   }
-  if (hasShot || hasPass) {
-    return captureOffsets(moveEnd, detail.action);
+  if (hasShot) {
+    const timing = gifActionTimingForState(state, 'shot');
+    return captureOffsets(
+      timing.durationMs,
+      actionAnimationFrameCount('shot', timing.distance, detail.action),
+    );
+  }
+  if (hasPass) {
+    const timing = gifActionTimingForState(state, 'pass');
+    return captureOffsets(
+      timing.durationMs,
+      actionAnimationFrameCount('pass', timing.distance, detail.action),
+    );
   }
   return captureOffsets(moveEnd, stateHasPositionChange(previousState, state) ? detail.movement : 1);
 }
 
 function gifPlaybackDurationForState(state) {
-  const { hasRebound } = animatedFlashKindsForState(state);
+  const { hasShot, hasPass, hasRebound } = animatedFlashKindsForState(state);
+  if (hasRebound) return gifActionTimingForState(state, 'rebound').durationMs;
+  if (hasShot) return gifActionTimingForState(state, 'shot').durationMs;
+  if (hasPass) return gifActionTimingForState(state, 'pass').durationMs;
   const baseDurationMs = Math.max(200, gifStepDurationMs.value || BASE_STEP_DURATION_MS);
-  return hasRebound ? Math.max(baseDurationMs, REBOUND_STEP_DURATION_MS) : baseDurationMs;
+  return baseDurationMs;
 }
 
 function isCompletedMultiPossessionGame(state) {
@@ -2955,6 +3142,13 @@ function reboundProgressForStateOffset(state, offsetMs) {
   if (!hasRebound) return 1;
   const durationMs = gifPlaybackDurationForState(state);
   return durationMs > 0 ? Math.min(1, offsetMs / durationMs) : 1;
+}
+
+function movementAnimationDurationForState(state) {
+  const { hasShot, hasPass } = animatedFlashKindsForState(state);
+  if (hasShot) return gifActionTimingForState(state, 'shot').durationMs;
+  if (hasPass) return gifActionTimingForState(state, 'pass').durationMs;
+  return moveTransitionMs.value;
 }
 
 function interpolateState(prevState, currState, t) {
@@ -3013,10 +3207,19 @@ async function handleSaveEpisode() {
     
     console.log(`[handleSaveEpisode] Generating ${states.length} frames...`);
     
-    // Upload each PNG immediately; accumulating them into one JSON payload can
-    // exceed the browser's maximum string size on multi-possession episodes.
+    // Capture binary PNGs and transfer bounded batches. This avoids both
+    // base64 expansion and an HTTP round trip for every animation frame.
     writer = await startEpisodeGifExport();
     let frameCount = 0;
+    let pendingFrames = [];
+    const flushPendingFrames = async () => {
+      if (pendingFrames.length === 0) return;
+      const first = pendingFrames[0].index + 1;
+      const last = pendingFrames[pendingFrames.length - 1].index + 1;
+      episodeSaveProgress.value = `Uploading frames ${first}–${last}`;
+      await writer.appendBatch(pendingFrames);
+      pendingFrames = [];
+    };
     for (let i = 0; i < states.length; i++) {
       try {
         episodeSaveProgress.value = `Saving step ${i + 1}/${states.length}`;
@@ -3037,7 +3240,7 @@ async function handleSaveEpisode() {
           // Capture uses explicit progress props while CSS transitions are
           // disabled. The offsets define the visual state and GIF timing; they
           // do not require waiting through the live animation in real time.
-          const moveDurationMs = moveTransitionMs.value;
+          const moveDurationMs = movementAnimationDurationForState(states[i]);
           const moveT = moveDurationMs > 0 ? Math.min(1, offset / moveDurationMs) : 1;
           const reboundT = reboundProgressForStateOffset(states[i], offset);
           const isFinalCaptureFrame = isFinalGameState && offset === offsets[offsets.length - 1];
@@ -3055,15 +3258,22 @@ async function handleSaveEpisode() {
           await nextTick();
 
           // Render this state as PNG
-          if (gameBoardRef.value && gameBoardRef.value.renderStateToPng) {
+          if (gameBoardRef.value && gameBoardRef.value.renderStateToPngBlob) {
             // eslint-disable-next-line no-await-in-loop
-            const pngDataUrl = await gameBoardRef.value.renderStateToPng({
+            const png = await gameBoardRef.value.renderStateToPngBlob({
               width: normalizedGifWidthPx(),
             });
-            if (!pngDataUrl) throw new Error('Board renderer returned an empty image');
-            await writer.append(pngDataUrl, isFinalCaptureFrame
-              ? END_GAME_GIF_HOLD_SECONDS : frameDurationMs / 1000);
+            if (!png) throw new Error('Board renderer returned an empty image');
+            pendingFrames.push({
+              index: frameCount,
+              png,
+              duration: isFinalCaptureFrame ? END_GAME_GIF_HOLD_SECONDS : frameDurationMs / 1000,
+            });
             frameCount += 1;
+            if (pendingFrames.length >= GIF_EXPORT_BATCH_SIZE) {
+              // eslint-disable-next-line no-await-in-loop
+              await flushPendingFrames();
+            }
           } else {
             throw new Error('Game board is unavailable for capture');
           }
@@ -3085,6 +3295,7 @@ async function handleSaveEpisode() {
       return;
     }
     
+    await flushPendingFrames();
     episodeSaveProgress.value = `Encoding ${frameCount} frames…`;
     const res = await writer.finish();
     alert(`Episode saved to ${res.file_path}`);
@@ -3261,6 +3472,23 @@ function toggleReplayPause() {
 
 async function handlePlayAgain() {
   const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
+  const currentMultiPossessionLimit = Number(gameState.value?.multi_possession_limit);
+  const canRestartCurrentMultiPossessionGame = (
+    gameState.value?.enable_multi_possession
+    && initialSetup.value
+    && initialSetup.value.mode !== 'template_sandbox'
+    && Number.isFinite(currentMultiPossessionLimit)
+    && currentMultiPossessionLimit >= 1
+  );
+
+  // Multi-possession games already have the selected policies and a possibly
+  // prepared Fast Mode JIT kernel in memory. Reset that runtime rather than
+  // calling init_game, which would construct a fresh runtime and warm again.
+  if (canRestartCurrentMultiPossessionGame) {
+    await handleMultiPossessionLimitRequested(currentMultiPossessionLimit, { forceRestart: true });
+    return;
+  }
+
   stopSelfPlay();
   cancelReplayAnimation();
   gameState.value = null;
@@ -3314,18 +3542,54 @@ async function handlePlayAgain() {
   }
 }
 
-async function handleMultiPossessionLimitRequested(limit) {
+async function handleMultiPossessionLimitRequested(limit, { forceRestart = false } = {}) {
   if (!gameState.value?.enable_multi_possession || !initialSetup.value) return;
   const parsed = Math.trunc(Number(limit));
   if (!Number.isFinite(parsed) || parsed < 1) return;
-  if (parsed === Number(gameState.value.multi_possession_limit)) return;
+  if (!forceRestart && parsed === Number(gameState.value.multi_possession_limit)) return;
 
-  // The possession limit is static JAX environment configuration, so applying
-  // it starts a clean game with the already selected policies.
-  await handleGameStarted({
-    ...initialSetup.value,
-    multiPossessionLimit: parsed,
-  });
+  // This is an episode-length setting, not a policy or court change. Restart
+  // the current game in-place so a prepared Fast Mode JIT kernel stays warm.
+  const sessionId = ++gameSessionId;
+  const nextSetup = { ...initialSetup.value, multiPossessionLimit: parsed };
+  stopSelfPlay();
+  cancelReplayAnimation();
+  isLoading.value = true;
+  error.value = null;
+  policyProbs.value = null;
+  lastMctsResults.value = null;
+  currentSelections.value = null;
+  userSelections.value = {};
+  activePlayerId.value = null;
+  moveHistory.value = [];
+  clearEvaluationArtifacts();
+  playbookAnalysis.value = null;
+  selectedPlaybookIntent.value = null;
+  gameHistory.value = [];
+  replayStates.value = [];
+  currentStepIndex.value = 0;
+  canReplay.value = false;
+  isManualStepping.value = false;
+  clearReboundPreview();
+  try {
+    const response = await setMultiPossessionLimit(parsed);
+    if (sessionId !== gameSessionId) return;
+    if (response.status !== 'success' || !response.state) {
+      throw new Error(response.message || 'Failed to restart multi-possession game.');
+    }
+    gameState.value = response.state;
+    gameHistory.value = [cloneState(response.state)];
+    initialSetup.value = nextSetup;
+    controlsKey.value += 1;
+    applyFastKernelStatus(response.fast_kernel);
+    refreshPolicyOptions(response.state.run_id);
+  } catch (err) {
+    if (sessionId !== gameSessionId) return;
+    error.value = err.message;
+    console.error('[App] Failed to change possession limit:', err);
+  } finally {
+    if (sessionId === gameSessionId) isLoading.value = false;
+  }
 }
 
 function clearEvaluationArtifacts() {
@@ -3418,13 +3682,7 @@ function onKeydown(e) {
   }
   if (key === 'n') {
     // New Game
-    if (initialSetup.value) {
-      if (initialSetup.value.mode === 'template_sandbox') {
-        handleTemplateSandboxStarted(initialSetup.value);
-      } else {
-        handleGameStarted(initialSetup.value);
-      }
-    }
+    handlePlayAgain();
   } else if (key === 'p') {
     // Toggle Self-Play
     if (isSelfPlaying.value || selfPlayStarting.value) {
@@ -3472,6 +3730,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   stopSelfPlay();
+  stopFastSelfPlayStatusPolling();
   stopEvaluationProgressPolling();
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('keyup', onKeyup);
@@ -3498,34 +3757,6 @@ onBeforeUnmount(() => {
         <div v-if="isLoading" class="loading">Loading Game...</div>
         <div v-if="error" class="error-message">{{ error }}</div>
         
-        <div v-if="gameState" class="ai-toggle">
-          <button class="toggle-btn" @click="aiMode = !aiMode">
-            <font-awesome-icon :icon="aiMode ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">Player AI</span>
-          </button>
-          <button class="toggle-btn" @click="playerDeterministic = !playerDeterministic" :disabled="!aiMode">
-            <font-awesome-icon :icon="playerDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">Player Deterministic</span>
-          </button>
-          <button class="toggle-btn" @click="opponentDeterministic = !opponentDeterministic">
-            <font-awesome-icon :icon="opponentDeterministic ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">Opponent Deterministic</span>
-          </button>
-          <button class="toggle-btn" @click="showOpponentActions = !showOpponentActions">
-            <font-awesome-icon :icon="showOpponentActions ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">Show Opponent Actions</span>
-          </button>
-          <button
-            class="toggle-btn"
-            type="button"
-            :aria-pressed="showGhostTrails"
-            @click="showGhostTrails = !showGhostTrails"
-          >
-            <font-awesome-icon :icon="showGhostTrails ? ['fas','toggle-on'] : ['fas','toggle-off']" />
-            <span class="toggle-label">Ghost Trails</span>
-          </button>
-        </div>
-
       </div>
     </div>
 
@@ -3640,6 +3871,14 @@ onBeforeUnmount(() => {
           ref="gameBoardRef"
           :game-history="boardGameHistory" 
           :show-ghost-trails="showGhostTrails"
+          :player-ai="aiMode"
+          :player-deterministic="playerDeterministic"
+          :opponent-deterministic="opponentDeterministic"
+          :fast-self-play-mode="fastSelfPlayMode"
+          :fast-self-play-warming="fastSelfPlayWarming"
+          :fast-mode-locked="isSelfPlaying || selfPlayStarting"
+          :show-opponent-actions="showOpponentActions"
+          :show-ghost-trails-control="showGhostTrails"
           :show-episode-outcome="activeControlsTab !== 'stats'"
           :playbook-overlay="boardPlaybookOverlay"
           v-model:activePlayerId="activePlayerId"
@@ -3669,6 +3908,12 @@ onBeforeUnmount(() => {
           @update-placement="handleBoardPlacementUpdate"
           @select-shot-cell="handleReboundShotSelected"
           @adjust-shot-clock="handleShotClockAdjustment"
+          @toggle-player-ai="aiMode = !aiMode"
+          @toggle-player-deterministic="playerDeterministic = !playerDeterministic"
+          @toggle-opponent-deterministic="opponentDeterministic = !opponentDeterministic"
+          @toggle-fast-self-play="toggleFastSelfPlayMode"
+          @toggle-show-opponent-actions="showOpponentActions = !showOpponentActions"
+          @toggle-show-ghost-trails="showGhostTrails = !showGhostTrails"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
@@ -3704,6 +3949,7 @@ onBeforeUnmount(() => {
             :initial-use-mcts="persistUseMcts"
           :mcts-step-running="isMctsStepRunning"
           :ai-mode="aiMode"
+          :fast-self-play="fastSelfPlayActive"
           :deterministic="playerDeterministic"
           :opponent-deterministic="opponentDeterministic"
           :show-opponent-actions="showOpponentActions"
@@ -3778,6 +4024,23 @@ onBeforeUnmount(() => {
           >
             New Game
           </button>
+        </div>
+        <div class="self-play-speed-row">
+          <label
+            class="turn-self-play-speed-control"
+            title="Target wall-clock interval between visible self-play steps"
+          >
+            <span class="turn-self-play-speed-label">Self-Play Speed</span>
+            <input
+              v-model.number="selfPlayStepIntervalMs"
+              type="range"
+              min="0"
+              max="1000"
+              step="50"
+              aria-label="Self-play speed"
+            >
+            <span class="turn-self-play-speed-value">{{ Math.round(selfPlayStepIntervalMs) }} ms per step</span>
+          </label>
         </div>
         <div
           v-if="selfPlayStarting"
@@ -3981,7 +4244,6 @@ header {
   box-shadow: 0 20px 45px rgba(2, 6, 23, 0.45);
 }
 
-.ai-toggle,
 .eval-controls {
   display: flex;
   flex-wrap: wrap;
@@ -4185,6 +4447,40 @@ header {
   justify-content: center;
 }
 
+.self-play-speed-row {
+  display: flex;
+  justify-content: center;
+  margin-top: -0.4rem;
+}
+
+.turn-self-play-speed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  max-width: 100%;
+  padding: 0.36rem 0.7rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--app-text-muted);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.turn-self-play-speed-control input[type='range'] {
+  width: min(13rem, 34vw);
+  accent-color: var(--app-accent);
+  cursor: pointer;
+}
+
+.turn-self-play-speed-value {
+  min-width: 6.5rem;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .self-play-loading {
   display: inline-flex;
   align-items: center;
@@ -4334,6 +4630,10 @@ header {
 @media (max-width: 1260px) {
   .top-row {
     grid-template-columns: 1fr;
+  }
+
+  .turn-self-play-speed-control input[type='range'] {
+    width: min(15rem, 44vw);
   }
 }
 

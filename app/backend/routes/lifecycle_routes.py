@@ -53,6 +53,7 @@ from app.backend.schemas import (
     ListPoliciesRequest,
     MCTSAdviseRequest,
     ReboundPreviewRequest,
+    SetMultiPossessionLimitRequest,
     StartSelfPlayRequest,
     TemplateBootstrapRequest,
 )
@@ -1134,6 +1135,7 @@ async def init_game(request: InitGameRequest):
         game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
         game_state.actions_log = []
         game_state.episode_states = []
+        game_state.replay_session_id = None
         game_state.phi_log = []
         game_state.playable_session = None
         if game_state.jax_runtime is None:
@@ -1347,6 +1349,7 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
     game_state.actions_log = []
     game_state.episode_states = []
+    game_state.replay_session_id = None
     game_state.phi_log = []
     game_state.playable_session = None
     game_state.selector_segment_index = 0
@@ -1933,6 +1936,64 @@ def rebound_preview(request: ReboundPreviewRequest | None = None):
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Rebound preview failed: {err}")
+
+
+@router.post("/api/prepare_fast_self_play")
+def prepare_fast_self_play():
+    """Begin non-blocking JAX Fast Mode preparation for the current session."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None:
+        return {"ready": True, "warming": False, "error": None}
+    try:
+        return runtime.prepare_fast_mode()
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Fast Mode preparation failed: {err}")
+
+
+@router.post("/api/set_multi_possession_limit")
+def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
+    """Restart a continuous dev game at a new cap without reloading its policy."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None or not runtime.multi_possession_enabled:
+        raise HTTPException(status_code=400, detail="The possession limit is available only for multi-possession games.")
+    try:
+        runtime.set_multi_possession_limit(request.multi_possession_limit)
+        runtime.reset()
+        game_state.env = runtime.display_env
+        game_state.user_team = runtime.user_team
+        game_state.obs = runtime.observation_dict(observer_is_offense=runtime.user_team_is_a)
+        game_state.prev_obs = None
+        game_state.self_play_active = False
+        game_state.counterfactual_snapshot = None
+        game_state.frames = []
+        game_state.reward_history = []
+        game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
+        game_state.actions_log = []
+        game_state.episode_states = []
+        game_state.replay_session_id = None
+        game_state.phi_log = []
+        game_state.selector_segment_index = 0
+        game_state.selector_last_boundary_reason = None
+        runtime._capture_turn_start(game_state)
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=True,
+            include_action_values=True,
+            include_state_values=True,
+        )
+        game_state.episode_states.append(dict(state))
+        return {
+            "status": "success",
+            "state": state,
+            "fast_kernel": runtime.fast_kernel_status(),
+        }
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Could not restart multi-possession game: {err}") from err
 
 
 @router.post("/api/start_self_play")

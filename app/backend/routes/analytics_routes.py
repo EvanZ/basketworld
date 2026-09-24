@@ -8,6 +8,50 @@ from app.backend.observations import calculate_phi_from_ep_data
 router = APIRouter()
 
 
+def _validated_replay_states() -> list[dict]:
+    """Return one coherent recording, never a spliced state sequence."""
+    states = list(getattr(game_state, "episode_states", None) or [])
+    replay_session_id = getattr(game_state, "replay_session_id", None)
+    if replay_session_id:
+        states = [
+            state for state in states
+            if state.get("replay_session_id") == replay_session_id
+        ]
+
+    previous_possessions = None
+    previous_user_score = None
+    previous_ai_score = None
+    for state in states:
+        possessions = state.get("completed_possessions")
+        user_score = state.get("user_score")
+        ai_score = state.get("ai_score")
+        if (
+            previous_possessions is not None
+            and possessions is not None
+            and int(possessions) < previous_possessions
+        ):
+            raise HTTPException(status_code=409, detail="Replay recording is not a monotonic episode.")
+        if (
+            previous_user_score is not None
+            and user_score is not None
+            and float(user_score) < previous_user_score
+        ):
+            raise HTTPException(status_code=409, detail="Replay recording is not a monotonic episode.")
+        if (
+            previous_ai_score is not None
+            and ai_score is not None
+            and float(ai_score) < previous_ai_score
+        ):
+            raise HTTPException(status_code=409, detail="Replay recording is not a monotonic episode.")
+        if possessions is not None:
+            previous_possessions = int(possessions)
+        if user_score is not None:
+            previous_user_score = float(user_score)
+        if ai_score is not None:
+            previous_ai_score = float(ai_score)
+    return states
+
+
 @router.get("/api/shot_stats")
 def get_shot_stats():
     """Return raw shot log and simple aggregates to compare displayed probabilities vs outcomes."""
@@ -95,8 +139,9 @@ def replay_last_episode():
     if not game_state.env:
         raise HTTPException(status_code=400, detail="Game not initialized.")
 
-    if getattr(game_state, "episode_states", None) and len(game_state.episode_states) > 0:
-        return {"status": "success", "states": list(game_state.episode_states)}
+    states = _validated_replay_states()
+    if states:
+        return {"status": "success", "states": states}
 
     if (
         game_state.replay_seed is None

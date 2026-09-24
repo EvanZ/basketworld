@@ -189,8 +189,8 @@ export async function saveStartTemplateLibrary(path, library) {
   return response.json();
 }
 
-export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null) {
-    console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions);
+export async function stepGame(actions, playerDeterministic = null, opponentDeterministic = null, mctsOptions = null, fastMode = false, replaySessionId = null) {
+    console.log('[API] Sending step request with actions:', actions, 'playerDeterministic:', playerDeterministic, 'opponentDeterministic:', opponentDeterministic, 'mctsOptions:', mctsOptions, 'fastMode:', fastMode);
     const response = await fetch(`${API_BASE_URL}/api/step`, {
         method: 'POST',
         headers: {
@@ -200,6 +200,8 @@ export async function stepGame(actions, playerDeterministic = null, opponentDete
             actions, 
             player_deterministic: playerDeterministic,
             opponent_deterministic: opponentDeterministic,
+            replay_session_id: replaySessionId,
+            fast_mode: Boolean(fastMode),
             use_mcts: mctsOptions?.use_mcts || false,
             mcts_player_id: mctsOptions?.player_id ?? null,
             mcts_player_ids: mctsOptions?.player_ids ?? null,
@@ -360,7 +362,7 @@ export async function renderGifFromPngs(frames, durations, stepDurationMs) {
     return response.blob();
 }
 
-export async function startSelfPlay(options = null) {
+export async function startSelfPlay(options = null, fastMode = false) {
     const payload = options && typeof options === 'object'
         ? {
             template_id: options.templateId || null,
@@ -368,6 +370,7 @@ export async function startSelfPlay(options = null) {
             template_seed: options.seed ?? null,
         }
         : {};
+    payload.fast_mode = Boolean(fastMode);
     const response = await fetch(`${API_BASE_URL}/api/start_self_play`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -377,6 +380,35 @@ export async function startSelfPlay(options = null) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to start self-play' }));
         console.error('[API] startSelfPlay failed:', response.status, errorData);
         throw new Error(errorData.detail || 'Failed to start self-play');
+    }
+    return response.json();
+}
+
+export async function prepareFastSelfPlay() {
+    const response = await fetch(`${API_BASE_URL}/api/prepare_fast_self_play`, {
+        method: 'POST',
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to prepare Fast Mode' }));
+        throw new Error(errorData.detail || 'Failed to prepare Fast Mode');
+    }
+    return response.json();
+}
+
+export async function setMultiPossessionLimit(multiPossessionLimit) {
+    const response = await fetch(`${API_BASE_URL}/api/set_multi_possession_limit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ multi_possession_limit: multiPossessionLimit }),
+    });
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to restart multi-possession game' }));
+        const message = response.status === 404
+            ? 'Backend restart required: the running backend does not yet provide in-place possession restarts.'
+            : (errorData.detail || 'Failed to restart multi-possession game');
+        const error = new Error(message);
+        error.status = response.status;
+        throw error;
     }
     return response.json();
 }

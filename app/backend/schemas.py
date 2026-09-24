@@ -34,6 +34,10 @@ class InitGameRequest(BaseModel):
     multi_possession_limit: int | None = Field(default=None, ge=1)
 
 
+class SetMultiPossessionLimitRequest(BaseModel):
+    multi_possession_limit: int = Field(ge=1)
+
+
 class TemplateBootstrapRequest(BaseModel):
     run_id: str | None = None
     user_team_name: str = "OFFENSE"
@@ -96,6 +100,12 @@ class ActionRequest(BaseModel):
     actions: dict[str, object]  # Accept ints, action names, or structured payloads like {type:"PASS", target:id}.
     player_deterministic: bool | None = None
     opponent_deterministic: bool | None = None
+    # Present for browser-driven self-play. It fences an in-flight request
+    # from an earlier episode after the user starts another game.
+    replay_session_id: str | None = None
+    # Fast self-play keeps the simulation authoritative while omitting the
+    # per-step inspection payload used by the development controls.
+    fast_mode: bool = False
     use_mcts: bool | None = None
     team: str | None = None  # Optional override of training_team ("OFFENSE"/"DEFENSE")
     mcts_player_id: int | None = None
@@ -181,6 +191,7 @@ class StartSelfPlayRequest(BaseModel):
     template_id: str | None = None
     template_mirrored: bool | None = None
     template_seed: int | None = None
+    fast_mode: bool = False
 
 
 class ReplayCounterfactualRequest(BaseModel):

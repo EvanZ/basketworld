@@ -27,6 +27,7 @@ from basketworld_jax.env.minimal import (
     REBOUND_CONTEST_MODE_LOCAL,
     TEAM_A,
     TEAM_B,
+    TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INBOUND_INVALID_PASS,
     TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
@@ -1057,23 +1058,59 @@ def test_team_b_can_take_a_live_possession_before_the_first_handoff():
     )
 
 
-def test_forced_pressure_turnover_starts_a_dead_ball_inbound():
-    static = _multi_possession_static()._replace(
-        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
-        defender_pressure_turnover_chance=jnp.asarray(1.0, dtype=jnp.float32),
-        defender_pressure_decay_lambda=jnp.asarray(0.0, dtype=jnp.float32),
-    )
+def _forced_pressure_turnover_state(static, *, defender_distances: tuple[int, int] = (1, 1)):
+    """Place a Team B ball handler at the basket and two pressuring Team A defenders."""
     state = reset_batch_minimal(
         static,
         jax.random.split(jax.random.PRNGKey(11), 1),
         jax,
         jnp,
     )
-    team_b_holder = np.asarray(static.defense_ids, dtype=np.int32)[0]
-    state = state._replace(
+    team_a = np.asarray(static.offense_ids, dtype=np.int32)
+    team_b = np.asarray(static.defense_ids, dtype=np.int32)
+    holder = int(team_b[0])
+    positions = np.asarray(state.positions).copy()
+    coords = np.asarray(static.cell_coords, dtype=np.int32)
+    basket = np.asarray(static.basket_position, dtype=np.int32)
+    delta_q = coords[:, 0] - basket[0]
+    delta_r = coords[:, 1] - basket[1]
+    cell_distances = (np.abs(delta_q) + np.abs(delta_r) + np.abs(delta_q + delta_r)) // 2
+
+    positions[0, holder] = basket
+    used = {tuple(basket.tolist())}
+    for defender, distance in zip(team_a.tolist(), defender_distances, strict=True):
+        cell_idx = next(
+            int(idx)
+            for idx in np.flatnonzero(cell_distances == distance)
+            if tuple(coords[idx].tolist()) not in used
+        )
+        positions[0, defender] = coords[cell_idx]
+        used.add(tuple(coords[cell_idx].tolist()))
+    for player_id in team_b[1:].tolist():
+        cell_idx = next(
+            int(idx)
+            for idx in range(coords.shape[0])
+            if tuple(coords[idx].tolist()) not in used
+        )
+        positions[0, player_id] = coords[cell_idx]
+        used.add(tuple(coords[cell_idx].tolist()))
+
+    return state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
         offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
-        ball_holder=jnp.asarray([team_b_holder], dtype=jnp.int32),
+        starting_offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
     )
+
+
+def test_forced_pressure_turnover_becomes_a_live_steal_that_must_clear():
+    static = _multi_possession_static()._replace(
+        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
+        defender_pressure_turnover_chance=jnp.asarray(1.0, dtype=jnp.float32),
+        defender_pressure_decay_lambda=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    state = _forced_pressure_turnover_state(static)
     actions = jnp.full(
         (1, state.positions.shape[1]), ActionType.NOOP.value, dtype=jnp.int32
     )
@@ -1094,19 +1131,55 @@ def test_forced_pressure_turnover_starts_a_dead_ball_inbound():
     )
 
     assert int(np.asarray(out.turnover)[0]) == 1
+    assert int(np.asarray(out.turnover_reason)[0]) == TURNOVER_REASON_DEFENDER_PRESSURE
+    stealer = int(np.asarray(out.steal_player)[0])
+    assert stealer in set(np.asarray(static.offense_ids, dtype=np.int32).tolist())
     assert int(np.asarray(out.possession_ended)[0]) == 1
     assert int(np.asarray(out.possession_end_reason)[0]) == POSSESSION_END_TURNOVER
     assert not bool(np.asarray(out.done)[0])
     assert int(np.asarray(out.state.completed_possessions)[0]) == 1
     assert int(np.asarray(out.state.offense_team)[0]) == TEAM_A
-    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_INBOUND
-    assert int(np.asarray(out.state.inbound_team)[0]) == TEAM_A
-    inbounder = int(np.asarray(out.state.inbound_player)[0])
-    assert inbounder in set(np.asarray(static.offense_ids, dtype=np.int32).tolist())
-    assert int(np.asarray(out.state.ball_holder)[0]) == inbounder
-    assert int(np.asarray(out.state.inbound_steps_remaining)[0]) == 5
+    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_LIVE
+    assert int(np.asarray(out.state.inbound_team)[0]) == -1
+    assert int(np.asarray(out.state.inbound_player)[0]) == -1
+    assert int(np.asarray(out.state.ball_holder)[0]) == stealer
+    assert int(np.asarray(out.state.inbound_steps_remaining)[0]) == 0
     assert int(np.asarray(out.state.clearance_achieved)[0]) == 0
     assert int(np.asarray(out.clearance_event)[0]) == 0
+
+
+def test_pressure_stealer_is_sampled_from_softmax_pressure_strengths():
+    # The basket holder makes both defenders valid irrespective of direction.
+    # At distances one and two with decay ln(2), their pressure strengths are
+    # 1.0 and 0.5, so softmax(log(strength)) assigns the first defender 2/3.
+    static = _multi_possession_static()._replace(
+        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
+        defender_pressure_turnover_chance=jnp.asarray(1.0, dtype=jnp.float32),
+        defender_pressure_decay_lambda=jnp.asarray(np.log(2.0), dtype=jnp.float32),
+    )
+    single_state = _forced_pressure_turnover_state(
+        static,
+        defender_distances=(1, 2),
+    )
+    sample_count = 1024
+    state = jax.tree_util.tree_map(
+        lambda value: jnp.repeat(value, sample_count, axis=0),
+        single_state,
+    )
+    out = step_batch_minimal(
+        static,
+        state,
+        _noops(state),
+        jax.random.split(jax.random.PRNGKey(13), sample_count),
+        jax,
+        jnp,
+    )
+
+    team_a = np.asarray(static.offense_ids, dtype=np.int32)
+    stealers = np.asarray(out.steal_player, dtype=np.int32)
+    assert set(stealers.tolist()) == set(team_a.tolist())
+    nearer_share = float(np.mean(stealers == team_a[0]))
+    assert nearer_share == pytest.approx(2.0 / 3.0, abs=0.07)
 
 
 def test_rebounds_and_dead_ball_offensive_violation_have_distinct_lifecycle_transitions():
@@ -1270,7 +1343,7 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
             assert int(np.asarray(out.state.inbound_player)[0]) == -1
 
 
-def test_defensive_lane_violation_awards_same_offense_one_point_and_dead_ball_restart():
+def test_defensive_lane_violation_awards_technical_and_sideline_restart_same_possession():
     static = _multi_possession_static(illegal_defense_enabled=True)._replace(
         illegal_defense_enabled=jnp.asarray(1, dtype=jnp.int8),
         defender_guard_distance=jnp.asarray(0.0, dtype=jnp.float32),
@@ -1292,6 +1365,7 @@ def test_defensive_lane_violation_awards_same_offense_one_point_and_dead_ball_re
         offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
         starting_offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
         ball_holder=jnp.asarray([team_b_holder], dtype=jnp.int32),
+        shot_clock=jnp.asarray([7], dtype=jnp.int32),
     )
 
     out = step_batch_minimal(
@@ -1305,16 +1379,17 @@ def test_defensive_lane_violation_awards_same_offense_one_point_and_dead_ball_re
 
     assert int(np.asarray(out.defensive_lane_violation)[0]) == 1
     assert int(np.asarray(out.turnover)[0]) == 0
-    assert int(np.asarray(out.possession_ended)[0]) == 1
+    assert int(np.asarray(out.possession_ended)[0]) == 0
     assert (
         int(np.asarray(out.possession_end_reason)[0])
         == POSSESSION_END_DEFENSIVE_VIOLATION
     )
-    assert int(np.asarray(out.state.completed_possessions)[0]) == 1
+    assert int(np.asarray(out.state.completed_possessions)[0]) == 0
     assert int(np.asarray(out.state.offense_team)[0]) == TEAM_B
     assert float(np.asarray(out.state.team_a_score)[0]) == pytest.approx(0.0)
     assert float(np.asarray(out.state.team_b_score)[0]) == pytest.approx(1.0)
     assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_INBOUND
+    assert int(np.asarray(out.state.shot_clock)[0]) == 14
     assert int(np.asarray(out.state.inbound_team)[0]) == TEAM_B
     assert int(np.asarray(out.state.ball_holder)[0]) == int(
         np.asarray(out.state.inbound_player)[0]
@@ -1323,6 +1398,37 @@ def test_defensive_lane_violation_awards_same_offense_one_point_and_dead_ball_re
         int(np.asarray(out.state.inbound_reason)[0])
         == POSSESSION_END_DEFENSIVE_VIOLATION
     )
+    inbounder = int(np.asarray(out.state.inbound_player)[0])
+    inbound_position = np.asarray(out.state.positions)[0, inbounder]
+    assert any(
+        np.array_equal(inbound_position, position)
+        for position in np.asarray(static.technical_inbound_positions)
+    )
+    assert not np.array_equal(inbound_position, np.asarray(static.inbound_position))
+
+    # The one-step threshold is intentional for triggering the first call.
+    # Restore the ordinary count before exercising entry after the inbound,
+    # otherwise the unmoved defender immediately incurs a second technical.
+    resumed_static = static._replace(
+        three_second_max_steps=jnp.asarray(3, dtype=jnp.int32)
+    )
+    live_state = _complete_inbound(resumed_static, out.state, seed=31)
+    reentry_masks = np.asarray(build_action_masks_batch(resumed_static, live_state, jnp))
+    legal_moves = np.flatnonzero(
+        reentry_masks[0, inbounder, MOVE_ACTION_START:MOVE_ACTION_END]
+    )
+    assert legal_moves.size > 0
+    reentry_out = step_batch_minimal(
+        resumed_static,
+        live_state,
+        _noops(live_state).at[0, inbounder].set(
+            MOVE_ACTION_START + int(legal_moves[0])
+        ),
+        jax.random.split(jax.random.PRNGKey(32), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(reentry_out.state.inbound_player)[0]) == -1
 
 
 def test_jit_vmap_mixed_phases_both_starters_final_score_and_legacy_mode():

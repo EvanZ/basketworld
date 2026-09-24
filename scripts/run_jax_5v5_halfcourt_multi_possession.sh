@@ -10,8 +10,27 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.env/bin/python}"
-NUM_UPDATES="${NUM_UPDATES:-500}"
+NUM_UPDATES="${NUM_UPDATES:-30000}"
+if [[ -v HISTORICAL_EVAL_UPDATES ]]; then
+  HISTORICAL_EVAL_UPDATES="$HISTORICAL_EVAL_UPDATES"
+else
+  HISTORICAL_EVAL_UPDATES="100,500,2500,5000,10000,20000,30000"
+fi
+HISTORICAL_EVAL_EPISODES="${HISTORICAL_EVAL_EPISODES:-200}"
+HISTORICAL_EVAL_HORIZON="${HISTORICAL_EVAL_HORIZON:-1024}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# Additive milestone evaluation defaults to the 30K schedule below. For example:
+# HISTORICAL_EVAL_UPDATES=100,2000,5000 ./scripts/run_jax_5v5_halfcourt_multi_possession.sh
+# Set HISTORICAL_EVAL_UPDATES= explicitly to disable it for a short smoke run.
+HISTORICAL_EVAL_ARGS=()
+if [ -n "$HISTORICAL_EVAL_UPDATES" ]; then
+  HISTORICAL_EVAL_ARGS=(
+    --historical-eval-updates "$HISTORICAL_EVAL_UPDATES"
+    --historical-eval-episodes "$HISTORICAL_EVAL_EPISODES"
+    --historical-eval-horizon "$HISTORICAL_EVAL_HORIZON"
+  )
+fi
 
 # Fresh multi-possession run: no continuation checkpoint, pretrained policy,
 # or historical opponent pool. Each of the two 512-row fixed-team cohorts
@@ -110,12 +129,12 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --intent-selector-learning-rate 1e-4 \
   --intent-selector-alpha-start 0.0 \
   --intent-selector-alpha-end 1.0 \
-  --intent-selector-alpha-warmup-updates 100 \
-  --intent-selector-alpha-ramp-updates 400 \
+  --intent-selector-alpha-warmup-updates 2500 \
+  --intent-selector-alpha-ramp-updates 2500 \
   --intent-selector-eps-start 0.5 \
   --intent-selector-eps-end 0.15 \
-  --intent-selector-eps-warmup-updates 100 \
-  --intent-selector-eps-ramp-updates 400 \
+  --intent-selector-eps-warmup-updates 2500 \
+  --intent-selector-eps-ramp-updates 2500 \
   --intent-selector-value-coef 0.5 \
   --intent-selector-entropy-coef 0.03 \
   --intent-selector-usage-reg-coef 0.05 \
@@ -125,8 +144,8 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --intent-selector-min-play-steps 6 \
   --intent-diversity-enabled true \
   --intent-diversity-beta-target 0.05 \
-  --intent-diversity-warmup-updates 100 \
-  --intent-diversity-ramp-updates 400 \
+  --intent-diversity-warmup-updates 2500 \
+  --intent-diversity-ramp-updates 2500 \
   --intent-diversity-clip 2.0 \
   --intent-disc-encoder-type set_step \
   --intent-disc-hidden-dim 128 \
@@ -142,25 +161,30 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --task-reward-scale-start 0.1 \
   --task-reward-scale-end 1.0 \
   --task-reward-scale-warmup-updates 0 \
-  --task-reward-scale-ramp-updates 500 \
+  --task-reward-scale-ramp-updates 2000 \
   --enable-phi-shaping true \
   --reward-shaping-gamma 1.0 \
   --phi-beta-start 0.0 \
   --phi-beta-end 0.25 \
   --phi-beta-warmup-updates 0 \
-  --phi-beta-ramp-updates 500 \
+  --phi-beta-ramp-updates 2000 \
   --phi-blend-weight 0.0 \
   --opponent-pool-size 10 \
   --opponent-pool-beta 0.7 \
   --opponent-pool-exploration 0.30 \
   --opponent-deterministic-episode-prob-start 0.20 \
   --opponent-deterministic-episode-prob-end 0.80 \
-  --opponent-deterministic-episode-prob-ramp-updates 500 \
-  --checkpoint-every-updates 25 \
+  --opponent-deterministic-episode-prob-ramp-updates 15000 \
+  --ent-coef-start 1.0 \
+  --ent-coef-end 0.03 \
+  --ent-schedule exp \
+  --checkpoint-every-updates 250 \
   --log-every-updates 10 \
   --eval-every-updates 0 \
-  --eval-deploy-every-updates 100 \
-  --eval-deploy-batches 4 \
+  --eval-deploy-every-updates 250 \
+  --eval-deploy-batches 2 \
   --eval-deploy-horizon 1024 \
+  "${HISTORICAL_EVAL_ARGS[@]}" \
   --mlflow-experiment-name halfcourt_multi_possessions \
-  --log-mlflow
+  --log-mlflow \
+  "$@"

@@ -98,6 +98,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  fastSelfPlay: {
+    type: Boolean,
+    default: false,
+  },
   deterministic: {
     type: Boolean,
     default: true,
@@ -6716,7 +6720,7 @@ watch(() => props.gameState, async (newGameState) => {
     policyProbabilities.value = null;
   }
 
-  const allowApiFetch = !props.isManualStepping && !props.isReplaying;
+  const allowApiFetch = !props.fastSelfPlay && !props.isManualStepping && !props.isReplaying;
   const shouldFetchAIData = newGameState && (!newGameState.done || props.isManualStepping);
   const shouldFetchActionValues = shouldFetchAIData && allowApiFetch && !consumedStoredValues;
   if (shouldFetchActionValues) {

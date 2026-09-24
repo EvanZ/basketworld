@@ -49,7 +49,7 @@ function inlineStyles(source, target) {
   }
 }
 
-export async function captureBoardPng(board, { scale = 2, width: targetWidth } = {}) {
+async function renderBoardToCanvas(board, { scale = 2, width: targetWidth } = {}) {
   if (!board) throw new Error('Game board is unavailable for capture');
   await document.fonts.ready;
   const fontCss = await embeddedFontCss();
@@ -58,7 +58,7 @@ export async function captureBoardPng(board, { scale = 2, width: targetWidth } =
   // At narrow widths, the live scoreboard/legacy clock can extend beyond the
   // court container. Include their actual bounds without reflowing the board.
   const bounds = [boardRect, ...Array.from(board.querySelectorAll(
-    '.game-scoreboard, .shot-clock-wrapper, .clearance-required-banner, .shot-attempt-banner',
+    '.game-scoreboard, .shot-clock-wrapper, .clearance-required-banner, .shot-attempt-banner, .fast-mode-warming-banner',
   ), (node) => node.getBoundingClientRect()).filter((rect) => rect.width > 0 && rect.height > 0)];
   const left = Math.min(...bounds.map((rect) => rect.left));
   const top = Math.min(...bounds.map((rect) => rect.top));
@@ -116,5 +116,20 @@ export async function captureBoardPng(board, { scale = 2, width: targetWidth } =
   ctx.fillStyle = '#0a0f1e';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/png');
+  return canvas;
+}
+
+export async function captureBoardPngBlob(board, options = {}) {
+  const canvas = await renderBoardToCanvas(board, options);
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) resolve(result);
+      else reject(new Error('Could not encode game board PNG'));
+    }, 'image/png');
+  });
+  return blob;
+}
+
+export async function captureBoardPng(board, options = {}) {
+  return asDataUrl(await captureBoardPngBlob(board, options));
 }
