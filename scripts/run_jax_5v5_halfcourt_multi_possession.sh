@@ -17,7 +17,9 @@ else
   HISTORICAL_EVAL_UPDATES="100,500,2500,5000,10000,20000,30000"
 fi
 HISTORICAL_EVAL_EPISODES="${HISTORICAL_EVAL_EPISODES:-200}"
-HISTORICAL_EVAL_HORIZON="${HISTORICAL_EVAL_HORIZON:-1024}"
+HISTORICAL_EVAL_HORIZON="${HISTORICAL_EVAL_HORIZON:-2048}"
+MULTI_POSSESSION_USE_INBOUNDS="${MULTI_POSSESSION_USE_INBOUNDS:-true}"
+MADE_BASKET_RESTART_MODE="${MADE_BASKET_RESTART_MODE:-check}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Additive milestone evaluation defaults to the 30K schedule below. For example:
@@ -32,16 +34,37 @@ if [ -n "$HISTORICAL_EVAL_UPDATES" ]; then
   )
 fi
 
+# This legacy flag still controls non-made-basket dead-ball restarts. Select
+# baseline_inbound, check, or direct_handoff for made baskets with
+# MADE_BASKET_RESTART_MODE (the experiment defaults to check).
+case "${MULTI_POSSESSION_USE_INBOUNDS,,}" in
+  1|true|yes|y|on)
+    INBOUNDS_MODE_ARGS=(--multi-possession-use-inbounds)
+    ;;
+  0|false|no|n|off)
+    INBOUNDS_MODE_ARGS=(--no-multi-possession-use-inbounds)
+    ;;
+  *)
+    echo "MULTI_POSSESSION_USE_INBOUNDS must be true or false." >&2
+    exit 2
+    ;;
+esac
+
 # Fresh multi-possession run: no continuation checkpoint, pretrained policy,
 # or historical opponent pool. Each of the two 512-row fixed-team cohorts
 # contributes to one shared policy, for 1,024 total environments per update.
+# The possession quota is per team: 25 Player plus 25 AI possessions.
 exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --run-train-loop \
   --enable-multi-possession \
   --multi-possession-limit 25 \
-  --multi-possession-reward-mode win_loss \
-  --score-potential-scale 1.0 \
+  --multi-possession-reward-mode scoring_events \
+  --score-potential-scale 0.0 \
+  --game-winner-reward 5.0 \
+  "${INBOUNDS_MODE_ARGS[@]}" \
+  --made-basket-restart-mode "$MADE_BASKET_RESTART_MODE" \
   --inbound-deadline-steps 5 \
+  --check-deadline-steps 5 \
   --players 5 \
   --court-rows 9 \
   --court-cols 8 \
@@ -162,15 +185,9 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --task-reward-scale-end 1.0 \
   --task-reward-scale-warmup-updates 0 \
   --task-reward-scale-ramp-updates 2000 \
-  --enable-phi-shaping true \
-  --reward-shaping-gamma 1.0 \
-  --phi-beta-start 0.0 \
-  --phi-beta-end 0.25 \
-  --phi-beta-warmup-updates 0 \
-  --phi-beta-ramp-updates 2000 \
-  --phi-blend-weight 0.0 \
-  --opponent-pool-size 10 \
-  --opponent-pool-beta 0.7 \
+  --enable-phi-shaping false \
+  --opponent-pool-size 30 \
+  --opponent-pool-beta 0.9 \
   --opponent-pool-exploration 0.30 \
   --opponent-deterministic-episode-prob-start 0.20 \
   --opponent-deterministic-episode-prob-end 0.80 \
@@ -183,7 +200,7 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --eval-every-updates 0 \
   --eval-deploy-every-updates 250 \
   --eval-deploy-batches 2 \
-  --eval-deploy-horizon 1024 \
+  --eval-deploy-horizon 2048 \
   "${HISTORICAL_EVAL_ARGS[@]}" \
   --mlflow-experiment-name halfcourt_multi_possessions \
   --log-mlflow \

@@ -3,6 +3,7 @@ import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
 import { getShotProbability, getPassStealProbabilities, renderGifFromPngs } from '@/services/api';
 import { captureBoardPng, captureBoardPngBlob } from '@/utils/boardCapture';
 import { actionAnimationTiming, hexDistance } from '@/utils/actionAnimationTiming';
+import { basketballRotationDegrees } from '@/utils/basketballAnimation';
 import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
 
@@ -221,7 +222,11 @@ const emit = defineEmits([
 //  HEXAGON GEOMETRY — POINTY-TOP, ODD-R OFFSET  (matches Python)
 // ------------------------------------------------------------
 
-const HEX_RADIUS = 24;  // pixel radius of one hexagon corner-to-center
+const HEX_RADIUS = 36;  // pixel radius of one hexagon corner-to-center
+// The basketball artwork uses normalized unit coordinates. This one value
+// scales the body, all three seams, and their strokes everywhere it appears.
+const BASKETBALL_SCALE = 0.36;
+const BASKETBALL_RADIUS = HEX_RADIUS * BASKETBALL_SCALE;
 const SQRT3 = Math.sqrt(3);
 const HEX_HALF_WIDTH = HEX_RADIUS * SQRT3 * 0.5;
 const PASS_COS_EPS = 1e-9;
@@ -525,6 +530,17 @@ function turnoverBannerPayload(actionResults) {
   };
 }
 
+function checkViolationBannerPayload(actionResults) {
+  const checks = Array.isArray(actionResults?.checks) ? actionResults.checks : [];
+  if (!checks.some((entry) => entry?.violation)) return null;
+  return {
+    text: 'Check Violation',
+    made: false,
+    kind: 'violation',
+    reboundText: null,
+  };
+}
+
 function shotAttemptBannerPayloadForState(state) {
   const actionResults = state?.last_action_results;
   const shots = actionResults?.shots;
@@ -532,6 +548,7 @@ function shotAttemptBannerPayloadForState(state) {
     ? Object.values(shots).find((result) => result && typeof result === 'object')
     : null;
   return shotAttemptBannerPayload(firstShot, actionResults)
+    ?? checkViolationBannerPayload(actionResults)
     ?? turnoverBannerPayload(actionResults)
     ?? defensiveLaneViolationBannerPayload(actionResults);
 }
@@ -1694,6 +1711,7 @@ const reboundResultOverlay = computed(() => {
     playerId: winner.playerId,
     team: winner.team,
     color: "#fbbf24",
+    distance: reboundDistanceForState(currentGameState.value),
   };
 });
 
@@ -1769,9 +1787,14 @@ const reboundBallOutline = computed(() => {
   return {
     x: point.x,
     y: point.y,
-    radius: HEX_RADIUS * (0.55 + 0.05 * Math.sin(Math.PI * t)),
+    radius: BASKETBALL_RADIUS,
     opacity,
-    dashOffset: (1 - t) * 22,
+    rotationDeg: basketballRotationDegrees(
+      t,
+      overlay.distance,
+      'rebound',
+      overlay.end.x >= overlay.start.x ? 1 : -1,
+    ),
   };
 });
 
@@ -1968,6 +1991,23 @@ const threePointArcPath = computed(() => {
   return segs.join(' ');
 });
 
+const clearanceArcPath = computed(() => {
+  const gs = currentGameState.value;
+  const hoop = basketPosition.value;
+  if (!gs || !hoop) return '';
+  const radiusPx = (gs.three_point_distance ?? 5) * HEX_RADIUS * SQRT3;
+  if (radiusPx <= 0) return '';
+
+  const shortDist = gs.three_point_short_distance;
+  const theta = shortDist === null || shortDist === undefined
+    ? Math.PI / 2
+    : Math.asin(Math.min((shortDist * HEX_RADIUS * SQRT3) / radiusPx, 0.999));
+  const points = buildArcPoints(hoop, radiusPx, -theta, theta, 200);
+  return points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+    .join(' ');
+});
+
 const offensiveLaneHexes = computed(() => {
   const gs = currentGameState.value;
   if (!gs || !gs.offensive_three_seconds_enabled || !gs.offensive_lane_hexes) return [];
@@ -2105,7 +2145,15 @@ const multiPossessionScoreboard = computed(() => {
   const userOnOffense = state.offense_label === 'user';
   return {
     completedPossessions: Number(state.completed_possessions ?? 0),
+    userCompletedPossessions: Number(state.user_completed_possessions ?? 0),
+    aiCompletedPossessions: Number(state.ai_completed_possessions ?? 0),
     possessionLimit: Number(state.multi_possession_limit ?? 0),
+    inOvertime: state.in_overtime === true || Number(state.overtime_round ?? 0) > 0,
+    overtimeRound: Math.max(0, Number(state.overtime_round ?? 0)),
+    overtimePossessionsCompleted: Math.max(
+      0,
+      Math.min(2, Number(state.overtime_possessions_completed ?? 0)),
+    ),
     userScore: toScore(state.user_score),
     aiScore: toScore(state.ai_score),
     userHasPossession: userOnOffense,
@@ -2115,6 +2163,9 @@ const multiPossessionScoreboard = computed(() => {
     inboundActive: state.game_phase === 'awaiting_inbound',
     inboundStepsRemaining: Math.max(0, Number(state.inbound_steps_remaining ?? 0)),
     inboundDeadlineSteps: Math.max(1, Number(state.inbound_deadline_steps ?? 5)),
+    checkActive: state.game_phase === 'awaiting_check',
+    checkStepsRemaining: Math.max(0, Number(state.check_steps_remaining ?? 0)),
+    checkDeadlineSteps: Math.max(1, Number(state.check_deadline_steps ?? 5)),
   };
 });
 // This is deliberately derived from the visible state rather than latched for
@@ -2292,6 +2343,17 @@ const inboundMarker = computed(() => {
     return null;
   }
   const pos = state.inbound_position;
+  if (!Array.isArray(pos) || pos.length < 2) return null;
+  return axialToCartesian(Number(pos[0]), Number(pos[1]));
+});
+
+const checkBallMarker = computed(() => {
+  const state = currentGameState.value;
+  if (
+    !state?.enable_multi_possession
+    || state?.game_phase !== 'awaiting_check'
+  ) return null;
+  const pos = state.check_position;
   if (!Array.isArray(pos) || pos.length < 2) return null;
   return axialToCartesian(Number(pos[0]), Number(pos[1]));
 });
@@ -3431,6 +3493,7 @@ function capturePassFlashFromState(state) {
     x2: end.x,
     y2: end.y,
     durationMs: timing.durationMs,
+    distance: hexDistance(passerPos, receiverPos),
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
@@ -3529,17 +3592,20 @@ const passBallOutline = computed(() => {
   const eased = 1 - ((1 - t) * (1 - t));
   const x = flash.x1 + dx * eased;
   const y = flash.y1 + dy * eased;
-  const radius = HEX_RADIUS * (0.7 + 0.06 * Math.sin(Math.PI * t));
   const edgeFade = Math.max(0, Math.min(1, t / 0.12, (1 - t) / 0.12));
   const opacity = edgeFade * (0.6 + 0.4 * passFlashOpacity.value);
-  const dashOffset = (1 - t) * 22;
 
   return {
     x,
     y,
-    radius,
+    radius: BASKETBALL_RADIUS,
     opacity,
-    dashOffset,
+    rotationDeg: basketballRotationDegrees(
+      t,
+      flash.distance,
+      'pass',
+      dx >= 0 ? 1 : -1,
+    ),
   };
 });
 
@@ -3591,6 +3657,7 @@ function triggerPassFlash(passerId, receiverId, start, end, distance) {
     x2: end.x,
     y2: end.y,
     durationMs: timing.durationMs,
+    distance,
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
@@ -3724,6 +3791,7 @@ function captureShotFlashFromState(state) {
     color: shot.success ? '#22c55e' : '#ef4444',
     path: arc.path,
     durationMs: timing.durationMs,
+    distance: hexDistance(shooterPos, basketPos),
   };
 }
 
@@ -3843,9 +3911,9 @@ const shotBallOutline = computed(() => {
   return {
     x: point.x,
     y: point.y,
-    radius: HEX_RADIUS * (0.69 + 0.06 * Math.sin(Math.PI * t)),
+    radius: BASKETBALL_RADIUS,
     opacity,
-    dashOffset: (1 - t) * 22,
+    rotationDeg: basketballRotationDegrees(t, flash.distance, 'shot', -1),
   };
 });
 
@@ -3924,6 +3992,7 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false, distan
     color: success ? '#22c55e' : '#ef4444',
     path: arc.path,
     durationMs: timing.durationMs,
+    distance,
   };
   if (!props.disableTransitions) {
     startShotFlashClock();
@@ -4056,7 +4125,8 @@ watch(
 
     // Turnovers do not produce a shot animation, so announce them explicitly.
     // The banner stays visible briefly after the next possession begins.
-    const turnoverOrViolationBanner = turnoverBannerPayload(state.last_action_results)
+    const turnoverOrViolationBanner = checkViolationBannerPayload(state.last_action_results)
+      ?? turnoverBannerPayload(state.last_action_results)
       ?? defensiveLaneViolationBannerPayload(state.last_action_results);
     if (turnoverOrViolationBanner) {
       triggerOutcomeBanner(turnoverOrViolationBanner);
@@ -4306,6 +4376,12 @@ onBeforeUnmount(() => {
     </div>
     <svg class="board-svg" :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
       <defs>
+        <g id="basketball-glyph">
+          <circle r="1" class="basketball-glyph-fill" />
+          <path d="M -1 0 L 1 0" class="basketball-glyph-seam" />
+          <path d="M -0.48 -0.85 Q 0 -0.18 0.48 -0.85" class="basketball-glyph-seam" />
+          <path d="M -0.48 0.85 Q 0 0.18 0.48 0.85" class="basketball-glyph-seam" />
+        </g>
         <marker
           id="arrowhead-offense"
           viewBox="0 0 10 10"
@@ -4371,7 +4447,10 @@ onBeforeUnmount(() => {
           v-for="hex in courtHexPolygons"
           :key="hex.key"
           :points="hex.points"
-          :class="['court-hex', threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified']"
+          :class="[
+            'court-hex',
+            threePointQualifiedSet.has(`${hex.q},${hex.r}`) ? 'qualified' : 'unqualified',
+          ]"
         />
         <text
           v-if="props.showCoordinates"
@@ -4414,6 +4493,11 @@ onBeforeUnmount(() => {
           v-if="threePointArcPath"
           :d="threePointArcPath"
           class="three-point-arc"
+        />
+        <path
+          v-if="clearanceRequiredBannerVisible && clearanceArcPath"
+          :d="clearanceArcPath"
+          class="clearance-arc-flash"
         />
 
         <!-- Court reference labels -->
@@ -4635,6 +4719,28 @@ onBeforeUnmount(() => {
             :points="hexPointsFor(marker.x, marker.y, HEX_RADIUS * 0.82)"
             class="legal-inbound-entry"
           />
+        </g>
+
+        <!-- A check ball is loose at the protected top-of-key cell until the
+             first offensive player enters it. -->
+        <g v-if="checkBallMarker && showPlayers" class="check-ball-marker" aria-label="Check ball">
+          <use
+            href="#basketball-glyph"
+            :transform="`translate(${checkBallMarker.x} ${checkBallMarker.y}) scale(${BASKETBALL_RADIUS})`"
+            class="check-ball-glyph"
+          />
+          <circle
+            :cx="checkBallMarker.x"
+            :cy="checkBallMarker.y"
+            :r="HEX_RADIUS * 0.47"
+            class="check-ball-pulse"
+          />
+          <text
+            :x="checkBallMarker.x"
+            :y="checkBallMarker.y - HEX_RADIUS * 0.62"
+            text-anchor="middle"
+            class="inbound-label"
+          >CHECK</text>
         </g>
 
         <!-- Draw the current players on top -->
@@ -4877,6 +4983,11 @@ onBeforeUnmount(() => {
                 :r="HEX_RADIUS * 0.9"
                 class="ball-indicator"
               />
+              <use
+                href="#basketball-glyph"
+                :transform="`translate(${(draggedPlayerId === player.id ? draggedPlayerPos.x : player.x) + (HEX_RADIUS * 0.57)} ${(draggedPlayerId === player.id ? draggedPlayerPos.y : player.y) - (HEX_RADIUS * 0.57)}) scale(${BASKETBALL_RADIUS})`"
+                class="held-basketball"
+              />
             </g>
             <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
             <g 
@@ -5072,14 +5183,12 @@ onBeforeUnmount(() => {
             :stroke="reboundResultOverlay.color"
             :opacity="reboundProjectile.impactOpacity"
           />
-          <circle
+          <use
             v-if="reboundBallOutline"
-            :cx="reboundBallOutline.x"
-            :cy="reboundBallOutline.y"
-            :r="reboundBallOutline.radius"
-            class="shot-ball-outline rebound-ball-outline"
+            href="#basketball-glyph"
+            :transform="`translate(${reboundBallOutline.x} ${reboundBallOutline.y}) rotate(${reboundBallOutline.rotationDeg}) scale(${reboundBallOutline.radius})`"
+            class="flight-basketball rebound-flight-basketball"
             :opacity="reboundBallOutline.opacity"
-            :style="{ strokeDashoffset: `${reboundBallOutline.dashOffset}` }"
           />
           <g :transform="`translate(${reboundResultOverlay.end.x}, ${reboundResultOverlay.end.y})`">
             <title>Sampled rebound winner P{{ reboundResultOverlay.playerId }}</title>
@@ -5087,15 +5196,10 @@ onBeforeUnmount(() => {
               :r="HEX_RADIUS * 0.96"
               class="rebound-winner-ring"
             />
-            <circle
-              :cx="HEX_RADIUS * 0.6"
-              :cy="-HEX_RADIUS * 0.6"
-              :r="HEX_RADIUS * 0.24"
+            <use
+              href="#basketball-glyph"
+              :transform="`translate(${HEX_RADIUS * 0.6} ${-HEX_RADIUS * 0.6}) scale(${BASKETBALL_RADIUS})`"
               class="rebound-winner-ball"
-            />
-            <path
-              :d="`M ${HEX_RADIUS * 0.46} ${-HEX_RADIUS * 0.6} Q ${HEX_RADIUS * 0.6} ${-HEX_RADIUS * 0.73} ${HEX_RADIUS * 0.74} ${-HEX_RADIUS * 0.6}`"
-              class="rebound-winner-ball-seam"
             />
             <text
               :x="HEX_RADIUS * 1.1"
@@ -5163,14 +5267,12 @@ onBeforeUnmount(() => {
               :opacity="passProjectile.impactOpacity"
             />
           </template>
-          <circle
+          <use
             v-if="passBallOutline"
-            :cx="passBallOutline.x"
-            :cy="passBallOutline.y"
-            :r="passBallOutline.radius"
-            class="pass-ball-outline"
+            href="#basketball-glyph"
+            :transform="`translate(${passBallOutline.x} ${passBallOutline.y}) rotate(${passBallOutline.rotationDeg}) scale(${passBallOutline.radius})`"
+            class="flight-basketball pass-flight-basketball"
             :opacity="passBallOutline.opacity"
-            :style="{ strokeDashoffset: `${passBallOutline.dashOffset}` }"
           />
           <line
             v-if="normalizedPassAnimationStyle !== 'projectile' || !passProjectile"
@@ -5222,14 +5324,12 @@ onBeforeUnmount(() => {
             :fill="activeShotFlash.color"
             :opacity="shotProjectile.projectileOpacity"
           />
-          <circle
+          <use
             v-if="shotBallOutline"
-            :cx="shotBallOutline.x"
-            :cy="shotBallOutline.y"
-            :r="shotBallOutline.radius"
-            class="shot-ball-outline"
+            href="#basketball-glyph"
+            :transform="`translate(${shotBallOutline.x} ${shotBallOutline.y}) rotate(${shotBallOutline.rotationDeg}) scale(${shotBallOutline.radius})`"
+            class="flight-basketball shot-flight-basketball"
             :opacity="shotBallOutline.opacity"
-            :style="{ strokeDashoffset: `${shotBallOutline.dashOffset}` }"
           />
           <circle
             v-if="shotProjectile && shotProjectile.impactOpacity > 0.01"
@@ -5455,9 +5555,25 @@ onBeforeUnmount(() => {
             <span class="score-period-label">Inbound</span>
             <span class="inbound-clock-digits">{{ multiPossessionScoreboard.inboundStepsRemaining }}</span>
           </span>
+          <span
+            v-if="multiPossessionScoreboard.checkActive"
+            class="inbound-clock-readout check-clock-readout"
+            :title="`Check count: ${multiPossessionScoreboard.checkStepsRemaining} of ${multiPossessionScoreboard.checkDeadlineSteps} steps remaining`"
+            aria-live="polite"
+          >
+            <span class="score-period-label">Check</span>
+            <span class="inbound-clock-digits check-clock-digits">{{ multiPossessionScoreboard.checkStepsRemaining }}</span>
+          </span>
         </div>
         <span class="score-possession-count">
-          {{ multiPossessionScoreboard.completedPossessions }}/{{ multiPossessionScoreboard.possessionLimit }} possessions
+          <template v-if="multiPossessionScoreboard.inOvertime">
+            OT {{ multiPossessionScoreboard.overtimeRound }}
+            · {{ multiPossessionScoreboard.overtimePossessionsCompleted }}/2 possessions
+          </template>
+          <template v-else>
+            PL {{ multiPossessionScoreboard.userCompletedPossessions }}/{{ multiPossessionScoreboard.possessionLimit }}
+            · AI {{ multiPossessionScoreboard.aiCompletedPossessions }}/{{ multiPossessionScoreboard.possessionLimit }} possessions
+          </template>
         </span>
       </div>
       <div class="score-side score-side-ai" :class="{ 'has-possession': multiPossessionScoreboard.aiHasPossession }">
@@ -5921,6 +6037,10 @@ onBeforeUnmount(() => {
   line-height: 1;
   text-shadow: 0 0 5px #fbbf24, 0 0 10px #fbbf24;
 }
+.check-clock-digits {
+  color: #60a5fa;
+  text-shadow: 0 0 5px #60a5fa, 0 0 10px #60a5fa;
+}
 
 .score-possession-count {
   margin-top: 0.6em;
@@ -6259,6 +6379,24 @@ onBeforeUnmount(() => {
   /* stroke-dasharray: 4 8; */
   filter: drop-shadow(0px 0px 3px rgba(225, 244, 223, 0.6));
 }
+.clearance-arc-flash {
+  fill: none;
+  stroke: #fbbf24;
+  stroke-width: 0.34rem;
+  stroke-linecap: round;
+  pointer-events: none;
+  filter: drop-shadow(0 0 0.28rem rgba(251, 191, 36, 0.95));
+  animation: clearance-arc-pulse 0.85s ease-in-out infinite alternate;
+}
+
+@keyframes clearance-arc-pulse {
+  from {
+    opacity: 0.45;
+  }
+  to {
+    opacity: 1;
+  }
+}
 .inbound-context-layer {
   pointer-events: none;
 }
@@ -6282,6 +6420,48 @@ onBeforeUnmount(() => {
   stroke: #4ade80;
   stroke-width: 2;
   stroke-dasharray: 4 3;
+}
+.check-ball-marker {
+  pointer-events: none;
+}
+.basketball-glyph-fill {
+  fill: #f97316;
+  stroke: #fed7aa;
+  stroke-width: 0.09;
+}
+.basketball-glyph-seam {
+  fill: none;
+  stroke: #7c2d12;
+  stroke-width: 0.085;
+  stroke-linecap: round;
+}
+.check-ball-glyph,
+.held-basketball,
+.flight-basketball,
+.rebound-winner-ball {
+  pointer-events: none;
+  filter: drop-shadow(0 0 5px rgba(249, 115, 22, 0.78));
+}
+.held-basketball {
+  filter:
+    drop-shadow(0 0 2px rgba(255, 247, 237, 0.88))
+    drop-shadow(0 0 5px rgba(249, 115, 22, 0.78));
+}
+.flight-basketball {
+  filter:
+    drop-shadow(0 0 2px rgba(255, 247, 237, 0.92))
+    drop-shadow(0 0 7px rgba(249, 115, 22, 0.92));
+}
+.check-ball-pulse {
+  fill: none;
+  stroke: #60a5fa;
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+  animation: check-ball-pulse 0.8s ease-in-out infinite alternate;
+}
+@keyframes check-ball-pulse {
+  from { opacity: 0.35; }
+  to { opacity: 1; }
 }
 .offensive-lane {
   fill: rgba(218, 3, 68, 0.631);
@@ -6749,11 +6929,7 @@ onBeforeUnmount(() => {
   stroke-width: 1.1px;
 }
 
-.rebound-flight-ball,
 .rebound-winner-ball {
-  fill: #f97316;
-  stroke: #fff7ed;
-  stroke-width: 1.2px;
   filter: drop-shadow(0 0 5px rgba(249, 115, 22, 0.78));
 }
 
@@ -6764,13 +6940,6 @@ onBeforeUnmount(() => {
   stroke-dasharray: 5 6;
   filter: drop-shadow(0 0 7px rgba(249, 115, 22, 0.65));
   animation: rebound-winner-pulse 1.15s ease-in-out infinite;
-}
-
-.rebound-winner-ball-seam {
-  fill: none;
-  stroke: rgba(124, 45, 18, 0.72);
-  stroke-width: 1px;
-  stroke-linecap: round;
 }
 
 .rebound-winner-label {
@@ -7035,14 +7204,6 @@ onBeforeUnmount(() => {
   stroke-width: 3;
 }
 
-.pass-ball-outline {
-  fill: none;
-  stroke: #ffa500;
-  stroke-width: 4.2;
-  stroke-dasharray: 8 6;
-  stroke-linecap: round;
-}
-
 .pass-flash-text {
   font-size: 18px;
   font-weight: 800;
@@ -7104,14 +7265,6 @@ onBeforeUnmount(() => {
 
 .shot-projectile-head {
   stroke: none;
-}
-
-.shot-ball-outline {
-  fill: none;
-  stroke: #ffa500;
-  stroke-width: 4.2;
-  stroke-dasharray: 8 6;
-  stroke-linecap: round;
 }
 
 .shot-projectile-impact {

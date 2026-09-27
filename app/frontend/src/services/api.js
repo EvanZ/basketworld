@@ -395,11 +395,20 @@ export async function prepareFastSelfPlay() {
     return response.json();
 }
 
-export async function setMultiPossessionLimit(multiPossessionLimit) {
+export async function setMultiPossessionLimit(
+    multiPossessionLimit,
+    madeBasketRestartMode = null,
+    checkDeadlineSteps = null,
+) {
+    const payload = { multi_possession_limit: multiPossessionLimit };
+    if (madeBasketRestartMode) payload.made_basket_restart_mode = madeBasketRestartMode;
+    if (checkDeadlineSteps !== null && checkDeadlineSteps !== undefined) {
+        payload.check_deadline_steps = checkDeadlineSteps;
+    }
     const response = await fetch(`${API_BASE_URL}/api/set_multi_possession_limit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ multi_possession_limit: multiPossessionLimit }),
+        body: JSON.stringify(payload),
     });
     if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Failed to restart multi-possession game' }));

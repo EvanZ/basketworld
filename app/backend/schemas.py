@@ -36,6 +36,12 @@ class InitGameRequest(BaseModel):
 
 class SetMultiPossessionLimitRequest(BaseModel):
     multi_possession_limit: int = Field(ge=1)
+    made_basket_restart_mode: Literal[
+        "baseline_inbound",
+        "check",
+        "direct_handoff",
+    ] | None = None
+    check_deadline_steps: int | None = Field(default=None, ge=1)
 
 
 class TemplateBootstrapRequest(BaseModel):

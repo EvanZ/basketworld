@@ -13,13 +13,18 @@ from basketworld_jax.train.runtime import (
     summarize_completed_possession_pace,
 )
 from basketworld_jax.env.minimal import (
+    GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_LIVE,
     MOVE_ACTION_START,
     MOVE_ACTION_END,
+    MULTI_POSSESSION_REWARD_SCORING_EVENTS,
+    MADE_BASKET_RESTART_BASELINE_INBOUND,
+    MADE_BASKET_RESTART_CHECK,
     PASS_ACTION_START,
     PASS_ACTION_END,
     POSSESSION_END_INBOUND_VIOLATION,
+    POSSESSION_END_CHECK_VIOLATION,
     POSSESSION_END_DEFENSIVE_REBOUND,
     POSSESSION_END_DEFENSIVE_VIOLATION,
     POSSESSION_END_MADE_BASKET,
@@ -32,8 +37,11 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
     _select_inbounder_single,
+    _prepare_check_positions_single,
     build_action_masks_batch,
     build_kernel_static_from_env,
+    build_spatial_diagnostics_batch,
+    build_token_observation_components_batch,
     build_turnover_probabilities_batch,
     reset_batch_minimal,
     step_batch_minimal,
@@ -46,14 +54,23 @@ def _multi_possession_static(
     possession_limit: int = 2,
     illegal_defense_enabled: bool = False,
     offensive_three_seconds_enabled: bool = False,
+    court_rows: int | None = None,
+    court_cols: int | None = None,
+    three_point_distance: float = 4.0,
+    three_point_short_distance: float | None = None,
 ):
     env = HexagonBasketballEnv(
         players=players,
         render_mode=None,
+        court_rows=court_rows,
+        court_cols=court_cols,
         pass_mode="pointer_targeted",
         allow_dunks=False,
+        three_point_distance=three_point_distance,
+        three_point_short_distance=three_point_short_distance,
         layup_pct=1.0,
         three_pt_pct=1.0,
+        three_pt_extra_hex_decay=0.0,
         dunk_pct=1.0,
         shot_pressure_enabled=False,
         defender_pressure_turnover_chance=0.0,
@@ -116,6 +133,41 @@ def _inbound_state(
     )
 
 
+def test_spatial_diagnostics_follow_active_roles_and_mark_corner_zone():
+    static = _multi_possession_static(players=2)
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(41), 1),
+        jax,
+        jnp,
+    )
+    cells = np.asarray(static.cell_coords, dtype=np.int32)
+    corner_index = int(np.flatnonzero(np.asarray(static.corner_cell_mask))[0])
+    spread_indices = np.linspace(0, len(cells) - 1, num=2, dtype=np.int32)
+    compact_team_a = np.repeat(cells[corner_index][None, :], repeats=2, axis=0)
+    spread_team_b = cells[spread_indices]
+    positions = jnp.asarray(
+        np.concatenate([compact_team_a, spread_team_b], axis=0)[None, :, :],
+        dtype=jnp.int32,
+    )
+
+    team_a_offense = state._replace(
+        positions=positions,
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+    )
+    team_a_metrics = build_spatial_diagnostics_batch(static, team_a_offense, jnp)
+    assert float(team_a_metrics["spatial_offense_teammate_pair_distance"][0]) == 0.0
+    assert float(team_a_metrics["spatial_defense_teammate_pair_distance"][0]) > 0.0
+    assert float(team_a_metrics["spatial_corner_player_fraction"][0]) >= 0.5
+
+    team_b_offense = team_a_offense._replace(
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+    )
+    team_b_metrics = build_spatial_diagnostics_batch(static, team_b_offense, jnp)
+    assert float(team_b_metrics["spatial_offense_teammate_pair_distance"][0]) > 0.0
+    assert float(team_b_metrics["spatial_defense_teammate_pair_distance"][0]) == 0.0
+
+
 def test_tied_closest_inbounders_are_selected_by_seeded_random_draw():
     static = _multi_possession_static()
     receiving_ids = np.asarray(static.offense_ids, dtype=np.int32)
@@ -151,6 +203,16 @@ def test_tied_closest_inbounders_are_selected_by_seeded_random_draw():
 def test_multi_possession_cli_validates_limit_and_disables_start_templates():
     assert parse_args(["--enable-multi-possession"]).multi_possession_limit == 25
     assert parse_args(["--enable-multi-possession"]).inbound_deadline_steps == 5
+    assert parse_args(["--enable-multi-possession"]).check_deadline_steps == 5
+    assert (
+        parse_args(["--enable-multi-possession"]).made_basket_restart_mode
+        == "baseline_inbound"
+    )
+    assert parse_args(["--enable-multi-possession"]).game_winner_reward == pytest.approx(0.0)
+    assert parse_args(["--enable-multi-possession"]).multi_possession_use_inbounds
+    assert not parse_args(
+        ["--enable-multi-possession", "--no-multi-possession-use-inbounds"]
+    ).multi_possession_use_inbounds
     args = parse_args(["--enable-multi-possession", "--multi-possession-limit", "25"])
     assert args.enable_multi_possession is True
     assert args.multi_possession_limit == 25
@@ -169,6 +231,14 @@ def test_multi_possession_cli_validates_limit_and_disables_start_templates():
     with pytest.raises(SystemExit, match="inbound-deadline-steps"):
         validate_train_args(
             parse_args(["--enable-multi-possession", "--inbound-deadline-steps", "0"])
+        )
+    with pytest.raises(SystemExit, match="check-deadline-steps"):
+        validate_train_args(
+            parse_args(["--enable-multi-possession", "--check-deadline-steps", "0"])
+        )
+    with pytest.raises(SystemExit, match="game-winner-reward"):
+        validate_train_args(
+            parse_args(["--enable-multi-possession", "--game-winner-reward", "-1"])
         )
 
 
@@ -194,6 +264,199 @@ def _noops(state):
         ActionType.NOOP.value,
         dtype=jnp.int32,
     )
+
+
+def _check_state(static, *, countdown: int = 5, seed: int = 310):
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(seed), 1),
+        jax,
+        jnp,
+    )
+    cells = np.asarray(static.cell_coords, dtype=np.int32)
+    check = np.asarray(static.check_position, dtype=np.int32)
+    directions = np.asarray(static.hex_directions, dtype=np.int32)
+    entry_direction = next(
+        idx
+        for idx, direction in enumerate(directions)
+        if np.any(np.all(cells == (check - direction)[None, :], axis=1))
+    )
+    entry = check - directions[entry_direction]
+    positions = np.asarray(state.positions, dtype=np.int32).copy()
+    offense_player = int(np.asarray(static.offense_ids, dtype=np.int32)[0])
+    positions[0, offense_player] = entry
+    occupied = {tuple(entry.tolist()), tuple(check.tolist())}
+    cursor = 0
+    for player_id in range(positions.shape[1]):
+        if player_id == offense_player:
+            continue
+        while tuple(cells[cursor].tolist()) in occupied:
+            cursor += 1
+        positions[0, player_id] = cells[cursor]
+        occupied.add(tuple(cells[cursor].tolist()))
+        cursor += 1
+    return (
+        state._replace(
+            positions=jnp.asarray(positions, dtype=jnp.int32),
+            ball_holder=jnp.asarray([-1], dtype=jnp.int32),
+            offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+            game_phase=jnp.asarray([GAME_PHASE_AWAITING_CHECK], dtype=jnp.int8),
+            check_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+            check_steps_remaining=jnp.asarray([countdown], dtype=jnp.int32),
+            check_steps_elapsed=jnp.asarray([0], dtype=jnp.int32),
+            clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
+        ),
+        offense_player,
+        MOVE_ACTION_START + entry_direction,
+    )
+
+
+@pytest.mark.parametrize("countdown", [5, 1])
+def test_check_pickup_succeeds_and_final_step_wins_over_timeout(countdown):
+    static = _multi_possession_static()._replace(
+        made_basket_restart_mode=jnp.asarray(
+            MADE_BASKET_RESTART_CHECK,
+            dtype=jnp.int8,
+        ),
+        check_deadline_steps=jnp.asarray(5, dtype=jnp.int32),
+    )
+    state, pickup_player, move_action = _check_state(static, countdown=countdown)
+    actions = _noops(state).at[0, pickup_player].set(move_action)
+    out = step_batch_minimal(
+        static,
+        state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(311 + countdown), 1),
+        jax,
+        jnp,
+    )
+
+    assert int(np.asarray(out.check_pickup)[0]) == 1
+    assert int(np.asarray(out.check_violation)[0]) == 0
+    assert int(np.asarray(out.state.ball_holder)[0]) == pickup_player
+    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_LIVE
+    assert int(np.asarray(out.state.clearance_achieved)[0]) == 1
+    assert int(np.asarray(out.state.shot_clock)[0]) == int(np.asarray(state.shot_clock)[0])
+
+
+def test_defense_cannot_enter_check_cell_and_timeout_starts_opponent_check():
+    static = _multi_possession_static()._replace(
+        made_basket_restart_mode=jnp.asarray(MADE_BASKET_RESTART_CHECK, dtype=jnp.int8),
+        check_deadline_steps=jnp.asarray(1, dtype=jnp.int32),
+    )
+    state, pickup_player, move_action = _check_state(static, countdown=1)
+    check = np.asarray(static.check_position, dtype=np.int32)
+    direction = np.asarray(static.hex_directions, dtype=np.int32)[move_action - MOVE_ACTION_START]
+    defender = int(np.asarray(static.defense_ids, dtype=np.int32)[0])
+    positions = np.asarray(state.positions, dtype=np.int32).copy()
+    positions[0, defender] = check - direction
+    occupied_without_pickup = {
+        tuple(position.tolist())
+        for player_id, position in enumerate(positions[0])
+        if player_id != pickup_player
+    }
+    replacement = next(
+        cell
+        for cell in np.asarray(static.cell_coords, dtype=np.int32)
+        if tuple(cell.tolist()) not in occupied_without_pickup
+        and not np.array_equal(cell, check)
+    )
+    positions[0, pickup_player] = replacement
+    state = state._replace(positions=jnp.asarray(positions, dtype=jnp.int32))
+    masks = np.asarray(build_action_masks_batch(static, state, jnp), dtype=np.int8)
+    assert masks[0, defender, move_action] == 0
+
+    actions = _noops(state).at[0, defender].set(move_action)
+    out = step_batch_minimal(
+        static,
+        state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(320), 1),
+        jax,
+        jnp,
+    )
+    assert not np.array_equal(np.asarray(out.state.positions)[0, defender], check)
+    assert int(np.asarray(out.check_violation)[0]) == 1
+    assert int(np.asarray(out.possession_end_reason)[0]) == POSSESSION_END_CHECK_VIOLATION
+    assert int(np.asarray(out.state.offense_team)[0]) == TEAM_B
+    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_CHECK
+    assert int(np.asarray(out.state.ball_holder)[0]) == -1
+    assert int(np.asarray(out.check_opportunity)[0]) == 1
+
+
+def test_check_transition_relocates_occupied_check_cell_with_seeded_tie_break():
+    static = _multi_possession_static()
+    state, occupant, _ = _check_state(static)
+    positions = np.asarray(state.positions, dtype=np.int32).copy()
+    positions[0, occupant] = np.asarray(static.check_position, dtype=np.int32)
+    state = state._replace(positions=jnp.asarray(positions, dtype=jnp.int32))
+    relocated = _prepare_check_positions_single(
+        static,
+        jax.tree_util.tree_map(lambda value: value[0], state),
+        jax.random.PRNGKey(321),
+        jax,
+        jnp,
+    )
+    assert not np.array_equal(np.asarray(relocated)[occupant], np.asarray(static.check_position))
+
+
+def test_baseline_inbound_remains_default_made_basket_restart():
+    static = _multi_possession_static()
+    assert int(np.asarray(static.made_basket_restart_mode)) == MADE_BASKET_RESTART_BASELINE_INBOUND
+
+
+def test_made_basket_enters_configured_check_phase_with_full_frozen_clock():
+    static = _multi_possession_static(possession_limit=2)._replace(
+        made_basket_restart_mode=jnp.asarray(MADE_BASKET_RESTART_CHECK, dtype=jnp.int8),
+        check_deadline_steps=jnp.asarray(5, dtype=jnp.int32),
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(322), 1),
+        jax,
+        jnp,
+    )._replace(
+        layup_pct=jnp.ones((1, 4), dtype=jnp.float32),
+        three_pt_pct=jnp.ones((1, 4), dtype=jnp.float32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+    )
+    prior_offense = int(np.asarray(state.offense_team)[0])
+    out = _shoot(static, state, seed=323)
+
+    assert int(np.asarray(out.shot_success)[0]) == 1
+    assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_CHECK
+    assert int(np.asarray(out.state.offense_team)[0]) == 1 - prior_offense
+    assert int(np.asarray(out.state.ball_holder)[0]) == -1
+    assert int(np.asarray(out.state.check_steps_remaining)[0]) == 5
+    assert int(np.asarray(out.state.shot_clock)[0]) == 24
+    assert int(np.asarray(out.check_opportunity)[0]) == 1
+    assert not np.any(
+        np.all(
+            np.asarray(out.state.positions)[0]
+            == np.asarray(static.check_position)[None, :],
+            axis=-1,
+        )
+    )
+
+
+def test_check_observation_encodes_loose_ball_phase_clock_and_distance():
+    static = _multi_possession_static()._replace(
+        made_basket_restart_mode=jnp.asarray(MADE_BASKET_RESTART_CHECK, dtype=jnp.int8),
+        check_deadline_steps=jnp.asarray(5, dtype=jnp.int32),
+    )
+    state, _, _ = _check_state(static, countdown=3)
+    players, globals_vec, _ = build_token_observation_components_batch(
+        static,
+        state,
+        jnp.asarray([1.0], dtype=jnp.float32),
+        jnp,
+        multi_possession_features=True,
+    )
+
+    assert float(np.asarray(globals_vec)[0, -2]) == pytest.approx(2.0)
+    assert float(np.asarray(globals_vec)[0, -1]) == pytest.approx(3.0 / 5.0)
+    assert np.all(np.asarray(players)[0, :, 3] == 0.0)
+    assert np.any(np.asarray(players)[0, :, 11] > 0.0)
 
 
 def _complete_inbound(static, state, seed: int):
@@ -875,7 +1138,8 @@ def test_multi_possession_reset_samples_independent_shooting_skills_for_both_tea
 
 
 def test_multi_possession_reset_is_neutral_before_the_jump_ball_and_handoffs_after_terminal_shot():
-    static = _multi_possession_static()
+    # One completed possession per team means two total possession endings.
+    static = _multi_possession_static(possession_limit=1)
     reset_keys = jax.random.split(jax.random.PRNGKey(17), 4)
     state = reset_batch_minimal(
         static,
@@ -1010,8 +1274,17 @@ def test_multi_possession_reset_is_neutral_before_the_jump_ball_and_handoffs_aft
     final_out = _shoot(static, resumed, seed=4)
 
     assert np.all(np.asarray(final_out.possession_ended, dtype=np.int8) == 1)
-    assert np.all(np.asarray(final_out.done, dtype=bool))
-    assert np.all(np.asarray(final_out.state.episode_ended, dtype=np.int8) == 1)
+    tied = np.asarray(final_out.state.team_a_score) == np.asarray(
+        final_out.state.team_b_score
+    )
+    np.testing.assert_array_equal(np.asarray(final_out.done, dtype=bool), ~tied)
+    np.testing.assert_array_equal(
+        np.asarray(final_out.state.episode_ended, dtype=bool), ~tied
+    )
+    np.testing.assert_array_equal(
+        np.asarray(final_out.state.overtime_round, dtype=np.int32),
+        tied.astype(np.int32),
+    )
     assert np.all(
         np.asarray(final_out.state.completed_possessions, dtype=np.int32) == 2
     )
@@ -1021,6 +1294,104 @@ def test_multi_possession_reset_is_neutral_before_the_jump_ball_and_handoffs_aft
     assert np.all(
         np.asarray(final_out.state.team_b_score) >= np.asarray(out.state.team_b_score)
     )
+
+
+def test_no_inbounds_ablation_directly_handoffs_dead_ball_restarts_to_receiving_team():
+    sample_count = 128
+    static = _multi_possession_static()._replace(
+        multi_possession_use_inbounds=jnp.asarray(0, dtype=jnp.int8)
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(201), sample_count),
+        jax,
+        jnp,
+    )
+    team_a_holder = int(np.asarray(static.offense_ids, dtype=np.int32)[0])
+    state = state._replace(
+        offense_team=jnp.full((sample_count,), TEAM_A, dtype=jnp.int8),
+        starting_offense_team=jnp.full((sample_count,), TEAM_A, dtype=jnp.int8),
+        ball_holder=jnp.full((sample_count,), team_a_holder, dtype=jnp.int32),
+        layup_pct=jnp.ones_like(state.layup_pct),
+        three_pt_pct=jnp.ones_like(state.three_pt_pct),
+        dunk_pct=jnp.ones_like(state.dunk_pct),
+        clearance_achieved=jnp.ones_like(state.clearance_achieved),
+    )
+    positions_before = np.asarray(state.positions).copy()
+
+    out = _shoot(static, state, seed=202)
+
+    assert np.all(np.asarray(out.possession_ended, dtype=np.int8) == 1)
+    made_mask = (
+        np.asarray(out.possession_end_reason, dtype=np.int32)
+        == POSSESSION_END_MADE_BASKET
+    )
+    # Some initial cells are forced into a terminal miss by the shot geometry;
+    # use the many made-basket rows to isolate the dead-ball transition.
+    assert int(made_mask.sum()) >= sample_count // 2
+    assert np.all(np.asarray(out.state.offense_team, dtype=np.int8)[made_mask] == TEAM_B)
+    assert np.all(
+        np.asarray(out.state.game_phase, dtype=np.int8)[made_mask] == GAME_PHASE_LIVE
+    )
+    assert np.all(np.asarray(out.state.inbound_team, dtype=np.int8)[made_mask] == -1)
+    assert np.all(np.asarray(out.state.inbound_player, dtype=np.int32)[made_mask] == -1)
+    assert np.all(
+        np.asarray(out.state.inbound_steps_remaining, dtype=np.int32)[made_mask] == 0
+    )
+    assert np.all(np.asarray(out.state.shot_clock, dtype=np.int32)[made_mask] == 24)
+    np.testing.assert_array_equal(
+        np.asarray(out.state.positions)[made_mask], positions_before[made_mask]
+    )
+
+    receiving_ids = np.asarray(static.defense_ids, dtype=np.int32)
+    holders = np.asarray(out.state.ball_holder, dtype=np.int32)[made_mask]
+    assert set(holders.tolist()).issubset(set(receiving_ids.tolist()))
+    # The handoff is intentionally uniform rather than roster-order based.
+    first_receiver_share = float(np.mean(holders == receiving_ids[0]))
+    assert first_receiver_share == pytest.approx(0.5, abs=0.15)
+    cell_indices = {
+        tuple(cell): index
+        for index, cell in enumerate(np.asarray(static.cell_coords, dtype=np.int32))
+    }
+    expected_clearance = np.asarray(
+        [
+            static.three_point_by_cell[
+                cell_indices[tuple(row[holder])]
+            ]
+            for row, holder in zip(
+                np.asarray(out.state.positions)[made_mask],
+                holders,
+                strict=True,
+            )
+        ],
+        dtype=np.int8,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out.state.clearance_achieved, dtype=np.int8)[made_mask],
+        expected_clearance,
+    )
+
+    # The same no-inbounds rule applies to ordinary dead-ball turnovers while
+    # retaining every player's existing location.
+    turnover_state = state._replace(
+        shot_clock=jnp.ones_like(state.shot_clock),
+    )
+    turnover_positions = np.asarray(turnover_state.positions).copy()
+    turnover_out = step_batch_minimal(
+        static,
+        turnover_state,
+        _noops(turnover_state),
+        jax.random.split(jax.random.PRNGKey(203), sample_count),
+        jax,
+        jnp,
+    )
+    assert np.all(np.asarray(turnover_out.turnover, dtype=np.int8) == 1)
+    assert np.all(np.asarray(turnover_out.state.game_phase, dtype=np.int8) == GAME_PHASE_LIVE)
+    assert np.all(np.asarray(turnover_out.state.inbound_player, dtype=np.int32) == -1)
+    assert set(np.asarray(turnover_out.state.ball_holder, dtype=np.int32).tolist()).issubset(
+        set(receiving_ids.tolist())
+    )
+    np.testing.assert_array_equal(np.asarray(turnover_out.state.positions), turnover_positions)
 
 
 def test_team_b_can_take_a_live_possession_before_the_first_handoff():
@@ -1269,6 +1640,9 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
         offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
         starting_offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
         ball_holder=jnp.asarray([team_a_holder], dtype=jnp.int32),
+        # Keep the completed regulation game out of overtime; this test is
+        # about stable-roster role switches and score bookkeeping.
+        team_a_score=jnp.asarray([100.0], dtype=jnp.float32),
         layup_pct=jnp.ones_like(state.layup_pct),
         three_pt_pct=jnp.ones_like(state.three_pt_pct),
         dunk_pct=jnp.ones_like(state.dunk_pct),
@@ -1283,9 +1657,9 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
     )
     assert stable_roster == list(range(state.positions.shape[1]))
 
-    expected_team_a_score = 0.0
+    expected_team_a_score = 100.0
     expected_team_b_score = 0.0
-    for possession_number, seed in enumerate((26, 27, 28), start=1):
+    for possession_number, seed in enumerate((26, 27, 28, 29, 30, 31), start=1):
         prior_offense_team = int(np.asarray(state.offense_team)[0])
         prior_positions = np.asarray(state.positions).copy()
         out = _shoot(static, state, seed=seed)
@@ -1301,7 +1675,7 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
         assert int(np.asarray(out.state.completed_possessions)[0]) == possession_number
         assert int(np.asarray(out.state.offense_team)[0]) == 1 - prior_offense_team
         boundary_positions = np.asarray(out.state.positions)
-        if possession_number < 3:
+        if possession_number < 6:
             inbounder = int(np.asarray(out.state.inbound_player)[0])
             other_players = np.arange(boundary_positions.shape[1]) != inbounder
             np.testing.assert_array_equal(
@@ -1327,7 +1701,7 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
             expected_team_b_score
         )
 
-        if possession_number < 3:
+        if possession_number < 6:
             assert not bool(np.asarray(out.done)[0])
             assert (
                 int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_AWAITING_INBOUND
@@ -1341,6 +1715,242 @@ def test_repeated_role_switches_preserve_fixed_teams_attributes_scores_and_final
             assert int(np.asarray(out.state.game_phase)[0]) == GAME_PHASE_LIVE
             assert int(np.asarray(out.state.inbound_team)[0]) == -1
             assert int(np.asarray(out.state.inbound_player)[0]) == -1
+
+    assert int(np.asarray(out.state.team_a_completed_possessions)[0]) == 3
+    assert int(np.asarray(out.state.team_b_completed_possessions)[0]) == 3
+    assert int(np.asarray(out.state.completed_possessions)[0]) == 6
+
+
+def test_clearance_requires_the_curved_arc_not_short_corner_three_point_cells():
+    static = _multi_possession_static(
+        players=2,
+        possession_limit=1,
+        court_rows=9,
+        court_cols=8,
+        three_point_distance=4.25,
+        three_point_short_distance=3.0,
+    )
+    three_mask = np.asarray(static.three_point_by_cell, dtype=np.int8)
+    clearance_mask = np.asarray(static.clearance_by_cell, dtype=np.int8)
+    short_corner_indices = np.flatnonzero((three_mask == 1) & (clearance_mask == 0))
+    curved_arc_indices = np.flatnonzero(clearance_mask == 1)
+    assert short_corner_indices.size > 0
+    assert curved_arc_indices.size > 0
+
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(119), 1),
+        jax,
+        jnp,
+    )
+    holder = int(np.asarray(static.offense_ids)[0])
+    positions = np.asarray(state.positions).copy()
+    positions[0, holder] = np.asarray(static.cell_coords)[short_corner_indices[0]]
+    short_corner_state = state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
+    )
+    short_corner_out = step_batch_minimal(
+        static,
+        short_corner_state,
+        _noops(short_corner_state),
+        jax.random.split(jax.random.PRNGKey(120), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(short_corner_out.state.clearance_achieved)[0]) == 0
+
+    positions[0, holder] = np.asarray(static.cell_coords)[curved_arc_indices[0]]
+    curved_arc_state = short_corner_state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32)
+    )
+    curved_arc_out = step_batch_minimal(
+        static,
+        curved_arc_state,
+        _noops(curved_arc_state),
+        jax.random.split(jax.random.PRNGKey(121), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(curved_arc_out.state.clearance_achieved)[0]) == 1
+
+
+def _tied_regulation_boundary_state(static, *, seed: int):
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(seed), 1),
+        jax,
+        jnp,
+    )
+    holder = int(np.asarray(static.defense_ids)[0])
+    positions = np.asarray(state.positions).copy()
+    positions[0, holder] = np.asarray(static.basket_position)
+    return state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        starting_offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        team_a_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([0], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        team_a_score=jnp.asarray([2.0], dtype=jnp.float32),
+        team_b_score=jnp.asarray([0.0], dtype=jnp.float32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+        layup_pct=jnp.ones_like(state.layup_pct),
+        three_pt_pct=jnp.ones_like(state.three_pt_pct),
+        dunk_pct=jnp.ones_like(state.dunk_pct),
+    )
+
+
+def test_paired_overtime_waits_for_both_possessions_and_emits_one_winner_bonus():
+    static = _multi_possession_static(possession_limit=1)._replace(
+        multi_possession_use_inbounds=jnp.asarray(0, dtype=jnp.int8),
+        multi_possession_reward_mode=jnp.asarray(
+            MULTI_POSSESSION_REWARD_SCORING_EVENTS, dtype=jnp.int32
+        ),
+        game_winner_reward=jnp.asarray(5.0, dtype=jnp.float32),
+    )
+    regulation = _shoot(
+        static,
+        _tied_regulation_boundary_state(static, seed=122),
+        seed=123,
+    )
+    assert not bool(np.asarray(regulation.done)[0])
+    assert int(np.asarray(regulation.state.overtime_round)[0]) == 1
+    assert int(np.asarray(regulation.state.overtime_possessions_completed)[0]) == 0
+    assert int(np.asarray(regulation.state.offense_team)[0]) == TEAM_A
+    np.testing.assert_array_equal(np.asarray(regulation.winner_reward), 0.0)
+
+    first_holder = int(np.asarray(regulation.state.ball_holder)[0])
+    first_positions = np.asarray(regulation.state.positions).copy()
+    first_positions[0, first_holder] = np.asarray(static.basket_position)
+    first_overtime = _shoot(
+        static,
+        regulation.state._replace(
+            positions=jnp.asarray(first_positions, dtype=jnp.int32),
+            clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+            layup_pct=jnp.ones_like(regulation.state.layup_pct),
+        ),
+        seed=124,
+    )
+    assert not bool(np.asarray(first_overtime.done)[0])
+    assert int(np.asarray(first_overtime.state.overtime_possessions_completed)[0]) == 1
+    assert int(np.asarray(first_overtime.state.offense_team)[0]) == TEAM_B
+    np.testing.assert_array_equal(np.asarray(first_overtime.winner_reward), 0.0)
+
+    final_overtime = _shoot(
+        static,
+        first_overtime.state._replace(
+            clearance_achieved=jnp.asarray([0], dtype=jnp.int8)
+        ),
+        seed=125,
+    )
+    assert bool(np.asarray(final_overtime.done)[0])
+    assert int(np.asarray(final_overtime.state.overtime_possessions_completed)[0]) == 2
+    team_a_bonus = float(
+        np.asarray(final_overtime.winner_reward)[
+            0, np.asarray(static.offense_ids, dtype=np.int32)
+        ].sum()
+    )
+    team_b_bonus = float(
+        np.asarray(final_overtime.winner_reward)[
+            0, np.asarray(static.defense_ids, dtype=np.int32)
+        ].sum()
+    )
+    assert team_a_bonus == pytest.approx(5.0)
+    assert team_b_bonus == pytest.approx(-5.0)
+    assert float(
+        np.asarray(final_overtime.game_reward)[
+            0, np.asarray(static.offense_ids, dtype=np.int32)
+        ].sum()
+    ) == pytest.approx(0.0)
+    assert float(
+        np.asarray(final_overtime.rewards)[
+            0, np.asarray(static.offense_ids, dtype=np.int32)
+        ].sum()
+    ) == pytest.approx(5.0)
+
+    repeated = step_batch_minimal(
+        static,
+        final_overtime.state,
+        _noops(final_overtime.state),
+        jax.random.split(jax.random.PRNGKey(126), 1),
+        jax,
+        jnp,
+    )
+    np.testing.assert_array_equal(np.asarray(repeated.winner_reward), 0.0)
+
+
+def test_tied_overtime_pair_continues_and_alternates_the_next_round_starter():
+    static = _multi_possession_static(possession_limit=1)._replace(
+        multi_possession_use_inbounds=jnp.asarray(0, dtype=jnp.int8)
+    )
+    regulation = _shoot(
+        static,
+        _tied_regulation_boundary_state(static, seed=127),
+        seed=128,
+    )
+    first = _shoot(
+        static,
+        regulation.state._replace(clearance_achieved=jnp.asarray([0], dtype=jnp.int8)),
+        seed=129,
+    )
+    second = _shoot(
+        static,
+        first.state._replace(clearance_achieved=jnp.asarray([0], dtype=jnp.int8)),
+        seed=130,
+    )
+
+    assert not bool(np.asarray(second.done)[0])
+    assert int(np.asarray(second.state.overtime_round)[0]) == 2
+    assert int(np.asarray(second.state.overtime_possessions_completed)[0]) == 0
+    assert int(np.asarray(second.state.overtime_starting_team)[0]) == TEAM_B
+    assert int(np.asarray(second.state.offense_team)[0]) == TEAM_B
+    assert float(np.asarray(second.state.team_a_score)[0]) == pytest.approx(2.0)
+    assert float(np.asarray(second.state.team_b_score)[0]) == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("finishing_team", "team_a_before", "team_b_before"),
+    [(TEAM_A, 24, 25), (TEAM_B, 25, 24)],
+)
+def test_25_possession_limit_is_per_team_and_terminates_at_50_combined(
+    finishing_team,
+    team_a_before,
+    team_b_before,
+):
+    static = _multi_possession_static(possession_limit=25)
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(125 + finishing_team), 1),
+        jax,
+        jnp,
+    )
+    holder = int(
+        np.asarray(
+            static.offense_ids if finishing_team == TEAM_A else static.defense_ids
+        )[0]
+    )
+    state = state._replace(
+        offense_team=jnp.asarray([finishing_team], dtype=jnp.int8),
+        ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        team_a_completed_possessions=jnp.asarray([team_a_before], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([team_b_before], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([49], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+        layup_pct=jnp.ones_like(state.layup_pct),
+        three_pt_pct=jnp.ones_like(state.three_pt_pct),
+        dunk_pct=jnp.ones_like(state.dunk_pct),
+    )
+
+    out = _shoot(static, state, seed=130 + finishing_team)
+
+    assert bool(np.asarray(out.done)[0])
+    assert int(np.asarray(out.state.team_a_completed_possessions)[0]) == 25
+    assert int(np.asarray(out.state.team_b_completed_possessions)[0]) == 25
+    assert int(np.asarray(out.state.completed_possessions)[0]) == 50
 
 
 def test_defensive_lane_violation_awards_technical_and_sideline_restart_same_possession():
@@ -1430,6 +2040,35 @@ def test_defensive_lane_violation_awards_technical_and_sideline_restart_same_pos
     )
     assert int(np.asarray(reentry_out.state.inbound_player)[0]) == -1
 
+    # The same technical interruption becomes an immediate live restart in
+    # the no-inbounds ablation. It preserves the offense, score, clock, and
+    # positions, but assigns the ball to a random player on that offense.
+    no_inbounds_static = static._replace(
+        multi_possession_use_inbounds=jnp.asarray(0, dtype=jnp.int8)
+    )
+    positions_before = np.asarray(state.positions).copy()
+    no_inbounds_out = step_batch_minimal(
+        no_inbounds_static,
+        state,
+        _noops(state),
+        jax.random.split(jax.random.PRNGKey(33), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(no_inbounds_out.defensive_lane_violation)[0]) == 1
+    assert int(np.asarray(no_inbounds_out.possession_ended)[0]) == 0
+    assert int(np.asarray(no_inbounds_out.state.game_phase)[0]) == GAME_PHASE_LIVE
+    assert int(np.asarray(no_inbounds_out.state.inbound_team)[0]) == -1
+    assert int(np.asarray(no_inbounds_out.state.inbound_player)[0]) == -1
+    assert int(np.asarray(no_inbounds_out.state.inbound_steps_remaining)[0]) == 0
+    assert int(np.asarray(no_inbounds_out.state.shot_clock)[0]) == 14
+    assert int(np.asarray(no_inbounds_out.state.ball_holder)[0]) in set(
+        np.asarray(no_inbounds_static.defense_ids, dtype=np.int32).tolist()
+    )
+    np.testing.assert_array_equal(
+        np.asarray(no_inbounds_out.state.positions), positions_before
+    )
+
 
 def test_jit_vmap_mixed_phases_both_starters_final_score_and_legacy_mode():
     static = _multi_possession_static(possession_limit=1)
@@ -1447,6 +2086,9 @@ def test_jit_vmap_mixed_phases_both_starters_final_score_and_legacy_mode():
         positions=jnp.asarray(positions, dtype=jnp.int32),
         offense_team=jnp.asarray([TEAM_A, TEAM_B, TEAM_A], dtype=jnp.int8),
         starting_offense_team=jnp.asarray([TEAM_A, TEAM_B, TEAM_A], dtype=jnp.int8),
+        team_a_completed_possessions=jnp.asarray([0, 1, 0], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([1, 0, 0], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([1, 1, 0], dtype=jnp.int32),
         ball_holder=jnp.asarray(
             [team_a_holder, team_b_holder, team_a_holder], dtype=jnp.int32
         ),
@@ -1483,8 +2125,8 @@ def test_jit_vmap_mixed_phases_both_starters_final_score_and_legacy_mode():
     assert np.asarray(out.possession_ended, dtype=np.int8).tolist() == [1, 1, 0]
     assert np.asarray(out.done, dtype=bool).tolist() == [True, True, False]
     assert np.asarray(out.state.completed_possessions, dtype=np.int32).tolist() == [
-        1,
-        1,
+        2,
+        2,
         0,
     ]
     assert np.asarray(out.state.starting_offense_team, dtype=np.int8).tolist() == [

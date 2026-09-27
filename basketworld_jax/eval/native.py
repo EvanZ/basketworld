@@ -14,6 +14,8 @@ from basketworld_jax.env.minimal import (
     MOVE_ACTION_START,
     MULTI_POSSESSION_SCHEMA_VERSION,
     GAME_PHASE_AWAITING_INBOUND,
+    GAME_PHASE_AWAITING_CHECK,
+    GAME_PHASE_LIVE,
     TEAM_A,
     TEAM_B,
     PASS_ACTION_END,
@@ -33,6 +35,7 @@ from basketworld_jax.env.minimal import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_kernel_static_from_env,
+    build_spatial_diagnostics_batch,
     build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch_with_role_flag,
     reset_batch_minimal,
@@ -141,9 +144,13 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "multi_possession_limit",
     "multi_possession_reward_mode",
     "score_potential_scale",
+    "game_winner_reward",
     "multi_possession_aux_rewards_enabled",
+    "multi_possession_use_inbounds",
+    "made_basket_restart_mode",
     "multi_possession_schema_version",
     "inbound_deadline_steps",
+    "check_deadline_steps",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -171,9 +178,13 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "multi_possession_limit": 25,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
+    "game_winner_reward": 0.0,
     "multi_possession_aux_rewards_enabled": False,
-    "multi_possession_schema_version": 2,
+    "multi_possession_use_inbounds": True,
+    "made_basket_restart_mode": "baseline_inbound",
+    "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
     "inbound_deadline_steps": 5,
+    "check_deadline_steps": 5,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -201,9 +212,13 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "multi_possession_limit": "int",
     "multi_possession_reward_mode": "str",
     "score_potential_scale": "float",
+    "game_winner_reward": "float",
     "multi_possession_aux_rewards_enabled": "bool",
+    "multi_possession_use_inbounds": "bool",
+    "made_basket_restart_mode": "str",
     "multi_possession_schema_version": "int",
     "inbound_deadline_steps": "int",
+    "check_deadline_steps": "int",
 }
 
 
@@ -454,6 +469,7 @@ def _apply_native_custom_setup(
 def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
     """Extract JAX kernel-only env attrs from checkpoint metadata."""
     out: dict[str, Any] = {}
+    explicit_restart_mode = False
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
@@ -471,12 +487,20 @@ def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, 
             for key in _JAX_STATIC_ONLY_ENV_KEYS:
                 if key in source and source[key] not in (None, ""):
                     out[key] = _coerce_runtime_static_value(key, source[key])
+                    if key == "made_basket_restart_mode":
+                        explicit_restart_mode = True
                     continue
                 if key == "rebound_contest_radius":
                     for old_key in ("rebound_contest_initial_radius",):
                         if old_key in source and source[old_key] not in (None, ""):
                             out[key] = _coerce_runtime_static_value(key, source[old_key])
                             break
+    if not explicit_restart_mode and out:
+        out["made_basket_restart_mode"] = (
+            "baseline_inbound"
+            if bool(out.get("multi_possession_use_inbounds", True))
+            else "direct_handoff"
+        )
     return out
 
 
@@ -513,7 +537,9 @@ def _native_eval_horizon(env, training_params: dict[str, Any] | None, payload: d
         possession_limit = max(1, int(getattr(env, "multi_possession_limit", 25)))
         inbound_steps = max(1, int(getattr(env, "inbound_deadline_steps", 5)))
         per_possession = int(horizon) + inbound_steps + 2
-        horizon = max(horizon, possession_limit * per_possession)
+        # The configured limit is per team, so a completed game contains up
+        # to twice that many team possessions.
+        horizon = max(horizon, 2 * possession_limit * per_possession)
     return int(horizon)
 
 
@@ -1076,6 +1102,15 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 n_players,
                 jnp,
             )
+            active_step = ~policy_state.episode_ended.astype(jnp.bool_)
+            spatial_live_step = active_step & (
+                policy_state.game_phase == GAME_PHASE_LIVE
+            )
+            spatial_diagnostics = build_spatial_diagnostics_batch(
+                static,
+                policy_state,
+                jnp,
+            )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
             env_out = step_batch_minimal(static, policy_state, full_actions, env_keys, jax, jnp)
             trace = {
@@ -1085,7 +1120,33 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "positions": env_out.state.positions.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(jnp.int32),
-                "active": (~policy_state.episode_ended.astype(jnp.bool_)).astype(jnp.int8),
+                "active": active_step.astype(jnp.int8),
+                "spatial_live_steps": spatial_live_step.astype(jnp.int8),
+                "spatial_all_player_pair_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_all_player_pair_distance"],
+                    0.0,
+                ),
+                "spatial_offense_teammate_pair_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_offense_teammate_pair_distance"],
+                    0.0,
+                ),
+                "spatial_defense_teammate_pair_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_defense_teammate_pair_distance"],
+                    0.0,
+                ),
+                "spatial_boundary_player_fraction": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_boundary_player_fraction"],
+                    0.0,
+                ),
+                "spatial_corner_player_fraction": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_corner_player_fraction"],
+                    0.0,
+                ),
                 "offense_values": jnp.where(
                     policy_state.offense_team == TEAM_A,
                     team_a_values,
@@ -1099,6 +1160,9 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "offense_rewards": jnp.sum(env_out.rewards[:, offense_ids], axis=1),
                 "defense_rewards": jnp.sum(env_out.rewards[:, defense_ids], axis=1),
                 "game_rewards": jnp.sum(env_out.game_reward[:, offense_ids], axis=1),
+                "winner_rewards": jnp.sum(
+                    env_out.winner_reward[:, offense_ids], axis=1
+                ),
                 "auxiliary_rewards": jnp.sum(
                     env_out.auxiliary_reward[:, offense_ids], axis=1
                 ),
@@ -1110,6 +1174,16 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "offense_team": policy_state.offense_team.astype(jnp.int8),
                 "next_offense_team": env_out.state.offense_team.astype(jnp.int8),
                 "completed_possessions": env_out.state.completed_possessions.astype(jnp.int32),
+                "team_a_completed_possessions": (
+                    env_out.state.team_a_completed_possessions.astype(jnp.int32)
+                ),
+                "team_b_completed_possessions": (
+                    env_out.state.team_b_completed_possessions.astype(jnp.int32)
+                ),
+                "overtime_round": env_out.state.overtime_round.astype(jnp.int32),
+                "overtime_possessions_completed": (
+                    env_out.state.overtime_possessions_completed.astype(jnp.int32)
+                ),
                 "prior_game_phase": policy_state.game_phase.astype(jnp.int8),
                 "game_phase": env_out.state.game_phase.astype(jnp.int8),
                 "inbound_team": env_out.state.inbound_team.astype(jnp.int8),
@@ -1153,6 +1227,10 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "clearance_events": env_out.clearance_event.astype(jnp.int8),
                 "clearance_elapsed_steps": env_out.clearance_elapsed_steps.astype(jnp.int32),
                 "turnovers_before_clearance": env_out.turnover_before_clearance.astype(jnp.int8),
+                "check_opportunities": env_out.check_opportunity.astype(jnp.int8),
+                "check_pickups": env_out.check_pickup.astype(jnp.int8),
+                "check_violations": env_out.check_violation.astype(jnp.int8),
+                "check_pickup_steps": env_out.check_pickup_steps.astype(jnp.int32),
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(jnp.int8),
                 "defensive_lane_violation": env_out.defensive_lane_violation.astype(jnp.int8),
                 "defensive_lane_violation_player": env_out.defensive_lane_violation_player.astype(jnp.int32),
@@ -1229,6 +1307,7 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "offense_rewards": np.asarray(trace["offense_rewards"])[:, :take].sum(axis=0),
         "defense_rewards": np.asarray(trace["defense_rewards"])[:, :take].sum(axis=0),
         "game_rewards": np.asarray(trace["game_rewards"])[:, :take].sum(axis=0),
+        "winner_rewards": np.asarray(trace["winner_rewards"])[:, :take].sum(axis=0),
         "auxiliary_rewards": np.asarray(trace["auxiliary_rewards"])[:, :take].sum(axis=0),
         "team_a_score_delta": np.asarray(trace["team_a_score_delta"])[:, :take].sum(axis=0),
         "team_b_score_delta": np.asarray(trace["team_b_score_delta"])[:, :take].sum(axis=0),
@@ -1243,9 +1322,35 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         "offensive_rebounds": np.asarray(trace["offensive_rebound"])[:, :take].sum(axis=0),
         "defensive_rebounds": np.asarray(trace["defensive_rebound"])[:, :take].sum(axis=0),
         "rebound_global_contests": np.asarray(trace["rebound_global_contest"])[:, :take].sum(axis=0),
+        "spatial_live_steps": np.asarray(trace["spatial_live_steps"])[:, :take].sum(axis=0),
+        "spatial_all_player_pair_distance": np.asarray(
+            trace["spatial_all_player_pair_distance"]
+        )[:, :take].sum(axis=0),
+        "spatial_offense_teammate_pair_distance": np.asarray(
+            trace["spatial_offense_teammate_pair_distance"]
+        )[:, :take].sum(axis=0),
+        "spatial_defense_teammate_pair_distance": np.asarray(
+            trace["spatial_defense_teammate_pair_distance"]
+        )[:, :take].sum(axis=0),
+        "spatial_boundary_player_fraction": np.asarray(
+            trace["spatial_boundary_player_fraction"]
+        )[:, :take].sum(axis=0),
+        "spatial_corner_player_fraction": np.asarray(
+            trace["spatial_corner_player_fraction"]
+        )[:, :take].sum(axis=0),
         "team_a_score": _final_trace_value("team_a_score", np.float32),
         "team_b_score": _final_trace_value("team_b_score", np.float32),
         "completed_possessions": _final_trace_value("completed_possessions", np.int32),
+        "team_a_completed_possessions": _final_trace_value(
+            "team_a_completed_possessions", np.int32
+        ),
+        "team_b_completed_possessions": _final_trace_value(
+            "team_b_completed_possessions", np.int32
+        ),
+        "overtime_round": _final_trace_value("overtime_round", np.int32),
+        "overtime_possessions_completed": _final_trace_value(
+            "overtime_possessions_completed", np.int32
+        ),
         "starting_offense_team": _final_trace_value("starting_offense_team", np.int8),
         "inbound_events": (
             np.asarray(trace["game_phase"])[:, :take] == 1
@@ -1577,6 +1682,12 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "completed": 0,
             "timeout_turnovers": 0,
             "invalid_pass_turnovers": 0,
+        },
+        "checks": {
+            "opportunities": 0,
+            "pickups": 0,
+            "violations": 0,
+            "pickup_steps_total": 0,
         },
         "assist_links": {},
         "assist_links_by_type": {"dunk": {}, "two": {}, "three": {}},
@@ -2231,6 +2342,7 @@ def run_native_jax_evaluation(
     all_offense_rewards: list[float] = []
     all_defense_rewards: list[float] = []
     all_game_rewards: list[float] = []
+    all_winner_rewards: list[float] = []
     all_auxiliary_rewards: list[float] = []
     all_phi_shaping: list[float] = []
     all_team_a_score_delta: list[float] = []
@@ -2245,9 +2357,19 @@ def run_native_jax_evaluation(
     all_offensive_rebounds: list[float] = []
     all_defensive_rebounds: list[float] = []
     all_rebound_global_contests: list[float] = []
+    all_spatial_live_steps: list[float] = []
+    all_spatial_all_player_pair_distances: list[float] = []
+    all_spatial_offense_teammate_pair_distances: list[float] = []
+    all_spatial_defense_teammate_pair_distances: list[float] = []
+    all_spatial_boundary_player_fractions: list[float] = []
+    all_spatial_corner_player_fractions: list[float] = []
     all_team_a_scores: list[float] = []
     all_team_b_scores: list[float] = []
     all_completed_possessions: list[int] = []
+    all_team_a_completed_possessions: list[int] = []
+    all_team_b_completed_possessions: list[int] = []
+    all_overtime_rounds: list[int] = []
+    all_overtime_possessions_completed: list[int] = []
     completed_possession_live_steps_total = 0
     completed_possession_count = 0
     all_starting_offense_teams: list[int] = []
@@ -2344,6 +2466,33 @@ def run_native_jax_evaluation(
                 "win" if user_score > opponent_score else ("loss" if user_score < opponent_score else "tie")
             ) if game_completed else None
             initial_holder = int(trace["ball_holder"][0, idx]) if int(horizon) > 0 else -1
+            spatial_live_steps = float(stats["spatial_live_steps"][idx])
+
+            def _spatial_mean(key: str) -> float:
+                return (
+                    float(stats[key][idx] / spatial_live_steps)
+                    if spatial_live_steps > 0.0
+                    else 0.0
+                )
+
+            episode_spatial = {
+                "live_step_count": int(spatial_live_steps),
+                "mean_live_all_player_pair_distance": _spatial_mean(
+                    "spatial_all_player_pair_distance"
+                ),
+                "mean_live_offense_teammate_pair_distance": _spatial_mean(
+                    "spatial_offense_teammate_pair_distance"
+                ),
+                "mean_live_defense_teammate_pair_distance": _spatial_mean(
+                    "spatial_defense_teammate_pair_distance"
+                ),
+                "mean_live_boundary_player_fraction": _spatial_mean(
+                    "spatial_boundary_player_fraction"
+                ),
+                "mean_live_corner_player_fraction": _spatial_mean(
+                    "spatial_corner_player_fraction"
+                ),
+            }
             if initial_holder >= 0:
                 initial_counts = eval_diagnostics.setdefault("initial_ball_holder_counts", {})
                 initial_key = str(initial_holder)
@@ -2479,6 +2628,15 @@ def run_native_jax_evaluation(
                     )
                 clearance_diag["turnovers_before_clearance"] += int(
                     trace["turnovers_before_clearance"][t, idx]
+                )
+                check_diag = eval_diagnostics["checks"]
+                check_diag["opportunities"] += int(
+                    trace["check_opportunities"][t, idx]
+                )
+                check_diag["pickups"] += int(trace["check_pickups"][t, idx])
+                check_diag["violations"] += int(trace["check_violations"][t, idx])
+                check_diag["pickup_steps_total"] += int(
+                    trace["check_pickup_steps"][t, idx]
                 )
                 inbound_diag = eval_diagnostics["inbounds"]
                 if int(trace["possession_ended"][t, idx]) and int(trace["game_phase"][t, idx]) == int(GAME_PHASE_AWAITING_INBOUND):
@@ -3022,6 +3180,30 @@ def run_native_jax_evaluation(
                         "opponent_score": opponent_score,
                         "margin": float(user_score - opponent_score),
                         "completed_possessions": int(stats["completed_possessions"][idx]),
+                        "team_a_completed_possessions": int(
+                            stats["team_a_completed_possessions"][idx]
+                        ),
+                        "team_b_completed_possessions": int(
+                            stats["team_b_completed_possessions"][idx]
+                        ),
+                        "overtime_round": int(stats["overtime_round"][idx]),
+                        "overtime_possessions_completed": int(
+                            stats["overtime_possessions_completed"][idx]
+                        ),
+                        "user_completed_possessions": int(
+                            stats[
+                                "team_a_completed_possessions"
+                                if user_team == Team.OFFENSE
+                                else "team_b_completed_possessions"
+                            ][idx]
+                        ),
+                        "opponent_completed_possessions": int(
+                            stats[
+                                "team_b_completed_possessions"
+                                if user_team == Team.OFFENSE
+                                else "team_a_completed_possessions"
+                            ][idx]
+                        ),
                         "starting_offense_team": (
                             "team_a"
                             if int(stats["starting_offense_team"][idx]) == TEAM_A
@@ -3031,7 +3213,11 @@ def run_native_jax_evaluation(
                     "episode_rewards": {
                         "offense": offense_reward,
                         "defense": defense_reward,
+                        "game": float(stats["game_rewards"][idx]),
+                        "winner": float(stats["winner_rewards"][idx]),
+                        "auxiliary": float(stats["auxiliary_rewards"][idx]),
                     },
+                    "spatial": episode_spatial,
                     "outcome_info": {
                         "shots": shots_payload,
                         "turnovers": turnovers_payload,
@@ -3043,6 +3229,12 @@ def run_native_jax_evaluation(
                         "team_a_score": team_a_score,
                         "team_b_score": team_b_score,
                         "completed_possessions": int(stats["completed_possessions"][idx]),
+                        "team_a_completed_possessions": int(
+                            stats["team_a_completed_possessions"][idx]
+                        ),
+                        "team_b_completed_possessions": int(
+                            stats["team_b_completed_possessions"][idx]
+                        ),
                     },
                     "shot_counts": episode_shots,
                 }
@@ -3052,6 +3244,7 @@ def run_native_jax_evaluation(
         all_offense_rewards.extend([float(v) for v in stats["offense_rewards"].tolist()])
         all_defense_rewards.extend([float(v) for v in stats["defense_rewards"].tolist()])
         all_game_rewards.extend([float(v) for v in stats["game_rewards"].tolist()])
+        all_winner_rewards.extend([float(v) for v in stats["winner_rewards"].tolist()])
         all_auxiliary_rewards.extend(
             [float(v) for v in stats["auxiliary_rewards"].tolist()]
         )
@@ -3072,6 +3265,24 @@ def run_native_jax_evaluation(
         all_offensive_rebounds.extend([float(v) for v in stats["offensive_rebounds"].tolist()])
         all_defensive_rebounds.extend([float(v) for v in stats["defensive_rebounds"].tolist()])
         all_rebound_global_contests.extend([float(v) for v in stats["rebound_global_contests"].tolist()])
+        all_spatial_live_steps.extend(
+            [float(v) for v in stats["spatial_live_steps"].tolist()]
+        )
+        all_spatial_all_player_pair_distances.extend(
+            [float(v) for v in stats["spatial_all_player_pair_distance"].tolist()]
+        )
+        all_spatial_offense_teammate_pair_distances.extend(
+            [float(v) for v in stats["spatial_offense_teammate_pair_distance"].tolist()]
+        )
+        all_spatial_defense_teammate_pair_distances.extend(
+            [float(v) for v in stats["spatial_defense_teammate_pair_distance"].tolist()]
+        )
+        all_spatial_boundary_player_fractions.extend(
+            [float(v) for v in stats["spatial_boundary_player_fraction"].tolist()]
+        )
+        all_spatial_corner_player_fractions.extend(
+            [float(v) for v in stats["spatial_corner_player_fraction"].tolist()]
+        )
         if static_multi:
             all_team_a_scores.extend([float(v) for v in stats["team_a_score"].tolist()])
             all_team_b_scores.extend([float(v) for v in stats["team_b_score"].tolist()])
@@ -3079,6 +3290,16 @@ def run_native_jax_evaluation(
             all_team_a_scores.extend([float(v) for v in stats["offense_points"].tolist()])
             all_team_b_scores.extend([float(v) for v in stats["defense_points"].tolist()])
         all_completed_possessions.extend([int(v) for v in stats["completed_possessions"].tolist()])
+        all_team_a_completed_possessions.extend(
+            [int(v) for v in stats["team_a_completed_possessions"].tolist()]
+        )
+        all_team_b_completed_possessions.extend(
+            [int(v) for v in stats["team_b_completed_possessions"].tolist()]
+        )
+        all_overtime_rounds.extend([int(v) for v in stats["overtime_round"].tolist()])
+        all_overtime_possessions_completed.extend(
+            [int(v) for v in stats["overtime_possessions_completed"].tolist()]
+        )
         all_starting_offense_teams.extend([int(v) for v in stats["starting_offense_team"].tolist()])
         all_inbound_events.extend([int(v) for v in stats["inbound_events"].tolist()])
         completed_episodes += take
@@ -3138,6 +3359,23 @@ def run_native_jax_evaluation(
     clearance_diag_final["elapsed_steps_mean"] = (
         float(clearance_elapsed_total / clearance_event_count)
         if clearance_event_count > 0
+        else 0.0
+    )
+    check_diag_final = eval_diagnostics.get("checks") or {}
+    check_opportunity_count = int(check_diag_final.get("opportunities", 0) or 0)
+    check_pickup_count = int(check_diag_final.get("pickups", 0) or 0)
+    check_violation_count = int(check_diag_final.get("violations", 0) or 0)
+    check_pickup_steps_total = int(
+        check_diag_final.get("pickup_steps_total", 0) or 0
+    )
+    check_diag_final["pickup_rate"] = (
+        float(check_pickup_count / check_opportunity_count)
+        if check_opportunity_count > 0
+        else 0.0
+    )
+    check_diag_final["mean_pickup_steps"] = (
+        float(check_pickup_steps_total / check_pickup_count)
+        if check_pickup_count > 0
         else 0.0
     )
     rebound_eligibility = dict(rebound_diag_final.get("eligibility", {}) or {})
@@ -3265,6 +3503,31 @@ def run_native_jax_evaluation(
     completed_possession_total = int(
         sum(all_completed_possessions[idx] for idx in completed_game_indices)
     )
+    completed_team_a_possessions = int(
+        sum(all_team_a_completed_possessions[idx] for idx in completed_game_indices)
+    )
+    completed_team_b_possessions = int(
+        sum(all_team_b_completed_possessions[idx] for idx in completed_game_indices)
+    )
+    completed_user_offensive_possessions = (
+        completed_team_a_possessions
+        if user_team == Team.OFFENSE
+        else completed_team_b_possessions
+    )
+    completed_opponent_offensive_possessions = (
+        completed_team_b_possessions
+        if user_team == Team.OFFENSE
+        else completed_team_a_possessions
+    )
+    spatial_live_step_total = float(sum(all_spatial_live_steps))
+
+    def _spatial_live_mean(values: list[float]) -> float:
+        return (
+            float(sum(values) / spatial_live_step_total)
+            if spatial_live_step_total > 0.0
+            else 0.0
+        )
+
     paired_game_count = 0
     paired_complete_count = 0
     for pair_start in range(0, len(all_completed), 2):
@@ -3305,8 +3568,19 @@ def run_native_jax_evaluation(
         "tie_count": tie_count,
         "completed_user_score_mean": _mean(completed_user_scores),
         "completed_opponent_score_mean": _mean(completed_opponent_scores),
+        # These stable-team totals are the authoritative PPP numerators for a
+        # multi-possession evaluation.  The role-oriented offense/defense
+        # aggregates below intentionally remain separate diagnostics because
+        # those roles alternate during a game.
+        "completed_user_score_total": float(sum(completed_user_scores)),
+        "completed_opponent_score_total": float(sum(completed_opponent_scores)),
         "completed_margin_mean": _mean(completed_margins),
+        "multi_possession_enabled": bool(static_multi),
         "completed_possessions_total": completed_possession_total,
+        "completed_user_offensive_possessions": int(completed_user_offensive_possessions),
+        "completed_opponent_offensive_possessions": int(
+            completed_opponent_offensive_possessions
+        ),
         "completed_possession_count": int(completed_possession_count),
         "completed_possession_live_steps": int(completed_possession_live_steps_total),
         "mean_live_steps_per_completed_possession": (
@@ -3314,17 +3588,48 @@ def run_native_jax_evaluation(
             if completed_possession_count > 0
             else 0.0
         ),
+        "spatial_live_step_count": int(spatial_live_step_total),
+        "mean_live_all_player_pair_distance": _spatial_live_mean(
+            all_spatial_all_player_pair_distances
+        ),
+        "mean_live_offense_teammate_pair_distance": _spatial_live_mean(
+            all_spatial_offense_teammate_pair_distances
+        ),
+        "mean_live_defense_teammate_pair_distance": _spatial_live_mean(
+            all_spatial_defense_teammate_pair_distances
+        ),
+        "mean_live_boundary_player_fraction": _spatial_live_mean(
+            all_spatial_boundary_player_fractions
+        ),
+        "mean_live_corner_player_fraction": _spatial_live_mean(
+            all_spatial_corner_player_fractions
+        ),
         "completed_possessions_mean": _mean(
             [all_completed_possessions[idx] for idx in completed_game_indices]
         ),
+        "overtime_game_count": int(
+            sum(all_overtime_rounds[idx] > 0 for idx in completed_game_indices)
+        ),
+        "overtime_rounds_mean": _mean(
+            [all_overtime_rounds[idx] for idx in completed_game_indices]
+        ),
+        "overtime_rounds_max": int(
+            max(
+                (all_overtime_rounds[idx] for idx in completed_game_indices),
+                default=0,
+            )
+        ),
         "user_points_per_possession": (
-            float(sum(completed_user_scores) / completed_possession_total)
-            if completed_possession_total > 0
+            float(sum(completed_user_scores) / completed_user_offensive_possessions)
+            if completed_user_offensive_possessions > 0
             else 0.0
         ),
         "opponent_points_per_possession": (
-            float(sum(completed_opponent_scores) / completed_possession_total)
-            if completed_possession_total > 0
+            float(
+                sum(completed_opponent_scores)
+                / completed_opponent_offensive_possessions
+            )
+            if completed_opponent_offensive_possessions > 0
             else 0.0
         ),
         "paired_starting_team_evaluation": {
@@ -3340,6 +3645,7 @@ def run_native_jax_evaluation(
         "offense_reward_per_episode": _mean(all_offense_rewards),
         "defense_reward_per_episode": _mean(all_defense_rewards),
         "game_reward_per_episode": _mean(all_game_rewards),
+        "winner_reward_per_episode": _mean(all_winner_rewards),
         "auxiliary_reward_per_episode": _mean(all_auxiliary_rewards),
         "phi_shaping_per_episode": _mean(all_phi_shaping),
         "team_a_score_delta_per_episode": _mean(all_team_a_score_delta),
@@ -3358,6 +3664,11 @@ def run_native_jax_evaluation(
         "turnovers_before_clearance_count": int(
             clearance_diag_final.get("turnovers_before_clearance", 0) or 0
         ),
+        "check_opportunity_count": check_opportunity_count,
+        "check_pickup_count": check_pickup_count,
+        "check_violation_count": check_violation_count,
+        "check_pickup_rate": float(check_diag_final["pickup_rate"]),
+        "check_mean_pickup_steps": float(check_diag_final["mean_pickup_steps"]),
         "inbound_started_count": int((eval_diagnostics.get("inbounds") or {}).get("started", 0) or 0),
         "inbound_completed_count": int((eval_diagnostics.get("inbounds") or {}).get("completed", 0) or 0),
         "inbound_timeout_turnover_count": int((eval_diagnostics.get("inbounds") or {}).get("timeout_turnovers", 0) or 0),

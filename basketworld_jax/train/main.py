@@ -89,6 +89,7 @@ from basketworld_jax.train.runtime import (
     build_compiled_grouped_opponent_rollout_runner,
     build_compiled_historical_match_eval_runner,
     HISTORICAL_MATCH_DIAGNOSTIC_KEYS,
+    HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS,
     build_compiled_rollout_runner,
     build_jitted_actor_critic_runner,
     build_jitted_ppo_update_runner,
@@ -241,8 +242,12 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "multi_possession_limit",
         "multi_possession_reward_mode",
         "score_potential_scale",
+        "game_winner_reward",
         "multi_possession_aux_rewards_enabled",
+        "multi_possession_use_inbounds",
+        "made_basket_restart_mode",
         "inbound_deadline_steps",
+        "check_deadline_steps",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -356,8 +361,12 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "multi_possession_limit",
     "multi_possession_reward_mode",
     "score_potential_scale",
+    "game_winner_reward",
     "multi_possession_aux_rewards_enabled",
+    "multi_possession_use_inbounds",
+    "made_basket_restart_mode",
     "inbound_deadline_steps",
+    "check_deadline_steps",
 )
 
 
@@ -951,7 +960,10 @@ def parse_args(argv=None):
         "--multi-possession-limit",
         type=int,
         default=25,
-        help="Completed possessions per multi-possession game.",
+        help=(
+            "Completed offensive possessions per team in a multi-possession game "
+            "(25 means 25 for each team, 50 combined)."
+        ),
     )
     parser.add_argument(
         "--inbound-deadline-steps",
@@ -963,12 +975,37 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--check-deadline-steps",
+        type=int,
+        default=5,
+        help="Simulation steps allowed for the receiving team to collect a check ball.",
+    )
+    parser.add_argument(
+        "--made-basket-restart-mode",
+        choices=("baseline_inbound", "check", "direct_handoff"),
+        default="baseline_inbound",
+        help=(
+            "Restart after made baskets with the legacy baseline inbound, a "
+            "protected top-of-key check, or an immediate random handoff."
+        ),
+    )
+    parser.add_argument(
+        "--multi-possession-use-inbounds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use dead-ball inbound plays in multi-possession games. Disable "
+            "for the no-inbounds ablation, which gives a random receiving "
+            "player the ball in place."
+        ),
+    )
+    parser.add_argument(
         "--multi-possession-reward-mode",
-        choices=("win_loss", "point_differential"),
+        choices=("win_loss", "point_differential", "scoring_events"),
         default="win_loss",
         help=(
-            "Terminal fixed-team game objective: +/-1/0 outcome or final "
-            "team-A point differential."
+            "Multi-possession objective: terminal +/-1/0 outcome, terminal "
+            "team-A point differential, or immediate actual scoring events."
         ),
     )
     parser.add_argument(
@@ -976,6 +1013,15 @@ def parse_args(argv=None):
         type=float,
         default=1.0,
         help="Scale for the fixed-team score-difference potential in multi-possession games.",
+    )
+    parser.add_argument(
+        "--game-winner-reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Zero-sum terminal bonus awarded once to the winning stable team "
+            "after regulation or paired overtime."
+        ),
     )
     parser.add_argument(
         "--multi-possession-aux-rewards-enabled",
@@ -1323,6 +1369,8 @@ def validate_train_args(args) -> None:
             raise SystemExit("--multi-possession-limit must be >= 1.")
         if int(getattr(args, "inbound_deadline_steps", 5)) < 1:
             raise SystemExit("--inbound-deadline-steps must be >= 1.")
+        if int(getattr(args, "check_deadline_steps", 5)) < 1:
+            raise SystemExit("--check-deadline-steps must be >= 1.")
         if bool(getattr(args, "start_template_enabled", False)):
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
@@ -1338,13 +1386,27 @@ def validate_train_args(args) -> None:
         reward_mode = str(
             getattr(args, "multi_possession_reward_mode", "win_loss") or "win_loss"
         )
-        if reward_mode not in {"win_loss", "point_differential"}:
+        if reward_mode not in {"win_loss", "point_differential", "scoring_events"}:
             raise SystemExit(
-                "--multi-possession-reward-mode must be 'win_loss' or 'point_differential'."
+                "--multi-possession-reward-mode must be 'win_loss', "
+                "'point_differential', or 'scoring_events'."
             )
         if float(getattr(args, "score_potential_scale", 1.0)) < 0.0:
             raise SystemExit("--score-potential-scale must be >= 0.")
-        if bool(getattr(args, "enable_phi_shaping", False)):
+        if float(getattr(args, "game_winner_reward", 0.0)) < 0.0:
+            raise SystemExit("--game-winner-reward must be >= 0.")
+        if reward_mode == "scoring_events":
+            if bool(getattr(args, "enable_phi_shaping", False)):
+                raise SystemExit(
+                    "--enable-phi-shaping is incompatible with "
+                    "--multi-possession-reward-mode scoring_events."
+                )
+            if bool(getattr(args, "multi_possession_aux_rewards_enabled", False)):
+                raise SystemExit(
+                    "--multi-possession-aux-rewards-enabled is incompatible with "
+                    "--multi-possession-reward-mode scoring_events."
+                )
+        elif bool(getattr(args, "enable_phi_shaping", False)):
             if bool(getattr(args, "phi_use_ball_handler_only", False)):
                 raise SystemExit(
                     "--phi-use-ball-handler-only is incompatible with multi-possession score potential shaping."
@@ -1566,9 +1628,13 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "multi_possession_limit": 25,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
+    "game_winner_reward": 0.0,
     "multi_possession_aux_rewards_enabled": False,
+    "multi_possession_use_inbounds": True,
+    "made_basket_restart_mode": "baseline_inbound",
     "multi_possession_schema_version": 1,
     "inbound_deadline_steps": 5,
+    "check_deadline_steps": 5,
 }
 
 
@@ -1576,7 +1642,14 @@ def _compatible_env_config_for_resume(actual: dict[str, Any], expected: dict[str
     out = dict(actual or {})
     for key in _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS:
         if key not in out and key in expected:
-            out[key] = expected[key]
+            if key == "made_basket_restart_mode":
+                out[key] = (
+                    "baseline_inbound"
+                    if bool(out.get("multi_possession_use_inbounds", True))
+                    else "direct_handoff"
+                )
+            else:
+                out[key] = expected[key]
     return out
 
 
@@ -3082,6 +3155,26 @@ def _historical_episode_rows(
         getattr(final_state, "completed_possessions", np.zeros(batch_size)),
         dtype=np.int32,
     )
+    team_a_completed_possessions = np.asarray(
+        getattr(
+            final_state,
+            "team_a_completed_possessions",
+            np.where(
+                starting_offense_team == 0,
+                (completed_possessions + 1) // 2,
+                completed_possessions // 2,
+            ),
+        ),
+        dtype=np.int32,
+    )
+    team_b_completed_possessions = np.asarray(
+        getattr(
+            final_state,
+            "team_b_completed_possessions",
+            completed_possessions - team_a_completed_possessions,
+        ),
+        dtype=np.int32,
+    )
     step_count = np.asarray(
         getattr(final_state, "step_count", np.zeros(batch_size)),
         dtype=np.int32,
@@ -3132,11 +3225,26 @@ def _historical_episode_rows(
             "candidate_point_differential": candidate_score - opponent_score,
             "outcome": outcome,
             "completed_possessions": int(completed_possessions[episode_index]),
+            "candidate_completed_possessions": int(
+                team_a_completed_possessions[episode_index]
+                if candidate_is_team_a
+                else team_b_completed_possessions[episode_index]
+            ),
+            "opponent_completed_possessions": int(
+                team_b_completed_possessions[episode_index]
+                if candidate_is_team_a
+                else team_a_completed_possessions[episode_index]
+            ),
             "environment_steps": int(step_count[episode_index]),
         }
         for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS:
             values = diagnostic_arrays.get(key)
-            row[key] = int(round(float(values[episode_index]))) if values is not None else 0
+            if values is None:
+                row[key] = 0.0 if key in HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS else 0
+            elif key in HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS:
+                row[key] = float(values[episode_index])
+            else:
+                row[key] = int(round(float(values[episode_index])))
         rows.append(row)
     return rows
 
@@ -3221,8 +3329,13 @@ def _summarize_historical_match(
         ),
     }
 
-    def _total(key: str) -> int:
-        return int(sum(row[key] for row in episode_rows))
+    def _total(key: str) -> float | int:
+        total = sum(row[key] for row in episode_rows)
+        return (
+            float(total)
+            if key in HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS
+            else int(total)
+        )
 
     def _rate(numerator: float, denominator: float) -> float | None:
         return float(numerator / denominator) if denominator else None
@@ -3230,6 +3343,8 @@ def _summarize_historical_match(
     candidate_score_total = int(sum(row["candidate_score"] for row in completed_rows))
     opponent_score_total = int(sum(row["opponent_score"] for row in completed_rows))
     completed_possessions = _total("completed_possessions")
+    candidate_completed_possessions = _total("candidate_completed_possessions")
+    opponent_completed_possessions = _total("opponent_completed_possessions")
     scalar_diagnostics: dict[str, Any] = {
         "mean_candidate_score": outcome_summary["mean_candidate_score"],
         "mean_opponent_score": outcome_summary["mean_opponent_score"],
@@ -3252,11 +3367,24 @@ def _summarize_historical_match(
         "completed_possession_count": completed_possessions,
         "candidate_points_per_completed_possession": _rate(
             candidate_score_total,
-            completed_possessions,
+            candidate_completed_possessions,
         ),
         "opponent_points_per_completed_possession": _rate(
             opponent_score_total,
-            completed_possessions,
+            opponent_completed_possessions,
+        ),
+        "candidate_completed_possession_count": candidate_completed_possessions,
+        "opponent_completed_possession_count": opponent_completed_possessions,
+        "check_opportunity_count": _total("check_opportunities"),
+        "check_pickup_count": _total("check_pickups"),
+        "check_violation_count": _total("check_violations"),
+        "check_pickup_rate": _rate(
+            _total("check_pickups"),
+            _total("check_opportunities"),
+        ),
+        "check_mean_pickup_steps": _rate(
+            _total("check_pickup_steps"),
+            _total("check_pickups"),
         ),
     }
     scalar_diagnostics["zero_zero_tie_rate"] = _rate(
@@ -3270,6 +3398,31 @@ def _summarize_historical_match(
             total,
             completed_count,
         )
+    spatial_live_steps = scalar_diagnostics["spatial_live_steps_total"]
+    scalar_diagnostics.update(
+        {
+            "mean_live_all_player_pair_distance": _rate(
+                scalar_diagnostics["spatial_all_player_pair_distance_total"],
+                spatial_live_steps,
+            ),
+            "candidate_mean_live_teammate_pair_distance": _rate(
+                scalar_diagnostics["candidate_spatial_teammate_pair_distance_total"],
+                spatial_live_steps,
+            ),
+            "opponent_mean_live_teammate_pair_distance": _rate(
+                scalar_diagnostics["opponent_spatial_teammate_pair_distance_total"],
+                spatial_live_steps,
+            ),
+            "mean_live_boundary_player_fraction": _rate(
+                scalar_diagnostics["spatial_boundary_player_fraction_total"],
+                spatial_live_steps,
+            ),
+            "mean_live_corner_player_fraction": _rate(
+                scalar_diagnostics["spatial_corner_player_fraction_total"],
+                spatial_live_steps,
+            ),
+        }
+    )
     for side in ("candidate", "opponent"):
         pass_attempts = scalar_diagnostics[f"{side}_pass_attempts_total"]
         completed_passes = scalar_diagnostics[f"{side}_completed_passes_total"]
@@ -4031,6 +4184,11 @@ def _build_reward_component_arrays(rollout, static, task_reward_scale: float, jn
             * static_scale
             * schedule_scale
         ),
+        "winner_reward": (
+            rollout.trajectory.winner_rewards.astype(jnp.float32)
+            * static_scale
+            * schedule_scale
+        ),
         "auxiliary_reward": (
             rollout.trajectory.auxiliary_rewards.astype(jnp.float32)
             * static_scale
@@ -4304,6 +4462,12 @@ def _summarize_role_rollout_metrics(
         f"{role}_game_reward_total": _active_sum(
             rollout.trajectory.game_rewards
         ),
+        f"{role}_winner_reward_mean": _active_mean(
+            rollout.trajectory.winner_rewards
+        ),
+        f"{role}_winner_reward_total": _active_sum(
+            rollout.trajectory.winner_rewards
+        ),
         f"{role}_auxiliary_reward_mean": _active_mean(
             rollout.trajectory.auxiliary_rewards
         ),
@@ -4433,6 +4597,16 @@ def _summarize_role_rollout_metrics(
             jax,
             jnp,
         )
+        # A multi-possession learner controls one fixed team through both
+        # offensive and defensive possessions.  Keep both phases in PPO, but
+        # do not let the role-labelled diagnostics mix them: an "offense"
+        # reward must contain only the learner's live offensive timesteps and
+        # a "defense" reward only its live defensive timesteps.
+        role_value = 1.0 if role == "offense" else -1.0
+        metric_role_mask = (
+            np.asarray(rollout.trajectory.training_role, dtype=np.float32)
+            == role_value
+        ).astype(np.float32)
         role_ppo_batch = build_ppo_batch(rollout, trainer_config, jax, jnp)
         values_shape = np.asarray(rollout.trajectory.values).shape
         value_diag = _masked_value_diagnostics(
@@ -4456,6 +4630,8 @@ def _summarize_role_rollout_metrics(
                 f"{role}_ppo_eligible",
                 rollout.trajectory,
                 training_mask,
+                metric_mask=metric_role_mask,
+                completion_mask=training_mask,
                 include_learner_shots=include_learner_shot_metrics,
                 include_opponent_shots=include_opponent_shot_metrics,
                 role=role,
@@ -5506,6 +5682,14 @@ def run_training_loop(args) -> dict[str, Any]:
                     jax,
                     jnp,
                 )
+                metric_role_value = 1.0 if role == "offense" else -1.0
+                metric_role_mask = (
+                    np.asarray(
+                        role_rollouts[role].trajectory.training_role,
+                        dtype=np.float32,
+                    )
+                    == metric_role_value
+                ).astype(np.float32)
                 role_components = role_reward_components[role]
                 last_metrics.update(
                     summarize_ppo_eligible_reward_component_metrics(
@@ -5515,6 +5699,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         task_rewards=role_components["task_reward"],
                         phi_rewards=role_components["phi_reward"],
                         intent_bonus_rewards=role_components["intent_bonus"],
+                        metric_mask=metric_role_mask,
+                        completion_mask=role_training_mask,
                     )
                 )
             last_metrics.update(_summarize_combined_value_diagnostics(last_metrics))

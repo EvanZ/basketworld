@@ -87,13 +87,21 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "multi_possession_limit",
     "multi_possession_reward_mode",
     "score_potential_scale",
+    "game_winner_reward",
     "multi_possession_aux_rewards_enabled",
+    "multi_possession_use_inbounds",
+    "made_basket_restart_mode",
     "inbound_deadline_steps",
+    "check_deadline_steps",
 }
 
 
 def _coerce_eval_env_override(key: str, value):
-    if key in {"enable_multi_possession", "multi_possession_aux_rewards_enabled"}:
+    if key in {
+        "enable_multi_possession",
+        "multi_possession_aux_rewards_enabled",
+        "multi_possession_use_inbounds",
+    }:
         if isinstance(value, bool):
             return value
         raw = str(value or "").strip().lower()
@@ -102,7 +110,11 @@ def _coerce_eval_env_override(key: str, value):
         if raw in {"0", "false", "no", "n", "f"}:
             return False
         raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
-    if key in {"multi_possession_limit", "inbound_deadline_steps"}:
+    if key in {
+        "multi_possession_limit",
+        "inbound_deadline_steps",
+        "check_deadline_steps",
+    }:
         try:
             numeric = int(value)
             if numeric < 1:
@@ -112,13 +124,27 @@ def _coerce_eval_env_override(key: str, value):
             raise HTTPException(status_code=400, detail=f"{key} must be a positive integer.")
     if key == "multi_possession_reward_mode":
         mode = str(value or "").strip().lower()
-        if mode in {"win_loss", "point_differential"}:
+        if mode in {"win_loss", "point_differential", "scoring_events"}:
             return mode
         raise HTTPException(
             status_code=400,
-            detail="multi_possession_reward_mode must be 'win_loss' or 'point_differential'.",
+            detail=(
+                "multi_possession_reward_mode must be 'win_loss', "
+                "'point_differential', or 'scoring_events'."
+            ),
         )
-    if key == "score_potential_scale":
+    if key == "made_basket_restart_mode":
+        mode = str(value or "").strip().lower().replace("-", "_")
+        if mode in {"baseline_inbound", "check", "direct_handoff"}:
+            return mode
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "made_basket_restart_mode must be 'baseline_inbound', "
+                "'check', or 'direct_handoff'."
+            ),
+        )
+    if key in {"score_potential_scale", "game_winner_reward"}:
         try:
             return max(0.0, float(value))
         except Exception:
@@ -479,6 +505,18 @@ def run_evaluation(request: EvaluationRequest):
             "opponent_score": game.get("opponent_score"),
             "completed_possessions": game.get(
                 "completed_possessions", outcome_info.get("completed_possessions")
+            ),
+            "team_a_completed_possessions": game.get(
+                "team_a_completed_possessions",
+                outcome_info.get("team_a_completed_possessions"),
+            ),
+            "team_b_completed_possessions": game.get(
+                "team_b_completed_possessions",
+                outcome_info.get("team_b_completed_possessions"),
+            ),
+            "user_completed_possessions": game.get("user_completed_possessions"),
+            "opponent_completed_possessions": game.get(
+                "opponent_completed_possessions"
             ),
         }
         episode_results.append(

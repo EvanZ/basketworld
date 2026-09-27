@@ -97,7 +97,9 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
             "multi_possession_limit": "7",
             "multi_possession_reward_mode": "point_differential",
             "score_potential_scale": "0.25",
+            "game_winner_reward": "5.0",
             "multi_possession_aux_rewards_enabled": "false",
+            "multi_possession_use_inbounds": "false",
             "inbound_deadline_steps": "4",
         },
         start_template_mode="enabled",
@@ -120,7 +122,9 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
     assert optional_params["multi_possession_limit"] == 7
     assert optional_params["multi_possession_reward_mode"] == "point_differential"
     assert optional_params["score_potential_scale"] == pytest.approx(0.25)
+    assert optional_params["game_winner_reward"] == pytest.approx(5.0)
     assert optional_params["multi_possession_aux_rewards_enabled"] is False
+    assert optional_params["multi_possession_use_inbounds"] is False
     assert optional_params["inbound_deadline_steps"] == 4
     assert optional_params["start_template_enabled"] is False
     assert "start_template_library" not in optional_params
@@ -130,6 +134,13 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
         evaluation_routes._coerce_eval_env_override("multi_possession_limit", "bad")
     with pytest.raises(Exception, match="inbound_deadline_steps"):
         evaluation_routes._coerce_eval_env_override("inbound_deadline_steps", 0)
+
+    assert (
+        evaluation_routes._coerce_eval_env_override(
+            "multi_possession_reward_mode", "scoring_events"
+        )
+        == "scoring_events"
+    )
 
 
 def test_evaluation_response_keeps_cutoff_games_incomplete(monkeypatch):

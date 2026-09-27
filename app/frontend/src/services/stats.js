@@ -12,6 +12,139 @@ function normalizeNumberRecord(raw) {
   return out;
 }
 
+function normalizeSpatialDiagnostics(raw) {
+  const diagnostics = raw && typeof raw === 'object' ? raw : {};
+  return {
+    liveStepCount: Number(diagnostics.liveStepCount) || 0,
+    meanAllPlayerPairDistance: Number(diagnostics.meanAllPlayerPairDistance) || 0,
+    meanOffenseTeammatePairDistance: Number(diagnostics.meanOffenseTeammatePairDistance) || 0,
+    meanDefenseTeammatePairDistance: Number(diagnostics.meanDefenseTeammatePairDistance) || 0,
+    meanBoundaryPlayerFraction: Number(diagnostics.meanBoundaryPlayerFraction) || 0,
+    meanCornerPlayerFraction: Number(diagnostics.meanCornerPlayerFraction) || 0,
+  };
+}
+
+export function countTeamOffensivePossessions(
+  completedPossessions,
+  startingOffenseTeam,
+  teamIsA,
+) {
+  const possessions = Math.max(0, Math.trunc(Number(completedPossessions) || 0));
+  if (possessions === 0) return 0;
+  const starter = String(startingOffenseTeam || '').trim().toLowerCase();
+  if (starter !== 'team_a' && starter !== 'team_b') return 0;
+  const teamStarts = (starter === 'team_a') === Boolean(teamIsA);
+  return teamStarts ? Math.ceil(possessions / 2) : Math.floor(possessions / 2);
+}
+
+/**
+ * Return the stable-team scoring totals from native multi-possession
+ * evaluation.  `total_offense_points` and `total_defense_points` are
+ * deliberately not used here: in a multi-possession game those are dynamic
+ * roles which alternate between the Player and AI teams.
+ */
+export function getNativeMultiPossessionScoreTotals(summary) {
+  if (!summary || typeof summary !== 'object') return null;
+  const values = {
+    playerPoints: Number(summary.completed_user_score_total),
+    aiPoints: Number(summary.completed_opponent_score_total),
+    totalPossessions: Number(summary.completed_possessions_total),
+    playerOffensivePossessions: Number(summary.completed_user_offensive_possessions),
+    aiOffensivePossessions: Number(summary.completed_opponent_offensive_possessions),
+  };
+  if (!Object.values(values).every((value) => Number.isFinite(value) && value >= 0)) {
+    return null;
+  }
+  if (
+    values.playerOffensivePossessions + values.aiOffensivePossessions
+    !== values.totalPossessions
+  ) {
+    return null;
+  }
+  return values;
+}
+
+/**
+ * Compatibility path for a backend that has not yet been restarted with the
+ * native stable-team summary fields.  Episode game scores are fixed to the
+ * Player/AI rosters, unlike the offense/defense role aggregates.
+ */
+export function getEpisodeMultiPossessionScoreTotals(episodeResults, userTeamIsA = true) {
+  if (!Array.isArray(episodeResults)) return null;
+  const totals = {
+    playerPoints: 0,
+    aiPoints: 0,
+    totalPossessions: 0,
+    playerOffensivePossessions: 0,
+    aiOffensivePossessions: 0,
+  };
+  let completedGameCount = 0;
+  for (const row of episodeResults) {
+    const game = row?.game && typeof row.game === 'object' ? row.game : {};
+    const finalState = row?.final_state && typeof row.final_state === 'object'
+      ? row.final_state
+      : {};
+    const completed = game.completed ?? row?.completed ?? finalState.completed;
+    if (!completed) continue;
+
+    const completedPossessions = Math.max(
+      0,
+      Math.trunc(Number(game.completed_possessions ?? finalState.completed_possessions) || 0),
+    );
+    const teamAPossessionsRaw = Number(
+      game.team_a_completed_possessions ?? finalState.team_a_completed_possessions,
+    );
+    const teamBPossessionsRaw = Number(
+      game.team_b_completed_possessions ?? finalState.team_b_completed_possessions,
+    );
+    const hasStableTeamPossessions = (
+      Number.isFinite(teamAPossessionsRaw)
+      && Number.isFinite(teamBPossessionsRaw)
+      && teamAPossessionsRaw >= 0
+      && teamBPossessionsRaw >= 0
+    );
+    const startingOffenseTeam = game.starting_offense_team ?? finalState.starting_offense_team;
+    const normalizedStarter = String(startingOffenseTeam || '').trim().toLowerCase();
+    if (
+      completedPossessions > 0
+      && !hasStableTeamPossessions
+      && normalizedStarter !== 'team_a'
+      && normalizedStarter !== 'team_b'
+    ) {
+      return null;
+    }
+    const playerPossessions = hasStableTeamPossessions
+      ? Math.trunc(userTeamIsA ? teamAPossessionsRaw : teamBPossessionsRaw)
+      : countTeamOffensivePossessions(
+        completedPossessions,
+        startingOffenseTeam,
+        userTeamIsA,
+      );
+    const aiPossessions = hasStableTeamPossessions
+      ? Math.trunc(userTeamIsA ? teamBPossessionsRaw : teamAPossessionsRaw)
+      : completedPossessions - playerPossessions;
+    const playerPoints = Number(game.user_score ?? finalState.user_score);
+    const aiPoints = Number(
+      game.opponent_score ?? finalState.ai_score ?? finalState.opponent_score,
+    );
+    if (
+      !Number.isFinite(playerPoints)
+      || !Number.isFinite(aiPoints)
+    ) {
+      return null;
+    }
+    totals.playerPoints += playerPoints;
+    totals.aiPoints += aiPoints;
+    totals.totalPossessions += hasStableTeamPossessions
+      ? playerPossessions + aiPossessions
+      : completedPossessions;
+    totals.playerOffensivePossessions += playerPossessions;
+    totals.aiOffensivePossessions += aiPossessions;
+    completedGameCount += 1;
+  }
+  return completedGameCount > 0 ? totals : null;
+}
+
 export function getDefaultStats() {
   return {
     episodes: 0,
@@ -40,6 +173,10 @@ export function getDefaultStats() {
       offensiveThreeSeconds: 0,
     },
     points: 0,
+    opponentPoints: 0,
+    totalPossessions: 0,
+    offensivePossessions: 0,
+    opponentOffensivePossessions: 0,
     rewardSum: 0,
     episodeStepsSum: 0,
     intentSelectionCounts: {},
@@ -109,6 +246,7 @@ export function getDefaultStats() {
       offense_value_mae: 0,
       defense_value_mae: 0,
     },
+    spatialDiagnostics: normalizeSpatialDiagnostics(),
   };
 }
 
@@ -160,6 +298,10 @@ export function loadStats() {
         offensiveThreeSeconds: Number(parsed?.violations?.offensiveThreeSeconds) || 0,
       },
       points: Number(parsed.points) || 0,
+      opponentPoints: Number(parsed.opponentPoints) || 0,
+      totalPossessions: Number(parsed.totalPossessions) || 0,
+      offensivePossessions: Number(parsed.offensivePossessions) || 0,
+      opponentOffensivePossessions: Number(parsed.opponentOffensivePossessions) || 0,
       rewardSum: Number(parsed.rewardSum) || 0,
       episodeStepsSum: Number(parsed.episodeStepsSum) || 0,
       intentSelectionCounts: normalizeNumberRecord(parsed.intentSelectionCounts),
@@ -221,6 +363,7 @@ export function loadStats() {
       valueDiagnostics: (parsed?.valueDiagnostics && typeof parsed.valueDiagnostics === 'object')
         ? { ...parsed.valueDiagnostics }
         : getDefaultStats().valueDiagnostics,
+      spatialDiagnostics: normalizeSpatialDiagnostics(parsed?.spatialDiagnostics),
     };
   } catch (e) {
     // Corrupt storage; reset

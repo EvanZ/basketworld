@@ -209,6 +209,19 @@ def test_game_longer_than_horizon_contributes_each_chunk_and_finishes_without_re
         jax,
         jnp,
     )._replace(shot_clock=jnp.asarray([2], dtype=jnp.int32))
+    current_team = int(np.asarray(state.offense_team)[0])
+    state = state._replace(
+        team_a_completed_possessions=jnp.asarray(
+            [0 if current_team == TEAM_A else 1], dtype=jnp.int32
+        ),
+        team_b_completed_possessions=jnp.asarray(
+            [1 if current_team == TEAM_A else 0], dtype=jnp.int32
+            ),
+            completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+            # Avoid entering paired overtime; this test isolates rollout
+            # chunking across a regulation game boundary.
+            team_a_score=jnp.asarray([1.0], dtype=jnp.float32),
+        )
     actions = jnp.full(
         (1, state.positions.shape[1]),
         ActionType.NOOP.value,
@@ -225,7 +238,7 @@ def test_game_longer_than_horizon_contributes_each_chunk_and_finishes_without_re
     )
     assert not bool(np.asarray(first_chunk.done)[0])
     assert int(np.asarray(first_chunk.state.step_count)[0]) == 1
-    assert int(np.asarray(first_chunk.state.completed_possessions)[0]) == 0
+    assert int(np.asarray(first_chunk.state.completed_possessions)[0]) == 1
 
     second_chunk = step_batch_minimal(
         static,
@@ -237,7 +250,7 @@ def test_game_longer_than_horizon_contributes_each_chunk_and_finishes_without_re
     )
     assert bool(np.asarray(second_chunk.done)[0])
     assert int(np.asarray(second_chunk.state.step_count)[0]) == 2
-    assert int(np.asarray(second_chunk.state.completed_possessions)[0]) == 1
+    assert int(np.asarray(second_chunk.state.completed_possessions)[0]) == 2
 
     for done in (first_chunk.done, second_chunk.done):
         trajectory = SimpleNamespace(

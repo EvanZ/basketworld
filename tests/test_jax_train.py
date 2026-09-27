@@ -227,17 +227,33 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
             "active_steps": np.asarray([120]),
             "completed_possessions": np.asarray([25]),
             "completed_possession_live_steps": np.asarray([75]),
+            "spatial_live_steps": np.asarray([75]),
+            "spatial_all_player_pair_distance": np.asarray([225.0]),
+            "candidate_spatial_teammate_pair_distance": np.asarray([150.0]),
+            "opponent_spatial_teammate_pair_distance": np.asarray([300.0]),
+            "spatial_boundary_player_fraction": np.asarray([15.0]),
+            "spatial_corner_player_fraction": np.asarray([7.5]),
             "candidate_pass_attempts": np.asarray([10]),
             "candidate_completed_passes": np.asarray([8]),
             "candidate_shot_attempts": np.asarray([4]),
             "candidate_shot_makes": np.asarray([1]),
             "candidate_clearance_events": np.asarray([5]),
             "candidate_clearance_elapsed_steps": np.asarray([11]),
+            "check_opportunities": np.asarray([4]),
+            "check_pickups": np.asarray([3]),
+            "check_violations": np.asarray([1]),
+            "check_pickup_steps": np.asarray([7]),
         },
         team_b_candidate_diagnostics={
             "active_steps": np.asarray([100]),
             "completed_possessions": np.asarray([25]),
             "completed_possession_live_steps": np.asarray([65]),
+            "spatial_live_steps": np.asarray([65]),
+            "spatial_all_player_pair_distance": np.asarray([195.0]),
+            "candidate_spatial_teammate_pair_distance": np.asarray([195.0]),
+            "opponent_spatial_teammate_pair_distance": np.asarray([130.0]),
+            "spatial_boundary_player_fraction": np.asarray([13.0]),
+            "spatial_corner_player_fraction": np.asarray([6.5]),
         },
         seed=3_000_000,
         horizon=1024,
@@ -253,7 +269,17 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
     assert summary["candidate_pass_completion_rate"] == pytest.approx(0.8)
     assert summary["candidate_shot_make_rate"] == pytest.approx(0.25)
     assert summary["candidate_mean_clearance_steps"] == pytest.approx(2.2)
+    assert summary["check_opportunity_count"] == 4
+    assert summary["check_pickup_count"] == 3
+    assert summary["check_violation_count"] == 1
+    assert summary["check_pickup_rate"] == pytest.approx(0.75)
+    assert summary["check_mean_pickup_steps"] == pytest.approx(7.0 / 3.0)
     assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(2.8)
+    assert summary["mean_live_all_player_pair_distance"] == pytest.approx(3.0)
+    assert summary["candidate_mean_live_teammate_pair_distance"] == pytest.approx(345.0 / 140.0)
+    assert summary["opponent_mean_live_teammate_pair_distance"] == pytest.approx(430.0 / 140.0)
+    assert summary["mean_live_boundary_player_fraction"] == pytest.approx(0.2)
+    assert summary["mean_live_corner_player_fraction"] == pytest.approx(0.1)
     assert len(summary["episode_diagnostics"]) == 2
     team_a_row, team_b_row = summary["episode_diagnostics"]
     assert team_a_row["candidate_fixed_team"] == "team_a"
@@ -261,6 +287,7 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
     assert team_a_row["opponent_score"] == 0
     assert team_a_row["candidate_pass_attempts"] == 10
     assert team_a_row["candidate_completed_passes"] == 8
+    assert team_a_row["spatial_all_player_pair_distance"] == pytest.approx(225.0)
     assert team_a_row["completed_possessions"] == 25
     assert team_b_row["candidate_fixed_team"] == "team_b"
     assert team_b_row["candidate_score"] == 0
@@ -680,6 +707,12 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         turnovers=2.0,
         completed_possessions=3.0,
         completed_possession_live_steps=7.0,
+        spatial_live_steps=4.0,
+        spatial_all_player_pair_distance=12.0,
+        spatial_offense_teammate_pair_distance=10.0,
+        spatial_defense_teammate_pair_distance=14.0,
+        spatial_boundary_player_fraction=1.5,
+        spatial_corner_player_fraction=0.5,
         turnover_intercepted=1.0,
         shot_attempts=5.0,
         shot_makes=2.0,
@@ -689,6 +722,10 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         offensive_rebounds=1.0,
         defensive_rebounds=3.0,
         rebound_global_contests=2.0,
+        check_opportunities=4.0,
+        check_pickups=3.0,
+        check_violations=1.0,
+        check_pickup_steps=7.0,
     )
     diagnostics = {field: 0.0 for field in ReboundDiagnosticTotals._fields}
     diagnostics.update(
@@ -732,7 +769,19 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
     assert summary["rebound_softmax_win_rate_defense"] == pytest.approx(0.625)
     assert summary["rebound_softmax_empirical_gap_defense"] == pytest.approx(0.125)
     assert summary["turnover_intercepted_share"] == pytest.approx(0.5)
+    assert summary["check_opportunity_count"] == 4
+    assert summary["check_pickup_count"] == 3
+    assert summary["check_violation_count"] == 1
+    assert summary["check_pickup_rate"] == pytest.approx(0.75)
+    assert summary["check_mean_pickup_steps"] == pytest.approx(7.0 / 3.0)
     assert summary["completed_possession_count"] == 3
+    assert summary["mean_winner_reward_per_episode"] == pytest.approx(0.0)
+    assert summary["spatial_live_step_count"] == 4
+    assert summary["mean_live_all_player_pair_distance"] == pytest.approx(3.0)
+    assert summary["mean_live_offense_teammate_pair_distance"] == pytest.approx(2.5)
+    assert summary["mean_live_defense_teammate_pair_distance"] == pytest.approx(3.5)
+    assert summary["mean_live_boundary_player_fraction"] == pytest.approx(0.375)
+    assert summary["mean_live_corner_player_fraction"] == pytest.approx(0.125)
     assert summary["completed_possession_live_steps"] == 7
     assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(
         7.0 / 3.0
@@ -1177,6 +1226,51 @@ def test_ppo_eligible_episode_metrics_use_training_mask():
     assert metrics["test_ppo_eligible_terminal_turnover_share"] == pytest.approx(1.0)
     assert metrics["test_ppo_eligible_terminal_turnover_intercepted_share"] == pytest.approx(1.0)
     assert metrics["test_ppo_eligible_shot_attempts_total"] == pytest.approx(0.0)
+
+
+def test_ppo_eligible_role_reward_metrics_exclude_opposite_live_role():
+    """Role-labelled rewards must not net the learner's other live role."""
+    jnp = pytest.importorskip("jax.numpy")
+
+    time_steps = 4
+    batch_size = 1
+    zeros = jnp.zeros((time_steps, batch_size), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, batch_size), dtype=jnp.float32),
+            "training_role": jnp.asarray([[1], [-1], [1], [-1]], dtype=jnp.float32),
+            "rewards": jnp.asarray([[2.0], [-3.0], [1.0], [-2.0]], dtype=jnp.float32),
+            "dones": jnp.asarray([[0], [0], [0], [1]], dtype=jnp.int8),
+            "terminal_episode_steps": jnp.asarray([[0], [0], [0], [4]], dtype=jnp.int32),
+        }
+    )
+    trajectory = TrajectoryBatch(**trajectory_data)
+    training_mask = jnp.ones((time_steps, batch_size), dtype=jnp.float32)
+    live_role = np.asarray(trajectory.training_role, dtype=np.float32)
+
+    offense_metrics = summarize_ppo_eligible_episode_metrics(
+        "offense_ppo_eligible",
+        trajectory,
+        training_mask,
+        metric_mask=(live_role > 0.0).astype(np.float32),
+        completion_mask=training_mask,
+    )
+    defense_metrics = summarize_ppo_eligible_episode_metrics(
+        "defense_ppo_eligible",
+        trajectory,
+        training_mask,
+        metric_mask=(live_role < 0.0).astype(np.float32),
+        completion_mask=training_mask,
+    )
+
+    # The complete game ends on a defensive tick. Both role diagnostics must
+    # nevertheless use that one completed-game denominator, while only
+    # accumulating rewards emitted during their own live role.
+    assert offense_metrics["offense_ppo_eligible_completed_episodes"] == pytest.approx(1.0)
+    assert defense_metrics["defense_ppo_eligible_completed_episodes"] == pytest.approx(1.0)
+    assert offense_metrics["offense_ppo_eligible_reward_per_completed_episode"] == pytest.approx(3.0)
+    assert defense_metrics["defense_ppo_eligible_reward_per_completed_episode"] == pytest.approx(-5.0)
 
 
 def test_reward_by_intent_metrics_attribute_completed_episodes_to_start_intent():
@@ -2077,10 +2171,16 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert deploy_metrics["same_policy_both_sides"] == 1
     assert "rebound_softmax_win_rate_offense" in deploy_metrics
     assert "defensive_rebound_rate" in deploy_metrics
+    assert "mean_live_all_player_pair_distance" in deploy_metrics
+    assert "mean_live_offense_teammate_pair_distance" in deploy_metrics
+    assert "mean_live_defense_teammate_pair_distance" in deploy_metrics
+    assert "mean_live_boundary_player_fraction" in deploy_metrics
+    assert "mean_live_corner_player_fraction" in deploy_metrics
     assert result["final_metrics"]["update_index"] == 2
     assert "mean_reward" in result["final_metrics"]
     assert "offense_mean_reward" in result["final_metrics"]
     assert "defense_mean_reward" in result["final_metrics"]
+    assert "mean_live_all_player_pair_distance" in result["final_metrics"]
     assert "offense_learner_mean_reward" in result["final_metrics"]
     assert "defense_learner_mean_reward" in result["final_metrics"]
     assert "offense_opponent_mean_reward" in result["final_metrics"]

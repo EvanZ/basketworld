@@ -25,6 +25,7 @@ from app.backend.state import GameState
 from basketworld.envs.basketworld_env_v2 import Team
 from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
+    GAME_PHASE_AWAITING_CHECK,
     SHOT_TYPE_DUNK,
     TEAM_A,
     TEAM_B,
@@ -345,6 +346,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
                 "rebound_target_temperature": 0.75,
                 "rebound_winner_temperature": 0.5,
                 "offensive_rebound_shot_clock_reset": 13,
+                "multi_possession_use_inbounds": False,
             },
         }
     )
@@ -359,6 +361,8 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
     assert float(np.asarray(runtime.static.rebound_target_temperature)) == pytest.approx(0.75)
     assert float(np.asarray(runtime.static.rebound_winner_temperature)) == pytest.approx(0.5)
     assert int(np.asarray(runtime.static.offensive_rebound_shot_clock_reset)) == 13
+    assert runtime.env_params["multi_possession_use_inbounds"] is False
+    assert int(np.asarray(runtime.static.multi_possession_use_inbounds)) == 0
 
     runtime.env_params["enable_rebounds"] = True
     runtime.display_env.enable_rebounds = True
@@ -503,7 +507,14 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert "policy_probabilities" not in start["state"]
     assert start["state"]["state_values"] == expected_values
     assert "obs_tokens" not in start["state"]
-    assert "training_params" not in start["state"]
+    assert "training_params" in start["state"]
+    assert len(start["state"]["player_shooting_skills"]) == runtime.n_players
+    assert len(start["state"]["player_rebound_skills"]) == runtime.n_players
+    assert len(start["state"]["player_rebound_skill_specialists"]) == runtime.n_players
+    assert len(start["state"]["team_a_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
+    assert len(start["state"]["team_b_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
+    assert start["state"]["episode_parameters"]["shot"] == start["state"]["shot_params"]
+    assert start["state"]["episode_parameters"]["rebound"] == start["state"]["rebound_runtime"]
 
     # The production Fast Mode path uses a cached JIT kernel.  Disable JIT for
     # this serialization-focused test so CI does not spend minutes compiling
@@ -524,11 +535,14 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert state["fast_mode"] is True
     assert len(state["positions"]) == runtime.n_players
     assert len(state["action_mask"]) == runtime.n_players
+    assert state["starting_offense_team"] in {"team_a", "team_b"}
     assert runtime._fast_action_mask is not None
     assert "last_action_results" in state
     assert "policy_probabilities" not in state
     assert state["state_values"] == expected_values
     assert "pre_step_state_values" not in body
+    assert "episode_parameters" not in state
+    assert "offense_shooting_pct_by_player" in state
 
 
 def _make_selector_runtime_and_state():
@@ -1396,7 +1410,12 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
         offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
         team_a_score=jnp.asarray([4.0], dtype=jnp.float32),
         team_b_score=jnp.asarray([6.0], dtype=jnp.float32),
+        team_a_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([2], dtype=jnp.int32),
         completed_possessions=jnp.asarray([3], dtype=jnp.int32),
+        overtime_round=jnp.asarray([2], dtype=jnp.int32),
+        overtime_possessions_completed=jnp.asarray([1], dtype=jnp.int32),
+        overtime_starting_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
         game_phase=jnp.asarray([GAME_PHASE_AWAITING_INBOUND], dtype=jnp.int8),
         inbound_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
         inbound_player=jnp.asarray([inbounder], dtype=jnp.int32),
@@ -1413,6 +1432,7 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     state = runtime.get_full_game_state(game_state, include_policy_probs=False)
 
     assert state["enable_multi_possession"] is True
+    assert state["multi_possession_use_inbounds"] is True
     assert state["team_a_score"] == pytest.approx(4.0)
     assert state["team_b_score"] == pytest.approx(6.0)
     assert state["user_score"] == pytest.approx(4.0)
@@ -1422,7 +1442,15 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     assert state["defense_ids"] == runtime.offense_ids
     assert state["user_player_ids"] == runtime.offense_ids
     assert state["completed_possessions"] == 3
-    assert state["remaining_possessions"] == 2
+    assert state["user_completed_possessions"] == 1
+    assert state["ai_completed_possessions"] == 2
+    assert state["in_overtime"] is True
+    assert state["overtime_round"] == 2
+    assert state["overtime_possessions_completed"] == 1
+    assert state["overtime_starting_team"] == "team_b"
+    assert state["clearance_zone_cells"]
+    assert state["starting_offense_team"] == "team_a"
+    assert state["remaining_possessions"] == 7
     assert state["game_phase"] == "awaiting_inbound"
     assert state["inbound_player"] == inbounder
     assert state["inbound_steps_remaining"] == 4
@@ -1435,10 +1463,54 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
         "relative_score",
         "possessions_remaining_norm",
         "clearance_required",
-        "inbound_phase",
-        "inbound_countdown_norm",
+        "restart_phase",
+        "restart_countdown_norm",
     ]
     assert runtime.observation_dict(observer_is_offense=True)["role_flag"].tolist() == [-1.0]
+
+
+def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+            "made_basket_restart_mode": "check",
+            "check_deadline_steps": 4,
+        }
+    )
+    runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
+    runtime.state = runtime.state._replace(
+        ball_holder=jnp.asarray([-1], dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        game_phase=jnp.asarray([GAME_PHASE_AWAITING_CHECK], dtype=jnp.int8),
+        check_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        check_steps_remaining=jnp.asarray([3], dtype=jnp.int32),
+        check_steps_elapsed=jnp.asarray([1], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    for compact in (False, True):
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=False,
+            compact=compact,
+        )
+
+        assert state["game_phase"] == "awaiting_check"
+        assert state["made_basket_restart_mode"] == "check"
+        assert state["check_team"] == "team_b"
+        assert state["check_position"] == [
+            int(v) for v in np.asarray(runtime.static.check_position).tolist()
+        ]
+        assert state["check_steps_remaining"] == 3
+        assert state["check_deadline_steps"] == 4
+        assert state["ball_holder"] is None
 
 
 def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
@@ -1521,6 +1593,29 @@ def test_jax_dev_runtime_changes_possession_limit_without_discarding_fast_kernel
     assert runtime._fast_kernel_generation == 7
     assert int(np.asarray(runtime.static.multi_possession_limit)) == 11
     assert runtime.display_env.multi_possession_limit == 11
+
+
+def test_jax_dev_runtime_changes_check_restart_without_discarding_fast_kernel():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        },
+    )
+    cached_runner = object()
+    runtime._step_batch_runner = cached_runner
+    runtime._fast_kernel_ready = True
+    runtime._fast_kernel_generation = 7
+
+    runtime.set_made_basket_restart("check", 4)
+
+    assert runtime._step_batch_runner is cached_runner
+    assert runtime.fast_kernel_status()["ready"] is True
+    assert runtime._fast_kernel_generation == 7
+    assert runtime.env_params["made_basket_restart_mode"] == "check"
+    assert runtime.env_params["check_deadline_steps"] == 4
+    assert runtime.display_env.made_basket_restart_mode == "check"
+    assert runtime.display_env.check_deadline_steps == 4
 
 
 def test_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):

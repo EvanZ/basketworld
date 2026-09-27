@@ -59,6 +59,7 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/enable_rebound_reward_redistribution": "true",
         "jax/env/offensive_rebound_reward_advance": "0.35",
         "jax/env/rebound_reward_once_per_possession": "false",
+        "jax/env/multi_possession_use_inbounds": "false",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
@@ -107,6 +108,7 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["enable_rebound_reward_redistribution"] is True
     assert merged["offensive_rebound_reward_advance"] == 0.35
     assert merged["rebound_reward_once_per_possession"] is False
+    assert merged["multi_possession_use_inbounds"] is False
 
 
 def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():

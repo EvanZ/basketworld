@@ -29,7 +29,14 @@ import {
   setDefenderPressureParams,
   setReboundParams,
 } from '@/services/api';
-import { loadStats, saveStats, resetStatsStorage } from '@/services/stats';
+import {
+  countTeamOffensivePossessions,
+  getEpisodeMultiPossessionScoreTotals,
+  getNativeMultiPossessionScoreTotals,
+  loadStats,
+  saveStats,
+  resetStatsStorage,
+} from '@/services/stats';
 
 function formatParamCount(n) {
   if (n === null || n === undefined) return 'N/A';
@@ -569,12 +576,19 @@ const userPolicySelection = ref('');
 const opponentPolicySelection = ref('');
 const isMultiPossessionGame = computed(() => Boolean(props.gameState?.enable_multi_possession));
 const multiPossessionLimitInput = ref(25);
+const madeBasketRestartModeInput = ref('baseline_inbound');
+const checkDeadlineStepsInput = ref(5);
 const normalizedMultiPossessionLimit = computed(() => {
   const value = Math.trunc(Number(multiPossessionLimitInput.value));
   return Number.isFinite(value) && value >= 1 ? value : 1;
 });
 const multiPossessionLimitIsCurrent = computed(() => (
   normalizedMultiPossessionLimit.value === Number(props.gameState?.multi_possession_limit)
+  && madeBasketRestartModeInput.value === String(
+    props.gameState?.made_basket_restart_mode ?? 'baseline_inbound'
+  )
+  && Math.trunc(Number(checkDeadlineStepsInput.value))
+    === Number(props.gameState?.check_deadline_steps ?? 5)
 ));
 
 watch(
@@ -586,9 +600,26 @@ watch(
   { immediate: true },
 );
 
+watch(
+  () => [
+    props.gameState?.made_basket_restart_mode,
+    props.gameState?.check_deadline_steps,
+  ],
+  ([mode, deadline]) => {
+    madeBasketRestartModeInput.value = String(mode ?? 'baseline_inbound');
+    const parsed = Math.trunc(Number(deadline));
+    checkDeadlineStepsInput.value = Number.isFinite(parsed) && parsed >= 1 ? parsed : 5;
+  },
+  { immediate: true },
+);
+
 function requestMultiPossessionLimitRestart() {
   if (!isMultiPossessionGame.value || multiPossessionLimitIsCurrent.value) return;
-  emit('multi-possession-limit-requested', normalizedMultiPossessionLimit.value);
+  emit('multi-possession-limit-requested', {
+    multiPossessionLimit: normalizedMultiPossessionLimit.value,
+    madeBasketRestartMode: madeBasketRestartModeInput.value,
+    checkDeadlineSteps: Math.max(1, Math.trunc(Number(checkDeadlineStepsInput.value) || 5)),
+  });
 }
 
 const playerPolicyLabel = computed(() => {
@@ -4921,7 +4952,15 @@ const totalViolations = computed(() => (
   Number(statsState.value?.violations?.defensiveLane || 0)
   + Number(statsState.value?.violations?.offensiveThreeSeconds || 0)
 ));
-const ppp = computed(() => safeDiv(statsState.value.points, Math.max(1, statsState.value.episodes)));
+const totalCompletedPossessions = computed(() => Number(statsState.value?.totalPossessions || 0));
+const offensivePossessions = computed(() => Number(statsState.value?.offensivePossessions || 0));
+const opponentOffensivePossessions = computed(() => (
+  Number(statsState.value?.opponentOffensivePossessions || 0)
+));
+const ppp = computed(() => safeDiv(statsState.value.points, offensivePossessions.value));
+const opponentPpp = computed(() => (
+  safeDiv(Number(statsState.value?.opponentPoints || 0), opponentOffensivePossessions.value)
+));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 const totalReboundChances = computed(() => (
@@ -5020,6 +5059,40 @@ const valueDiagRows = computed(() => [
   { key: 'offense_value_mae', label: 'OFF value MAE', value: formatDebugNumber(valueDiag.value?.offense_value_mae, 3) },
   { key: 'defense_value_mae', label: 'DEF value MAE', value: formatDebugNumber(valueDiag.value?.defense_value_mae, 3) },
 ]);
+const spatialDiag = computed(() => statsState.value?.spatialDiagnostics || {});
+const spatialLiveStepCount = computed(() => Number(spatialDiag.value?.liveStepCount || 0));
+const spatialDiagRows = computed(() => [
+  {
+    key: 'live_steps',
+    label: 'Live-play samples',
+    value: String(spatialLiveStepCount.value),
+  },
+  {
+    key: 'all_players',
+    label: 'All-player pair distance',
+    value: `${formatDebugNumber(spatialDiag.value?.meanAllPlayerPairDistance, 2)} hex`,
+  },
+  {
+    key: 'offense_teammates',
+    label: 'OFF teammate distance',
+    value: `${formatDebugNumber(spatialDiag.value?.meanOffenseTeammatePairDistance, 2)} hex`,
+  },
+  {
+    key: 'defense_teammates',
+    label: 'DEF teammate distance',
+    value: `${formatDebugNumber(spatialDiag.value?.meanDefenseTeammatePairDistance, 2)} hex`,
+  },
+  {
+    key: 'boundary',
+    label: 'Boundary occupancy',
+    value: formatDebugProb(spatialDiag.value?.meanBoundaryPlayerFraction),
+  },
+  {
+    key: 'corner',
+    label: 'Corner-zone occupancy',
+    value: formatDebugProb(spatialDiag.value?.meanCornerPlayerFraction),
+  },
+]);
 const avgOffenseReboundTargetDistance = computed(() => (
   safeDiv(Number(statsState.value?.rebounds?.targetDistanceSumOffense || 0), reboundTargetDistanceCount.value)
 ));
@@ -5029,6 +5102,11 @@ const avgDefenseReboundTargetDistance = computed(() => (
 
 function ensureStatsDiagnosticFields(target) {
   if (!target || typeof target !== 'object') return;
+  target.points = Number(target.points || 0);
+  target.opponentPoints = Number(target.opponentPoints || 0);
+  target.totalPossessions = Number(target.totalPossessions || 0);
+  target.offensivePossessions = Number(target.offensivePossessions || 0);
+  target.opponentOffensivePossessions = Number(target.opponentOffensivePossessions || 0);
   if (!target.intentSelectionCounts || typeof target.intentSelectionCounts !== 'object') {
     target.intentSelectionCounts = {};
   }
@@ -5128,6 +5206,27 @@ function ensureStatsDiagnosticFields(target) {
     target.valueDiagnostics
     && typeof target.valueDiagnostics === "object"
   ) ? target.valueDiagnostics : {};
+  if (!target.spatialDiagnostics || typeof target.spatialDiagnostics !== 'object') {
+    target.spatialDiagnostics = {};
+  }
+  target.spatialDiagnostics.liveStepCount = Number(
+    target.spatialDiagnostics.liveStepCount || 0,
+  );
+  target.spatialDiagnostics.meanAllPlayerPairDistance = Number(
+    target.spatialDiagnostics.meanAllPlayerPairDistance || 0,
+  );
+  target.spatialDiagnostics.meanOffenseTeammatePairDistance = Number(
+    target.spatialDiagnostics.meanOffenseTeammatePairDistance || 0,
+  );
+  target.spatialDiagnostics.meanDefenseTeammatePairDistance = Number(
+    target.spatialDiagnostics.meanDefenseTeammatePairDistance || 0,
+  );
+  target.spatialDiagnostics.meanBoundaryPlayerFraction = Number(
+    target.spatialDiagnostics.meanBoundaryPlayerFraction || 0,
+  );
+  target.spatialDiagnostics.meanCornerPlayerFraction = Number(
+    target.spatialDiagnostics.meanCornerPlayerFraction || 0,
+  );
 }
 
 ensureStatsDiagnosticFields(statsState.value);
@@ -5510,13 +5609,54 @@ function buildEvalAggregateRow(entry) {
     orbPct: reboundChances > 0 ? (offensiveRebounds / reboundChances) * 100 : 0,
     drbPct: reboundChances > 0 ? (defensiveRebounds / reboundChances) * 100 : 0,
     episodes,
-    ppp: episodes > 0 ? points / episodes : 0,
+    pointsPerEpisode: episodes > 0 ? points / episodes : 0,
     unassisted: {
       dunk: Math.max(0, dunk.mk - Number(assistByType.dunk || 0)),
       two: Math.max(0, two.mk - Number(assistByType.two || 0)),
       three: Math.max(0, three.mk - Number(assistByType.three || 0)),
     },
   };
+}
+
+function recordPossessionTotals(target, {
+  completedPossessions,
+  teamACompletedPossessions,
+  teamBCompletedPossessions,
+  startingOffenseTeam,
+  multiPossession,
+  userTeamIsA,
+}) {
+  if (!target || typeof target !== 'object') return;
+  const completed = Math.max(0, Math.trunc(Number(completedPossessions) || 0));
+  if (multiPossession) {
+    const teamA = Number(teamACompletedPossessions);
+    const teamB = Number(teamBCompletedPossessions);
+    const hasStableTeamCounts = (
+      Number.isFinite(teamA) && teamA >= 0
+      && Number.isFinite(teamB) && teamB >= 0
+    );
+    const playerPossessions = hasStableTeamCounts
+      ? Math.trunc(userTeamIsA ? teamA : teamB)
+      : countTeamOffensivePossessions(
+        completed,
+        startingOffenseTeam,
+        userTeamIsA,
+      );
+    const aiPossessions = hasStableTeamCounts
+      ? Math.trunc(userTeamIsA ? teamB : teamA)
+      : completed - playerPossessions;
+    target.totalPossessions += hasStableTeamCounts
+      ? playerPossessions + aiPossessions
+      : completed;
+    target.offensivePossessions += playerPossessions;
+    target.opponentOffensivePossessions += aiPossessions;
+    return;
+  }
+  // Legacy episodes are a single offensive possession. Preserve their prior
+  // semantics while allowing the multi-possession path to be exact.
+  target.totalPossessions += 1;
+  if (userTeamIsA) target.offensivePossessions += 1;
+  else target.opponentOffensivePossessions += 1;
 }
 
 const selectedEvalStats = computed(() => {
@@ -5651,6 +5791,7 @@ const shotChartConfig = computed(() => {
 
 async function recordEpisodeStats(finalState, skipApiCall = false, episodeData = null) {
   ensureStatsDiagnosticFields(statsState.value);
+  const multiPossession = Boolean(finalState?.enable_multi_possession);
   const results = finalState?.last_action_results || {};
   // Shot attempt (at most one at termination)
   const shots = results?.shots || {};
@@ -5682,7 +5823,7 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
       if (potentialAssisted) statsState.value.twoPt.potentialAssists += 1;
     }
 
-    if (made) {
+    if (made && !multiPossession) {
       statsState.value.points += isThree ? 3 : 2;
     }
   }
@@ -5709,7 +5850,9 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
     (turnover) => String(turnover?.reason || '') === 'offensive_three_seconds'
   ).length;
   // Defensive 3-second violation awards offense 1 point.
-  statsState.value.points += Number(defensiveLaneCount || 0);
+  if (!multiPossession) {
+    statsState.value.points += Number(defensiveLaneCount || 0);
+  }
   statsState.value.violations.defensiveLane += Number(defensiveLaneCount || 0);
   statsState.value.violations.offensiveThreeSeconds += Number(offensiveThreeCount || 0);
 
@@ -5737,6 +5880,33 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   statsState.value.rewardBreakdown.totalReward += Number(episodeRewardAdded || 0);
   statsState.value.rewardBreakdown.unexplained += Number(episodeRewardAdded || 0);
 
+  const userTeamIsA = Boolean(
+    finalState?.team_ownership?.team_a === 'user'
+    || String(finalState?.user_team_name || 'OFFENSE').toUpperCase() === 'OFFENSE'
+  );
+  recordPossessionTotals(statsState.value, {
+    completedPossessions: finalState?.completed_possessions,
+    teamACompletedPossessions: finalState?.team_a_completed_possessions,
+    teamBCompletedPossessions: finalState?.team_b_completed_possessions,
+    startingOffenseTeam: finalState?.starting_offense_team,
+    multiPossession,
+    userTeamIsA,
+  });
+
+  // A completed multi-possession game contains many scoring events.  The
+  // final stable-team scoreboard is therefore the only exact source for the
+  // Player and AI totals; `last_action_results` describes just the final tick.
+  if (multiPossession) {
+    const playerScore = Number(finalState?.user_score);
+    const aiScore = Number(finalState?.ai_score);
+    if (Number.isFinite(playerScore)) {
+      statsState.value.points += playerScore;
+    }
+    if (Number.isFinite(aiScore)) {
+      statsState.value.opponentPoints += aiScore;
+    }
+  }
+
   // Increment episode count last
   statsState.value.episodes += 1;
   saveStats(statsState.value);
@@ -5751,11 +5921,21 @@ function applyEvaluationStats(
   const next = resetStatsStorage();
   ensureStatsDiagnosticFields(next);
   const statsByPlayer = perPlayerStats || {};
+  const evaluationUsesMultiPossession = Boolean(
+    isMultiPossessionGame.value
+    || (episodeResults || []).some((row) => row?.final_state?.enable_multi_possession)
+  );
 
   const offenseIds = (props.gameState?.offense_ids || []).map((id) => Number(id));
   const defenseIds = (props.gameState?.defense_ids || []).map((id) => Number(id));
+  const stableUserIds = (props.gameState?.user_player_ids || []).map((id) => Number(id));
 
-  let teamIds = userTeamName === 'DEFENSE' ? defenseIds : offenseIds;
+  // In multi-possession play offense_ids/defense_ids describe the current
+  // possession and change after every switch.  Player statistics must instead
+  // remain attached to the fixed blue roster.
+  let teamIds = evaluationUsesMultiPossession && stableUserIds.length > 0
+    ? stableUserIds
+    : (userTeamName === 'DEFENSE' ? defenseIds : offenseIds);
   if (!Array.isArray(teamIds) || teamIds.length === 0) {
     const allIds = Object.keys(statsByPlayer)
       .map((k) => Number(k))
@@ -5884,6 +6064,29 @@ function applyEvaluationStats(
     const epRewards = row?.episode_rewards || {};
     const rewardVal = userTeamName === 'DEFENSE' ? epRewards?.defense : epRewards?.offense;
     next.rewardSum += Number(rewardVal || 0);
+
+    const finalState = row?.final_state || {};
+    const game = row?.game || {};
+    const multiPossession = Boolean(
+      isMultiPossessionGame.value || finalState?.enable_multi_possession
+    );
+    const userTeamIsA = multiPossession
+      ? true
+      : String(userTeamName || 'OFFENSE').toUpperCase() === 'OFFENSE';
+    recordPossessionTotals(next, {
+      completedPossessions: game?.completed_possessions ?? finalState?.completed_possessions,
+      teamACompletedPossessions: (
+        game?.team_a_completed_possessions
+        ?? finalState?.team_a_completed_possessions
+      ),
+      teamBCompletedPossessions: (
+        game?.team_b_completed_possessions
+        ?? finalState?.team_b_completed_possessions
+      ),
+      startingOffenseTeam: game?.starting_offense_team ?? finalState?.starting_offense_team,
+      multiPossession,
+      userTeamIsA,
+    });
   }
 
   if (evalDiagnostics && typeof evalDiagnostics === 'object') {
@@ -5933,12 +6136,34 @@ function applyEvaluationStats(
     const selectorDiagRaw = evalDiagnostics.selector || {};
     const nativeSummary = evalDiagnostics.jax_native_summary || {};
     const nativeEpisodeCount = Number(nativeSummary.num_episodes ?? 0);
+    const nativeMultiPossession = Boolean(
+      nativeSummary.multi_possession_enabled
+      || nativeSummary.paired_starting_team_evaluation?.enabled
+    );
+    const nativeMultiTotals = nativeMultiPossession
+      ? getNativeMultiPossessionScoreTotals(nativeSummary)
+      : null;
+    const episodeMultiTotals = nativeMultiPossession && !nativeMultiTotals
+      ? getEpisodeMultiPossessionScoreTotals(episodeResults, true)
+      : null;
     const nativeTeamPrefix = String(userTeamName || 'OFFENSE').toUpperCase() === 'DEFENSE'
       ? 'defense'
       : 'offense';
     const nativeTotalPoints = Number(nativeSummary[`total_${nativeTeamPrefix}_points`]);
     const nativeRewardPerEpisode = Number(nativeSummary[`${nativeTeamPrefix}_reward_per_episode`]);
-    if (Number.isFinite(nativeTotalPoints)) {
+    if (nativeMultiTotals) {
+      next.points = nativeMultiTotals.playerPoints;
+      next.opponentPoints = nativeMultiTotals.aiPoints;
+      next.totalPossessions = nativeMultiTotals.totalPossessions;
+      next.offensivePossessions = nativeMultiTotals.playerOffensivePossessions;
+      next.opponentOffensivePossessions = nativeMultiTotals.aiOffensivePossessions;
+    } else if (episodeMultiTotals) {
+      next.points = episodeMultiTotals.playerPoints;
+      next.opponentPoints = episodeMultiTotals.aiPoints;
+      next.totalPossessions = episodeMultiTotals.totalPossessions;
+      next.offensivePossessions = episodeMultiTotals.playerOffensivePossessions;
+      next.opponentOffensivePossessions = episodeMultiTotals.aiOffensivePossessions;
+    } else if (Number.isFinite(nativeTotalPoints)) {
       next.points = nativeTotalPoints;
     }
     if (nativeEpisodeCount > 0 && Number.isFinite(nativeRewardPerEpisode)) {
@@ -6149,6 +6374,25 @@ function applyEvaluationStats(
     ) ? evalDiagnostics.value_diagnostics : {};
     next.valueDiagnostics = { ...rawValueDiagnostics };
     console.info('[Stats] Value diagnostics', next.valueDiagnostics);
+    next.spatialDiagnostics = {
+      liveStepCount: Number(nativeSummary.spatial_live_step_count || 0),
+      meanAllPlayerPairDistance: Number(
+        nativeSummary.mean_live_all_player_pair_distance || 0,
+      ),
+      meanOffenseTeammatePairDistance: Number(
+        nativeSummary.mean_live_offense_teammate_pair_distance || 0,
+      ),
+      meanDefenseTeammatePairDistance: Number(
+        nativeSummary.mean_live_defense_teammate_pair_distance || 0,
+      ),
+      meanBoundaryPlayerFraction: Number(
+        nativeSummary.mean_live_boundary_player_fraction || 0,
+      ),
+      meanCornerPlayerFraction: Number(
+        nativeSummary.mean_live_corner_player_fraction || 0,
+      ),
+    };
+    console.info('[Stats] Spatial diagnostics', next.spatialDiagnostics);
 
     const rbRaw = evalDiagnostics.reward_breakdown || {};
     next.rewardBreakdown = {
@@ -6182,7 +6426,13 @@ async function copyStatsMarkdown() {
     const fg = (made, att) => (safeDiv(made, Math.max(1, att)) * 100).toFixed(1) + '%';
     const summary = [
       ['Episodes', String(s.episodes)],
-      ['PPP', ppp.value.toFixed(2)],
+      ['Completed possessions', String(s.totalPossessions)],
+      ['Player offensive possessions', String(s.offensivePossessions)],
+      ['AI offensive possessions', String(s.opponentOffensivePossessions)],
+      ['Player points', String(s.points)],
+      ['AI points', String(s.opponentPoints)],
+      ['Player PPP', ppp.value.toFixed(2)],
+      ['AI PPP', opponentPpp.value.toFixed(2)],
       ['Avg total reward/ep', avgRewardPerEp.value.toFixed(2)],
       ['Avg ep length (steps)', safeDiv(s.episodeStepsSum, Math.max(1, s.episodes)).toFixed(1)],
       ['Total assists', String(s.dunk.assists + s.twoPt.assists + s.threePt.assists)],
@@ -6238,6 +6488,7 @@ async function copyStatsMarkdown() {
       ['Phi shaping', Number(rb.phiShaping || 0).toFixed(2)],
       ['Unexplained', Number(rb.unexplained || 0).toFixed(2)],
     ];
+    const spatialRows = spatialDiagRows.value.map((row) => [row.label, row.value]);
     const shotsHeader = ['Type', 'Attempts', 'Made', 'FG%', 'Assists', 'Potential assists (missed)'];
     const shotsRows = [
       ['Dunks', s.dunk.attempts, s.dunk.made, fg(s.dunk.made, s.dunk.attempts), s.dunk.assists, s.dunk.potentialAssists],
@@ -6276,6 +6527,13 @@ async function copyStatsMarkdown() {
       '| --- | --- |',
       table(valueDiagRows.value.map((row) => [row.label, row.value])),
       '',
+      ...(spatialLiveStepCount.value > 0 ? [
+        '## Spatial Diagnostics',
+        '| Metric | Value |',
+        '| --- | --- |',
+        table(spatialRows),
+        '',
+      ] : []),
       '## Reward Decomposition',
       '| Component | Value |',
       '| --- | --- |',
@@ -8579,7 +8837,7 @@ function offenseSkillDeltaLabel(idx) {
               <th>Pot. Ast</th>
               <th>TOV</th>
               <th>Points</th>
-              <th>PPP</th>
+              <th>Pts/Ep</th>
             </tr>
           </thead>
           <tbody>
@@ -8594,7 +8852,7 @@ function offenseSkillDeltaLabel(idx) {
               <td>{{ row.potentialAssists }}</td>
               <td>{{ row.turnovers }}</td>
               <td>{{ row.points.toFixed(1) }}</td>
-              <td>{{ row.ppp.toFixed(2) }}</td>
+              <td>{{ row.pointsPerEpisode.toFixed(2) }}</td>
             </tr>
           </tbody>
         </table>
@@ -8613,6 +8871,11 @@ function offenseSkillDeltaLabel(idx) {
               >?</span>
             </h5>
             <div class="param-item" data-tooltip="Number of evaluated episodes included in these stats."><span class="param-name">Episodes played:</span><span class="param-value">{{ statsState.episodes }}</span></div>
+            <div class="param-item" data-tooltip="Completed possessions by both teams across the evaluated games. Incomplete final possessions are excluded."><span class="param-name">Completed possessions:</span><span class="param-value">{{ totalCompletedPossessions }}</span></div>
+            <div class="param-item" data-tooltip="Completed possessions in which the Player team was on offense. PPP uses this denominator."><span class="param-name">Player offensive possessions:</span><span class="param-value">{{ offensivePossessions }}</span></div>
+            <div class="param-item" data-tooltip="Completed possessions in which the AI team was on offense. The Player and AI offensive-possession counts add up to completed possessions."><span class="param-name">AI offensive possessions:</span><span class="param-value">{{ opponentOffensivePossessions }}</span></div>
+            <div class="param-item" data-tooltip="Points scored by the fixed blue Player team. In multi-possession evaluation, this comes from the stable team-A scoreboard rather than the changing offensive role."><span class="param-name">Player points:</span><span class="param-value">{{ statsState.points }}</span></div>
+            <div class="param-item" data-tooltip="Points scored by the fixed red AI team. In multi-possession evaluation, this comes from the stable team-B scoreboard rather than the changing defensive role."><span class="param-name">AI points:</span><span class="param-value">{{ statsState.opponentPoints }}</span></div>
             <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
             <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>
@@ -8631,7 +8894,8 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Total lane-rule violations (illegal defense + offensive 3-second)."><span class="param-name">Total violations:</span><span class="param-value">{{ totalViolations }}</span></div>
             <div class="param-item" data-tooltip="Defenders stayed in the lane too long without guarding; counts technical-style lane violations."><span class="param-name">Illegal defense violations:</span><span class="param-value">{{ statsState.violations?.defensiveLane || 0 }}</span></div>
             <div class="param-item" data-tooltip="Offense kept a player in the lane beyond the 3-second limit, causing turnovers."><span class="param-name">Offensive 3-second violations:</span><span class="param-value">{{ statsState.violations?.offensiveThreeSeconds || 0 }}</span></div>
-            <div class="param-item" data-tooltip="Points per possession proxy here: total points scored by user team divided by episodes."><span class="param-name">PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
+            <div class="param-item" data-tooltip="Player-team points divided only by the Player team's completed offensive possessions. This remains valid when a game contains many alternating possessions."><span class="param-name">Player PPP:</span><span class="param-value">{{ ppp.toFixed(2) }}</span></div>
+            <div class="param-item" data-tooltip="AI-team points divided only by the AI team's completed offensive possessions."><span class="param-name">AI PPP:</span><span class="param-value">{{ opponentPpp.toFixed(2) }}</span></div>
             <div class="param-item" data-tooltip="Average total environment reward for the user team, including scoring reward plus any assist, violation, phi-shaping, or other configured reward terms. This is only expected to match PPP when those auxiliary terms are disabled and the terminal reward mode is PPP-compatible."><span class="param-name">Avg total reward/ep:</span><span class="param-value">{{ avgRewardPerEp.toFixed(2) }}</span></div>
             <div class="param-item" data-tooltip="Average number of steps per episode."><span class="param-name">Avg ep length (steps):</span><span class="param-value">{{ avgEpisodeLen.toFixed(1) }}</span></div>
           </div>
@@ -8654,6 +8918,46 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">{{ row.label }}:</span>
               <span class="param-value">{{ row.value }}</span>
             </div>
+          </div>
+          <div class="param-category">
+            <h5>
+              Spatial Diagnostics
+              <span
+                class="category-help"
+                title="Live-play geometry from native JAX evaluation. Distances are hex steps and exclude inbound ticks. Boundary and corner-zone occupancy are the fraction of all players on those cells."
+                aria-label="Spatial diagnostics help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-if="spatialLiveStepCount === 0"
+              class="param-item"
+              data-tooltip="The latest evaluation did not return any live-play spatial samples. Native JAX evaluation is required; inbound ticks are intentionally excluded."
+            >
+              <span class="param-name">Status:</span>
+              <span class="param-value">No live-play samples returned</span>
+            </div>
+            <template v-else>
+              <div
+                v-for="row in spatialDiagRows"
+                :key="`spatial-diagnostic-${row.key}`"
+                class="param-item"
+                :data-tooltip="row.key === 'all_players'
+                  ? 'Mean hex distance over every unordered player pair. Lower values indicate the whole court has compressed.'
+                  : row.key === 'offense_teammates'
+                    ? 'Mean hex distance over all active-offense teammate pairs.'
+                    : row.key === 'defense_teammates'
+                      ? 'Mean hex distance over all active-defense teammate pairs.'
+                      : row.key === 'boundary'
+                        ? 'Fraction of players occupying an outer boundary cell during live play.'
+                        : row.key === 'corner'
+                          ? 'Fraction of players occupying a corner-zone cell during live play.'
+                          : 'Live-play environment steps included in these spatial averages.'"
+              >
+                <span class="param-name">{{ row.label }}:</span>
+                <span class="param-value">{{ row.value }}</span>
+              </div>
+            </template>
           </div>
           <div class="param-category">
             <h5>
@@ -11065,15 +11369,44 @@ function offenseSkillDeltaLabel(idx) {
               />
             </div>
             <p class="policy-mode-note">
-              Combined across both teams. Applying a new value restarts the current game.
+              Per team. Applying any setting below restarts the current game.
             </p>
+            <div
+              class="param-item"
+              data-tooltip="How play restarts after a made basket. Legacy checkpoints default to a baseline inbound."
+            >
+              <span class="param-name">Made-basket restart:</span>
+              <select
+                v-model="madeBasketRestartModeInput"
+                class="env-param-input"
+                :disabled="multiPossessionRestarting"
+              >
+                <option value="baseline_inbound">Baseline inbound</option>
+                <option value="check">Top-of-key check</option>
+                <option value="direct_handoff">Direct handoff</option>
+              </select>
+            </div>
+            <div
+              class="param-item"
+              data-tooltip="Steps available for an offensive player to enter the protected check cell and collect the ball."
+            >
+              <span class="param-name">Check deadline:</span>
+              <input
+                v-model.number="checkDeadlineStepsInput"
+                class="env-param-input"
+                type="number"
+                min="1"
+                step="1"
+                :disabled="multiPossessionRestarting || madeBasketRestartModeInput !== 'check'"
+              />
+            </div>
             <div class="offense-skill-actions">
               <button
                 class="refresh-policies-btn"
                 :disabled="multiPossessionRestarting || multiPossessionLimitIsCurrent"
                 @click="requestMultiPossessionLimitRestart"
               >
-                {{ multiPossessionRestarting ? 'Restarting...' : `Restart with ${normalizedMultiPossessionLimit} possessions` }}
+                {{ multiPossessionRestarting ? 'Restarting...' : 'Apply and restart game' }}
               </button>
             </div>
           </div>

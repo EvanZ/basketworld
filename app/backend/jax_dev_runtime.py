@@ -13,6 +13,7 @@ from basketworld.utils.play_names import lookup_play_name
 from basketworld.utils.start_templates import resolve_start_template
 from basketworld_jax.env.minimal import (
     ACTION_COUNT,
+    MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_START,
     REBOUND_CONTEST_MODE_LOCAL,
     REBOUND_SKILL_SAMPLING_ONE_HIGH_PER_TEAM,
@@ -21,7 +22,12 @@ from basketworld_jax.env.minimal import (
     TEAM_A,
     TEAM_B,
     GAME_PHASE_AWAITING_INBOUND,
+    GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_LIVE,
+    MADE_BASKET_RESTART_BASELINE_INBOUND,
+    MADE_BASKET_RESTART_CHECK,
+    MADE_BASKET_RESTART_DIRECT_HANDOFF,
+    POSSESSION_END_CHECK_VIOLATION,
     POSSESSION_END_DEFENSIVE_REBOUND,
     POSSESSION_END_DEFENSIVE_VIOLATION,
     POSSESSION_END_INBOUND_VIOLATION,
@@ -29,6 +35,7 @@ from basketworld_jax.env.minimal import (
     POSSESSION_END_TURNOVER,
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_CLEARANCE_VIOLATION,
+    TURNOVER_REASON_CHECK_TIMEOUT,
     TURNOVER_REASON_INBOUND_INVALID_PASS,
     TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
@@ -81,9 +88,13 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "multi_possession_limit",
     "multi_possession_reward_mode",
     "score_potential_scale",
+    "game_winner_reward",
     "multi_possession_aux_rewards_enabled",
+    "multi_possession_use_inbounds",
+    "made_basket_restart_mode",
     "multi_possession_schema_version",
     "inbound_deadline_steps",
+    "check_deadline_steps",
 }
 
 
@@ -112,9 +123,13 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "multi_possession_limit": 25,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
+    "game_winner_reward": 0.0,
     "multi_possession_aux_rewards_enabled": False,
-    "multi_possession_schema_version": 2,
+    "multi_possession_use_inbounds": True,
+    "made_basket_restart_mode": "baseline_inbound",
+    "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
     "inbound_deadline_steps": 5,
+    "check_deadline_steps": 5,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -142,9 +157,13 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "multi_possession_limit": "int",
     "multi_possession_reward_mode": "str",
     "score_potential_scale": "float",
+    "game_winner_reward": "float",
     "multi_possession_aux_rewards_enabled": "bool",
+    "multi_possession_use_inbounds": "bool",
+    "made_basket_restart_mode": "str",
     "multi_possession_schema_version": "int",
     "inbound_deadline_steps": "int",
+    "check_deadline_steps": "int",
 }
 
 
@@ -153,6 +172,19 @@ def _canonical_rebound_contest_mode(value: Any) -> str:
     if raw in {"local", "local_contest"}:
         return "local_contest"
     return "global_contest"
+
+
+def _made_basket_restart_mode_from_static(static: Any) -> str:
+    mode_id = _int_from_static_field(
+        static,
+        "made_basket_restart_mode",
+        MADE_BASKET_RESTART_BASELINE_INBOUND,
+    )
+    if mode_id == MADE_BASKET_RESTART_CHECK:
+        return "check"
+    if mode_id == MADE_BASKET_RESTART_DIRECT_HANDOFF:
+        return "direct_handoff"
+    return "baseline_inbound"
 
 
 def _rebound_contest_mode_from_static(static: Any) -> str:
@@ -382,12 +414,21 @@ def _jax_static_env_params_from_policy(policy_obj: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if any(isinstance(source, dict) for source in sources[:2]):
         out.update(_JAX_STATIC_ONLY_ENV_DEFAULTS)
+    explicit_restart_mode = False
     for source in sources:
         if not isinstance(source, dict):
             continue
         for key in _JAX_STATIC_ONLY_ENV_KEYS:
             if key in source and source[key] not in (None, ""):
                 out[key] = _coerce_runtime_static_value(key, source[key])
+                if key == "made_basket_restart_mode":
+                    explicit_restart_mode = True
+    if not explicit_restart_mode and out:
+        out["made_basket_restart_mode"] = (
+            "baseline_inbound"
+            if bool(out.get("multi_possession_use_inbounds", True))
+            else "direct_handoff"
+        )
     return out
 
 def _coerce_play_name_map(metadata: dict[str, Any] | None, num_intents: int) -> dict[str, str]:
@@ -480,8 +521,10 @@ class JaxDevRuntime:
         self.jax = raw_model.jax
         self.jnp = raw_model.jnp
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
         self._fast_action_mask = None
+        self._fast_episode_metadata_cache: dict[str, Any] | None = None
         self._fast_kernel_lock = threading.RLock()
         self._fast_kernel_generation = 0
         self._fast_kernel_ready = False
@@ -540,12 +583,21 @@ class JaxDevRuntime:
             jax = self.jax
             jnp = self.jnp
 
-            def _runner(state, actions, rng_keys, multi_possession_limit):
-                # The possession cap changes the episode boundary, but not the
-                # transition's shapes. Keep it as a dynamic JIT input so a
-                # dev-game restart at a new cap reuses this compiled kernel.
+            def _runner(
+                state,
+                actions,
+                rng_keys,
+                multi_possession_limit,
+                made_basket_restart_mode,
+                check_deadline_steps,
+            ):
+                # These game settings change transition values, not shapes.
+                # Keep them dynamic so in-game configuration reuses the
+                # prepared Fast Mode executable.
                 runtime_static = static._replace(
                     multi_possession_limit=multi_possession_limit,
+                    made_basket_restart_mode=made_basket_restart_mode,
+                    check_deadline_steps=check_deadline_steps,
                 )
                 output = step_batch_minimal(runtime_static, state, actions, rng_keys, jax, jnp)
                 # Fast Mode needs the next action mask only for a compact
@@ -586,7 +638,14 @@ class JaxDevRuntime:
 
         def _warm() -> None:
             try:
-                _, next_mask = runner(state, actions, keys, self.static.multi_possession_limit)
+                _, next_mask = runner(
+                    state,
+                    actions,
+                    keys,
+                    self.static.multi_possession_limit,
+                    self.static.made_basket_restart_mode,
+                    self.static.check_deadline_steps,
+                )
                 self.jax.block_until_ready(next_mask)
             except Exception as exc:
                 with self._fast_kernel_lock:
@@ -644,6 +703,44 @@ class JaxDevRuntime:
             )
             self.env_params["multi_possession_limit"] = normalized
             self.display_env.multi_possession_limit = normalized
+            self._fast_action_mask = None
+
+    def set_made_basket_restart(
+        self,
+        mode: str,
+        check_deadline_steps: int,
+    ) -> None:
+        """Update made-basket restart rules without rebuilding policy state."""
+        if not self.multi_possession_enabled:
+            raise ValueError("Restart rules are available only for multi-possession games.")
+        normalized_mode = str(mode or "baseline_inbound").strip().lower().replace("-", "_")
+        mode_ids = {
+            "baseline_inbound": MADE_BASKET_RESTART_BASELINE_INBOUND,
+            "check": MADE_BASKET_RESTART_CHECK,
+            "direct_handoff": MADE_BASKET_RESTART_DIRECT_HANDOFF,
+        }
+        if normalized_mode not in mode_ids:
+            raise ValueError(
+                "Restart mode must be baseline_inbound, check, or direct_handoff."
+            )
+        normalized_deadline = int(check_deadline_steps)
+        if normalized_deadline < 1:
+            raise ValueError("The check deadline must be at least one step.")
+        with self._fast_kernel_lock:
+            self.static = self.static._replace(
+                made_basket_restart_mode=self.jnp.asarray(
+                    mode_ids[normalized_mode],
+                    dtype=self.static.made_basket_restart_mode.dtype,
+                ),
+                check_deadline_steps=self.jnp.asarray(
+                    normalized_deadline,
+                    dtype=self.static.check_deadline_steps.dtype,
+                ),
+            )
+            self.env_params["made_basket_restart_mode"] = normalized_mode
+            self.env_params["check_deadline_steps"] = normalized_deadline
+            self.display_env.made_basket_restart_mode = normalized_mode
+            self.display_env.check_deadline_steps = normalized_deadline
             self._fast_action_mask = None
 
     def _team_ids(self, team_is_a: bool) -> list[int]:
@@ -832,6 +929,7 @@ class JaxDevRuntime:
             rebound_skill=self.jnp.asarray(skill_batch, dtype=self.jnp.float32),
             rebound_skill_specialist=self.jnp.asarray(specialist_batch, dtype=self.jnp.float32),
         )
+        self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
@@ -848,6 +946,8 @@ class JaxDevRuntime:
         """Refresh immutable JAX kernel config after live display-env edits."""
         self._apply_jax_static_env_attrs()
         self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self._clearance_zone_cells_cache = None
+        self._fast_episode_metadata_cache = None
         self._invalidate_compiled_kernels()
         self._canonicalize_multi_possession_ownership()
         self._last_policy_probs = None
@@ -908,6 +1008,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds = []
+        self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
@@ -1359,6 +1460,8 @@ class JaxDevRuntime:
                 actions_batch,
                 step_keys,
                 self.static.multi_possession_limit,
+                self.static.made_basket_restart_mode,
+                self.static.check_deadline_steps,
             )
         else:
             self._fast_action_mask = None
@@ -1499,6 +1602,7 @@ class JaxDevRuntime:
     def _start_self_play_locked(self, request: Any, game_state: Any) -> dict[str, Any]:
         fast_mode = bool(getattr(request, "fast_mode", False))
         self._fast_action_mask = None
+        self._fast_episode_metadata_cache = None
         requested_seed = getattr(request, "template_seed", None)
         seed = (
             int(requested_seed)
@@ -1552,6 +1656,7 @@ class JaxDevRuntime:
             include_action_values=not fast_mode,
             include_state_values=True,
             compact=fast_mode,
+            include_episode_metadata=fast_mode,
         )
         state_payload["replay_session_id"] = replay_session_id
         self._append_episode_state(game_state, state_payload)
@@ -1672,6 +1777,7 @@ class JaxDevRuntime:
             "dunk_pct": _skill_state("dunk_pct", "offense_dunk_pct_by_player"),
         }
         self.state = self.state._replace(**updates)
+        self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._sync_display_env()
@@ -2050,6 +2156,7 @@ class JaxDevRuntime:
             "offensive_lane_violations": [],
             "defender_pressure": {},
             "inbounds": [],
+            "checks": [],
             "possession_events": [],
             "clearance": None,
         }
@@ -2066,7 +2173,15 @@ class JaxDevRuntime:
                 previous = history[-1]
                 if previous.get("replay_session_id") != replay_session_id:
                     raise RuntimeError("Refusing to splice replay recordings.")
-                for key in ("completed_possessions", "user_score", "ai_score"):
+                for key in (
+                    "completed_possessions",
+                    "team_a_completed_possessions",
+                    "team_b_completed_possessions",
+                    "user_completed_possessions",
+                    "ai_completed_possessions",
+                    "user_score",
+                    "ai_score",
+                ):
                     prior_value = previous.get(key)
                     next_value = state_payload.get(key)
                     if prior_value is not None and next_value is not None and float(next_value) < float(prior_value):
@@ -2235,6 +2350,25 @@ class JaxDevRuntime:
                     "steps_remaining": _as_int(_field0(next_state, "inbound_steps_remaining")),
                 }
             )
+        if prev_phase == GAME_PHASE_AWAITING_CHECK:
+            check_team = _as_int(_field0(prev_state, "check_team"))
+            pickup_player = _as_int(_field0(next_state, "ball_holder"))
+            results["checks"].append(
+                {
+                    "team": "team_a" if check_team == TEAM_A else "team_b",
+                    "completed": _as_bool(out.check_pickup[0]),
+                    "violation": _as_bool(out.check_violation[0]),
+                    "pickup_player": pickup_player
+                    if _as_bool(out.check_pickup[0]) and pickup_player >= 0
+                    else None,
+                    "pickup_steps": _as_int(out.check_pickup_steps[0])
+                    if _as_bool(out.check_pickup[0])
+                    else None,
+                    "steps_remaining": _as_int(
+                        _field0(next_state, "check_steps_remaining")
+                    ),
+                }
+            )
         if _as_bool(out.possession_ended[0]):
             reason = _as_int(out.possession_end_reason[0])
             reason_map = {
@@ -2243,15 +2377,23 @@ class JaxDevRuntime:
                 POSSESSION_END_TURNOVER: "turnover",
                 POSSESSION_END_DEFENSIVE_VIOLATION: "defensive_violation",
                 POSSESSION_END_INBOUND_VIOLATION: "inbound_violation",
+                POSSESSION_END_CHECK_VIOLATION: "check_violation",
             }
             results["possession_events"].append(
                 {
                     "reason": reason_map.get(reason, "possession_end"),
                     "completed_possessions": _as_int(_field0(next_state, "completed_possessions")),
+                    "team_a_completed_possessions": _as_int(
+                        _field0(next_state, "team_a_completed_possessions")
+                    ),
+                    "team_b_completed_possessions": _as_int(
+                        _field0(next_state, "team_b_completed_possessions")
+                    ),
                     "next_offense_team": "team_a"
                     if _as_int(_field0(next_state, "offense_team")) == TEAM_A
                     else "team_b",
                     "awaiting_inbound": bool(next_phase == GAME_PHASE_AWAITING_INBOUND),
+                    "awaiting_check": bool(next_phase == GAME_PHASE_AWAITING_CHECK),
                 }
             )
         if _as_bool(out.clearance_event[0]):
@@ -2801,11 +2943,234 @@ class JaxDevRuntime:
         game_state.turn_start_ball_holder = self.ball_holder
         game_state.turn_start_shot_clock = self.shot_clock
 
+    def _clearance_zone_cells(self) -> list[list[int]]:
+        if self._clearance_zone_cells_cache is None:
+            coords, eligible = self.jax.device_get(
+                (self.static.cell_coords, self.static.clearance_by_cell)
+            )
+            self._clearance_zone_cells_cache = tuple(
+                (int(q), int(r))
+                for (q, r), is_eligible in zip(
+                    np.asarray(coords, dtype=np.int32).tolist(),
+                    np.asarray(eligible, dtype=np.bool_).tolist(),
+                )
+                if is_eligible
+            )
+        return [[q, r] for q, r in self._clearance_zone_cells_cache]
+
+    def _fast_episode_metadata(self, game_state: Any) -> dict[str, Any]:
+        """Return immutable episode metadata, computed once per Fast Mode run."""
+        if self._fast_episode_metadata_cache is not None:
+            return self._fast_episode_metadata_cache
+
+        skill_host = self.jax.device_get(
+            {
+                "layup_pct": _field0(self.state, "layup_pct"),
+                "three_pt_pct": _field0(self.state, "three_pt_pct"),
+                "dunk_pct": _field0(self.state, "dunk_pct"),
+                "rebound_skill": _field0(self.state, "rebound_skill"),
+                "rebound_skill_specialist": _field0(
+                    self.state,
+                    "rebound_skill_specialist",
+                ),
+            }
+        )
+        layup_pct = np.asarray(skill_host["layup_pct"], dtype=np.float32).reshape(-1)
+        three_pt_pct = np.asarray(
+            skill_host["three_pt_pct"],
+            dtype=np.float32,
+        ).reshape(-1)
+        dunk_pct = np.asarray(skill_host["dunk_pct"], dtype=np.float32).reshape(-1)
+        rebound_skill = np.asarray(
+            skill_host["rebound_skill"],
+            dtype=np.float32,
+        ).reshape(-1)
+        rebound_specialist = np.asarray(
+            skill_host["rebound_skill_specialist"],
+            dtype=np.float32,
+        ).reshape(-1)
+
+        def _team_skills(ids: list[int]) -> dict[str, list[float]]:
+            return {
+                "layup": [float(layup_pct[pid]) for pid in ids],
+                "three_pt": [float(three_pt_pct[pid]) for pid in ids],
+                "dunk": [float(dunk_pct[pid]) for pid in ids],
+            }
+
+        shot_params = {
+            "layup_pct": float(self.display_env.layup_pct or 0.0),
+            "three_pt_pct": float(self.display_env.three_pt_pct or 0.0),
+            "three_pt_extra_hex_decay": float(
+                self.display_env.three_pt_extra_hex_decay or 0.05
+            ),
+            "dunk_pct": float(self.display_env.dunk_pct or 0.0),
+            "layup_std": float(self.display_env.layup_std or 0.0),
+            "three_pt_std": float(self.display_env.three_pt_std or 0.0),
+            "dunk_std": float(self.display_env.dunk_std or 0.0),
+            "allow_dunks": bool(self.display_env.allow_dunks),
+        }
+        rebound_runtime = {
+            "enabled": bool(getattr(self.display_env, "enable_rebounds", False)),
+            "kernel_enabled": _as_bool(self.static.enable_rebounds),
+            "table_model_dir": str(
+                getattr(self.display_env, "rebound_table_model_dir", "") or ""
+            ),
+            "target_temperature": float(
+                getattr(self.display_env, "rebound_target_temperature", 1.0)
+            ),
+            "target_uniform_mix": float(
+                getattr(self.display_env, "rebound_target_uniform_mix", 0.0)
+            ),
+            "winner_distance_weight": float(
+                getattr(self.display_env, "rebound_winner_distance_weight", 1.0)
+            ),
+            "basket_position_weight": _float_from_static_field(
+                self.static,
+                "rebound_basket_position_weight",
+                0.0,
+            ),
+            "winner_temperature": float(
+                getattr(self.display_env, "rebound_winner_temperature", 1.0)
+            ),
+            "skill_std": float(
+                getattr(self.display_env, "rebound_skill_std", 0.0)
+            ),
+            "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(
+                self.static
+            ),
+            "skill_high": _float_from_static_field(
+                self.static,
+                "rebound_skill_high",
+                1.0,
+            ),
+            "skill_low": _float_from_static_field(
+                self.static,
+                "rebound_skill_low",
+                -0.25,
+            ),
+            "skill_weight": float(
+                getattr(self.display_env, "rebound_skill_weight", 0.0)
+            ),
+            "contest_mode": _rebound_contest_mode_from_static(self.static),
+            "contest_radius": _int_from_static_field(
+                self.static,
+                "rebound_contest_radius",
+                1,
+            ),
+            "obs_top_n_targets": _int_from_static_field(
+                self.static,
+                "rebound_obs_top_n_targets",
+                0,
+            ),
+            "offensive_rebound_shot_clock_reset": int(
+                getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)
+            ),
+            "terminal_reward_mode": str(
+                getattr(
+                    self.display_env,
+                    "rebound_terminal_reward_mode",
+                    "actual_points",
+                )
+                or "actual_points"
+            ),
+            "reward_redistribution_enabled": _as_bool(
+                self.static.enable_rebound_reward_redistribution
+            ),
+            "offensive_rebound_reward_advance": _float_from_static_field(
+                self.static,
+                "offensive_rebound_reward_advance",
+                0.4,
+            ),
+            "reward_once_per_possession": _as_bool(
+                self.static.rebound_reward_once_per_possession
+            ),
+            "target_table_shape": [
+                int(v) for v in self.static.rebound_target_probs.shape
+            ],
+        }
+        policy = getattr(game_state, "unified_policy", None)
+        opponent = getattr(game_state, "defense_policy", None)
+        policy_metadata = get_policy_metadata(policy) or {}
+        opponent_metadata = get_policy_metadata(opponent) or {}
+        training_params = copy.deepcopy(
+            getattr(game_state, "mlflow_training_params", None)
+        )
+        mlflow_env_defaults = copy.deepcopy(
+            getattr(game_state, "mlflow_env_optional_defaults", {}) or {}
+        )
+        self._fast_episode_metadata_cache = {
+            "episode_parameters": {
+                "required_environment": copy.deepcopy(self.required_params),
+                "environment": copy.deepcopy(self.env_params),
+                "mlflow_environment_defaults": mlflow_env_defaults,
+                "training": training_params,
+                "shot": copy.deepcopy(shot_params),
+                "rebound": copy.deepcopy(rebound_runtime),
+            },
+            "player_shooting_skills": {
+                str(pid): {
+                    "layup": float(layup_pct[pid]),
+                    "three_pt": float(three_pt_pct[pid]),
+                    "dunk": float(dunk_pct[pid]),
+                }
+                for pid in range(self.n_players)
+            },
+            "team_a_shooting_pct_by_player": _team_skills(self._team_ids(True)),
+            "team_b_shooting_pct_by_player": _team_skills(self._team_ids(False)),
+            "offense_shooting_pct_sampled": copy.deepcopy(
+                getattr(game_state, "sampled_offense_skills", None) or {}
+            ),
+            "player_rebound_skills": {
+                str(pid): float(rebound_skill[pid])
+                for pid in range(self.n_players)
+            },
+            "player_rebound_skill_specialists": {
+                str(pid): bool(rebound_specialist[pid] > 0.0)
+                for pid in range(self.n_players)
+            },
+            "shot_params": shot_params,
+            "rebound_runtime": rebound_runtime,
+            "training_params": training_params,
+            "mlflow_env_defaults": mlflow_env_defaults,
+            "model_backend": get_policy_backend_kind(policy),
+            "model_capabilities": copy.deepcopy(get_policy_capabilities(policy)),
+            "model_metadata": copy.deepcopy(policy_metadata),
+            "opponent_model_backend": get_policy_backend_kind(opponent),
+            "opponent_model_capabilities": copy.deepcopy(
+                get_policy_capabilities(opponent)
+            ),
+            "opponent_model_metadata": copy.deepcopy(opponent_metadata),
+            "run_id": getattr(game_state, "run_id", None),
+            "run_name": getattr(game_state, "run_name", None),
+            "model_codename": policy_metadata.get("model_codename"),
+            "unified_policy_name": getattr(game_state, "unified_policy_key", None),
+            "opponent_unified_policy_name": getattr(
+                game_state,
+                "opponent_unified_policy_key",
+                None,
+            ),
+            "start_template_library": copy.deepcopy(
+                getattr(game_state, "mlflow_start_template_library", None)
+            ),
+            "start_template_library_source": getattr(
+                game_state,
+                "start_template_library_source",
+                None,
+            ),
+            "start_template_library_path": getattr(
+                game_state,
+                "start_template_library_path",
+                None,
+            ),
+        }
+        return self._fast_episode_metadata_cache
+
     def _fast_game_state(
         self,
         game_state: Any,
         *,
         include_state_values: bool = False,
+        include_episode_metadata: bool = False,
     ) -> dict[str, Any]:
         """Return only the state needed to animate a live self-play board.
 
@@ -2830,11 +3195,25 @@ class JaxDevRuntime:
             "team_a_score": _field0(self.state, "team_a_score"),
             "team_b_score": _field0(self.state, "team_b_score"),
             "completed_possessions": _field0(self.state, "completed_possessions"),
+            "team_a_completed_possessions": _field0(
+                self.state, "team_a_completed_possessions"
+            ),
+            "team_b_completed_possessions": _field0(
+                self.state, "team_b_completed_possessions"
+            ),
+            "overtime_round": _field0(self.state, "overtime_round"),
+            "overtime_possessions_completed": _field0(
+                self.state, "overtime_possessions_completed"
+            ),
+            "overtime_starting_team": _field0(self.state, "overtime_starting_team"),
+            "starting_offense_team": _field0(self.state, "starting_offense_team"),
             "game_phase": _field0(self.state, "game_phase"),
             "inbound_player": _field0(self.state, "inbound_player"),
             "inbound_team": _field0(self.state, "inbound_team"),
             "inbound_reason": _field0(self.state, "inbound_reason"),
             "inbound_steps_remaining": _field0(self.state, "inbound_steps_remaining"),
+            "check_team": _field0(self.state, "check_team"),
+            "check_steps_remaining": _field0(self.state, "check_steps_remaining"),
             "clearance_achieved": _field0(self.state, "clearance_achieved"),
             "offense_lane_steps": _field0(self.state, "offense_lane_steps"),
             "defense_lane_steps": _field0(self.state, "defense_lane_steps"),
@@ -2867,14 +3246,39 @@ class JaxDevRuntime:
         inbound_team = int(np.asarray(host["inbound_team"]).reshape(-1)[0])
         inbound_reason_code = int(np.asarray(host["inbound_reason"]).reshape(-1)[0])
         completed_possessions = int(np.asarray(host["completed_possessions"]).reshape(-1)[0])
+        team_a_completed_possessions = int(
+            np.asarray(host["team_a_completed_possessions"]).reshape(-1)[0]
+        )
+        team_b_completed_possessions = int(
+            np.asarray(host["team_b_completed_possessions"]).reshape(-1)[0]
+        )
+        user_completed_possessions = (
+            team_a_completed_possessions
+            if user_team_is_a
+            else team_b_completed_possessions
+        )
+        ai_completed_possessions = (
+            team_b_completed_possessions
+            if user_team_is_a
+            else team_a_completed_possessions
+        )
         game_phase = int(np.asarray(host["game_phase"]).reshape(-1)[0])
         clearance_achieved = bool(np.asarray(host["clearance_achieved"]).reshape(-1)[0])
+        overtime_round = int(np.asarray(host["overtime_round"]).reshape(-1)[0])
+        overtime_possessions_completed = int(
+            np.asarray(host["overtime_possessions_completed"]).reshape(-1)[0]
+        )
+        overtime_starting_team = int(
+            np.asarray(host["overtime_starting_team"]).reshape(-1)[0]
+        )
+        clearance_zone_cells = self._clearance_zone_cells()
         inbound_reason_map = {
             POSSESSION_END_MADE_BASKET: "made_basket",
             POSSESSION_END_DEFENSIVE_REBOUND: "defensive_rebound",
             POSSESSION_END_TURNOVER: "turnover",
             POSSESSION_END_DEFENSIVE_VIOLATION: "defensive_violation",
             POSSESSION_END_INBOUND_VIOLATION: "inbound_violation",
+            POSSESSION_END_CHECK_VIOLATION: "check_violation",
         }
         inbound_position = (
             [int(v) for v in positions[inbound_player]]
@@ -2903,6 +3307,16 @@ class JaxDevRuntime:
             "done": bool(np.asarray(host["episode_ended"]).reshape(-1)[0]),
             "enable_multi_possession": bool(self.multi_possession_enabled),
             "multi_possession_limit": _int_from_static_field(self.static, "multi_possession_limit", 1),
+            "multi_possession_use_inbounds": bool(
+                _int_from_static_field(
+                    self.static,
+                    "multi_possession_use_inbounds",
+                    1,
+                )
+            ),
+            "made_basket_restart_mode": _made_basket_restart_mode_from_static(
+                self.static
+            ),
             "team_a_ids": team_a_ids,
             "team_b_ids": team_b_ids,
             "user_player_ids": user_ids,
@@ -2917,15 +3331,36 @@ class JaxDevRuntime:
             "offense_ids": active_offense_ids,
             "defense_ids": active_defense_ids,
             "completed_possessions": completed_possessions,
+            "team_a_completed_possessions": team_a_completed_possessions,
+            "team_b_completed_possessions": team_b_completed_possessions,
+            "user_completed_possessions": user_completed_possessions,
+            "ai_completed_possessions": ai_completed_possessions,
+            "in_overtime": overtime_round > 0,
+            "overtime_round": overtime_round,
+            "overtime_possessions_completed": overtime_possessions_completed,
+            "overtime_starting_team": (
+                "team_a"
+                if overtime_starting_team == TEAM_A
+                else ("team_b" if overtime_starting_team == TEAM_B else None)
+            ),
+            "starting_offense_team": (
+                "team_a"
+                if int(np.asarray(host["starting_offense_team"]).reshape(-1)[0]) == TEAM_A
+                else "team_b"
+            ),
             "remaining_possessions": max(
                 0,
-                _int_from_static_field(self.static, "multi_possession_limit", 1)
+                (2 * _int_from_static_field(self.static, "multi_possession_limit", 1))
                 - completed_possessions,
             ),
             "game_phase": (
                 "awaiting_inbound"
                 if game_phase == GAME_PHASE_AWAITING_INBOUND
-                else "live"
+                else (
+                    "awaiting_check"
+                    if game_phase == GAME_PHASE_AWAITING_CHECK
+                    else "live"
+                )
             ),
             "inbound_team": "team_a" if inbound_team == TEAM_A else ("team_b" if inbound_team == TEAM_B else None),
             "inbound_player": inbound_player if inbound_player >= 0 else None,
@@ -2935,6 +3370,26 @@ class JaxDevRuntime:
                 np.asarray(host["inbound_steps_remaining"]).reshape(-1)[0]
             ),
             "inbound_deadline_steps": _int_from_static_field(self.static, "inbound_deadline_steps", 5),
+            "check_team": (
+                "team_a"
+                if int(np.asarray(host["check_team"]).reshape(-1)[0]) == TEAM_A
+                else (
+                    "team_b"
+                    if int(np.asarray(host["check_team"]).reshape(-1)[0]) == TEAM_B
+                    else None
+                )
+            ),
+            "check_position": [
+                int(v) for v in np.asarray(self.static.check_position).tolist()
+            ],
+            "check_steps_remaining": int(
+                np.asarray(host["check_steps_remaining"]).reshape(-1)[0]
+            ),
+            "check_deadline_steps": _int_from_static_field(
+                self.static,
+                "check_deadline_steps",
+                5,
+            ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
             "clearance_achieved": clearance_achieved,
             "clearance_required": bool(
@@ -2942,6 +3397,7 @@ class JaxDevRuntime:
                 and not clearance_achieved
                 and game_phase == GAME_PHASE_LIVE
             ),
+            "clearance_zone_cells": clearance_zone_cells,
             "last_action_results": copy.deepcopy(self.last_action_results),
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
             "court_width": int(self.display_env.court_width),
@@ -2973,6 +3429,16 @@ class JaxDevRuntime:
             },
             "pass_mode": self.display_env.pass_mode or "directional",
         }
+        episode_metadata = self._fast_episode_metadata(game_state)
+        state["offense_shooting_pct_by_player"] = copy.deepcopy(
+            episode_metadata[
+                "team_a_shooting_pct_by_player"
+                if team_a_is_offense
+                else "team_b_shooting_pct_by_player"
+            ]
+        )
+        if include_episode_metadata:
+            state.update(copy.deepcopy(episode_metadata))
         if include_state_values:
             state["state_values"] = self.state_values()
         return state
@@ -2985,11 +3451,13 @@ class JaxDevRuntime:
         include_action_values: bool = False,
         include_state_values: bool = False,
         compact: bool = False,
+        include_episode_metadata: bool = False,
     ) -> dict[str, Any]:
         if compact:
             return self._fast_game_state(
                 game_state,
                 include_state_values=include_state_values,
+                include_episode_metadata=include_episode_metadata,
             )
         self._sync_display_env()
         observer_is_offense = game_state.user_team != Team.DEFENSE
@@ -3049,8 +3517,8 @@ class JaxDevRuntime:
                     "relative_score",
                     "possessions_remaining_norm",
                     "clearance_required",
-                    "inbound_phase",
-                    "inbound_countdown_norm",
+                    "restart_phase",
+                    "restart_countdown_norm",
                 ]
             )
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
@@ -3071,12 +3539,21 @@ class JaxDevRuntime:
         inbound_player = _as_int(_field0(self.state, "inbound_player"))
         inbound_team = _as_int(_field0(self.state, "inbound_team"))
         inbound_reason_code = _as_int(_field0(self.state, "inbound_reason"))
+        overtime_round = _as_int(_field0(self.state, "overtime_round"))
+        overtime_possessions_completed = _as_int(
+            _field0(self.state, "overtime_possessions_completed")
+        )
+        overtime_starting_team = _as_int(
+            _field0(self.state, "overtime_starting_team")
+        )
+        clearance_zone_cells = self._clearance_zone_cells()
         inbound_reason_map = {
             POSSESSION_END_MADE_BASKET: "made_basket",
             POSSESSION_END_DEFENSIVE_REBOUND: "defensive_rebound",
             POSSESSION_END_TURNOVER: "turnover",
             POSSESSION_END_DEFENSIVE_VIOLATION: "defensive_violation",
             POSSESSION_END_INBOUND_VIOLATION: "inbound_violation",
+            POSSESSION_END_CHECK_VIOLATION: "check_violation",
         }
         inbound_position = (
             [int(v) for v in positions[inbound_player]]
@@ -3106,6 +3583,16 @@ class JaxDevRuntime:
             "done": _as_bool(_field0(self.state, "episode_ended")),
             "enable_multi_possession": bool(self.multi_possession_enabled),
             "multi_possession_limit": _int_from_static_field(self.static, "multi_possession_limit", 1),
+            "multi_possession_use_inbounds": bool(
+                _int_from_static_field(
+                    self.static,
+                    "multi_possession_use_inbounds",
+                    1,
+                )
+            ),
+            "made_basket_restart_mode": _made_basket_restart_mode_from_static(
+                self.static
+            ),
             "team_a_ids": team_a_ids,
             "team_b_ids": team_b_ids,
             "user_player_ids": user_ids,
@@ -3120,15 +3607,55 @@ class JaxDevRuntime:
             "active_offense_ids": active_offense_ids,
             "active_defense_ids": active_defense_ids,
             "completed_possessions": _as_int(_field0(self.state, "completed_possessions")),
+            "team_a_completed_possessions": _as_int(
+                _field0(self.state, "team_a_completed_possessions")
+            ),
+            "team_b_completed_possessions": _as_int(
+                _field0(self.state, "team_b_completed_possessions")
+            ),
+            "user_completed_possessions": _as_int(
+                _field0(
+                    self.state,
+                    "team_a_completed_possessions"
+                    if user_team_is_a
+                    else "team_b_completed_possessions",
+                )
+            ),
+            "ai_completed_possessions": _as_int(
+                _field0(
+                    self.state,
+                    "team_b_completed_possessions"
+                    if user_team_is_a
+                    else "team_a_completed_possessions",
+                )
+            ),
+            "in_overtime": overtime_round > 0,
+            "overtime_round": overtime_round,
+            "overtime_possessions_completed": overtime_possessions_completed,
+            "overtime_starting_team": (
+                "team_a"
+                if overtime_starting_team == TEAM_A
+                else ("team_b" if overtime_starting_team == TEAM_B else None)
+            ),
+            "starting_offense_team": (
+                "team_a"
+                if _as_int(_field0(self.state, "starting_offense_team")) == TEAM_A
+                else "team_b"
+            ),
             "remaining_possessions": max(
                 0,
-                _int_from_static_field(self.static, "multi_possession_limit", 1)
+                (2 * _int_from_static_field(self.static, "multi_possession_limit", 1))
                 - _as_int(_field0(self.state, "completed_possessions")),
             ),
             "game_phase": (
                 "awaiting_inbound"
                 if _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_AWAITING_INBOUND
-                else "live"
+                else (
+                    "awaiting_check"
+                    if _as_int(_field0(self.state, "game_phase"))
+                    == GAME_PHASE_AWAITING_CHECK
+                    else "live"
+                )
             ),
             "inbound_team": (
                 "team_a" if inbound_team == TEAM_A else ("team_b" if inbound_team == TEAM_B else None)
@@ -3142,6 +3669,26 @@ class JaxDevRuntime:
                 "inbound_deadline_steps",
                 5,
             ),
+            "check_team": (
+                "team_a"
+                if _as_int(_field0(self.state, "check_team")) == TEAM_A
+                else (
+                    "team_b"
+                    if _as_int(_field0(self.state, "check_team")) == TEAM_B
+                    else None
+                )
+            ),
+            "check_position": [
+                int(v) for v in np.asarray(self.static.check_position).tolist()
+            ],
+            "check_steps_remaining": _as_int(
+                _field0(self.state, "check_steps_remaining")
+            ),
+            "check_deadline_steps": _int_from_static_field(
+                self.static,
+                "check_deadline_steps",
+                5,
+            ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
             "clearance_achieved": bool(_as_bool(_field0(self.state, "clearance_achieved"))),
             "clearance_required": bool(
@@ -3149,9 +3696,22 @@ class JaxDevRuntime:
                 and not _as_bool(_field0(self.state, "clearance_achieved"))
                 and _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_LIVE
             ),
+            "clearance_zone_cells": clearance_zone_cells,
             "start_templates_disabled": bool(self.multi_possession_enabled),
             "start_templates_disabled_reason": (
-                "Multi-possession games use the normal opening spawn and inbound restarts."
+                (
+                    "Multi-possession games use the normal opening spawn and "
+                    "inbound restarts."
+                    if _int_from_static_field(
+                        self.static,
+                        "multi_possession_use_inbounds",
+                        1,
+                    )
+                    else (
+                        "Multi-possession games use the normal opening spawn and "
+                        "direct dead-ball handoffs."
+                    )
+                )
                 if self.multi_possession_enabled
                 else None
             ),

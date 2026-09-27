@@ -14,6 +14,7 @@ from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_LIVE,
     MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL,
+    MULTI_POSSESSION_REWARD_SCORING_EVENTS,
     MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_START,
     TEAM_A,
@@ -33,6 +34,7 @@ from basketworld_jax.train.main import (
     validate_train_args,
 )
 from tests.test_jax_multi_possession import (
+    _complete_inbound,
     _force_rebound_winner,
     _multi_possession_static,
     _noops,
@@ -57,8 +59,14 @@ def _terminal_clearance_violation(
     state = state._replace(
         offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
         ball_holder=jnp.asarray([holder], dtype=jnp.int32),
-        completed_possessions=jnp.asarray(
+        team_a_completed_possessions=jnp.asarray(
             [int(np.asarray(static.multi_possession_limit)) - 1], dtype=jnp.int32
+        ),
+        team_b_completed_possessions=jnp.asarray(
+            [int(np.asarray(static.multi_possession_limit))], dtype=jnp.int32
+        ),
+        completed_possessions=jnp.asarray(
+            [2 * int(np.asarray(static.multi_possession_limit)) - 1], dtype=jnp.int32
         ),
         team_a_score=jnp.asarray([team_a_score], dtype=jnp.float32),
         team_b_score=jnp.asarray([team_b_score], dtype=jnp.float32),
@@ -78,7 +86,7 @@ def _terminal_clearance_violation(
 
 @pytest.mark.parametrize(
     ("score_a", "score_b", "expected"),
-    [(5.0, 3.0, 1.0), (2.0, 4.0, -1.0), (3.0, 3.0, 0.0)],
+    [(5.0, 3.0, 1.0), (2.0, 4.0, -1.0)],
 )
 def test_terminal_win_loss_rewards_are_fixed_team_zero_sum_and_not_duplicated(
     score_a,
@@ -113,7 +121,7 @@ def test_terminal_win_loss_rewards_are_fixed_team_zero_sum_and_not_duplicated(
 
 
 def test_terminal_point_differential_is_separately_selectable():
-    static = _multi_possession_static(possession_limit=2)._replace(
+    static = _multi_possession_static(possession_limit=1)._replace(
         multi_possession_reward_mode=jnp.asarray(
             MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL,
             dtype=jnp.int32,
@@ -127,6 +135,178 @@ def test_terminal_point_differential_is_separately_selectable():
     )
     assert _team_total(out.game_reward, static.offense_ids) == pytest.approx(4.0)
     assert _team_total(out.game_reward, static.defense_ids) == pytest.approx(-4.0)
+
+
+@pytest.mark.parametrize("is_three, expected_points", [(False, 2.0), (True, 3.0)])
+def test_scoring_event_rewards_use_actual_two_and_three_point_score_deltas(
+    is_three, expected_points
+):
+    static = _multi_possession_static(possession_limit=2)._replace(
+        multi_possession_reward_mode=jnp.asarray(
+            MULTI_POSSESSION_REWARD_SCORING_EVENTS,
+            dtype=jnp.int32,
+        ),
+        # The reward mode itself must remain transparent even if stale static
+        # settings try to restore either deprecated reward source.
+        enable_phi_shaping=jnp.asarray(1, dtype=jnp.int8),
+        phi_beta=jnp.asarray(0.5, dtype=jnp.float32),
+        multi_possession_aux_rewards_enabled=jnp.asarray(1, dtype=jnp.int8),
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(221), 1),
+        jax,
+        jnp,
+    )
+    holder = int(np.asarray(static.offense_ids)[0])
+    positions = np.asarray(state.positions).copy()
+    if is_three:
+        three_cell = int(np.flatnonzero(np.asarray(static.three_point_by_cell))[0])
+        positions[0, holder] = np.asarray(static.cell_coords)[three_cell]
+    else:
+        positions[0, holder] = np.asarray(static.basket_position)
+    state = state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+        layup_pct=jnp.ones_like(state.layup_pct),
+        three_pt_pct=jnp.ones_like(state.three_pt_pct),
+        dunk_pct=jnp.ones_like(state.dunk_pct),
+        cached_phi=jnp.asarray([7.0], dtype=jnp.float32),
+    )
+
+    out = _shoot(static, state, seed=222 + int(is_three))
+
+    assert int(np.asarray(out.shot_success)[0]) == 1
+    assert float(np.asarray(out.shot_value)[0]) == pytest.approx(expected_points)
+    assert float(np.asarray(out.team_a_score_delta)[0]) == pytest.approx(expected_points)
+    assert float(np.asarray(out.team_b_score_delta)[0]) == pytest.approx(0.0)
+    assert _team_total(out.game_reward, static.offense_ids) == pytest.approx(expected_points)
+    assert _team_total(out.game_reward, static.defense_ids) == pytest.approx(-expected_points)
+    assert _team_total(out.rewards, static.offense_ids) == pytest.approx(expected_points)
+    assert _team_total(out.rewards, static.defense_ids) == pytest.approx(-expected_points)
+    assert _team_total(out.auxiliary_reward, static.offense_ids) == pytest.approx(0.0)
+    assert float(np.asarray(out.phi_r_shape)[0]) == pytest.approx(0.0)
+    assert float(np.asarray(out.state.cached_phi)[0]) == pytest.approx(0.0)
+
+
+def test_scoring_event_rewards_award_technical_and_nothing_for_non_scoring_terminal():
+    technical_static = _multi_possession_static(
+        illegal_defense_enabled=True
+    )._replace(
+        multi_possession_reward_mode=jnp.asarray(
+            MULTI_POSSESSION_REWARD_SCORING_EVENTS,
+            dtype=jnp.int32,
+        ),
+        illegal_defense_enabled=jnp.asarray(1, dtype=jnp.int8),
+        defender_guard_distance=jnp.asarray(0.0, dtype=jnp.float32),
+        three_second_max_steps=jnp.asarray(0, dtype=jnp.int32),
+    )
+    technical_state = reset_batch_minimal(
+        technical_static,
+        jax.random.split(jax.random.PRNGKey(224), 1),
+        jax,
+        jnp,
+    )
+    team_b_holder = int(np.asarray(technical_static.defense_ids)[0])
+    team_a_defender = int(np.asarray(technical_static.offense_ids)[0])
+    lane_idx = int(np.flatnonzero(np.asarray(technical_static.defensive_lane_by_cell))[0])
+    positions = np.asarray(technical_state.positions).copy()
+    positions[0, team_a_defender] = np.asarray(technical_static.cell_coords)[lane_idx]
+    technical_state = technical_state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int8),
+        ball_holder=jnp.asarray([team_b_holder], dtype=jnp.int32),
+        shot_clock=jnp.asarray([7], dtype=jnp.int32),
+    )
+    technical = step_batch_minimal(
+        technical_static,
+        technical_state,
+        _noops(technical_state),
+        jax.random.split(jax.random.PRNGKey(225), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(technical.defensive_lane_violation)[0]) == 1
+    assert float(np.asarray(technical.team_a_score_delta)[0]) == pytest.approx(0.0)
+    assert float(np.asarray(technical.team_b_score_delta)[0]) == pytest.approx(1.0)
+    assert _team_total(technical.rewards, technical_static.offense_ids) == pytest.approx(-1.0)
+    assert _team_total(technical.rewards, technical_static.defense_ids) == pytest.approx(1.0)
+
+    no_score_static = _multi_possession_static(possession_limit=2)._replace(
+        multi_possession_reward_mode=jnp.asarray(
+            MULTI_POSSESSION_REWARD_SCORING_EVENTS,
+            dtype=jnp.int32,
+        )
+    )
+    no_score = _terminal_clearance_violation(
+        no_score_static,
+        team_a_score=7.0,
+        team_b_score=3.0,
+        seed=226,
+    )
+    assert bool(np.asarray(no_score.done)[0])
+    np.testing.assert_array_equal(np.asarray(no_score.game_reward), 0.0)
+    np.testing.assert_array_equal(np.asarray(no_score.rewards), 0.0)
+
+
+def test_scoring_event_rewards_sum_to_final_score_differential_over_game():
+    static = _multi_possession_static(possession_limit=1)._replace(
+        multi_possession_reward_mode=jnp.asarray(
+            MULTI_POSSESSION_REWARD_SCORING_EVENTS,
+            dtype=jnp.int32,
+        )
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(227), 1),
+        jax,
+        jnp,
+    )
+    team_a_holder = int(np.asarray(static.offense_ids)[0])
+    state = state._replace(
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        ball_holder=jnp.asarray([team_a_holder], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+        layup_pct=jnp.ones_like(state.layup_pct),
+        three_pt_pct=jnp.ones_like(state.three_pt_pct),
+        dunk_pct=jnp.ones_like(state.dunk_pct),
+    )
+
+    positions = np.asarray(state.positions).copy()
+    positions[0, team_a_holder] = np.asarray(static.basket_position)
+    first = _shoot(
+        static,
+        state._replace(positions=jnp.asarray(positions, dtype=jnp.int32)),
+        seed=228,
+    )
+    rewards_for_team_a = _team_total(first.rewards, static.offense_ids)
+    assert rewards_for_team_a == pytest.approx(2.0)
+
+    inbound_state = _complete_inbound(static, first.state, seed=229)
+    state = inbound_state._replace(
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
+        layup_pct=jnp.ones_like(inbound_state.layup_pct),
+        three_pt_pct=jnp.ones_like(inbound_state.three_pt_pct),
+        dunk_pct=jnp.ones_like(inbound_state.dunk_pct),
+    )
+    holder = int(np.asarray(state.ball_holder)[0])
+    three_cell = int(np.flatnonzero(np.asarray(static.three_point_by_cell))[0])
+    positions = np.asarray(state.positions).copy()
+    positions[0, holder] = np.asarray(static.cell_coords)[three_cell]
+    second = _shoot(
+        static,
+        state._replace(positions=jnp.asarray(positions, dtype=jnp.int32)),
+        seed=230,
+    )
+    assert bool(np.asarray(second.done)[0])
+    rewards_for_team_a += _team_total(second.rewards, static.offense_ids)
+    final_score_diff = float(
+        np.asarray(second.state.team_a_score - second.state.team_b_score)[0]
+    )
+    assert final_score_diff == pytest.approx(-1.0)
+    assert rewards_for_team_a == pytest.approx(final_score_diff)
 
 
 def test_score_potential_telescopes_across_role_flip_rollout_boundary_and_beta_change():
@@ -149,6 +329,9 @@ def test_score_potential_telescopes_across_role_flip_rollout_boundary_and_beta_c
         positions=jnp.asarray(positions, dtype=jnp.int32),
         offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
         ball_holder=jnp.asarray([holder], dtype=jnp.int32),
+        team_a_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([2], dtype=jnp.int32),
         clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
         layup_pct=jnp.ones_like(state.layup_pct),
         three_pt_pct=jnp.ones_like(state.three_pt_pct),
@@ -255,6 +438,7 @@ def test_role_switch_and_offensive_rebound_do_not_reset_or_flip_score_potential(
         team_a_score=jnp.asarray([2.0], dtype=jnp.float32),
         team_b_score=jnp.asarray([0.0], dtype=jnp.float32),
         cached_phi=jnp.asarray([1.0], dtype=jnp.float32),
+        clearance_achieved=jnp.asarray([1], dtype=jnp.int8),
         layup_pct=jnp.zeros((1, 4), dtype=jnp.float32),
         three_pt_pct=jnp.zeros((1, 4), dtype=jnp.float32),
         dunk_pct=jnp.zeros((1, 4), dtype=jnp.float32),
@@ -289,7 +473,9 @@ def test_game_context_observations_are_team_relative_and_cover_inbound_final_sta
         offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
         team_a_score=jnp.asarray([6.0], dtype=jnp.float32),
         team_b_score=jnp.asarray([3.0], dtype=jnp.float32),
-        completed_possessions=jnp.asarray([2], dtype=jnp.int32),
+        team_a_completed_possessions=jnp.asarray([2], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([3], dtype=jnp.int32),
         game_phase=jnp.asarray([GAME_PHASE_AWAITING_INBOUND], dtype=jnp.int8),
         inbound_player=jnp.asarray([inbounder], dtype=jnp.int32),
         inbound_steps_remaining=jnp.asarray([3], dtype=jnp.int32),
@@ -305,7 +491,7 @@ def test_game_context_observations_are_team_relative_and_cover_inbound_final_sta
     assert float(np.asarray(defense_globals)[0, 0]) == pytest.approx(-3.0 / 15.0)
     np.testing.assert_allclose(
         np.asarray(offense_globals)[0, 1:],
-        np.asarray([3.0 / 5.0, 1.0, 1.0, 3.0 / 5.0], dtype=np.float32),
+        np.asarray([3.0 / 5.0, 0.0, 1.0, 3.0 / 5.0], dtype=np.float32),
     )
     assert np.asarray(offense_players)[0, inbounder].tolist() == [1.0, 0.0]
 
@@ -333,7 +519,9 @@ def test_game_context_observations_are_team_relative_and_cover_inbound_final_sta
     assert float(np.asarray(flipped_defense)[0, 0]) == pytest.approx(3.0 / 15.0)
 
     final_state = state._replace(
-        completed_possessions=jnp.asarray([5], dtype=jnp.int32),
+        team_a_completed_possessions=jnp.asarray([5], dtype=jnp.int32),
+        team_b_completed_possessions=jnp.asarray([5], dtype=jnp.int32),
+        completed_possessions=jnp.asarray([10], dtype=jnp.int32),
         episode_ended=jnp.asarray([1], dtype=jnp.int8),
         game_phase=jnp.asarray([GAME_PHASE_LIVE], dtype=jnp.int8),
         inbound_player=jnp.asarray([-1], dtype=jnp.int32),
@@ -354,6 +542,7 @@ def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs
     assert args.multi_possession_reward_mode == "win_loss"
     assert args.score_potential_scale == pytest.approx(1.0)
     assert args.multi_possession_aux_rewards_enabled is False
+    assert args.multi_possession_use_inbounds is True
     validate_train_args(args)
     assert (
         _jax_env_config_from_args(args)["multi_possession_schema_version"]
@@ -363,9 +552,30 @@ def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs
         _jax_env_config_from_args(parse_args([]))["multi_possession_schema_version"]
         == 1
     )
+    assert not _jax_env_config_from_args(
+        parse_args(
+            ["--enable-multi-possession", "--no-multi-possession-use-inbounds"]
+        )
+    )["multi_possession_use_inbounds"]
 
     with pytest.raises(SystemExit, match="requires --enable-multi-possession"):
         validate_train_args(parse_args(["--multi-possession-aux-rewards-enabled"]))
+    scoring_args = parse_args(
+        ["--enable-multi-possession", "--multi-possession-reward-mode", "scoring_events"]
+    )
+    validate_train_args(scoring_args)
+    with pytest.raises(SystemExit, match="incompatible with.*scoring_events"):
+        validate_train_args(
+            parse_args(
+                [
+                    "--enable-multi-possession",
+                    "--multi-possession-reward-mode",
+                    "scoring_events",
+                    "--enable-phi-shaping",
+                    "true",
+                ]
+            )
+        )
     with pytest.raises(SystemExit, match="phi-use-ball-handler-only"):
         validate_train_args(
             parse_args(
@@ -407,6 +617,7 @@ def test_reward_components_remain_separate_for_training_logging():
             rewards=jnp.asarray([[3.5]], dtype=jnp.float32),
             phi_r_shape=jnp.asarray([[0.25]], dtype=jnp.float32),
             game_rewards=jnp.asarray([[1.0]], dtype=jnp.float32),
+            winner_rewards=jnp.asarray([[0.75]], dtype=jnp.float32),
             auxiliary_rewards=jnp.asarray([[0.5]], dtype=jnp.float32),
         )
     )
@@ -425,10 +636,12 @@ def test_reward_components_remain_separate_for_training_logging():
         "task_reward",
         "phi_reward",
         "game_reward",
+        "winner_reward",
         "auxiliary_reward",
         "intent_bonus",
     }
     assert float(np.asarray(components["phi_reward"])[0, 0]) == pytest.approx(3.0)
     assert float(np.asarray(components["game_reward"])[0, 0]) == pytest.approx(6.0)
+    assert float(np.asarray(components["winner_reward"])[0, 0]) == pytest.approx(4.5)
     assert float(np.asarray(components["auxiliary_reward"])[0, 0]) == pytest.approx(3.0)
     assert float(np.asarray(components["task_reward"])[0, 0]) == pytest.approx(0.5)

@@ -97,9 +97,13 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "multi_possession_limit",
     "multi_possession_reward_mode",
     "score_potential_scale",
+    "game_winner_reward",
     "multi_possession_aux_rewards_enabled",
+    "multi_possession_use_inbounds",
+    "made_basket_restart_mode",
     "multi_possession_schema_version",
     "inbound_deadline_steps",
+    "check_deadline_steps",
 }
 
 
@@ -256,9 +260,13 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "multi_possession_limit": int,
     "multi_possession_reward_mode": str,
     "score_potential_scale": float,
+    "game_winner_reward": float,
     "multi_possession_aux_rewards_enabled": _str_to_bool,
+    "multi_possession_use_inbounds": _str_to_bool,
+    "made_basket_restart_mode": str,
     "multi_possession_schema_version": int,
     "inbound_deadline_steps": int,
+    "check_deadline_steps": int,
 }
 
 
@@ -1958,6 +1966,21 @@ def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
         raise HTTPException(status_code=400, detail="The possession limit is available only for multi-possession games.")
     try:
         runtime.set_multi_possession_limit(request.multi_possession_limit)
+        if (
+            request.made_basket_restart_mode is not None
+            or request.check_deadline_steps is not None
+        ):
+            runtime.set_made_basket_restart(
+                request.made_basket_restart_mode
+                or str(
+                    runtime.env_params.get(
+                        "made_basket_restart_mode",
+                        "baseline_inbound",
+                    )
+                ),
+                request.check_deadline_steps
+                or int(runtime.env_params.get("check_deadline_steps", 5)),
+            )
         runtime.reset()
         game_state.env = runtime.display_env
         game_state.user_team = runtime.user_team

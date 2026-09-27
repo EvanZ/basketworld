@@ -26,13 +26,16 @@ from basketworld_jax.env import (
     step_batch_minimal,
 )
 from basketworld_jax.env.minimal import (
+    GAME_PHASE_LIVE,
     POSSESSION_END_DEFENSIVE_REBOUND,
     POSSESSION_END_DEFENSIVE_VIOLATION,
+    POSSESSION_END_CHECK_VIOLATION,
     POSSESSION_END_INBOUND_VIOLATION,
     POSSESSION_END_MADE_BASKET,
     POSSESSION_END_TURNOVER,
     ReboundDiagnosticTotals,
     TURNOVER_REASON_CLEARANCE_VIOLATION,
+    TURNOVER_REASON_CHECK_TIMEOUT,
     TURNOVER_REASON_DEFENDER_PRESSURE,
     TURNOVER_REASON_INBOUND_INVALID_PASS,
     TURNOVER_REASON_INBOUND_TIMEOUT,
@@ -41,6 +44,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_OFFENSIVE_THREE_SECONDS,
     TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
     TURNOVER_REASON_SHOT_CLOCK,
+    build_spatial_diagnostics_batch,
     zero_rebound_diagnostic_totals_like,
 )
 from basketworld_jax.models import (
@@ -76,6 +80,16 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "active_steps",
     "completed_possessions",
     "completed_possession_live_steps",
+    "check_opportunities",
+    "check_pickups",
+    "check_violations",
+    "check_pickup_steps",
+    "spatial_live_steps",
+    "spatial_all_player_pair_distance",
+    "candidate_spatial_teammate_pair_distance",
+    "opponent_spatial_teammate_pair_distance",
+    "spatial_boundary_player_fraction",
+    "spatial_corner_player_fraction",
     "rebound_attempts",
     "candidate_pass_attempts",
     "candidate_completed_passes",
@@ -121,6 +135,16 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "opponent_defensive_lane_violations",
 )
 
+HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "spatial_all_player_pair_distance",
+        "candidate_spatial_teammate_pair_distance",
+        "opponent_spatial_teammate_pair_distance",
+        "spatial_boundary_player_fraction",
+        "spatial_corner_player_fraction",
+    }
+)
+
 for _side in ("candidate", "opponent"):
     for _reason in (
         "pass_out_of_bounds",
@@ -132,6 +156,7 @@ for _side in ("candidate", "opponent"):
         "inbound_timeout",
         "inbound_invalid_pass",
         "clearance_violation",
+        "check_timeout",
     ):
         HISTORICAL_MATCH_DIAGNOSTIC_KEYS += (f"{_side}_turnover_{_reason}",)
     for _reason in (
@@ -140,6 +165,7 @@ for _side in ("candidate", "opponent"):
         "turnover",
         "defensive_violation",
         "inbound_violation",
+        "check_violation",
     ):
         HISTORICAL_MATCH_DIAGNOSTIC_KEYS += (f"{_side}_possession_end_{_reason}",)
 
@@ -745,6 +771,22 @@ def _build_intent_transition_metrics(state) -> dict[str, Any]:
     }
 
 
+def _build_spatial_step_metrics(static, state, active_step, jnp) -> dict[str, Any]:
+    """Keep geometry diagnostics only for active, in-court live-play ticks."""
+    live_step = (
+        active_step.astype(jnp.bool_)
+        & (state.game_phase == GAME_PHASE_LIVE)
+    )
+    diagnostics = build_spatial_diagnostics_batch(static, state, jnp)
+    return {
+        "spatial_live_steps": live_step.astype(jnp.float32),
+        **{
+            key: jnp.where(live_step, value, jnp.zeros_like(value))
+            for key, value in diagnostics.items()
+        },
+    }
+
+
 def _zero_selector_transition_metrics(state, jnp) -> dict[str, Any]:
     batch_shape = state.intent_index.shape
     return {
@@ -1280,6 +1322,14 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                     ),
                     0.0,
                 ),
+                winner_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.winner_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
                 auxiliary_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -1294,6 +1344,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
                 phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
+                **_build_spatial_step_metrics(static, policy_state, active_step, jnp),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -1309,6 +1360,10 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                     env_out.turnover_before_clearance.astype(jnp.int8),
                     0,
                 ),
+                check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
                     env_out.possession_ended.astype(jnp.int8),
@@ -1737,6 +1792,14 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                     ),
                     0.0,
                 ),
+                winner_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.winner_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
                 auxiliary_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -1751,6 +1814,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
                 phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
+                **_build_spatial_step_metrics(static, policy_state, active_step, jnp),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -1766,6 +1830,10 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                     env_out.turnover_before_clearance.astype(jnp.int8),
                     0,
                 ),
+                check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
                     env_out.possession_ended.astype(jnp.int8),
@@ -2205,6 +2273,14 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     ),
                     0.0,
                 ),
+                winner_rewards=jnp.where(
+                    active_step,
+                    jnp.sum(
+                        env_out.winner_reward * static.training_player_mask[None, :],
+                        axis=1,
+                    ),
+                    0.0,
+                ),
                 auxiliary_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -2219,6 +2295,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 phi_prev=jnp.where(active_step, env_out.phi_prev.astype(jnp.float32), 0.0),
                 phi_next=jnp.where(active_step, env_out.phi_next.astype(jnp.float32), 0.0),
                 phi_beta=jnp.where(active_step, env_out.phi_beta.astype(jnp.float32), 0.0),
+                **_build_spatial_step_metrics(static, policy_state, active_step, jnp),
                 pass_attempts=jnp.where(active_step, env_out.pass_attempt.astype(jnp.int8), 0),
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
@@ -2234,6 +2311,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     env_out.turnover_before_clearance.astype(jnp.int8),
                     0,
                 ),
+                check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
                     env_out.possession_ended.astype(jnp.int8),
@@ -2479,6 +2560,9 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
+                winner_rewards=jnp.sum(
+                    env_out.winner_reward * static.training_player_mask[None, :], axis=1
+                ),
                 auxiliary_rewards=jnp.sum(
                     env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -2491,6 +2575,10 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_pickups=env_out.check_pickup.astype(jnp.int8),
+                check_violations=env_out.check_violation.astype(jnp.int8),
+                check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
                     env_out.completed_possession_live_steps.astype(jnp.int32)
@@ -2614,6 +2702,9 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
+                winner_rewards=jnp.sum(
+                    env_out.winner_reward * static.training_player_mask[None, :], axis=1
+                ),
                 auxiliary_rewards=jnp.sum(
                     env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -2626,6 +2717,10 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_pickups=env_out.check_pickup.astype(jnp.int8),
+                check_violations=env_out.check_violation.astype(jnp.int8),
+                check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
                     env_out.completed_possession_live_steps.astype(jnp.int32)
@@ -2713,6 +2808,35 @@ def _build_historical_match_step_diagnostics(
         env_out.completed_possession_live_steps.astype(jnp.float32),
         0.0,
     )
+    counters["check_opportunities"] = _count(env_out.check_opportunity)
+    counters["check_pickups"] = _count(env_out.check_pickup)
+    counters["check_violations"] = _count(env_out.check_violation)
+    counters["check_pickup_steps"] = jnp.where(
+        active_step,
+        env_out.check_pickup_steps.astype(jnp.float32),
+        0.0,
+    )
+    spatial_metrics = _build_spatial_step_metrics(static, state, active_step, jnp)
+    counters["spatial_live_steps"] = spatial_metrics["spatial_live_steps"]
+    counters["spatial_all_player_pair_distance"] = spatial_metrics[
+        "spatial_all_player_pair_distance"
+    ]
+    counters["candidate_spatial_teammate_pair_distance"] = jnp.where(
+        candidate_is_offense,
+        spatial_metrics["spatial_offense_teammate_pair_distance"],
+        spatial_metrics["spatial_defense_teammate_pair_distance"],
+    )
+    counters["opponent_spatial_teammate_pair_distance"] = jnp.where(
+        candidate_is_offense,
+        spatial_metrics["spatial_defense_teammate_pair_distance"],
+        spatial_metrics["spatial_offense_teammate_pair_distance"],
+    )
+    counters["spatial_boundary_player_fraction"] = spatial_metrics[
+        "spatial_boundary_player_fraction"
+    ]
+    counters["spatial_corner_player_fraction"] = spatial_metrics[
+        "spatial_corner_player_fraction"
+    ]
     counters["rebound_attempts"] = _count(env_out.rebound_attempt)
 
     _split_offense(env_out.pass_attempt, "pass_attempts", counters)
@@ -2773,6 +2897,7 @@ def _build_historical_match_step_diagnostics(
         "inbound_timeout": TURNOVER_REASON_INBOUND_TIMEOUT,
         "inbound_invalid_pass": TURNOVER_REASON_INBOUND_INVALID_PASS,
         "clearance_violation": TURNOVER_REASON_CLEARANCE_VIOLATION,
+        "check_timeout": TURNOVER_REASON_CHECK_TIMEOUT,
     }
     for reason_name, reason in turnover_reasons.items():
         _split_offense(
@@ -2787,6 +2912,7 @@ def _build_historical_match_step_diagnostics(
         "turnover": POSSESSION_END_TURNOVER,
         "defensive_violation": POSSESSION_END_DEFENSIVE_VIOLATION,
         "inbound_violation": POSSESSION_END_INBOUND_VIOLATION,
+        "check_violation": POSSESSION_END_CHECK_VIOLATION,
     }
     for reason_name, reason in possession_end_reasons.items():
         _split_offense(
@@ -3195,6 +3321,9 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
+                winner_rewards=jnp.sum(
+                    env_out.winner_reward * static.training_player_mask[None, :], axis=1
+                ),
                 auxiliary_rewards=jnp.sum(
                     env_out.auxiliary_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -3207,6 +3336,10 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 clearance_events=env_out.clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
+                check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_pickups=env_out.check_pickup.astype(jnp.int8),
+                check_violations=env_out.check_violation.astype(jnp.int8),
+                check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
                     env_out.completed_possession_live_steps.astype(jnp.int32)
@@ -3368,6 +3501,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
             )
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
+            spatial_metrics = _build_spatial_step_metrics(static, state, active_step, jnp)
 
             def _active_sum(value):
                 value = jnp.asarray(value, dtype=jnp.float32)
@@ -3379,6 +3513,9 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 offense_reward=_active_sum(jnp.sum(env_out.rewards[:, offense_ids], axis=1)),
                 defense_reward=_active_sum(jnp.sum(env_out.rewards[:, defense_ids], axis=1)),
                 game_reward=_active_sum(jnp.sum(env_out.game_reward[:, offense_ids], axis=1)),
+                winner_reward=_active_sum(
+                    jnp.sum(env_out.winner_reward[:, offense_ids], axis=1)
+                ),
                 auxiliary_reward=_active_sum(
                     jnp.sum(env_out.auxiliary_reward[:, offense_ids], axis=1)
                 ),
@@ -3410,9 +3547,29 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 turnovers_before_clearance=_active_sum(
                     env_out.turnover_before_clearance
                 ),
+                check_opportunities=_active_sum(env_out.check_opportunity),
+                check_pickups=_active_sum(env_out.check_pickup),
+                check_violations=_active_sum(env_out.check_violation),
+                check_pickup_steps=_active_sum(env_out.check_pickup_steps),
                 completed_possessions=_active_sum(env_out.possession_ended),
                 completed_possession_live_steps=_active_sum(
                     env_out.completed_possession_live_steps
+                ),
+                spatial_live_steps=_active_sum(spatial_metrics["spatial_live_steps"]),
+                spatial_all_player_pair_distance=_active_sum(
+                    spatial_metrics["spatial_all_player_pair_distance"]
+                ),
+                spatial_offense_teammate_pair_distance=_active_sum(
+                    spatial_metrics["spatial_offense_teammate_pair_distance"]
+                ),
+                spatial_defense_teammate_pair_distance=_active_sum(
+                    spatial_metrics["spatial_defense_teammate_pair_distance"]
+                ),
+                spatial_boundary_player_fraction=_active_sum(
+                    spatial_metrics["spatial_boundary_player_fraction"]
+                ),
+                spatial_corner_player_fraction=_active_sum(
+                    spatial_metrics["spatial_corner_player_fraction"]
                 ),
                 shot_attempts=_active_sum(shot_metrics["shot_attempts"]),
                 shot_makes=_active_sum(shot_metrics["shot_makes"]),
@@ -3587,9 +3744,33 @@ def summarize_deploy_eval_outputs(
             totals["completed_possession_live_steps"],
             totals["completed_possessions"],
         ),
+        "spatial_live_step_count": int(totals["spatial_live_steps"]),
+        "mean_live_all_player_pair_distance": _rate(
+            totals["spatial_all_player_pair_distance"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_offense_teammate_pair_distance": _rate(
+            totals["spatial_offense_teammate_pair_distance"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_defense_teammate_pair_distance": _rate(
+            totals["spatial_defense_teammate_pair_distance"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_boundary_player_fraction": _rate(
+            totals["spatial_boundary_player_fraction"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_corner_player_fraction": _rate(
+            totals["spatial_corner_player_fraction"],
+            totals["spatial_live_steps"],
+        ),
         "mean_offense_reward_per_episode": _per_episode(totals["offense_reward"]),
         "mean_defense_reward_per_episode": _per_episode(totals["defense_reward"]),
         "game_reward_total": totals["game_reward"],
+        "mean_game_reward_per_episode": _per_episode(totals["game_reward"]),
+        "winner_reward_total": totals["winner_reward"],
+        "mean_winner_reward_per_episode": _per_episode(totals["winner_reward"]),
         "auxiliary_reward_total": totals["auxiliary_reward"],
         "team_a_score_delta_total": totals["team_a_score_delta"],
         "team_b_score_delta_total": totals["team_b_score_delta"],
@@ -3608,6 +3789,15 @@ def summarize_deploy_eval_outputs(
         "assists_per_episode": _per_episode(totals["assists"]),
         "turnovers": int(turnovers),
         "turnovers_per_episode": _per_episode(turnovers),
+        "check_opportunity_count": int(totals["check_opportunities"]),
+        "check_pickup_count": int(totals["check_pickups"]),
+        "check_violation_count": int(totals["check_violations"]),
+        "check_pickup_rate": _rate(
+            totals["check_pickups"], totals["check_opportunities"]
+        ),
+        "check_mean_pickup_steps": _rate(
+            totals["check_pickup_steps"], totals["check_pickups"]
+        ),
         "shot_attempts": int(shot_attempts),
         "shot_makes": int(totals["shot_makes"]),
         "shot_make_rate": _rate(totals["shot_makes"], shot_attempts),
@@ -4412,14 +4602,31 @@ def summarize_ppo_eligible_episode_metrics(
     trajectory: TrajectoryBatch,
     training_mask,
     *,
+    metric_mask=None,
+    completion_mask=None,
     include_learner_shots: bool = True,
     include_opponent_shots: bool = True,
     role: str | None = None,
 ) -> dict[str, float]:
-    """Summarize only the rollout steps that are eligible for PPO loss updates."""
-    mask = np.asarray(training_mask, dtype=np.float32)
+    """Summarize PPO-eligible events, optionally restricted to one live role.
+
+    ``metric_mask`` selects the events attributed to this metric (for example,
+    only timesteps when the learner is the active offense).  Completed-game
+    denominators deliberately use ``completion_mask`` instead: a game ending
+    during a defensive possession is still a completed game for an
+    offense-only diagnostic, and vice versa.
+    """
+    eligible_mask = np.asarray(training_mask, dtype=np.float32)
+    if metric_mask is None:
+        mask = eligible_mask
+    else:
+        mask = eligible_mask * np.asarray(metric_mask, dtype=np.float32)
+    if completion_mask is None:
+        episode_mask = eligible_mask
+    else:
+        episode_mask = eligible_mask * np.asarray(completion_mask, dtype=np.float32)
     terminal_steps = np.asarray(trajectory.terminal_episode_steps, dtype=np.int32)
-    terminal_mask = ((terminal_steps > 0) & (mask > 0.5)).astype(np.float32)
+    terminal_mask = ((terminal_steps > 0) & (episode_mask > 0.5)).astype(np.float32)
     completed_episodes = int(terminal_mask.sum())
     completed_denom = float(completed_episodes) if completed_episodes > 0 else 0.0
     step_count = float(mask.sum())
@@ -4490,6 +4697,9 @@ def summarize_ppo_eligible_episode_metrics(
         "turnovers": trajectory.turnovers,
         "clearance_events": trajectory.clearance_events,
         "turnovers_before_clearance": trajectory.turnovers_before_clearance,
+        "check_opportunities": trajectory.check_opportunities,
+        "check_pickups": trajectory.check_pickups,
+        "check_violations": trajectory.check_violations,
         "learner_turnovers": trajectory.learner_turnovers,
         "opponent_turnovers": trajectory.opponent_turnovers,
         "offensive_three_seconds": trajectory.offensive_three_seconds,
@@ -4592,11 +4802,21 @@ def summarize_ppo_eligible_reward_component_metrics(
     task_rewards,
     phi_rewards,
     intent_bonus_rewards,
+    metric_mask=None,
+    completion_mask=None,
 ) -> dict[str, float]:
-    """Summarize PPO-eligible reward components on the same denominator as total reward."""
-    mask = np.asarray(training_mask, dtype=np.float32)
+    """Summarize PPO reward components on the same role-aware denominator."""
+    eligible_mask = np.asarray(training_mask, dtype=np.float32)
+    if metric_mask is None:
+        mask = eligible_mask
+    else:
+        mask = eligible_mask * np.asarray(metric_mask, dtype=np.float32)
+    if completion_mask is None:
+        episode_mask = eligible_mask
+    else:
+        episode_mask = eligible_mask * np.asarray(completion_mask, dtype=np.float32)
     terminal_steps = np.asarray(trajectory.terminal_episode_steps, dtype=np.int32)
-    terminal_mask = ((terminal_steps > 0) & (mask > 0.5)).astype(np.float32)
+    terminal_mask = ((terminal_steps > 0) & (episode_mask > 0.5)).astype(np.float32)
     completed_episodes = int(terminal_mask.sum())
     completed_denom = float(completed_episodes) if completed_episodes > 0 else 0.0
     step_count = float(mask.sum())
@@ -4800,12 +5020,20 @@ def summarize_training_step(
     active_ppo_count = float(ppo_active.sum())
     ppo_loss_weight_sum = float(ppo_loss_weights.sum())
     ppo_loss_denominator_value = float(ppo_loss_denominator.max()) if ppo_loss_denominator.size else 0.0
+    spatial_live_mask = np.asarray(
+        rollout_out.trajectory.spatial_live_steps,
+        dtype=np.float32,
+    )
+    spatial_live_step_count = float(spatial_live_mask.sum())
 
     def _active_mean(values, mask) -> float:
         denom = float(mask.sum())
         if denom <= 0.0:
             return 0.0
         return float((np.asarray(values, dtype=np.float32) * mask).sum() / denom)
+
+    def _spatial_live_mean(values) -> float:
+        return _active_mean(values, spatial_live_mask)
 
     reward_mean = _active_mean(rollout_out.trajectory.rewards, rollout_active)
     phi_r_shape_mean = _active_mean(rollout_out.trajectory.phi_r_shape, rollout_active)
@@ -4896,6 +5124,22 @@ def summarize_training_step(
         "phi_beta_mean": phi_beta_mean,
         "game_reward_mean": game_reward_mean,
         "auxiliary_reward_mean": auxiliary_reward_mean,
+        "spatial_live_step_count": int(spatial_live_step_count),
+        "mean_live_all_player_pair_distance": _spatial_live_mean(
+            rollout_out.trajectory.spatial_all_player_pair_distance
+        ),
+        "mean_live_offense_teammate_pair_distance": _spatial_live_mean(
+            rollout_out.trajectory.spatial_offense_teammate_pair_distance
+        ),
+        "mean_live_defense_teammate_pair_distance": _spatial_live_mean(
+            rollout_out.trajectory.spatial_defense_teammate_pair_distance
+        ),
+        "mean_live_boundary_player_fraction": _spatial_live_mean(
+            rollout_out.trajectory.spatial_boundary_player_fraction
+        ),
+        "mean_live_corner_player_fraction": _spatial_live_mean(
+            rollout_out.trajectory.spatial_corner_player_fraction
+        ),
         "team_a_score_delta_total": team_a_score_delta_total,
         "team_b_score_delta_total": team_b_score_delta_total,
         "done_rate": done_rate,
@@ -4965,6 +5209,18 @@ def summarize_training_step(
             dtype=np.float32,
         ).sum()
     )
+    check_opportunities = float(
+        np.asarray(rollout_out.trajectory.check_opportunities, dtype=np.float32).sum()
+    )
+    check_pickups = float(
+        np.asarray(rollout_out.trajectory.check_pickups, dtype=np.float32).sum()
+    )
+    check_violations = float(
+        np.asarray(rollout_out.trajectory.check_violations, dtype=np.float32).sum()
+    )
+    check_pickup_steps = float(
+        np.asarray(rollout_out.trajectory.check_pickup_steps, dtype=np.float32).sum()
+    )
     summary.update(
         {
             "clearance_event_count": int(clearance_events),
@@ -4973,6 +5229,15 @@ def summarize_training_step(
                 clearance_elapsed_total / max(1.0, clearance_events)
             ),
             "turnovers_before_clearance_count": int(turnovers_before_clearance),
+            "check_opportunity_count": int(check_opportunities),
+            "check_pickup_count": int(check_pickups),
+            "check_violation_count": int(check_violations),
+            "check_pickup_rate": float(
+                check_pickups / max(1.0, check_opportunities)
+            ),
+            "check_mean_pickup_steps": float(
+                check_pickup_steps / max(1.0, check_pickups)
+            ),
         }
     )
     summary.update(

@@ -47,6 +47,7 @@ class TrajectoryBatch(NamedTuple):
     rewards: Any
     dones: Any
     game_rewards: Any
+    winner_rewards: Any
     auxiliary_rewards: Any
     team_a_score_delta: Any
     team_b_score_delta: Any
@@ -54,6 +55,12 @@ class TrajectoryBatch(NamedTuple):
     phi_prev: Any
     phi_next: Any
     phi_beta: Any
+    spatial_live_steps: Any
+    spatial_all_player_pair_distance: Any
+    spatial_offense_teammate_pair_distance: Any
+    spatial_defense_teammate_pair_distance: Any
+    spatial_boundary_player_fraction: Any
+    spatial_corner_player_fraction: Any
     pass_attempts: Any
     completed_passes: Any
     assists: Any
@@ -70,6 +77,10 @@ class TrajectoryBatch(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    check_opportunities: Any
+    check_pickups: Any
+    check_violations: Any
+    check_pickup_steps: Any
     possession_ended: Any
     completed_possession_live_steps: Any
     shot_attempts: Any
@@ -180,6 +191,7 @@ class EvalTrace(NamedTuple):
     rewards: Any
     dones: Any
     game_rewards: Any
+    winner_rewards: Any
     auxiliary_rewards: Any
     team_a_score_delta: Any
     team_b_score_delta: Any
@@ -190,6 +202,10 @@ class EvalTrace(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    check_opportunities: Any
+    check_pickups: Any
+    check_violations: Any
+    check_pickup_steps: Any
     possession_ended: Any
     completed_possession_live_steps: Any
     shot_attempts: Any
@@ -238,6 +254,7 @@ class DeployEvalTotals(NamedTuple):
     offense_reward: Any
     defense_reward: Any
     game_reward: Any
+    winner_reward: Any
     auxiliary_reward: Any
     team_a_score_delta: Any
     team_b_score_delta: Any
@@ -255,8 +272,18 @@ class DeployEvalTotals(NamedTuple):
     clearance_events: Any
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
+    check_opportunities: Any
+    check_pickups: Any
+    check_violations: Any
+    check_pickup_steps: Any
     completed_possessions: Any
     completed_possession_live_steps: Any
+    spatial_live_steps: Any
+    spatial_all_player_pair_distance: Any
+    spatial_offense_teammate_pair_distance: Any
+    spatial_defense_teammate_pair_distance: Any
+    spatial_boundary_player_fraction: Any
+    spatial_corner_player_fraction: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any

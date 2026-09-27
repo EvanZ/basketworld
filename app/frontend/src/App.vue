@@ -2202,8 +2202,11 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
     if (!res || res.status !== 'success' || !res.state) {
       throw new Error(res?.message || 'Failed to start self-play.');
     }
-    gameState.value = res.state;
-    gameHistory.value = [res.state];
+    const startingState = useFastMode
+      ? { ...(gameState.value || {}), ...res.state }
+      : res.state;
+    gameState.value = startingState;
+    gameHistory.value = [cloneState(startingState)];
     replaySessionId = res.replay_session_id || res.state?.replay_session_id || null;
     moveHistory.value = [];
     currentSelections.value = null;
@@ -2418,8 +2421,11 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
       );
       if (!isCurrentGameSession(activeGameSessionId)) break;
       if (response.status === 'success') {
-        gameState.value = response.state;
-        gameHistory.value.push(cloneState(response.state));
+        const nextState = useFastMode
+          ? { ...(gameState.value || {}), ...response.state }
+          : response.state;
+        gameState.value = nextState;
+        gameHistory.value.push(cloneState(nextState));
         if (useFastMode) {
           currentSelections.value = buildDisplayActions(response.actions_taken, response.actions_taken_meta);
           if (response.fast_kernel) {
@@ -3542,16 +3548,41 @@ async function handlePlayAgain() {
   }
 }
 
-async function handleMultiPossessionLimitRequested(limit, { forceRestart = false } = {}) {
+async function handleMultiPossessionLimitRequested(requested, { forceRestart = false } = {}) {
   if (!gameState.value?.enable_multi_possession || !initialSetup.value) return;
+  const request = requested && typeof requested === 'object'
+    ? requested
+    : { multiPossessionLimit: requested };
+  const limit = request.multiPossessionLimit ?? request.limit;
   const parsed = Math.trunc(Number(limit));
   if (!Number.isFinite(parsed) || parsed < 1) return;
-  if (!forceRestart && parsed === Number(gameState.value.multi_possession_limit)) return;
+  const restartMode = String(
+    request.madeBasketRestartMode
+      ?? gameState.value.made_basket_restart_mode
+      ?? 'baseline_inbound',
+  );
+  const checkDeadline = Math.trunc(Number(
+    request.checkDeadlineSteps
+      ?? gameState.value.check_deadline_steps
+      ?? 5,
+  ));
+  if (!Number.isFinite(checkDeadline) || checkDeadline < 1) return;
+  if (
+    !forceRestart
+    && parsed === Number(gameState.value.multi_possession_limit)
+    && restartMode === String(gameState.value.made_basket_restart_mode ?? 'baseline_inbound')
+    && checkDeadline === Number(gameState.value.check_deadline_steps ?? 5)
+  ) return;
 
   // This is an episode-length setting, not a policy or court change. Restart
   // the current game in-place so a prepared Fast Mode JIT kernel stays warm.
   const sessionId = ++gameSessionId;
-  const nextSetup = { ...initialSetup.value, multiPossessionLimit: parsed };
+  const nextSetup = {
+    ...initialSetup.value,
+    multiPossessionLimit: parsed,
+    madeBasketRestartMode: restartMode,
+    checkDeadlineSteps: checkDeadline,
+  };
   stopSelfPlay();
   cancelReplayAnimation();
   isLoading.value = true;
@@ -3572,7 +3603,7 @@ async function handleMultiPossessionLimitRequested(limit, { forceRestart = false
   isManualStepping.value = false;
   clearReboundPreview();
   try {
-    const response = await setMultiPossessionLimit(parsed);
+    const response = await setMultiPossessionLimit(parsed, restartMode, checkDeadline);
     if (sessionId !== gameSessionId) return;
     if (response.status !== 'success' || !response.state) {
       throw new Error(response.message || 'Failed to restart multi-possession game.');

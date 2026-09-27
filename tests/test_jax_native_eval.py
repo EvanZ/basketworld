@@ -299,8 +299,42 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
     assert "inbound_timeout_turnover_count" in summary
     assert "turnovers_before_clearance_count" in summary
     assert "completed_possession_count" in summary
+    assert "completed_user_offensive_possessions" in summary
+    assert "completed_opponent_offensive_possessions" in summary
+    assert "completed_user_score_total" in summary
+    assert "completed_opponent_score_total" in summary
+    assert (
+        summary["completed_user_offensive_possessions"]
+        + summary["completed_opponent_offensive_possessions"]
+        == summary["completed_possessions_total"]
+    )
     assert "completed_possession_live_steps" in summary
     assert "mean_live_steps_per_completed_possession" in summary
+    assert "winner_reward_per_episode" in summary
+    assert "overtime_game_count" in summary
+    assert "overtime_rounds_mean" in summary
+    assert "overtime_rounds_max" in summary
+    assert "check_opportunity_count" in summary
+    assert "check_pickup_count" in summary
+    assert "check_violation_count" in summary
+    assert "check_pickup_rate" in summary
+    assert "check_mean_pickup_steps" in summary
+    assert summary["spatial_live_step_count"] > 0
+    assert np.isfinite(summary["mean_live_all_player_pair_distance"])
+    assert np.isfinite(summary["mean_live_offense_teammate_pair_distance"])
+    assert np.isfinite(summary["mean_live_defense_teammate_pair_distance"])
+    if summary["completed_user_offensive_possessions"] > 0:
+        assert np.isclose(
+            summary["user_points_per_possession"],
+            summary["completed_user_score_total"]
+            / summary["completed_user_offensive_possessions"],
+        )
+    if summary["completed_opponent_offensive_possessions"] > 0:
+        assert np.isclose(
+            summary["opponent_points_per_possession"],
+            summary["completed_opponent_score_total"]
+            / summary["completed_opponent_offensive_possessions"],
+        )
     for episode in result["results"]:
         assert set(episode["game"]) >= {
             "completed",
@@ -308,7 +342,18 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
             "team_a_score",
             "team_b_score",
             "completed_possessions",
+            "team_a_completed_possessions",
+            "team_b_completed_possessions",
             "starting_offense_team",
+            "overtime_round",
+            "overtime_possessions_completed",
         }
+        if episode["completed"]:
+            assert episode["game"]["team_a_completed_possessions"] >= 1
+            assert episode["game"]["team_b_completed_possessions"] >= 1
+            assert episode["game"]["completed_possessions"] == (
+                episode["game"]["team_a_completed_possessions"]
+                + episode["game"]["team_b_completed_possessions"]
+            )
         if not episode["completed"]:
             assert episode["game"]["result"] is None
