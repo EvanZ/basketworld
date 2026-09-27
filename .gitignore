@@ -100,5 +100,11 @@ prompts/
 /site/
 
 app/backend/episodes/
+# Local UI episode exports and cached policy checkpoints.
+episodes/
+
+# Auxiliary Git worktrees created for local comparison/debugging.
+.worktrees/
+
 # keep social preview asset in repo
 !app/frontend/public/social-splash.jpg
