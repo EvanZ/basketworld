@@ -20,6 +20,10 @@ HISTORICAL_EVAL_EPISODES="${HISTORICAL_EVAL_EPISODES:-200}"
 HISTORICAL_EVAL_HORIZON="${HISTORICAL_EVAL_HORIZON:-2048}"
 MULTI_POSSESSION_USE_INBOUNDS="${MULTI_POSSESSION_USE_INBOUNDS:-true}"
 MADE_BASKET_RESTART_MODE="${MADE_BASKET_RESTART_MODE:-check}"
+MULTI_POSSESSION_LIMIT_START="${MULTI_POSSESSION_LIMIT_START:-1}"
+MULTI_POSSESSION_LIMIT_END="${MULTI_POSSESSION_LIMIT_END:-25}"
+MULTI_POSSESSION_LIMIT_RAMP_UPDATES="${MULTI_POSSESSION_LIMIT_RAMP_UPDATES:-5000}"
+MULTI_POSSESSION_OVERTIME_ROUND_CAP="${MULTI_POSSESSION_OVERTIME_ROUND_CAP:-0}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Additive milestone evaluation defaults to the 30K schedule below. For example:
@@ -53,11 +57,17 @@ esac
 # Fresh multi-possession run: no continuation checkpoint, pretrained policy,
 # or historical opponent pool. Each of the two 512-row fixed-team cohorts
 # contributes to one shared policy, for 1,024 total environments per update.
-# The possession quota is per team: 25 Player plus 25 AI possessions.
+# The possession quota is per team. Training begins with short games and
+# linearly grows to the final quota; completed games keep the quota they had at
+# reset. A zero overtime cap follows each episode's active possession limit.
 exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --run-train-loop \
   --enable-multi-possession \
-  --multi-possession-limit 25 \
+  --multi-possession-limit "$MULTI_POSSESSION_LIMIT_END" \
+  --multi-possession-limit-start "$MULTI_POSSESSION_LIMIT_START" \
+  --multi-possession-limit-end "$MULTI_POSSESSION_LIMIT_END" \
+  --multi-possession-limit-ramp-updates "$MULTI_POSSESSION_LIMIT_RAMP_UPDATES" \
+  --multi-possession-overtime-round-cap "$MULTI_POSSESSION_OVERTIME_ROUND_CAP" \
   --multi-possession-reward-mode scoring_events \
   --score-potential-scale 0.0 \
   --game-winner-reward 5.0 \

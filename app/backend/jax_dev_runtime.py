@@ -86,6 +86,10 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     # expose these constructor arguments, but the compiled kernel reads attrs.
     "enable_multi_possession",
     "multi_possession_limit",
+    "multi_possession_limit_start",
+    "multi_possession_limit_end",
+    "multi_possession_limit_ramp_updates",
+    "multi_possession_overtime_round_cap",
     "multi_possession_reward_mode",
     "score_potential_scale",
     "game_winner_reward",
@@ -121,6 +125,10 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_reward_once_per_possession": True,
     "enable_multi_possession": False,
     "multi_possession_limit": 25,
+    "multi_possession_limit_start": None,
+    "multi_possession_limit_end": None,
+    "multi_possession_limit_ramp_updates": 0,
+    "multi_possession_overtime_round_cap": 0,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
     "game_winner_reward": 0.0,
@@ -155,6 +163,10 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_reward_once_per_possession": "bool",
     "enable_multi_possession": "bool",
     "multi_possession_limit": "int",
+    "multi_possession_limit_start": "int",
+    "multi_possession_limit_end": "int",
+    "multi_possession_limit_ramp_updates": "int",
+    "multi_possession_overtime_round_cap": "int",
     "multi_possession_reward_mode": "str",
     "score_potential_scale": "float",
     "game_winner_reward": "float",
@@ -3201,6 +3213,12 @@ class JaxDevRuntime:
             "team_b_completed_possessions": _field0(
                 self.state, "team_b_completed_possessions"
             ),
+            "episode_possession_limit": _field0(
+                self.state, "episode_possession_limit"
+            ),
+            "episode_overtime_round_cap": _field0(
+                self.state, "episode_overtime_round_cap"
+            ),
             "overtime_round": _field0(self.state, "overtime_round"),
             "overtime_possessions_completed": _field0(
                 self.state, "overtime_possessions_completed"
@@ -3271,6 +3289,12 @@ class JaxDevRuntime:
         overtime_starting_team = int(
             np.asarray(host["overtime_starting_team"]).reshape(-1)[0]
         )
+        episode_possession_limit = int(
+            np.asarray(host["episode_possession_limit"]).reshape(-1)[0]
+        )
+        episode_overtime_round_cap = int(
+            np.asarray(host["episode_overtime_round_cap"]).reshape(-1)[0]
+        )
         clearance_zone_cells = self._clearance_zone_cells()
         inbound_reason_map = {
             POSSESSION_END_MADE_BASKET: "made_basket",
@@ -3306,7 +3330,8 @@ class JaxDevRuntime:
             "user_team_name": self.user_team.name,
             "done": bool(np.asarray(host["episode_ended"]).reshape(-1)[0]),
             "enable_multi_possession": bool(self.multi_possession_enabled),
-            "multi_possession_limit": _int_from_static_field(self.static, "multi_possession_limit", 1),
+            "multi_possession_limit": episode_possession_limit,
+            "multi_possession_overtime_round_cap": episode_overtime_round_cap,
             "multi_possession_use_inbounds": bool(
                 _int_from_static_field(
                     self.static,
@@ -3350,7 +3375,7 @@ class JaxDevRuntime:
             ),
             "remaining_possessions": max(
                 0,
-                (2 * _int_from_static_field(self.static, "multi_possession_limit", 1))
+                (2 * episode_possession_limit)
                 - completed_possessions,
             ),
             "game_phase": (
@@ -3546,6 +3571,12 @@ class JaxDevRuntime:
         overtime_starting_team = _as_int(
             _field0(self.state, "overtime_starting_team")
         )
+        episode_possession_limit = _as_int(
+            _field0(self.state, "episode_possession_limit")
+        )
+        episode_overtime_round_cap = _as_int(
+            _field0(self.state, "episode_overtime_round_cap")
+        )
         clearance_zone_cells = self._clearance_zone_cells()
         inbound_reason_map = {
             POSSESSION_END_MADE_BASKET: "made_basket",
@@ -3582,7 +3613,8 @@ class JaxDevRuntime:
             "user_team_name": self.user_team.name,
             "done": _as_bool(_field0(self.state, "episode_ended")),
             "enable_multi_possession": bool(self.multi_possession_enabled),
-            "multi_possession_limit": _int_from_static_field(self.static, "multi_possession_limit", 1),
+            "multi_possession_limit": episode_possession_limit,
+            "multi_possession_overtime_round_cap": episode_overtime_round_cap,
             "multi_possession_use_inbounds": bool(
                 _int_from_static_field(
                     self.static,
@@ -3644,7 +3676,7 @@ class JaxDevRuntime:
             ),
             "remaining_possessions": max(
                 0,
-                (2 * _int_from_static_field(self.static, "multi_possession_limit", 1))
+                (2 * episode_possession_limit)
                 - _as_int(_field0(self.state, "completed_possessions")),
             ),
             "game_phase": (

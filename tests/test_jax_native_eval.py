@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ from basketworld_jax.config import TRAIN_FROZEN_VALUES
 from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
 from basketworld_jax.eval.native import (
     _apply_paired_starting_teams,
+    _native_eval_horizon,
     _phi_beta_for_eval,
     _post_orb_continuation_diagnostics_from_trace,
     _task_reward_scale_for_eval,
@@ -95,6 +97,22 @@ def test_task_reward_scale_for_eval_matches_update_schedule():
         "jax/phi_beta_ramp_updates": 500,
     }
     assert _phi_beta_for_eval(phi_params, payload, default=0.0) == pytest.approx(0.125)
+
+
+def test_native_eval_horizon_includes_regulation_and_capped_paired_overtime():
+    env = SimpleNamespace(
+        shot_clock_steps=24,
+        enable_rebounds=False,
+        enable_multi_possession=True,
+        multi_possession_limit=3,
+        multi_possession_overtime_round_cap=0,
+        inbound_deadline_steps=5,
+    )
+    # Base per-possession guard is 26 + 5 inbound steps + 2 transition steps.
+    assert _native_eval_horizon(env, {}, {}) == 2 * (3 + 3) * 33
+
+    env.multi_possession_overtime_round_cap = 1
+    assert _native_eval_horizon(env, {}, {}) == 2 * (3 + 1) * 33
 
 
 def test_native_eval_pairs_reset_rows_with_swapped_starting_teams_without_moving_players():

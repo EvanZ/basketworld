@@ -46,6 +46,9 @@ from basketworld_jax.train.main import (
     _filter_mlflow_train_metrics,
     _phi_beta_for_update,
     _log_mlflow_params,
+    _jax_env_config_from_args,
+    _multi_possession_curriculum_enabled,
+    _multi_possession_limit_for_update,
     _selector_learning_rate_for_args,
     _task_reward_scale_for_update,
     build_trainer_config,
@@ -112,6 +115,45 @@ def test_trainer_parser_defaults_match_frozen_scope():
 
     skill_only_args = parse_args(["--no-rebound-target-observation-features"])
     assert skill_only_args.rebound_target_observation_features is False
+
+
+def test_multi_possession_limit_curriculum_is_discrete_and_uses_final_limit_for_eval():
+    args = parse_args(
+        [
+            "--enable-multi-possession",
+            "--multi-possession-limit",
+            "25",
+            "--multi-possession-limit-start",
+            "1",
+            "--multi-possession-limit-end",
+            "25",
+            "--multi-possession-limit-ramp-updates",
+            "24",
+        ]
+    )
+    validate_train_args(args)
+
+    assert _multi_possession_curriculum_enabled(args) is True
+    assert _multi_possession_limit_for_update(args, 1) == 1
+    assert _multi_possession_limit_for_update(args, 13) == 13
+    assert _multi_possession_limit_for_update(args, 25) == 25
+    assert _multi_possession_limit_for_update(args, 250) == 25
+    env_config = _jax_env_config_from_args(args)
+    assert env_config["multi_possession_limit"] == 25
+    assert env_config["multi_possession_limit_start"] == 1
+    assert env_config["multi_possession_limit_end"] == 25
+    assert env_config["multi_possession_limit_ramp_updates"] == 24
+
+
+def test_multi_possession_limit_remains_fixed_without_enabled_curriculum():
+    args = parse_args(
+        ["--enable-multi-possession", "--multi-possession-limit", "7"]
+    )
+    validate_train_args(args)
+
+    assert _multi_possession_curriculum_enabled(args) is False
+    assert _multi_possession_limit_for_update(args, 1) == 7
+    assert _multi_possession_limit_for_update(args, 10_000) == 7
 
 
 def test_deploy_eval_args_reject_invalid_values():
@@ -1986,6 +2028,11 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/task_reward_scale_end"] == 1.0
     assert recorder.params["jax/task_reward_scale_warmup_updates"] == 50
     assert recorder.params["jax/task_reward_scale_ramp_updates"] == 300
+    assert recorder.params["jax/multi_possession_limit_start"] == 25
+    assert recorder.params["jax/multi_possession_limit_end"] == 25
+    assert recorder.params["jax/multi_possession_limit_ramp_updates"] == 0
+    assert recorder.params["jax/multi_possession_limit_curriculum_enabled"] is False
+    assert recorder.params["jax/multi_possession_overtime_round_cap"] == 0
     assert recorder.params["jax/ent_coef_start"] == 0.02
     assert recorder.params["jax/ent_coef_end"] == 0.003
     assert recorder.params["jax/ent_schedule"] == "exp"
@@ -2430,8 +2477,19 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     first_args = parse_args(
         [
             "--run-train-loop",
+            "--enable-multi-possession",
+            "--multi-possession-limit",
+            "3",
+            "--multi-possession-limit-start",
+            "1",
+            "--multi-possession-limit-end",
+            "3",
+            "--multi-possession-limit-ramp-updates",
+            "2",
+            "--players",
+            "2",
             "--kernel-batch-size",
-            "4",
+            "2",
             "--rollout-horizon",
             "4",
             "--num-updates",
@@ -2441,9 +2499,7 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
             "--log-every-updates",
             "1",
             "--eval-every-updates",
-            "1",
-            "--eval-horizon",
-            "4",
+            "0",
             "--checkpoint-dir",
             str(checkpoint_dir),
             "--checkpoint-every-updates",
@@ -2476,6 +2532,18 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert payload["env_config"]["dunk_std"] == 0.3
     assert payload["env_config"]["allow_dunks"] is True
     assert payload["env_config"]["dunk_pct"] == 0.6
+    assert payload["env_config"]["multi_possession_limit"] == 3
+    assert payload["env_config"]["multi_possession_limit_start"] == 1
+    assert payload["env_config"]["multi_possession_limit_end"] == 3
+    assert payload["env_config"]["multi_possession_limit_ramp_updates"] == 2
+    assert payload["last_metrics"]["multi_possession_limit_active"] == 1
+    for role in ("offense", "defense"):
+        np.testing.assert_array_equal(
+            np.asarray(
+                payload["current_state"][role]["episode_possession_limit"]
+            ),
+            1,
+        )
     assert payload["play_name_metadata"]["backend"] == "jax"
     assert payload["play_name_metadata"]["pool_version"] >= 1
     assert payload["play_name_metadata"]["model_codename"]
@@ -2493,8 +2561,19 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     resumed_args = parse_args(
         [
             "--run-train-loop",
+            "--enable-multi-possession",
+            "--multi-possession-limit",
+            "3",
+            "--multi-possession-limit-start",
+            "1",
+            "--multi-possession-limit-end",
+            "3",
+            "--multi-possession-limit-ramp-updates",
+            "2",
+            "--players",
+            "2",
             "--kernel-batch-size",
-            "4",
+            "2",
             "--rollout-horizon",
             "4",
             "--num-updates",
@@ -2504,9 +2583,7 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
             "--log-every-updates",
             "1",
             "--eval-every-updates",
-            "1",
-            "--eval-horizon",
-            "4",
+            "0",
             "--checkpoint-dir",
             str(checkpoint_dir),
             "--checkpoint-every-updates",
@@ -2529,6 +2606,7 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
 
     assert resumed_result["resumed_from_checkpoint"] == str(latest_checkpoint)
     assert resumed_result["final_metrics"]["update_index"] == 2
+    assert resumed_result["final_metrics"]["multi_possession_limit_active"] == 2
     assert resumed_result["final_metrics"]["cumulative_active_step_count"] >= (
         first_result["final_metrics"]["cumulative_active_step_count"]
     )

@@ -142,6 +142,10 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "rebound_reward_once_per_possession",
     "enable_multi_possession",
     "multi_possession_limit",
+    "multi_possession_limit_start",
+    "multi_possession_limit_end",
+    "multi_possession_limit_ramp_updates",
+    "multi_possession_overtime_round_cap",
     "multi_possession_reward_mode",
     "score_potential_scale",
     "game_winner_reward",
@@ -176,6 +180,10 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "rebound_reward_once_per_possession": True,
     "enable_multi_possession": False,
     "multi_possession_limit": 25,
+    "multi_possession_limit_start": None,
+    "multi_possession_limit_end": None,
+    "multi_possession_limit_ramp_updates": 0,
+    "multi_possession_overtime_round_cap": 0,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
     "game_winner_reward": 0.0,
@@ -210,6 +218,10 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "rebound_reward_once_per_possession": "bool",
     "enable_multi_possession": "bool",
     "multi_possession_limit": "int",
+    "multi_possession_limit_start": "int",
+    "multi_possession_limit_end": "int",
+    "multi_possession_limit_ramp_updates": "int",
+    "multi_possession_overtime_round_cap": "int",
     "multi_possession_reward_mode": "str",
     "score_potential_scale": "float",
     "game_winner_reward": "float",
@@ -535,11 +547,23 @@ def _native_eval_horizon(env, training_params: dict[str, Any] | None, payload: d
         # dead-ball inbound. This is a completion guard, not a declaration
         # that reaching the cutoff is a tie or a valid completed game.
         possession_limit = max(1, int(getattr(env, "multi_possession_limit", 25)))
+        configured_overtime_cap = max(
+            0,
+            int(getattr(env, "multi_possession_overtime_round_cap", 0)),
+        )
+        overtime_round_cap = (
+            configured_overtime_cap
+            if configured_overtime_cap > 0
+            else possession_limit
+        )
         inbound_steps = max(1, int(getattr(env, "inbound_deadline_steps", 5)))
         per_possession = int(horizon) + inbound_steps + 2
         # The configured limit is per team, so a completed game contains up
         # to twice that many team possessions.
-        horizon = max(horizon, 2 * possession_limit * per_possession)
+        horizon = max(
+            horizon,
+            2 * (possession_limit + overtime_round_cap) * per_possession,
+        )
     return int(horizon)
 
 

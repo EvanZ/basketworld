@@ -291,6 +291,9 @@ class KernelStatic(NamedTuple):
     rebound_reward_once_per_possession: Any
     enable_multi_possession: Any
     multi_possession_limit: Any
+    # Zero means derive the effective paired-overtime cap from the episode's
+    # per-team regulation possession limit.
+    multi_possession_overtime_round_cap: Any
     multi_possession_reward_mode: Any
     score_potential_scale: Any
     game_winner_reward: Any
@@ -350,6 +353,10 @@ class KernelState(NamedTuple):
     team_b_completed_possessions: Any
     # Legacy/aggregate counter: total completed possessions across both teams.
     completed_possessions: Any
+    # Episode-scoped copies keep curriculum changes from altering games that
+    # were already in progress when a new training update began.
+    episode_possession_limit: Any
+    episode_overtime_round_cap: Any
     # Overtime is made of fair two-possession rounds. Zero means regulation.
     overtime_round: Any
     overtime_possessions_completed: Any
@@ -612,6 +619,19 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
     rebound_skill_specialist = _player_rebound_skill_specialist_array(env)
     offense_lane_steps, defense_lane_steps = _lane_step_arrays(env)
     assist_candidate = getattr(env, "_assist_candidate", None)
+    episode_possession_limit = max(
+        1,
+        int(getattr(env, "multi_possession_limit", 25)),
+    )
+    configured_overtime_cap = max(
+        0,
+        int(getattr(env, "multi_possession_overtime_round_cap", 0)),
+    )
+    episode_overtime_round_cap = (
+        configured_overtime_cap
+        if configured_overtime_cap > 0
+        else episode_possession_limit
+    )
     return {
         "positions": np.asarray(env.positions, dtype=np.int32).copy(),
         "ball_holder": int(env.ball_holder) if env.ball_holder is not None else -1,
@@ -652,6 +672,8 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "team_a_completed_possessions": 0,
         "team_b_completed_possessions": 0,
         "completed_possessions": 0,
+        "episode_possession_limit": episode_possession_limit,
+        "episode_overtime_round_cap": episode_overtime_round_cap,
         "overtime_round": 0,
         "overtime_possessions_completed": 0,
         "overtime_starting_team": -1,
@@ -852,6 +874,28 @@ def stack_state_snapshots(
         ),
         completed_possessions=xp.asarray(
             np.asarray([int(item.get("completed_possessions", 0)) for item in snapshots], dtype=np.int32),
+            dtype=xp.int32,
+        ),
+        episode_possession_limit=xp.asarray(
+            np.asarray(
+                [int(item.get("episode_possession_limit", 25)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        episode_overtime_round_cap=xp.asarray(
+            np.asarray(
+                [
+                    int(
+                        item.get(
+                            "episode_overtime_round_cap",
+                            item.get("episode_possession_limit", 25),
+                        )
+                    )
+                    for item in snapshots
+                ],
+                dtype=np.int32,
+            ),
             dtype=xp.int32,
         ),
         overtime_round=xp.asarray(
@@ -1525,6 +1569,13 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         ),
         multi_possession_limit=xp.asarray(
             max(1, int(getattr(env, "multi_possession_limit", 25))),
+            dtype=xp.int32,
+        ),
+        multi_possession_overtime_round_cap=xp.asarray(
+            max(
+                0,
+                int(getattr(env, "multi_possession_overtime_round_cap", 0)),
+            ),
             dtype=xp.int32,
         ),
         multi_possession_reward_mode=xp.asarray(
@@ -3066,12 +3117,12 @@ def build_multi_possession_observation_features_batch(
         - state.team_b_score.astype(jnp.float32)
     )
     score_norm = jnp.maximum(
-        3.0 * static.multi_possession_limit.astype(jnp.float32),
+        3.0 * state.episode_possession_limit.astype(jnp.float32),
         1.0,
     )
     relative_score = jnp.where(viewer_is_team_a, score_diff_a, -score_diff_a) / score_norm
     possession_limit = jnp.maximum(
-        static.multi_possession_limit.astype(jnp.float32),
+        state.episode_possession_limit.astype(jnp.float32),
         1.0,
     )
     viewer_completed_possessions = jnp.where(
@@ -4095,8 +4146,8 @@ def _finalize_possession_single(
         + completed_by_team_b.astype(jnp.int32)
     )
     regulation_quota_complete = (
-        (team_a_completed >= static.multi_possession_limit)
-        & (team_b_completed >= static.multi_possession_limit)
+        (team_a_completed >= state.episode_possession_limit)
+        & (team_b_completed >= state.episode_possession_limit)
     )
     scores_tied = state.team_a_score == state.team_b_score
     already_overtime = state.overtime_round > 0
@@ -4107,10 +4158,16 @@ def _finalize_possession_single(
     )
     regulation_boundary = advance & regulation_quota_complete & (~already_overtime)
     start_overtime = regulation_boundary & scores_tied
-    continue_overtime = overtime_pair_done & scores_tied
+    tied_overtime_cap_reached = (
+        overtime_pair_done
+        & scores_tied
+        & (state.overtime_round >= state.episode_overtime_round_cap)
+    )
+    continue_overtime = overtime_pair_done & scores_tied & (~tied_overtime_cap_reached)
     game_done = (
         (regulation_boundary & (~scores_tied))
         | (overtime_pair_done & (~scores_tied))
+        | tied_overtime_cap_reached
     )
     next_overtime_round = jnp.where(
         start_overtime,
@@ -4204,26 +4261,17 @@ def _finalize_possession_single(
         )
         & (~use_inbounds)
     )
-    awaiting_check = (
-        advance
-        & (~game_done)
-        & (
-            (is_made_basket & made_restart_is_check)
-            | is_check_violation
-        )
-    )
+    awaiting_check = advance & (~game_done) & is_made_basket & made_restart_is_check
     awaiting_inbound = (
         advance
         & (~game_done)
         & requires_inbound.astype(jnp.bool_)
-        & (~is_check_violation)
         & jnp.where(is_made_basket, made_restart_is_inbound, use_inbounds)
     )
     direct_dead_ball_handoff = (
         advance
         & (~game_done)
         & requires_inbound.astype(jnp.bool_)
-        & (~is_check_violation)
         & jnp.where(is_made_basket, made_restart_is_direct, ~use_inbounds)
     )
     live_handoff = (
@@ -4231,6 +4279,18 @@ def _finalize_possession_single(
         & (~game_done)
         & (~requires_inbound.astype(jnp.bool_))
         & (~awaiting_check)
+    )
+    check_violation_inbound_position = _select_technical_inbound_position_single(
+        static,
+        static.check_position,
+        check_relocation_key,
+        jax,
+        jnp,
+    )
+    dead_ball_inbound_position = jnp.where(
+        is_check_violation,
+        check_violation_inbound_position,
+        static.inbound_position,
     )
     (
         restored_positions,
@@ -4240,7 +4300,7 @@ def _finalize_possession_single(
         static,
         state,
         effective_next_offense_team,
-        static.inbound_position,
+        dead_ball_inbound_position,
         inbound_key,
         jax,
         jnp,
@@ -4464,7 +4524,35 @@ def _finalize_possession_single(
     return next_state, game_done, possession_ended, completed_possession_live_steps
 
 
-def _technical_inbound_position_single(static: KernelStatic, state: KernelState, jnp):
+def _select_technical_inbound_position_single(
+    static: KernelStatic,
+    interruption_position,
+    selection_key,
+    jax,
+    jnp,
+):
+    """Choose a nearest frontcourt sideline, randomizing exact distance ties."""
+    distances = _hex_distance(
+        static.technical_inbound_positions,
+        interruption_position[None, :],
+        jnp,
+    )
+    nearest_distance = jnp.min(distances)
+    tied = distances == nearest_distance
+    tie_scores = jax.random.uniform(selection_key, shape=distances.shape)
+    selected_index = jnp.argmax(
+        jnp.where(tied, tie_scores, -jnp.ones_like(tie_scores))
+    )
+    return static.technical_inbound_positions[selected_index]
+
+
+def _technical_inbound_position_single(
+    static: KernelStatic,
+    state: KernelState,
+    selection_key,
+    jax,
+    jnp,
+):
     """Choose the nearer frontcourt sideline for a defensive technical restart."""
     safe_holder = jnp.clip(
         state.ball_holder,
@@ -4472,12 +4560,13 @@ def _technical_inbound_position_single(static: KernelStatic, state: KernelState,
         state.positions.shape[0] - 1,
     )
     interruption_position = state.positions[safe_holder]
-    distances = _hex_distance(
-        static.technical_inbound_positions,
-        interruption_position[None, :],
+    return _select_technical_inbound_position_single(
+        static,
+        interruption_position,
+        selection_key,
+        jax,
         jnp,
     )
-    return static.technical_inbound_positions[jnp.argmin(distances)]
 
 
 def _restart_after_defensive_technical_single(
@@ -4490,8 +4579,17 @@ def _restart_after_defensive_technical_single(
     jnp,
 ):
     """Award the technical point and resume the *same* possession from sideline."""
-    technical_inbound_position = _technical_inbound_position_single(static, state, jnp)
-    inbound_key, direct_handoff_key = jax.random.split(inbound_selection_key)
+    technical_position_key, inbound_key, direct_handoff_key = jax.random.split(
+        inbound_selection_key,
+        3,
+    )
+    technical_inbound_position = _technical_inbound_position_single(
+        static,
+        state,
+        technical_position_key,
+        jax,
+        jnp,
+    )
     (
         _,
         inbound_positions,
@@ -4708,6 +4806,19 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
 
         def _violation(_):
+            opponent_team = (1 - moved_state.offense_team).astype(jnp.int8)
+            point = jnp.asarray(1.0, dtype=jnp.float32)
+            penalized_state = _replace_state(
+                moved_state,
+                offense_score=moved_state.offense_score
+                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                defense_score=moved_state.defense_score
+                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+                team_a_score=moved_state.team_a_score
+                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                team_b_score=moved_state.team_b_score
+                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+            )
             (
                 final_state,
                 game_done,
@@ -4715,13 +4826,13 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 completed_possession_live_steps,
             ) = _finalize_possession_single(
                 static,
-                moved_state,
+                penalized_state,
                 possession_ended=jnp.asarray(True),
                 possession_end_reason=jnp.asarray(
                     POSSESSION_END_CHECK_VIOLATION,
                     dtype=jnp.int32,
                 ),
-                next_offense_team=1 - moved_state.offense_team,
+                next_offense_team=opponent_team,
                 requires_inbound=jnp.asarray(True),
                 inbound_selection_key=next_check_key,
                 jax=jax,
@@ -6756,6 +6867,12 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         team_a_completed_possessions=jnp.asarray(0, dtype=jnp.int32),
         team_b_completed_possessions=jnp.asarray(0, dtype=jnp.int32),
         completed_possessions=jnp.asarray(0, dtype=jnp.int32),
+        episode_possession_limit=static.multi_possession_limit.astype(jnp.int32),
+        episode_overtime_round_cap=jnp.where(
+            static.multi_possession_overtime_round_cap > 0,
+            static.multi_possession_overtime_round_cap,
+            static.multi_possession_limit,
+        ).astype(jnp.int32),
         overtime_round=jnp.asarray(0, dtype=jnp.int32),
         overtime_possessions_completed=jnp.asarray(0, dtype=jnp.int32),
         overtime_starting_team=jnp.asarray(-1, dtype=jnp.int8),
@@ -6825,13 +6942,16 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "multi_possession_overtime_round_cap",
         "multi_possession_reward_mode",
         "score_potential_scale",
         "game_winner_reward",
         "multi_possession_aux_rewards_enabled",
         "multi_possession_use_inbounds",
         "multi_possession_schema_version",
+        "made_basket_restart_mode",
         "inbound_deadline_steps",
+        "check_deadline_steps",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

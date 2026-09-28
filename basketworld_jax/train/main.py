@@ -240,6 +240,10 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
         "multi_possession_limit",
+        "multi_possession_limit_start",
+        "multi_possession_limit_end",
+        "multi_possession_limit_ramp_updates",
+        "multi_possession_overtime_round_cap",
         "multi_possession_reward_mode",
         "score_potential_scale",
         "game_winner_reward",
@@ -359,6 +363,10 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_counterfactual_positioning_enabled",
     "enable_multi_possession",
     "multi_possession_limit",
+    "multi_possession_limit_start",
+    "multi_possession_limit_end",
+    "multi_possession_limit_ramp_updates",
+    "multi_possession_overtime_round_cap",
     "multi_possession_reward_mode",
     "score_potential_scale",
     "game_winner_reward",
@@ -966,6 +974,42 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--multi-possession-limit-start",
+        type=int,
+        default=None,
+        help=(
+            "Optional starting per-team possession limit for the episode-length "
+            "curriculum. Omit to keep fixed-length training."
+        ),
+    )
+    parser.add_argument(
+        "--multi-possession-limit-end",
+        type=int,
+        default=None,
+        help=(
+            "Optional final per-team possession limit for the episode-length "
+            "curriculum. Defaults to --multi-possession-limit."
+        ),
+    )
+    parser.add_argument(
+        "--multi-possession-limit-ramp-updates",
+        type=int,
+        default=0,
+        help=(
+            "Training updates over which to linearly ramp the integer per-team "
+            "possession limit. Update 1 uses the start value."
+        ),
+    )
+    parser.add_argument(
+        "--multi-possession-overtime-round-cap",
+        type=int,
+        default=0,
+        help=(
+            "Maximum paired overtime rounds before a tied game ends as a tie. "
+            "Zero derives the cap from that episode's per-team possession limit."
+        ),
+    )
+    parser.add_argument(
         "--inbound-deadline-steps",
         type=int,
         default=5,
@@ -1367,6 +1411,14 @@ def validate_train_args(args) -> None:
     if bool(getattr(args, "enable_multi_possession", False)):
         if int(getattr(args, "multi_possession_limit", 25)) < 1:
             raise SystemExit("--multi-possession-limit must be >= 1.")
+        for key in ("multi_possession_limit_start", "multi_possession_limit_end"):
+            value = getattr(args, key, None)
+            if value is not None and int(value) < 1:
+                raise SystemExit(f"--{key.replace('_', '-')} must be >= 1.")
+        if int(getattr(args, "multi_possession_limit_ramp_updates", 0)) < 0:
+            raise SystemExit("--multi-possession-limit-ramp-updates must be >= 0.")
+        if int(getattr(args, "multi_possession_overtime_round_cap", 0)) < 0:
+            raise SystemExit("--multi-possession-overtime-round-cap must be >= 0.")
         if int(getattr(args, "inbound_deadline_steps", 5)) < 1:
             raise SystemExit("--inbound-deadline-steps must be >= 1.")
         if int(getattr(args, "check_deadline_steps", 5)) < 1:
@@ -1602,12 +1654,43 @@ def validate_train_args(args) -> None:
                 raise SystemExit("--intent-diversity-ramp-updates must be >= 0.")
 
 
+def _multi_possession_final_limit(args) -> int:
+    end = getattr(args, "multi_possession_limit_end", None)
+    return max(
+        1,
+        int(
+            getattr(args, "multi_possession_limit", 25)
+            if end is None
+            else end
+        ),
+    )
+
+
+def _multi_possession_start_limit(args) -> int:
+    start = getattr(args, "multi_possession_limit_start", None)
+    return max(
+        1,
+        int(_multi_possession_final_limit(args) if start is None else start),
+    )
+
+
+def _multi_possession_curriculum_enabled(args) -> bool:
+    return (
+        bool(getattr(args, "enable_multi_possession", False))
+        and _multi_possession_start_limit(args) != _multi_possession_final_limit(args)
+        and int(getattr(args, "multi_possession_limit_ramp_updates", 0)) > 0
+    )
+
+
 def _jax_env_config_from_args(args) -> dict[str, Any]:
     config = {
         key: to_builtin(getattr(args, key))
         for key in JAX_ENV_MLFLOW_PARAM_KEYS
         if hasattr(args, key)
     }
+    # The final curriculum value is the canonical fixed limit used by native
+    # evaluation and by tooling that does not run the training schedule.
+    config["multi_possession_limit"] = _multi_possession_final_limit(args)
     config["multi_possession_schema_version"] = (
         MULTI_POSSESSION_SCHEMA_VERSION
         if bool(getattr(args, "enable_multi_possession", False))
@@ -1626,6 +1709,10 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "rebound_counterfactual_positioning_enabled": False,
     "enable_multi_possession": False,
     "multi_possession_limit": 25,
+    "multi_possession_limit_start": None,
+    "multi_possession_limit_end": None,
+    "multi_possession_limit_ramp_updates": 0,
+    "multi_possession_overtime_round_cap": 0,
     "multi_possession_reward_mode": "win_loss",
     "score_potential_scale": 1.0,
     "game_winner_reward": 0.0,
@@ -2892,6 +2979,17 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         ),
         "jax/task_reward_scale_warmup_steps": int(getattr(args, "task_reward_scale_warmup_steps", 0)),
         "jax/task_reward_scale_ramp_steps": int(getattr(args, "task_reward_scale_ramp_steps", 1)),
+        "jax/multi_possession_limit_start": _multi_possession_start_limit(args),
+        "jax/multi_possession_limit_end": _multi_possession_final_limit(args),
+        "jax/multi_possession_limit_ramp_updates": int(
+            getattr(args, "multi_possession_limit_ramp_updates", 0)
+        ),
+        "jax/multi_possession_limit_curriculum_enabled": (
+            _multi_possession_curriculum_enabled(args)
+        ),
+        "jax/multi_possession_overtime_round_cap": int(
+            getattr(args, "multi_possession_overtime_round_cap", 0)
+        ),
         "jax/pass_mode": str(getattr(args, "pass_mode")),
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
@@ -4069,6 +4167,31 @@ def _linear_position_schedule(
     return float(start) + ((float(end) - float(start)) * float(progress))
 
 
+def _multi_possession_limit_for_update(args, update_index: int) -> int:
+    """Return the curriculum target for episodes beginning in this update.
+
+    Update one uses the configured start value. Existing episodes retain the
+    episode-scoped value stored in KernelState and therefore never change
+    length midway through a game.
+    """
+    end = _multi_possession_final_limit(args)
+    start = _multi_possession_start_limit(args)
+    if not _multi_possession_curriculum_enabled(args):
+        return end
+    ramp_updates = max(
+        0,
+        int(getattr(args, "multi_possession_limit_ramp_updates", 0)),
+    )
+    if ramp_updates <= 0:
+        return end
+    progress = min(
+        1.0,
+        max(0.0, (int(update_index) - 1) / float(ramp_updates)),
+    )
+    interpolated = float(start) + ((float(end) - float(start)) * progress)
+    return max(1, int(np.floor(interpolated + 0.5)))
+
+
 def _entropy_coef_for_update(args, update_index: int) -> float:
     start_raw = getattr(args, "ent_coef_start", None)
     end_raw = getattr(args, "ent_coef_end", None)
@@ -4142,6 +4265,37 @@ def _phi_beta_for_update(args, update_index: int) -> float:
 def _static_with_phi_beta(static, phi_beta: float, jnp):
     return static._replace(
         phi_beta=jnp.asarray(float(phi_beta), dtype=jnp.float32),
+    )
+
+
+def _static_with_training_schedules(
+    static,
+    *,
+    phi_beta: float,
+    possession_limit: int,
+    jnp,
+):
+    return static._replace(
+        phi_beta=jnp.asarray(float(phi_beta), dtype=jnp.float32),
+        multi_possession_limit=jnp.asarray(
+            int(possession_limit),
+            dtype=static.multi_possession_limit.dtype,
+        ),
+    )
+
+
+def _state_with_episode_game_length(state, *, possession_limit: int, overtime_cap: int, jnp):
+    effective_limit = max(1, int(possession_limit))
+    effective_cap = max(1, int(overtime_cap) if int(overtime_cap) > 0 else effective_limit)
+    return state._replace(
+        episode_possession_limit=jnp.full_like(
+            state.episode_possession_limit,
+            effective_limit,
+        ),
+        episode_overtime_round_cap=jnp.full_like(
+            state.episode_overtime_round_cap,
+            effective_cap,
+        ),
     )
 
 
@@ -4658,6 +4812,9 @@ def _print_checkpoint_summary(
     metrics = dict(last_metrics or {})
     rows = [
         ("update_index", int(update_index)),
+        ("multi_possession_limit_active", metrics.get("multi_possession_limit_active")),
+        ("episode_possession_limit_mean", metrics.get("episode_possession_limit_mean")),
+        ("episode_overtime_round_cap_mean", metrics.get("episode_overtime_round_cap_mean")),
         ("steps_per_update", metrics.get("steps_per_update")),
         ("rollout_active_step_fraction", metrics.get("rollout_active_step_fraction")),
         ("ppo_active_sample_fraction", metrics.get("ppo_active_sample_fraction")),
@@ -4809,12 +4966,25 @@ def run_training_loop(args) -> dict[str, Any]:
     validate_train_args(args)
     historical_milestone_updates = _historical_eval_updates(args)
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
+    final_possession_limit = _multi_possession_final_limit(args)
+    initial_possession_limit = _multi_possession_limit_for_update(args, 1)
     role_args = {
         role: _args_for_training_role(args, role)
         for role in TRAINING_ROLES
     }
+    for role in TRAINING_ROLES:
+        role_args[role].multi_possession_limit = final_possession_limit
     statics = {
         role: sample_state_batch(role_args[role], xp=jnp)[0]
+        for role in TRAINING_ROLES
+    }
+    initial_training_statics = {
+        role: statics[role]._replace(
+            multi_possession_limit=jnp.asarray(
+                initial_possession_limit,
+                dtype=statics[role].multi_possession_limit.dtype,
+            )
+        )
         for role in TRAINING_ROLES
     }
     static = statics["offense"]
@@ -4826,7 +4996,12 @@ def run_training_loop(args) -> dict[str, Any]:
     eval_initial_states = {}
     for role, reset_key, eval_key in zip(TRAINING_ROLES, role_reset_keys, role_eval_reset_keys, strict=True):
         initial_reset_keys = jax.random.split(reset_key, int(args.kernel_batch_size))
-        current_states[role] = reset_batch_minimal(statics[role], initial_reset_keys, jax, jnp)
+        current_states[role] = reset_batch_minimal(
+            initial_training_statics[role],
+            initial_reset_keys,
+            jax,
+            jnp,
+        )
         eval_reset_keys = jax.random.split(eval_key, int(args.kernel_batch_size))
         eval_initial_states[role] = reset_batch_minimal(statics[role], eval_reset_keys, jax, jnp)
 
@@ -4985,6 +5160,7 @@ def run_training_loop(args) -> dict[str, Any]:
         else None
     )
 
+    reset_resume_env_state = False
     if resume_checkpoint:
         checkpoint_payload = load_checkpoint(resume_checkpoint)
         _validate_resume_checkpoint_payload(
@@ -5139,6 +5315,24 @@ def run_training_loop(args) -> dict[str, Any]:
         eval_trajectories = []
         last_metrics = None
 
+    if reset_resume_env_state:
+        resume_possession_limit = _multi_possession_limit_for_update(
+            args,
+            completed_updates + 1,
+        )
+        configured_overtime_cap = int(
+            getattr(args, "multi_possession_overtime_round_cap", 0)
+        )
+        current_states = {
+            role: _state_with_episode_game_length(
+                current_states[role],
+                possession_limit=resume_possession_limit,
+                overtime_cap=configured_overtime_cap,
+                jnp=jnp,
+            )
+            for role in TRAINING_ROLES
+        }
+
     historical_checkpoint_root = _historical_checkpoint_root(
         checkpoint_dir=checkpoint_dir,
         resume_checkpoint=resume_checkpoint,
@@ -5285,7 +5479,22 @@ def run_training_loop(args) -> dict[str, Any]:
             entropy_coef = _entropy_coef_for_update(args, update_idx)
             task_reward_scale = _task_reward_scale_for_update(args, update_idx)
             phi_beta = _phi_beta_for_update(args, update_idx)
+            active_possession_limit = _multi_possession_limit_for_update(
+                args,
+                update_idx,
+            )
             active_statics = {
+                role: _static_with_training_schedules(
+                    statics[role],
+                    phi_beta=phi_beta,
+                    possession_limit=active_possession_limit,
+                    jnp=jnp,
+                )
+                for role in TRAINING_ROLES
+            }
+            # Evaluation remains comparable across training updates by using
+            # the final configured game length, never the partial curriculum.
+            eval_statics = {
                 role: _static_with_phi_beta(statics[role], phi_beta, jnp)
                 for role in TRAINING_ROLES
             }
@@ -5715,6 +5924,42 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 last_metrics.update(selector_update_metrics)
             _add_episode_usage_metrics(last_metrics, cumulative_episode_usage)
+            episode_possession_limits = np.concatenate(
+                [
+                    np.asarray(
+                        jax.device_get(current_states[role].episode_possession_limit),
+                        dtype=np.int32,
+                    ).reshape(-1)
+                    for role in TRAINING_ROLES
+                ]
+            )
+            episode_overtime_caps = np.concatenate(
+                [
+                    np.asarray(
+                        jax.device_get(current_states[role].episode_overtime_round_cap),
+                        dtype=np.int32,
+                    ).reshape(-1)
+                    for role in TRAINING_ROLES
+                ]
+            )
+            last_metrics["multi_possession_limit_active"] = int(
+                active_possession_limit
+            )
+            last_metrics["multi_possession_limit_curriculum_enabled"] = float(
+                _multi_possession_curriculum_enabled(args)
+            )
+            last_metrics["episode_possession_limit_mean"] = float(
+                np.mean(episode_possession_limits)
+            )
+            last_metrics["episode_possession_limit_min"] = int(
+                np.min(episode_possession_limits)
+            )
+            last_metrics["episode_possession_limit_max"] = int(
+                np.max(episode_possession_limits)
+            )
+            last_metrics["episode_overtime_round_cap_mean"] = float(
+                np.mean(episode_overtime_caps)
+            )
             last_metrics["task_reward_scale"] = float(task_reward_scale)
             last_metrics["task_reward_scale_is_scheduled"] = float(
                 getattr(args, "task_reward_scale_start", None) is not None
@@ -5834,7 +6079,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 for role, role_eval_key in zip(TRAINING_ROLES, role_eval_keys, strict=True):
                     if grouped_opponent_params is not None:
                         eval_outputs[role] = grouped_eval_runner(
-                            active_statics[role],
+                            eval_statics[role],
                             eval_initial_states[role],
                             params,
                             grouped_opponent_params,
@@ -5844,7 +6089,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                     elif opponent_params is None:
                         eval_outputs[role] = eval_runner(
-                            active_statics[role],
+                            eval_statics[role],
                             eval_initial_states[role],
                             params,
                             role_eval_key,
@@ -5852,7 +6097,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                     else:
                         eval_outputs[role] = frozen_eval_runner(
-                            active_statics[role],
+                            eval_statics[role],
                             eval_initial_states[role],
                             params,
                             opponent_params,
@@ -5999,13 +6244,13 @@ def run_training_loop(args) -> dict[str, Any]:
                         int(args.kernel_batch_size),
                     )
                     deploy_initial_state = reset_batch_minimal(
-                        active_statics["offense"],
+                        eval_statics["offense"],
                         deploy_reset_keys,
                         jax,
                         jnp,
                     )
                     deploy_output = deploy_eval_runner(
-                        active_statics["offense"],
+                        eval_statics["offense"],
                         deploy_initial_state,
                         params,
                         deploy_rollout_key,
@@ -6231,7 +6476,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     for opponent_update in sorted(historical_milestone_params):
                         match = _run_historical_match_evaluation(
                             runner=historical_match_eval_runner,
-                            statics=active_statics,
+                            statics=eval_statics,
                             candidate_params=params,
                             opponent_params=historical_milestone_params[opponent_update],
                             candidate_update=int(update_idx),

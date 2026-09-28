@@ -227,6 +227,9 @@ const HEX_RADIUS = 36;  // pixel radius of one hexagon corner-to-center
 // scales the body, all three seams, and their strokes everywhere it appears.
 const BASKETBALL_SCALE = 0.36;
 const BASKETBALL_RADIUS = HEX_RADIUS * BASKETBALL_SCALE;
+// Uniform artwork is authored against the whole normalized hex cell: the arms
+// meet its side edges and the two shorts legs meet its lower sloped edges.
+const PLAYER_UNIFORM_RADIUS = HEX_RADIUS;
 const SQRT3 = Math.sqrt(3);
 const HEX_HALF_WIDTH = HEX_RADIUS * SQRT3 * 0.5;
 const PASS_COS_EPS = 1e-9;
@@ -2150,6 +2153,14 @@ const multiPossessionScoreboard = computed(() => {
     possessionLimit: Number(state.multi_possession_limit ?? 0),
     inOvertime: state.in_overtime === true || Number(state.overtime_round ?? 0) > 0,
     overtimeRound: Math.max(0, Number(state.overtime_round ?? 0)),
+    overtimeRoundCap: Math.max(
+      1,
+      Number(
+        state.multi_possession_overtime_round_cap
+          ?? state.multi_possession_limit
+          ?? 1,
+      ),
+    ),
     overtimePossessionsCompleted: Math.max(
       0,
       Math.min(2, Number(state.overtime_possessions_completed ?? 0)),
@@ -2178,6 +2189,9 @@ const clearanceRequiredBannerVisible = computed(() => {
     && state?.game_phase === 'live',
   );
 });
+const heldBallHorizontalOffset = computed(() => (
+  clearanceRequiredBannerVisible.value ? HEX_RADIUS * 0.57 : -HEX_RADIUS * 0.57
+));
 const endGameResultText = computed(() => {
   const state = currentGameState.value;
   const playerScore = Number(state?.user_score ?? 0);
@@ -2606,6 +2620,12 @@ function playerTeamClass(player) {
   if (player?.owner === 'user') return 'player-user';
   if (player?.owner === 'ai') return 'player-ai';
   return player?.isOffense ? 'player-offense' : 'player-defense';
+}
+
+function playerUniformColor(player) {
+  if (player?.owner === 'user') return '#007bff';
+  if (player?.owner === 'ai') return '#dc3545';
+  return player?.isOffense ? offenseShellColor(player.id) : '#dc3545';
 }
 
 function playerCircleStyle(player) {
@@ -4750,14 +4770,6 @@ onBeforeUnmount(() => {
           :key="player.id"
           :class="[
             'player-group',
-            {
-              'ball-handler-bounce':
-                !props.placementMode
-                && player.hasBall
-                && draggedPlayerId !== player.id
-                && shotJumpPlayerId !== player.id
-                && shotInFlightPlayerId !== player.id,
-            },
             { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
             { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id },
             {
@@ -4854,6 +4866,29 @@ onBeforeUnmount(() => {
               class="player-offense-core"
               style="pointer-events: none;"
             />
+            <!-- Keep the uniform paths in each player instance instead of a
+                 styled <use>. Board capture inlines computed SVG styles, and
+                 shared <defs> cannot resolve a different team color per use. -->
+            <g
+              :transform="`${playerLabelTransform(player)} scale(${PLAYER_UNIFORM_RADIUS})`"
+              class="player-uniform-glyph"
+              :style="{ '--player-uniform-color': playerUniformColor(player) }"
+              aria-hidden="true"
+            >
+              <path
+                d="M -0.30 -0.76 L -0.56 -0.62 C -0.43 -0.47 -0.45 -0.30 -0.68 -0.18 L -0.866 -0.08 L -0.866 0.18 L -0.68 0.22 L 0.68 0.22 L 0.866 0.18 L 0.866 -0.08 L 0.68 -0.18 C 0.45 -0.30 0.43 -0.47 0.56 -0.62 L 0.30 -0.76 C 0.25 -0.55 0.14 -0.44 0 -0.44 C -0.14 -0.44 -0.25 -0.55 -0.30 -0.76 Z"
+                class="player-uniform-piece"
+              />
+              <path
+                d="M -0.27 -0.71 C -0.23 -0.51 -0.13 -0.41 0 -0.41 C 0.13 -0.41 0.23 -0.51 0.27 -0.71"
+                class="player-uniform-detail"
+              />
+              <path
+                d="M -0.866 0.24 L 0.866 0.24 C 0.88 0.35 0.84 0.48 0.74 0.57 L 0.10 0.94 L 0 0.56 L -0.10 0.94 L -0.74 0.57 C -0.84 0.48 -0.88 0.35 -0.866 0.24 Z"
+                class="player-uniform-piece"
+              />
+              <path d="M 0 0.25 L 0 0.56" class="player-uniform-detail" />
+            </g>
             <text 
               v-if="minimalChrome && getPlayerDisplayName(player.id)"
               :transform="playerLabelTransform(player)"
@@ -4983,11 +5018,25 @@ onBeforeUnmount(() => {
                 :r="HEX_RADIUS * 0.9"
                 class="ball-indicator"
               />
-              <use
-                href="#basketball-glyph"
-                :transform="`translate(${(draggedPlayerId === player.id ? draggedPlayerPos.x : player.x) + (HEX_RADIUS * 0.57)} ${(draggedPlayerId === player.id ? draggedPlayerPos.y : player.y) - (HEX_RADIUS * 0.57)}) scale(${BASKETBALL_RADIUS})`"
-                class="held-basketball"
-              />
+              <g
+                :transform="`translate(${(draggedPlayerId === player.id ? draggedPlayerPos.x : player.x) + heldBallHorizontalOffset} ${(draggedPlayerId === player.id ? draggedPlayerPos.y : player.y) + (HEX_RADIUS * 0.57)})`"
+              >
+                <g
+                  :class="{
+                    'held-basketball-bounce':
+                      !props.placementMode
+                      && draggedPlayerId !== player.id
+                      && shotJumpPlayerId !== player.id
+                      && shotInFlightPlayerId !== player.id,
+                  }"
+                >
+                  <use
+                    href="#basketball-glyph"
+                    :transform="`scale(${BASKETBALL_RADIUS})`"
+                    class="held-basketball"
+                  />
+                </g>
+              </g>
             </g>
             <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
             <g 
@@ -5567,7 +5616,7 @@ onBeforeUnmount(() => {
         </div>
         <span class="score-possession-count">
           <template v-if="multiPossessionScoreboard.inOvertime">
-            OT {{ multiPossessionScoreboard.overtimeRound }}
+            OT {{ multiPossessionScoreboard.overtimeRound }}/{{ multiPossessionScoreboard.overtimeRoundCap }}
             · {{ multiPossessionScoreboard.overtimePossessionsCompleted }}/2 possessions
           </template>
           <template v-else>
@@ -6435,6 +6484,26 @@ onBeforeUnmount(() => {
   stroke-width: 0.085;
   stroke-linecap: round;
 }
+.player-uniform-glyph {
+  pointer-events: none;
+  color: rgba(248, 250, 252, 0.9);
+  filter: drop-shadow(0 0 1px rgba(2, 6, 23, 0.85));
+  transition: transform 0.26s ease;
+}
+.player-uniform-piece {
+  fill: var(--player-uniform-color, #64748b);
+  stroke: currentColor;
+  stroke-width: 0.065;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.player-uniform-detail {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 0.055;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
 .check-ball-glyph,
 .held-basketball,
 .flight-basketball,
@@ -6551,7 +6620,7 @@ onBeforeUnmount(() => {
   }
 }
 
-.ball-handler-bounce {
+.held-basketball-bounce {
   animation: dribble-bounce var(--dribble-period, 0.95s) ease-in-out infinite;
   animation-delay: var(--dribble-delay, 0s);
   will-change: transform;
@@ -6793,6 +6862,7 @@ onBeforeUnmount(() => {
 .no-move-transitions .player-offense-core,
 .no-move-transitions .player-defense,
 .no-move-transitions .player-ai,
+.no-move-transitions .player-uniform-glyph,
 .no-move-transitions .player-name-text,
 .no-move-transitions .player-index-text,
 .no-move-transitions .player-text,
@@ -7221,9 +7291,9 @@ onBeforeUnmount(() => {
 
 @keyframes dribble-bounce {
   0%, 100% { transform: translateY(0); }
-  38% { transform: translateY(calc(-1 * var(--dribble-amp, 6px))); }
-  50% { transform: translateY(calc(-1 * var(--dribble-amp, 6px))); }
-  72% { transform: translateY(calc(-0.25 * var(--dribble-amp, 6px))); }
+  38% { transform: translateY(var(--dribble-amp, 6px)); }
+  50% { transform: translateY(var(--dribble-amp, 6px)); }
+  72% { transform: translateY(calc(0.25 * var(--dribble-amp, 6px))); }
 }
 
 @keyframes shoot-jump {

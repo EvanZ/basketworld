@@ -1432,6 +1432,8 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     state = runtime.get_full_game_state(game_state, include_policy_probs=False)
 
     assert state["enable_multi_possession"] is True
+    assert state["multi_possession_limit"] == 5
+    assert state["multi_possession_overtime_round_cap"] == 5
     assert state["multi_possession_use_inbounds"] is True
     assert state["team_a_score"] == pytest.approx(4.0)
     assert state["team_b_score"] == pytest.approx(6.0)

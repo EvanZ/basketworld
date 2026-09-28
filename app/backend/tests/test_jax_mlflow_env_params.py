@@ -60,6 +60,10 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
         "jax/env/offensive_rebound_reward_advance": "0.35",
         "jax/env/rebound_reward_once_per_possession": "false",
         "jax/env/multi_possession_use_inbounds": "false",
+        "jax/env/multi_possession_limit_start": "1",
+        "jax/env/multi_possession_limit_end": "25",
+        "jax/env/multi_possession_limit_ramp_updates": "5000",
+        "jax/env/multi_possession_overtime_round_cap": "0",
     }
 
     merged = _overlay_jax_mlflow_env_params(optional, params)
@@ -109,6 +113,10 @@ def test_overlay_jax_mlflow_env_params_applies_skill_stds():
     assert merged["offensive_rebound_reward_advance"] == 0.35
     assert merged["rebound_reward_once_per_possession"] is False
     assert merged["multi_possession_use_inbounds"] is False
+    assert merged["multi_possession_limit_start"] == 1
+    assert merged["multi_possession_limit_end"] == 25
+    assert merged["multi_possession_limit_ramp_updates"] == 5000
+    assert merged["multi_possession_overtime_round_cap"] == 0
 
 
 def test_overlay_jax_mlflow_env_params_accepts_rebound_skill_aliases():

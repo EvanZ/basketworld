@@ -95,6 +95,7 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
         env_overrides={
             "enable_multi_possession": "true",
             "multi_possession_limit": "7",
+            "multi_possession_overtime_round_cap": "9",
             "multi_possession_reward_mode": "point_differential",
             "score_potential_scale": "0.25",
             "game_winner_reward": "5.0",
@@ -120,6 +121,7 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
 
     assert optional_params["enable_multi_possession"] is True
     assert optional_params["multi_possession_limit"] == 7
+    assert optional_params["multi_possession_overtime_round_cap"] == 9
     assert optional_params["multi_possession_reward_mode"] == "point_differential"
     assert optional_params["score_potential_scale"] == pytest.approx(0.25)
     assert optional_params["game_winner_reward"] == pytest.approx(5.0)
@@ -134,6 +136,16 @@ def test_evaluation_multi_possession_overrides_are_validated_and_disable_templat
         evaluation_routes._coerce_eval_env_override("multi_possession_limit", "bad")
     with pytest.raises(Exception, match="inbound_deadline_steps"):
         evaluation_routes._coerce_eval_env_override("inbound_deadline_steps", 0)
+    assert (
+        evaluation_routes._coerce_eval_env_override(
+            "multi_possession_overtime_round_cap", 0
+        )
+        == 0
+    )
+    with pytest.raises(Exception, match="multi_possession_overtime_round_cap"):
+        evaluation_routes._coerce_eval_env_override(
+            "multi_possession_overtime_round_cap", -1
+        )
 
     assert (
         evaluation_routes._coerce_eval_env_override(

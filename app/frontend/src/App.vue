@@ -2103,6 +2103,10 @@ function handleSelfPlayButton() {
     console.log('[App] Self-play disabled in sandbox/editing modes');
     return;
   }
+  if (fastSelfPlayMode.value && fastSelfPlayWarming.value) {
+    console.log('[App] Self-play is waiting for the existing Fast Mode warmup to finish');
+    return;
+  }
   // Get current selections from PlayerControls. If self-play is configured
   // to reset onto a random template, discard stale actions from the old board.
   const startTemplateOptions = getRandomStartTemplateOptionsFromControls();
@@ -2184,6 +2188,7 @@ async function toggleFastSelfPlayMode() {
 
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
+  if (fastSelfPlayMode.value && fastSelfPlayWarming.value) return;
   const sessionId = ++selfPlaySessionId;
   const activeGameSessionId = ++gameSessionId;
   const useFastMode = fastSelfPlayMode.value;
@@ -4033,10 +4038,16 @@ onBeforeUnmount(() => {
           <button 
             @click="(isSelfPlaying || selfPlayStarting) ? stopSelfPlay() : handleSelfPlayButton()"
             class="action-button self-play-button"
-            :disabled="!isSelfPlaying && !selfPlayStarting && (!aiMode || gameState.done || liveButtonsDisabled)"
-            :title="(isSelfPlaying || selfPlayStarting) ? 'Stop the current self-play episode' : 'Run the current game with policy actions'"
+            :disabled="!isSelfPlaying && !selfPlayStarting && (!aiMode || gameState.done || liveButtonsDisabled || (fastSelfPlayMode && fastSelfPlayWarming))"
+            :title="(isSelfPlaying || selfPlayStarting)
+              ? 'Stop the current self-play episode'
+              : ((fastSelfPlayMode && fastSelfPlayWarming)
+                ? 'Wait for the current Fast Mode warmup to finish'
+                : 'Run the current game with policy actions')"
           >
-            {{ (isSelfPlaying || selfPlayStarting) ? 'Stop Self-Play' : 'Self-Play' }}
+            {{ (isSelfPlaying || selfPlayStarting)
+              ? 'Stop Self-Play'
+              : ((fastSelfPlayMode && fastSelfPlayWarming) ? 'Warming…' : 'Self-Play') }}
           </button>
           
           <button 

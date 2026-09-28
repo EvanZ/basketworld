@@ -85,6 +85,7 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "rebound_contest_radius",
     "enable_multi_possession",
     "multi_possession_limit",
+    "multi_possession_overtime_round_cap",
     "multi_possession_reward_mode",
     "score_potential_scale",
     "game_winner_reward",
@@ -122,6 +123,17 @@ def _coerce_eval_env_override(key: str, value):
             return numeric
         except Exception:
             raise HTTPException(status_code=400, detail=f"{key} must be a positive integer.")
+    if key == "multi_possession_overtime_round_cap":
+        try:
+            numeric = int(value)
+            if numeric < 0:
+                raise ValueError
+            return numeric
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} must be a non-negative integer.",
+            )
     if key == "multi_possession_reward_mode":
         mode = str(value or "").strip().lower()
         if mode in {"win_loss", "point_differential", "scoring_events"}:
