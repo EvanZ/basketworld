@@ -610,6 +610,7 @@ const defaultEvalConfig = () => ({
   },
   showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
+  actionModeMatrix: false,
   intentSelectionMode: 'learned_sample',
   startTemplateMode: 'checkpoint',
   startTemplateProb: 1.0,
@@ -2875,6 +2876,8 @@ async function handleEvaluation() {
         mirrorProb: Number(evalConfig.value.startTemplateMirrorProb ?? 0.0),
       },
       evalConfig.value.envOverrides || null,
+      !!evalConfig.value.actionModeMatrix,
+      null,
     );
     
   if (response.status === 'success' && Array.isArray(response.results)) {

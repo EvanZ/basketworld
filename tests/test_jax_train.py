@@ -275,6 +275,12 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
             "opponent_spatial_teammate_pair_distance": np.asarray([300.0]),
             "spatial_boundary_player_fraction": np.asarray([15.0]),
             "spatial_corner_player_fraction": np.asarray([7.5]),
+            "spatial_ball_handler_samples": np.asarray([70.0]),
+            "spatial_ball_handler_nearest_defender_distance": np.asarray([105.0]),
+            "spatial_ball_handler_pressured": np.asarray([42.0]),
+            "spatial_offense_nearest_defender_distance": np.asarray([150.0]),
+            "spatial_unguarded_offense_fraction": np.asarray([30.0]),
+            "spatial_team_centroid_distance": np.asarray([180.0]),
             "candidate_pass_attempts": np.asarray([10]),
             "candidate_completed_passes": np.asarray([8]),
             "candidate_shot_attempts": np.asarray([4]),
@@ -296,6 +302,12 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
             "opponent_spatial_teammate_pair_distance": np.asarray([130.0]),
             "spatial_boundary_player_fraction": np.asarray([13.0]),
             "spatial_corner_player_fraction": np.asarray([6.5]),
+            "spatial_ball_handler_samples": np.asarray([60.0]),
+            "spatial_ball_handler_nearest_defender_distance": np.asarray([75.0]),
+            "spatial_ball_handler_pressured": np.asarray([30.0]),
+            "spatial_offense_nearest_defender_distance": np.asarray([130.0]),
+            "spatial_unguarded_offense_fraction": np.asarray([26.0]),
+            "spatial_team_centroid_distance": np.asarray([170.0]),
         },
         seed=3_000_000,
         horizon=1024,
@@ -322,6 +334,13 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
     assert summary["opponent_mean_live_teammate_pair_distance"] == pytest.approx(430.0 / 140.0)
     assert summary["mean_live_boundary_player_fraction"] == pytest.approx(0.2)
     assert summary["mean_live_corner_player_fraction"] == pytest.approx(0.1)
+    assert summary[
+        "mean_live_ball_handler_nearest_defender_distance"
+    ] == pytest.approx(180.0 / 130.0)
+    assert summary["live_ball_handler_pressure_rate"] == pytest.approx(72.0 / 130.0)
+    assert summary["mean_live_offense_nearest_defender_distance"] == pytest.approx(2.0)
+    assert summary["mean_live_unguarded_offense_fraction"] == pytest.approx(0.4)
+    assert summary["mean_live_team_centroid_distance"] == pytest.approx(2.5)
     assert len(summary["episode_diagnostics"]) == 2
     team_a_row, team_b_row = summary["episode_diagnostics"]
     assert team_a_row["candidate_fixed_team"] == "team_a"
@@ -755,6 +774,12 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         spatial_defense_teammate_pair_distance=14.0,
         spatial_boundary_player_fraction=1.5,
         spatial_corner_player_fraction=0.5,
+        spatial_ball_handler_samples=3.0,
+        spatial_ball_handler_nearest_defender_distance=4.5,
+        spatial_ball_handler_pressured=2.0,
+        spatial_offense_nearest_defender_distance=8.0,
+        spatial_unguarded_offense_fraction=1.0,
+        spatial_team_centroid_distance=6.0,
         turnover_intercepted=1.0,
         shot_attempts=5.0,
         shot_makes=2.0,
@@ -824,6 +849,13 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
     assert summary["mean_live_defense_teammate_pair_distance"] == pytest.approx(3.5)
     assert summary["mean_live_boundary_player_fraction"] == pytest.approx(0.375)
     assert summary["mean_live_corner_player_fraction"] == pytest.approx(0.125)
+    assert summary[
+        "mean_live_ball_handler_nearest_defender_distance"
+    ] == pytest.approx(1.5)
+    assert summary["live_ball_handler_pressure_rate"] == pytest.approx(2.0 / 3.0)
+    assert summary["mean_live_offense_nearest_defender_distance"] == pytest.approx(2.0)
+    assert summary["mean_live_unguarded_offense_fraction"] == pytest.approx(0.25)
+    assert summary["mean_live_team_centroid_distance"] == pytest.approx(1.5)
     assert summary["completed_possession_live_steps"] == 7
     assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(
         7.0 / 3.0

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 import numpy as np
 from basketworld.envs.basketworld_env_v2 import Team
+from basketworld_jax.eval import can_run_native_jax_evaluation
 
 from app.backend.evaluation import (
     pass_steal_preview as eval_pass_steal_preview,
@@ -32,6 +33,57 @@ _NUMPY_SAFE_ENCODER = {
     np.bool_: bool,
     np.ndarray: lambda arr: arr.tolist(),
 }
+
+
+_ACTION_MODE_MATRIX = (
+    ("argmax_vs_argmax", True, True),
+    ("sampled_vs_argmax", False, True),
+    ("argmax_vs_sampled", True, False),
+    ("sampled_vs_sampled", False, False),
+)
+
+
+def _action_mode_matrix_cell(raw_results: dict, *, player_deterministic: bool, ai_deterministic: bool) -> dict:
+    diagnostics = raw_results.get("eval_diagnostics", {}) or {}
+    summary = diagnostics.get("jax_native_summary", {}) or {}
+    completed = int(summary.get("completed_games", 0) or 0)
+
+    def _rate(key: str) -> float:
+        return float(summary.get(key, 0) or 0) / completed if completed else 0.0
+
+    keys = (
+        "completion_rate",
+        "completed_margin_mean",
+        "user_points_per_possession",
+        "opponent_points_per_possession",
+        "spatial_live_step_count",
+        "mean_live_all_player_pair_distance",
+        "mean_live_offense_teammate_pair_distance",
+        "mean_live_defense_teammate_pair_distance",
+        "mean_live_boundary_player_fraction",
+        "mean_live_corner_player_fraction",
+        "ball_handler_sample_count",
+        "mean_live_ball_handler_nearest_defender_distance",
+        "live_ball_handler_pressure_rate",
+        "mean_live_offense_nearest_defender_distance",
+        "mean_live_unguarded_offense_fraction",
+        "mean_live_team_centroid_distance",
+    )
+    cell = {
+        "player_action_mode": "argmax" if player_deterministic else "sampled",
+        "ai_action_mode": "argmax" if ai_deterministic else "sampled",
+        "eval_seed": int(summary.get("eval_seed", 0) or 0),
+        "episode_count": int(summary.get("num_episodes", 0) or 0),
+        "completed_episode_count": completed,
+        "player_wins": int(summary.get("win_count", 0) or 0),
+        "ties": int(summary.get("tie_count", 0) or 0),
+        "player_losses": int(summary.get("loss_count", 0) or 0),
+        "player_win_rate": _rate("win_count"),
+        "tie_rate": _rate("tie_count"),
+        "player_loss_rate": _rate("loss_count"),
+    }
+    cell.update({key: summary.get(key, 0) for key in keys})
+    return cell
 
 
 def _normalize_jsonable(value):
@@ -338,6 +390,13 @@ def run_evaluation(request: EvaluationRequest):
     num_episodes = max(1, min(request.num_episodes, 1000000))
     player_deterministic = request.player_deterministic
     opponent_deterministic = request.opponent_deterministic
+    action_mode_matrix = bool(getattr(request, "action_mode_matrix", False))
+    requested_eval_seed = getattr(request, "eval_seed", None)
+    eval_seed = (
+        int(requested_eval_seed)
+        if requested_eval_seed is not None
+        else int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+    )
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
     if custom_setup.get("rebound_skills") is not None:
         rebound_skill_values = [float(v) for v in custom_setup.get("rebound_skills") or []]
@@ -363,6 +422,8 @@ def run_evaluation(request: EvaluationRequest):
     print("[Evaluation] Configuration:")
     print(f"  - Player deterministic: {player_deterministic}")
     print(f"  - Opponent deterministic: {opponent_deterministic}")
+    print(f"  - Action-mode matrix: {action_mode_matrix}")
+    print(f"  - Evaluation seed: {eval_seed}")
     print(f"  - Intent selection mode: {intent_selection_mode}")
     print(f"  - Start-template eval mode: {eval_template_diagnostics.get('start_template_mode')}")
     print(f"  - Start-template enabled: {eval_template_diagnostics.get('start_template_enabled')}")
@@ -410,26 +471,92 @@ def run_evaluation(request: EvaluationRequest):
         num_workers = max(2, min(mp.cpu_count(), 16, num_episodes))
 
     try:
-        reset_evaluation_progress(num_episodes)
-        raw_results = eval_run_evaluation(
-            num_episodes=num_episodes,
-            player_deterministic=player_deterministic,
-            opponent_deterministic=opponent_deterministic,
-            required_params=game_state.env_required_params,
-            optional_params=eval_optional_params,
-            training_params=game_state.mlflow_training_params,
+        if action_mode_matrix and not can_run_native_jax_evaluation(
             unified_policy_path=game_state.unified_policy_path,
             opponent_policy_path=game_state.opponent_policy_path,
-            user_team_name=game_state.user_team.name,
-            role_flag_offense=game_state.role_flag_offense,
-            role_flag_defense=game_state.role_flag_defense,
-            shot_accumulator=shot_accumulator,
             custom_setup=custom_setup,
             randomize_offense_permutation=randomize_offense_perm,
-            intent_selection_mode=intent_selection_mode,
-            num_workers=num_workers,
-            progress_callback=update_evaluation_progress,
-        )
+        ):
+            raise ValueError(
+                "Action-mode matrix evaluation requires the JAX-native evaluation path."
+            )
+
+        total_eval_episodes = num_episodes * (len(_ACTION_MODE_MATRIX) if action_mode_matrix else 1)
+        reset_evaluation_progress(total_eval_episodes)
+
+        def _run_one(
+            *,
+            run_player_deterministic: bool,
+            run_opponent_deterministic: bool,
+            progress_offset: int,
+        ):
+            run_shots: dict[str, list[int]] = {}
+
+            def _progress(completed: int, _total: int) -> None:
+                update_evaluation_progress(
+                    progress_offset + int(completed),
+                    total_eval_episodes,
+                )
+
+            result = eval_run_evaluation(
+                num_episodes=num_episodes,
+                player_deterministic=run_player_deterministic,
+                opponent_deterministic=run_opponent_deterministic,
+                required_params=game_state.env_required_params,
+                optional_params=eval_optional_params,
+                training_params=game_state.mlflow_training_params,
+                unified_policy_path=game_state.unified_policy_path,
+                opponent_policy_path=game_state.opponent_policy_path,
+                user_team_name=game_state.user_team.name,
+                role_flag_offense=game_state.role_flag_offense,
+                role_flag_defense=game_state.role_flag_defense,
+                shot_accumulator=run_shots,
+                custom_setup=custom_setup,
+                randomize_offense_permutation=randomize_offense_perm,
+                intent_selection_mode=intent_selection_mode,
+                num_workers=num_workers,
+                progress_callback=_progress,
+                eval_seed=eval_seed,
+            )
+            return result, run_shots
+
+        if action_mode_matrix:
+            matrix_cells = {}
+            primary_results = None
+            primary_shots = None
+            for mode_index, (mode_key, player_argmax, ai_argmax) in enumerate(
+                _ACTION_MODE_MATRIX
+            ):
+                mode_results, mode_shots = _run_one(
+                    run_player_deterministic=player_argmax,
+                    run_opponent_deterministic=ai_argmax,
+                    progress_offset=mode_index * num_episodes,
+                )
+                if primary_results is None:
+                    primary_results = mode_results
+                    primary_shots = mode_shots
+                matrix_cells[mode_key] = _action_mode_matrix_cell(
+                    mode_results,
+                    player_deterministic=player_argmax,
+                    ai_deterministic=ai_argmax,
+                )
+            raw_results = primary_results
+            shot_accumulator = primary_shots or {}
+            raw_results.setdefault("eval_diagnostics", {})[
+                "action_mode_matrix"
+            ] = {
+                "enabled": True,
+                "eval_seed": eval_seed,
+                "episodes_per_mode": num_episodes,
+                "total_episode_count": total_eval_episodes,
+                "cells": matrix_cells,
+            }
+        else:
+            raw_results, shot_accumulator = _run_one(
+                run_player_deterministic=player_deterministic,
+                run_opponent_deterministic=opponent_deterministic,
+                progress_offset=0,
+            )
     except Exception as e:
         import traceback
 
@@ -560,7 +687,10 @@ def run_evaluation(request: EvaluationRequest):
     except Exception:
         pass
 
-    update_evaluation_progress(len(episode_results), len(episode_results))
+    if action_mode_matrix:
+        update_evaluation_progress(total_eval_episodes, total_eval_episodes)
+    else:
+        update_evaluation_progress(len(episode_results), len(episode_results))
 
     return _to_jsonable({
         "status": "success",

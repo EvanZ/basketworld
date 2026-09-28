@@ -1797,6 +1797,7 @@ def run_evaluation(
     intent_selection_mode: str = "learned_sample",
     num_workers: int | None = None,
     progress_callback=None,
+    eval_seed: int | None = None,
 ):
     if can_run_native_jax_evaluation(
         unified_policy_path=unified_policy_path,
@@ -1820,6 +1821,7 @@ def run_evaluation(
             intent_selection_mode=intent_selection_mode,
             custom_setup=custom_setup,
             progress_callback=progress_callback,
+            eval_seed=eval_seed,
         )
 
     if num_workers is None or num_workers <= 1:

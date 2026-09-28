@@ -1171,6 +1171,40 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     spatial_diagnostics["spatial_corner_player_fraction"],
                     0.0,
                 ),
+                "spatial_ball_handler_samples": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_ball_handler_samples"],
+                    0.0,
+                ),
+                "spatial_ball_handler_nearest_defender_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics[
+                        "spatial_ball_handler_nearest_defender_distance"
+                    ],
+                    0.0,
+                ),
+                "spatial_ball_handler_pressured": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_ball_handler_pressured"],
+                    0.0,
+                ),
+                "spatial_offense_nearest_defender_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics[
+                        "spatial_offense_nearest_defender_distance"
+                    ],
+                    0.0,
+                ),
+                "spatial_unguarded_offense_fraction": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_unguarded_offense_fraction"],
+                    0.0,
+                ),
+                "spatial_team_centroid_distance": jnp.where(
+                    spatial_live_step,
+                    spatial_diagnostics["spatial_team_centroid_distance"],
+                    0.0,
+                ),
                 "offense_values": jnp.where(
                     policy_state.offense_team == TEAM_A,
                     team_a_values,
@@ -1361,6 +1395,24 @@ def _episode_stats_from_trace(trace: dict[str, np.ndarray], *, take: int, horizo
         )[:, :take].sum(axis=0),
         "spatial_corner_player_fraction": np.asarray(
             trace["spatial_corner_player_fraction"]
+        )[:, :take].sum(axis=0),
+        "spatial_ball_handler_samples": np.asarray(
+            trace["spatial_ball_handler_samples"]
+        )[:, :take].sum(axis=0),
+        "spatial_ball_handler_nearest_defender_distance": np.asarray(
+            trace["spatial_ball_handler_nearest_defender_distance"]
+        )[:, :take].sum(axis=0),
+        "spatial_ball_handler_pressured": np.asarray(
+            trace["spatial_ball_handler_pressured"]
+        )[:, :take].sum(axis=0),
+        "spatial_offense_nearest_defender_distance": np.asarray(
+            trace["spatial_offense_nearest_defender_distance"]
+        )[:, :take].sum(axis=0),
+        "spatial_unguarded_offense_fraction": np.asarray(
+            trace["spatial_unguarded_offense_fraction"]
+        )[:, :take].sum(axis=0),
+        "spatial_team_centroid_distance": np.asarray(
+            trace["spatial_team_centroid_distance"]
         )[:, :take].sum(axis=0),
         "team_a_score": _final_trace_value("team_a_score", np.float32),
         "team_b_score": _final_trace_value("team_b_score", np.float32),
@@ -2387,6 +2439,12 @@ def run_native_jax_evaluation(
     all_spatial_defense_teammate_pair_distances: list[float] = []
     all_spatial_boundary_player_fractions: list[float] = []
     all_spatial_corner_player_fractions: list[float] = []
+    all_spatial_ball_handler_samples: list[float] = []
+    all_spatial_ball_handler_nearest_defender_distances: list[float] = []
+    all_spatial_ball_handler_pressured: list[float] = []
+    all_spatial_offense_nearest_defender_distances: list[float] = []
+    all_spatial_unguarded_offense_fractions: list[float] = []
+    all_spatial_team_centroid_distances: list[float] = []
     all_team_a_scores: list[float] = []
     all_team_b_scores: list[float] = []
     all_completed_possessions: list[int] = []
@@ -2499,6 +2557,15 @@ def run_native_jax_evaluation(
                     else 0.0
                 )
 
+            ball_handler_samples = float(stats["spatial_ball_handler_samples"][idx])
+
+            def _ball_handler_mean(key: str) -> float:
+                return (
+                    float(stats[key][idx] / ball_handler_samples)
+                    if ball_handler_samples > 0.0
+                    else 0.0
+                )
+
             episode_spatial = {
                 "live_step_count": int(spatial_live_steps),
                 "mean_live_all_player_pair_distance": _spatial_mean(
@@ -2515,6 +2582,24 @@ def run_native_jax_evaluation(
                 ),
                 "mean_live_corner_player_fraction": _spatial_mean(
                     "spatial_corner_player_fraction"
+                ),
+                "ball_handler_sample_count": int(ball_handler_samples),
+                "mean_live_ball_handler_nearest_defender_distance": (
+                    _ball_handler_mean(
+                        "spatial_ball_handler_nearest_defender_distance"
+                    )
+                ),
+                "live_ball_handler_pressure_rate": _ball_handler_mean(
+                    "spatial_ball_handler_pressured"
+                ),
+                "mean_live_offense_nearest_defender_distance": _spatial_mean(
+                    "spatial_offense_nearest_defender_distance"
+                ),
+                "mean_live_unguarded_offense_fraction": _spatial_mean(
+                    "spatial_unguarded_offense_fraction"
+                ),
+                "mean_live_team_centroid_distance": _spatial_mean(
+                    "spatial_team_centroid_distance"
                 ),
             }
             if initial_holder >= 0:
@@ -3307,6 +3392,34 @@ def run_native_jax_evaluation(
         all_spatial_corner_player_fractions.extend(
             [float(v) for v in stats["spatial_corner_player_fraction"].tolist()]
         )
+        all_spatial_ball_handler_samples.extend(
+            [float(v) for v in stats["spatial_ball_handler_samples"].tolist()]
+        )
+        all_spatial_ball_handler_nearest_defender_distances.extend(
+            [
+                float(v)
+                for v in stats[
+                    "spatial_ball_handler_nearest_defender_distance"
+                ].tolist()
+            ]
+        )
+        all_spatial_ball_handler_pressured.extend(
+            [float(v) for v in stats["spatial_ball_handler_pressured"].tolist()]
+        )
+        all_spatial_offense_nearest_defender_distances.extend(
+            [
+                float(v)
+                for v in stats[
+                    "spatial_offense_nearest_defender_distance"
+                ].tolist()
+            ]
+        )
+        all_spatial_unguarded_offense_fractions.extend(
+            [float(v) for v in stats["spatial_unguarded_offense_fraction"].tolist()]
+        )
+        all_spatial_team_centroid_distances.extend(
+            [float(v) for v in stats["spatial_team_centroid_distance"].tolist()]
+        )
         if static_multi:
             all_team_a_scores.extend([float(v) for v in stats["team_a_score"].tolist()])
             all_team_b_scores.extend([float(v) for v in stats["team_b_score"].tolist()])
@@ -3544,11 +3657,19 @@ def run_native_jax_evaluation(
         else completed_team_a_possessions
     )
     spatial_live_step_total = float(sum(all_spatial_live_steps))
+    spatial_ball_handler_sample_total = float(sum(all_spatial_ball_handler_samples))
 
     def _spatial_live_mean(values: list[float]) -> float:
         return (
             float(sum(values) / spatial_live_step_total)
             if spatial_live_step_total > 0.0
+            else 0.0
+        )
+
+    def _spatial_ball_handler_mean(values: list[float]) -> float:
+        return (
+            float(sum(values) / spatial_ball_handler_sample_total)
+            if spatial_ball_handler_sample_total > 0.0
             else 0.0
         )
 
@@ -3627,6 +3748,24 @@ def run_native_jax_evaluation(
         ),
         "mean_live_corner_player_fraction": _spatial_live_mean(
             all_spatial_corner_player_fractions
+        ),
+        "ball_handler_sample_count": int(spatial_ball_handler_sample_total),
+        "mean_live_ball_handler_nearest_defender_distance": (
+            _spatial_ball_handler_mean(
+                all_spatial_ball_handler_nearest_defender_distances
+            )
+        ),
+        "live_ball_handler_pressure_rate": _spatial_ball_handler_mean(
+            all_spatial_ball_handler_pressured
+        ),
+        "mean_live_offense_nearest_defender_distance": _spatial_live_mean(
+            all_spatial_offense_nearest_defender_distances
+        ),
+        "mean_live_unguarded_offense_fraction": _spatial_live_mean(
+            all_spatial_unguarded_offense_fractions
+        ),
+        "mean_live_team_centroid_distance": _spatial_live_mean(
+            all_spatial_team_centroid_distances
         ),
         "completed_possessions_mean": _mean(
             [all_completed_possessions[idx] for idx in completed_game_indices]

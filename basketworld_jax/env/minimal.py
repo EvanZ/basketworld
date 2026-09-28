@@ -1780,6 +1780,53 @@ def build_spatial_diagnostics_batch(static: KernelStatic, state: KernelState, jn
     )
     offense_pairs = _unordered_teammate_distances(offense_positions, jnp)
     defense_pairs = _unordered_teammate_distances(defense_positions, jnp)
+    offense_defense_distances = _hex_distance(
+        offense_positions[:, :, None, :],
+        defense_positions[:, None, :, :],
+        jnp,
+    ).astype(jnp.float32)
+    nearest_defender_by_offense = jnp.min(offense_defense_distances, axis=2)
+
+    safe_ball_holder = jnp.clip(state.ball_holder, 0, player_count - 1)
+    ball_holder_is_offense = (
+        (state.ball_holder >= 0)
+        & jnp.any(
+            offense_ids == state.ball_holder[:, None],
+            axis=1,
+        )
+    )
+    ball_holder_positions = jnp.take_along_axis(
+        positions,
+        jnp.broadcast_to(
+            safe_ball_holder[:, None, None],
+            (batch_size, 1, coordinate_count),
+        ),
+        axis=1,
+    )[:, 0, :]
+    ball_handler_defender_distances = _hex_distance(
+        ball_holder_positions[:, None, :],
+        defense_positions,
+        jnp,
+    ).astype(jnp.float32)
+    ball_handler_nearest_defender = jnp.min(
+        ball_handler_defender_distances,
+        axis=1,
+    )
+    ball_handler_nearest_defender = jnp.where(
+        ball_holder_is_offense,
+        ball_handler_nearest_defender,
+        jnp.zeros_like(ball_handler_nearest_defender),
+    )
+    pressure_distance = static.defender_pressure_distance.astype(jnp.float32)
+
+    offense_centroid = jnp.mean(offense_positions.astype(jnp.float32), axis=1)
+    defense_centroid = jnp.mean(defense_positions.astype(jnp.float32), axis=1)
+    centroid_delta = offense_centroid - defense_centroid
+    team_centroid_distance = 0.5 * (
+        jnp.abs(centroid_delta[:, 0])
+        + jnp.abs(centroid_delta[:, 1])
+        + jnp.abs(centroid_delta[:, 0] + centroid_delta[:, 1])
+    )
     cell_indices, in_court = _lookup_cell_indices(static.cell_coords, positions, jnp)
     boundary_players = static.boundary_cell_mask[cell_indices] * in_court.astype(jnp.int8)
     corner_players = static.corner_cell_mask[cell_indices] * in_court.astype(jnp.int8)
@@ -1804,6 +1851,23 @@ def build_spatial_diagnostics_batch(static: KernelStatic, state: KernelState, jn
             corner_players.astype(jnp.float32),
             axis=1,
         ),
+        "spatial_ball_handler_samples": ball_holder_is_offense.astype(jnp.float32),
+        "spatial_ball_handler_nearest_defender_distance": (
+            ball_handler_nearest_defender.astype(jnp.float32)
+        ),
+        "spatial_ball_handler_pressured": (
+            ball_holder_is_offense
+            & (ball_handler_nearest_defender <= pressure_distance)
+        ).astype(jnp.float32),
+        "spatial_offense_nearest_defender_distance": jnp.mean(
+            nearest_defender_by_offense,
+            axis=1,
+        ).astype(jnp.float32),
+        "spatial_unguarded_offense_fraction": jnp.mean(
+            (nearest_defender_by_offense > 2.0).astype(jnp.float32),
+            axis=1,
+        ),
+        "spatial_team_centroid_distance": team_centroid_distance.astype(jnp.float32),
     }
 
 

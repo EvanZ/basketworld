@@ -3519,6 +3519,30 @@ def _summarize_historical_match(
                 scalar_diagnostics["spatial_corner_player_fraction_total"],
                 spatial_live_steps,
             ),
+            "mean_live_ball_handler_nearest_defender_distance": _rate(
+                scalar_diagnostics[
+                    "spatial_ball_handler_nearest_defender_distance_total"
+                ],
+                scalar_diagnostics["spatial_ball_handler_samples_total"],
+            ),
+            "live_ball_handler_pressure_rate": _rate(
+                scalar_diagnostics["spatial_ball_handler_pressured_total"],
+                scalar_diagnostics["spatial_ball_handler_samples_total"],
+            ),
+            "mean_live_offense_nearest_defender_distance": _rate(
+                scalar_diagnostics[
+                    "spatial_offense_nearest_defender_distance_total"
+                ],
+                spatial_live_steps,
+            ),
+            "mean_live_unguarded_offense_fraction": _rate(
+                scalar_diagnostics["spatial_unguarded_offense_fraction_total"],
+                spatial_live_steps,
+            ),
+            "mean_live_team_centroid_distance": _rate(
+                scalar_diagnostics["spatial_team_centroid_distance_total"],
+                spatial_live_steps,
+            ),
         }
     )
     for side in ("candidate", "opponent"):

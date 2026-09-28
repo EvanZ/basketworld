@@ -1726,6 +1726,7 @@ const defaultEvalConfig = () => ({
   },
   showReboundSkillsOnBoard: false,
   randomizeOffensePermutation: false,
+  actionModeMatrix: false,
   intentSelectionMode: 'learned_sample',
   startTemplateMode: 'checkpoint',
   startTemplateProb: 1.0,
@@ -5061,6 +5062,22 @@ const valueDiagRows = computed(() => [
 ]);
 const spatialDiag = computed(() => statsState.value?.spatialDiagnostics || {});
 const spatialLiveStepCount = computed(() => Number(spatialDiag.value?.liveStepCount || 0));
+function spatialDiagTooltip(key) {
+  const descriptions = {
+    live_steps: 'Live-play environment steps included in these spatial averages.',
+    all_players: 'Mean hex distance over every unordered player pair. Lower values indicate the whole court has compressed.',
+    offense_teammates: 'Mean hex distance over all active-offense teammate pairs.',
+    defense_teammates: 'Mean hex distance over all active-defense teammate pairs.',
+    boundary: 'Fraction of players occupying an outer boundary cell during live play.',
+    corner: 'Fraction of players occupying a corner-zone cell during live play.',
+    ball_handler_distance: 'Mean distance from the current ball handler to the nearest defender.',
+    ball_handler_pressure: 'Fraction of ball-handler samples with a defender inside the configured pressure distance.',
+    offense_coverage: 'For each offensive player, find the nearest defender, then average those distances.',
+    unguarded_offense: 'Fraction of offensive players more than two hexes from every defender.',
+    centroid_distance: 'Hex distance between the mean axial positions of the active offense and defense.',
+  };
+  return descriptions[key] || descriptions.live_steps;
+}
 const spatialDiagRows = computed(() => [
   {
     key: 'live_steps',
@@ -5092,7 +5109,47 @@ const spatialDiagRows = computed(() => [
     label: 'Corner-zone occupancy',
     value: formatDebugProb(spatialDiag.value?.meanCornerPlayerFraction),
   },
+  {
+    key: 'ball_handler_distance',
+    label: 'Ball handler to nearest DEF',
+    value: `${formatDebugNumber(spatialDiag.value?.meanBallHandlerNearestDefenderDistance, 2)} hex`,
+  },
+  {
+    key: 'ball_handler_pressure',
+    label: 'Ball handler pressured',
+    value: formatDebugProb(spatialDiag.value?.ballHandlerPressureRate),
+  },
+  {
+    key: 'offense_coverage',
+    label: 'OFF to nearest DEF',
+    value: `${formatDebugNumber(spatialDiag.value?.meanOffenseNearestDefenderDistance, 2)} hex`,
+  },
+  {
+    key: 'unguarded_offense',
+    label: 'OFF players unguarded',
+    value: formatDebugProb(spatialDiag.value?.meanUnguardedOffenseFraction),
+  },
+  {
+    key: 'centroid_distance',
+    label: 'Team centroid distance',
+    value: `${formatDebugNumber(spatialDiag.value?.meanTeamCentroidDistance, 2)} hex`,
+  },
 ]);
+const actionModeMatrix = computed(() => statsState.value?.actionModeMatrix || {});
+const actionModeMatrixRows = computed(() => {
+  const cells = actionModeMatrix.value?.cells;
+  if (!cells || typeof cells !== 'object') return [];
+  return Object.entries(cells).map(([key, cell]) => ({
+    key,
+    label: `PL ${cell?.player_action_mode || '?'} · AI ${cell?.ai_action_mode || '?'}`,
+    record: `${Number(cell?.player_wins || 0)}-${Number(cell?.ties || 0)}-${Number(cell?.player_losses || 0)}`,
+    margin: formatDebugNumber(cell?.completed_margin_mean, 2),
+    playerPpp: formatDebugNumber(cell?.user_points_per_possession, 2),
+    aiPpp: formatDebugNumber(cell?.opponent_points_per_possession, 2),
+    pressure: formatDebugProb(cell?.live_ball_handler_pressure_rate),
+    centroid: formatDebugNumber(cell?.mean_live_team_centroid_distance, 2),
+  }));
+});
 const avgOffenseReboundTargetDistance = computed(() => (
   safeDiv(Number(statsState.value?.rebounds?.targetDistanceSumOffense || 0), reboundTargetDistanceCount.value)
 ));
@@ -5227,6 +5284,30 @@ function ensureStatsDiagnosticFields(target) {
   target.spatialDiagnostics.meanCornerPlayerFraction = Number(
     target.spatialDiagnostics.meanCornerPlayerFraction || 0,
   );
+  target.spatialDiagnostics.ballHandlerSampleCount = Number(
+    target.spatialDiagnostics.ballHandlerSampleCount || 0,
+  );
+  target.spatialDiagnostics.meanBallHandlerNearestDefenderDistance = Number(
+    target.spatialDiagnostics.meanBallHandlerNearestDefenderDistance || 0,
+  );
+  target.spatialDiagnostics.ballHandlerPressureRate = Number(
+    target.spatialDiagnostics.ballHandlerPressureRate || 0,
+  );
+  target.spatialDiagnostics.meanOffenseNearestDefenderDistance = Number(
+    target.spatialDiagnostics.meanOffenseNearestDefenderDistance || 0,
+  );
+  target.spatialDiagnostics.meanUnguardedOffenseFraction = Number(
+    target.spatialDiagnostics.meanUnguardedOffenseFraction || 0,
+  );
+  target.spatialDiagnostics.meanTeamCentroidDistance = Number(
+    target.spatialDiagnostics.meanTeamCentroidDistance || 0,
+  );
+  if (!target.actionModeMatrix || typeof target.actionModeMatrix !== 'object') {
+    target.actionModeMatrix = { enabled: false, cells: {} };
+  }
+  target.actionModeMatrix.cells = (
+    target.actionModeMatrix.cells && typeof target.actionModeMatrix.cells === 'object'
+  ) ? target.actionModeMatrix.cells : {};
 }
 
 ensureStatsDiagnosticFields(statsState.value);
@@ -6391,7 +6472,29 @@ function applyEvaluationStats(
       meanCornerPlayerFraction: Number(
         nativeSummary.mean_live_corner_player_fraction || 0,
       ),
+      ballHandlerSampleCount: Number(
+        nativeSummary.ball_handler_sample_count || 0,
+      ),
+      meanBallHandlerNearestDefenderDistance: Number(
+        nativeSummary.mean_live_ball_handler_nearest_defender_distance || 0,
+      ),
+      ballHandlerPressureRate: Number(
+        nativeSummary.live_ball_handler_pressure_rate || 0,
+      ),
+      meanOffenseNearestDefenderDistance: Number(
+        nativeSummary.mean_live_offense_nearest_defender_distance || 0,
+      ),
+      meanUnguardedOffenseFraction: Number(
+        nativeSummary.mean_live_unguarded_offense_fraction || 0,
+      ),
+      meanTeamCentroidDistance: Number(
+        nativeSummary.mean_live_team_centroid_distance || 0,
+      ),
     };
+    next.actionModeMatrix = (
+      evalDiagnostics.action_mode_matrix
+      && typeof evalDiagnostics.action_mode_matrix === 'object'
+    ) ? { ...evalDiagnostics.action_mode_matrix } : { enabled: false, cells: {} };
     console.info('[Stats] Spatial diagnostics', next.spatialDiagnostics);
 
     const rbRaw = evalDiagnostics.reward_breakdown || {};
@@ -8942,22 +9045,32 @@ function offenseSkillDeltaLabel(idx) {
                 v-for="row in spatialDiagRows"
                 :key="`spatial-diagnostic-${row.key}`"
                 class="param-item"
-                :data-tooltip="row.key === 'all_players'
-                  ? 'Mean hex distance over every unordered player pair. Lower values indicate the whole court has compressed.'
-                  : row.key === 'offense_teammates'
-                    ? 'Mean hex distance over all active-offense teammate pairs.'
-                    : row.key === 'defense_teammates'
-                      ? 'Mean hex distance over all active-defense teammate pairs.'
-                      : row.key === 'boundary'
-                        ? 'Fraction of players occupying an outer boundary cell during live play.'
-                        : row.key === 'corner'
-                          ? 'Fraction of players occupying a corner-zone cell during live play.'
-                          : 'Live-play environment steps included in these spatial averages.'"
+                :data-tooltip="spatialDiagTooltip(row.key)"
               >
                 <span class="param-name">{{ row.label }}:</span>
                 <span class="param-value">{{ row.value }}</span>
               </div>
             </template>
+          </div>
+          <div v-if="actionModeMatrixRows.length" class="param-category">
+            <h5>
+              Action-Mode Matrix
+              <span
+                class="category-help"
+                title="Same policies, paired starts, environment configuration, and evaluation seed; only Player/AI argmax versus sampled action selection changes. Record is Player wins-ties-losses."
+                aria-label="Action-mode matrix help"
+                tabindex="0"
+              >?</span>
+            </h5>
+            <div
+              v-for="row in actionModeMatrixRows"
+              :key="`action-mode-${row.key}`"
+              class="param-item"
+              :data-tooltip="`Record ${row.record}; mean Player margin ${row.margin}; PPP PL ${row.playerPpp}, AI ${row.aiPpp}; ball-handler pressure ${row.pressure}; centroid distance ${row.centroid} hex.`"
+            >
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.record }} · Δ {{ row.margin }}</span>
+            </div>
           </div>
           <div class="param-category">
             <h5>
@@ -10879,6 +10992,21 @@ function offenseSkillDeltaLabel(idx) {
           />
           Randomize offense player slots each episode (shuffle positions)
         </label>
+      </div>
+
+      <div class="eval-row">
+        <label class="inline-label">
+          <input
+            type="checkbox"
+            :checked="evalConfigSafe.actionModeMatrix"
+            :disabled="props.isEvaluating"
+            @change="emitEvalConfigUpdate({ actionModeMatrix: $event.target.checked })"
+          />
+          Run four-way Player/AI action-mode matrix
+        </label>
+        <span class="status-note">
+          Runs the selected episode count in each of four same-seed argmax/sampled matchups.
+        </span>
       </div>
 
       <div class="eval-row">

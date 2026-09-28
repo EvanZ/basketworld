@@ -214,3 +214,101 @@ def test_evaluation_response_keeps_cutoff_games_incomplete(monkeypatch):
     assert result["final_state"]["done"] is False
     assert result["final_state"]["team_a_score"] == pytest.approx(4.0)
     assert result["final_state"]["completed_possessions"] == 2
+
+
+def test_action_mode_matrix_runs_four_same_seed_native_evaluations(monkeypatch):
+    fake_env = SimpleNamespace(shot_clock_steps=24, min_shot_clock=1)
+    monkeypatch.setattr(evaluation_routes.game_state, "env", fake_env)
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy", object())
+    monkeypatch.setattr(evaluation_routes.game_state, "defense_policy", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "env_required_params", {"players": 2})
+    monkeypatch.setattr(
+        evaluation_routes.game_state,
+        "env_optional_params",
+        {"enable_multi_possession": True, "multi_possession_limit": 1},
+    )
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy_path", "/tmp/policy")
+    monkeypatch.setattr(evaluation_routes.game_state, "opponent_policy_path", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "mlflow_training_params", {})
+    monkeypatch.setattr(evaluation_routes.game_state, "user_team", Team.OFFENSE)
+    monkeypatch.setattr(evaluation_routes.game_state, "unified_policy_key", "test")
+    monkeypatch.setattr(evaluation_routes.game_state, "opponent_unified_policy_key", None)
+    monkeypatch.setattr(evaluation_routes.game_state, "role_flag_offense", 1.0)
+    monkeypatch.setattr(evaluation_routes.game_state, "role_flag_defense", -1.0)
+    monkeypatch.setattr(evaluation_routes, "eval_validate_custom_eval_setup", lambda *_: {})
+    monkeypatch.setattr(evaluation_routes, "can_run_native_jax_evaluation", lambda **_: True)
+    monkeypatch.setattr(evaluation_routes, "get_ui_game_state", lambda: {})
+
+    progress = []
+    monkeypatch.setattr(evaluation_routes, "reset_evaluation_progress", lambda total: progress.append((0, total)))
+    monkeypatch.setattr(
+        evaluation_routes,
+        "update_evaluation_progress",
+        lambda completed, total: progress.append((completed, total)),
+    )
+    calls = []
+
+    def _fake_run(**kwargs):
+        calls.append(kwargs)
+        kwargs["progress_callback"](kwargs["num_episodes"], kwargs["num_episodes"])
+        player_argmax = bool(kwargs["player_deterministic"])
+        ai_argmax = bool(kwargs["opponent_deterministic"])
+        margin = float(int(player_argmax) - int(ai_argmax))
+        return {
+            "results": [
+                {
+                    "episode": index + 1,
+                    "steps": 5,
+                    "completed": True,
+                    "game": {
+                        "completed": True,
+                        "user_score": 2.0,
+                        "opponent_score": 1.0,
+                    },
+                    "outcome_info": {},
+                }
+                for index in range(kwargs["num_episodes"])
+            ],
+            "shot_accumulator": {},
+            "eval_diagnostics": {
+                "jax_native_summary": {
+                    "num_episodes": kwargs["num_episodes"],
+                    "eval_seed": kwargs["eval_seed"],
+                    "completed_games": kwargs["num_episodes"],
+                    "completion_rate": 1.0,
+                    "win_count": 1,
+                    "tie_count": 0,
+                    "loss_count": 1,
+                    "completed_margin_mean": margin,
+                    "user_points_per_possession": 1.0,
+                    "opponent_points_per_possession": 0.5,
+                }
+            },
+        }
+
+    monkeypatch.setattr(evaluation_routes, "eval_run_evaluation", _fake_run)
+
+    response = evaluation_routes.run_evaluation(
+        EvaluationRequest(
+            num_episodes=2,
+            action_mode_matrix=True,
+            eval_seed=12345,
+        )
+    )
+
+    assert len(calls) == 4
+    assert {call["eval_seed"] for call in calls} == {12345}
+    assert [
+        (call["player_deterministic"], call["opponent_deterministic"])
+        for call in calls
+    ] == [(True, True), (False, True), (True, False), (False, False)]
+    matrix = response["eval_diagnostics"]["action_mode_matrix"]
+    assert matrix["episodes_per_mode"] == 2
+    assert matrix["total_episode_count"] == 8
+    assert set(matrix["cells"]) == {
+        "argmax_vs_argmax",
+        "sampled_vs_argmax",
+        "argmax_vs_sampled",
+        "sampled_vs_sampled",
+    }
+    assert progress[-1] == (8, 8)

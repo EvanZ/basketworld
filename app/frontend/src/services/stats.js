@@ -21,6 +21,15 @@ function normalizeSpatialDiagnostics(raw) {
     meanDefenseTeammatePairDistance: Number(diagnostics.meanDefenseTeammatePairDistance) || 0,
     meanBoundaryPlayerFraction: Number(diagnostics.meanBoundaryPlayerFraction) || 0,
     meanCornerPlayerFraction: Number(diagnostics.meanCornerPlayerFraction) || 0,
+    ballHandlerSampleCount: Number(diagnostics.ballHandlerSampleCount) || 0,
+    meanBallHandlerNearestDefenderDistance:
+      Number(diagnostics.meanBallHandlerNearestDefenderDistance) || 0,
+    ballHandlerPressureRate: Number(diagnostics.ballHandlerPressureRate) || 0,
+    meanOffenseNearestDefenderDistance:
+      Number(diagnostics.meanOffenseNearestDefenderDistance) || 0,
+    meanUnguardedOffenseFraction:
+      Number(diagnostics.meanUnguardedOffenseFraction) || 0,
+    meanTeamCentroidDistance: Number(diagnostics.meanTeamCentroidDistance) || 0,
   };
 }
 
@@ -247,6 +256,7 @@ export function getDefaultStats() {
       defense_value_mae: 0,
     },
     spatialDiagnostics: normalizeSpatialDiagnostics(),
+    actionModeMatrix: { enabled: false, cells: {} },
   };
 }
 
@@ -364,6 +374,9 @@ export function loadStats() {
         ? { ...parsed.valueDiagnostics }
         : getDefaultStats().valueDiagnostics,
       spatialDiagnostics: normalizeSpatialDiagnostics(parsed?.spatialDiagnostics),
+      actionModeMatrix: (
+        parsed?.actionModeMatrix && typeof parsed.actionModeMatrix === 'object'
+      ) ? { ...parsed.actionModeMatrix } : { enabled: false, cells: {} },
     };
   } catch (e) {
     // Corrupt storage; reset

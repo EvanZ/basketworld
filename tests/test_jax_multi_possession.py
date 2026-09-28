@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv
 from basketworld_jax.train.main import parse_args, validate_train_args
 from basketworld_jax.train.runtime import (
+    _build_spatial_step_metrics,
     _selector_segment_application_masks,
     summarize_completed_possession_pace,
 )
@@ -170,6 +171,54 @@ def test_spatial_diagnostics_follow_active_roles_and_mark_corner_zone():
     team_b_metrics = build_spatial_diagnostics_batch(static, team_b_offense, jnp)
     assert float(team_b_metrics["spatial_offense_teammate_pair_distance"][0]) > 0.0
     assert float(team_b_metrics["spatial_defense_teammate_pair_distance"][0]) == 0.0
+
+
+def test_spatial_engagement_diagnostics_measure_coverage_and_gate_dead_ball_steps():
+    static = _multi_possession_static(players=2)
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(42), 1),
+        jax,
+        jnp,
+    )
+    positions = jnp.asarray(
+        [[[0, 0], [2, 0], [1, 0], [4, 0]]],
+        dtype=jnp.int32,
+    )
+    live_state = state._replace(
+        positions=positions,
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        ball_holder=jnp.asarray([0], dtype=jnp.int32),
+        game_phase=jnp.asarray([GAME_PHASE_LIVE], dtype=jnp.int8),
+    )
+
+    diagnostics = build_spatial_diagnostics_batch(static, live_state, jnp)
+    assert float(diagnostics["spatial_ball_handler_samples"][0]) == 1.0
+    assert float(
+        diagnostics["spatial_ball_handler_nearest_defender_distance"][0]
+    ) == pytest.approx(1.0)
+    assert float(diagnostics["spatial_ball_handler_pressured"][0]) == 1.0
+    assert float(
+        diagnostics["spatial_offense_nearest_defender_distance"][0]
+    ) == pytest.approx(1.0)
+    assert float(diagnostics["spatial_unguarded_offense_fraction"][0]) == 0.0
+    assert float(diagnostics["spatial_team_centroid_distance"][0]) == pytest.approx(
+        1.5
+    )
+
+    active = jnp.asarray([True], dtype=jnp.bool_)
+    live_metrics = _build_spatial_step_metrics(static, live_state, active, jnp)
+    assert float(live_metrics["spatial_live_steps"][0]) == 1.0
+
+    check_state = live_state._replace(
+        ball_holder=jnp.asarray([-1], dtype=jnp.int32),
+        game_phase=jnp.asarray([GAME_PHASE_AWAITING_CHECK], dtype=jnp.int8),
+    )
+    dead_ball_metrics = _build_spatial_step_metrics(static, check_state, active, jnp)
+    assert float(dead_ball_metrics["spatial_live_steps"][0]) == 0.0
+    for key, value in dead_ball_metrics.items():
+        if key != "spatial_live_steps":
+            assert float(value[0]) == 0.0
 
 
 def test_tied_closest_inbounders_are_selected_by_seeded_random_draw():

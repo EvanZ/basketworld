@@ -483,6 +483,8 @@ export async function runEvaluation(
   intentSelectionMode = 'learned_sample',
   startTemplateOptions = null,
   envOverrides = null,
+  actionModeMatrix = false,
+  evalSeed = null,
 ) {
   const templateOptions = startTemplateOptions || {};
   const response = await fetch(`${API_BASE_URL}/api/run_evaluation`, {
@@ -492,6 +494,12 @@ export async function runEvaluation(
       num_episodes: numEpisodes, 
       player_deterministic: playerDeterministic,
       opponent_deterministic: opponentDeterministic,
+      action_mode_matrix: Boolean(actionModeMatrix),
+      eval_seed: (
+        evalSeed !== null
+        && evalSeed !== undefined
+        && Number.isFinite(Number(evalSeed))
+      ) ? Number(evalSeed) : null,
       custom_setup: customSetup || null,
       randomize_offense_permutation: Boolean(randomizeOffensePermutation),
       intent_selection_mode: String(intentSelectionMode || 'learned_sample'),

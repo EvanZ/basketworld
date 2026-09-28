@@ -90,6 +90,12 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "opponent_spatial_teammate_pair_distance",
     "spatial_boundary_player_fraction",
     "spatial_corner_player_fraction",
+    "spatial_ball_handler_samples",
+    "spatial_ball_handler_nearest_defender_distance",
+    "spatial_ball_handler_pressured",
+    "spatial_offense_nearest_defender_distance",
+    "spatial_unguarded_offense_fraction",
+    "spatial_team_centroid_distance",
     "rebound_attempts",
     "candidate_pass_attempts",
     "candidate_completed_passes",
@@ -142,6 +148,12 @@ HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS = frozenset(
         "opponent_spatial_teammate_pair_distance",
         "spatial_boundary_player_fraction",
         "spatial_corner_player_fraction",
+        "spatial_ball_handler_samples",
+        "spatial_ball_handler_nearest_defender_distance",
+        "spatial_ball_handler_pressured",
+        "spatial_offense_nearest_defender_distance",
+        "spatial_unguarded_offense_fraction",
+        "spatial_team_centroid_distance",
     }
 )
 
@@ -2837,6 +2849,15 @@ def _build_historical_match_step_diagnostics(
     counters["spatial_corner_player_fraction"] = spatial_metrics[
         "spatial_corner_player_fraction"
     ]
+    for key in (
+        "spatial_ball_handler_samples",
+        "spatial_ball_handler_nearest_defender_distance",
+        "spatial_ball_handler_pressured",
+        "spatial_offense_nearest_defender_distance",
+        "spatial_unguarded_offense_fraction",
+        "spatial_team_centroid_distance",
+    ):
+        counters[key] = spatial_metrics[key]
     counters["rebound_attempts"] = _count(env_out.rebound_attempt)
 
     _split_offense(env_out.pass_attempt, "pass_attempts", counters)
@@ -3571,6 +3592,24 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 spatial_corner_player_fraction=_active_sum(
                     spatial_metrics["spatial_corner_player_fraction"]
                 ),
+                spatial_ball_handler_samples=_active_sum(
+                    spatial_metrics["spatial_ball_handler_samples"]
+                ),
+                spatial_ball_handler_nearest_defender_distance=_active_sum(
+                    spatial_metrics["spatial_ball_handler_nearest_defender_distance"]
+                ),
+                spatial_ball_handler_pressured=_active_sum(
+                    spatial_metrics["spatial_ball_handler_pressured"]
+                ),
+                spatial_offense_nearest_defender_distance=_active_sum(
+                    spatial_metrics["spatial_offense_nearest_defender_distance"]
+                ),
+                spatial_unguarded_offense_fraction=_active_sum(
+                    spatial_metrics["spatial_unguarded_offense_fraction"]
+                ),
+                spatial_team_centroid_distance=_active_sum(
+                    spatial_metrics["spatial_team_centroid_distance"]
+                ),
                 shot_attempts=_active_sum(shot_metrics["shot_attempts"]),
                 shot_makes=_active_sum(shot_metrics["shot_makes"]),
                 shot_dunks=_active_sum(shot_metrics["shot_dunks"]),
@@ -3763,6 +3802,26 @@ def summarize_deploy_eval_outputs(
         ),
         "mean_live_corner_player_fraction": _rate(
             totals["spatial_corner_player_fraction"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_ball_handler_nearest_defender_distance": _rate(
+            totals["spatial_ball_handler_nearest_defender_distance"],
+            totals["spatial_ball_handler_samples"],
+        ),
+        "live_ball_handler_pressure_rate": _rate(
+            totals["spatial_ball_handler_pressured"],
+            totals["spatial_ball_handler_samples"],
+        ),
+        "mean_live_offense_nearest_defender_distance": _rate(
+            totals["spatial_offense_nearest_defender_distance"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_unguarded_offense_fraction": _rate(
+            totals["spatial_unguarded_offense_fraction"],
+            totals["spatial_live_steps"],
+        ),
+        "mean_live_team_centroid_distance": _rate(
+            totals["spatial_team_centroid_distance"],
             totals["spatial_live_steps"],
         ),
         "mean_offense_reward_per_episode": _per_episode(totals["offense_reward"]),
@@ -5139,6 +5198,29 @@ def summarize_training_step(
         ),
         "mean_live_corner_player_fraction": _spatial_live_mean(
             rollout_out.trajectory.spatial_corner_player_fraction
+        ),
+        "mean_live_ball_handler_nearest_defender_distance": _active_mean(
+            rollout_out.trajectory.spatial_ball_handler_nearest_defender_distance,
+            np.asarray(
+                rollout_out.trajectory.spatial_ball_handler_samples,
+                dtype=np.float32,
+            ),
+        ),
+        "live_ball_handler_pressure_rate": _active_mean(
+            rollout_out.trajectory.spatial_ball_handler_pressured,
+            np.asarray(
+                rollout_out.trajectory.spatial_ball_handler_samples,
+                dtype=np.float32,
+            ),
+        ),
+        "mean_live_offense_nearest_defender_distance": _spatial_live_mean(
+            rollout_out.trajectory.spatial_offense_nearest_defender_distance
+        ),
+        "mean_live_unguarded_offense_fraction": _spatial_live_mean(
+            rollout_out.trajectory.spatial_unguarded_offense_fraction
+        ),
+        "mean_live_team_centroid_distance": _spatial_live_mean(
+            rollout_out.trajectory.spatial_team_centroid_distance
         ),
         "team_a_score_delta_total": team_a_score_delta_total,
         "team_b_score_delta_total": team_b_score_delta_total,

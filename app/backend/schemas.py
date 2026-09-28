@@ -143,6 +143,8 @@ class EvaluationRequest(BaseModel):
     num_episodes: int = 100
     player_deterministic: bool = True
     opponent_deterministic: bool = True
+    action_mode_matrix: bool = False
+    eval_seed: int | None = None
     custom_setup: CustomEvalSetup | None = None
     randomize_offense_permutation: bool = False
     intent_selection_mode: Literal["learned_sample", "best_intent", "uniform_random"] = "learned_sample"

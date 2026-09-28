@@ -341,6 +341,14 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
     assert np.isfinite(summary["mean_live_all_player_pair_distance"])
     assert np.isfinite(summary["mean_live_offense_teammate_pair_distance"])
     assert np.isfinite(summary["mean_live_defense_teammate_pair_distance"])
+    assert summary["ball_handler_sample_count"] > 0
+    assert np.isfinite(
+        summary["mean_live_ball_handler_nearest_defender_distance"]
+    )
+    assert 0.0 <= summary["live_ball_handler_pressure_rate"] <= 1.0
+    assert np.isfinite(summary["mean_live_offense_nearest_defender_distance"])
+    assert 0.0 <= summary["mean_live_unguarded_offense_fraction"] <= 1.0
+    assert np.isfinite(summary["mean_live_team_centroid_distance"])
     if summary["completed_user_offensive_possessions"] > 0:
         assert np.isclose(
             summary["user_points_per_possession"],

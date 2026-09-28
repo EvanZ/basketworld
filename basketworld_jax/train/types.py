@@ -61,6 +61,12 @@ class TrajectoryBatch(NamedTuple):
     spatial_defense_teammate_pair_distance: Any
     spatial_boundary_player_fraction: Any
     spatial_corner_player_fraction: Any
+    spatial_ball_handler_samples: Any
+    spatial_ball_handler_nearest_defender_distance: Any
+    spatial_ball_handler_pressured: Any
+    spatial_offense_nearest_defender_distance: Any
+    spatial_unguarded_offense_fraction: Any
+    spatial_team_centroid_distance: Any
     pass_attempts: Any
     completed_passes: Any
     assists: Any
@@ -284,6 +290,12 @@ class DeployEvalTotals(NamedTuple):
     spatial_defense_teammate_pair_distance: Any
     spatial_boundary_player_fraction: Any
     spatial_corner_player_fraction: Any
+    spatial_ball_handler_samples: Any
+    spatial_ball_handler_nearest_defender_distance: Any
+    spatial_ball_handler_pressured: Any
+    spatial_offense_nearest_defender_distance: Any
+    spatial_unguarded_offense_fraction: Any
+    spatial_team_centroid_distance: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
